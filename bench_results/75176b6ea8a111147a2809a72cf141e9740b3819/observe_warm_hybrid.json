@@ -1,0 +1,21 @@
+{
+  "commit": "75176b6ea8a111147a2809a72cf141e9740b3819",
+  "bench": "observe_warm_hybrid",
+  "recorded_at": "2026-05-23T09:16:00-05:00",
+  "source_of_truth": "crates/synapse-mcp/tests/m1_tools_fsv.rs stdio structuredContent round-trip readback",
+  "manual_fsv": {
+    "command": "cargo test -p synapse-mcp --test m1_tools_fsv -- --nocapture",
+    "samples": 100,
+    "p99_ms": 2.075,
+    "threshold_ms": 30.0,
+    "pass": true,
+    "readback": "source_of_truth=mcp_perception_mode edge=hybrid_round_trip_p99 after=p99_ms:2.075"
+  },
+  "criterion_baseline": {
+    "command": "cargo bench -p synapse-perception --bench observe_warm_hybrid -- --warm-up-time 1 --measurement-time 2 --sample-size 10",
+    "mean_ci_low_us": 5.6618,
+    "mean_us": 5.6994,
+    "mean_ci_high_us": 5.7176
+  },
+  "notes": "Criterion measures the warm perception assembler path. Manual FSV p99 measures the actual MCP stdio request-response path used for the issue gate."
+}

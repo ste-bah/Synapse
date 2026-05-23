@@ -1,0 +1,28 @@
+{
+  "commit": "75176b6ea8a111147a2809a72cf141e9740b3819",
+  "bench": "vram_steady_state",
+  "recorded_at": "2026-05-23T09:16:30-05:00",
+  "source_of_truth": "nvidia-smi process and GPU memory readback while target/debug/synapse-mcp --mode stdio was running",
+  "gpu": {
+    "name": "NVIDIA GeForce RTX 5090",
+    "memory_total_mb": 32607,
+    "memory_used_total_mb": 4566
+  },
+  "no_model_loaded": {
+    "synapse_process": "17530 target/debug/synapse-mcp --mode stdio",
+    "nvidia_compute_apps_rows": 0,
+    "synapse_vram_mb": 0,
+    "threshold_mb": 500,
+    "pass": true,
+    "readback": "nvidia-smi --query-compute-apps=pid,process_name,used_memory returned no rows; nvidia-smi pmon -c 1 returned no active GPU process rows"
+  },
+  "yolov10n_loaded": {
+    "model_present_linux": false,
+    "model_present_windows": false,
+    "linux_path": "/home/cabdru/synapse/synapse/models/yolov10n_general.onnx",
+    "windows_path": "C:\\Users\\hotra\\AppData\\Local\\synapse\\models\\yolov10n_general.onnx",
+    "measured": false,
+    "threshold_mb": 1500,
+    "reason": "The M1 local build does not bundle YOLOv10n and no operator-imported yolov10n_general.onnx exists on either checked source-of-truth path."
+  }
+}
