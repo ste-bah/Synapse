@@ -8,6 +8,7 @@ expression: projection
   "inputSchema": {
     "$defs": {
       "ElementId": {
+        "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
         "type": "string"
       },
       "TypeBackend": {

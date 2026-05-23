@@ -82,6 +82,7 @@ expression: schemas
           "type": "string"
         },
         "ElementId": {
+          "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
           "type": "string"
         }
       },
@@ -231,6 +232,7 @@ expression: schemas
           "type": "string"
         },
         "ElementId": {
+          "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
           "type": "string"
         },
         "MouseButton": {
@@ -504,6 +506,7 @@ expression: schemas
           "type": "string"
         },
         "ElementId": {
+          "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
           "type": "string"
         }
       },
@@ -986,6 +989,7 @@ expression: schemas
     "inputSchema": {
       "$defs": {
         "ElementId": {
+          "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
           "type": "string"
         },
         "TypeBackend": {
@@ -1084,6 +1088,7 @@ expression: schemas
     "inputSchema": {
       "$defs": {
         "ElementId": {
+          "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
           "type": "string"
         },
         "FindScope": {
@@ -1164,6 +1169,7 @@ expression: schemas
     "outputSchema": {
       "$defs": {
         "ElementId": {
+          "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
           "type": "string"
         },
         "FindResult": {
@@ -1648,6 +1654,7 @@ expression: schemas
           "type": "object"
         },
         "ElementId": {
+          "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
           "type": "string"
         },
         "EventSource": {
@@ -2189,6 +2196,7 @@ expression: schemas
     "inputSchema": {
       "$defs": {
         "ElementId": {
+          "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
           "type": "string"
         },
         "OcrBackend": {
@@ -2474,6 +2482,7 @@ expression: schemas
           ]
         },
         "ElementId": {
+          "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
           "type": "string"
         }
       },

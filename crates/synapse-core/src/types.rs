@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, fmt, str::FromStr};
+use std::{borrow::Cow, collections::BTreeMap, fmt, str::FromStr};
 
 use chrono::{DateTime, Utc};
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
@@ -387,9 +387,9 @@ pub struct Size {
 }
 
 pub type SessionId = String;
-#[derive(
-    Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize, JsonSchema,
-)]
+const ELEMENT_ID_SCHEMA_PATTERN: &str = r"^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$";
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ElementId(String);
 
@@ -453,6 +453,19 @@ impl FromStr for ElementId {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         parse_element_id_parts(value)?;
         Ok(Self(value.to_owned()))
+    }
+}
+
+impl JsonSchema for ElementId {
+    fn schema_name() -> Cow<'static, str> {
+        "ElementId".into()
+    }
+
+    fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+        json_schema!({
+            "type": "string",
+            "pattern": ELEMENT_ID_SCHEMA_PATTERN,
+        })
     }
 }
 

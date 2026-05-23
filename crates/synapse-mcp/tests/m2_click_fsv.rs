@@ -5,6 +5,8 @@ use synapse_core::error_codes;
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 use tempfile::TempDir;
 
+const ELEMENT_ID_PATTERN: &str = r"^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$";
+
 #[tokio::test]
 async fn act_click_schema_defaults_and_edges_fsv() -> anyhow::Result<()> {
     let log_dir = TempDir::new()?;
@@ -44,6 +46,7 @@ async fn act_click_schema_defaults_and_edges_fsv() -> anyhow::Result<()> {
     assert_eq!(schema["properties"]["clicks"]["default"], 1);
     assert_eq!(schema["properties"]["use_invoke_pattern"]["default"], true);
     assert_eq!(schema["properties"]["backend"]["default"], "auto");
+    assert_element_id_schema_pattern(schema);
 
     let projection = json!({
         "name": act_click["name"],
@@ -88,6 +91,8 @@ async fn act_click_schema_defaults_and_edges_fsv() -> anyhow::Result<()> {
         error_code(&clicks_zero),
         Some(error_codes::TOOL_PARAMS_INVALID)
     );
+
+    assert_malformed_element_id_rejected(&mut client).await?;
 
     println!("source_of_truth=mcp_act_click edge=modifier_rejected before=modifiers:[ctrl]");
     let modifier = client
@@ -161,6 +166,46 @@ fn schema_root(value: Option<&Value>) -> Value {
         "required": value.get("required"),
         "additionalProperties": value.get("additionalProperties"),
     })
+}
+
+fn assert_element_id_schema_pattern(schema: &Value) {
+    println!(
+        "source_of_truth=tools_list tool=act_click edge=element_id_schema after_type:{} after_pattern:{}",
+        schema["$defs"]["ElementId"]["type"], schema["$defs"]["ElementId"]["pattern"]
+    );
+    assert_eq!(
+        schema["$defs"]["ElementId"]["pattern"],
+        Value::String(ELEMENT_ID_PATTERN.to_owned())
+    );
+}
+
+async fn assert_malformed_element_id_rejected(client: &mut StdioMcpClient) -> anyhow::Result<()> {
+    println!(
+        "source_of_truth=mcp_act_click edge=malformed_element_id before=element_id:not-a-valid-id"
+    );
+    let malformed = client
+        .tools_call_error(
+            "act_click",
+            json!({"target": {"element_id": "not-a-valid-id"}}),
+        )
+        .await?;
+    println!("source_of_truth=mcp_act_click edge=malformed_element_id after={malformed}");
+    let malformed_code =
+        error_code(&malformed).context("malformed element_id error code missing")?;
+    assert!(
+        [
+            error_codes::TOOL_PARAMS_INVALID,
+            error_codes::ACTION_TARGET_INVALID
+        ]
+        .contains(&malformed_code),
+        "malformed element_id rejected with unexpected code {malformed_code}"
+    );
+    assert_eq!(
+        malformed_code,
+        error_codes::TOOL_PARAMS_INVALID,
+        "current rejection layer is MCP parameter deserialization after ElementId parse validation"
+    );
+    Ok(())
 }
 
 fn assert_recording_log_readbacks(logs: &str) -> anyhow::Result<()> {

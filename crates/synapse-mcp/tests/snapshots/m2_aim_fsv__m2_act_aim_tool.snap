@@ -81,6 +81,7 @@ expression: projection
         "type": "string"
       },
       "ElementId": {
+        "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
         "type": "string"
       }
     },
