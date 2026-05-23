@@ -1,0 +1,127 @@
+---
+source: crates/synapse-mcp/tests/m2_aim_fsv.rs
+expression: projection
+---
+{
+  "description": "Move the pointer toward a screen, element, or track target",
+  "inputSchema": {
+    "$defs": {
+      "ActAimElementTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "element_id": {
+            "$ref": "#/$defs/ElementId"
+          }
+        },
+        "required": [
+          "element_id"
+        ],
+        "type": "object"
+      },
+      "ActAimPointTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "y": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "ActAimTarget": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ActAimPointTarget"
+          },
+          {
+            "$ref": "#/$defs/ActAimElementTarget"
+          },
+          {
+            "$ref": "#/$defs/ActAimTrackTarget"
+          }
+        ]
+      },
+      "ActAimTrackTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "track_id": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "track_id"
+        ],
+        "type": "object"
+      },
+      "AimBackend": {
+        "enum": [
+          "software",
+          "hardware",
+          "auto"
+        ],
+        "type": "string"
+      },
+      "AimStyleParam": {
+        "enum": [
+          "snap",
+          "flick",
+          "natural",
+          "track"
+        ],
+        "type": "string"
+      },
+      "ElementId": {
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "backend": {
+        "$ref": "#/$defs/AimBackend",
+        "default": "auto"
+      },
+      "deadline_ms": {
+        "default": 80,
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "style": {
+        "$ref": "#/$defs/AimStyleParam",
+        "default": "snap"
+      },
+      "target": {
+        "$ref": "#/$defs/ActAimTarget"
+      }
+    },
+    "required": [
+      "target"
+    ],
+    "title": "ActAimParams",
+    "type": "object"
+  },
+  "name": "act_aim",
+  "outputSchemaRoot": {
+    "additionalProperties": false,
+    "required": [
+      "ok",
+      "style_used",
+      "duration_ms",
+      "backend_used",
+      "elapsed_ms"
+    ],
+    "title": "ActAimResponse",
+    "type": "object"
+  }
+}
