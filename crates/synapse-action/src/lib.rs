@@ -1,6 +1,7 @@
 #![allow(unsafe_code)]
 
 pub mod backend;
+pub mod curve;
 pub mod emitter;
 pub mod error;
 pub mod handle;
@@ -11,6 +12,7 @@ pub use backend::{
     resolve_backend,
     unavailable::HardwareUnavailableBackend,
 };
+pub use curve::sample_curve;
 pub use emitter::{
     ActionEmitter, ActionEmitterSnapshotHandle, ActionSnapshotMessage, ActionStateSnapshot,
     EmitState,
