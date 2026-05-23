@@ -17,6 +17,7 @@ tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 enigo.workspace = true
+synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
 windows.workspace = true
 
 [dev-dependencies]

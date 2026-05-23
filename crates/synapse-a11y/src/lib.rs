@@ -12,6 +12,8 @@ use thiserror::Error;
 use tokio::{net::TcpStream, sync::mpsc::UnboundedSender, time::timeout};
 
 #[cfg(windows)]
+pub use uiautomation;
+#[cfg(windows)]
 pub use uiautomation::UIElement;
 
 #[cfg(not(windows))]

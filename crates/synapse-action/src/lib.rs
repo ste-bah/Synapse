@@ -6,6 +6,7 @@ pub mod dynamics;
 pub mod emitter;
 pub mod error;
 pub mod handle;
+pub mod invoke;
 
 pub use backend::{
     ActionBackend, ResolvedBackend,
@@ -21,3 +22,4 @@ pub use emitter::{
 };
 pub use error::{ActionError, ActionResult};
 pub use handle::{ACTION_QUEUE_CAPACITY, ActionHandle, ActionMessage, RELEASE_ALL_HANDLE};
+pub use invoke::invoke_element;

@@ -2945,6 +2945,7 @@ dependencies = [
  "proptest",
  "serde",
  "sha2",
+ "synapse-a11y",
  "synapse-core",
  "thiserror",
  "tokio",
