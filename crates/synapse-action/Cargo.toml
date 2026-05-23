@@ -20,9 +20,14 @@ enigo.workspace = true
 windows.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 insta.workspace = true
 proptest.workspace = true
 sha2.workspace = true
+
+[[bench]]
+name = "action_curve_step_calc_natural"
+harness = false
 
 [lints.rust]
 unsafe_code = "allow"
