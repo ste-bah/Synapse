@@ -58,15 +58,12 @@ pub async fn act_press_with_handle(
         )
     })?;
     let backend = params.backend.to_backend();
-    let action = press_action(keys, params.hold_ms, backend);
+    let action = press_action(keys.clone(), params.hold_ms, backend);
 
     if let Some(recording) = recording {
         execute_recording(&recording, &action)?;
     } else {
-        handle
-            .execute(action)
-            .await
-            .map_err(|error| action_error_to_mcp(&error))?;
+        execute_live_press_sequence(handle, keys, params.hold_ms, backend).await?;
     }
 
     Ok(ActPressResponse {
@@ -218,6 +215,60 @@ fn press_action(keys: Vec<Key>, hold_ms: u32, backend: Backend) -> Action {
     }
 }
 
+async fn execute_live_press_sequence(
+    handle: ActionHandle,
+    keys: Vec<Key>,
+    hold_ms: u32,
+    backend: Backend,
+) -> Result<(), ErrorData> {
+    let mut pressed = Vec::with_capacity(keys.len());
+    for key in &keys {
+        if let Err(error) = handle
+            .execute(Action::KeyDown {
+                key: key.clone(),
+                backend,
+            })
+            .await
+        {
+            release_pressed_keys(&handle, &pressed, backend).await;
+            return Err(action_error_to_mcp(&error));
+        }
+        pressed.push(key.clone());
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
+
+    let mut first_error = None;
+    for key in pressed.iter().rev() {
+        if let Err(error) = handle
+            .execute(Action::KeyUp {
+                key: key.clone(),
+                backend,
+            })
+            .await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+
+    if let Some(error) = first_error {
+        return Err(action_error_to_mcp(&error));
+    }
+    Ok(())
+}
+
+async fn release_pressed_keys(handle: &ActionHandle, pressed: &[Key], backend: Backend) {
+    for key in pressed.iter().rev() {
+        let _ = handle
+            .execute(Action::KeyUp {
+                key: key.clone(),
+                backend,
+            })
+            .await;
+    }
+}
+
 fn execute_recording(recording: &RecordingBackend, action: &Action) -> Result<(), ErrorData> {
     let before_events = recording.events();
     let before_event_count = before_events.len();
@@ -293,18 +344,20 @@ const fn backend_used_name(backend: Backend) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use super::{
         ActPressParams, PressBackend, act_press_with_handle, default_hold_ms,
-        default_press_backend, event_sequence, key, normalized_keys,
+        default_press_backend, event_sequence, execute_live_press_sequence, key, normalized_keys,
     };
-    use synapse_action::{ActionEmitter, RecordedInput};
+    use synapse_action::{ActionEmitter, RecordedInput, RecordingBackend};
+    use synapse_core::{Action, Backend};
+    use tokio_util::sync::CancellationToken;
 
     #[tokio::test]
     async fn recording_backend_readback_orders_chord_and_default_hold() {
         let (handle, _snapshot_handle, _emitter) = ActionEmitter::channel();
-        let recording = Arc::new(synapse_action::RecordingBackend::new());
+        let recording = Arc::new(RecordingBackend::new());
         let params = ActPressParams {
             keys: vec!["shift".to_owned(), "ctrl".to_owned(), "s".to_owned()],
             hold_ms: default_hold_ms(),
@@ -329,6 +382,65 @@ mod tests {
             sequence,
             "down:ctrl>down:shift>down:s>delay:33>up:s>up:shift>up:ctrl"
         );
+    }
+
+    #[tokio::test]
+    async fn live_press_sequence_leaves_actor_available_for_release_all_mid_hold() {
+        let cancel = CancellationToken::new();
+        let recording = Arc::new(RecordingBackend::new());
+        let (handle, snapshot_handle, join) =
+            ActionEmitter::spawn_with_backend(cancel.clone(), recording.clone());
+        let keys = vec![key("a")];
+        let started_events = recording.events();
+        println!(
+            "source_of_truth=act_press_live_sequence edge=mid_hold_release before_events={started_events:?}"
+        );
+
+        let press = tokio::spawn(execute_live_press_sequence(
+            handle.clone(),
+            keys,
+            50,
+            Backend::Software,
+        ));
+        let before_release = wait_for_held_key(&snapshot_handle, "a").await;
+        println!(
+            "source_of_truth=act_press_live_sequence edge=mid_hold_release before_release={before_release:?}"
+        );
+
+        handle
+            .execute(Action::ReleaseAll)
+            .await
+            .unwrap_or_else(|error| panic!("release_all should execute during hold: {error}"));
+        let after_release = snapshot_handle
+            .snapshot()
+            .await
+            .unwrap_or_else(|error| panic!("snapshot after release_all should succeed: {error}"));
+        println!(
+            "source_of_truth=act_press_live_sequence edge=mid_hold_release after_release={after_release:?}"
+        );
+        assert!(after_release.held_keys.is_empty());
+
+        press
+            .await
+            .unwrap_or_else(|error| panic!("press task should join: {error}"))
+            .unwrap_or_else(|error| {
+                panic!("press task should tolerate prior release_all: {error}")
+            });
+        let final_events = recording.events();
+        println!(
+            "source_of_truth=act_press_live_sequence edge=mid_hold_release after_events={final_events:?}"
+        );
+        assert!(
+            final_events
+                .iter()
+                .any(|event| matches!(event, RecordedInput::ReleaseAll { .. }))
+        );
+
+        cancel.cancel();
+        let final_snapshot = join
+            .await
+            .unwrap_or_else(|error| panic!("emitter should join: {error}"));
+        assert!(final_snapshot.held_keys.is_empty());
     }
 
     #[test]
@@ -366,5 +478,25 @@ mod tests {
             "source_of_truth=act_press_recording edge=event_sequence before={before:?} after={after}"
         );
         assert_eq!(after, "down:ctrl>delay:33>up:ctrl");
+    }
+
+    async fn wait_for_held_key(
+        snapshot_handle: &synapse_action::ActionEmitterSnapshotHandle,
+        key_name: &str,
+    ) -> synapse_action::ActionStateSnapshot {
+        for _ in 0..50 {
+            let snapshot = snapshot_handle
+                .snapshot()
+                .await
+                .unwrap_or_else(|error| panic!("snapshot should succeed: {error}"));
+            if snapshot.held_keys.iter().any(|key| match &key.code {
+                synapse_core::KeyCode::Named { value } => value == key_name,
+                _ => false,
+            }) {
+                return snapshot;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("timed out waiting for held key {key_name}");
     }
 }
