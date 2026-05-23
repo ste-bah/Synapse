@@ -20,6 +20,18 @@ async fn act_click_schema_defaults_and_edges_fsv() -> anyhow::Result<()> {
         .get("tools")
         .and_then(Value::as_array)
         .context("tools array missing")?;
+    assert_act_click_schema(tools)?;
+    call_act_click_happy_paths(&mut client).await?;
+    call_act_click_error_edges(&mut client).await?;
+
+    assert!(client.shutdown().await?.success());
+    let logs = read_logs(log_dir.path())?;
+    assert_double_click_timing_cache_readback(&logs)?;
+    assert_recording_log_readbacks(&logs)?;
+    Ok(())
+}
+
+fn assert_act_click_schema(tools: &[Value]) -> anyhow::Result<()> {
     let act_click = tools
         .iter()
         .find(|tool| tool.get("name") == Some(&Value::String("act_click".to_owned())))
@@ -55,7 +67,10 @@ async fn act_click_schema_defaults_and_edges_fsv() -> anyhow::Result<()> {
         "outputSchemaRoot": schema_root(act_click.get("outputSchema")),
     });
     insta::assert_json_snapshot!("m2_act_click_tool", projection);
+    Ok(())
+}
 
+async fn call_act_click_happy_paths(client: &mut StdioMcpClient) -> anyhow::Result<()> {
     println!("source_of_truth=mcp_act_click edge=happy before=target:(12,34)");
     let happy = client
         .tools_call("act_click", json!({"target": {"x": 12, "y": 34}}))
@@ -68,7 +83,47 @@ async fn act_click_schema_defaults_and_edges_fsv() -> anyhow::Result<()> {
     assert!(response.ok);
     assert!(!response.used_invoke_pattern);
     assert_eq!(response.backend_used, "software");
+    assert_timing_response(&response, 1);
 
+    println!("source_of_truth=mcp_act_click edge=clicks_two before=target:(20,30) clicks:2");
+    let clicks_two = client
+        .tools_call(
+            "act_click",
+            json!({"target": {"x": 20, "y": 30}, "clicks": 2}),
+        )
+        .await?;
+    let response: ActClickWireResponse = structured(&clicks_two)?;
+    println!(
+        "source_of_truth=mcp_act_click edge=clicks_two after=ok:{} window_ms:{} inter_click_delay_ms:{} elapsed_ms:{}",
+        response.ok,
+        response.double_click_window_ms,
+        response.inter_click_delay_ms,
+        response.elapsed_ms
+    );
+    assert!(response.ok);
+    assert_timing_response(&response, 2);
+
+    println!("source_of_truth=mcp_act_click edge=clicks_three before=target:(0,0) clicks:3");
+    let clicks_three = client
+        .tools_call(
+            "act_click",
+            json!({"target": {"x": 0, "y": 0}, "clicks": 3}),
+        )
+        .await?;
+    let response: ActClickWireResponse = structured(&clicks_three)?;
+    println!(
+        "source_of_truth=mcp_act_click edge=clicks_three after=ok:{} window_ms:{} inter_click_delay_ms:{} elapsed_ms:{}",
+        response.ok,
+        response.double_click_window_ms,
+        response.inter_click_delay_ms,
+        response.elapsed_ms
+    );
+    assert!(response.ok);
+    assert_timing_response(&response, 3);
+    Ok(())
+}
+
+async fn call_act_click_error_edges(client: &mut StdioMcpClient) -> anyhow::Result<()> {
     println!("source_of_truth=mcp_act_click edge=extra_property before=junk:true");
     let extra = client
         .tools_call_error(
@@ -92,7 +147,20 @@ async fn act_click_schema_defaults_and_edges_fsv() -> anyhow::Result<()> {
         Some(error_codes::TOOL_PARAMS_INVALID)
     );
 
-    assert_malformed_element_id_rejected(&mut client).await?;
+    println!("source_of_truth=mcp_act_click edge=clicks_four before=clicks:4");
+    let clicks_four = client
+        .tools_call_error(
+            "act_click",
+            json!({"target": {"x": 12, "y": 34}, "clicks": 4}),
+        )
+        .await?;
+    println!("source_of_truth=mcp_act_click edge=clicks_four after={clicks_four}");
+    assert_eq!(
+        error_code(&clicks_four),
+        Some(error_codes::TOOL_PARAMS_INVALID)
+    );
+
+    assert_malformed_element_id_rejected(client).await?;
 
     println!("source_of_truth=mcp_act_click edge=modifier_rejected before=modifiers:[ctrl]");
     let modifier = client
@@ -106,10 +174,6 @@ async fn act_click_schema_defaults_and_edges_fsv() -> anyhow::Result<()> {
         error_code(&modifier),
         Some(error_codes::ACTION_BACKEND_UNAVAILABLE)
     );
-
-    assert!(client.shutdown().await?.success());
-    let logs = read_logs(log_dir.path())?;
-    assert_recording_log_readbacks(&logs)?;
     Ok(())
 }
 
@@ -142,7 +206,16 @@ struct ActClickWireResponse {
     ok: bool,
     used_invoke_pattern: bool,
     backend_used: String,
+    double_click_window_ms: u32,
+    inter_click_delay_ms: u32,
     elapsed_ms: u32,
+}
+
+fn assert_timing_response(response: &ActClickWireResponse, clicks: u8) {
+    assert!(response.double_click_window_ms >= 2);
+    assert!(response.inter_click_delay_ms < response.double_click_window_ms);
+    let max_total_ms = response.double_click_window_ms * u32::from(clicks);
+    assert!(response.elapsed_ms <= max_total_ms);
 }
 
 fn structured<T: DeserializeOwned>(resp: &Value) -> anyhow::Result<T> {
@@ -210,24 +283,100 @@ async fn assert_malformed_element_id_rejected(client: &mut StdioMcpClient) -> an
 
 fn assert_recording_log_readbacks(logs: &str) -> anyhow::Result<()> {
     let readbacks = recording_readbacks(logs)?;
+    assert_click_readback(
+        &readbacks,
+        "happy",
+        1,
+        2,
+        "mouse_move:screen(12,34):natural_fast:50>down:left>delay:0>up:left",
+    )?;
+    assert_click_readback(
+        &readbacks,
+        "clicks_two",
+        2,
+        4,
+        "mouse_move:screen(20,30):natural_fast:50>down:left>delay:0>up:left>down:left>delay:0>up:left",
+    )?;
+    assert_click_readback(
+        &readbacks,
+        "clicks_three",
+        3,
+        6,
+        "mouse_move:screen(0,0):natural_fast:50>down:left>delay:0>up:left>down:left>delay:0>up:left>down:left>delay:0>up:left",
+    )?;
+    Ok(())
+}
+
+fn assert_double_click_timing_cache_readback(logs: &str) -> anyhow::Result<()> {
+    let readback = json_log_fields(logs)?
+        .into_iter()
+        .find(|fields| {
+            fields.get("code").and_then(Value::as_str) == Some("M2_DOUBLE_CLICK_TIMING_CACHED")
+        })
+        .context("double-click timing cache readback missing")?;
+    let window_ms = readback
+        .get("window_ms")
+        .and_then(Value::as_u64)
+        .context("double-click timing readback missing window_ms")?;
+    let inter_click_delay_ms = readback
+        .get("inter_click_delay_ms")
+        .and_then(Value::as_u64)
+        .context("double-click timing readback missing inter_click_delay_ms")?;
+    let source = readback
+        .get("source")
+        .and_then(Value::as_str)
+        .context("double-click timing readback missing source")?;
+    println!(
+        "source_of_truth=daemon_log edge=double_click_cache after_window_ms={window_ms} after_inter_click_delay_ms={inter_click_delay_ms} source={source}"
+    );
+    assert!(inter_click_delay_ms < window_ms);
+    Ok(())
+}
+
+fn assert_click_readback(
+    readbacks: &[RecordingReadback],
+    edge: &str,
+    click_count: u64,
+    button_event_count: u64,
+    expected_sequence: &str,
+) -> anyhow::Result<()> {
     let readback = readbacks
         .iter()
         .find(|readback| {
-            readback.event_sequence
-                == "mouse_move:screen(12,34):natural_fast:50>down:left>delay:0>up:left"
-                && readback.new_event_count == 4
+            readback.event_sequence == expected_sequence
+                && readback.click_count == click_count
+                && readback.button_event_count == button_event_count
         })
-        .context("happy-path act_click recording readback missing expected sequence")?;
-    let mut events = readback.event_sequence.split('>');
-    let first = events.next().unwrap_or("<missing>");
+        .with_context(|| {
+            format!("{edge} act_click recording readback missing expected sequence")
+        })?;
+    let first = readback
+        .event_sequence
+        .split('>')
+        .next()
+        .unwrap_or("<missing>");
     let last = readback
         .event_sequence
         .rsplit('>')
         .next()
         .unwrap_or("<missing>");
     println!(
-        "source_of_truth=recording_log tool=act_click edge=happy after_event_count={} first={} last={} sequence={}",
-        readback.new_event_count, first, last, readback.event_sequence
+        "source_of_truth=recording_log tool=act_click edge={edge} after_click_count={} button_events={} new_event_count={} window_ms={} inter_click_delay_ms={} scheduled_total_ms={} first={} last={} sequence={}",
+        readback.click_count,
+        readback.button_event_count,
+        readback.new_event_count,
+        readback.double_click_window_ms,
+        readback.inter_click_delay_ms,
+        readback.scheduled_inter_click_total_ms,
+        first,
+        last,
+        readback.event_sequence
+    );
+    assert!(readback.inter_click_delay_ms < readback.double_click_window_ms);
+    assert_eq!(readback.button_event_count, click_count * 2);
+    assert!(
+        readback.scheduled_inter_click_total_ms
+            <= readback.double_click_window_ms * readback.click_count
     );
     Ok(())
 }
@@ -236,6 +385,11 @@ fn assert_recording_log_readbacks(logs: &str) -> anyhow::Result<()> {
 struct RecordingReadback {
     event_sequence: String,
     new_event_count: u64,
+    click_count: u64,
+    button_event_count: u64,
+    double_click_window_ms: u64,
+    inter_click_delay_ms: u64,
+    scheduled_inter_click_total_ms: u64,
 }
 
 fn read_logs(path: &std::path::Path) -> anyhow::Result<String> {
@@ -251,9 +405,7 @@ fn read_logs(path: &std::path::Path) -> anyhow::Result<String> {
 
 fn recording_readbacks(logs: &str) -> anyhow::Result<Vec<RecordingReadback>> {
     let mut readbacks = Vec::new();
-    for line in logs.lines().filter(|line| !line.trim().is_empty()) {
-        let value: Value = serde_json::from_str(line)?;
-        let fields = &value["fields"];
+    for fields in json_log_fields(logs)? {
         if fields.get("code").and_then(Value::as_str) != Some("M2_ACT_CLICK_RECORDING_READBACK") {
             continue;
         }
@@ -266,10 +418,44 @@ fn recording_readbacks(logs: &str) -> anyhow::Result<Vec<RecordingReadback>> {
             .get("new_event_count")
             .and_then(Value::as_u64)
             .context("recording readback missing new_event_count")?;
+        let click_count = fields
+            .get("click_count")
+            .and_then(Value::as_u64)
+            .context("recording readback missing click_count")?;
+        let button_event_count = fields
+            .get("button_event_count")
+            .and_then(Value::as_u64)
+            .context("recording readback missing button_event_count")?;
+        let double_click_window_ms = fields
+            .get("double_click_window_ms")
+            .and_then(Value::as_u64)
+            .context("recording readback missing double_click_window_ms")?;
+        let inter_click_delay_ms = fields
+            .get("inter_click_delay_ms")
+            .and_then(Value::as_u64)
+            .context("recording readback missing inter_click_delay_ms")?;
+        let scheduled_inter_click_total_ms = fields
+            .get("scheduled_inter_click_total_ms")
+            .and_then(Value::as_u64)
+            .context("recording readback missing scheduled_inter_click_total_ms")?;
         readbacks.push(RecordingReadback {
             event_sequence,
             new_event_count,
+            click_count,
+            button_event_count,
+            double_click_window_ms,
+            inter_click_delay_ms,
+            scheduled_inter_click_total_ms,
         });
     }
     Ok(readbacks)
+}
+
+fn json_log_fields(logs: &str) -> anyhow::Result<Vec<Value>> {
+    let mut fields = Vec::new();
+    for line in logs.lines().filter(|line| !line.trim().is_empty()) {
+        let value: Value = serde_json::from_str(line)?;
+        fields.push(value["fields"].clone());
+    }
+    Ok(fields)
 }

@@ -15,7 +15,7 @@ use std::{
 
 use synapse_action::{
     ActionEmitter, ActionEmitterSnapshotHandle, ActionHandle, ActionStateSnapshot,
-    RELEASE_ALL_HANDLE, RecordingBackend,
+    RELEASE_ALL_HANDLE, RecordingBackend, initialize_double_click_timing_cache,
 };
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -91,6 +91,14 @@ impl M2State {
         shutdown_reason: &'static str,
         connection_closed_cancel: Option<CancellationToken>,
     ) -> Self {
+        let double_click_timing = initialize_double_click_timing_cache();
+        tracing::info!(
+            code = "M2_DOUBLE_CLICK_TIMING_CACHED",
+            window_ms = double_click_timing.window_ms,
+            inter_click_delay_ms = double_click_timing.inter_click_delay_ms,
+            source = double_click_timing.source,
+            "source_of_truth=double_click_timing after_cache_readback"
+        );
         let recording =
             recording_backend_enabled(recording_backend).then(|| Arc::new(RecordingBackend::new()));
         if tokio::runtime::Handle::try_current().is_ok() {

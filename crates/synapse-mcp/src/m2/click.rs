@@ -4,12 +4,14 @@ use rmcp::ErrorData;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use synapse_action::{
-    ActionBackend, ActionError, ActionHandle, EmitState, RecordedInput, RecordingBackend,
+    ActionBackend, ActionError, ActionHandle, DoubleClickTiming, EmitState, RecordedInput,
+    RecordingBackend, cached_double_click_timing,
 };
 use synapse_core::{
     Action, AimCurve, AimNaturalParams, Backend, ButtonAction, ElementId, MouseButton, MouseTarget,
     Point, error_codes,
 };
+use tokio::time::{Duration, sleep};
 
 use crate::m1::mcp_error;
 
@@ -84,6 +86,8 @@ pub struct ActClickResponse {
     pub ok: bool,
     pub used_invoke_pattern: bool,
     pub backend_used: String,
+    pub double_click_window_ms: u32,
+    pub inter_click_delay_ms: u32,
     pub elapsed_ms: u32,
 }
 
@@ -94,6 +98,7 @@ pub async fn act_click_with_handle(
 ) -> Result<ActClickResponse, ErrorData> {
     validate_click_params(&params)?;
     let started = Instant::now();
+    let double_click_timing = cached_double_click_timing();
     let target = mouse_target(&params)?;
     let mut actions = Vec::with_capacity(usize::from(params.clicks) + 1);
     actions.push(Action::MouseMove {
@@ -112,47 +117,102 @@ pub async fn act_click_with_handle(
     }
 
     if let Some(recording) = recording {
-        execute_recording(&recording, &actions)?;
+        execute_recording(&recording, &actions, params.clicks, double_click_timing).await?;
     } else {
-        for action in actions {
-            handle
-                .execute(action)
-                .await
-                .map_err(|error| action_error_to_mcp(&error))?;
-        }
+        execute_actor_actions(handle, actions, double_click_timing).await?;
     }
 
     Ok(ActClickResponse {
         ok: true,
         used_invoke_pattern: false,
         backend_used: backend_used_name(params.backend).to_owned(),
+        double_click_window_ms: double_click_timing.window_ms,
+        inter_click_delay_ms: double_click_timing.inter_click_delay_ms,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     })
 }
 
-fn execute_recording(recording: &RecordingBackend, actions: &[Action]) -> Result<(), ErrorData> {
+async fn execute_actor_actions(
+    handle: ActionHandle,
+    actions: Vec<Action>,
+    timing: DoubleClickTiming,
+) -> Result<(), ErrorData> {
+    let action_count = actions.len();
+    for (action_index, action) in actions.into_iter().enumerate() {
+        handle
+            .execute(action)
+            .await
+            .map_err(|error| action_error_to_mcp(&error))?;
+        maybe_sleep_between_clicks(action_index, action_count, timing).await;
+    }
+    Ok(())
+}
+
+async fn execute_recording(
+    recording: &RecordingBackend,
+    actions: &[Action],
+    click_count: u8,
+    timing: DoubleClickTiming,
+) -> Result<(), ErrorData> {
     let before_events = recording.events();
     let before_event_count = before_events.len();
     let mut emit_state = EmitState::new();
-    for action in actions {
+    let action_count = actions.len();
+    for (action_index, action) in actions.iter().enumerate() {
         recording
             .execute(action, &mut emit_state)
             .map_err(|error| action_error_to_mcp(&error))?;
+        maybe_sleep_between_clicks(action_index, action_count, timing).await;
     }
     let after_events = recording.events();
     let new_events = &after_events[before_event_count..];
     let event_sequence = event_sequence(new_events);
+    let button_event_count = mouse_button_event_count(new_events);
+    let scheduled_inter_click_total_ms =
+        u32::from(click_count.saturating_sub(1)) * timing.inter_click_delay_ms;
     tracing::info!(
         code = "M2_ACT_CLICK_RECORDING_READBACK",
         kind = "act_click",
         before_event_count,
         after_event_count = after_events.len(),
         new_event_count = new_events.len(),
+        click_count,
+        button_event_count,
+        double_click_window_ms = timing.window_ms,
+        inter_click_delay_ms = timing.inter_click_delay_ms,
+        scheduled_inter_click_total_ms,
         event_sequence,
         ?new_events,
         "source_of_truth=recording_backend tool=act_click after_events_readback"
     );
     Ok(())
+}
+
+async fn maybe_sleep_between_clicks(
+    action_index: usize,
+    action_count: usize,
+    timing: DoubleClickTiming,
+) {
+    if should_delay_between_clicks(action_index, action_count) {
+        let delay = Duration::from_millis(u64::from(timing.inter_click_delay_ms));
+        sleep(delay).await;
+    }
+}
+
+const fn should_delay_between_clicks(action_index: usize, action_count: usize) -> bool {
+    action_index >= 1 && action_index + 1 < action_count
+}
+
+fn mouse_button_event_count(events: &[RecordedInput]) -> usize {
+    events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                RecordedInput::MouseButtonDown { .. } | RecordedInput::MouseButtonUp { .. }
+            )
+        })
+        .count()
 }
 
 fn event_sequence(events: &[RecordedInput]) -> String {

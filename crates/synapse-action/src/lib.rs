@@ -1,6 +1,7 @@
 #![allow(unsafe_code)]
 
 pub mod backend;
+pub mod click_timing;
 pub mod clipboard;
 pub mod curve;
 pub mod dynamics;
@@ -17,6 +18,10 @@ pub use backend::{
     recording::{RecordedInput, RecordingBackend},
     resolve_backend,
     unavailable::HardwareUnavailableBackend,
+};
+pub use click_timing::{
+    DoubleClickTiming, cached_double_click_timing, initialize_double_click_timing_cache,
+    inter_click_delay_ms_for_window,
 };
 pub use clipboard::{
     ClipboardFormat, clear as clear_clipboard, read_text as read_clipboard_text,

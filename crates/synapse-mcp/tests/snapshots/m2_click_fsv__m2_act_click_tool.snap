@@ -143,6 +143,8 @@ expression: projection
       "ok",
       "used_invoke_pattern",
       "backend_used",
+      "double_click_window_ms",
+      "inter_click_delay_ms",
       "elapsed_ms"
     ],
     "title": "ActClickResponse",

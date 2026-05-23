@@ -302,7 +302,17 @@ expression: schemas
         "backend_used": {
           "type": "string"
         },
+        "double_click_window_ms": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "elapsed_ms": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "inter_click_delay_ms": {
           "format": "uint32",
           "minimum": 0,
           "type": "integer"
@@ -318,6 +328,8 @@ expression: schemas
         "ok",
         "used_invoke_pattern",
         "backend_used",
+        "double_click_window_ms",
+        "inter_click_delay_ms",
         "elapsed_ms"
       ],
       "title": "ActClickResponse",
