@@ -4,6 +4,9 @@ use crate::{ActionError, EmitState};
 
 #[cfg(windows)]
 pub mod software;
+#[cfg(not(windows))]
+#[path = "software_non_windows.rs"]
+pub mod software;
 
 pub trait ActionBackend: Send + Sync {
     /// Executes one action against a concrete backend while updating emitter state.
