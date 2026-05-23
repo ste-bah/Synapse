@@ -14,12 +14,17 @@ path = "src/main.rs"
 anyhow.workspace = true
 clap.workspace = true
 rmcp.workspace = true
+serde_json.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
 synapse-test-utils = { version = "0.1.0", path = "../synapse-test-utils" }
 
 [lints]

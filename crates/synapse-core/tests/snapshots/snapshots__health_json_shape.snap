@@ -1,0 +1,11 @@
+---
+source: crates/synapse-core/tests/snapshots.rs
+expression: "Health\n{\n    ok: true, version: \"0.1.0\".to_owned(), build: \"dev\".to_owned(), uptime_s:\n    0, subsystems: BTreeMap::new(),\n}"
+---
+{
+  "ok": true,
+  "version": "0.1.0",
+  "build": "dev",
+  "uptime_s": 0,
+  "subsystems": {}
+}

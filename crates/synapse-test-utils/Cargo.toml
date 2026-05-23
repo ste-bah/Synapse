@@ -8,6 +8,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
