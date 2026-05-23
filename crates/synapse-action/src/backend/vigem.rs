@@ -773,6 +773,7 @@ const fn action_kind(action: &Action) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
     use synapse_core::{AimCurve, Backend, MouseTarget, Point};
 
     #[test]
