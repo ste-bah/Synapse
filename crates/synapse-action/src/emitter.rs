@@ -623,10 +623,10 @@ impl ActionEmitter {
     }
 
     /// Drives a `ReleaseAll` through the resolved backend (so the production
-    /// path actually emits SendInput KeyUps for every held key/button), aborts
-    /// in-flight auto-release timers, and logs the drained snapshot. The
-    /// blocking backend work runs on `spawn_blocking` so the runtime stays
-    /// responsive.
+    /// path actually emits `SendInput` `KeyUp`s for every held key/button),
+    /// aborts in-flight auto-release timers, and logs the drained snapshot.
+    /// The blocking backend work runs on `spawn_blocking` so the runtime
+    /// stays responsive.
     async fn do_release_all(&mut self, reason: &'static str) -> ActionResult<()> {
         let before = self.snapshot();
         let mut held_pad_ids: Vec<_> = before.pad_state.keys().copied().collect();
