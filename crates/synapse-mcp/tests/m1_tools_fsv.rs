@@ -11,7 +11,7 @@ static MCP_FSV_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[tokio::test]
-async fn tools_list_contains_exact_m1_surface_and_closed_schemas() -> anyhow::Result<()> {
+async fn tools_list_contains_m1_surface_and_closed_schemas() -> anyhow::Result<()> {
     let _guard = MCP_FSV_LOCK.lock().await;
     let mut client = StdioMcpClient::launch_and_init_with_env(None, SYNTHETIC_ENV).await?;
     let resp = client.tools_list().await?;
@@ -29,20 +29,28 @@ async fn tools_list_contains_exact_m1_surface_and_closed_schemas() -> anyhow::Re
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     names.sort();
+    let m1_names = [
+        "find",
+        "health",
+        "observe",
+        "read_text",
+        "set_capture_target",
+        "set_perception_mode",
+    ];
     println!("source_of_truth=tools_list edge=m1_names after={names:?}");
-    assert_eq!(
-        names,
-        [
-            "find",
-            "health",
-            "observe",
-            "read_text",
-            "set_capture_target",
-            "set_perception_mode"
-        ]
-    );
+    for name in m1_names {
+        assert!(names.iter().any(|tool_name| tool_name == name));
+    }
 
-    for tool in tools {
+    let m1_tools = tools
+        .iter()
+        .filter(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| m1_names.contains(&name))
+        })
+        .collect::<Vec<_>>();
+    for tool in &m1_tools {
         let name = tool
             .get("name")
             .and_then(Value::as_str)
@@ -54,10 +62,10 @@ async fn tools_list_contains_exact_m1_surface_and_closed_schemas() -> anyhow::Re
     }
     println!(
         "source_of_truth=tools_list edge=schema_closed after=checked_tools:{}",
-        tools.len()
+        m1_tools.len()
     );
 
-    let projection = tools
+    let projection = m1_tools
         .iter()
         .map(|tool| {
             json!({

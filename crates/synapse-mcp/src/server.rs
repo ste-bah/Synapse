@@ -18,7 +18,10 @@ use crate::{
         SharedM1State, assemble_observation, empty_input_schema, find_in_state, mcp_error,
         read_text_in_state, set_capture_target_in_state, set_perception_mode_in_state,
     },
-    m2::{SharedM2State, shared_m2_state_from_env},
+    m2::{
+        ActClickParams, ActClickResponse, SharedM2State, act_click_with_handle,
+        shared_m2_state_from_env,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -69,6 +72,18 @@ impl SynapseService {
         } else {
             "Synapse M1 perception MCP server with M2 action scaffold"
         }
+    }
+
+    fn m2_action_handle(&self) -> Result<synapse_action::ActionHandle, ErrorData> {
+        self.m2_state
+            .lock()
+            .map(|state| state.emitter_handle.clone())
+            .map_err(|_err| {
+                mcp_error(
+                    synapse_core::error_codes::OBSERVE_INTERNAL,
+                    "M2 service state lock poisoned",
+                )
+            })
     }
 }
 
@@ -158,6 +173,20 @@ impl SynapseService {
         );
         let mut state = self.m1_state()?;
         set_perception_mode_in_state(&mut state, &params.0).map(Json)
+    }
+
+    #[tool(description = "Click a screen coordinate or UI Automation element")]
+    pub async fn act_click(
+        &self,
+        params: Parameters<ActClickParams>,
+    ) -> Result<Json<ActClickResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "act_click",
+            "tool.invocation kind=act_click"
+        );
+        let handle = self.m2_action_handle()?;
+        act_click_with_handle(handle, params.0).await.map(Json)
     }
 }
 

@@ -1,0 +1,150 @@
+---
+source: crates/synapse-mcp/tests/m2_click_fsv.rs
+expression: projection
+---
+{
+  "description": "Click a screen coordinate or UI Automation element",
+  "inputSchema": {
+    "$defs": {
+      "ActClickElementTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "element_id": {
+            "$ref": "#/$defs/ElementId"
+          }
+        },
+        "required": [
+          "element_id"
+        ],
+        "type": "object"
+      },
+      "ActClickPointTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "y": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "ActClickTarget": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ActClickElementTarget"
+          },
+          {
+            "$ref": "#/$defs/ActClickPointTarget"
+          }
+        ]
+      },
+      "Backend": {
+        "enum": [
+          "software",
+          "vigem",
+          "hardware",
+          "auto"
+        ],
+        "type": "string"
+      },
+      "ClickCurve": {
+        "enum": [
+          "natural",
+          "instant",
+          "linear",
+          "ease_in_out"
+        ],
+        "type": "string"
+      },
+      "ClickModifier": {
+        "enum": [
+          "ctrl",
+          "shift",
+          "alt",
+          "super"
+        ],
+        "type": "string"
+      },
+      "ElementId": {
+        "type": "string"
+      },
+      "MouseButton": {
+        "enum": [
+          "left",
+          "right",
+          "middle",
+          "x1",
+          "x2"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "backend": {
+        "$ref": "#/$defs/Backend",
+        "default": "auto"
+      },
+      "button": {
+        "$ref": "#/$defs/MouseButton",
+        "default": "left"
+      },
+      "clicks": {
+        "default": 1,
+        "format": "uint8",
+        "maximum": 3,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "curve": {
+        "$ref": "#/$defs/ClickCurve",
+        "default": "natural"
+      },
+      "duration_ms": {
+        "default": 50,
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "modifiers": {
+        "items": {
+          "$ref": "#/$defs/ClickModifier"
+        },
+        "type": "array"
+      },
+      "target": {
+        "$ref": "#/$defs/ActClickTarget"
+      },
+      "use_invoke_pattern": {
+        "default": true,
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "target"
+    ],
+    "title": "ActClickParams",
+    "type": "object"
+  },
+  "name": "act_click",
+  "outputSchemaRoot": {
+    "additionalProperties": false,
+    "required": [
+      "ok",
+      "used_invoke_pattern",
+      "backend_used",
+      "elapsed_ms"
+    ],
+    "title": "ActClickResponse",
+    "type": "object"
+  }
+}

@@ -19,6 +19,8 @@ use synapse_action::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+pub use click::{ActClickParams, ActClickResponse, act_click_with_handle};
+
 const RECORDING_BACKEND_ENV: &str = "SYNAPSE_MCP_RECORDING_BACKEND";
 
 pub type SharedM2State = Arc<Mutex<M2State>>;
