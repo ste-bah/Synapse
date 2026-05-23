@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::Instant,
@@ -16,6 +16,9 @@ use synapse_core::{Point, Rect, error_codes};
 
 pub const CAPTURE_CHANNEL_CAPACITY: usize = 2;
 pub const FRAMES_DROPPED_METRIC: &str = "synapse_capture_frames_dropped_total";
+const THREAD_PRIORITY_UNKNOWN: i32 = i32::MIN;
+const THREAD_PRIORITY_UNSUPPORTED: i32 = i32::MIN + 1;
+const THREAD_PRIORITY_TIME_CRITICAL: i32 = i32::MAX;
 
 #[cfg(windows)]
 pub type D3d11Texture = windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
@@ -193,10 +196,21 @@ impl CaptureError {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CaptureStats {
     frames_captured: AtomicU64,
     frames_dropped: AtomicU64,
+    thread_priority: AtomicI32,
+}
+
+impl Default for CaptureStats {
+    fn default() -> Self {
+        Self {
+            frames_captured: AtomicU64::new(0),
+            frames_dropped: AtomicU64::new(0),
+            thread_priority: AtomicI32::new(THREAD_PRIORITY_UNKNOWN),
+        }
+    }
 }
 
 impl CaptureStats {
@@ -210,6 +224,11 @@ impl CaptureStats {
         self.frames_dropped.load(Ordering::Relaxed)
     }
 
+    #[must_use]
+    pub fn thread_priority(&self) -> CaptureThreadPriority {
+        decode_thread_priority(self.thread_priority.load(Ordering::Relaxed))
+    }
+
     fn increment_captured(&self) {
         self.frames_captured.fetch_add(1, Ordering::Relaxed);
     }
@@ -218,6 +237,11 @@ impl CaptureStats {
         self.frames_dropped.fetch_add(1, Ordering::Relaxed);
         synapse_telemetry::metrics::counter!(FRAMES_DROPPED_METRIC).increment(1);
     }
+
+    fn set_thread_priority(&self, priority: CaptureThreadPriority) {
+        self.thread_priority
+            .store(encode_thread_priority(priority), Ordering::Relaxed);
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -225,6 +249,7 @@ pub enum CaptureThreadPriority {
     TimeCritical,
     Other(i32),
     Unsupported,
+    Unknown,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -432,6 +457,12 @@ pub fn init_process_dpi_awareness() -> Result<DpiAwarenessStatus, CaptureError> 
 
 #[must_use]
 #[allow(clippy::missing_const_for_fn)]
+pub fn is_per_monitor_v2_dpi_aware() -> bool {
+    is_per_monitor_v2_dpi_aware_impl()
+}
+
+#[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn current_thread_priority() -> CaptureThreadPriority {
     current_thread_priority_impl()
 }
@@ -449,6 +480,7 @@ fn run_capture_thread(
     ctx: CaptureThreadContext,
 ) -> Result<(), CaptureError> {
     set_capture_thread_priority()?;
+    ctx.stats.set_thread_priority(current_thread_priority());
     match config.backend_preference {
         CaptureBackendPreference::Auto => match run_graphics_capture(config.clone(), ctx.clone()) {
             Ok(()) => Ok(()),
@@ -504,6 +536,24 @@ const fn should_fallback_to_dxgi(preference: CaptureBackendPreference, err: &Cap
             CaptureError::GraphicsApiUnsupported { .. }
         )
     )
+}
+
+const fn encode_thread_priority(priority: CaptureThreadPriority) -> i32 {
+    match priority {
+        CaptureThreadPriority::TimeCritical => THREAD_PRIORITY_TIME_CRITICAL,
+        CaptureThreadPriority::Unsupported => THREAD_PRIORITY_UNSUPPORTED,
+        CaptureThreadPriority::Unknown => THREAD_PRIORITY_UNKNOWN,
+        CaptureThreadPriority::Other(value) => value,
+    }
+}
+
+const fn decode_thread_priority(value: i32) -> CaptureThreadPriority {
+    match value {
+        THREAD_PRIORITY_TIME_CRITICAL => CaptureThreadPriority::TimeCritical,
+        THREAD_PRIORITY_UNSUPPORTED => CaptureThreadPriority::Unsupported,
+        THREAD_PRIORITY_UNKNOWN => CaptureThreadPriority::Unknown,
+        other => CaptureThreadPriority::Other(other),
+    }
 }
 
 fn push_frame(ctx: &CaptureThreadContext, frame: CapturedFrame) -> Result<(), CaptureError> {
@@ -591,6 +641,11 @@ fn init_process_dpi_awareness_impl() -> Result<DpiAwarenessStatus, CaptureError>
 }
 
 #[cfg(not(windows))]
+const fn is_per_monitor_v2_dpi_aware_impl() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
 const fn current_thread_priority_impl() -> CaptureThreadPriority {
     CaptureThreadPriority::Unsupported
 }
@@ -636,6 +691,11 @@ fn init_process_dpi_awareness_impl() -> Result<DpiAwarenessStatus, CaptureError>
 }
 
 #[cfg(windows)]
+fn is_per_monitor_v2_dpi_aware_impl() -> bool {
+    windows_impl::is_per_monitor_v2_dpi_aware()
+}
+
+#[cfg(windows)]
 fn current_thread_priority_impl() -> CaptureThreadPriority {
     windows_impl::current_thread_priority()
 }
@@ -662,7 +722,10 @@ mod windows_impl {
             GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
         },
         UI::{
-            HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext},
+            HiDpi::{
+                AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                GetThreadDpiAwarenessContext, SetProcessDpiAwarenessContext,
+            },
             WindowsAndMessaging::IsWindow,
         },
     };
@@ -808,6 +871,16 @@ mod windows_impl {
                 detail: err.to_string(),
             }),
         }
+    }
+
+    pub fn is_per_monitor_v2_dpi_aware() -> bool {
+        unsafe {
+            AreDpiAwarenessContextsEqual(
+                GetThreadDpiAwarenessContext(),
+                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            )
+        }
+        .as_bool()
     }
 
     pub fn current_thread_priority() -> CaptureThreadPriority {
@@ -994,6 +1067,7 @@ mod tests {
     use super::*;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(not(windows))]
     #[test]
@@ -1013,6 +1087,56 @@ mod tests {
         for seq in 0..1_000 {
             let _frame = CapturedFrame::synthetic(seq, 16, 16);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn captured_frame_drop_loop_queries_d3d_texture() -> Result<(), CaptureError> {
+        use windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC;
+
+        let _guard = CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|err| panic!("capture lock poisoned: {err}"));
+        let handle = spawn_capture_loop(CaptureConfig {
+            min_update_interval_ms: 16,
+            dirty_region_only: false,
+            ..CaptureConfig::default()
+        })?;
+        let rx = handle.receiver();
+        let mut queried = 0_u32;
+
+        for _ in 0..1_000 {
+            let frame = rx.recv_timeout(Duration::from_secs(5)).map_err(|err| {
+                CaptureError::ThreadFailed {
+                    detail: err.to_string(),
+                }
+            })?;
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            unsafe {
+                frame.texture.get().GetDesc(std::ptr::addr_of_mut!(desc));
+            }
+            if queried == 0 || queried == 999 {
+                println!(
+                    "d3d_query frame_seq={} desc_width={} desc_height={} frame_width={} frame_height={}",
+                    frame.frame_seq, desc.Width, desc.Height, frame.width, frame.height
+                );
+            }
+            assert_eq!(desc.Width, frame.width);
+            assert_eq!(desc.Height, frame.height);
+            queried = queried.saturating_add(1);
+        }
+
+        let stats = handle.stats();
+        println!(
+            "after d3d_drop_loop queried={} captured={} dropped={} priority={:?}",
+            queried,
+            stats.frames_captured(),
+            stats.frames_dropped(),
+            stats.thread_priority()
+        );
+        handle.stop()?;
+        assert_eq!(queried, 1_000);
+        Ok(())
     }
 
     #[test]
@@ -1115,8 +1239,12 @@ mod tests {
 
     #[test]
     fn capture_channel_capacity_is_exactly_two_and_drops_oldest() -> Result<(), CaptureError> {
+        let _guard = CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|err| panic!("capture lock poisoned: {err}"));
         let handle = spawn_capture_loop(CaptureConfig {
             min_update_interval_ms: 1,
+            dirty_region_only: false,
             ..CaptureConfig::default()
         })?;
         let stats = handle.stats();
@@ -1126,7 +1254,12 @@ mod tests {
             stats.frames_dropped(),
             handle.receiver().len()
         );
-        thread::sleep(Duration::from_millis(40));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while std::time::Instant::now() < deadline
+            && (stats.frames_captured() <= 2 || stats.frames_dropped() == 0)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
 
         println!(
             "after slow_consumer captured={} dropped={} channel_len={}",
@@ -1138,6 +1271,28 @@ mod tests {
         assert!(stats.frames_dropped() > 0);
         assert_eq!(CAPTURE_CHANNEL_CAPACITY, 2);
         assert!(handle.receiver().len() <= CAPTURE_CHANNEL_CAPACITY);
+        handle.stop()
+    }
+
+    #[test]
+    fn capture_thread_priority_is_recorded() -> Result<(), CaptureError> {
+        let _guard = CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|err| panic!("capture lock poisoned: {err}"));
+        let handle = spawn_capture_loop(CaptureConfig {
+            min_update_interval_ms: 1,
+            ..CaptureConfig::default()
+        })?;
+        let stats = handle.stats();
+        println!("before priority_readback={:?}", stats.thread_priority());
+        thread::sleep(Duration::from_millis(20));
+        let priority = stats.thread_priority();
+        println!("after priority_readback={priority:?}");
+        if cfg!(windows) {
+            assert_eq!(priority, CaptureThreadPriority::TimeCritical);
+        } else {
+            assert_eq!(priority, CaptureThreadPriority::Unsupported);
+        }
         handle.stop()
     }
 
@@ -1178,6 +1333,9 @@ mod tests {
 
     #[test]
     fn switching_capture_target_stops_previous_session() -> Result<(), CaptureError> {
+        let _guard = CAPTURE_LOCK
+            .lock()
+            .unwrap_or_else(|err| panic!("capture lock poisoned: {err}"));
         let mut controller = CaptureController::new();
         assert_eq!(controller.switch_to(CaptureConfig::default())?, 1);
         let first_stop = controller.active().map_or_else(
@@ -1224,6 +1382,21 @@ mod tests {
             current_thread_priority(),
             CaptureThreadPriority::Unsupported
         );
+        Ok(())
+    }
+
+    #[test]
+    fn dpi_awareness_readback_matches_platform() -> Result<(), CaptureError> {
+        let before = is_per_monitor_v2_dpi_aware();
+        let status = init_process_dpi_awareness()?;
+        let after = is_per_monitor_v2_dpi_aware();
+        println!("dpi_readback before={before} status={status:?} after={after}");
+        if cfg!(windows) {
+            assert!(after);
+        } else {
+            assert_eq!(status, DpiAwarenessStatus::Unsupported);
+            assert!(!after);
+        }
         Ok(())
     }
 }
