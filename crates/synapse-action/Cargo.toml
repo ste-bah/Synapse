@@ -33,6 +33,10 @@ tracing-subscriber.workspace = true
 name = "action_curve_step_calc_natural"
 harness = false
 
+[[bench]]
+name = "action_recording_round_trip"
+harness = false
+
 [lints.rust]
 unsafe_code = "allow"
 unused = { level = "warn", priority = -1 }
