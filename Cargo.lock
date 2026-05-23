@@ -3139,8 +3139,10 @@ name = "synapse-test-utils"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "regex",
  "serde",
  "serde_json",
+ "synapse-a11y",
  "synapse-core",
  "tempfile",
  "tokio",
