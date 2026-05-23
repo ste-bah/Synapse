@@ -2,6 +2,8 @@ use synapse_core::{Action, Backend};
 
 use crate::{ActionError, EmitState};
 
+#[cfg(any(windows, test))]
+pub(crate) mod mouse_coordinates;
 pub mod recording;
 #[cfg(windows)]
 pub mod software;

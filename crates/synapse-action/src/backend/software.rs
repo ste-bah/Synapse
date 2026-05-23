@@ -5,16 +5,26 @@ use synapse_core::{
     Action, AimStyle, AimTarget, ButtonAction, ComboInput, Key, KeyCode, KeystrokeDynamics,
     MouseButton, MouseTarget, Point,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-    KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_HWHEEL, MOUSEEVENTF_MOVE, MOUSEEVENTF_WHEEL,
-    MOUSEINPUT, SendInput, VIRTUAL_KEY,
+use windows::Win32::{
+    Foundation::POINT as WinPoint,
+    UI::{
+        Input::KeyboardAndMouse::{
+            INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+            KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE,
+            MOUSEEVENTF_HWHEEL, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEEVENTF_WHEEL,
+            MOUSEINPUT, SendInput, VIRTUAL_KEY,
+        },
+        WindowsAndMessaging::{
+            GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+            SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+        },
+    },
 };
 
+use super::mouse_coordinates::{VirtualDesktop, normalize_absolute_mouse_point};
 use super::text_dispatch::{TextDispatchInput, text_dispatch_plan};
 use crate::{ActionBackend, ActionError, EmitState, sample_curve};
 
-const CURVE_BATCH_STEPS: usize = 50;
 const WHEEL_DELTA: i32 = 120;
 
 #[derive(Debug, Default)]
@@ -28,18 +38,22 @@ impl SoftwareBackend {
     }
 }
 
-/// Reads the current software cursor position from the OS cursor backend.
+/// Reads the current software cursor position in Win32 screen coordinates.
 ///
 /// # Errors
 ///
-/// Returns `ActionError::BackendUnavailable` when the cursor backend cannot be
-/// initialized or the OS cursor location cannot be read.
+/// Returns `ActionError::BackendUnavailable` when the OS cursor location cannot
+/// be read from the active input desktop.
 pub fn cursor_position() -> Result<Point, ActionError> {
-    let enigo = enigo()?;
-    let (x, y) = enigo
-        .location()
-        .map_err(enigo_error("read cursor position"))?;
-    Ok(Point { x, y })
+    let mut point = WinPoint { x: 0, y: 0 };
+    // SAFETY: `point` is a valid writable POINT for the duration of the call.
+    unsafe { GetCursorPos(&raw mut point) }.map_err(|err| ActionError::BackendUnavailable {
+        detail: format!("GetCursorPos failed: {err}"),
+    })?;
+    Ok(Point {
+        x: point.x,
+        y: point.y,
+    })
 }
 
 impl ActionBackend for SoftwareBackend {
@@ -174,26 +188,22 @@ fn mouse_move(target: &MouseTarget) -> Result<(), ActionError> {
                 .to_owned(),
         });
     };
-    let current = cursor_position()?;
-    mouse_move_relative_i32(point.x - current.x, point.y - current.y)
+    send_absolute_mouse_move(*point, "absolute mouse move")
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_move_relative"))]
 fn mouse_move_relative(dx: f32, dy: f32) -> Result<(), ActionError> {
     #[allow(clippy::cast_possible_truncation)]
     let rounded = (dx.round() as i32, dy.round() as i32);
-    mouse_move_relative_i32(rounded.0, rounded.1)
-}
-
-fn mouse_move_relative_i32(dx: i32, dy: i32) -> Result<(), ActionError> {
-    if dx == 0 && dy == 0 {
-        return send_input_batch(&[], "relative mouse move");
+    if rounded.0 == 0 && rounded.1 == 0 {
+        return Ok(());
     }
-    let inputs: Vec<_> = curve_steps(dx, dy)
-        .into_iter()
-        .map(|(step_x, step_y)| mouse_input(step_x, step_y, 0, MOUSEEVENTF_MOVE))
-        .collect();
-    send_input_batch(&inputs, "relative mouse move")
+    let current = cursor_position()?;
+    let target = Point {
+        x: current.x.saturating_add(rounded.0),
+        y: current.y.saturating_add(rounded.1),
+    };
+    send_absolute_mouse_move(target, "relative absolute mouse move")
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_button"))]
@@ -243,10 +253,7 @@ fn mouse_drag(
     duration_ms: u32,
     state: &mut EmitState,
 ) -> Result<(), ActionError> {
-    let mut enigo = enigo()?;
-    enigo
-        .move_mouse(from.x, from.y, enigo::Coordinate::Abs)
-        .map_err(enigo_error("move to drag origin"))?;
+    send_absolute_mouse_move(from, "drag origin absolute mouse move")?;
     mouse_button(button, ButtonAction::Down, 0, state)?;
     mouse_move_curve(from, to, curve, duration_ms)?;
     mouse_button(button, ButtonAction::Up, 0, state)
@@ -259,27 +266,18 @@ fn mouse_move_curve(
     duration_ms: u32,
 ) -> Result<(), ActionError> {
     let samples = sample_curve(curve, from, to, duration_ms, None);
+    let desktop = virtual_desktop()?;
     let mut inputs = Vec::with_capacity(samples.len().saturating_sub(1));
-    let mut previous = from;
     for point in samples.into_iter().skip(1) {
-        inputs.push(mouse_input(
-            point.x.saturating_sub(previous.x),
-            point.y.saturating_sub(previous.y),
-            0,
-            MOUSEEVENTF_MOVE,
-        ));
-        previous = point;
+        inputs.push(absolute_mouse_input_for_desktop(point, desktop));
     }
-    send_input_batch(&inputs, "drag curve mouse move")
+    send_input_batch(&inputs, "drag curve absolute mouse move")
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_scroll"))]
 fn mouse_scroll(dy: i32, dx: i32, at: Option<Point>) -> Result<(), ActionError> {
     if let Some(point) = at {
-        let mut enigo = enigo()?;
-        enigo
-            .move_mouse(point.x, point.y, enigo::Coordinate::Abs)
-            .map_err(enigo_error("move to scroll point"))?;
+        send_absolute_mouse_move(point, "scroll point absolute mouse move")?;
     }
     let mut inputs = Vec::with_capacity(2);
     if dy != 0 {
@@ -437,20 +435,37 @@ const fn enigo_button(button: MouseButton) -> EnigoButton {
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-fn curve_steps(dx: i32, dy: i32) -> Vec<(i32, i32)> {
-    let mut steps = Vec::with_capacity(CURVE_BATCH_STEPS);
-    let mut prev_x = 0;
-    let mut prev_y = 0;
-    for index in 1..=CURVE_BATCH_STEPS {
-        let progress = index as f32 / CURVE_BATCH_STEPS as f32;
-        let x = (dx as f32 * progress).round() as i32;
-        let y = (dy as f32 * progress).round() as i32;
-        steps.push((x - prev_x, y - prev_y));
-        prev_x = x;
-        prev_y = y;
-    }
-    steps
+fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), ActionError> {
+    let input = absolute_mouse_input(point)?;
+    send_input_batch(&[input], detail)
+}
+
+fn absolute_mouse_input(point: Point) -> Result<INPUT, ActionError> {
+    let desktop = virtual_desktop()?;
+    Ok(absolute_mouse_input_for_desktop(point, desktop))
+}
+
+fn absolute_mouse_input_for_desktop(point: Point, desktop: VirtualDesktop) -> INPUT {
+    let normalized = normalize_absolute_mouse_point(point, desktop);
+    mouse_input(
+        normalized.dx,
+        normalized.dy,
+        0,
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+    )
+}
+
+fn virtual_desktop() -> Result<VirtualDesktop, ActionError> {
+    // SAFETY: GetSystemMetrics is read-only for these virtual-screen metrics.
+    let left = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let top = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    VirtualDesktop::new(left, top, width, height).ok_or_else(|| ActionError::BackendUnavailable {
+        detail: format!(
+            "invalid virtual desktop metrics left={left} top={top} width={width} height={height}"
+        ),
+    })
 }
 
 const fn keyboard_input(scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
