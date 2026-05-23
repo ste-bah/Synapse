@@ -24,8 +24,9 @@ use crate::{
         read_text_in_state, set_capture_target_in_state, set_perception_mode_in_state,
     },
     m2::{
-        ActClickParams, ActClickResponse, ActTypeParams, ActTypeResponse, SharedM2State,
-        act_click_with_handle, act_type_with_handle, shared_m2_state_from_env,
+        ActClickParams, ActClickResponse, ActPressParams, ActPressResponse, ActTypeParams,
+        ActTypeResponse, SharedM2State, act_click_with_handle, act_press_with_handle,
+        act_type_with_handle, shared_m2_state_from_env,
     },
 };
 
@@ -220,6 +221,22 @@ impl SynapseService {
         );
         let (handle, recording) = self.m2_action_context()?;
         act_type_with_handle(handle, recording, params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(description = "Press a keyboard key or ordered chord")]
+    pub async fn act_press(
+        &self,
+        params: Parameters<ActPressParams>,
+    ) -> Result<Json<ActPressResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "act_press",
+            "tool.invocation kind=act_press"
+        );
+        let (handle, recording) = self.m2_action_context()?;
+        act_press_with_handle(handle, recording, params.0)
             .await
             .map(Json)
     }

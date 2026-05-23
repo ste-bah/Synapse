@@ -1,0 +1,57 @@
+---
+source: crates/synapse-mcp/tests/m2_press_fsv.rs
+expression: projection
+---
+{
+  "description": "Press a keyboard key or ordered chord",
+  "inputSchema": {
+    "$defs": {
+      "PressBackend": {
+        "enum": [
+          "software",
+          "hardware",
+          "auto"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "backend": {
+        "$ref": "#/$defs/PressBackend",
+        "default": "auto"
+      },
+      "hold_ms": {
+        "default": 33,
+        "format": "uint32",
+        "maximum": 30000,
+        "minimum": 1,
+        "type": "integer"
+      },
+      "keys": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "keys"
+    ],
+    "title": "ActPressParams",
+    "type": "object"
+  },
+  "name": "act_press",
+  "outputSchemaRoot": {
+    "additionalProperties": false,
+    "required": [
+      "ok",
+      "keys_pressed",
+      "elapsed_ms",
+      "backend_used"
+    ],
+    "title": "ActPressResponse",
+    "type": "object"
+  }
+}
