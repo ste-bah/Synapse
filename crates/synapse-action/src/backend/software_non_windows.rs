@@ -16,6 +16,7 @@ impl SoftwareBackend {
 impl ActionBackend for SoftwareBackend {
     #[tracing::instrument(skip_all, fields(backend = "software"))]
     fn execute(&self, action: &Action, _state: &mut EmitState) -> Result<(), ActionError> {
+        crate::validate_action(action)?;
         Err(ActionError::BackendUnavailable {
             detail: format!(
                 "software backend requires Windows; current target is non-Win; action_kind={}",

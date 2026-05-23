@@ -11,7 +11,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSEINPUT, SendInput, VIRTUAL_KEY,
 };
 
-use crate::{ActionBackend, ActionError, EmitState};
+use crate::{ActionBackend, ActionError, EmitState, sample_curve};
 
 const CURVE_BATCH_STEPS: usize = 50;
 const WHEEL_DELTA: i32 = 120;
@@ -30,6 +30,7 @@ impl SoftwareBackend {
 impl ActionBackend for SoftwareBackend {
     #[tracing::instrument(skip_all, fields(backend = "software"))]
     fn execute(&self, action: &Action, state: &mut EmitState) -> Result<(), ActionError> {
+        crate::validate_action(action)?;
         match action {
             Action::KeyPress { key, hold_ms, .. } => press_key(key, *hold_ms, state),
             Action::KeyDown { key, .. } => set_key(key, Direction::Press, state),
@@ -45,8 +46,13 @@ impl ActionBackend for SoftwareBackend {
                 ..
             } => mouse_button(*button, *action, *hold_ms, state),
             Action::MouseDrag {
-                from, to, button, ..
-            } => mouse_drag(*from, *to, *button, state),
+                from,
+                to,
+                button,
+                curve,
+                duration_ms,
+                ..
+            } => mouse_drag(*from, *to, *button, curve, *duration_ms, state),
             Action::MouseScroll { dy, dx, at, .. } => mouse_scroll(*dy, *dx, *at),
             Action::AimAt { target, style, .. } => aim_at(target, *style),
             Action::Combo { steps, .. } => combo(steps, state),
@@ -193,6 +199,8 @@ fn mouse_drag(
     from: Point,
     to: Point,
     button: MouseButton,
+    curve: &synapse_core::AimCurve,
+    duration_ms: u32,
     state: &mut EmitState,
 ) -> Result<(), ActionError> {
     let mut enigo = enigo()?;
@@ -200,8 +208,29 @@ fn mouse_drag(
         .move_mouse(from.x, from.y, enigo::Coordinate::Abs)
         .map_err(enigo_error("move to drag origin"))?;
     mouse_button(button, ButtonAction::Down, 0, state)?;
-    mouse_move_relative_i32(to.x - from.x, to.y - from.y)?;
+    mouse_move_curve(from, to, curve, duration_ms)?;
     mouse_button(button, ButtonAction::Up, 0, state)
+}
+
+fn mouse_move_curve(
+    from: Point,
+    to: Point,
+    curve: &synapse_core::AimCurve,
+    duration_ms: u32,
+) -> Result<(), ActionError> {
+    let samples = sample_curve(curve, from, to, duration_ms, None);
+    let mut inputs = Vec::with_capacity(samples.len().saturating_sub(1));
+    let mut previous = from;
+    for point in samples.into_iter().skip(1) {
+        inputs.push(mouse_input(
+            point.x.saturating_sub(previous.x),
+            point.y.saturating_sub(previous.y),
+            0,
+            MOUSEEVENTF_MOVE,
+        ));
+        previous = point;
+    }
+    send_input_batch(&inputs, "drag curve mouse move")
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_scroll"))]

@@ -1,6 +1,5 @@
 ---
 source: crates/synapse-action/tests/recording_backend_fsv.rs
-assertion_line: 63
 expression: snapshot
 ---
 {
@@ -160,20 +159,33 @@ expression: snapshot
   ],
   "mouse_drag": [
     {
-      "kind": "mouse_move_absolute",
-      "point": {
-        "x": 1,
-        "y": 2
-      }
-    },
-    {
       "kind": "mouse_button_down",
       "button": "left"
     },
     {
-      "kind": "mouse_move_relative",
-      "dx": 10.0,
-      "dy": 20.0
+      "kind": "mouse_move",
+      "to": {
+        "kind": "screen",
+        "point": {
+          "x": 11,
+          "y": 22
+        }
+      },
+      "curve": {
+        "kind": "natural",
+        "params": {
+          "control_point_jitter": 0.08,
+          "tremor_stddev_px": 0.2,
+          "overshoot_prob": 0.25,
+          "overshoot_factor_range": [
+            1.02,
+            1.06
+          ],
+          "micro_correct_steps": 1,
+          "timing_stddev_ms": 1.5
+        }
+      },
+      "duration_ms": 200
     },
     {
       "kind": "mouse_button_up",

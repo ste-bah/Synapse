@@ -6,7 +6,7 @@ use std::{
 use synapse_core::Action;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{ActionError, ActionResult};
+use crate::{ActionError, ActionResult, validate_action};
 
 pub const ACTION_QUEUE_CAPACITY: usize = 256;
 
@@ -38,6 +38,7 @@ impl ActionHandle {
     /// Returns `ACTION_BACKEND_UNAVAILABLE` when the emitter channel or
     /// acknowledgement path is closed, or the emitter's own `ActionError`.
     pub async fn execute(&self, action: Action) -> ActionResult<()> {
+        validate_action(&action)?;
         let (ack_tx, ack_rx) = oneshot::channel();
         self.tx
             .send((action, ack_tx))
@@ -59,6 +60,7 @@ impl ActionHandle {
     /// Returns `ACTION_QUEUE_FULL` when the bounded queue is saturated, or
     /// `ACTION_BACKEND_UNAVAILABLE` when the emitter channel is closed.
     pub fn try_execute(&self, action: Action) -> ActionResult<()> {
+        validate_action(&action)?;
         let (ack_tx, _ack_rx) = oneshot::channel();
         self.tx.try_send((action, ack_tx)).map_err(map_try_send)?;
         Ok(())

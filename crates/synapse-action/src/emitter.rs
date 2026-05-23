@@ -375,6 +375,7 @@ impl ActionEmitter {
 
     #[tracing::instrument(skip_all, fields(action_kind = %action_kind(&action)))]
     async fn execute(&mut self, action: Action) -> ActionResult<()> {
+        crate::validate_action(&action)?;
         if action_consumes_rate_limit(&action) {
             let backend = resolved_backend_for_action(&action)?;
             self.consume_rate_limit(backend)?;

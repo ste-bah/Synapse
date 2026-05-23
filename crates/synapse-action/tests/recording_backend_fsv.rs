@@ -368,24 +368,30 @@ fn mouse_button_case() -> RecordingCase {
 }
 
 fn mouse_drag_case() -> RecordingCase {
+    let curve = AimCurve::Natural {
+        params: AimNaturalParams::FAST,
+    };
     RecordingCase {
         edge: "mouse_drag",
         action: Action::MouseDrag {
             from: Point { x: 1, y: 2 },
             to: Point { x: 11, y: 22 },
             button: MouseButton::Left,
-            curve: AimCurve::Instant,
-            duration_ms: 1,
+            curve: curve.clone(),
+            duration_ms: 200,
             backend: Backend::Software,
         },
         expected_events: vec![
-            RecordedInput::MouseMoveAbsolute {
-                point: Point { x: 1, y: 2 },
-            },
             RecordedInput::MouseButtonDown {
                 button: MouseButton::Left,
             },
-            RecordedInput::MouseMoveRelative { dx: 10.0, dy: 20.0 },
+            RecordedInput::MouseMove {
+                to: MouseTarget::Screen {
+                    point: Point { x: 11, y: 22 },
+                },
+                curve,
+                duration_ms: 200,
+            },
             RecordedInput::MouseButtonUp {
                 button: MouseButton::Left,
             },

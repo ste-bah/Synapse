@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 
 use synapse_core::{
-    Action, ButtonAction, ComboInput, GamepadReport, Key, KeyCode, KeystrokeDynamics, MouseButton,
-    PadButton, PadId, Point, Stick, Trigger,
+    Action, AimCurve, ButtonAction, ComboInput, GamepadReport, Key, KeyCode, KeystrokeDynamics,
+    MouseButton, MouseTarget, PadButton, PadId, Point, Stick, Trigger,
 };
 
 use super::RecordedInput;
@@ -44,8 +44,12 @@ impl RecordingState {
                 ..
             } => self.mouse_button(*button, *action, *hold_ms, state),
             Action::MouseDrag {
-                from, to, button, ..
-            } => self.mouse_drag(*from, *to, *button, state),
+                to,
+                button,
+                curve,
+                duration_ms,
+                ..
+            } => self.mouse_drag(*to, *button, curve, *duration_ms, state),
             Action::MouseScroll { dy, dx, at, .. } => {
                 self.events.push(RecordedInput::MouseScroll {
                     dy: *dy,
@@ -181,14 +185,20 @@ impl RecordingState {
         state.apply_mouse_button(button, ButtonAction::Up);
     }
 
-    fn mouse_drag(&mut self, from: Point, to: Point, button: MouseButton, state: &mut EmitState) {
-        self.events
-            .push(RecordedInput::MouseMoveAbsolute { point: from });
+    fn mouse_drag(
+        &mut self,
+        to: Point,
+        button: MouseButton,
+        curve: &AimCurve,
+        duration_ms: u32,
+        state: &mut EmitState,
+    ) {
         self.mouse_button_down(button, state);
-        self.mouse_move_relative(
-            f64::from(to.x.saturating_sub(from.x)),
-            f64::from(to.y.saturating_sub(from.y)),
-        );
+        self.events.push(RecordedInput::MouseMove {
+            to: MouseTarget::Screen { point: to },
+            curve: curve.clone(),
+            duration_ms,
+        });
         self.mouse_button_up(button, state);
     }
 

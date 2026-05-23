@@ -136,6 +136,7 @@ impl RecordingBackend {
 impl ActionBackend for RecordingBackend {
     #[tracing::instrument(skip_all, fields(backend = "recording"))]
     fn execute(&self, action: &Action, state: &mut EmitState) -> Result<(), ActionError> {
+        crate::validate_action(action)?;
         self.state().apply_action(action, state);
         Ok(())
     }

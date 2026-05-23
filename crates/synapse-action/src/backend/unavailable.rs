@@ -16,6 +16,7 @@ impl HardwareUnavailableBackend {
 impl ActionBackend for HardwareUnavailableBackend {
     #[tracing::instrument(skip_all, fields(backend = "hardware"))]
     fn execute(&self, action: &Action, _state: &mut EmitState) -> Result<(), ActionError> {
+        crate::validate_action(action)?;
         Err(ActionError::BackendUnavailable {
             detail: format!(
                 "backend=hardware reason=hardware HID backend ships in M4 action_kind={}",
