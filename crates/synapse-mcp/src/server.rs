@@ -24,10 +24,10 @@ use crate::{
         read_text_in_state, set_capture_target_in_state, set_perception_mode_in_state,
     },
     m2::{
-        ActAimParams, ActAimResponse, ActClickParams, ActClickResponse, ActPressParams,
-        ActPressResponse, ActTypeParams, ActTypeResponse, SharedM2State, act_aim_with_handle,
-        act_click_with_handle, act_press_with_handle, act_type_with_handle,
-        shared_m2_state_from_env,
+        ActAimParams, ActAimResponse, ActClickParams, ActClickResponse, ActDragParams,
+        ActDragResponse, ActPressParams, ActPressResponse, ActTypeParams, ActTypeResponse,
+        SharedM2State, act_aim_with_handle, act_click_with_handle, act_drag_with_handle,
+        act_press_with_handle, act_type_with_handle, shared_m2_state_from_env,
     },
 };
 
@@ -254,6 +254,22 @@ impl SynapseService {
         );
         let (handle, recording) = self.m2_action_context()?;
         act_aim_with_handle(handle, recording, params.0)
+            .await
+            .map(Json)
+    }
+
+    #[tool(description = "Drag between screen coordinates or element centers")]
+    pub async fn act_drag(
+        &self,
+        params: Parameters<ActDragParams>,
+    ) -> Result<Json<ActDragResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "act_drag",
+            "tool.invocation kind=act_drag"
+        );
+        let (handle, recording) = self.m2_action_context()?;
+        act_drag_with_handle(handle, recording, params.0)
             .await
             .map(Json)
     }

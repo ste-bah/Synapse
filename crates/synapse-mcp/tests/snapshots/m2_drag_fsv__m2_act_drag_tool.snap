@@ -1,0 +1,128 @@
+---
+source: crates/synapse-mcp/tests/m2_drag_fsv.rs
+expression: projection
+---
+{
+  "description": "Drag between screen coordinates or element centers",
+  "inputSchema": {
+    "$defs": {
+      "ActDragElementTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "element_id": {
+            "$ref": "#/$defs/ElementId"
+          }
+        },
+        "required": [
+          "element_id"
+        ],
+        "type": "object"
+      },
+      "ActDragPointTarget": {
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "y": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "ActDragTarget": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ActDragPointTarget"
+          },
+          {
+            "$ref": "#/$defs/ActDragElementTarget"
+          }
+        ]
+      },
+      "DragBackend": {
+        "enum": [
+          "software",
+          "hardware",
+          "auto"
+        ],
+        "type": "string"
+      },
+      "DragButton": {
+        "enum": [
+          "left",
+          "right",
+          "middle"
+        ],
+        "type": "string"
+      },
+      "DragCurve": {
+        "enum": [
+          "natural",
+          "instant",
+          "linear",
+          "ease_in_out"
+        ],
+        "type": "string"
+      },
+      "ElementId": {
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "backend": {
+        "$ref": "#/$defs/DragBackend",
+        "default": "auto"
+      },
+      "button": {
+        "$ref": "#/$defs/DragButton",
+        "default": "left"
+      },
+      "curve": {
+        "$ref": "#/$defs/DragCurve",
+        "default": "natural"
+      },
+      "duration_ms": {
+        "default": 200,
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "from": {
+        "$ref": "#/$defs/ActDragTarget"
+      },
+      "to": {
+        "$ref": "#/$defs/ActDragTarget"
+      }
+    },
+    "required": [
+      "from",
+      "to"
+    ],
+    "title": "ActDragParams",
+    "type": "object"
+  },
+  "name": "act_drag",
+  "outputSchemaRoot": {
+    "additionalProperties": false,
+    "required": [
+      "ok",
+      "button_used",
+      "curve_used",
+      "duration_ms",
+      "distance_px",
+      "backend_used",
+      "elapsed_ms"
+    ],
+    "title": "ActDragResponse",
+    "type": "object"
+  }
+}
