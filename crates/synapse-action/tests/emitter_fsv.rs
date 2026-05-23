@@ -1,6 +1,9 @@
 use std::{
     error::Error,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use proptest::{
@@ -8,17 +11,27 @@ use proptest::{
     prelude::*,
     test_runner::{Config, TestCaseError, TestRunner},
 };
-use synapse_action::{ACTION_QUEUE_CAPACITY, ActionEmitter, ActionStateSnapshot};
+use synapse_action::{
+    ACTION_QUEUE_CAPACITY, ActionBackend, ActionEmitter, ActionStateSnapshot, RecordingBackend,
+};
 use synapse_core::{
     Action, Backend, ButtonAction, GamepadReport, Key, KeyCode, MouseButton, PadButton, Stick,
     Trigger,
 };
 use tokio_util::sync::CancellationToken;
 
+/// Cross-platform substitute for the production `SoftwareBackend`: it mutates
+/// the same `EmitState` the actor exposes via snapshot, so the actor's
+/// held-state, release-all, and shutdown behavior can be exercised on any host.
+fn substitute_backend() -> Arc<dyn ActionBackend> {
+    Arc::new(RecordingBackend::new())
+}
+
 #[tokio::test]
 async fn emitter_tracks_held_state_and_release_all_drains() -> Result<(), Box<dyn Error>> {
     let cancel = CancellationToken::new();
-    let (handle, snapshot_handle, join) = ActionEmitter::spawn(cancel.clone());
+    let (handle, snapshot_handle, join) =
+        ActionEmitter::spawn_with_backend(cancel.clone(), substitute_backend());
     let key = key_named("shift");
     let report = pad_report(vec![PadButton::A], (0.5, -0.5), (0.0, 0.0), 0.25, 0.0);
 
@@ -67,7 +80,8 @@ async fn emitter_tracks_held_state_and_release_all_drains() -> Result<(), Box<dy
 #[tokio::test]
 async fn release_all_on_empty_state_stays_empty() -> Result<(), Box<dyn Error>> {
     let cancel = CancellationToken::new();
-    let (handle, snapshot_handle, join) = ActionEmitter::spawn(cancel.clone());
+    let (handle, snapshot_handle, join) =
+        ActionEmitter::spawn_with_backend(cancel.clone(), substitute_backend());
 
     let before = snapshot_handle.snapshot().await?;
     println!("source_of_truth=action_emitter_state edge=empty_release before={before:?}");
@@ -119,7 +133,8 @@ fn emitter_channel_preserves_bounded_queue_capacity() {
 #[tokio::test]
 async fn cancellation_drains_held_state_before_actor_returns() -> Result<(), Box<dyn Error>> {
     let cancel = CancellationToken::new();
-    let (handle, snapshot_handle, join) = ActionEmitter::spawn(cancel.clone());
+    let (handle, snapshot_handle, join) =
+        ActionEmitter::spawn_with_backend(cancel.clone(), substitute_backend());
     let key = key_named("control");
 
     handle
@@ -142,7 +157,8 @@ async fn cancellation_drains_held_state_before_actor_returns() -> Result<(), Box
 #[tokio::test]
 async fn unmatched_key_up_does_not_create_held_state() -> Result<(), Box<dyn Error>> {
     let cancel = CancellationToken::new();
-    let (handle, snapshot_handle, join) = ActionEmitter::spawn(cancel.clone());
+    let (handle, snapshot_handle, join) =
+        ActionEmitter::spawn_with_backend(cancel.clone(), substitute_backend());
 
     let before = snapshot_handle.snapshot().await?;
     println!("source_of_truth=action_emitter_state edge=unmatched_key_up before={before:?}");
@@ -199,7 +215,8 @@ async fn run_stream_and_release(
     actions: Vec<Action>,
 ) -> Result<(ActionStateSnapshot, ActionStateSnapshot), Box<dyn Error>> {
     let cancel = CancellationToken::new();
-    let (handle, snapshot_handle, join) = ActionEmitter::spawn(cancel.clone());
+    let (handle, snapshot_handle, join) =
+        ActionEmitter::spawn_with_backend(cancel.clone(), substitute_backend());
 
     for action in actions {
         handle.execute(action).await?;

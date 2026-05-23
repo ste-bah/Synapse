@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use bit_set::BitSet;
 use synapse_core::{
-    Action, Backend, ButtonAction, ComboInput, GamepadReport, Key, KeyCode, MouseButton, PadButton,
-    PadId, Stick, Trigger, error_codes,
+    Action, Backend, ButtonAction, ComboInput, GamepadReport, Key, KeyCode, MouseButton, PadId,
+    error_codes,
 };
 use tokio::{
     sync::{mpsc, oneshot},
@@ -13,8 +13,9 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    ACTION_QUEUE_CAPACITY, ActionError, ActionHandle, ActionMessage, ActionResult, ResolvedBackend,
-    TokenBucket, rate_limit::retry_after_ms_for_snapshot, resolve_backend,
+    ACTION_QUEUE_CAPACITY, ActionBackend, ActionError, ActionHandle, ActionMessage, ActionResult,
+    HardwareUnavailableBackend, ResolvedBackend, TokenBucket, VigemStateOnlyBackend,
+    backend::software::SoftwareBackend, rate_limit::retry_after_ms_for_snapshot, resolve_backend,
 };
 
 #[cfg(test)]
@@ -176,12 +177,58 @@ impl ActionEmitterSnapshotHandle {
     }
 }
 
+/// Snapshot of the three production backends the actor dispatches through.
+///
+/// Resolved per-action via [`resolve_backend`]. The actor itself stays the
+/// single serialization point — backends never see concurrent calls.
+#[derive(Clone)]
+pub struct Backends {
+    software: Arc<dyn ActionBackend>,
+    vigem: Arc<dyn ActionBackend>,
+    hardware: Arc<dyn ActionBackend>,
+}
+
+impl Backends {
+    #[must_use]
+    pub fn production() -> Self {
+        Self {
+            software: Arc::new(SoftwareBackend::new()),
+            vigem: Arc::new(VigemStateOnlyBackend::new()),
+            hardware: Arc::new(HardwareUnavailableBackend::new()),
+        }
+    }
+
+    #[must_use]
+    pub fn all_routed_to(backend: Arc<dyn ActionBackend>) -> Self {
+        Self {
+            software: Arc::clone(&backend),
+            vigem: Arc::clone(&backend),
+            hardware: backend,
+        }
+    }
+
+    fn pick(&self, resolved: ResolvedBackend) -> Arc<dyn ActionBackend> {
+        match resolved {
+            ResolvedBackend::Software => Arc::clone(&self.software),
+            ResolvedBackend::Vigem => Arc::clone(&self.vigem),
+            ResolvedBackend::Hardware => Arc::clone(&self.hardware),
+        }
+    }
+}
+
+impl std::fmt::Debug for Backends {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Backends").finish_non_exhaustive()
+    }
+}
+
 pub struct ActionEmitter {
     rx: mpsc::Receiver<ActionMessage>,
     snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
     auto_release_tx: mpsc::Sender<HeldKeyAutoRelease>,
     auto_release_rx: mpsc::Receiver<HeldKeyAutoRelease>,
     state: EmitState,
+    backends: Backends,
     rate_limits: BackendRateLimits,
     held_key_timers: HashMap<Key, JoinHandle<()>>,
     held_key_timer_ids: HashMap<Key, u64>,
@@ -255,6 +302,15 @@ impl ActionEmitter {
         rx: mpsc::Receiver<ActionMessage>,
         snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
     ) -> Self {
+        Self::new_with_backends(rx, snapshot_rx, Backends::production())
+    }
+
+    #[must_use]
+    pub fn new_with_backends(
+        rx: mpsc::Receiver<ActionMessage>,
+        snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
+        backends: Backends,
+    ) -> Self {
         let (auto_release_tx, auto_release_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         Self {
             rx,
@@ -262,6 +318,7 @@ impl ActionEmitter {
             auto_release_tx,
             auto_release_rx,
             state: EmitState::new(),
+            backends,
             rate_limits: BackendRateLimits::new(),
             held_key_timers: HashMap::new(),
             held_key_timer_ids: HashMap::new(),
@@ -273,6 +330,7 @@ impl ActionEmitter {
     fn with_rate_limits(
         rx: mpsc::Receiver<ActionMessage>,
         snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
+        backends: Backends,
         rate_limits: BackendRateLimits,
     ) -> Self {
         let (auto_release_tx, auto_release_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
@@ -282,6 +340,7 @@ impl ActionEmitter {
             auto_release_tx,
             auto_release_rx,
             state: EmitState::new(),
+            backends,
             rate_limits,
             held_key_timers: HashMap::new(),
             held_key_timer_ids: HashMap::new(),
@@ -293,25 +352,40 @@ impl ActionEmitter {
     fn channel_with_rate_limits(
         rate_limits: BackendRateLimits,
     ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
+        let backends = Backends::all_routed_to(Arc::new(crate::RecordingBackend::new()));
         let (handle, rx) = ActionHandle::channel();
         let (snapshot_tx, snapshot_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         (
             handle,
             ActionEmitterSnapshotHandle::new(snapshot_tx),
-            Self::with_rate_limits(rx, snapshot_rx, rate_limits),
+            Self::with_rate_limits(rx, snapshot_rx, backends, rate_limits),
         )
     }
 
     #[must_use]
     #[tracing::instrument(skip_all, fields(action_kind = "channel"))]
     pub fn channel() -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
+        Self::channel_with_backends(Backends::production())
+    }
+
+    #[must_use]
+    pub fn channel_with_backends(
+        backends: Backends,
+    ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
         let (handle, rx) = ActionHandle::channel();
         let (snapshot_tx, snapshot_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         (
             handle,
             ActionEmitterSnapshotHandle::new(snapshot_tx),
-            Self::new(rx, snapshot_rx),
+            Self::new_with_backends(rx, snapshot_rx, backends),
         )
+    }
+
+    #[must_use]
+    pub fn channel_with_backend(
+        backend: Arc<dyn ActionBackend>,
+    ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
+        Self::channel_with_backends(Backends::all_routed_to(backend))
     }
 
     /// Spawns the action serialization actor on the current Tokio runtime.
@@ -328,6 +402,23 @@ impl ActionEmitter {
         JoinHandle<ActionStateSnapshot>,
     ) {
         let (handle, snapshot_handle, emitter) = Self::channel();
+        let join = tokio::spawn(emitter.run(cancel));
+        (handle, snapshot_handle, join)
+    }
+
+    /// Spawns an actor wired with a single substitute backend across all
+    /// resolved kinds. Intended for cross-platform tests that want to observe
+    /// actor dispatch without driving real input devices.
+    #[must_use]
+    pub fn spawn_with_backend(
+        cancel: CancellationToken,
+        backend: Arc<dyn ActionBackend>,
+    ) -> (
+        ActionHandle,
+        ActionEmitterSnapshotHandle,
+        JoinHandle<ActionStateSnapshot>,
+    ) {
+        let (handle, snapshot_handle, emitter) = Self::channel_with_backend(backend);
         let join = tokio::spawn(emitter.run(cancel));
         (handle, snapshot_handle, join)
     }
@@ -400,52 +491,104 @@ impl ActionEmitter {
     #[tracing::instrument(skip_all, fields(action_kind = %action_kind(&action)))]
     async fn execute(&mut self, action: Action) -> ActionResult<()> {
         crate::validate_action(&action)?;
+
+        if matches!(action, Action::ReleaseAll) {
+            return self.do_release_all("tool_invocation").await;
+        }
+
         if action_consumes_rate_limit(&action) {
             let backend = resolved_backend_for_action(&action)?;
             self.consume_rate_limit(backend)?;
         }
 
-        match action {
-            Action::KeyPress { key, .. } => {
-                self.state.hold_key(&key);
-                self.cancel_held_key_timer(&key);
-                self.state.release_key(&key);
-            }
-            Action::KeyDown { key, .. } => {
-                self.state.hold_key(&key);
-                self.schedule_held_key_auto_release(key);
-            }
-            Action::KeyUp { key, .. } => {
-                self.cancel_held_key_timer(&key);
-                self.state.release_key(&key);
-            }
-            Action::KeyChord { keys, .. } => self.apply_key_chord(&keys),
-            Action::TypeText { .. }
-            | Action::MouseMove { .. }
-            | Action::MouseMoveRelative { .. }
-            | Action::MouseDrag { .. }
-            | Action::MouseScroll { .. }
-            | Action::AimAt { .. } => {}
-            Action::MouseButton { button, action, .. } => {
-                self.state.apply_mouse_button(button, action);
-            }
-            Action::PadButton {
-                pad,
-                button,
-                action,
-                ..
-            } => self.apply_pad_button(pad, button, action),
-            Action::PadStick { pad, stick, x, y } => self.apply_pad_stick(pad, stick, x, y),
-            Action::PadTrigger {
-                pad,
-                trigger,
-                value,
-            } => self.apply_pad_trigger(pad, trigger, value),
-            Action::PadReport { pad, report } => self.apply_pad_report(pad, report),
-            Action::Combo { steps, .. } => self.apply_combo(steps),
-            Action::ReleaseAll => self.release_all("tool_invocation").await,
+        self.cancel_timers_for_release_actions(&action);
+
+        let resolved = resolved_backend_for_action(&action)?;
+        let backend = self.backends.pick(resolved);
+        let result = self.dispatch_via_backend(backend, action.clone()).await;
+
+        if result.is_ok() {
+            self.schedule_timers_for_held_keys(&action);
         }
-        Ok(())
+
+        result
+    }
+
+    async fn dispatch_via_backend(
+        &mut self,
+        backend: Arc<dyn ActionBackend>,
+        action: Action,
+    ) -> ActionResult<()> {
+        let mut state = std::mem::take(&mut self.state);
+        let task = tokio::task::spawn_blocking(move || {
+            let result = backend.execute(&action, &mut state);
+            (result, state)
+        });
+        match task.await {
+            Ok((result, state)) => {
+                self.state = state;
+                result
+            }
+            Err(join_error) => {
+                // The blocking task panicked or was cancelled; we lost the
+                // moved EmitState. Fail-closed: surface the cause and reset
+                // held-state to empty so the next action starts clean.
+                self.state = EmitState::new();
+                Err(ActionError::BackendUnavailable {
+                    detail: format!(
+                        "code={} backend.execute spawn_blocking join failed: {join_error}",
+                        error_codes::ACTION_BACKEND_UNAVAILABLE
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Cancels in-flight auto-release timers for any key the action is about
+    /// to release. Done before backend dispatch so a timer cannot fire mid-call
+    /// and enqueue a duplicate `KeyUp` against a key the backend has already
+    /// released.
+    fn cancel_timers_for_release_actions(&mut self, action: &Action) {
+        match action {
+            Action::KeyPress { key, .. } | Action::KeyUp { key, .. } => {
+                self.cancel_held_key_timer(key);
+            }
+            Action::KeyChord { keys, .. } => {
+                for key in keys {
+                    self.cancel_held_key_timer(key);
+                }
+            }
+            Action::Combo { steps, .. } => {
+                for step in steps {
+                    if let ComboInput::KeyUp { key } | ComboInput::KeyPress { key, .. } =
+                        &step.input
+                    {
+                        self.cancel_held_key_timer(key);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Schedules safety auto-release timers for any key the action just put
+    /// into a held-down state. Called only when the backend dispatch
+    /// succeeded — if the backend errored the key is never in `held_keys`
+    /// and there is nothing to time out.
+    fn schedule_timers_for_held_keys(&mut self, action: &Action) {
+        match action {
+            Action::KeyDown { key, .. } => {
+                self.schedule_held_key_auto_release(key.clone());
+            }
+            Action::Combo { steps, .. } => {
+                for step in steps {
+                    if let ComboInput::KeyDown { key } = &step.input {
+                        self.schedule_held_key_auto_release(key.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     fn consume_rate_limit(&self, backend: ResolvedBackend) -> ActionResult<()> {
@@ -470,11 +613,28 @@ impl ActionEmitter {
 
     #[tracing::instrument(skip_all, fields(action_kind = "release_all"))]
     async fn release_all(&mut self, reason: &'static str) {
+        let _release_result = self.do_release_all(reason).await;
+    }
+
+    /// Drives a `ReleaseAll` through the resolved backend (so the production
+    /// path actually emits SendInput KeyUps for every held key/button), aborts
+    /// in-flight auto-release timers, and logs the drained snapshot. The
+    /// blocking backend work runs on `spawn_blocking` so the runtime stays
+    /// responsive.
+    async fn do_release_all(&mut self, reason: &'static str) -> ActionResult<()> {
         let before = self.snapshot();
         let mut held_pad_ids: Vec<_> = before.pad_state.keys().copied().collect();
         held_pad_ids.sort_unstable();
+        let released_keys = before.held_keys.len();
+        let released_buttons = before.held_buttons.len();
+        let released_pads = before.pad_state.len();
+
         let cancelled_key_timers = self.abort_all_held_key_timers();
-        let (released_keys, released_buttons, released_pads) = self.state.release_all();
+
+        let resolved = resolved_backend_for_action(&Action::ReleaseAll)?;
+        let backend = self.backends.pick(resolved);
+        let result = self.dispatch_via_backend(backend, Action::ReleaseAll).await;
+
         tracing::warn!(
             code = error_codes::SAFETY_RELEASE_ALL_FIRED,
             reason,
@@ -489,8 +649,17 @@ impl ActionEmitter {
             released_buttons,
             released_pads,
             cancelled_key_timers,
+            backend_ok = result.is_ok(),
             "release_all drained action emitter held state"
         );
+
+        // If the backend failed mid-release, clear the held bitmaps anyway —
+        // the actor's state must reflect what the safety path attempted, so
+        // the next ReleaseAll snapshot does not loop on the same keys.
+        if result.is_err() {
+            self.state.release_all();
+        }
+        result
     }
 
     fn schedule_held_key_auto_release(&mut self, key: Key) {
@@ -567,109 +736,6 @@ impl ActionEmitter {
         keys
     }
 
-    fn apply_key_chord(&mut self, keys: &[Key]) {
-        for key in keys {
-            self.state.hold_key(key);
-        }
-        for key in keys {
-            self.cancel_held_key_timer(key);
-            self.state.release_key(key);
-        }
-    }
-
-    fn apply_combo(&mut self, steps: Vec<synapse_core::ComboStep>) {
-        for step in steps {
-            match step.input {
-                ComboInput::KeyDown { key } => {
-                    self.state.hold_key(&key);
-                    self.schedule_held_key_auto_release(key);
-                }
-                ComboInput::KeyUp { key } | ComboInput::KeyPress { key, .. } => {
-                    self.cancel_held_key_timer(&key);
-                    self.state.release_key(&key);
-                }
-                ComboInput::MouseButton { button, action } => {
-                    self.state.apply_mouse_button(button, action);
-                }
-                ComboInput::MouseMoveRel { .. } => {}
-                ComboInput::PadButton {
-                    pad,
-                    button,
-                    action,
-                } => self.apply_pad_button(pad, button, action),
-                ComboInput::PadStick { pad, stick, x, y } => {
-                    self.apply_pad_stick(pad, stick, x, y);
-                }
-            }
-        }
-    }
-
-    fn apply_pad_button(&mut self, pad: PadId, button: PadButton, action: ButtonAction) {
-        let should_remove = {
-            let report = self
-                .state
-                .pad_state
-                .entry(pad)
-                .or_insert_with(neutral_gamepad_report);
-            match action {
-                ButtonAction::Down => push_unique(&mut report.buttons, button),
-                ButtonAction::Up | ButtonAction::Press => {
-                    report.buttons.retain(|held| *held != button);
-                }
-            }
-            is_neutral_report(report)
-        };
-
-        if should_remove {
-            self.state.pad_state.remove(&pad);
-        }
-    }
-
-    fn apply_pad_stick(&mut self, pad: PadId, stick: Stick, x: f32, y: f32) {
-        let should_remove = {
-            let report = self
-                .state
-                .pad_state
-                .entry(pad)
-                .or_insert_with(neutral_gamepad_report);
-            match stick {
-                Stick::Left => report.thumb_l = (x, y),
-                Stick::Right => report.thumb_r = (x, y),
-            }
-            is_neutral_report(report)
-        };
-
-        if should_remove {
-            self.state.pad_state.remove(&pad);
-        }
-    }
-
-    fn apply_pad_trigger(&mut self, pad: PadId, trigger: Trigger, value: f32) {
-        let should_remove = {
-            let report = self
-                .state
-                .pad_state
-                .entry(pad)
-                .or_insert_with(neutral_gamepad_report);
-            match trigger {
-                Trigger::Left => report.lt = value,
-                Trigger::Right => report.rt = value,
-            }
-            is_neutral_report(report)
-        };
-
-        if should_remove {
-            self.state.pad_state.remove(&pad);
-        }
-    }
-
-    fn apply_pad_report(&mut self, pad: PadId, report: GamepadReport) {
-        if is_neutral_report(&report) {
-            self.state.pad_state.remove(&pad);
-        } else {
-            self.state.pad_state.insert(pad, report);
-        }
-    }
 }
 
 impl Drop for ActionEmitter {
@@ -767,30 +833,6 @@ const fn mouse_button_from_index(index: usize) -> Option<MouseButton> {
     }
 }
 
-const fn neutral_gamepad_report() -> GamepadReport {
-    GamepadReport {
-        buttons: Vec::new(),
-        thumb_l: (0.0, 0.0),
-        thumb_r: (0.0, 0.0),
-        lt: 0.0,
-        rt: 0.0,
-    }
-}
-
-fn is_neutral_report(report: &GamepadReport) -> bool {
-    report.buttons.is_empty()
-        && report.thumb_l == (0.0, 0.0)
-        && report.thumb_r == (0.0, 0.0)
-        && report.lt == 0.0
-        && report.rt == 0.0
-}
-
-fn push_unique(buttons: &mut Vec<PadButton>, button: PadButton) {
-    if !buttons.contains(&button) {
-        buttons.push(button);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -799,7 +841,7 @@ mod tests {
     };
 
     use crate::{ActionBackend, RecordedInput, RecordingBackend};
-    use synapse_core::KeyCode;
+    use synapse_core::{KeyCode, PadButton};
     use tracing_subscriber::fmt::writer::MakeWriter;
 
     use super::*;

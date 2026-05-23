@@ -1,7 +1,7 @@
 #![cfg(not(windows))]
 
 use synapse_action::{
-    ActionBackend, ActionError, EmitState,
+    ActionBackend, ActionError, EmitState, RecordingBackend,
     backend::software::{SoftwareBackend, cursor_position},
 };
 use synapse_core::{
@@ -17,11 +17,30 @@ fn software_backend_returns_unavailable_for_every_action_variant_on_non_windows(
     for (edge, action) in action_cases() {
         let mut state = EmitState::new();
         let before = state.snapshot();
-        let error = match backend.execute(&action, &mut state) {
+        let result = backend.execute(&action, &mut state);
+        let after = state.snapshot();
+
+        // Empty `ReleaseAll` is the documented exception: it performs no I/O
+        // on any platform (the held-state loops emit zero SendInput calls on
+        // Windows). The non-Windows stub mirrors that semantic so safety
+        // paths — cancel/shutdown, panic hook, M2 `release_all` tool — can
+        // dispatch `ReleaseAll` on Linux/macOS dev hosts without falsely
+        // surfacing ACTION_BACKEND_UNAVAILABLE for a no-op.
+        if matches!(action, Action::ReleaseAll) {
+            assert!(
+                result.is_ok(),
+                "empty ReleaseAll on non-Windows must succeed as a no-op: {result:?}"
+            );
+            println!(
+                "source_of_truth=software_linux edge={edge} before={before:?} after={after:?} after_code=OK (empty-state no-op)"
+            );
+            continue;
+        }
+
+        let error = match result {
             Ok(()) => panic!("non-Windows software backend must fail closed for {edge}"),
             Err(error) => error,
         };
-        let after = state.snapshot();
 
         assert!(matches!(error, ActionError::BackendUnavailable { .. }));
         assert_eq!(error.code(), error_codes::ACTION_BACKEND_UNAVAILABLE);
@@ -32,6 +51,42 @@ fn software_backend_returns_unavailable_for_every_action_variant_on_non_windows(
             error.code()
         );
     }
+}
+
+#[test]
+fn non_windows_software_backend_release_all_on_non_empty_state_fails_closed() {
+    let mut state = EmitState::new();
+    // Drive the recording backend to seed `state.held_keys` without leaning
+    // on EmitState's pub(crate) helpers from inside an integration test.
+    let recording = RecordingBackend::new();
+    recording
+        .execute(
+            &Action::KeyDown {
+                key: key("synthetic-stuck"),
+                backend: Backend::Software,
+            },
+            &mut state,
+        )
+        .unwrap_or_else(|error| panic!("recording KeyDown must seed state: {error}"));
+    let before = state.snapshot();
+    assert_eq!(before.held_keys.len(), 1);
+    println!("source_of_truth=software_linux edge=release_all_non_empty before={before:?}");
+
+    let backend = SoftwareBackend::new();
+    let result = backend.execute(&Action::ReleaseAll, &mut state);
+    let after = state.snapshot();
+    let error = match result {
+        Ok(()) => panic!(
+            "non-Windows software backend must fail-closed for ReleaseAll on non-empty state"
+        ),
+        Err(error) => error,
+    };
+    assert_eq!(error.code(), error_codes::ACTION_BACKEND_UNAVAILABLE);
+    assert_eq!(before, after);
+    println!(
+        "source_of_truth=software_linux edge=release_all_non_empty after={after:?} after_code={}",
+        error.code()
+    );
 }
 
 #[test]

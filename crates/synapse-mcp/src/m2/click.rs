@@ -440,6 +440,8 @@ const fn backend_used_name(backend: Backend) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tokio_util::sync::CancellationToken;
 
     use super::{
@@ -447,12 +449,14 @@ mod tests {
         default_click_backend, default_click_button, default_click_count, default_click_curve,
         default_click_duration_ms, default_use_invoke_pattern,
     };
-    use synapse_action::ActionEmitter;
+    use synapse_action::{ActionBackend, ActionEmitter, RecordingBackend};
 
     #[tokio::test]
     async fn coordinate_click_leaves_actor_held_state_empty() {
         let cancel = CancellationToken::new();
-        let (handle, snapshot_handle, join) = ActionEmitter::spawn(cancel.clone());
+        let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
+        let (handle, snapshot_handle, join) =
+            ActionEmitter::spawn_with_backend(cancel.clone(), backend);
         let before = match snapshot_handle.snapshot().await {
             Ok(snapshot) => snapshot,
             Err(err) => panic!("before snapshot failed: {err}"),

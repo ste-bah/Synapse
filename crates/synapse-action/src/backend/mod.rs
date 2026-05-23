@@ -9,6 +9,7 @@ pub mod software;
 #[path = "software_non_windows.rs"]
 pub mod software;
 pub mod unavailable;
+pub mod vigem;
 
 pub trait ActionBackend: Send + Sync {
     /// Executes one action against a concrete backend while updating emitter state.

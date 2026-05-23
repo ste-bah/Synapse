@@ -100,9 +100,11 @@ fn action_error_to_mcp(error: &ActionError) -> ErrorData {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use tokio_util::sync::CancellationToken;
 
-    use synapse_action::ActionEmitter;
+    use synapse_action::{ActionBackend, ActionEmitter, RecordingBackend};
     use synapse_core::{
         Backend, ButtonAction, GamepadReport, Key, KeyCode, MouseButton, PadButton,
     };
@@ -112,7 +114,9 @@ mod tests {
     #[tokio::test]
     async fn release_all_counts_and_drains_actor_state() {
         let cancel = CancellationToken::new();
-        let (handle, snapshot_handle, join) = ActionEmitter::spawn(cancel.clone());
+        let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
+        let (handle, snapshot_handle, join) =
+            ActionEmitter::spawn_with_backend(cancel.clone(), backend);
         let keys = [key("ctrl"), key("shift"), key("alt")];
         for key in &keys {
             handle

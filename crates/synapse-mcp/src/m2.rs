@@ -14,7 +14,7 @@ use std::{
 };
 
 use synapse_action::{
-    ActionEmitter, ActionEmitterSnapshotHandle, ActionHandle, ActionStateSnapshot,
+    ActionBackend, ActionEmitter, ActionEmitterSnapshotHandle, ActionHandle, ActionStateSnapshot,
     RELEASE_ALL_HANDLE, RecordingBackend, initialize_double_click_timing_cache,
 };
 use tokio::{sync::watch, task::JoinHandle};
@@ -91,6 +91,27 @@ impl M2State {
         shutdown_reason: &'static str,
         connection_closed_cancel: Option<CancellationToken>,
     ) -> Self {
+        Self::from_recording_backend_env_with_actor_backend(
+            recording_backend,
+            shutdown_cancel,
+            shutdown_reason,
+            connection_closed_cancel,
+            None,
+        )
+    }
+
+    /// Lower-level constructor that lets callers (notably cross-platform
+    /// tests) substitute the actor's `ActionBackend` for one that does not
+    /// require the production OS — e.g. `RecordingBackend`. Production code
+    /// passes `actor_backend = None` and gets the platform-native backends.
+    #[must_use]
+    pub fn from_recording_backend_env_with_actor_backend(
+        recording_backend: Option<&str>,
+        shutdown_cancel: CancellationToken,
+        shutdown_reason: &'static str,
+        connection_closed_cancel: Option<CancellationToken>,
+        actor_backend: Option<Arc<dyn ActionBackend>>,
+    ) -> Self {
         let double_click_timing = initialize_double_click_timing_cache();
         tracing::info!(
             code = "M2_DOUBLE_CLICK_TIMING_CACHED",
@@ -101,8 +122,14 @@ impl M2State {
         );
         let recording =
             recording_backend_enabled(recording_backend).then(|| Arc::new(RecordingBackend::new()));
+        let build_emitter = || {
+            actor_backend.as_ref().map_or_else(
+                ActionEmitter::channel,
+                |backend| ActionEmitter::channel_with_backend(Arc::clone(backend)),
+            )
+        };
         if tokio::runtime::Handle::try_current().is_ok() {
-            let (emitter_handle, snapshot_handle, emitter) = ActionEmitter::channel();
+            let (emitter_handle, snapshot_handle, emitter) = build_emitter();
             let _release_handle_result = RELEASE_ALL_HANDLE.set(emitter_handle.clone());
             let (done_tx, done_rx) = watch::channel(None);
             let emitter_task = tokio::spawn(async move {
@@ -127,7 +154,7 @@ impl M2State {
             };
         }
 
-        let (emitter_handle, snapshot_handle, emitter) = ActionEmitter::channel();
+        let (emitter_handle, snapshot_handle, emitter) = build_emitter();
         Self {
             emitter_handle,
             snapshot_handle,
@@ -270,7 +297,15 @@ mod tests {
     async fn m2_state_uses_injected_cancel_token_to_release_all_on_shutdown() {
         let before = Some("false");
         let cancel = CancellationToken::new();
-        let mut state = M2State::from_recording_backend_env_with_cancel(before, cancel.clone());
+        let substitute: std::sync::Arc<dyn synapse_action::ActionBackend> =
+            std::sync::Arc::new(synapse_action::RecordingBackend::new());
+        let mut state = M2State::from_recording_backend_env_with_actor_backend(
+            before,
+            cancel.clone(),
+            "shutdown",
+            None,
+            Some(substitute),
+        );
         let key = key_named("m2-cancel-token");
         println!(
             "source_of_truth=m2_state scenario=injected_cancel before_cancelled:{} emitter_running:{}",

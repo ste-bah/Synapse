@@ -52,8 +52,18 @@ async fn force_panic_during_act_press_fires_release_all_log() -> anyhow::Result<
     assert!(release_line.contains("\"held_pad_ids\":\"[6]\""));
     assert!(release_line.contains("\"released_pads\":1"));
     assert!(panic_line.contains("\"reason\":\"panic\""));
-    assert!(panic_line.contains("\"result\":\"ok\""));
     assert!(panic_line.contains("\"timeout_ms\":10"));
+    // On Windows the panic-hook release_all reaches the live SoftwareBackend
+    // and emits SendInput KeyUp/MouseUp for every held key/button, returning
+    // `result=ok`. On non-Windows hosts the SoftwareBackend stub fails-closed
+    // with ACTION_BACKEND_UNAVAILABLE — the panic hook still logs the attempt
+    // but tags `result=error` so the failure is observable rather than silent.
+    if cfg!(windows) {
+        assert!(panic_line.contains("\"result\":\"ok\""));
+    } else {
+        assert!(panic_line.contains("\"result\":\"error\""));
+        assert!(panic_line.contains(error_codes::ACTION_BACKEND_UNAVAILABLE));
+    }
     drop(client);
     Ok(())
 }

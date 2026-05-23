@@ -187,12 +187,28 @@ async fn act_click_default_unset_uses_actor_path_without_recording_log_fsv() -> 
     let mut client = StdioMcpClient::launch_and_init_with_log_dir(Some(log_dir.path())).await?;
 
     println!("source_of_truth=mcp_act_click edge=env_unset before=recording_env:absent");
-    let response = client
-        .tools_call("act_click", json!({"target": {"x": 3, "y": 4}}))
-        .await?;
-    let response: ActClickWireResponse = structured(&response)?;
-    assert!(response.ok);
-    assert_eq!(response.backend_used, "software");
+    // With the actor wired through the live `SoftwareBackend`, the no-recording
+    // path drives real SendInput on Windows and fails-closed with
+    // ACTION_BACKEND_UNAVAILABLE on non-Windows hosts. Either way the
+    // observability invariant — "no M2_ACT_*_RECORDING_READBACK lines unless
+    // the env opt-in is set" — must hold.
+    if cfg!(windows) {
+        let response = client
+            .tools_call("act_click", json!({"target": {"x": 3, "y": 4}}))
+            .await?;
+        let response: ActClickWireResponse = structured(&response)?;
+        assert!(response.ok);
+        assert_eq!(response.backend_used, "software");
+    } else {
+        let error = client
+            .tools_call_error("act_click", json!({"target": {"x": 3, "y": 4}}))
+            .await?;
+        println!("source_of_truth=mcp_act_click edge=env_unset after_error={error}");
+        assert_eq!(
+            error_code(&error),
+            Some(error_codes::ACTION_BACKEND_UNAVAILABLE)
+        );
+    }
 
     assert!(client.shutdown().await?.success());
     let logs = read_logs(log_dir.path())?;

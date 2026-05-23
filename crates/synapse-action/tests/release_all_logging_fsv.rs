@@ -4,7 +4,8 @@ use std::{
 };
 
 use synapse_action::{
-    ActionEmitter, ActionEmitterSnapshotHandle, ActionHandle, ActionStateSnapshot,
+    ActionBackend, ActionEmitter, ActionEmitterSnapshotHandle, ActionHandle, ActionStateSnapshot,
+    RecordingBackend,
 };
 use synapse_core::{
     Action, Backend, ButtonAction, GamepadReport, Key, KeyCode, MouseButton, PadButton,
@@ -120,7 +121,8 @@ fn spawn_emitter(
     ActionEmitterSnapshotHandle,
     JoinHandle<ActionStateSnapshot>,
 ) {
-    let (handle, snapshot, emitter) = ActionEmitter::channel();
+    let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
+    let (handle, snapshot, emitter) = ActionEmitter::channel_with_backend(backend);
     let join = tokio::spawn(emitter.run_with_shutdown_reason(
         shutdown,
         shutdown_reason,

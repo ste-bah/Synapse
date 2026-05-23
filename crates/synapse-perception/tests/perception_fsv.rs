@@ -580,7 +580,10 @@ fn winrt_ocr_capture_vs_recognize_timing_native() -> TestResult {
             let result = read_text_from_software_bitmap(captured.region, &captured.bitmap);
             recognize_ms.push(recognize_started.elapsed().as_secs_f64() * 1_000.0);
             if matches!(
-                result.as_ref().err().map(synapse_perception::PerceptionError::code),
+                result
+                    .as_ref()
+                    .err()
+                    .map(synapse_perception::PerceptionError::code),
                 Some(error_codes::OCR_BACKEND_UNAVAILABLE)
             ) {
                 return Err(io::Error::other("WinRT OCR backend unavailable").into());
