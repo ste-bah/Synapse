@@ -65,6 +65,9 @@ expression: projection
       "dx",
       "smooth",
       "scrolled",
+      "wheel_event_count",
+      "smooth_interval_ms",
+      "scheduled_smooth_total_ms",
       "backend_used",
       "elapsed_ms"
     ],

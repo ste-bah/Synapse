@@ -976,11 +976,26 @@ expression: schemas
         "ok": {
           "type": "boolean"
         },
+        "scheduled_smooth_total_ms": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "scrolled": {
           "type": "boolean"
         },
         "smooth": {
           "type": "boolean"
+        },
+        "smooth_interval_ms": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "wheel_event_count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
         }
       },
       "required": [
@@ -989,6 +1004,9 @@ expression: schemas
         "dx",
         "smooth",
         "scrolled",
+        "wheel_event_count",
+        "smooth_interval_ms",
+        "scheduled_smooth_total_ms",
         "backend_used",
         "elapsed_ms"
       ],
