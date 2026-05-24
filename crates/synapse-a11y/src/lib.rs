@@ -372,6 +372,31 @@ pub fn re_resolve(id: &ElementId) -> A11yResult<UIElement> {
     platform::re_resolve(id)
 }
 
+/// Read-only mirror of `uiautomation::types::ExpandCollapseState`. Kept
+/// independent of the underlying crate so callers don't need a uiautomation
+/// dependency just to compare against a literal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExpandState {
+    Collapsed,
+    Expanded,
+    PartiallyExpanded,
+    LeafNode,
+}
+
+/// Reads `ExpandCollapsePattern::CurrentExpandCollapseState` from the given
+/// element. Used by `act_click(use_invoke_pattern=true)` FSV tests to assert
+/// menu/expander state flipped after an invoke.
+///
+/// # Errors
+///
+/// Returns the same structured UIA errors as the other a11y accessors;
+/// `A11Y_PATTERN_UNAVAILABLE`-class error when the element does not expose
+/// `ExpandCollapsePattern`; `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn expand_state_of(element: &UIElement) -> A11yResult<ExpandState> {
+    platform::expand_state_of(element)
+}
+
 /// Starts the dedicated `WinEvent` hook thread and marshals events into `sender`.
 ///
 /// # Errors
@@ -534,7 +559,11 @@ mod platform {
     use uiautomation::{
         UIAutomation, UIElement,
         core::UICacheRequest,
-        types::{ControlType, ElementMode, Handle, Point as UiaPoint, TreeScope, UIProperty},
+        patterns::UIExpandCollapsePattern,
+        types::{
+            ControlType, ElementMode, ExpandCollapseState, Handle, Point as UiaPoint, TreeScope,
+            UIProperty,
+        },
         variants::{Value, Variant},
     };
     use windows::{
@@ -814,6 +843,20 @@ mod platform {
                     ),
                 }
             })
+        })
+    }
+
+    pub fn expand_state_of(element: &UIElement) -> A11yResult<super::ExpandState> {
+        let pattern: UIExpandCollapsePattern =
+            element.get_pattern().map_err(|err| A11yError::Internal {
+                detail: format!("ExpandCollapsePattern not exposed: {err}"),
+            })?;
+        let state = pattern.get_state().map_err(map_uia_error)?;
+        Ok(match state {
+            ExpandCollapseState::Collapsed => super::ExpandState::Collapsed,
+            ExpandCollapseState::Expanded => super::ExpandState::Expanded,
+            ExpandCollapseState::PartiallyExpanded => super::ExpandState::PartiallyExpanded,
+            ExpandCollapseState::LeafNode => super::ExpandState::LeafNode,
         })
     }
 
@@ -1533,6 +1576,12 @@ mod platform {
     pub fn re_resolve(_id: &ElementId) -> A11yResult<UIElement> {
         Err(A11yError::not_available(
             "UIA element re-resolution requires Windows",
+        ))
+    }
+
+    pub fn expand_state_of(_element: &UIElement) -> A11yResult<super::ExpandState> {
+        Err(A11yError::not_available(
+            "ExpandCollapsePattern state requires Windows",
         ))
     }
 

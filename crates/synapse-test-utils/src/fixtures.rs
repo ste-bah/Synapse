@@ -351,10 +351,7 @@ mod platform {
             .status()
             .context("invoke WScript.Shell SendKeys ^n via PowerShell")?;
         if !status.success() {
-            bail!(
-                "WScript.Shell SendKeys ^n exited with status {} (pid={pid})",
-                status
-            );
+            bail!("WScript.Shell SendKeys ^n exited with status {status} (pid={pid})");
         }
         Ok(())
     }
