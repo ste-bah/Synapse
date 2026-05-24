@@ -135,13 +135,14 @@ mod windows_fsv {
         ffi::OsString,
         path::{Path, PathBuf},
         process::{Command, Output, Stdio},
+        sync::{Mutex, MutexGuard, OnceLock},
         thread,
         time::{Duration, Instant},
     };
 
     use std::os::windows::process::CommandExt;
 
-    use anyhow::{Context, bail};
+    use anyhow::{Context, anyhow, bail};
     use tempfile::TempDir;
 
     const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
@@ -149,13 +150,22 @@ mod windows_fsv {
 
     use super::SIGINT_RELEASE_BUDGET_MS;
 
+    fn desktop_fsv_lock() -> anyhow::Result<MutexGuard<'static, ()>> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_err| anyhow!("desktop FSV lock poisoned"))
+    }
+
     #[test]
     #[ignore = "requires native Windows desktop, WH_KEYBOARD_LL, and console Ctrl-C delivery"]
     fn wh_keyboard_ll_observes_keyup_within_10ms_after_sigint_fsv() -> anyhow::Result<()> {
+        let _guard = desktop_fsv_lock()?;
         let work_dir = TempDir::new()?;
         let script_path = work_dir.path().join("sigint_keyboard_hook_fsv.ps1");
         std::fs::write(&script_path, POWERSHELL_HOOK_SCRIPT)?;
-        let output = run_powershell_fsv(&script_path, work_dir.path(), &mcp_binary_path()?)?;
+        let output =
+            run_powershell_fsv(&script_path, work_dir.path(), &mcp_binary_path()?, "sigint")?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
 
@@ -181,10 +191,94 @@ mod windows_fsv {
         Ok(())
     }
 
+    #[test]
+    #[ignore = "requires native Windows desktop, WH_KEYBOARD_LL, and stdio child process control"]
+    fn wh_keyboard_ll_observes_keyup_within_10ms_after_connection_closed_fsv() -> anyhow::Result<()>
+    {
+        let _guard = desktop_fsv_lock()?;
+        let work_dir = TempDir::new()?;
+        let script_path = work_dir
+            .path()
+            .join("connection_closed_keyboard_hook_fsv.ps1");
+        std::fs::write(&script_path, POWERSHELL_HOOK_SCRIPT)?;
+        let output = run_powershell_fsv(
+            &script_path,
+            work_dir.path(),
+            &mcp_binary_path()?,
+            "connection_closed",
+        )?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        println!("{}", stdout.trim_end());
+        if !stderr.trim().is_empty() {
+            println!("source_of_truth=powershell_stderr edge=connection_closed after={stderr:?}");
+        }
+
+        if !output.status.success() {
+            bail!(
+                "PowerShell connection_closed WH_KEYBOARD_LL FSV failed with status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+        }
+        assert!(
+            stdout
+                .contains("source_of_truth=keyboard_hook_timeline edge=connection_closed before=")
+        );
+        assert!(
+            stdout.contains(
+                "source_of_truth=keyboard_hook_timeline edge=connection_closed before_connection_closed="
+            )
+        );
+        assert!(
+            stdout.contains("source_of_truth=keyboard_hook_timeline edge=connection_closed after=")
+        );
+        assert!(stdout.contains("source_of_truth=daemon_log edge=connection_closed after_exit=0"));
+        assert!(stdout.contains("\"reason\":\"connection_closed\""));
+        assert!(stdout.contains("\"released_keys\":1"));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires native Windows desktop, WH_KEYBOARD_LL, and stdio child process control"]
+    fn wh_keyboard_ll_observes_keyup_within_10ms_after_panic_mid_press_fsv() -> anyhow::Result<()> {
+        let _guard = desktop_fsv_lock()?;
+        let work_dir = TempDir::new()?;
+        let script_path = work_dir.path().join("panic_keyboard_hook_fsv.ps1");
+        std::fs::write(&script_path, POWERSHELL_HOOK_SCRIPT)?;
+        let output =
+            run_powershell_fsv(&script_path, work_dir.path(), &mcp_binary_path()?, "panic")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        println!("{}", stdout.trim_end());
+        if !stderr.trim().is_empty() {
+            println!("source_of_truth=powershell_stderr edge=panic after={stderr:?}");
+        }
+
+        if !output.status.success() {
+            bail!(
+                "PowerShell panic WH_KEYBOARD_LL FSV failed with status {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status.code()
+            );
+        }
+        assert!(stdout.contains("source_of_truth=keyboard_hook_timeline edge=panic before="));
+        assert!(stdout.contains("source_of_truth=keyboard_hook_timeline edge=panic before_panic="));
+        assert!(stdout.contains("source_of_truth=keyboard_hook_timeline edge=panic after="));
+        assert!(stdout.contains("source_of_truth=daemon_log edge=panic after_exit="));
+        assert!(stdout.contains("after_release_line="));
+        assert!(stdout.contains("source_of_truth=daemon_log edge=panic after_panic_line="));
+        assert!(stdout.contains("\"reason\":\"tool_invocation\""));
+        assert!(stdout.contains("\"reason\":\"panic\""));
+        assert!(stdout.contains("\"released_keys\":1"));
+        Ok(())
+    }
+
     fn run_powershell_fsv(
         script_path: &Path,
         work_dir: &Path,
         mcp_bin: &Path,
+        mode: &str,
     ) -> anyhow::Result<Output> {
         let mut child = Command::new(powershell_exe())
             .args([
@@ -199,6 +293,8 @@ mod windows_fsv {
                 work_dir.as_os_str().to_owned(),
                 OsString::from("-BudgetMs"),
                 OsString::from(SIGINT_RELEASE_BUDGET_MS.to_string()),
+                OsString::from("-Mode"),
+                OsString::from(mode),
             ])
             .creation_flags(CREATE_NEW_CONSOLE)
             .stdout(Stdio::piped())
@@ -248,7 +344,9 @@ mod windows_fsv {
 param(
   [Parameter(Mandatory=$true)][string]$McpBin,
   [Parameter(Mandatory=$true)][string]$WorkDir,
-  [Parameter(Mandatory=$true)][int]$BudgetMs
+  [Parameter(Mandatory=$true)][int]$BudgetMs,
+  [ValidateSet('sigint', 'connection_closed', 'panic')]
+  [string]$Mode = 'sigint'
 )
 
 Set-StrictMode -Version Latest
@@ -545,7 +643,20 @@ function Get-KeyupLatencyAfterSigint([long]$SigintAtMs) {
   return ($latencies | Measure-Object -Minimum).Minimum
 }
 
-function Read-SafetyLine([string]$LogDir) {
+function Get-FirstAKeyDownElapsed() {
+  $latencies = @()
+  foreach ($event in [KeyboardHookRecorder]::Snapshot()) {
+    if ($event.IsAKeyDown()) {
+      $latencies += $event.ElapsedMs
+    }
+  }
+  if ($latencies.Count -eq 0) {
+    return $null
+  }
+  return ($latencies | Measure-Object -Minimum).Minimum
+}
+
+function Read-SafetyLine([string]$LogDir, [string]$Reason) {
   $lines = @()
   foreach ($file in Get-ChildItem -LiteralPath $LogDir -File) {
     foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
@@ -554,7 +665,7 @@ function Read-SafetyLine([string]$LogDir) {
       }
       try {
         $json = $line | ConvertFrom-Json
-        if ($json.fields.code -eq 'SAFETY_RELEASE_ALL_FIRED' -and $json.fields.reason -eq 'sigint') {
+        if ($json.fields.code -eq 'SAFETY_RELEASE_ALL_FIRED' -and $json.fields.reason -eq $Reason) {
           $lines += $line
         }
       } catch {
@@ -562,7 +673,33 @@ function Read-SafetyLine([string]$LogDir) {
     }
   }
   if ($lines.Count -eq 0) {
-    throw 'expected SAFETY_RELEASE_ALL_FIRED reason=sigint in daemon logs'
+    throw "expected SAFETY_RELEASE_ALL_FIRED reason=$Reason in daemon logs"
+  }
+  return $lines[$lines.Count - 1]
+}
+
+function Read-ReleasedKeyLine([string]$LogDir) {
+  $lines = @()
+  foreach ($file in Get-ChildItem -LiteralPath $LogDir -File) {
+    foreach ($line in [System.IO.File]::ReadLines($file.FullName)) {
+      if ([string]::IsNullOrWhiteSpace($line)) {
+        continue
+      }
+      try {
+        $json = $line | ConvertFrom-Json
+        if (
+          $json.fields.code -eq 'SAFETY_RELEASE_ALL_FIRED' -and
+          $json.fields.reason -eq 'tool_invocation' -and
+          $json.fields.released_keys -eq 1
+        ) {
+          $lines += $line
+        }
+      } catch {
+      }
+    }
+  }
+  if ($lines.Count -eq 0) {
+    throw 'expected SAFETY_RELEASE_ALL_FIRED reason=tool_invocation released_keys=1 in daemon logs'
   }
   return $lines[$lines.Count - 1]
 }
@@ -584,6 +721,9 @@ try {
   $startInfo.CreateNoWindow = $false
   $startInfo.EnvironmentVariables['SYNAPSE_LOG_LEVEL'] = 'debug'
   $startInfo.EnvironmentVariables['SYNAPSE_LOG_DIR'] = $logDir
+  if ($Mode -eq 'panic') {
+    $startInfo.EnvironmentVariables['SYNAPSE_MCP_FORCE_PANIC_DURING_ACT'] = 'act_press_after_keydown'
+  }
   $proc = [System.Diagnostics.Process]::Start($startInfo)
 
   Write-RawJsonLine $proc '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"synapse-sigint-keyboard-hook-fsv","version":"0.1.0"}}}'
@@ -594,32 +734,52 @@ try {
   }
   Write-RawJsonLine $proc '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
 
-  Write-Output "source_of_truth=keyboard_hook_timeline edge=sigint before=$([KeyboardHookRecorder]::FormatTimeline())"
+  Write-Output "source_of_truth=keyboard_hook_timeline edge=$Mode before=$([KeyboardHookRecorder]::FormatTimeline())"
   Write-RawJsonLine $proc '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"act_press","arguments":{"keys":["a"],"hold_ms":5000,"backend":"software"}}}'
   Wait-ForHookEvent { param($event) $event.IsAKeyDown() } 2000
-  Write-Output "source_of_truth=keyboard_hook_timeline edge=sigint before_sigint=$([KeyboardHookRecorder]::FormatTimeline())"
+  Write-Output "source_of_truth=keyboard_hook_timeline edge=$Mode before_$Mode=$([KeyboardHookRecorder]::FormatTimeline())"
 
-  if (-not [ConsoleCtrl]::InstallIgnoreHandler()) {
-    throw 'SetConsoleCtrlHandler custom ignore handler failed'
+  if ($Mode -eq 'panic') {
+    $triggerAtMs = Get-FirstAKeyDownElapsed
+    if ($null -eq $triggerAtMs) {
+      throw 'expected A KeyDown before forced panic'
+    }
+  } else {
+    $triggerAtMs = [KeyboardHookRecorder]::ElapsedMs()
   }
-  $ignoreCtrlC = $true
-  $sigintAtMs = [KeyboardHookRecorder]::ElapsedMs()
-  if (-not [ConsoleCtrl]::GenerateConsoleCtrlEvent(1, 0)) {
-    throw 'GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) failed'
+  if ($Mode -eq 'sigint') {
+    if (-not [ConsoleCtrl]::InstallIgnoreHandler()) {
+      throw 'SetConsoleCtrlHandler custom ignore handler failed'
+    }
+    $ignoreCtrlC = $true
+    if (-not [ConsoleCtrl]::GenerateConsoleCtrlEvent(1, 0)) {
+      throw 'GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, 0) failed'
+    }
+  } elseif ($Mode -eq 'connection_closed') {
+    $proc.StandardInput.Close()
+  } elseif ($Mode -eq 'panic') {
+    # The debug panic is injected inside act_press immediately after keydown.
+  } else {
+    throw "unsupported mode $Mode"
   }
-  Wait-ForHookEvent { param($event) $event.IsAKeyUp() -and $event.ElapsedMs -ge $sigintAtMs } 2000
-  $latency = Get-KeyupLatencyAfterSigint $sigintAtMs
+  Wait-ForHookEvent { param($event) $event.IsAKeyUp() -and $event.ElapsedMs -ge $triggerAtMs } 2000
+  $latency = Get-KeyupLatencyAfterSigint $triggerAtMs
   if ($null -eq $latency) {
-    throw 'expected A KeyUp after SIGINT'
+    throw "expected A KeyUp after $Mode"
   }
-  Write-Output "source_of_truth=keyboard_hook_timeline edge=sigint after=$([KeyboardHookRecorder]::FormatTimeline()) sigint_at_ms=$sigintAtMs keyup_latency_ms=$latency"
+  Write-Output "source_of_truth=keyboard_hook_timeline edge=$Mode after=$([KeyboardHookRecorder]::FormatTimeline()) trigger_at_ms=$triggerAtMs keyup_latency_ms=$latency"
   if ($latency -gt $BudgetMs) {
-    throw "expected A KeyUp within ${BudgetMs}ms after SIGINT, got ${latency}ms"
+    throw "expected A KeyUp within ${BudgetMs}ms after $Mode, got ${latency}ms"
   }
 
-  if (-not $proc.WaitForExit(10000)) {
+  if ($Mode -eq 'panic' -and -not $proc.HasExited) {
+    try { $proc.StandardInput.Close() } catch { }
+  }
+  $stdoutDrain = $proc.StandardOutput.ReadToEndAsync()
+  $stderrDrain = $proc.StandardError.ReadToEndAsync()
+  if (-not $proc.WaitForExit(20000)) {
     try { $proc.Kill() } catch { }
-    throw 'timed out waiting for child exit after SIGINT'
+    throw "timed out waiting for child exit after $Mode"
   }
   $exitCode = $proc.ExitCode
   if ($ignoreCtrlC) {
@@ -627,14 +787,25 @@ try {
     $ignoreCtrlC = $false
   }
 
-  $stderr = $proc.StandardError.ReadToEnd()
-  if (-not [string]::IsNullOrWhiteSpace($stderr)) {
-    Write-Output "source_of_truth=daemon_stderr edge=sigint after=$stderr"
+  $stdoutRemainder = $stdoutDrain.Result
+  $stderr = $stderrDrain.Result
+  if (-not [string]::IsNullOrWhiteSpace($stdoutRemainder)) {
+    Write-Output "source_of_truth=daemon_stdout edge=$Mode after=$stdoutRemainder"
   }
-  $safetyLine = Read-SafetyLine $logDir
-  Write-Output "source_of_truth=daemon_log edge=sigint after_exit=$exitCode after_safety_line=$safetyLine"
-  if ($exitCode -ne 0) {
-    throw "expected daemon exit code 0 after SIGINT, got $exitCode"
+  if (-not [string]::IsNullOrWhiteSpace($stderr)) {
+    Write-Output "source_of_truth=daemon_stderr edge=$Mode after=$stderr"
+  }
+  if ($Mode -eq 'panic') {
+    $releaseLine = Read-ReleasedKeyLine $logDir
+    $panicLine = Read-SafetyLine $logDir 'panic'
+    Write-Output "source_of_truth=daemon_log edge=panic after_exit=$exitCode after_release_line=$releaseLine"
+    Write-Output "source_of_truth=daemon_log edge=panic after_panic_line=$panicLine"
+    exit 0
+  }
+  $safetyLine = Read-SafetyLine $logDir $Mode
+  Write-Output "source_of_truth=daemon_log edge=$Mode after_exit=$exitCode after_safety_line=$safetyLine"
+  if ($Mode -ne 'panic' -and $exitCode -ne 0) {
+    throw "expected daemon exit code 0 after $Mode, got $exitCode"
   }
   if ($safetyLine -notmatch '"released_keys":1') {
     throw "expected released_keys=1 in safety line: $safetyLine"

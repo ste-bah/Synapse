@@ -37,6 +37,12 @@ use crate::{
     },
 };
 
+type M2ActionContext = (
+    synapse_action::ActionHandle,
+    Option<Arc<RecordingBackend>>,
+    Option<CancellationToken>,
+);
+
 #[derive(Debug, Clone)]
 pub struct SynapseService {
     started_at: Instant,
@@ -112,12 +118,16 @@ impl SynapseService {
         }
     }
 
-    fn m2_action_context(
-        &self,
-    ) -> Result<(synapse_action::ActionHandle, Option<Arc<RecordingBackend>>), ErrorData> {
+    fn m2_action_context(&self) -> Result<M2ActionContext, ErrorData> {
         self.m2_state
             .lock()
-            .map(|state| (state.emitter_handle.clone(), state.recording.clone()))
+            .map(|state| {
+                (
+                    state.emitter_handle.clone(),
+                    state.recording.clone(),
+                    state.connection_closed_cancel.clone(),
+                )
+            })
             .map_err(|_err| {
                 mcp_error(
                     synapse_core::error_codes::OBSERVE_INTERNAL,
@@ -318,7 +328,7 @@ impl SynapseService {
             kind = "act_click",
             "tool.invocation kind=act_click"
         );
-        let (handle, recording) = self.m2_action_context()?;
+        let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
         act_click_with_handle(handle, recording, params.0)
             .await
             .map(Json)
@@ -334,7 +344,7 @@ impl SynapseService {
             kind = "act_type",
             "tool.invocation kind=act_type"
         );
-        let (handle, recording) = self.m2_action_context()?;
+        let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
         self.ensure_act_type_foreground(recording.as_ref())?;
         act_type_with_handle(handle, recording, params.0)
             .await
@@ -352,8 +362,8 @@ impl SynapseService {
             "tool.invocation kind=act_press"
         );
         maybe_force_panic_during_act("act_press");
-        let (handle, recording) = self.m2_action_context()?;
-        act_press_with_handle(handle, recording, params.0)
+        let (handle, recording, connection_closed_cancel) = self.m2_action_context()?;
+        act_press_with_handle(handle, recording, connection_closed_cancel, params.0)
             .await
             .map(Json)
     }
@@ -368,7 +378,7 @@ impl SynapseService {
             kind = "act_aim",
             "tool.invocation kind=act_aim"
         );
-        let (handle, recording) = self.m2_action_context()?;
+        let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
         act_aim_with_handle(handle, recording, params.0)
             .await
             .map(Json)
@@ -384,7 +394,7 @@ impl SynapseService {
             kind = "act_drag",
             "tool.invocation kind=act_drag"
         );
-        let (handle, recording) = self.m2_action_context()?;
+        let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
         act_drag_with_handle(handle, recording, params.0)
             .await
             .map(Json)
@@ -402,7 +412,7 @@ impl SynapseService {
             kind = "act_scroll",
             "tool.invocation kind=act_scroll"
         );
-        let (handle, recording) = self.m2_action_context()?;
+        let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
         act_scroll_with_handle(handle, recording, params.0)
             .await
             .map(Json)
@@ -418,7 +428,7 @@ impl SynapseService {
             kind = "act_pad",
             "tool.invocation kind=act_pad"
         );
-        let (handle, recording) = self.m2_action_context()?;
+        let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
         act_pad_with_handle(handle, recording, params.0)
             .await
             .map(Json)

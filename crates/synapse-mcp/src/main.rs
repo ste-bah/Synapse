@@ -2,12 +2,20 @@ mod m1;
 mod m2;
 mod server;
 
-use std::{path::PathBuf, process::ExitCode, time::Duration};
+use std::{
+    io,
+    path::PathBuf,
+    pin::Pin,
+    process::ExitCode,
+    task::{Context as TaskContext, Poll},
+    time::Duration,
+};
 
 use anyhow::Context;
 use clap::{Parser, ValueEnum};
 use rmcp::ServiceExt;
 use synapse_telemetry::{TelemetryConfig, TelemetryGuard, init_tracing};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::filter::LevelFilter;
 
@@ -97,7 +105,13 @@ async fn run_stdio(telemetry_guard: TelemetryGuard) -> anyhow::Result<ExitCode> 
     );
     synapse_action::install_panic_hook();
     let m2_emitter_done = service.m2_emitter_done_receiver();
-    let start = service.serve_with_ct(rmcp::transport::stdio(), rmcp_token.clone());
+    let (stdin, stdout) = rmcp::transport::stdio();
+    let stdin = CancelOnEofRead::new(
+        stdin,
+        emitter_connection_closed_token.clone(),
+        rmcp_token.clone(),
+    );
+    let start = service.serve_with_ct((stdin, stdout), rmcp_token.clone());
     tokio::pin!(start);
     let service = tokio::select! {
         service = &mut start => match service {
@@ -142,6 +156,52 @@ async fn run_stdio(telemetry_guard: TelemetryGuard) -> anyhow::Result<ExitCode> 
 
     drop(telemetry_guard);
     Ok(code)
+}
+
+struct CancelOnEofRead<R> {
+    inner: R,
+    connection_closed_cancel: CancellationToken,
+    service_cancel: CancellationToken,
+    eof_seen: bool,
+}
+
+impl<R> CancelOnEofRead<R> {
+    const fn new(
+        inner: R,
+        connection_closed_cancel: CancellationToken,
+        service_cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            inner,
+            connection_closed_cancel,
+            service_cancel,
+            eof_seen: false,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for CancelOnEofRead<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before_len = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(&result, Poll::Ready(Ok(())))
+            && buf.filled().len() == before_len
+            && !self.eof_seen
+        {
+            self.eof_seen = true;
+            self.connection_closed_cancel.cancel();
+            self.service_cancel.cancel();
+            tracing::info!(
+                code = "MCP_STDIO_EOF_CONNECTION_CLOSED",
+                "source_of_truth=stdio edge=connection_closed after=eof"
+            );
+        }
+        result
+    }
 }
 
 #[cfg(windows)]

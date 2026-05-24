@@ -7,6 +7,7 @@ use synapse_action::{
     ActionBackend, ActionError, ActionHandle, EmitState, RecordedInput, RecordingBackend,
 };
 use synapse_core::{Action, Backend, Key, KeyCode, error_codes};
+use tokio_util::sync::CancellationToken;
 
 use crate::m1::mcp_error;
 
@@ -46,6 +47,7 @@ pub struct ActPressResponse {
 pub async fn act_press_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
+    connection_closed_cancel: Option<CancellationToken>,
     params: ActPressParams,
 ) -> Result<ActPressResponse, ErrorData> {
     validate_hold_ms(params.hold_ms)?;
@@ -63,7 +65,14 @@ pub async fn act_press_with_handle(
     if let Some(recording) = recording {
         execute_recording(&recording, &action)?;
     } else {
-        execute_live_press_sequence(handle, keys, params.hold_ms, backend).await?;
+        execute_live_press_sequence(
+            handle,
+            keys,
+            params.hold_ms,
+            backend,
+            connection_closed_cancel,
+        )
+        .await?;
     }
 
     Ok(ActPressResponse {
@@ -220,6 +229,7 @@ async fn execute_live_press_sequence(
     keys: Vec<Key>,
     hold_ms: u32,
     backend: Backend,
+    connection_closed_cancel: Option<CancellationToken>,
 ) -> Result<(), ErrorData> {
     let mut pressed = Vec::with_capacity(keys.len());
     for key in &keys {
@@ -234,9 +244,18 @@ async fn execute_live_press_sequence(
             return Err(action_error_to_mcp(&error));
         }
         pressed.push(key.clone());
+        maybe_force_panic_after_keydown();
     }
 
-    tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
+    let connection_closed = if let Some(cancel) = connection_closed_cancel {
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))) => false,
+            () = cancel.cancelled() => true,
+        }
+    } else {
+        tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
+        false
+    };
 
     let mut first_error = None;
     for key in pressed.iter().rev() {
@@ -255,8 +274,31 @@ async fn execute_live_press_sequence(
     if let Some(error) = first_error {
         return Err(action_error_to_mcp(&error));
     }
+    if connection_closed {
+        tracing::warn!(
+            code = "M2_ACT_PRESS_CONNECTION_CLOSED_RELEASE",
+            released_keys = pressed.len(),
+            "source_of_truth=connection_closed edge=act_press after=pressed_keys_released"
+        );
+    }
     Ok(())
 }
+
+#[cfg(debug_assertions)]
+fn maybe_force_panic_after_keydown() {
+    if std::env::var("SYNAPSE_MCP_FORCE_PANIC_DURING_ACT").as_deref()
+        == Ok("act_press_after_keydown")
+    {
+        tracing::warn!(
+            code = "M2_ACT_PRESS_FORCE_PANIC_AFTER_KEYDOWN",
+            "source_of_truth=act_press edge=force_panic after=keydown"
+        );
+        tokio::task::block_in_place(|| panic!("forced panic during act_press after keydown"));
+    }
+}
+
+#[cfg(not(debug_assertions))]
+const fn maybe_force_panic_after_keydown() {}
 
 async fn release_pressed_keys(handle: &ActionHandle, pressed: &[Key], backend: Backend) {
     for key in pressed.iter().rev() {
@@ -366,7 +408,7 @@ mod tests {
         let before = recording.events();
         println!("source_of_truth=act_press_recording edge=ordered_chord before={before:?}");
 
-        let response = act_press_with_handle(handle, Some(Arc::clone(&recording)), params)
+        let response = act_press_with_handle(handle, Some(Arc::clone(&recording)), None, params)
             .await
             .unwrap_or_else(|error| panic!("act_press recording should succeed: {error}"));
         let after = recording.events();
@@ -401,6 +443,7 @@ mod tests {
             keys,
             50,
             Backend::Software,
+            None,
         ));
         let before_release = wait_for_held_key(&snapshot_handle, "a").await;
         println!(

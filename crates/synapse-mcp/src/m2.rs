@@ -38,6 +38,7 @@ pub struct M2State {
     pub emitter_handle: ActionHandle,
     pub snapshot_handle: ActionEmitterSnapshotHandle,
     pub recording: Option<Arc<RecordingBackend>>,
+    pub connection_closed_cancel: Option<CancellationToken>,
     retained_emitter: Option<ActionEmitter>,
     emitter_cancel: Option<CancellationToken>,
     emitter_task: Option<JoinHandle<ActionStateSnapshot>>,
@@ -123,6 +124,7 @@ impl M2State {
         );
         let recording =
             recording_backend_enabled(recording_backend).then(|| Arc::new(RecordingBackend::new()));
+        let tool_connection_closed_cancel = connection_closed_cancel.clone();
         let build_emitter = || {
             actor_backend
                 .as_ref()
@@ -149,6 +151,7 @@ impl M2State {
                 emitter_handle,
                 snapshot_handle,
                 recording,
+                connection_closed_cancel: tool_connection_closed_cancel,
                 retained_emitter: None,
                 emitter_cancel: None,
                 emitter_task: Some(emitter_task),
@@ -161,6 +164,7 @@ impl M2State {
             emitter_handle,
             snapshot_handle,
             recording,
+            connection_closed_cancel: tool_connection_closed_cancel,
             retained_emitter: Some(emitter),
             emitter_cancel: None,
             emitter_task: None,
@@ -209,6 +213,10 @@ impl fmt::Debug for M2State {
             .field("emitter_handle", &self.emitter_handle)
             .field("snapshot_handle", &self.snapshot_handle)
             .field("recording", &self.recording_enabled())
+            .field(
+                "connection_closed_cancel",
+                &self.connection_closed_cancel.is_some(),
+            )
             .field("retained_emitter", &self.emitter_retained())
             .field("emitter_cancel", &self.emitter_cancel.is_some())
             .field("emitter_task", &self.emitter_running())
