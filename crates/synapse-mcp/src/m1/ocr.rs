@@ -1,5 +1,5 @@
 use rmcp::ErrorData;
-use synapse_core::{OcrBackend, OcrResult, OcrWord, Rect, error_codes};
+use synapse_core::{OcrResult, OcrWord, Rect, error_codes};
 use synapse_perception::{TextRegion, read_text, read_text_with_provider};
 
 use crate::m1::{M1State, ReadTextParams, current_input, mcp_error};
@@ -15,14 +15,14 @@ pub fn read_text_in_state(state: &M1State, params: ReadTextParams) -> Result<Ocr
             .map_err(|err| mcp_error(err.code(), err.to_string()))?;
         return Ok(ocr_result_from_text_regions(
             words,
-            params.backend,
+            region,
             params.lang_hint,
         ));
     }
     let words = read_text(region).map_err(|err| mcp_error(err.code(), err.to_string()))?;
     Ok(ocr_result_from_text_regions(
         words,
-        params.backend,
+        region,
         params.lang_hint,
     ))
 }
@@ -53,26 +53,48 @@ fn text_region(state: &M1State, params: &ReadTextParams) -> Result<Rect, ErrorDa
 
 fn ocr_result_from_text_regions(
     regions: Vec<TextRegion>,
-    backend: OcrBackend,
-    language: Option<String>,
+    region: Rect,
+    lang: Option<String>,
 ) -> OcrResult {
-    let text = regions
+    let full_text = regions
         .iter()
         .map(|word| word.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
+    let confidence = aggregate_confidence(&regions);
     OcrResult {
-        text,
+        full_text,
         words: regions
             .into_iter()
             .map(|word| OcrWord {
                 text: word.text,
                 bbox: word.bbox,
-                confidence: word.confidence,
+                confidence: normalize_confidence(word.confidence),
             })
             .collect(),
-        language,
-        backend,
+        confidence,
+        region,
+        lang: lang.unwrap_or_else(|| "und".to_owned()),
+    }
+}
+
+fn aggregate_confidence(regions: &[TextRegion]) -> f32 {
+    if regions.is_empty() {
+        return 0.0;
+    }
+    let sum = regions
+        .iter()
+        .map(|word| normalize_confidence(word.confidence))
+        .sum::<f32>();
+    let count = u16::try_from(regions.len()).unwrap_or(u16::MAX);
+    sum / f32::from(count)
+}
+
+const fn normalize_confidence(confidence: f32) -> f32 {
+    if confidence.is_finite() {
+        confidence.clamp(0.0, 1.0)
+    } else {
+        0.0
     }
 }
 

@@ -894,12 +894,11 @@ pub enum OcrBackend {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OcrResult {
-    pub text: String,
-    #[serde(default)]
+    pub full_text: String,
     pub words: Vec<OcrWord>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub language: Option<String>,
-    pub backend: OcrBackend,
+    pub confidence: f32,
+    pub region: Rect,
+    pub lang: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

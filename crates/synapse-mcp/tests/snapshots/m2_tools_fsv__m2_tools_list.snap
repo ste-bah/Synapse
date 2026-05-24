@@ -1,6 +1,5 @@
 ---
 source: crates/synapse-mcp/tests/m2_tools_fsv.rs
-assertion_line: 123
 expression: schemas
 ---
 [
@@ -2332,14 +2331,6 @@ expression: schemas
     "name": "read_text",
     "outputSchema": {
       "$defs": {
-        "OcrBackend": {
-          "enum": [
-            "winrt",
-            "crnn",
-            "auto"
-          ],
-          "type": "string"
-        },
         "OcrWord": {
           "additionalProperties": false,
           "properties": {
@@ -2393,20 +2384,20 @@ expression: schemas
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "additionalProperties": false,
       "properties": {
-        "backend": {
-          "$ref": "#/$defs/OcrBackend"
+        "confidence": {
+          "format": "float",
+          "type": "number"
         },
-        "language": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "text": {
+        "full_text": {
           "type": "string"
         },
+        "lang": {
+          "type": "string"
+        },
+        "region": {
+          "$ref": "#/$defs/Rect"
+        },
         "words": {
-          "default": [],
           "items": {
             "$ref": "#/$defs/OcrWord"
           },
@@ -2414,8 +2405,11 @@ expression: schemas
         }
       },
       "required": [
-        "text",
-        "backend"
+        "full_text",
+        "words",
+        "confidence",
+        "region",
+        "lang"
       ],
       "title": "OcrResult",
       "type": "object"

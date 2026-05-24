@@ -894,10 +894,11 @@ pub struct StoredSession {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OcrResult {
-    pub text: String,
+    pub full_text: String,
     pub words: Vec<OcrWord>,
-    pub language: Option<String>,
-    pub backend: OcrBackend,
+    pub confidence: f32,
+    pub region: Rect,
+    pub lang: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -907,6 +908,10 @@ pub struct OcrWord {
     pub confidence: f32,
 }
 ```
+
+M3 changes `OcrResult` from the pre-v1 `text` / `language` / `backend` output to the
+shape above. Cached OCR payloads are wipe-and-rebuild data; do not add a migration shim
+for the pre-v1 shape.
 
 ---
 

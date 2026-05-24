@@ -64,6 +64,8 @@ override:   --db <path>     (CLI flag)
 | `CF_KV` | `[utf8]` | bytes | raw | none | 10 MB | 50 MB | Generic key-value extension |
 
 Default DB size budget **~4 GB** including write-amplification. Soft cap → start aggressive expiry. Hard cap → refuse writes; surface `STORAGE_CF_HARD_CAP_REACHED`.
+`CF_OCR_CACHE` is recomputable pre-v1 data: schema changes such as the M3 `OcrResult`
+shape are handled by wiping/rebuilding cached OCR entries, not by compatibility shims.
 
 Retention is operator-configurable in `config.toml`:
 
@@ -469,7 +471,7 @@ Profiles are TOML data; no scripts in v1. Post-v1: optional profile signing via 
 
 ## 9. Migrations
 
-Pre-v1: none. DB wipe on schema change is acceptable. CI tests wipe-and-rebuild from a sample data set.
+Pre-v1: none. DB wipe on schema change is acceptable. Local FSV tests wipe-and-rebuild from a sample data set.
 
 Post-v1: migrations live in `synapse-storage::migrations` with explicit `from -> to` functions. Idempotent and resumable. Migration failure halts the daemon with `STORAGE_SCHEMA_MISMATCH`; operator runs `synapse-mcp db migrate` manually.
 

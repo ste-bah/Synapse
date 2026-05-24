@@ -157,6 +157,10 @@ pub struct ReadTextParams {
     #[serde(default)]
     pub element_id: Option<ElementId>,
     #[serde(default)]
+    #[expect(
+        dead_code,
+        reason = "backend remains part of the M1 request schema; provider selection is not branched here yet"
+    )]
     pub backend: OcrBackend,
     #[serde(default)]
     pub lang_hint: Option<String>,

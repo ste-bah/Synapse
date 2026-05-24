@@ -279,8 +279,11 @@ expression: projection
     "outputSchemaRoot": {
       "additionalProperties": false,
       "required": [
-        "text",
-        "backend"
+        "full_text",
+        "words",
+        "confidence",
+        "region",
+        "lang"
       ],
       "title": "OcrResult",
       "type": "object"

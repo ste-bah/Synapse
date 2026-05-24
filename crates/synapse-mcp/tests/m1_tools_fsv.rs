@@ -309,17 +309,31 @@ async fn verify_read_text(client: &mut StdioMcpClient) -> anyhow::Result<()> {
     let ocr_resp = client
         .tools_call(
             "read_text",
-            json!({"region": {"x": 5, "y": 7, "w": 256, "h": 64}}),
+            json!({"region": {"x": 5, "y": 7, "w": 256, "h": 64}, "lang_hint": "en"}),
         )
         .await?;
-    let ocr: OcrResult = structured(&ocr_resp)?;
+    let structured_ocr = &ocr_resp["structuredContent"];
+    assert!(structured_ocr.get("text").is_none());
+    assert!(structured_ocr.get("language").is_none());
+    assert!(structured_ocr.get("backend").is_none());
+    let ocr: OcrResult =
+        serde_json::from_value(structured_ocr.clone()).context("decode OCR structuredContent")?;
     println!(
-        "source_of_truth=mcp_read_text edge=synthetic_region after=text:{} words:{}",
-        ocr.text,
-        ocr.words.len()
+        "source_of_truth=mcp_read_text edge=synthetic_region after=full_text:{} words:{} confidence:{:.3} region:{:?} lang:{}",
+        ocr.full_text,
+        ocr.words.len(),
+        ocr.confidence,
+        ocr.region,
+        ocr.lang
     );
-    assert_eq!(ocr.text, "Synapse");
+    assert_eq!(ocr.full_text, "Synapse");
     assert_eq!(ocr.words.len(), 1);
+    assert!((ocr.confidence - 0.99).abs() < 0.001);
+    assert_eq!(ocr.region.x, 5);
+    assert_eq!(ocr.region.y, 7);
+    assert_eq!(ocr.region.w, 256);
+    assert_eq!(ocr.region.h, 64);
+    assert_eq!(ocr.lang, "en");
 
     println!(
         "source_of_truth=mcp_read_text edge=element_id before=element_id:0x1234:0000002a00000001"
@@ -330,13 +344,22 @@ async fn verify_read_text(client: &mut StdioMcpClient) -> anyhow::Result<()> {
             json!({"element_id": "0x1234:0000002a00000001"}),
         )
         .await?;
-    let element_ocr: OcrResult = structured(&element_ocr_resp)?;
+    let structured_element_ocr = &element_ocr_resp["structuredContent"];
+    assert!(structured_element_ocr.get("text").is_none());
+    assert!(structured_element_ocr.get("language").is_none());
+    assert!(structured_element_ocr.get("backend").is_none());
+    let element_ocr: OcrResult = serde_json::from_value(structured_element_ocr.clone())
+        .context("decode element OCR structuredContent")?;
     println!(
-        "source_of_truth=mcp_read_text edge=element_id after=text:{} words:{}",
-        element_ocr.text,
-        element_ocr.words.len()
+        "source_of_truth=mcp_read_text edge=element_id after=full_text:{} words:{} confidence:{:.3} region:{:?} lang:{}",
+        element_ocr.full_text,
+        element_ocr.words.len(),
+        element_ocr.confidence,
+        element_ocr.region,
+        element_ocr.lang
     );
-    assert_eq!(element_ocr.text, "Synapse");
+    assert_eq!(element_ocr.full_text, "Synapse");
+    assert_eq!(element_ocr.lang, "und");
 
     println!("source_of_truth=mcp_read_text edge=missing_target before=params:empty");
     let missing_target = client.tools_call_error("read_text", json!({})).await?;

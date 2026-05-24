@@ -186,11 +186,16 @@ Returns:
 
 ```json
 {
-  "text": "...",
+  "full_text": "...",
   "words": [{"text": "Save", "bbox": {}, "confidence": 0.99}],
-  "language": "en"
+  "confidence": 0.99,
+  "region": {"x": 10, "y": 20, "w": 120, "h": 32},
+  "lang": "en"
 }
 ```
+
+Pre-v1 OCR cache/tool payloads using `text` / `language` / `backend` are wipe-and-rebuild;
+the M3 response shape does not carry a compatibility shim.
 
 ### 3.5 `read_hud`
 
