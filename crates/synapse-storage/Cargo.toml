@@ -26,5 +26,9 @@ insta.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 
+[[bench]]
+name = "batch_throughput"
+harness = false
+
 [lints]
 workspace = true

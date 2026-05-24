@@ -1,3 +1,4 @@
+mod batch;
 pub mod cf;
 pub mod codecs;
 pub mod compaction;
@@ -5,6 +6,7 @@ pub mod error;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, DBCompressionType,
@@ -25,7 +27,8 @@ const SCHEMA_VERSION_KEY: &[u8] = b"__schema_version";
 pub struct Db {
     pub path: PathBuf,
     pub schema_version: u32,
-    inner: DB,
+    batcher: batch::Batcher,
+    inner: Arc<DB>,
 }
 
 impl fmt::Debug for Db {
@@ -65,11 +68,55 @@ impl Db {
             }
         }
 
+        let inner = Arc::new(inner);
+        let batcher = batch::Batcher::spawn(Arc::clone(&inner));
+
         Ok(Self {
             path: path.to_path_buf(),
             schema_version,
+            batcher,
             inner,
         })
+    }
+
+    /// Enqueues key/value writes for one column family.
+    ///
+    /// Callers aggregate producer-side and submit batches; per-frame single
+    /// writes intentionally are not part of this API.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::WriteFailed`] when the column family is missing,
+    /// the background batcher is unavailable, or `RocksDB` rejects the batch.
+    #[tracing::instrument(skip_all, fields(cf_name))]
+    pub fn put_batch<I, K, V>(&self, cf_name: &str, kvs: I) -> StorageResult<()>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
+        self.inner
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::WriteFailed {
+                cf_name: cf_name.to_owned(),
+                detail: "column family handle missing".to_owned(),
+            })?;
+        let kvs = kvs
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        self.batcher.put_batch(cf_name, kvs)
+    }
+
+    /// Flushes pending batched writes with synchronous `RocksDB` write options.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::WriteFailed`] when the background batcher is
+    /// unavailable or `RocksDB` rejects the flush.
+    #[tracing::instrument(skip_all)]
+    pub fn flush(&self) -> StorageResult<()> {
+        self.batcher.flush()
     }
 
     /// Scans a column family into owned key/value bytes.
@@ -210,6 +257,8 @@ fn open_failed_detail(path: &Path, detail: String) -> StorageError {
     }
 }
 
+#[cfg(test)]
+mod batch_tests;
 #[cfg(test)]
 mod compaction_tests;
 #[cfg(test)]
