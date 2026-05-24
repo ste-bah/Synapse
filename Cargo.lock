@@ -3258,7 +3258,9 @@ dependencies = [
 name = "synapse-audio"
 version = "0.1.0"
 dependencies = [
+ "ort",
  "serde",
+ "sha2",
  "synapse-core",
  "thiserror",
  "tokio",
