@@ -274,7 +274,7 @@ Every PR must preserve this. PRs that add planning, MCTS, GOAP, skill libraries,
 |---|---|---|
 | 500 LoC cap erodes silently — emitter.rs ended at 1474, vigem.rs 1131, invoke.rs 653 | M2 carry-over | Reviewers enforce at ≤ 450 LoC during code review; M3 work-item A.0 splits the M2 over-cap files **before** building reflex on top |
 | Telemetry log GC at startup only → long-lived daemon exceeds 500 MB cap | #241 (partially landed in `615cd4f`) | Every long-running background task uses `tokio::interval` with explicit cadence; document the cadence in the work-item acceptance |
-| `fsv-*/` ephemeral run dirs leak into the worktree | #242 | Standardize on `.runs/` (gitignored) for any test that writes ad-hoc artifacts; never write into the repo root |
+| `fsv-*/` ephemeral run dirs leak into the worktree | #242/#261 | Standardize on `.runs/` (gitignored) for any test that writes ad-hoc artifacts; use `scripts/clean-runs.ps1` for pruning; never write into the repo root |
 | `bench_results/<sha>/` was committed per commit (8 dirs removed by #260) | #243/#260 | Use local `critcmp` JSON outside the repo; stop committing per-commit baselines |
 | M2 packaged-Notepad UIA `MenuBar` discovery is silently empty under `ControlView` walker | #244 | M3 work-item A.0c switches to `RawView`; future a11y work must include a UWP-packaged-app smoke test |
 | Coords are physical (DPI-aware) pixels — undocumented; trips DPI-unaware SoT readers | #239 | M3 work-item A.0g patches tool schema descriptions + `03_action.md`; future tools must document coord space explicitly |

@@ -95,7 +95,12 @@ The canonical location for ad-hoc run artifacts (`.log`, `.ndjson`, scratch JSON
 
 The legacy `fsv-<NNN>/` pattern (e.g. `fsv-218/`) at the repo root is **deprecated** and excluded by `.gitignore`. Existing content can be migrated to `.runs/<id>/` or deleted.
 
-A small `scripts/clean-runs.ps1` (tracked under #242) prunes `.runs/` subdirs older than 30 days.
+`scripts/clean-runs.ps1` prunes `.runs/` subdirs older than 30 days by default. It only touches root `fsv-*` dirs when `-IncludeLegacyFsv` is set.
+
+```powershell
+.\scripts\clean-runs.ps1
+.\scripts\clean-runs.ps1 -IncludeLegacyFsv -WhatIf
+```
 
 ## Benchmark baselines (#243 / #260 / #350)
 
