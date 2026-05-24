@@ -400,21 +400,52 @@ async fn notepad_save_invalid_dir_shows_dialog_and_writes_no_file_fsv() -> anyho
 
     press_keys(&mut client, "invalid_dir_dismiss_error", json!(["escape"])).await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    press_keys(
-        &mut client,
-        "invalid_dir_select_filename",
-        json!(["ctrl", "a"]),
-    )
-    .await?;
     let cleanup_dialog = observe(&mut client).await?;
     println!(
-        "source_of_truth=mcp_observe edge=invalid_dir_cleanup_dialog after_title={:?} process={:?} focused_role={:?}",
+        "source_of_truth=mcp_observe edge=invalid_dir_cleanup_dialog before_select hwnd=0x{:x} pid={} title={:?} process={:?} focused_role={:?}",
+        cleanup_dialog.foreground.hwnd,
+        cleanup_dialog.foreground.pid,
         cleanup_dialog.foreground.window_title,
         cleanup_dialog.foreground.process_name,
         cleanup_dialog
             .focused
             .as_ref()
             .map(|focused| focused.role.as_str())
+    );
+    assert!(
+        cleanup_dialog
+            .foreground
+            .window_title
+            .eq_ignore_ascii_case("Save as"),
+        "expected Save as foreground after dismissing invalid path dialog, got {:?}",
+        cleanup_dialog.foreground.window_title
+    );
+    press_keys(
+        &mut client,
+        "invalid_dir_select_filename",
+        json!(["ctrl", "a"]),
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let cleanup_dialog_after_select = observe(&mut client).await?;
+    println!(
+        "source_of_truth=mcp_observe edge=invalid_dir_cleanup_dialog after_select hwnd=0x{:x} pid={} title={:?} process={:?} focused_role={:?}",
+        cleanup_dialog_after_select.foreground.hwnd,
+        cleanup_dialog_after_select.foreground.pid,
+        cleanup_dialog_after_select.foreground.window_title,
+        cleanup_dialog_after_select.foreground.process_name,
+        cleanup_dialog_after_select
+            .focused
+            .as_ref()
+            .map(|focused| focused.role.as_str())
+    );
+    assert!(
+        cleanup_dialog_after_select
+            .foreground
+            .window_title
+            .eq_ignore_ascii_case("Save as"),
+        "expected Save as foreground after selecting cleanup filename, got {:?}",
+        cleanup_dialog_after_select.foreground.window_title
     );
 
     let cleanup_path_text = cleanup_path.to_string_lossy().into_owned();
