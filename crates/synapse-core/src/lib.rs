@@ -1,6 +1,7 @@
 pub mod defaults;
 pub mod error_codes;
 pub mod filter;
+pub mod retention;
 pub mod types;
 
 pub use defaults::SCHEMA_VERSION;

@@ -22,6 +22,8 @@ pub enum StorageError {
         #[source]
         source: serde_json::Error,
     },
+    #[error("storage read failed in {cf_name}: {detail}")]
+    ReadFailed { cf_name: String, detail: String },
     #[error("storage schema mismatch: expected {expected}, actual {actual}")]
     SchemaMismatch { expected: u32, actual: u32 },
 }
@@ -33,7 +35,7 @@ impl StorageError {
         match self {
             Self::OpenFailed { .. } => error_codes::STORAGE_OPEN_FAILED,
             Self::EncodeJson { .. } => error_codes::STORAGE_WRITE_FAILED,
-            Self::DecodeJson { .. } => error_codes::STORAGE_READ_FAILED,
+            Self::DecodeJson { .. } | Self::ReadFailed { .. } => error_codes::STORAGE_READ_FAILED,
             Self::SchemaMismatch { .. } => error_codes::STORAGE_SCHEMA_MISMATCH,
         }
     }

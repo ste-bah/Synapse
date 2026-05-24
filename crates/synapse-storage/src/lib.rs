@@ -1,13 +1,14 @@
 pub mod cf;
 pub mod codecs;
+pub mod compaction;
 pub mod error;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 use rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Options,
-    SliceTransform,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, DBCompressionType,
+    IteratorMode, Options, SliceTransform,
 };
 use synapse_core::error_codes;
 
@@ -24,8 +25,6 @@ const SCHEMA_VERSION_KEY: &[u8] = b"__schema_version";
 pub struct Db {
     pub path: PathBuf,
     pub schema_version: u32,
-    // Keeps RocksDB open for the lifetime of Db; direct read/write APIs land in later M3 work-items.
-    #[allow(dead_code)]
     inner: DB,
 }
 
@@ -72,6 +71,48 @@ impl Db {
             inner,
         })
     }
+
+    /// Scans a column family into owned key/value bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] when the column family is missing
+    /// or `RocksDB` iteration fails.
+    #[tracing::instrument(skip_all, fields(cf_name))]
+    pub fn scan_cf(&self, cf_name: &str) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let handle = self.cf_handle(cf_name)?;
+        let mut rows = Vec::new();
+        for item in self.inner.iterator_cf(&handle, IteratorMode::Start) {
+            let (key, value) = item.map_err(|source| StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: source.to_string(),
+            })?;
+            rows.push((key.to_vec(), value.to_vec()));
+        }
+        Ok(rows)
+    }
+
+    /// Compacts a whole column family.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] when the column family is missing.
+    #[tracing::instrument(skip_all, fields(cf_name))]
+    pub fn compact_cf(&self, cf_name: &str) -> StorageResult<()> {
+        let handle = self.cf_handle(cf_name)?;
+        self.inner
+            .compact_range_cf(&handle, None::<&[u8]>, None::<&[u8]>);
+        Ok(())
+    }
+
+    fn cf_handle(&self, cf_name: &str) -> StorageResult<ColumnFamilyRef<'_>> {
+        self.inner
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: "column family handle missing".to_owned(),
+            })
+    }
 }
 
 fn db_options() -> Options {
@@ -90,7 +131,7 @@ fn db_options() -> Options {
     options
 }
 
-fn cf_options(name: &str) -> Options {
+fn cf_options(name: &'static str) -> Options {
     let mut options = Options::default();
     options.set_write_buffer_size(DEFAULT_WRITE_BUFFER_BYTES);
     options.set_max_write_buffer_number(3);
@@ -113,6 +154,7 @@ fn cf_options(name: &str) -> Options {
         _ => {}
     }
 
+    compaction::install_ttl_filter(&mut options, name);
     apply_block_cache(&mut options);
     options
 }
@@ -168,5 +210,7 @@ fn open_failed_detail(path: &Path, detail: String) -> StorageError {
     }
 }
 
+#[cfg(test)]
+mod compaction_tests;
 #[cfg(test)]
 mod open_tests;
