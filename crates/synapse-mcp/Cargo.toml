@@ -25,6 +25,7 @@ synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
 synapse-perception = { version = "0.1.0", path = "../synapse-perception" }
+synapse-profiles = { version = "0.1.0", path = "../synapse-profiles" }
 synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 tokio.workspace = true
 tokio-util.workspace = true

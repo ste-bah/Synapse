@@ -1534,4 +1534,6 @@ pub struct Health {
 pub struct SubsystemHealth {
     pub status: String,
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_profile_id: Option<ProfileId>,
 }

@@ -1,0 +1,142 @@
+---
+source: crates/synapse-mcp/tests/m3_profile_tools.rs
+expression: profile_tool_shapes
+---
+[
+  {
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "profile_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile_id"
+      ],
+      "title": "ProfileActivateParams",
+      "type": "object"
+    },
+    "name": "profile_activate",
+    "outputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "active_profile_id": {
+          "type": "string"
+        },
+        "changed": {
+          "type": "boolean"
+        },
+        "previous_active_profile_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "profile_id",
+        "active_profile_id",
+        "changed"
+      ],
+      "title": "ProfileActivateResponse",
+      "type": "object"
+    }
+  },
+  {
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "include_inactive": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "title": "ProfileListParams",
+      "type": "object"
+    },
+    "name": "profile_list",
+    "outputSchema": {
+      "$defs": {
+        "ProfileMatchStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "exe": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title_regex": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "ProfileStatus": {
+          "additionalProperties": false,
+          "properties": {
+            "active": {
+              "type": "boolean"
+            },
+            "id": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "matches": {
+              "items": {
+                "$ref": "#/$defs/ProfileMatchStatus"
+              },
+              "type": "array"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "label",
+            "matches",
+            "active",
+            "schema_version"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "active_profile_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profiles": {
+          "items": {
+            "$ref": "#/$defs/ProfileStatus"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "profiles"
+      ],
+      "title": "ProfileListResponse",
+      "type": "object"
+    }
+  }
+]

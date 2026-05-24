@@ -14,7 +14,7 @@ use rmcp::{
     tool, tool_handler, tool_router,
 };
 use synapse_action::{ActionStateSnapshot, RecordingBackend};
-use synapse_core::{ForegroundContext, Health, error_codes};
+use synapse_core::{ForegroundContext, Health, SubsystemHealth, error_codes};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -35,7 +35,14 @@ use crate::{
         release_all_with_handles, shared_m2_state_from_env,
         shared_m2_state_from_env_with_shutdown_reason,
     },
-    m3::{SharedM3State, shared_m3_state_from_env, shared_m3_state_from_env_with_shutdown_reason},
+    m3::{
+        SharedM3State,
+        profile::{
+            ProfileActivateParams, ProfileActivateResponse, ProfileListParams, ProfileListResponse,
+            activate_profile, list_profiles,
+        },
+        shared_m3_state_from_env, shared_m3_state_from_env_with_shutdown_reason,
+    },
 };
 
 type M2ActionContext = (
@@ -102,12 +109,45 @@ impl SynapseService {
     }
 
     fn health_payload(&self) -> Health {
+        let mut subsystems = BTreeMap::new();
+        subsystems.insert("profiles".to_owned(), self.profile_health());
         Health {
             ok: true,
             version: env!("CARGO_PKG_VERSION").to_owned(),
             build: option_env!("VERGEN_GIT_SHA").unwrap_or("dev").to_owned(),
             uptime_s: self.started_at.elapsed().as_secs(),
-            subsystems: BTreeMap::new(),
+            subsystems,
+        }
+    }
+
+    fn profile_health(&self) -> SubsystemHealth {
+        match self.m3_state.lock() {
+            Ok(state) => state.profile_runtime.as_ref().map_or_else(
+                || SubsystemHealth {
+                    status: "not_initialized".to_owned(),
+                    detail: Some(
+                        "profile runtime initializes on first profile tool call".to_owned(),
+                    ),
+                    active_profile_id: None,
+                },
+                |runtime| match runtime.active_profile_id() {
+                    Ok(active_profile_id) => SubsystemHealth {
+                        status: "healthy".to_owned(),
+                        detail: Some(format!("profile_dir={}", runtime.profile_dir().display())),
+                        active_profile_id,
+                    },
+                    Err(error) => SubsystemHealth {
+                        status: "error".to_owned(),
+                        detail: Some(error.to_string()),
+                        active_profile_id: None,
+                    },
+                },
+            ),
+            Err(_err) => SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some("M3 service state lock poisoned".to_owned()),
+                active_profile_id: None,
+            },
         }
     }
 
@@ -191,6 +231,37 @@ impl SynapseService {
                     "M2 service state lock poisoned",
                 )
             })
+    }
+
+    fn profile_runtime(&self) -> Result<Arc<synapse_profiles::ProfileRuntime>, ErrorData> {
+        self.m3_state
+            .lock()
+            .map_err(|_err| {
+                mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "M3 service state lock poisoned",
+                )
+            })?
+            .ensure_profile_runtime()
+            .map_err(|error| mcp_error(error.code(), error.to_string()))
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    fn activate_profile_locked(
+        &self,
+        params: &ProfileActivateParams,
+    ) -> Result<ProfileActivateResponse, ErrorData> {
+        // Keep the M3 mutex held so concurrent activations preserve changed=false idempotency.
+        let mut state = self.m3_state.lock().map_err(|_err| {
+            mcp_error(
+                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                "M3 service state lock poisoned",
+            )
+        })?;
+        let runtime = state
+            .ensure_profile_runtime()
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        activate_profile(&runtime, params)
     }
 
     fn last_observed_foreground(&self) -> Result<Option<ForegroundContext>, ErrorData> {
@@ -499,6 +570,34 @@ impl SynapseService {
             .await
             .map(Json)
     }
+
+    #[tool(description = "List loaded profiles")]
+    pub async fn profile_list(
+        &self,
+        params: Parameters<ProfileListParams>,
+    ) -> Result<Json<ProfileListResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "profile_list",
+            "tool.invocation kind=profile_list"
+        );
+        let runtime = self.profile_runtime()?;
+        list_profiles(&runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "Activate a loaded profile by id")]
+    pub async fn profile_activate(
+        &self,
+        params: Parameters<ProfileActivateParams>,
+    ) -> Result<Json<ProfileActivateResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "profile_activate",
+            profile_id = %params.0.profile_id,
+            "tool.invocation kind=profile_activate"
+        );
+        self.activate_profile_locked(&params.0).map(Json)
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -545,13 +644,13 @@ mod tests {
     use super::SynapseService;
 
     #[test]
-    fn health_payload_is_m0_hardcoded() {
+    fn health_payload_reports_profile_subsystem_uninitialized() {
         let service = SynapseService::new();
         let payload = service.health_payload();
         assert!(payload.ok);
         assert_eq!(payload.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(payload.build, "dev");
-        assert!(payload.subsystems.is_empty());
+        assert_eq!(payload.subsystems["profiles"].status, "not_initialized");
     }
 
     #[test]

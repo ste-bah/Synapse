@@ -375,6 +375,7 @@ fn health_json_shape_and_schema_are_stable() -> Result<(), Box<dyn std::error::E
     let subsystem = SubsystemHealth {
         status: "healthy".to_owned(),
         detail: None,
+        active_profile_id: None,
     };
     assert_eq!(
         serde_json::to_value(subsystem)?,

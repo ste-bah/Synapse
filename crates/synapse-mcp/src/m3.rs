@@ -10,6 +10,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+use synapse_profiles::{ProfileError, ProfileRuntime, bundled_profiles_dir};
 use tokio_util::sync::CancellationToken;
 
 const DB_ENV: &str = "SYNAPSE_DB";
@@ -30,6 +31,7 @@ pub struct M3State {
     pub shutdown_cancel: CancellationToken,
     pub shutdown_reason: &'static str,
     pub connection_closed_cancel: Option<CancellationToken>,
+    pub profile_runtime: Option<Arc<ProfileRuntime>>,
 }
 
 pub fn shared_m3_state_from_env() -> Result<SharedM3State> {
@@ -94,12 +96,29 @@ impl M3State {
             shutdown_cancel,
             shutdown_reason,
             connection_closed_cancel,
+            profile_runtime: None,
         })
     }
 
     #[must_use]
     pub const fn scaffold_ready(&self) -> bool {
         !self.bind.is_empty()
+    }
+
+    pub fn ensure_profile_runtime(
+        &mut self,
+    ) -> std::result::Result<Arc<ProfileRuntime>, ProfileError> {
+        if let Some(runtime) = &self.profile_runtime {
+            return Ok(Arc::clone(runtime));
+        }
+
+        let profile_dir = self
+            .profile_dir
+            .clone()
+            .unwrap_or_else(bundled_profiles_dir);
+        let runtime = Arc::new(ProfileRuntime::spawn(profile_dir)?);
+        self.profile_runtime = Some(Arc::clone(&runtime));
+        Ok(runtime)
     }
 }
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
