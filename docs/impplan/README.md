@@ -118,7 +118,7 @@ These are landed-but-imperfect surfaces from M2. M3 either consumes them as-is o
 | #231 | held-key auto-release clears actor state but never dispatches backend `KeyUp` | Stuck-key telemetry fires; physical key never released | Auto-release path must call the same backend dispatch as a normal `KeyUp` |
 | #243/#260 | bench_results dir bloat (8 per-commit subdirs committed) | Repo grows | Use local `critcmp` exports under `%LOCALAPPDATA%\synapse\benchmarks\baselines\` / `.runs\benchmarks\`; stop committing per-commit baselines |
 | #242/#261 | `fsv-*/` ephemeral run dirs leak into the worktree | Untracked clutter | Standardize on `.runs/` + `.gitignore` + `scripts/clean-runs.ps1` |
-| #241 | Telemetry log GC runs only at startup | Long-lived daemon exceeds 500 MB cap | Move to `tokio::interval`; already partially landed in `615cd4f` |
+| #241/#262 | Telemetry log GC runs only at startup | Long-lived daemon exceeds 500 MB cap | Periodic telemetry GC worker + size-cap FSV complete |
 | **M2 LoC overrun** | `emitter.rs` 1474, `vigem.rs` 1131, `invoke.rs` 653, `software.rs` 586, `m2/click.rs` 506, `m2/press.rs` 545 — over the 500 LoC hard cap | Split before M3 builds reflex enqueue path on top, or land an ADR amending the rule with measurable justification | First M3 PR: file-split refactor with no behavior change |
 
 ---

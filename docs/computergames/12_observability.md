@@ -75,7 +75,7 @@ Rotation (`tracing-appender::rolling::Builder`):
 - Total log directory cap: 500 MB (oldest pruned first)
 - Per-file size cap: 500 MB (rotate mid-day if reached)
 
-Compression and pruning run in a low-priority background tokio task on a 1-hour timer.
+Pruning runs at startup and in the `synapse-telemetry-gc` background worker while the daemon is alive. The default cadence is 6 h and can be overridden with `SYNAPSE_LOG_GC_INTERVAL_S`; `0` disables the periodic worker for short-lived tests.
 
 ### 3.3 What's logged at which level
 
