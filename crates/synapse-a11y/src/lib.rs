@@ -270,6 +270,26 @@ pub fn window_from_hwnd(hwnd: i64) -> A11yResult<UIElement> {
     platform::window_from_hwnd(hwnd)
 }
 
+/// Requests foreground focus for a top-level native HWND.
+///
+/// # Errors
+///
+/// Returns a structured UIA error when Windows rejects the foreground request,
+/// or `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn focus_window(hwnd: i64) -> A11yResult<()> {
+    platform::focus_window(hwnd)
+}
+
+/// Requests that a top-level native HWND close by posting `WM_CLOSE`.
+///
+/// # Errors
+///
+/// Returns a structured UIA error when Windows rejects the close message, or
+/// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn close_window(hwnd: i64) -> A11yResult<()> {
+    platform::close_window(hwnd)
+}
+
 /// Returns the top-level UIA window for a process id.
 ///
 /// # Errors
@@ -529,8 +549,9 @@ mod platform {
                     EVENT_OBJECT_VALUECHANGE, EVENT_SYSTEM_ALERT, EVENT_SYSTEM_FOREGROUND,
                     EVENT_SYSTEM_MENUEND, EVENT_SYSTEM_MENUSTART, EnumWindows, GetForegroundWindow,
                     GetMessageW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
-                    IsWindowVisible, MSG, PostThreadMessageW, TranslateMessage,
-                    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_APP,
+                    IsWindowVisible, MSG, PostMessageW, PostThreadMessageW, SW_RESTORE,
+                    SetForegroundWindow, ShowWindow, TranslateMessage, WINEVENT_OUTOFCONTEXT,
+                    WINEVENT_SKIPOWNPROCESS, WM_APP, WM_CLOSE,
                 },
             },
         },
@@ -620,6 +641,39 @@ mod platform {
             });
         }
         element_from_hwnd(hwnd)
+    }
+
+    pub fn focus_window(hwnd: i64) -> A11yResult<()> {
+        let hwnd = HWND(hwnd as *mut c_void);
+        if hwnd.0.is_null() {
+            return Err(A11yError::NoForeground {
+                detail: "HWND was null".to_owned(),
+            });
+        }
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+        if unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+            Ok(())
+        } else {
+            Err(A11yError::internal(format!(
+                "SetForegroundWindow returned false for hwnd 0x{:x}",
+                hwnd.0 as isize
+            )))
+        }
+    }
+
+    pub fn close_window(hwnd: i64) -> A11yResult<()> {
+        let hwnd = HWND(hwnd as *mut c_void);
+        if hwnd.0.is_null() {
+            return Err(A11yError::NoForeground {
+                detail: "HWND was null".to_owned(),
+            });
+        }
+        unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }.map_err(|err| {
+            A11yError::internal(format!(
+                "PostMessageW(WM_CLOSE) failed for hwnd 0x{:x}: {err}",
+                hwnd.0 as isize
+            ))
+        })
     }
 
     fn element_from_hwnd(hwnd: HWND) -> A11yResult<UIElement> {
@@ -1402,6 +1456,16 @@ mod platform {
         Err(A11yError::not_available(
             "UIA HWND window lookup requires Windows",
         ))
+    }
+
+    pub fn focus_window(_hwnd: i64) -> A11yResult<()> {
+        Err(A11yError::not_available(
+            "foreground window focus requires Windows",
+        ))
+    }
+
+    pub fn close_window(_hwnd: i64) -> A11yResult<()> {
+        Err(A11yError::not_available("window close requires Windows"))
     }
 
     pub fn window_for_process(_pid: u32) -> A11yResult<UIElement> {

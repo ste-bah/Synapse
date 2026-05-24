@@ -68,6 +68,7 @@ mod platform {
         launcher_pid: u32,
         pid: u32,
         hwnd: i64,
+        pid_preexisting: bool,
     }
 
     impl NotepadHandle {
@@ -79,6 +80,11 @@ mod platform {
         #[must_use]
         pub const fn hwnd(&self) -> i64 {
             self.hwnd
+        }
+
+        #[must_use]
+        pub const fn pid_preexisting(&self) -> bool {
+            self.pid_preexisting
         }
 
         pub fn current_foreground_context(&self) -> anyhow::Result<ForegroundContext> {
@@ -94,6 +100,57 @@ mod platform {
         fn close_inner(&mut self) -> anyhow::Result<()> {
             let mut child = self.child.take();
 
+            let close_window = synapse_a11y::close_window(self.hwnd);
+            let window_closed = wait_for_window_gone(self.hwnd, GRACEFUL_CLOSE_TIMEOUT);
+            let child_exited = child
+                .as_mut()
+                .map_or(Ok(true), |child| {
+                    wait_for_child_exit(child, GRACEFUL_CLOSE_TIMEOUT)
+                })
+                .context("wait for Notepad launcher graceful close")?;
+            if window_closed {
+                if child_exited {
+                    return Ok(());
+                }
+
+                let launcher_cleanup = terminate_launcher_if_safe(self.launcher_pid, self.pid);
+                let child_exited = child
+                    .as_mut()
+                    .map_or(Ok(true), |child| {
+                        wait_for_child_exit(child, FORCE_CLOSE_TIMEOUT)
+                    })
+                    .context("wait for Notepad launcher after window close")?;
+                if child_exited {
+                    return Ok(());
+                }
+
+                self.child = child;
+                let close_window_status =
+                    close_window.map_or_else(|err| err.to_string(), |()| "posted".to_owned());
+                let launcher_cleanup_status = launcher_cleanup
+                    .map_or_else(|err| err.to_string(), |status| status.to_string());
+                bail!(
+                    "Notepad hwnd 0x{:x} closed after WM_CLOSE ({close_window_status}) but launcher_pid {} did not exit after launcher cleanup ({launcher_cleanup_status})",
+                    self.hwnd,
+                    self.launcher_pid
+                );
+            }
+
+            if self.pid_preexisting {
+                let launcher_cleanup = terminate_launcher_if_safe(self.launcher_pid, self.pid);
+                self.child = child;
+                let close_window_status =
+                    close_window.map_or_else(|err| err.to_string(), |()| "posted".to_owned());
+                let launcher_cleanup_status = launcher_cleanup
+                    .map_or_else(|err| err.to_string(), |status| status.to_string());
+                bail!(
+                    "Notepad hwnd 0x{:x} pid {} launcher_pid {} remained after WM_CLOSE ({close_window_status}); refusing taskkill for pre-existing Notepad pid; launcher cleanup status ({launcher_cleanup_status})",
+                    self.hwnd,
+                    self.pid,
+                    self.launcher_pid
+                );
+            }
+
             let graceful_ui = terminate_process_tree(self.pid, false);
             let graceful_launcher = terminate_launcher_if_distinct(self.launcher_pid, self.pid);
             let window_closed = wait_for_window_gone(self.hwnd, GRACEFUL_CLOSE_TIMEOUT);
@@ -102,7 +159,7 @@ mod platform {
                 .map_or(Ok(true), |child| {
                     wait_for_child_exit(child, GRACEFUL_CLOSE_TIMEOUT)
                 })
-                .context("wait for Notepad launcher graceful close")?;
+                .context("wait for Notepad launcher graceful taskkill close")?;
             if window_closed && child_exited {
                 return Ok(());
             }
@@ -147,8 +204,11 @@ mod platform {
     #[allow(clippy::trivial_regex)]
     pub fn launch_notepad() -> anyhow::Result<NotepadHandle> {
         let title_regex = Regex::new(NOTEPAD_TITLE_REGEX).context("compile Notepad title regex")?;
-        let excluded_hwnds = matching_window_hwnds(&title_regex)
-            .context("snapshot existing Notepad title windows before launch")?;
+        let existing_windows = visible_top_level_windows()
+            .context("snapshot existing top-level windows before Notepad launch")?;
+        let excluded_hwnds = matching_window_hwnds(&existing_windows, &title_regex);
+        let existing_notepad_pids =
+            notepad_process_ids().context("snapshot existing notepad.exe pids before launch")?;
         let mut child = Command::new(notepad_exe())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -170,12 +230,14 @@ mod platform {
                 return Err(err).context("Notepad did not reach the expected startup title");
             }
         };
+        let pid_preexisting = existing_notepad_pids.contains(&context.pid);
 
         Ok(NotepadHandle {
             child: Some(child),
             launcher_pid: pid,
             pid: context.pid,
             hwnd: context.hwnd,
+            pid_preexisting,
         })
     }
 
@@ -228,12 +290,45 @@ mod platform {
             .with_context(|| format!("read foreground context for hwnd 0x{hwnd:x}"))
     }
 
-    fn matching_window_hwnds(title_regex: &Regex) -> anyhow::Result<HashSet<i64>> {
-        Ok(visible_top_level_windows()?
-            .into_iter()
+    fn matching_window_hwnds(windows: &[WindowCandidate], title_regex: &Regex) -> HashSet<i64> {
+        windows
+            .iter()
             .filter(|candidate| title_regex.is_match(&candidate.title))
             .map(|candidate| candidate.hwnd)
-            .collect())
+            .collect()
+    }
+
+    fn notepad_process_ids() -> anyhow::Result<HashSet<u32>> {
+        let output = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "Get-Process notepad -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.Id }",
+            ])
+            .stdin(Stdio::null())
+            .output()
+            .context("run PowerShell notepad process id snapshot")?;
+        if !output.status.success() {
+            bail!(
+                "PowerShell notepad process id snapshot failed with status {} stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        output
+            .stdout
+            .split(|byte| *byte == b'\n' || *byte == b'\r')
+            .filter_map(|line| {
+                let line = std::str::from_utf8(line).ok()?.trim();
+                if line.is_empty() {
+                    None
+                } else {
+                    Some(line.parse::<u32>())
+                }
+            })
+            .collect::<Result<HashSet<_>, _>>()
+            .context("parse existing notepad.exe pids")
     }
 
     fn visible_top_level_windows() -> anyhow::Result<Vec<WindowCandidate>> {
@@ -304,6 +399,13 @@ mod platform {
             .context("run PowerShell Win32_Process.Terminate fallback")
     }
 
+    fn terminate_launcher_if_safe(launcher_pid: u32, ui_pid: u32) -> anyhow::Result<ExitStatus> {
+        if launcher_pid == ui_pid {
+            bail!("launcher pid matches UI pid; refusing launcher-only taskkill");
+        }
+        terminate_process_tree(launcher_pid, false)
+    }
+
     fn terminate_launcher_if_distinct(
         launcher_pid: u32,
         ui_pid: u32,
@@ -365,6 +467,11 @@ mod platform {
         #[must_use]
         pub const fn hwnd(&self) -> i64 {
             0
+        }
+
+        #[must_use]
+        pub const fn pid_preexisting(&self) -> bool {
+            false
         }
 
         pub fn current_foreground_context(&self) -> anyhow::Result<ForegroundContext> {
