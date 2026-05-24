@@ -1411,11 +1411,91 @@ pub enum EventFilter {
     },
 }
 
+pub const EVENT_FILTER_MAX_DEPTH: u32 = 8;
+
 impl EventFilter {
     #[must_use]
     pub fn matches(&self, event: &Event) -> bool {
         crate::filter::matches_event_filter(self, event)
     }
+
+    #[must_use]
+    pub fn depth(&self) -> u32 {
+        match self {
+            Self::All
+            | Self::None
+            | Self::Kind { .. }
+            | Self::Source { .. }
+            | Self::Data { .. } => 1,
+            Self::And { args } | Self::Or { args } => args
+                .iter()
+                .map(Self::depth)
+                .max()
+                .map_or(1, |child_depth| child_depth.saturating_add(1)),
+            Self::Not { arg } => arg.depth().saturating_add(1),
+        }
+    }
+
+    /// Validates this filter for M3 reflex/event subscription use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an `And`/`Or` node is empty or when the tree depth
+    /// exceeds `EVENT_FILTER_MAX_DEPTH`.
+    pub fn validate(&self) -> Result<(), EventFilterValidationError> {
+        self.validate_with_max_depth(EVENT_FILTER_MAX_DEPTH)
+    }
+
+    /// Validates this filter against a caller-provided maximum depth.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an `And`/`Or` node is empty or when the tree depth
+    /// exceeds `max_depth`.
+    pub fn validate_with_max_depth(
+        &self,
+        max_depth: u32,
+    ) -> Result<(), EventFilterValidationError> {
+        let depth = self.depth();
+        if depth > max_depth {
+            return Err(EventFilterValidationError::DepthExceeded { depth, max_depth });
+        }
+        match self {
+            Self::And { args } => {
+                if args.is_empty() {
+                    return Err(EventFilterValidationError::EmptyAnd);
+                }
+                for arg in args {
+                    arg.validate_with_max_depth(max_depth)?;
+                }
+            }
+            Self::Or { args } => {
+                if args.is_empty() {
+                    return Err(EventFilterValidationError::EmptyOr);
+                }
+                for arg in args {
+                    arg.validate_with_max_depth(max_depth)?;
+                }
+            }
+            Self::Not { arg } => arg.validate_with_max_depth(max_depth)?,
+            Self::All
+            | Self::None
+            | Self::Kind { .. }
+            | Self::Source { .. }
+            | Self::Data { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum EventFilterValidationError {
+    #[error("event filter 'and' must contain at least one argument")]
+    EmptyAnd,
+    #[error("event filter 'or' must contain at least one argument")]
+    EmptyOr,
+    #[error("event filter depth {depth} exceeds maximum {max_depth}")]
+    DepthExceeded { depth: u32, max_depth: u32 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
