@@ -1,5 +1,6 @@
 mod m1;
 mod m2;
+mod m3;
 mod server;
 
 use std::{
@@ -98,11 +99,12 @@ async fn run_stdio(telemetry_guard: TelemetryGuard) -> anyhow::Result<ExitCode> 
     let rmcp_token = CancellationToken::new();
     let emitter_shutdown_token = CancellationToken::new();
     let emitter_connection_closed_token = CancellationToken::new();
-    let service = SynapseService::with_m2_shutdown_reason(
+    let service = SynapseService::try_with_m2_shutdown_reason(
         emitter_shutdown_token.clone(),
         "sigint",
         emitter_connection_closed_token.clone(),
-    );
+    )
+    .context("initialize Synapse service state")?;
     synapse_action::install_panic_hook();
     let m2_emitter_done = service.m2_emitter_done_receiver();
     let (stdin, stdout) = rmcp::transport::stdio();

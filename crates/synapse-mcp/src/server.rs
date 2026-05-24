@@ -35,6 +35,7 @@ use crate::{
         release_all_with_handles, shared_m2_state_from_env,
         shared_m2_state_from_env_with_shutdown_reason,
     },
+    m3::{SharedM3State, shared_m3_state_from_env, shared_m3_state_from_env_with_shutdown_reason},
 };
 
 type M2ActionContext = (
@@ -49,35 +50,48 @@ pub struct SynapseService {
     tool_router: ToolRouter<Self>,
     m1_state: SharedM1State,
     m2_state: SharedM2State,
+    m3_state: SharedM3State,
 }
 
 impl SynapseService {
     #[must_use]
     pub fn new() -> Self {
-        Self {
+        match Self::try_new() {
+            Ok(service) => service,
+            Err(error) => panic!("M3 state should initialize from environment: {error:#}"),
+        }
+    }
+
+    pub fn try_new() -> anyhow::Result<Self> {
+        Ok(Self {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_env(),
-        }
+            m3_state: shared_m3_state_from_env()?,
+        })
     }
 
-    #[must_use]
-    pub fn with_m2_shutdown_reason(
+    pub fn try_with_m2_shutdown_reason(
         shutdown_cancel: CancellationToken,
         shutdown_reason: &'static str,
         connection_closed_cancel: CancellationToken,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_env_with_shutdown_reason(
+                shutdown_cancel.clone(),
+                shutdown_reason,
+                Some(connection_closed_cancel.clone()),
+            ),
+            m3_state: shared_m3_state_from_env_with_shutdown_reason(
                 shutdown_cancel,
                 shutdown_reason,
                 Some(connection_closed_cancel),
-            ),
-        }
+            )?,
+        })
     }
 
     pub fn m2_emitter_done_receiver(&self) -> Option<watch::Receiver<Option<ActionStateSnapshot>>> {
@@ -107,14 +121,37 @@ impl SynapseService {
     }
 
     fn instructions(&self) -> &'static str {
-        if self
+        let recording_enabled = self
             .m2_state
             .lock()
-            .is_ok_and(|state| state.recording_enabled())
-        {
-            "Synapse M1 perception MCP server with M2 action scaffold (recording enabled)"
-        } else {
-            "Synapse M1 perception MCP server with M2 action scaffold"
+            .is_ok_and(|state| state.recording_enabled());
+        let m3_stub_count = crate::m3::m3_tool_stubs().len();
+        let m3_scaffold_ready = self.m3_state.lock().is_ok_and(|state| {
+            let _state_readback = (
+                state.db_path.as_ref(),
+                state.profile_dir.as_ref(),
+                state.reflex_disabled,
+                state.bearer_token.as_ref(),
+                state.shutdown_cancel.is_cancelled(),
+                state.shutdown_reason,
+                state
+                    .connection_closed_cancel
+                    .as_ref()
+                    .map(CancellationToken::is_cancelled),
+            );
+            state.scaffold_ready() && m3_stub_count == 11
+        });
+        match (recording_enabled, m3_scaffold_ready) {
+            (true, true) => {
+                "Synapse M1 perception MCP server with M2 action scaffold and M3 scaffold (recording enabled)"
+            }
+            (false, true) => {
+                "Synapse M1 perception MCP server with M2 action scaffold and M3 scaffold"
+            }
+            (true, false) => {
+                "Synapse M1 perception MCP server with M2 action scaffold (recording enabled)"
+            }
+            (false, false) => "Synapse M1 perception MCP server with M2 action scaffold",
         }
     }
 
