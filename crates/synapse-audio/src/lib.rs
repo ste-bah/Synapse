@@ -1,4 +1,5 @@
 pub mod detectors;
+pub mod direction;
 pub mod error;
 pub mod loopback;
 pub mod ring;
@@ -15,6 +16,7 @@ pub use error::{AudioError, AudioResult};
 pub use loopback::LoopbackStatus;
 pub use ring::{AudioFormat, AudioRing, AudioWindow};
 pub use stt::{Transcription, WhisperTinyStt};
+pub use synapse_core::DirectionEstimate;
 
 pub const DEFAULT_RING_SECONDS: u32 = 5;
 pub const MAX_RING_SECONDS: u32 = 5;
@@ -135,6 +137,18 @@ impl AudioRuntime {
     #[tracing::instrument(skip_all, fields(component = "audio_runtime", seconds))]
     pub fn tail_seconds(&self, seconds: f32) -> AudioResult<AudioWindow> {
         self.ring.tail_seconds(seconds)
+    }
+
+    /// Estimates direction from the most recent stereo audio samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AudioError::LoopbackInitFailed`] when `seconds` is outside
+    /// the configured ring duration.
+    #[tracing::instrument(skip_all, fields(component = "audio_runtime", seconds))]
+    pub fn estimate_direction_tail(&self, seconds: f32) -> AudioResult<DirectionEstimate> {
+        let window = self.tail_seconds(seconds)?;
+        Ok(direction::estimate_direction(&window))
     }
 
     /// Transcribes the most recent audio samples in the ring.
