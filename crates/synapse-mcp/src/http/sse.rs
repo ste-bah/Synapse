@@ -177,6 +177,13 @@ impl SseState {
         self.inner.event_bus.clone()
     }
 
+    pub(crate) fn active_subscription_count(&self) -> usize {
+        self.inner
+            .subscriptions
+            .lock()
+            .map_or(0, |subscriptions| subscriptions.len())
+    }
+
     pub(crate) fn cancel(&self, id: &str) -> Result<(), SseCancelError> {
         let removed_from_map = {
             let mut subscriptions = self

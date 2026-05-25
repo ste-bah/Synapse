@@ -6,7 +6,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, RwLock, mpsc},
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -36,6 +36,7 @@ struct ProfileState {
     profiles: BTreeMap<ProfileId, LoadedProfile>,
     active_profile_id: Option<ProfileId>,
     last_errors: Vec<ProfileLoadError>,
+    last_reload_at: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -179,6 +180,12 @@ impl ProfileRuntime {
     }
 
     #[instrument(skip_all)]
+    pub fn last_reload_at(&self) -> Result<Option<String>, ProfileError> {
+        let state = self.state.read().map_err(|_| ProfileError::StatePoisoned)?;
+        Ok(state.last_reload_at.and_then(system_time_epoch_ms))
+    }
+
+    #[instrument(skip_all)]
     pub fn resolve_foreground(
         &self,
         foreground: &ForegroundWindow,
@@ -244,8 +251,16 @@ fn refresh_state(
         guard.active_profile_id = None;
     }
     guard.last_errors = errors;
+    guard.last_reload_at = Some(SystemTime::now());
     drop(guard);
     Ok(())
+}
+
+fn system_time_epoch_ms(value: SystemTime) -> Option<String> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis().to_string())
 }
 
 fn load_dir(

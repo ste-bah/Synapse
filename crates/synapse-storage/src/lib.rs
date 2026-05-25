@@ -6,6 +6,7 @@ pub mod error;
 mod gc;
 mod pressure;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -194,6 +195,28 @@ impl Db {
     #[must_use]
     pub fn pressure_level(&self) -> DiskPressureLevel {
         self.pressure.level()
+    }
+
+    /// Returns approximate logical bytes currently stored in each Synapse column family.
+    ///
+    /// This scans row keys and values so health reports reflect persisted data
+    /// even when `RocksDB` has not compacted files yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::ReadFailed`] when a column family cannot be scanned.
+    #[tracing::instrument(skip_all)]
+    pub fn cf_sizes(&self) -> StorageResult<BTreeMap<String, u64>> {
+        let mut sizes = BTreeMap::new();
+        for cf_name in cf::ALL_COLUMN_FAMILIES {
+            let mut bytes = 0_u64;
+            for (key, value) in self.scan_cf(cf_name)? {
+                bytes = bytes.saturating_add(key.len() as u64);
+                bytes = bytes.saturating_add(value.len() as u64);
+            }
+            sizes.insert(cf_name.to_owned(), bytes);
+        }
+        Ok(sizes)
     }
 
     /// Runs one disk-pressure check immediately.

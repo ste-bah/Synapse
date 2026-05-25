@@ -7,7 +7,7 @@ pub mod replay;
 pub mod subscribe;
 #[cfg(test)]
 mod tests;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::{
     num::NonZeroUsize,
     path::PathBuf,
@@ -28,6 +28,8 @@ use crate::http::sse::SseState;
 const DB_ENV: &str = "SYNAPSE_DB";
 const PROFILE_DIR_ENV: &str = "SYNAPSE_PROFILE_DIR";
 const REFLEX_DISABLED_ENV: &str = "SYNAPSE_REFLEX_DISABLED";
+const REFLEX_FORCE_DEGRADED_ENV: &str = "SYNAPSE_REFLEX_FORCE_DEGRADED";
+const STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV: &str = "SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE";
 const ENABLE_AUDIO_ENV: &str = "SYNAPSE_ENABLE_AUDIO";
 const ALLOW_UNKNOWN_PROFILE_ENV: &str = "SYNAPSE_ALLOW_UNKNOWN_PROFILE";
 const ALLOWED_PERMISSIONS_ENV: &str = "SYNAPSE_MCP_ALLOWED_PERMISSIONS";
@@ -39,6 +41,10 @@ const DEFAULT_BIND: &str = "127.0.0.1:7700";
 pub type SharedM3State = Arc<Mutex<M3State>>;
 
 #[derive(Clone, Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "config mirrors independent operator startup gates and fail-closed toggles"
+)]
 pub struct M3ServiceConfig {
     pub db_path: Option<PathBuf>,
     pub profile_dir: Option<PathBuf>,
@@ -49,6 +55,8 @@ pub struct M3ServiceConfig {
     pub enable_audio: bool,
     pub allow_unknown_profile: bool,
     pub allowed_permissions: Option<String>,
+    pub reflex_force_degraded: bool,
+    pub storage_pressure_free_bytes_sample: Option<u64>,
 }
 
 impl M3ServiceConfig {
@@ -56,6 +64,10 @@ impl M3ServiceConfig {
     #[expect(
         clippy::too_many_arguments,
         reason = "constructor mirrors parsed CLI/config fields without hiding startup gates"
+    )]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "constructor mirrors parsed CLI/config booleans exactly"
     )]
     pub fn from_cli_parts(
         db_path: Option<PathBuf>,
@@ -66,6 +78,8 @@ impl M3ServiceConfig {
         enable_audio: bool,
         allow_unknown_profile: bool,
         allowed_permissions: Option<String>,
+        reflex_force_degraded: bool,
+        storage_pressure_free_bytes_sample: Option<u64>,
     ) -> Self {
         Self {
             db_path,
@@ -77,11 +91,16 @@ impl M3ServiceConfig {
             enable_audio,
             allow_unknown_profile,
             allowed_permissions,
+            reflex_force_degraded,
+            storage_pressure_free_bytes_sample,
         }
     }
 
     pub fn from_env() -> Result<Self> {
         let reflex_disabled_raw = std::env::var(REFLEX_DISABLED_ENV).ok();
+        let reflex_force_degraded_raw = std::env::var(REFLEX_FORCE_DEGRADED_ENV).ok();
+        let storage_pressure_free_bytes_sample_raw =
+            std::env::var(STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV).ok();
         let enable_audio_raw = std::env::var(ENABLE_AUDIO_ENV).ok();
         let allow_unknown_profile_raw = std::env::var(ALLOW_UNKNOWN_PROFILE_ENV).ok();
         let max_subscriptions_raw = std::env::var(MAX_SUBSCRIPTIONS_ENV).ok();
@@ -94,6 +113,14 @@ impl M3ServiceConfig {
                 ALLOW_UNKNOWN_PROFILE_ENV,
                 allow_unknown_profile_raw.as_deref(),
             )?,
+            reflex_force_degraded: parse_bool_env(
+                REFLEX_FORCE_DEGRADED_ENV,
+                reflex_force_degraded_raw.as_deref(),
+            )?,
+            storage_pressure_free_bytes_sample: parse_optional_u64_env(
+                STORAGE_PRESSURE_FREE_BYTES_SAMPLE_ENV,
+                storage_pressure_free_bytes_sample_raw.as_deref(),
+            )?,
             bind: std::env::var(BIND_ENV).unwrap_or_else(|_| DEFAULT_BIND.to_owned()),
             bearer_token: std::env::var(BEARER_TOKEN_ENV).ok(),
             max_subscriptions: parse_max_subscriptions_env(max_subscriptions_raw.as_deref())?,
@@ -103,6 +130,10 @@ impl M3ServiceConfig {
 }
 
 #[derive(Debug)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "runtime state keeps independent startup gates explicit for health readback"
+)]
 pub struct M3State {
     pub db_path: Option<PathBuf>,
     pub profile_dir: Option<PathBuf>,
@@ -115,6 +146,12 @@ pub struct M3State {
     pub permission_grants: PermissionGrants,
     pub enable_audio: bool,
     pub allow_unknown_profile: bool,
+    pub reflex_force_degraded: bool,
+    pub storage_pressure_free_bytes_sample: Option<u64>,
+    pub storage_last_error: Option<String>,
+    pub reflex_last_error: Option<String>,
+    pub profile_last_error: Option<String>,
+    pub audio_last_error: Option<String>,
     pub profile_runtime: Option<Arc<ProfileRuntime>>,
     pub sse_state: SseState,
     pub reflex_runtime: Option<Arc<Mutex<ReflexRuntime>>>,
@@ -174,6 +211,8 @@ impl M3State {
             Some(bool_env_value(config.enable_audio)),
             Some(bool_env_value(config.allow_unknown_profile)),
             config.allowed_permissions.as_deref(),
+            Some(bool_env_value(config.reflex_force_degraded)),
+            config.storage_pressure_free_bytes_sample,
             shutdown_cancel,
             shutdown_reason,
             connection_closed_cancel,
@@ -191,6 +230,8 @@ impl M3State {
         enable_audio: Option<&str>,
         allow_unknown_profile: Option<&str>,
         allowed_permissions: Option<&str>,
+        reflex_force_degraded: Option<&str>,
+        storage_pressure_free_bytes_sample: Option<u64>,
         shutdown_cancel: CancellationToken,
         shutdown_reason: &'static str,
         connection_closed_cancel: Option<CancellationToken>,
@@ -199,6 +240,8 @@ impl M3State {
         let enable_audio = parse_bool_env(ENABLE_AUDIO_ENV, enable_audio)?;
         let allow_unknown_profile =
             parse_bool_env(ALLOW_UNKNOWN_PROFILE_ENV, allow_unknown_profile)?;
+        let reflex_force_degraded =
+            parse_bool_env(REFLEX_FORCE_DEGRADED_ENV, reflex_force_degraded)?;
         let permission_grants = configured_grants_from_parts(allowed_permissions, enable_audio)?;
         Ok(Self {
             db_path,
@@ -214,6 +257,12 @@ impl M3State {
             permission_grants,
             enable_audio,
             allow_unknown_profile,
+            reflex_force_degraded,
+            storage_pressure_free_bytes_sample,
+            storage_last_error: None,
+            reflex_last_error: None,
+            profile_last_error: None,
+            audio_last_error: None,
             profile_runtime: None,
             sse_state,
             reflex_runtime: None,
@@ -238,7 +287,14 @@ impl M3State {
             .profile_dir
             .clone()
             .unwrap_or_else(bundled_profiles_dir);
-        let runtime = Arc::new(ProfileRuntime::spawn(profile_dir)?);
+        let runtime = match ProfileRuntime::spawn(profile_dir) {
+            Ok(runtime) => Arc::new(runtime),
+            Err(error) => {
+                self.profile_last_error = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        self.profile_last_error = None;
         self.profile_runtime = Some(Arc::clone(&runtime));
         Ok(runtime)
     }
@@ -258,12 +314,37 @@ impl M3State {
         }
 
         let db_path = self.db_path.clone().unwrap_or_else(default_db_path);
-        let db = Arc::new(Db::open(&db_path, SCHEMA_VERSION)?);
-        let runtime = Arc::new(Mutex::new(ReflexRuntime::spawn(
+        let db = match Db::open(&db_path, SCHEMA_VERSION) {
+            Ok(db) => Arc::new(db),
+            Err(error) => {
+                self.storage_last_error = Some(error.to_string());
+                return Err(error.into());
+            }
+        };
+        self.storage_last_error = None;
+        if let Some(free_bytes) = self.storage_pressure_free_bytes_sample
+            && let Err(error) = db.run_pressure_check_with_free_bytes_sample(free_bytes)
+        {
+            self.storage_last_error = Some(error.to_string());
+            return Err(error.into());
+        }
+        let scheduler_config = synapse_reflex::SchedulerConfig {
+            force_degraded: self.reflex_force_degraded,
+            ..synapse_reflex::SchedulerConfig::default()
+        };
+        let runtime = match ReflexRuntime::spawn_with_config(
             db,
             action_handle,
             event_bus,
-        )?));
+            scheduler_config,
+        ) {
+            Ok(runtime) => Arc::new(Mutex::new(runtime)),
+            Err(error) => {
+                self.reflex_last_error = Some(error.to_string());
+                return Err(error.into());
+            }
+        };
+        self.reflex_last_error = None;
         self.reflex_runtime = Some(Arc::clone(&runtime));
         Ok(runtime)
     }
@@ -291,7 +372,14 @@ impl M3State {
             detectors_enabled: false,
             stt_model_path: None,
         };
-        let runtime = Arc::new(AudioRuntime::spawn(config)?);
+        let runtime = match AudioRuntime::spawn(config) {
+            Ok(runtime) => Arc::new(runtime),
+            Err(error) => {
+                self.audio_last_error = Some(error.to_string());
+                return Err(error);
+            }
+        };
+        self.audio_last_error = None;
         self.audio_runtime = Some(Arc::clone(&runtime));
         Ok(runtime)
     }
@@ -347,6 +435,16 @@ fn parse_max_subscriptions_env(value: Option<&str>) -> Result<NonZeroUsize> {
         return Ok(DEFAULT_MAX_SUBSCRIPTIONS_NONZERO);
     };
     parse_max_subscriptions_value(MAX_SUBSCRIPTIONS_ENV, value)
+}
+
+fn parse_optional_u64_env(name: &str, value: Option<&str>) -> Result<Option<u64>> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    value
+        .parse::<u64>()
+        .map(Some)
+        .with_context(|| format!("{name} must be an unsigned integer; got {value:?}"))
 }
 
 fn parse_max_subscriptions_value(name: &str, value: &str) -> Result<NonZeroUsize> {

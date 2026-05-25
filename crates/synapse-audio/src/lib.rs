@@ -223,6 +223,12 @@ impl AudioRuntime {
             loopback::LoopbackHandle::status,
         )
     }
+
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "audio_runtime"))]
+    pub fn stt_model_loaded(&self) -> bool {
+        self.stt.lock().is_ok_and(|stt| stt.is_loaded())
+    }
 }
 
 fn validate_config(config: &AudioConfig) -> AudioResult<()> {

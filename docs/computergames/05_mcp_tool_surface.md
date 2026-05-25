@@ -738,19 +738,19 @@ Returns:
 {
   "ok": true,
   "subsystems": {
-    "capture": {"status": "healthy", "fps": 60, "frames_dropped_60s": 0},
-    "a11y": {"status": "healthy", "events_60s": 412},
-    "audio": {"status": "healthy", "device": "Speakers (Realtek...)"},
-    "perception": {"status": "healthy", "detection_p99_ms": 4.2, "ocr_p99_ms": 7.8},
-    "action": {"status": "healthy", "queue_depth": 0},
-    "reflex": {"status": "healthy", "active_count": 2, "tick_jitter_us_p99": 180},
-    "storage": {"status": "healthy", "db_size_mb": 234},
-    "models": {"loaded": ["yolov10n", "whisper-tiny"]}
+    "storage": {"status": "ok", "db_path": "...", "schema_version": 7, "cf_sizes": {"CF_REFLEX_AUDIT": 4096}},
+    "reflex": {"status": "ok", "active_count": 2, "last_tick_jitter_us": 180, "recursion_clamps_total": 0},
+    "profiles": {"status": "ok", "active_profile_id": "notepad", "profile_count": 4, "last_reload_at": "1779723537765"},
+    "audio": {"status": "disabled", "ring_buffer_seconds": 5, "stt_model_loaded": false},
+    "http": {"status": "ok", "bind_addr": "127.0.0.1:7700", "active_sessions": 1, "sse_subscribers": 0}
   },
   "version": "0.1.0",
   "uptime_s": 1245
 }
 ```
+
+M3 subsystem status strings are `initializing`, `ok`, `degraded_latency`,
+`disk_pressure_l1`..`disk_pressure_l4`, `disabled`, or `error`.
 
 ### 3.30 `replay_record`
 

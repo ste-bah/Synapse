@@ -29,6 +29,7 @@ type McpHttpService = StreamableHttpService<SynapseService, LocalSessionManager>
 #[derive(Clone)]
 struct HttpState {
     health_service: Arc<SynapseService>,
+    session_manager: Arc<LocalSessionManager>,
     sse_state: SseState,
 }
 
@@ -115,10 +116,11 @@ fn router(
         "HTTP bearer token configured"
     );
     let health_service = Arc::new(service.clone());
-    let mcp_service = streamable_service(shutdown_cancel, service)
+    let (mcp_service, session_manager) = streamable_service(shutdown_cancel, service)
         .context("initialize HTTP MCP session state")?;
     let state = HttpState {
         health_service,
+        session_manager,
         sse_state,
     };
     Ok(Router::new()
@@ -137,17 +139,19 @@ fn router(
 fn streamable_service(
     shutdown_cancel: &CancellationToken,
     service: SynapseService,
-) -> anyhow::Result<McpHttpService> {
+) -> anyhow::Result<(McpHttpService, Arc<LocalSessionManager>)> {
     let config = StreamableHttpServerConfig::default()
         .with_cancellation_token(shutdown_cancel.child_token());
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config =
         session::load_session_config().context("load HTTP session config")?;
-    Ok(StreamableHttpService::new(
+    let session_manager = Arc::new(session_manager);
+    let service = StreamableHttpService::new(
         move || Ok(service.clone()),
-        Arc::new(session_manager),
+        Arc::clone(&session_manager),
         config,
-    ))
+    );
+    Ok((service, session_manager))
 }
 
 fn http_service(
@@ -171,7 +175,12 @@ async fn health(State(state): State<HttpState>) -> Json<Health> {
         code = "MCP_HTTP_HEALTH",
         "tool.invocation kind=health transport=http"
     );
-    Json(state.health_service.health_payload())
+    let active_sessions = state.session_manager.sessions.read().await.len();
+    Json(
+        state
+            .health_service
+            .health_payload_with_http_sessions(Some(active_sessions)),
+    )
 }
 
 async fn events(

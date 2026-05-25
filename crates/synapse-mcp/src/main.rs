@@ -58,6 +58,14 @@ struct Cli {
     allow_unknown_profile: bool,
     #[arg(long, env = "SYNAPSE_MCP_ALLOWED_PERMISSIONS", value_name = "LIST")]
     allowed_permissions: Option<String>,
+    #[arg(long, env = "SYNAPSE_REFLEX_FORCE_DEGRADED")]
+    reflex_force_degraded: bool,
+    #[arg(
+        long,
+        env = "SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE",
+        value_name = "BYTES"
+    )]
+    storage_pressure_free_bytes_sample: Option<u64>,
     #[arg(
         long,
         env = "SYNAPSE_MAX_SUBSCRIPTIONS",
@@ -78,6 +86,8 @@ impl Cli {
             self.enable_audio,
             self.allow_unknown_profile,
             self.allowed_permissions.clone(),
+            self.reflex_force_degraded,
+            self.storage_pressure_free_bytes_sample,
         )
     }
 }

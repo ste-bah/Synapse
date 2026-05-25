@@ -20,7 +20,7 @@ use synapse_core::{
     ReflexId, ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION, StoredReflexAudit,
     error_codes,
 };
-use synapse_storage::{Db, cf, decode_json};
+use synapse_storage::{Db, DiskPressureLevel, StorageResult, cf, decode_json};
 use uuid::Uuid;
 
 pub use audit::write_audit;
@@ -77,6 +77,7 @@ pub struct ReflexRuntime {
     db: Arc<Db>,
     action_handle: ActionHandle,
     event_bus: EventBus,
+    scheduler_config: SchedulerConfig,
     reflexes: Vec<ScheduledReflex>,
     disabled_reflex_ids: HashSet<ReflexId>,
     scheduler: Option<SchedulerHandle>,
@@ -108,10 +109,26 @@ impl ReflexRuntime {
         action_handle: ActionHandle,
         event_bus: EventBus,
     ) -> ReflexResult<Self> {
+        Self::spawn_with_config(db, action_handle, event_bus, SchedulerConfig::default())
+    }
+
+    /// Spawns the reflex runtime with an explicit scheduler config.
+    ///
+    /// # Errors
+    ///
+    /// The scaffold currently cannot fail after receiving initialized handles.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn spawn_with_config(
+        db: Arc<Db>,
+        action_handle: ActionHandle,
+        event_bus: EventBus,
+        scheduler_config: SchedulerConfig,
+    ) -> ReflexResult<Self> {
         Ok(Self {
             db,
             action_handle,
             event_bus,
+            scheduler_config,
             reflexes: Vec::new(),
             disabled_reflex_ids: HashSet::new(),
             scheduler: None,
@@ -143,7 +160,7 @@ impl ReflexRuntime {
             self.event_bus.clone(),
             self.action_handle.clone(),
             next.clone(),
-            SchedulerConfig::default(),
+            self.scheduler_config.clone(),
             Arc::clone(&self.db),
         )?;
         if !self.disabled_reflex_ids.is_empty() {
@@ -350,6 +367,79 @@ impl ReflexRuntime {
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
     pub fn schema_version(&self) -> u32 {
         self.db.schema_version
+    }
+
+    /// Returns the current storage pressure level backing reflex persistence.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn storage_pressure_level(&self) -> DiskPressureLevel {
+        self.db.pressure_level()
+    }
+
+    /// Returns logical byte sizes for each storage column family.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when a column family scan fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn storage_cf_sizes(&self) -> StorageResult<BTreeMap<String, u64>> {
+        self.db.cf_sizes()
+    }
+
+    /// Returns the number of currently active reflexes.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn active_count(&self) -> usize {
+        self.statuses()
+            .into_iter()
+            .filter(|status| status.state == ReflexState::Active)
+            .count()
+    }
+
+    /// Returns the most recent scheduler tick jitter.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn last_tick_jitter_us(&self) -> Option<u64> {
+        self.scheduler
+            .as_ref()
+            .and_then(|scheduler| scheduler.samples().last().map(|sample| sample.jitter_us))
+    }
+
+    /// Returns true when the latest tick ran in degraded mode or missed its deadline.
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn degraded_latency(&self) -> bool {
+        self.scheduler
+            .as_ref()
+            .and_then(|scheduler| scheduler.samples().last().copied())
+            .is_some_and(|sample| sample.degraded || sample.late)
+    }
+
+    /// Counts persisted recursion-guard clamp audit rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reflex error when audit rows cannot be scanned or decoded.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn recursion_clamps_total(&self) -> ReflexResult<u64> {
+        let rows =
+            self.db
+                .scan_cf(cf::CF_REFLEX_AUDIT)
+                .map_err(|error| ReflexError::ParamsInvalid {
+                    detail: format!("reflex audit scan failed: {error}"),
+                })?;
+        let mut total = 0_u64;
+        for (_key, value) in rows {
+            let audit = decode_json::<StoredReflexAudit>(&value).map_err(|error| {
+                ReflexError::ParamsInvalid {
+                    detail: format!("reflex audit decode failed: {error}"),
+                }
+            })?;
+            if audit.error_code.as_deref() == Some(error_codes::REFLEX_RECURSION_LIMIT) {
+                total = total.saturating_add(1);
+            }
+        }
+        Ok(total)
     }
 
     /// Returns the action emitter handle used by reflex controllers.
