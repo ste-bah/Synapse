@@ -52,6 +52,11 @@ expression: shape
         "minimum": 0,
         "type": "integer"
       },
+      "observations_skipped": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
       "path": {
         "type": "string"
       },
@@ -64,6 +69,7 @@ expression: shape
     "required": [
       "path",
       "records_written",
+      "observations_skipped",
       "bytes"
     ],
     "title": "ReplayRecordResponse",

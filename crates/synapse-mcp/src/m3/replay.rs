@@ -73,6 +73,7 @@ pub struct ReplayRecordParams {
 pub struct ReplayRecordResponse {
     pub path: String,
     pub records_written: u64,
+    pub observations_skipped: u64,
     pub bytes: u64,
 }
 
@@ -104,10 +105,10 @@ pub async fn record_replay(
     })?;
     let mut writer = BufWriter::new(file);
 
-    let records_written = if params.duration_ms > 0 {
+    let stats = if params.duration_ms > 0 {
         record_window(&mut writer, &m1_state, &sse_state, target, params).await?
     } else {
-        0
+        RecordWindowStats::default()
     };
 
     writer.flush().await.map_err(|error| {
@@ -130,7 +131,8 @@ pub async fn record_replay(
 
     Ok(ReplayRecordResponse {
         path: display_path(&path),
-        records_written,
+        records_written: stats.records_written,
+        observations_skipped: stats.observations_skipped,
         bytes: bytes.len(),
     })
 }
@@ -141,11 +143,11 @@ async fn record_window<W>(
     sse_state: &SseState,
     target: ReplayTarget,
     params: &ReplayRecordParams,
-) -> Result<u64, ErrorData>
+) -> Result<RecordWindowStats, ErrorData>
 where
     W: AsyncWrite + Unpin + Send,
 {
-    let mut records_written = 0_u64;
+    let mut stats = RecordWindowStats::default();
     let deadline = Instant::now() + Duration::from_millis(u64::from(params.duration_ms));
     let mut event_subscription = if target.includes_events() {
         Some(
@@ -164,7 +166,7 @@ where
 
     let result = async {
         if target.includes_observations() {
-            records_written = records_written.saturating_add(
+            stats.record_observation(
                 write_observation(writer, m1_state, &assembler, include, target).await?,
             );
             next_observation_sample = Instant::now() + OBSERVATION_SAMPLE_INTERVAL;
@@ -172,12 +174,13 @@ where
 
         while Instant::now() < deadline {
             if let Some(subscription) = &event_subscription {
-                records_written = records_written
+                stats.records_written = stats
+                    .records_written
                     .saturating_add(drain_events(writer, subscription.drain(), target).await?);
             }
 
             if target.includes_observations() && Instant::now() >= next_observation_sample {
-                records_written = records_written.saturating_add(
+                stats.record_observation(
                     write_observation(writer, m1_state, &assembler, include, target).await?,
                 );
                 next_observation_sample += OBSERVATION_SAMPLE_INTERVAL;
@@ -187,11 +190,34 @@ where
         }
 
         if let Some(subscription) = &event_subscription {
-            records_written = records_written
+            stats.records_written = stats
+                .records_written
                 .saturating_add(drain_events(writer, subscription.drain(), target).await?);
         }
 
-        Ok(records_written)
+        if target.includes_observations()
+            && stats.observations_written == 0
+            && stats.observations_skipped > 0
+        {
+            return Err(mcp_error(
+                error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+                format!(
+                    "replay_record could not capture any observations; skipped {} unavailable samples",
+                    stats.observations_skipped
+                ),
+            ));
+        }
+
+        if stats.observations_skipped > 0 {
+            tracing::warn!(
+                code = "REPLAY_OBSERVATION_GAPS_SKIPPED",
+                observations_skipped = stats.observations_skipped,
+                observations_written = stats.observations_written,
+                "replay_record skipped transient unavailable observation samples"
+            );
+        }
+
+        Ok(stats)
     }
     .await;
 
@@ -208,7 +234,7 @@ async fn write_observation<W>(
     assembler: &ObservationAssembler,
     include: ObserveInclude,
     target: ReplayTarget,
-) -> Result<u64, ErrorData>
+) -> Result<ObservationWrite, ErrorData>
 where
     W: AsyncWrite + Unpin + Send,
 {
@@ -219,11 +245,22 @@ where
                 "M1 service state lock poisoned",
             )
         })?;
-        current_input(&state, include.max_subtree_depth)?
+        match current_input(&state, include.max_subtree_depth) {
+            Ok(input) => input,
+            Err(error) if is_no_perception_error(&error) => {
+                return Ok(ObservationWrite::skipped());
+            }
+            Err(error) => return Err(error),
+        }
     };
-    let observation = assembler
+    let observation = match assembler
         .assemble(include, input)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
+    {
+        Ok(observation) => observation,
+        Err(error) if is_no_perception_error(&error) => return Ok(ObservationWrite::skipped()),
+        Err(error) => return Err(error),
+    };
     match target {
         ReplayTarget::Observations => write_json_line(writer, &observation).await?,
         ReplayTarget::Both => {
@@ -237,7 +274,60 @@ where
         }
         ReplayTarget::Events => {}
     }
-    Ok(1)
+    Ok(ObservationWrite::written(target))
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct RecordWindowStats {
+    records_written: u64,
+    observations_written: u64,
+    observations_skipped: u64,
+}
+
+impl RecordWindowStats {
+    const fn record_observation(&mut self, write: ObservationWrite) {
+        self.records_written = self.records_written.saturating_add(write.records_written);
+        self.observations_written = self
+            .observations_written
+            .saturating_add(write.observations_written);
+        self.observations_skipped = self
+            .observations_skipped
+            .saturating_add(write.observations_skipped);
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+struct ObservationWrite {
+    records_written: u64,
+    observations_written: u64,
+    observations_skipped: u64,
+}
+
+impl ObservationWrite {
+    const fn skipped() -> Self {
+        Self {
+            records_written: 0,
+            observations_written: 0,
+            observations_skipped: 1,
+        }
+    }
+
+    const fn written(target: ReplayTarget) -> Self {
+        Self {
+            records_written: if target.includes_observations() { 1 } else { 0 },
+            observations_written: 1,
+            observations_skipped: 0,
+        }
+    }
+}
+
+fn is_no_perception_error(error: &ErrorData) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        == Some(error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE)
 }
 
 async fn drain_events<W>(
@@ -393,8 +483,8 @@ mod tests {
 
     use chrono::Utc;
     use serde_json::json;
-    use synapse_core::EventSource;
-    use tempfile::TempDir;
+    use synapse_core::{EventSource, ForegroundContext, Observation, Rect, SensorStatus};
+    use synapse_perception::ObservationInput;
 
     use crate::m1::M1State;
 
@@ -402,8 +492,8 @@ mod tests {
 
     #[tokio::test]
     async fn events_target_records_published_bus_events() -> anyhow::Result<()> {
-        let dir = TempDir::new()?;
-        let path = dir.path().join("events.jsonl");
+        let path = replay_test_path("events");
+        let _ = std::fs::remove_file(&path);
         let sse_state = SseState::from_env();
         let publisher = sse_state.event_bus();
         let params = ReplayRecordParams {
@@ -441,6 +531,121 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].seq, 324_001);
         assert_eq!(events[0].data["known"], "event-target");
+        std::fs::remove_file(&path)?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn observations_target_skips_transient_no_perception_and_continues() -> anyhow::Result<()>
+    {
+        let path = replay_test_path("transient-observations");
+        let _ = std::fs::remove_file(&path);
+        let sse_state = SseState::from_env();
+        let params = ReplayRecordParams {
+            target: "observations".to_owned(),
+            format: "jsonl".to_owned(),
+            duration_ms: 600,
+            path: Some(path.display().to_string()),
+        };
+        let state = M1State {
+            synthetic: Some(observation_input()),
+            force_no_perception: true,
+            ..M1State::default()
+        };
+        let m1_state = Arc::new(Mutex::new(state));
+        let toggled = Arc::clone(&m1_state);
+        let restore_perception = tokio::spawn(async move {
+            sleep(Duration::from_millis(40)).await;
+            toggled
+                .lock()
+                .map_err(|_| anyhow::anyhow!("test M1 state lock poisoned"))?
+                .force_no_perception = false;
+            anyhow::Ok(())
+        });
+
+        let response = record_replay(m1_state, sse_state, &params)
+            .await
+            .map_err(|error| anyhow::anyhow!("record_replay failed: {error:?}"))?;
+        restore_perception.await??;
+
+        assert!(response.records_written >= 1);
+        assert!(response.observations_skipped >= 1);
+
+        let replay_text = std::fs::read_to_string(&path)?;
+        let observations = replay_text
+            .lines()
+            .map(serde_json::from_str::<Observation>)
+            .collect::<Result<Vec<_>, _>>()?;
+        assert!(!observations.is_empty());
+        assert_eq!(observations[0].foreground.process_name, "notepad.exe");
+        std::fs::remove_file(&path)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observations_target_errors_when_every_sample_is_unavailable() -> anyhow::Result<()> {
+        let path = replay_test_path("unavailable-observations");
+        let _ = std::fs::remove_file(&path);
+        let sse_state = SseState::from_env();
+        let params = ReplayRecordParams {
+            target: "observations".to_owned(),
+            format: "jsonl".to_owned(),
+            duration_ms: 60,
+            path: Some(path.display().to_string()),
+        };
+        let state = M1State {
+            synthetic: Some(observation_input()),
+            force_no_perception: true,
+            ..M1State::default()
+        };
+        let m1_state = Arc::new(Mutex::new(state));
+
+        let error = match record_replay(m1_state, sse_state, &params).await {
+            Ok(response) => {
+                anyhow::bail!("sustained no-perception replay unexpectedly succeeded: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_data_code(&error),
+            Some(error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE)
+        );
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    fn observation_input() -> ObservationInput {
+        let mut input = ObservationInput::new(ForegroundContext {
+            hwnd: 100,
+            pid: 200,
+            process_name: "notepad.exe".to_owned(),
+            process_path: "C:\\Windows\\System32\\notepad.exe".to_owned(),
+            window_title: "transient.txt - Notepad".to_owned(),
+            window_bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 600,
+            },
+            monitor_index: 0,
+            dpi_scale: 1.0,
+            profile_id: None,
+            steam_appid: None,
+            is_fullscreen: false,
+            is_dwm_composed: true,
+        });
+        input.a11y_status = SensorStatus::Healthy;
+        input
+    }
+
+    fn error_data_code(error: &ErrorData) -> Option<&str> {
+        error.data.as_ref()?.get("code")?.as_str()
+    }
+
+    fn replay_test_path(prefix: &str) -> PathBuf {
+        replay_root().join(format!(
+            "{prefix}-{}.jsonl",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
     }
 }

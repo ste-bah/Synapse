@@ -44,6 +44,7 @@ async fn replay_record_schema_defaults_file_output_and_edges() -> anyhow::Result
         .await?;
     let payload = structured(&response)?;
     assert!(payload["records_written"].as_u64().unwrap_or_default() >= 1);
+    assert_eq!(payload["observations_skipped"], 0);
     assert!(payload["bytes"].as_u64().unwrap_or_default() > 0);
 
     let replay_text = std::fs::read_to_string(&observation_path)?;
@@ -67,6 +68,7 @@ async fn replay_record_schema_defaults_file_output_and_edges() -> anyhow::Result
         .await?;
     let empty_payload = structured(&empty)?;
     assert_eq!(empty_payload["records_written"], 0);
+    assert_eq!(empty_payload["observations_skipped"], 0);
     assert_eq!(empty_payload["bytes"], 0);
     assert_eq!(std::fs::read_to_string(&empty_path)?, "");
 
@@ -132,7 +134,7 @@ fn assert_replay_record_schema(tool: &Value) {
     assert_eq!(shape["inputSchema"]["required"], json!(["duration_ms"]));
     assert_eq!(
         shape["outputSchema"]["required"],
-        json!(["path", "records_written", "bytes"])
+        json!(["path", "records_written", "observations_skipped", "bytes"])
     );
     insta::assert_json_snapshot!("m3_replay_record_tool", shape);
 }
