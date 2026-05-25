@@ -30,6 +30,7 @@ synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
 synapse-perception = { version = "0.1.0", path = "../synapse-perception" }
 synapse-profiles = { version = "0.1.0", path = "../synapse-profiles" }
 synapse-reflex = { version = "0.1.0", path = "../synapse-reflex" }
+synapse-storage = { version = "0.1.0", path = "../synapse-storage" }
 synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 tokio.workspace = true
 tokio-util.workspace = true

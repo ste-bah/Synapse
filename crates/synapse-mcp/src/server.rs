@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    sync::{Arc, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
     time::Instant,
 };
 
@@ -42,6 +42,7 @@ use crate::{
             ProfileActivateParams, ProfileActivateResponse, ProfileListParams, ProfileListResponse,
             activate_profile, list_profiles,
         },
+        reflex::{ReflexRegisterParams, ReflexRegisterResponse, register_reflex},
         shared_m3_state_from_env, shared_m3_state_from_env_with_shutdown_reason,
         shared_m3_state_from_env_with_shutdown_reason_and_sse_state,
         subscribe::{
@@ -288,6 +289,21 @@ impl SynapseService {
             })
     }
 
+    fn reflex_runtime(&self) -> Result<Arc<Mutex<synapse_reflex::ReflexRuntime>>, ErrorData> {
+        let event_bus = self.sse_state()?.event_bus();
+        let (action_handle, _recording, _connection_closed_cancel) = self.m2_action_context()?;
+        self.m3_state
+            .lock()
+            .map_err(|_err| {
+                mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "M3 service state lock poisoned",
+                )
+            })?
+            .ensure_reflex_runtime(action_handle, event_bus)
+            .map_err(|error| m3_state_error(&error))
+    }
+
     #[allow(clippy::significant_drop_tightening)]
     fn activate_profile_locked(
         &self,
@@ -371,6 +387,16 @@ impl Default for SynapseService {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn m3_state_error(error: &anyhow::Error) -> ErrorData {
+    if let Some(reflex_error) = error.downcast_ref::<synapse_reflex::ReflexError>() {
+        return mcp_error(reflex_error.code(), reflex_error.to_string());
+    }
+    mcp_error(
+        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+        error.to_string(),
+    )
 }
 
 #[cfg(debug_assertions)]
@@ -643,6 +669,22 @@ impl SynapseService {
         );
         let sse_state = self.sse_state()?;
         cancel_subscription(&sse_state, &params.0).map(Json)
+    }
+
+    #[tool(description = "Register a reflex")]
+    pub async fn reflex_register(
+        &self,
+        params: Parameters<ReflexRegisterParams>,
+    ) -> Result<Json<ReflexRegisterResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "reflex_register",
+            reflex_kind = %params.0.kind,
+            priority = params.0.priority,
+            "tool.invocation kind=reflex_register"
+        );
+        let runtime = self.reflex_runtime()?;
+        register_reflex(&runtime, params.0).map(Json)
     }
 
     #[tool(description = "List loaded profiles")]

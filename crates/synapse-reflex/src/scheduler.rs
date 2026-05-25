@@ -21,6 +21,7 @@ use crate::{
 use scheduler_tick::tick;
 
 pub const MAX_SCHEDULED_REFLEXES: usize = 32;
+pub const MAX_REFLEX_PRIORITY: u32 = 1000;
 pub const REFLEX_TICK_LATE_KIND: &str = "reflex_tick_late";
 pub const DEFAULT_SAMPLE_LIMIT: usize = 4096;
 pub const DEFAULT_REFLEX_PRIORITY: u32 = 100;
@@ -82,6 +83,8 @@ pub struct ScheduledReflex {
     pub trigger: SchedulerTrigger,
     pub then: Vec<Action>,
     pub priority: u32,
+    pub lifetime: ReflexLifetime,
+    pub exclusive: bool,
     pub debounce: Duration,
 }
 
@@ -93,6 +96,8 @@ impl ScheduledReflex {
             trigger: SchedulerTrigger::EveryTick,
             then,
             priority: DEFAULT_REFLEX_PRIORITY,
+            lifetime: ReflexLifetime::UntilCancelled,
+            exclusive: false,
             debounce: Duration::ZERO,
         }
     }
@@ -108,6 +113,8 @@ impl ScheduledReflex {
             trigger: SchedulerTrigger::OnEvent(filter),
             then,
             priority: DEFAULT_REFLEX_PRIORITY,
+            lifetime: ReflexLifetime::UntilCancelled,
+            exclusive: false,
             debounce: Duration::ZERO,
         }
     }
@@ -124,8 +131,28 @@ impl ScheduledReflex {
             trigger: SchedulerTrigger::OnEvent(filter),
             then,
             priority: DEFAULT_REFLEX_PRIORITY,
+            lifetime: ReflexLifetime::UntilCancelled,
+            exclusive: false,
             debounce,
         }
+    }
+
+    #[must_use]
+    pub const fn with_priority(mut self, priority: u32) -> Self {
+        self.priority = priority;
+        self
+    }
+
+    #[must_use]
+    pub fn with_lifetime(mut self, lifetime: ReflexLifetime) -> Self {
+        self.lifetime = lifetime;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_exclusive(mut self, exclusive: bool) -> Self {
+        self.exclusive = exclusive;
+        self
     }
 }
 
@@ -388,7 +415,7 @@ struct RuntimeState {
     tick_index: u64,
 }
 
-fn validate_reflexes(reflexes: &[ScheduledReflex]) -> ReflexResult<()> {
+pub(crate) fn validate_reflexes(reflexes: &[ScheduledReflex]) -> ReflexResult<()> {
     if reflexes.len() > MAX_SCHEDULED_REFLEXES {
         return Err(ReflexError::CapReached {
             detail: format!(
@@ -398,6 +425,14 @@ fn validate_reflexes(reflexes: &[ScheduledReflex]) -> ReflexResult<()> {
         });
     }
     for reflex in reflexes {
+        if reflex.priority > MAX_REFLEX_PRIORITY {
+            return Err(ReflexError::PriorityInvalid {
+                detail: format!(
+                    "priority {} exceeds maximum {MAX_REFLEX_PRIORITY}",
+                    reflex.priority
+                ),
+            });
+        }
         reflex.trigger.validate()?;
     }
     Ok(())
@@ -524,8 +559,8 @@ fn status_for_reflex(
         last_fired_at: None,
         fire_count: 0,
         priority: reflex.priority,
-        lifetime: ReflexLifetime::UntilCancelled,
-        exclusive: false,
+        lifetime: reflex.lifetime.clone(),
+        exclusive: reflex.exclusive,
         last_error_code: None,
     }
 }

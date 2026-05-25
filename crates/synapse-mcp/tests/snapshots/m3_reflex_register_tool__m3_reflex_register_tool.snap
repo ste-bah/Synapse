@@ -1,0 +1,2206 @@
+---
+source: crates/synapse-mcp/tests/m3_reflex_register_tool.rs
+expression: shape
+---
+{
+  "inputSchema": {
+    "$defs": {
+      "Action": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "hold_ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "key": {
+                "$ref": "#/$defs/Key"
+              },
+              "kind": {
+                "const": "key_press",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "key",
+              "hold_ms",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "key": {
+                "$ref": "#/$defs/Key"
+              },
+              "kind": {
+                "const": "key_down",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "key",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "key": {
+                "$ref": "#/$defs/Key"
+              },
+              "kind": {
+                "const": "key_up",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "key",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "hold_ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "keys": {
+                "items": {
+                  "$ref": "#/$defs/Key"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "const": "key_chord",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "keys",
+              "hold_ms",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "dynamics": {
+                "$ref": "#/$defs/KeystrokeDynamics"
+              },
+              "kind": {
+                "const": "type_text",
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "text",
+              "dynamics",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "curve": {
+                "$ref": "#/$defs/AimCurve"
+              },
+              "duration_ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "mouse_move",
+                "type": "string"
+              },
+              "to": {
+                "$ref": "#/$defs/MouseTarget"
+              }
+            },
+            "required": [
+              "kind",
+              "to",
+              "curve",
+              "duration_ms",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "dx": {
+                "format": "float",
+                "type": "number"
+              },
+              "dy": {
+                "format": "float",
+                "type": "number"
+              },
+              "kind": {
+                "const": "mouse_move_relative",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "dx",
+              "dy",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "$ref": "#/$defs/ButtonAction"
+              },
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "button": {
+                "$ref": "#/$defs/MouseButton"
+              },
+              "hold_ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "mouse_button",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "button",
+              "action",
+              "hold_ms",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "button": {
+                "$ref": "#/$defs/MouseButton"
+              },
+              "curve": {
+                "$ref": "#/$defs/AimCurve"
+              },
+              "duration_ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "from": {
+                "$ref": "#/$defs/Point"
+              },
+              "kind": {
+                "const": "mouse_drag",
+                "type": "string"
+              },
+              "to": {
+                "$ref": "#/$defs/Point"
+              }
+            },
+            "required": [
+              "kind",
+              "from",
+              "to",
+              "button",
+              "curve",
+              "duration_ms",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "at": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/Point"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "dx": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "dy": {
+                "format": "int32",
+                "type": "integer"
+              },
+              "kind": {
+                "const": "mouse_scroll",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "dy",
+              "dx",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "$ref": "#/$defs/ButtonAction"
+              },
+              "button": {
+                "$ref": "#/$defs/PadButton"
+              },
+              "hold_ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "pad_button",
+                "type": "string"
+              },
+              "pad": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "pad",
+              "button",
+              "action",
+              "hold_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "pad_stick",
+                "type": "string"
+              },
+              "pad": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "stick": {
+                "$ref": "#/$defs/Stick"
+              },
+              "x": {
+                "format": "float",
+                "type": "number"
+              },
+              "y": {
+                "format": "float",
+                "type": "number"
+              }
+            },
+            "required": [
+              "kind",
+              "pad",
+              "stick",
+              "x",
+              "y"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "pad_trigger",
+                "type": "string"
+              },
+              "pad": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "trigger": {
+                "$ref": "#/$defs/Trigger"
+              },
+              "value": {
+                "format": "float",
+                "type": "number"
+              }
+            },
+            "required": [
+              "kind",
+              "pad",
+              "trigger",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "pad_report",
+                "type": "string"
+              },
+              "pad": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "report": {
+                "$ref": "#/$defs/GamepadReport"
+              }
+            },
+            "required": [
+              "kind",
+              "pad",
+              "report"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "deadline_ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "aim_at",
+                "type": "string"
+              },
+              "style": {
+                "$ref": "#/$defs/AimStyle"
+              },
+              "target": {
+                "$ref": "#/$defs/AimTarget"
+              }
+            },
+            "required": [
+              "kind",
+              "target",
+              "style",
+              "deadline_ms",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "kind": {
+                "const": "combo",
+                "type": "string"
+              },
+              "steps": {
+                "items": {
+                  "$ref": "#/$defs/ComboStep"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "steps",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "release_all",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "AimCurve": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "instant",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "linear",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "ease_in_out",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "bezier",
+                "type": "string"
+              },
+              "p1": {
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "format": "float",
+                    "type": "number"
+                  },
+                  {
+                    "format": "float",
+                    "type": "number"
+                  }
+                ],
+                "type": "array"
+              },
+              "p2": {
+                "maxItems": 2,
+                "minItems": 2,
+                "prefixItems": [
+                  {
+                    "format": "float",
+                    "type": "number"
+                  },
+                  {
+                    "format": "float",
+                    "type": "number"
+                  }
+                ],
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "p1",
+              "p2"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "natural",
+                "type": "string"
+              },
+              "params": {
+                "$ref": "#/$defs/AimNaturalParams"
+              }
+            },
+            "required": [
+              "kind",
+              "params"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "AimNaturalParams": {
+        "additionalProperties": false,
+        "properties": {
+          "control_point_jitter": {
+            "format": "float",
+            "type": "number"
+          },
+          "micro_correct_steps": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "overshoot_factor_range": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "format": "float",
+                "type": "number"
+              },
+              {
+                "format": "float",
+                "type": "number"
+              }
+            ],
+            "type": "array"
+          },
+          "overshoot_prob": {
+            "format": "float",
+            "type": "number"
+          },
+          "seed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "timing_stddev_ms": {
+            "format": "float",
+            "type": "number"
+          },
+          "tremor_stddev_px": {
+            "format": "float",
+            "type": "number"
+          }
+        },
+        "required": [
+          "control_point_jitter",
+          "tremor_stddev_px",
+          "overshoot_prob",
+          "overshoot_factor_range",
+          "micro_correct_steps",
+          "timing_stddev_ms"
+        ],
+        "type": "object"
+      },
+      "AimStyle": {
+        "enum": [
+          "snap",
+          "flick",
+          "natural",
+          "track"
+        ],
+        "type": "string"
+      },
+      "AimTarget": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "screen",
+                "type": "string"
+              },
+              "point": {
+                "$ref": "#/$defs/Point"
+              }
+            },
+            "required": [
+              "kind",
+              "point"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "element_id": {
+                "$ref": "#/$defs/ElementId"
+              },
+              "kind": {
+                "const": "element",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "element_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "track",
+                "type": "string"
+              },
+              "track_id": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "track_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "Backend": {
+        "enum": [
+          "software",
+          "vigem",
+          "hardware",
+          "auto"
+        ],
+        "type": "string"
+      },
+      "ButtonAction": {
+        "enum": [
+          "press",
+          "down",
+          "up"
+        ],
+        "type": "string"
+      },
+      "ComboInput": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "key": {
+                "$ref": "#/$defs/Key"
+              },
+              "kind": {
+                "const": "key_down",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "key"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "key": {
+                "$ref": "#/$defs/Key"
+              },
+              "kind": {
+                "const": "key_up",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "key"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "hold_ms": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "key": {
+                "$ref": "#/$defs/Key"
+              },
+              "kind": {
+                "const": "key_press",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "key",
+              "hold_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "$ref": "#/$defs/ButtonAction"
+              },
+              "button": {
+                "$ref": "#/$defs/MouseButton"
+              },
+              "kind": {
+                "const": "mouse_button",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "button",
+              "action"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "dx": {
+                "format": "float",
+                "type": "number"
+              },
+              "dy": {
+                "format": "float",
+                "type": "number"
+              },
+              "kind": {
+                "const": "mouse_move_rel",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "dx",
+              "dy"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "$ref": "#/$defs/ButtonAction"
+              },
+              "button": {
+                "$ref": "#/$defs/PadButton"
+              },
+              "kind": {
+                "const": "pad_button",
+                "type": "string"
+              },
+              "pad": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "pad",
+              "button",
+              "action"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "pad_stick",
+                "type": "string"
+              },
+              "pad": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "stick": {
+                "$ref": "#/$defs/Stick"
+              },
+              "x": {
+                "format": "float",
+                "type": "number"
+              },
+              "y": {
+                "format": "float",
+                "type": "number"
+              }
+            },
+            "required": [
+              "kind",
+              "pad",
+              "stick",
+              "x",
+              "y"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ComboStep": {
+        "additionalProperties": false,
+        "properties": {
+          "at_ms": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "input": {
+            "$ref": "#/$defs/ComboInput"
+          }
+        },
+        "required": [
+          "at_ms",
+          "input"
+        ],
+        "type": "object"
+      },
+      "DataPredicate": {
+        "oneOf": [
+          {
+            "properties": {
+              "op": {
+                "const": "eq",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "ne",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "lt",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "le",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "gt",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "ge",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "regex",
+                "type": "string"
+              },
+              "pattern": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "pattern"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "in_set",
+                "type": "string"
+              },
+              "values": {
+                "items": true,
+                "type": "array"
+              }
+            },
+            "required": [
+              "op",
+              "values"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "exists",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ElementId": {
+        "pattern": "^-?0x[0-9a-fA-F]+:[0-9a-fA-F]+$",
+        "type": "string"
+      },
+      "EventFilter": {
+        "oneOf": [
+          {
+            "properties": {
+              "op": {
+                "const": "all",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "none",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "type": "string"
+              },
+              "op": {
+                "const": "kind",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "source",
+                "type": "string"
+              },
+              "source": {
+                "$ref": "#/$defs/EventSource"
+              }
+            },
+            "required": [
+              "op",
+              "source"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "args": {
+                "items": {
+                  "$ref": "#/$defs/EventFilter"
+                },
+                "type": "array"
+              },
+              "op": {
+                "const": "and",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "args"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "args": {
+                "items": {
+                  "$ref": "#/$defs/EventFilter"
+                },
+                "type": "array"
+              },
+              "op": {
+                "const": "or",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "args"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "arg": {
+                "$ref": "#/$defs/EventFilter"
+              },
+              "op": {
+                "const": "not",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "arg"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "data",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "predicate": {
+                "$ref": "#/$defs/DataPredicate"
+              }
+            },
+            "required": [
+              "op",
+              "path",
+              "predicate"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "EventSource": {
+        "enum": [
+          "a11y_uia",
+          "a11y_win_event",
+          "a11y_cdp",
+          "perception",
+          "perception_detection",
+          "perception_hud",
+          "perception_audio",
+          "filesystem",
+          "process",
+          "clipboard",
+          "action_emitter",
+          "reflex",
+          "system"
+        ],
+        "type": "string"
+      },
+      "GamepadController": {
+        "enum": [
+          "x360",
+          "ds4"
+        ],
+        "type": "string"
+      },
+      "GamepadReport": {
+        "additionalProperties": false,
+        "properties": {
+          "buttons": {
+            "default": [],
+            "items": {
+              "$ref": "#/$defs/PadButton"
+            },
+            "type": "array"
+          },
+          "controller": {
+            "$ref": "#/$defs/GamepadController",
+            "default": "x360"
+          },
+          "lt": {
+            "format": "float",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          "rt": {
+            "format": "float",
+            "maximum": 1.0,
+            "minimum": 0.0,
+            "type": "number"
+          },
+          "thumb_l": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "maximum": 1.0,
+                "minimum": -1.0,
+                "type": "number"
+              },
+              {
+                "maximum": 1.0,
+                "minimum": -1.0,
+                "type": "number"
+              }
+            ],
+            "type": "array"
+          },
+          "thumb_r": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "maximum": 1.0,
+                "minimum": -1.0,
+                "type": "number"
+              },
+              {
+                "maximum": 1.0,
+                "minimum": -1.0,
+                "type": "number"
+              }
+            ],
+            "type": "array"
+          }
+        },
+        "required": [
+          "thumb_l",
+          "thumb_r",
+          "lt",
+          "rt"
+        ],
+        "type": "object"
+      },
+      "Key": {
+        "additionalProperties": false,
+        "properties": {
+          "code": {
+            "$ref": "#/$defs/KeyCode"
+          },
+          "use_scancode": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "use_scancode"
+        ],
+        "type": "object"
+      },
+      "KeyCode": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "named",
+                "type": "string"
+              },
+              "value": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "symbol",
+                "type": "string"
+              },
+              "value": {
+                "maxLength": 1,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "hid_code",
+                "type": "string"
+              },
+              "value": {
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "KeystrokeDynamics": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "burst",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "linear",
+                "type": "string"
+              },
+              "ms_per_char": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "ms_per_char"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "natural",
+                "type": "string"
+              },
+              "params": {
+                "$ref": "#/$defs/KeystrokeNaturalParams"
+              }
+            },
+            "required": [
+              "kind",
+              "params"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "KeystrokeNaturalParams": {
+        "additionalProperties": false,
+        "properties": {
+          "bigram_bias": {
+            "type": "boolean"
+          },
+          "mean_iki_ms": {
+            "format": "float",
+            "type": "number"
+          },
+          "stddev_ms": {
+            "format": "float",
+            "type": "number"
+          }
+        },
+        "required": [
+          "mean_iki_ms",
+          "stddev_ms",
+          "bigram_bias"
+        ],
+        "type": "object"
+      },
+      "MouseButton": {
+        "enum": [
+          "left",
+          "right",
+          "middle",
+          "x1",
+          "x2"
+        ],
+        "type": "string"
+      },
+      "MouseTarget": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "screen",
+                "type": "string"
+              },
+              "point": {
+                "$ref": "#/$defs/Point"
+              }
+            },
+            "required": [
+              "kind",
+              "point"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "element_id": {
+                "$ref": "#/$defs/ElementId"
+              },
+              "kind": {
+                "const": "element",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "element_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PadButton": {
+        "enum": [
+          "a",
+          "b",
+          "x",
+          "y",
+          "lb",
+          "rb",
+          "ls",
+          "rs",
+          "back",
+          "start",
+          "up",
+          "down",
+          "left",
+          "right",
+          "guide"
+        ],
+        "type": "string"
+      },
+      "Point": {
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "y": {
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "ReflexLifetime": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "until_cancelled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "one_shot",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "duration",
+                "type": "string"
+              },
+              "ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "ms"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "filter": {
+                "$ref": "#/$defs/EventFilter"
+              },
+              "kind": {
+                "const": "until_event",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "filter"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "until_deadline",
+                "type": "string"
+              },
+              "ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "ms"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ReflexThen": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "action": {
+                "$ref": "#/$defs/Action"
+              },
+              "kind": {
+                "const": "action",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "action"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "actions": {
+                "items": {
+                  "$ref": "#/$defs/Action"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "const": "actions",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "actions"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "kind": {
+                "const": "combo",
+                "type": "string"
+              },
+              "steps": {
+                "items": {
+                  "$ref": "#/$defs/ComboStep"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "steps",
+              "backend"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "Stick": {
+        "enum": [
+          "left",
+          "right"
+        ],
+        "type": "string"
+      },
+      "Trigger": {
+        "enum": [
+          "left",
+          "right"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "backend": {
+        "$ref": "#/$defs/Backend",
+        "default": "auto"
+      },
+      "exclusive": {
+        "default": false,
+        "type": "boolean"
+      },
+      "kind": {
+        "enum": [
+          "aim_track",
+          "hold_move",
+          "hold_button",
+          "combo",
+          "on_event"
+        ],
+        "type": "string"
+      },
+      "lifetime": {
+        "$ref": "#/$defs/ReflexLifetime",
+        "default": {
+          "kind": "until_cancelled"
+        }
+      },
+      "priority": {
+        "default": 100,
+        "format": "uint32",
+        "maximum": 1000,
+        "minimum": 0,
+        "type": "integer"
+      },
+      "then": {
+        "$ref": "#/$defs/ReflexThen"
+      },
+      "when": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/EventFilter"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
+      }
+    },
+    "required": [
+      "kind",
+      "then"
+    ],
+    "title": "ReflexRegisterParams",
+    "type": "object"
+  },
+  "name": "reflex_register",
+  "outputSchema": {
+    "$defs": {
+      "DataPredicate": {
+        "oneOf": [
+          {
+            "properties": {
+              "op": {
+                "const": "eq",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "ne",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "lt",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "le",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "gt",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "ge",
+                "type": "string"
+              },
+              "value": true
+            },
+            "required": [
+              "op",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "regex",
+                "type": "string"
+              },
+              "pattern": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "pattern"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "in_set",
+                "type": "string"
+              },
+              "values": {
+                "items": true,
+                "type": "array"
+              }
+            },
+            "required": [
+              "op",
+              "values"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "exists",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "EventFilter": {
+        "oneOf": [
+          {
+            "properties": {
+              "op": {
+                "const": "all",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "none",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "type": "string"
+              },
+              "op": {
+                "const": "kind",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "source",
+                "type": "string"
+              },
+              "source": {
+                "$ref": "#/$defs/EventSource"
+              }
+            },
+            "required": [
+              "op",
+              "source"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "args": {
+                "items": {
+                  "$ref": "#/$defs/EventFilter"
+                },
+                "type": "array"
+              },
+              "op": {
+                "const": "and",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "args"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "args": {
+                "items": {
+                  "$ref": "#/$defs/EventFilter"
+                },
+                "type": "array"
+              },
+              "op": {
+                "const": "or",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "args"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "arg": {
+                "$ref": "#/$defs/EventFilter"
+              },
+              "op": {
+                "const": "not",
+                "type": "string"
+              }
+            },
+            "required": [
+              "op",
+              "arg"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "op": {
+                "const": "data",
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "predicate": {
+                "$ref": "#/$defs/DataPredicate"
+              }
+            },
+            "required": [
+              "op",
+              "path",
+              "predicate"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "EventSource": {
+        "enum": [
+          "a11y_uia",
+          "a11y_win_event",
+          "a11y_cdp",
+          "perception",
+          "perception_detection",
+          "perception_hud",
+          "perception_audio",
+          "filesystem",
+          "process",
+          "clipboard",
+          "action_emitter",
+          "reflex",
+          "system"
+        ],
+        "type": "string"
+      },
+      "ReflexLifetime": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "until_cancelled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "one_shot",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "duration",
+                "type": "string"
+              },
+              "ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "ms"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "filter": {
+                "$ref": "#/$defs/EventFilter"
+              },
+              "kind": {
+                "const": "until_event",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "filter"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "until_deadline",
+                "type": "string"
+              },
+              "ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "ms"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ReflexState": {
+        "enum": [
+          "active",
+          "paused",
+          "cancelled",
+          "expired",
+          "disabled",
+          "starved"
+        ],
+        "type": "string"
+      },
+      "ReflexStatus": {
+        "additionalProperties": false,
+        "properties": {
+          "exclusive": {
+            "type": "boolean"
+          },
+          "fire_count": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind_summary": {
+            "type": "string"
+          },
+          "last_error_code": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_fired_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "lifetime": {
+            "$ref": "#/$defs/ReflexLifetime"
+          },
+          "priority": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "registered_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/$defs/ReflexState"
+          }
+        },
+        "required": [
+          "id",
+          "kind_summary",
+          "state",
+          "registered_at",
+          "fire_count",
+          "priority",
+          "lifetime",
+          "exclusive"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "reflex_id": {
+        "type": "string"
+      },
+      "state": {
+        "$ref": "#/$defs/ReflexStatus"
+      }
+    },
+    "required": [
+      "reflex_id",
+      "state"
+    ],
+    "title": "ReflexRegisterResponse",
+    "type": "object"
+  }
+}

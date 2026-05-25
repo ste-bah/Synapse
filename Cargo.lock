@@ -3277,6 +3277,7 @@ dependencies = [
  "synapse-perception",
  "synapse-profiles",
  "synapse-reflex",
+ "synapse-storage",
  "synapse-telemetry",
  "synapse-test-utils",
  "tempfile",

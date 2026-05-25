@@ -3,7 +3,7 @@ use std::{error::Error, io, time::Duration};
 use serde_json::json;
 use synapse_action::{ACTION_QUEUE_CAPACITY, ActionHandle, ActionMessage};
 use synapse_core::{
-    Action, Backend, Event, EventFilter, EventSource, ReflexState, SCHEMA_VERSION,
+    Action, Backend, Event, EventFilter, EventSource, ReflexLifetime, ReflexState, SCHEMA_VERSION,
     StoredReflexAudit, error_codes,
 };
 use synapse_reflex::{
@@ -422,6 +422,8 @@ fn scheduler_rejects_invalid_trigger_filter() {
         trigger: SchedulerTrigger::OnEvent(EventFilter::And { args: Vec::new() }),
         then: vec![Action::ReleaseAll],
         priority: 0,
+        lifetime: ReflexLifetime::UntilCancelled,
+        exclusive: false,
         debounce: Duration::ZERO,
     };
     assert_eq!(action_rx.len(), 0);

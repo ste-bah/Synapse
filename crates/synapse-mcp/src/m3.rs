@@ -10,7 +10,11 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex},
 };
+use synapse_action::ActionHandle;
+use synapse_core::SCHEMA_VERSION;
 use synapse_profiles::{ProfileError, ProfileRuntime, bundled_profiles_dir};
+use synapse_reflex::{EventBus, ReflexError, ReflexRuntime};
+use synapse_storage::Db;
 use tokio_util::sync::CancellationToken;
 
 use crate::http::sse::SseState;
@@ -35,6 +39,7 @@ pub struct M3State {
     pub connection_closed_cancel: Option<CancellationToken>,
     pub profile_runtime: Option<Arc<ProfileRuntime>>,
     pub sse_state: SseState,
+    pub reflex_runtime: Option<Arc<Mutex<ReflexRuntime>>>,
 }
 
 pub fn shared_m3_state_from_env() -> Result<SharedM3State> {
@@ -170,6 +175,7 @@ impl M3State {
             connection_closed_cancel,
             profile_runtime: None,
             sse_state,
+            reflex_runtime: None,
         })
     }
 
@@ -193,6 +199,38 @@ impl M3State {
         self.profile_runtime = Some(Arc::clone(&runtime));
         Ok(runtime)
     }
+
+    pub fn ensure_reflex_runtime(
+        &mut self,
+        action_handle: ActionHandle,
+        event_bus: EventBus,
+    ) -> Result<Arc<Mutex<ReflexRuntime>>> {
+        if let Some(runtime) = &self.reflex_runtime {
+            return Ok(Arc::clone(runtime));
+        }
+        if self.reflex_disabled {
+            bail!(ReflexError::DisabledByOperator {
+                detail: "SYNAPSE_REFLEX_DISABLED is set".to_owned(),
+            });
+        }
+
+        let db_path = self.db_path.clone().unwrap_or_else(default_db_path);
+        let db = Arc::new(Db::open(&db_path, SCHEMA_VERSION)?);
+        let runtime = Arc::new(Mutex::new(ReflexRuntime::spawn(
+            db,
+            action_handle,
+            event_bus,
+        )?));
+        self.reflex_runtime = Some(Arc::clone(&runtime));
+        Ok(runtime)
+    }
+}
+
+fn default_db_path() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("synapse")
+        .join("db")
 }
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct M3ToolStub {
