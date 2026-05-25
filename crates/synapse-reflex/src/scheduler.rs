@@ -9,14 +9,20 @@ use std::{
 };
 
 use chrono::Utc;
+use serde_json::json;
 use synapse_action::ActionHandle;
-use synapse_core::{Action, EventFilter, ReflexId, ReflexLifetime, ReflexState, ReflexStatus};
+use synapse_core::{
+    Action, EventFilter, ReflexId, ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION,
+    StoredReflexAudit, error_codes,
+};
 use synapse_storage::Db;
+use uuid::Uuid;
 
 use crate::{
-    EventBus, SubscriberHandle,
+    EventBus, REFLEX_LIFETIME_EXPIRED_KIND, SubscriberHandle,
     error::{ReflexError, ReflexResult},
     kinds::{combo::ComboController, on_event::OnEventState},
+    write_audit,
 };
 use scheduler_tick::tick;
 
@@ -573,12 +579,70 @@ fn kind_summary(reflex: &ScheduledReflex) -> String {
 }
 
 fn mark_reflex_fired(runtime: &RuntimeState, index: usize) {
+    let expired = runtime
+        .reflexes
+        .get(index)
+        .is_some_and(|reflex| matches!(reflex.reflex.lifetime, ReflexLifetime::OneShot));
+    if expired && let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
+        control.active = false;
+    }
+    let mut expired_status = None;
     if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = ReflexState::Active;
+        status.state = if expired {
+            ReflexState::Expired
+        } else {
+            ReflexState::Active
+        };
         status.last_fired_at = Some(Utc::now());
         status.fire_count = status.fire_count.saturating_add(1);
         status.last_error_code = None;
+        if expired {
+            expired_status = Some(status.clone());
+        }
     }
+    if let Some(status) = expired_status {
+        write_lifetime_expired_audit(runtime, &status);
+    }
+}
+
+fn write_lifetime_expired_audit(runtime: &RuntimeState, status: &ReflexStatus) {
+    let Some(db) = runtime.audit_db.as_deref() else {
+        return;
+    };
+    let audit = StoredReflexAudit {
+        schema_version: SCHEMA_VERSION,
+        audit_id: Uuid::now_v7().to_string(),
+        reflex_id: status.id.clone(),
+        ts_ns: now_ts_ns(),
+        status: ReflexState::Expired,
+        event_id: None,
+        steps: Vec::new(),
+        error_code: Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned()),
+        details: json!({
+            "kind": REFLEX_LIFETIME_EXPIRED_KIND,
+            "reason": "one_shot",
+            "tick_index": runtime.tick_index,
+            "fire_count": status.fire_count,
+        }),
+        redacted: false,
+        redactions: Vec::new(),
+    };
+    if let Err(error) = write_audit(db, &audit) {
+        tracing::warn!(
+            component = "reflex_lifetime",
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "reflex lifetime audit write failed"
+        );
+    }
+}
+
+fn now_ts_ns() -> u64 {
+    Utc::now()
+        .timestamp_nanos_opt()
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_default()
 }
 
 fn mark_reflex_starved(runtime: &RuntimeState, index: usize) {

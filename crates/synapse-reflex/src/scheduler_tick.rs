@@ -120,7 +120,6 @@ fn dispatch_triggered_reflexes(
                     Ok(action_count) => {
                         *dispatched_actions = dispatched_actions.saturating_add(action_count);
                         runtime.on_event_states[trigger.reflex_index].mark_fired(now);
-                        super::mark_reflex_fired(runtime, trigger.reflex_index);
                         guard.record_fire();
                         publish_fired(
                             &runtime.event_bus,
@@ -130,6 +129,7 @@ fn dispatch_triggered_reflexes(
                             event,
                             &trigger.actions,
                         );
+                        super::mark_reflex_fired(runtime, trigger.reflex_index);
                     }
                     Err(error) => {
                         *dispatch_blocked = true;

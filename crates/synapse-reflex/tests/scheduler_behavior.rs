@@ -7,8 +7,9 @@ use synapse_core::{
     StoredReflexAudit, error_codes,
 };
 use synapse_reflex::{
-    DEFAULT_REFLEX_PRIORITY, EventBus, REFLEX_RECURSION_LIMIT_KIND, REFLEX_STARVED_KIND,
-    REFLEX_TICK_LATE_KIND, ReflexScheduler, ScheduledReflex, SchedulerConfig, SchedulerTrigger,
+    DEFAULT_REFLEX_PRIORITY, EventBus, REFLEX_LIFETIME_EXPIRED_KIND, REFLEX_RECURSION_LIMIT_KIND,
+    REFLEX_STARVED_KIND, REFLEX_TICK_LATE_KIND, ReflexScheduler, ScheduledReflex, SchedulerConfig,
+    SchedulerTrigger,
 };
 use synapse_storage::{Db, cf, decode_json};
 use tempfile::tempdir;
@@ -70,6 +71,55 @@ fn on_event_reflex_pulls_bus_event_and_dispatches() -> Result<(), Box<dyn Error>
     assert!(pulled >= 1);
     assert_eq!(dispatched, 1);
     assert_eq!(action_rx.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn one_shot_on_event_expires_after_first_fire() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let db = std::sync::Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
+    let bus = EventBus::default();
+    let (action_handle, action_rx) = ActionHandle::channel();
+    let reflex = ScheduledReflex::on_event(
+        "reflex-one-shot",
+        EventFilter::Kind {
+            kind: "once".to_owned(),
+        },
+        vec![Action::ReleaseAll],
+    )
+    .with_lifetime(ReflexLifetime::OneShot);
+    assert_eq!(action_rx.len(), 0);
+
+    let mut scheduler = ReflexScheduler::spawn_with_audit_db(
+        bus.clone(),
+        action_handle,
+        vec![reflex],
+        slow_ticks_config(16),
+        std::sync::Arc::clone(&db),
+    )?;
+    let _report = bus.publish(event(1, "once"));
+    assert!(wait_for_status(
+        &scheduler,
+        "reflex-one-shot",
+        ReflexState::Expired,
+        WAIT_TIMEOUT
+    ));
+    let _report = bus.publish(event(2, "once"));
+    let samples = scheduler.wait_for_samples(16, WAIT_TIMEOUT);
+    scheduler.stop()?;
+    db.flush()?;
+
+    let statuses = scheduler.statuses();
+    let status = status(&statuses, "reflex-one-shot")?;
+    let audits = read_audits(&db)?;
+    assert_eq!(samples.len(), 16);
+    assert_eq!(action_rx.len(), 1);
+    assert_eq!(status.state, ReflexState::Expired);
+    assert_eq!(status.fire_count, 1);
+    assert!(audits.iter().any(|audit| {
+        audit.status == ReflexState::Expired
+            && audit.details["kind"].as_str() == Some(REFLEX_LIFETIME_EXPIRED_KIND)
+    }));
     Ok(())
 }
 

@@ -46,7 +46,15 @@ pub use scheduler::{
     TickSample, p99_jitter_us,
 };
 
+pub const REFLEX_CANCELLED_KIND: &str = "reflex_cancelled";
 pub const REFLEX_REGISTERED_KIND: &str = "reflex_registered";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReflexCancelOutcome {
+    Cancelled { status: ReflexStatus },
+    NotFound,
+    AlreadyExpired { status: ReflexStatus },
+}
 
 /// Runtime handle for the M3 reflex subsystem.
 ///
@@ -147,6 +155,52 @@ impl ReflexRuntime {
         Ok(status)
     }
 
+    /// Cancels an active reflex and persists a cancellation audit row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ReflexError`] if the cancellation audit row cannot be
+    /// persisted.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", reflex_id = %reflex_id))]
+    pub fn cancel(&mut self, reflex_id: &str) -> ReflexResult<ReflexCancelOutcome> {
+        let Some(status) = self
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == reflex_id)
+        else {
+            return Ok(ReflexCancelOutcome::NotFound);
+        };
+
+        match status.state {
+            ReflexState::Expired => {
+                return Ok(ReflexCancelOutcome::AlreadyExpired { status });
+            }
+            ReflexState::Cancelled => {
+                return Ok(ReflexCancelOutcome::Cancelled { status });
+            }
+            ReflexState::Active
+            | ReflexState::Paused
+            | ReflexState::Disabled
+            | ReflexState::Starved => {}
+        }
+
+        let Some(scheduler) = &self.scheduler else {
+            return Ok(ReflexCancelOutcome::NotFound);
+        };
+        if !scheduler.cancel_reflex(reflex_id) {
+            return Ok(ReflexCancelOutcome::NotFound);
+        }
+        let status = scheduler
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == reflex_id)
+            .ok_or_else(|| ReflexError::ParamsInvalid {
+                detail: format!("cancelled reflex status missing: {reflex_id}"),
+            })?;
+        self.write_cancellation_audit(&status)?;
+        Ok(ReflexCancelOutcome::Cancelled { status })
+    }
+
     /// Returns the current scheduler status snapshot for active reflexes.
     #[must_use]
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
@@ -210,6 +264,33 @@ impl ReflexRuntime {
             detail: format!("registration audit flush failed: {error}"),
         })
     }
+
+    fn write_cancellation_audit(&self, status: &ReflexStatus) -> ReflexResult<()> {
+        let audit = StoredReflexAudit {
+            schema_version: SCHEMA_VERSION,
+            audit_id: Uuid::now_v7().to_string(),
+            reflex_id: status.id.clone(),
+            ts_ns: now_ts_ns(),
+            status: ReflexState::Cancelled,
+            event_id: None,
+            steps: Vec::new(),
+            error_code: None,
+            details: json!({
+                "kind": REFLEX_CANCELLED_KIND,
+                "kind_summary": status.kind_summary,
+                "priority": status.priority,
+                "exclusive": status.exclusive,
+            }),
+            redacted: false,
+            redactions: Vec::new(),
+        };
+        write_audit(&self.db, &audit).map_err(|error| ReflexError::ParamsInvalid {
+            detail: format!("cancellation audit write failed: {error}"),
+        })?;
+        self.db.flush().map_err(|error| ReflexError::ParamsInvalid {
+            detail: format!("cancellation audit flush failed: {error}"),
+        })
+    }
 }
 
 fn now_ts_ns() -> u64 {
@@ -224,12 +305,15 @@ mod tests {
     use std::{error::Error, sync::Arc};
 
     use synapse_action::ActionHandle;
-    use synapse_core::Action;
-    use synapse_storage::Db;
+    use synapse_core::{Action, EventFilter, ReflexState, StoredReflexAudit};
+    use synapse_storage::{Db, cf, decode_json};
     use tempfile::tempdir;
     use tokio::sync::mpsc;
 
-    use super::{EventBus, ReflexRuntime};
+    use super::{
+        EventBus, REFLEX_CANCELLED_KIND, REFLEX_REGISTERED_KIND, ReflexCancelOutcome,
+        ReflexRuntime, ScheduledReflex,
+    };
 
     const TEST_SCHEMA_VERSION: u32 = 7;
 
@@ -249,6 +333,56 @@ mod tests {
 
         assert_eq!(runtime.schema_version(), TEST_SCHEMA_VERSION);
         assert_eq!(queued_action, Action::ReleaseAll);
+        Ok(())
+    }
+
+    #[test]
+    fn cancel_registered_reflex_marks_status_and_writes_audit() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let db = Arc::new(Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?);
+        let (action_handle, _action_rx) = ActionHandle::channel();
+        let mut runtime =
+            ReflexRuntime::spawn(Arc::clone(&db), action_handle, EventBus::default())?;
+        let reflex = ScheduledReflex::on_event(
+            "reflex-runtime-cancel",
+            EventFilter::Kind {
+                kind: "support-cancel".to_owned(),
+            },
+            vec![Action::ReleaseAll],
+        );
+        let registered = runtime.register(&reflex)?;
+        assert_eq!(registered.state, ReflexState::Active);
+
+        let outcome = runtime.cancel("reflex-runtime-cancel")?;
+        let ReflexCancelOutcome::Cancelled { status } = outcome else {
+            panic!("registered reflex should cancel");
+        };
+        assert_eq!(status.state, ReflexState::Cancelled);
+        assert_eq!(
+            runtime
+                .statuses()
+                .into_iter()
+                .find(|status| status.id == "reflex-runtime-cancel")
+                .map(|status| status.state),
+            Some(ReflexState::Cancelled)
+        );
+
+        let audits = db
+            .scan_cf(cf::CF_REFLEX_AUDIT)?
+            .iter()
+            .map(|(_key, value)| decode_json::<StoredReflexAudit>(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let kinds = audits
+            .iter()
+            .map(|audit| audit.details["kind"].as_str())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&Some(REFLEX_REGISTERED_KIND)));
+        assert!(kinds.contains(&Some(REFLEX_CANCELLED_KIND)));
+        assert!(
+            audits
+                .iter()
+                .any(|audit| audit.status == ReflexState::Cancelled)
+        );
         Ok(())
     }
 }
