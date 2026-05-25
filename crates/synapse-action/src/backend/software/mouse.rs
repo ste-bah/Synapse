@@ -89,7 +89,7 @@ pub(super) fn mouse_button(
             enigo
                 .button(enigo_button, Direction::Press)
                 .map_err(enigo_error("emit mouse button"))?;
-            sleep_ms(hold_ms);
+            let _interrupted = sleep_ms(hold_ms);
             enigo
                 .button(enigo_button, Direction::Release)
                 .map_err(enigo_error("emit mouse button"))?;

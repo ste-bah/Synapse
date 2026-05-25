@@ -65,14 +65,17 @@ pub(super) async fn serve(
     let shutdown_cancel = CancellationToken::new();
     let connection_closed_cancel = CancellationToken::new();
     let sse_state = SseState::from_env();
-    let app = router(
+    let service = http_service(
         shutdown_cancel.clone(),
         connection_closed_cancel.clone(),
-        local_addr,
-        sse_state,
+        sse_state.clone(),
         m3_config,
     )
-    .context("build HTTP MCP router")?;
+    .context("initialize shared HTTP service state")?;
+    let _operator_hotkey_guard = crate::safety::install_operator_hotkey(service.m3_state_handle())
+        .context("install operator panic hotkey")?;
+    let app = router(&shutdown_cancel, local_addr, sse_state, service)
+        .context("build HTTP MCP router")?;
 
     tracing::info!(
         code = "MCP_HTTP_STARTED",
@@ -100,11 +103,10 @@ pub(super) async fn serve(
 }
 
 fn router(
-    shutdown_cancel: CancellationToken,
-    connection_closed_cancel: CancellationToken,
+    shutdown_cancel: &CancellationToken,
     bind_addr: SocketAddr,
     sse_state: SseState,
-    m3_config: M3ServiceConfig,
+    service: SynapseService,
 ) -> anyhow::Result<Router> {
     let auth = Arc::new(HttpAuth::load(bind_addr).context("load HTTP bearer token")?);
     tracing::info!(
@@ -112,22 +114,9 @@ fn router(
         source = auth.source_label(),
         "HTTP bearer token configured"
     );
-    let health_service = Arc::new(
-        http_service(
-            shutdown_cancel.clone(),
-            connection_closed_cancel.clone(),
-            sse_state.clone(),
-            m3_config.clone(),
-        )
-        .context("initialize HTTP health service state")?,
-    );
-    let mcp_service = streamable_service(
-        shutdown_cancel,
-        connection_closed_cancel,
-        sse_state.clone(),
-        m3_config,
-    )
-    .context("initialize HTTP MCP session state")?;
+    let health_service = Arc::new(service.clone());
+    let mcp_service = streamable_service(shutdown_cancel, service)
+        .context("initialize HTTP MCP session state")?;
     let state = HttpState {
         health_service,
         sse_state,
@@ -146,10 +135,8 @@ fn router(
 }
 
 fn streamable_service(
-    shutdown_cancel: CancellationToken,
-    connection_closed_cancel: CancellationToken,
-    sse_state: SseState,
-    m3_config: M3ServiceConfig,
+    shutdown_cancel: &CancellationToken,
+    service: SynapseService,
 ) -> anyhow::Result<McpHttpService> {
     let config = StreamableHttpServerConfig::default()
         .with_cancellation_token(shutdown_cancel.child_token());
@@ -157,14 +144,7 @@ fn streamable_service(
     session_manager.session_config =
         session::load_session_config().context("load HTTP session config")?;
     Ok(StreamableHttpService::new(
-        move || {
-            http_service(
-                shutdown_cancel.clone(),
-                connection_closed_cancel.clone(),
-                sse_state.clone(),
-                m3_config.clone(),
-            )
-        },
+        move || Ok(service.clone()),
         Arc::new(session_manager),
         config,
     ))

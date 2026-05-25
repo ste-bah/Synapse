@@ -152,6 +152,10 @@ impl SynapseService {
             .and_then(|state| state.emitter_done_receiver())
     }
 
+    pub(crate) fn m3_state_handle(&self) -> SharedM3State {
+        Arc::clone(&self.m3_state)
+    }
+
     pub(crate) fn health_payload(&self) -> Health {
         let mut subsystems = BTreeMap::new();
         subsystems.insert("profiles".to_owned(), self.profile_health());

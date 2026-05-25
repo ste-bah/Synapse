@@ -1,4 +1,7 @@
-use std::{thread, time::Duration};
+use std::{
+    thread,
+    time::{Duration, Instant},
+};
 
 use enigo::{Enigo, Settings};
 
@@ -26,8 +29,20 @@ pub(super) fn enigo_error(context: &'static str) -> impl FnOnce(enigo::InputErro
     }
 }
 
-pub(super) fn sleep_ms(milliseconds: u32) {
-    if milliseconds > 0 {
-        thread::sleep(Duration::from_millis(u64::from(milliseconds)));
+pub(super) fn sleep_ms(milliseconds: u32) -> bool {
+    if milliseconds == 0 {
+        return false;
+    }
+    let epoch = crate::hotkey::operator_release_epoch();
+    let deadline = Instant::now() + Duration::from_millis(u64::from(milliseconds));
+    loop {
+        if crate::hotkey::operator_release_requested_since(epoch) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        thread::sleep((deadline - now).min(Duration::from_millis(1)));
     }
 }

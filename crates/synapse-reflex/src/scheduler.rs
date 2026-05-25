@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -252,6 +252,62 @@ impl SchedulerHandle {
             status.state = ReflexState::Cancelled;
         }
         true
+    }
+
+    #[must_use]
+    pub fn disable_reflexes(&self, reflex_ids: &[ReflexId]) -> Vec<ReflexStatus> {
+        if reflex_ids.is_empty() {
+            return Vec::new();
+        }
+        let reflex_ids = reflex_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let indexes = {
+            let statuses = lock_statuses(&self.statuses);
+            statuses
+                .iter()
+                .enumerate()
+                .filter_map(|(index, status)| {
+                    (reflex_ids.contains(status.id.as_str())
+                        && is_operator_disable_candidate(status.state))
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>()
+        };
+        if indexes.is_empty() {
+            return Vec::new();
+        }
+
+        {
+            let mut controls = lock_controls(&self.controls);
+            for index in &indexes {
+                if let Some(control) = controls.get_mut(*index) {
+                    control.active = false;
+                }
+            }
+        }
+
+        let mut disabled = Vec::with_capacity(indexes.len());
+        let mut statuses = lock_statuses(&self.statuses);
+        for index in indexes {
+            if let Some(status) = statuses.get_mut(index) {
+                status.state = ReflexState::Disabled;
+                status.last_error_code = Some(error_codes::REFLEX_DISABLED_BY_OPERATOR.to_owned());
+                disabled.push(status.clone());
+            }
+        }
+        disabled
+    }
+
+    #[must_use]
+    pub fn disable_all_reflexes(&self) -> Vec<ReflexStatus> {
+        let reflex_ids = lock_statuses(&self.statuses)
+            .iter()
+            .filter(|status| is_operator_disable_candidate(status.state))
+            .map(|status| status.id.clone())
+            .collect::<Vec<_>>();
+        self.disable_reflexes(&reflex_ids)
     }
 
     /// Stops the scheduler thread.
@@ -551,6 +607,13 @@ fn status_index(statuses: &Arc<Mutex<Vec<ReflexStatus>>>, reflex_id: &str) -> Op
     lock_statuses(statuses)
         .iter()
         .position(|status| status.id == reflex_id)
+}
+
+const fn is_operator_disable_candidate(state: ReflexState) -> bool {
+    matches!(
+        state,
+        ReflexState::Active | ReflexState::Paused | ReflexState::Starved
+    )
 }
 
 fn status_for_reflex(

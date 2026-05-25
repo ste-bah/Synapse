@@ -2,6 +2,7 @@ mod http;
 mod m1;
 mod m2;
 mod m3;
+mod safety;
 mod server;
 
 use std::{
@@ -123,6 +124,8 @@ async fn run_stdio(
     )
     .context("initialize Synapse service state")?;
     synapse_action::install_panic_hook();
+    let _operator_hotkey_guard = safety::install_operator_hotkey(service.m3_state_handle())
+        .context("install operator panic hotkey")?;
     let m2_emitter_done = service.m2_emitter_done_receiver();
     let (stdin, stdout) = rmcp::transport::stdio();
     let stdin = CancelOnEofRead::new(

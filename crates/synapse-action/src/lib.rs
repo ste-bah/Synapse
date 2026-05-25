@@ -8,6 +8,7 @@ pub mod dynamics;
 pub mod emitter;
 pub mod error;
 pub mod handle;
+pub mod hotkey;
 pub mod invoke;
 pub mod rate_limit;
 pub mod safety;
@@ -36,6 +37,10 @@ pub use emitter::{
 };
 pub use error::{ActionError, ActionResult};
 pub use handle::{ACTION_QUEUE_CAPACITY, ActionHandle, ActionMessage, RELEASE_ALL_HANDLE};
+pub use hotkey::{
+    OperatorHotkeyGuard, install_operator_hotkey, operator_release_epoch,
+    operator_release_requested_since,
+};
 pub use invoke::{
     CoordinateFallbackPlan, ElementClickOutcome, click_element_or_fallback, invoke_element,
 };

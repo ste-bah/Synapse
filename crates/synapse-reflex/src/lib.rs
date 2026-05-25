@@ -16,7 +16,10 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde_json::json;
 use synapse_action::ActionHandle;
-use synapse_core::{ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION, StoredReflexAudit};
+use synapse_core::{
+    ReflexId, ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION, StoredReflexAudit,
+    error_codes,
+};
 use synapse_storage::{Db, cf, decode_json};
 use uuid::Uuid;
 
@@ -53,6 +56,7 @@ pub use scheduler::{
 };
 
 pub const REFLEX_CANCELLED_KIND: &str = "reflex_cancelled";
+pub const REFLEX_DISABLED_KIND: &str = "reflex_disabled_by_operator";
 pub const REFLEX_REGISTERED_KIND: &str = "reflex_registered";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -74,6 +78,7 @@ pub struct ReflexRuntime {
     action_handle: ActionHandle,
     event_bus: EventBus,
     reflexes: Vec<ScheduledReflex>,
+    disabled_reflex_ids: HashSet<ReflexId>,
     scheduler: Option<SchedulerHandle>,
 }
 
@@ -108,6 +113,7 @@ impl ReflexRuntime {
             action_handle,
             event_bus,
             reflexes: Vec::new(),
+            disabled_reflex_ids: HashSet::new(),
             scheduler: None,
         })
     }
@@ -140,6 +146,10 @@ impl ReflexRuntime {
             SchedulerConfig::default(),
             Arc::clone(&self.db),
         )?;
+        if !self.disabled_reflex_ids.is_empty() {
+            let disabled_reflex_ids = self.disabled_reflex_ids.iter().cloned().collect::<Vec<_>>();
+            let _disabled_statuses = new_scheduler.disable_reflexes(&disabled_reflex_ids);
+        }
         let old_scheduler = self.scheduler.replace(new_scheduler);
         self.reflexes = next;
         if let Some(mut old_scheduler) = old_scheduler {
@@ -196,6 +206,7 @@ impl ReflexRuntime {
         if !scheduler.cancel_reflex(reflex_id) {
             return Ok(ReflexCancelOutcome::NotFound);
         }
+        self.disabled_reflex_ids.remove(reflex_id);
         let status = scheduler
             .statuses()
             .into_iter()
@@ -205,6 +216,25 @@ impl ReflexRuntime {
             })?;
         self.write_cancellation_audit(&status)?;
         Ok(ReflexCancelOutcome::Cancelled { status })
+    }
+
+    /// Disables every active scheduler reflex for the operator panic hotkey.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ReflexError`] when the disabled audit rows cannot be
+    /// persisted.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn disable_all_by_operator(&mut self) -> ReflexResult<Vec<ReflexStatus>> {
+        let Some(scheduler) = &self.scheduler else {
+            return Ok(Vec::new());
+        };
+        let disabled = scheduler.disable_all_reflexes();
+        for status in &disabled {
+            self.disabled_reflex_ids.insert(status.id.clone());
+        }
+        self.write_disabled_audits(&disabled)?;
+        Ok(disabled)
     }
 
     /// Returns the current scheduler status snapshot for active reflexes.
@@ -387,6 +417,40 @@ impl ReflexRuntime {
         })
     }
 
+    fn write_disabled_audits(&self, statuses: &[ReflexStatus]) -> ReflexResult<()> {
+        if statuses.is_empty() {
+            return Ok(());
+        }
+        for status in statuses {
+            let audit = StoredReflexAudit {
+                schema_version: SCHEMA_VERSION,
+                audit_id: Uuid::now_v7().to_string(),
+                reflex_id: status.id.clone(),
+                ts_ns: now_ts_ns(),
+                status: ReflexState::Disabled,
+                event_id: None,
+                steps: Vec::new(),
+                error_code: Some(error_codes::REFLEX_DISABLED_BY_OPERATOR.to_owned()),
+                details: json!({
+                    "kind": REFLEX_DISABLED_KIND,
+                    "kind_summary": status.kind_summary,
+                    "priority": status.priority,
+                    "lifetime": status.lifetime,
+                    "exclusive": status.exclusive,
+                    "reason": "operator_hotkey",
+                }),
+                redacted: false,
+                redactions: Vec::new(),
+            };
+            write_audit(&self.db, &audit).map_err(|error| ReflexError::ParamsInvalid {
+                detail: format!("disabled audit write failed: {error}"),
+            })?;
+        }
+        self.db.flush().map_err(|error| ReflexError::ParamsInvalid {
+            detail: format!("disabled audit flush failed: {error}"),
+        })
+    }
+
     fn terminal_statuses_from_audit(&self) -> ReflexResult<Vec<ReflexStatus>> {
         let rows =
             self.db
@@ -548,8 +612,8 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        EventBus, REFLEX_CANCELLED_KIND, REFLEX_REGISTERED_KIND, ReflexCancelOutcome,
-        ReflexRuntime, ScheduledReflex,
+        EventBus, REFLEX_CANCELLED_KIND, REFLEX_DISABLED_KIND, REFLEX_REGISTERED_KIND,
+        ReflexCancelOutcome, ReflexRuntime, ScheduledReflex,
     };
 
     const TEST_SCHEMA_VERSION: u32 = 7;
@@ -633,6 +697,63 @@ mod tests {
         assert_eq!(restored[0].id, "reflex-runtime-cancel");
         assert_eq!(restored[0].state, ReflexState::Cancelled);
         assert_eq!(restored[0].kind_summary, "on_event:1 actions");
+        Ok(())
+    }
+
+    #[test]
+    fn disable_all_by_operator_marks_statuses_and_writes_audit() -> Result<(), Box<dyn Error>> {
+        let temp = tempdir()?;
+        let db = Arc::new(Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?);
+        let (action_handle, _action_rx) = ActionHandle::channel();
+        let mut runtime =
+            ReflexRuntime::spawn(Arc::clone(&db), action_handle, EventBus::default())?;
+        let first = ScheduledReflex::on_event(
+            "reflex-runtime-disable-a",
+            EventFilter::Kind {
+                kind: "support-disable-a".to_owned(),
+            },
+            vec![Action::ReleaseAll],
+        );
+        let second = ScheduledReflex::on_event(
+            "reflex-runtime-disable-b",
+            EventFilter::Kind {
+                kind: "support-disable-b".to_owned(),
+            },
+            vec![Action::ReleaseAll],
+        );
+        runtime.register(&first)?;
+        runtime.register(&second)?;
+
+        let disabled = runtime.disable_all_by_operator()?;
+        assert_eq!(disabled.len(), 2);
+        assert!(
+            disabled
+                .iter()
+                .all(|status| status.state == ReflexState::Disabled)
+        );
+        assert!(
+            runtime
+                .list(false)?
+                .iter()
+                .all(|status| status.state == ReflexState::Disabled)
+        );
+        assert!(runtime.disable_all_by_operator()?.is_empty());
+
+        let audits = db
+            .scan_cf(cf::CF_REFLEX_AUDIT)?
+            .iter()
+            .map(|(_key, value)| decode_json::<StoredReflexAudit>(value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let disabled_audits = audits
+            .iter()
+            .filter(|audit| audit.details["kind"].as_str() == Some(REFLEX_DISABLED_KIND))
+            .collect::<Vec<_>>();
+        assert_eq!(disabled_audits.len(), 2);
+        assert!(disabled_audits.iter().all(|audit| {
+            audit.status == ReflexState::Disabled
+                && audit.error_code.as_deref()
+                    == Some(synapse_core::error_codes::REFLEX_DISABLED_BY_OPERATOR)
+        }));
         Ok(())
     }
 }

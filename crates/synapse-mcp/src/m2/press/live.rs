@@ -1,4 +1,6 @@
 use rmcp::ErrorData;
+use std::time::Duration;
+
 use synapse_action::ActionHandle;
 use synapse_core::{Action, Backend, Key};
 use tokio_util::sync::CancellationToken;
@@ -28,15 +30,7 @@ pub(in crate::m2::press) async fn execute_live_press_sequence(
         maybe_force_panic_after_keydown();
     }
 
-    let connection_closed = if let Some(cancel) = connection_closed_cancel {
-        tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))) => false,
-            () = cancel.cancelled() => true,
-        }
-    } else {
-        tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
-        false
-    };
+    let hold_end = wait_for_hold_end(hold_ms, connection_closed_cancel).await;
 
     let mut first_error = None;
     for key in pressed.iter().rev() {
@@ -55,14 +49,57 @@ pub(in crate::m2::press) async fn execute_live_press_sequence(
     if let Some(error) = first_error {
         return Err(action_error_to_mcp(&error));
     }
-    if connection_closed {
-        tracing::warn!(
-            code = "M2_ACT_PRESS_CONNECTION_CLOSED_RELEASE",
-            released_keys = pressed.len(),
-            "readback=connection_closed edge=act_press after=pressed_keys_released"
-        );
+    match hold_end {
+        HoldEnd::Elapsed => {}
+        HoldEnd::ConnectionClosed => {
+            tracing::warn!(
+                code = "M2_ACT_PRESS_CONNECTION_CLOSED_RELEASE",
+                released_keys = pressed.len(),
+                "readback=connection_closed edge=act_press after=pressed_keys_released"
+            );
+        }
+        HoldEnd::OperatorRelease => {
+            tracing::warn!(
+                code = synapse_core::error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                released_keys = pressed.len(),
+                "readback=operator_hotkey edge=act_press after=pressed_keys_released"
+            );
+        }
     }
     Ok(())
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum HoldEnd {
+    Elapsed,
+    ConnectionClosed,
+    OperatorRelease,
+}
+
+async fn wait_for_hold_end(
+    hold_ms: u32,
+    connection_closed_cancel: Option<CancellationToken>,
+) -> HoldEnd {
+    let release_epoch = synapse_action::operator_release_epoch();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(hold_ms));
+    loop {
+        if synapse_action::operator_release_requested_since(release_epoch) {
+            return HoldEnd::OperatorRelease;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return HoldEnd::Elapsed;
+        }
+        let tick = (deadline - now).min(Duration::from_millis(1));
+        if let Some(cancel) = &connection_closed_cancel {
+            tokio::select! {
+                () = tokio::time::sleep(tick) => {}
+                () = cancel.cancelled() => return HoldEnd::ConnectionClosed,
+            }
+        } else {
+            tokio::time::sleep(tick).await;
+        }
+    }
 }
 
 #[cfg(debug_assertions)]

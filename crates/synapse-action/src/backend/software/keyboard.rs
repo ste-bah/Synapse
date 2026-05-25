@@ -10,7 +10,7 @@ pub(super) fn press_key(key: &Key, hold_ms: u32, state: &mut EmitState) -> Resul
     let mut enigo = enigo()?;
     state.hold_key(key);
     emit_key(&mut enigo, key, Direction::Press)?;
-    sleep_ms(hold_ms);
+    let _interrupted = sleep_ms(hold_ms);
     emit_key(&mut enigo, key, Direction::Release)?;
     state.release_key(key);
     Ok(())
@@ -45,7 +45,7 @@ pub(super) fn key_chord(
         state.hold_key(key);
         emit_key(&mut enigo, key, Direction::Press)?;
     }
-    sleep_ms(hold_ms);
+    let _interrupted = sleep_ms(hold_ms);
     for key in keys.iter().rev() {
         emit_key(&mut enigo, key, Direction::Release)?;
         state.release_key(key);
