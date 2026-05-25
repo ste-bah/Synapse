@@ -42,7 +42,7 @@ fn run_under_load_sample() -> u64 {
     let bus = EventBus::default();
     let (action_handle, action_rx) = ActionHandle::channel();
     let drain_thread = spawn_action_drain_thread(action_rx);
-    let reflexes = (0..8)
+    let reflexes = (0..32)
         .map(|index| {
             ScheduledReflex::every_tick(format!("reflex-load-{index}"), vec![Action::ReleaseAll])
         })

@@ -37,6 +37,14 @@ harness = false
 name = "reflex_tick_jitter_under_load"
 harness = false
 
+[[bench]]
+name = "event_to_subscriber"
+harness = false
+
+[[bench]]
+name = "reflex_combo_step_interval"
+harness = false
+
 [lints.rust]
 unsafe_code = "allow"
 unused = { level = "warn", priority = -1 }
