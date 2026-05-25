@@ -126,6 +126,11 @@ impl M2State {
         );
         let recording =
             recording_backend_enabled(recording_backend).then(|| Arc::new(RecordingBackend::new()));
+        let actor_backend = actor_backend.or_else(|| {
+            recording
+                .as_ref()
+                .map(|recording| Arc::clone(recording) as Arc<dyn ActionBackend>)
+        });
         let tool_connection_closed_cancel = connection_closed_cancel.clone();
         let build_emitter = || {
             actor_backend
@@ -303,6 +308,57 @@ mod tests {
         assert_eq!(snapshot.held_key_timer_count, 0);
         assert!(snapshot.held_buttons.is_empty());
         assert!(snapshot.pad_state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recording_env_routes_actor_actions_to_recording_backend() {
+        let before = Some("true");
+        let state = M2State::from_recording_backend_env(before);
+        let recording = state
+            .recording
+            .clone()
+            .unwrap_or_else(|| panic!("recording env should install recording backend"));
+        let key = key_named("m2-recording-actor");
+        let before_events = recording.events();
+
+        state
+            .emitter_handle
+            .execute(Action::KeyDown {
+                key: key.clone(),
+                backend: Backend::Software,
+            })
+            .await
+            .unwrap_or_else(|error| panic!("KeyDown should route to recording backend: {error}"));
+        let after_key_down = state
+            .snapshot_handle
+            .snapshot()
+            .await
+            .unwrap_or_else(|error| panic!("snapshot after keydown should succeed: {error}"));
+        state
+            .emitter_handle
+            .execute(Action::ReleaseAll)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("ReleaseAll should route to recording backend: {error}")
+            });
+        let after_release = state
+            .snapshot_handle
+            .snapshot()
+            .await
+            .unwrap_or_else(|error| panic!("snapshot after release should succeed: {error}"));
+        let after_events = recording.events();
+
+        println!(
+            "readback=m2_state scenario=recording_actor before_events:{} after_key_down_held_keys:{:?} after_release_held_keys:{:?} after_events:{}",
+            before_events.len(),
+            after_key_down.held_keys,
+            after_release.held_keys,
+            after_events.len()
+        );
+        assert_eq!(before_events.len(), 0);
+        assert_eq!(after_key_down.held_keys, vec![key]);
+        assert!(after_release.held_keys.is_empty());
+        assert_eq!(after_events.len(), 2);
     }
 
     #[tokio::test]
