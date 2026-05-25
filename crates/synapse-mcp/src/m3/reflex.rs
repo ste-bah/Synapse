@@ -32,6 +32,10 @@ const fn default_backend() -> Backend {
     Backend::Auto
 }
 
+const fn default_include_expired() -> bool {
+    false
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReflexRegisterParams {
@@ -79,6 +83,20 @@ pub enum ReflexCancelReason {
 pub struct ReflexCancelResponse {
     pub cancelled: bool,
     pub reason: ReflexCancelReason,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReflexListParams {
+    #[serde(default = "default_include_expired")]
+    #[schemars(default = "default_include_expired")]
+    pub include_expired: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ReflexListResponse {
+    pub reflexes: Vec<ReflexStatus>,
 }
 
 #[must_use]
@@ -158,6 +176,23 @@ pub fn cancel_reflex(
             reason: ReflexCancelReason::AlreadyExpired,
         },
     })
+}
+
+pub fn list_reflexes(
+    runtime: &Arc<Mutex<ReflexRuntime>>,
+    params: &ReflexListParams,
+) -> Result<ReflexListResponse, ErrorData> {
+    let runtime = runtime.lock().map_err(|_err| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "reflex runtime lock poisoned",
+        )
+    })?;
+    let reflexes = runtime
+        .list(params.include_expired)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    drop(runtime);
+    Ok(ReflexListResponse { reflexes })
 }
 
 fn scheduled_reflex_from_params(

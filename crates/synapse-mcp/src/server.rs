@@ -43,8 +43,9 @@ use crate::{
             activate_profile, list_profiles,
         },
         reflex::{
-            ReflexCancelParams, ReflexCancelResponse, ReflexRegisterParams, ReflexRegisterResponse,
-            cancel_reflex, register_reflex,
+            ReflexCancelParams, ReflexCancelResponse, ReflexListParams, ReflexListResponse,
+            ReflexRegisterParams, ReflexRegisterResponse, cancel_reflex, list_reflexes,
+            register_reflex,
         },
         shared_m3_state_from_env, shared_m3_state_from_env_with_shutdown_reason,
         shared_m3_state_from_env_with_shutdown_reason_and_sse_state,
@@ -703,6 +704,21 @@ impl SynapseService {
         );
         let runtime = self.reflex_runtime()?;
         cancel_reflex(&runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "List registered reflexes")]
+    pub async fn reflex_list(
+        &self,
+        params: Parameters<ReflexListParams>,
+    ) -> Result<Json<ReflexListResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "reflex_list",
+            include_expired = params.0.include_expired,
+            "tool.invocation kind=reflex_list"
+        );
+        let runtime = self.reflex_runtime()?;
+        list_reflexes(&runtime, &params.0).map(Json)
     }
 
     #[tool(description = "List loaded profiles")]
