@@ -23,7 +23,6 @@ pub struct ActComboParams {
     #[serde(default = "default_backend")]
     #[schemars(default = "default_backend")]
     pub backend: Backend,
-    #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
@@ -32,10 +31,7 @@ pub struct ActComboParams {
 pub struct ActComboStep {
     pub at_ms: u32,
     pub action: ActComboAction,
-    #[serde(default = "empty_params")]
-    #[schemars(default = "empty_params")]
     pub params: serde_json::Value,
-    #[serde(default)]
     pub backend: Option<Backend>,
 }
 
@@ -69,7 +65,6 @@ pub struct ActRunShellParams {
     #[serde(default)]
     #[schemars(default)]
     pub args: Vec<String>,
-    #[serde(default)]
     pub working_dir: Option<String>,
     #[serde(default)]
     #[schemars(default)]
@@ -77,7 +72,6 @@ pub struct ActRunShellParams {
     #[serde(default = "default_shell_timeout_ms")]
     #[schemars(default = "default_shell_timeout_ms", range(min = 1, max = 600_000))]
     pub timeout_ms: u32,
-    #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
@@ -98,17 +92,14 @@ pub struct ActLaunchParams {
     #[serde(default)]
     #[schemars(default)]
     pub args: Vec<String>,
-    #[serde(default)]
     pub working_dir: Option<String>,
     #[serde(default)]
     #[schemars(default)]
     pub env: BTreeMap<String, String>,
-    #[serde(default)]
     pub wait_for_window_title_regex: Option<String>,
     #[serde(default = "default_launch_timeout_ms")]
     #[schemars(default = "default_launch_timeout_ms", range(min = 1, max = 600_000))]
     pub timeout_ms: u32,
-    #[serde(default)]
     pub idempotency_key: Option<String>,
 }
 
@@ -365,8 +356,4 @@ const fn default_shell_timeout_ms() -> u32 {
 
 const fn default_launch_timeout_ms() -> u32 {
     DEFAULT_LAUNCH_TIMEOUT_MS
-}
-
-fn empty_params() -> serde_json::Value {
-    serde_json::Value::Object(serde_json::Map::new())
 }
