@@ -274,7 +274,13 @@ fn canonical_yolov10n_descriptor_uses_local_appdata_shape() -> TestResult {
 
 #[test]
 fn model_error_codes_have_throw_sites() -> TestResult {
-    let source = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))?;
+    let source = fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .map(fs::read_to_string)
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
     for (code, throw_site) in [
         (
             error_codes::MODEL_DOWNLOAD_FAILED,
