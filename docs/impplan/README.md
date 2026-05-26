@@ -116,7 +116,7 @@ All M2 carry-over items from the prior revision are resolved on `main`. The orig
 | #239 | DPI-aware physical-pixel coordinates undocumented | `4eef83c docs(action): document physical pixel tool coordinates` + tool schema descriptions |
 | #234 | `SoftwareBackend::mouse_move` DPI mismatch | `eef654f`/mouse-coordinates split — Win32 `GetCursorPos` in DPI-aware mode |
 | #233 | `software::type_text` ignored `dynamics` | dynamics re-threaded through `text_dispatch.rs` in the `synapse-action` split refactor |
-| #231 | held-key auto-release never dispatched backend KeyUp | `87a051d test(action): add auto-release keyboard hook FSV` (regression FSV) plus the emitter split that calls the same backend dispatch as normal KeyUp |
+| #231 | held-key auto-release never dispatched backend KeyUp | `87a051d test(action): add auto-release keyboard hook FSV` (legacy test-name artifact; supporting regression evidence only) plus the emitter split that calls the same backend dispatch as normal KeyUp |
 | #243/#260 | `bench_results/<sha>/` committed bloat | `4b6eb80 chore(bench): move baselines off-tree` — local `critcmp` exports under `%LOCALAPPDATA%\synapse\benchmarks\baselines\` / `.runs\benchmarks\` |
 | #242/#261 | Ephemeral verification run dirs in worktree | `81bb8ab chore(test): add run artifact cleanup` — `.runs/` standardized via `.gitignore` + `scripts/clean-runs.ps1` |
 | #241/#262 | Telemetry log GC at startup only | `c430ccc test(telemetry): cover periodic log size GC` — periodic GC worker + size-cap manual evidence |

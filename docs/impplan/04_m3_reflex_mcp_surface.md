@@ -540,7 +540,7 @@ the daemon, read back, and confirm data persists. The disk-pressure scenario
 gets a 5th: **all 4 levels must transition deterministically** with a manual
 SoT read between each transition. For M3 storage edges, the trigger and SoT
 readback are the live `storage_*` MCP tools plus daemon log inspection; do not
-replace this with a script, harness, or automated FSV helper.
+replace this with a script, harness, or automated helper.
 
 ### 7.4 Trigger → outcome reasoning (doc-comment on every test fn)
 

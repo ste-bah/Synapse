@@ -358,7 +358,7 @@ with FSV naming are regression artifacts until renamed or removed.
 ## 15. Manual test plan (release gate)
 
 M2+ uses manual FSV on the operator's configured Windows host as the shipping
-gate. GitHub Actions/CI, automated FSV scripts, and missing-dependency
+gate. GitHub Actions/CI, automated scripts, and missing-dependency
 portability tests are not release gates. A missing configured-host prerequisite
 is an acquisition/setup task, not a reason to mark the issue blocked by itself:
 figure out where the thing must come from, where it must physically appear, and

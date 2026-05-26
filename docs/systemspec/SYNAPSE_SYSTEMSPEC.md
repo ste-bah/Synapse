@@ -215,7 +215,7 @@ All 30 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[to
 | `audio_tail` | Return the most-recent loopback audio tail as PCM s16le bytes (max 5 s; `synapse_audio::MAX_RING_SECONDS`) | `server.rs::audio_tail`, `m3/audio.rs` |
 | `audio_transcribe` | Transcribe the loopback tail via Whisper-tiny (language pinned to `"en"`) | `server.rs::audio_transcribe`, `m3/audio.rs` |
 | `storage_inspect` | Return per-CF row counts and byte sizes from RocksDB for the operator-visible CFs | `server.rs::storage_inspect`, `m3/storage.rs` |
-| `storage_put_probe_rows` | Insert probe rows into a chosen CF to validate write-batch + flush + GC paths during FSV | `server.rs::storage_put_probe_rows`, `m3/storage.rs` |
+| `storage_put_probe_rows` | Insert bounded probe rows into a chosen CF so manual FSV can trigger storage writes, then separately read the RocksDB/log SoT | `server.rs::storage_put_probe_rows`, `m3/storage.rs` |
 | `storage_gc_once` | Run one synchronous GC pass and return the per-CF before/after sizes | `server.rs::storage_gc_once`, `m3/storage.rs` |
 | `storage_pressure_sample` | Apply one synthetic free-byte sample to drive the disk-pressure responder | `server.rs::storage_pressure_sample`, `m3/storage.rs` |
 
@@ -3545,7 +3545,7 @@ PRD `docs/computergames/05_mcp_tool_surface.md` defines a 30-tool surface cap fo
 | 25 | `audio_tail` | M3 | live | |
 | 26 | `audio_transcribe` | M3 | live (en only) | |
 | 27 | `storage_inspect` | M3 (operator) | live | per-CF row+byte size readback |
-| 28 | `storage_put_probe_rows` | M3 (operator) | live | FSV write-path probe |
+| 28 | `storage_put_probe_rows` | M3 (operator) | live | manual storage write/readback support tool |
 | 29 | `storage_gc_once` | M3 (operator) | live | synchronous GC pass with before/after sizes |
 | 30 | `storage_pressure_sample` | M3 (operator) | live | synthetic disk-pressure trigger |
 | — | `read_hud` | (deferred to M4) | not live | HUD extraction pipeline not yet wired |
@@ -4184,7 +4184,7 @@ For convenience the M3 tool-call gating is summarized here (live source: `crates
 | `profile_activate` | `WRITE_PROFILE_ACTIVE` |
 | `replay_record` | `WRITE_REPLAY` |
 | `audio_tail`, `audio_transcribe` | `READ_AUDIO` |
-| `storage_inspect`, `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample` | (operator-only — no M3 permission gate; intended for FSV from the configured host) |
+| `storage_inspect`, `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample` | (operator-only — no M3 permission gate; support manual FSV from the configured host) |
 
 `reflex_register`'s effective permission set is computed by `add_action_permissions` over the compiled `Vec<Action>` (e.g., `Action::PadReport` requires `INPUT_PAD`; any action with `Backend::Hardware` adds `INPUT_HARDWARE_HID`).
 

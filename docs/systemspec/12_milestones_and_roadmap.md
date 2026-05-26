@@ -93,7 +93,7 @@ PRD `docs/computergames/05_mcp_tool_surface.md` defines a 30-tool surface cap fo
 | 25 | `audio_tail` | M3 | live | |
 | 26 | `audio_transcribe` | M3 | live (en only) | |
 | 27 | `storage_inspect` | M3 (operator) | live | per-CF row+byte size readback |
-| 28 | `storage_put_probe_rows` | M3 (operator) | live | FSV write-path probe |
+| 28 | `storage_put_probe_rows` | M3 (operator) | live | manual storage write/readback support tool |
 | 29 | `storage_gc_once` | M3 (operator) | live | synchronous GC pass with before/after sizes |
 | 30 | `storage_pressure_sample` | M3 (operator) | live | synthetic disk-pressure trigger |
 | — | `read_hud` | (deferred to M4) | not live | HUD extraction pipeline not yet wired |
