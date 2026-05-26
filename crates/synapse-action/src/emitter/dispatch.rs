@@ -3,7 +3,7 @@ use std::sync::Arc;
 use synapse_core::{Action, ComboInput, error_codes};
 
 use super::routing::{action_consumes_rate_limit, action_kind, resolved_backend_for_action};
-use super::{ActionEmitter, EmitState};
+use super::{ActionEmitter, EmitState, HeldKeyTimerKey};
 use crate::{
     ActionBackend, ActionError, ActionResult, ResolvedBackend,
     rate_limit::retry_after_ms_for_snapshot,
@@ -18,19 +18,21 @@ impl ActionEmitter {
             return self.do_release_all("tool_invocation").await;
         }
 
+        let resolved = resolved_backend_for_action(&action)?;
+
         if action_consumes_rate_limit(&action) {
-            let backend = resolved_backend_for_action(&action)?;
-            self.consume_rate_limit(backend)?;
+            self.consume_rate_limit(resolved)?;
         }
 
-        self.cancel_timers_for_release_actions(&action);
+        self.cancel_timers_for_release_actions(&action, resolved);
 
-        let resolved = resolved_backend_for_action(&action)?;
         let backend = self.backends.pick(resolved);
-        let result = self.dispatch_via_backend(backend, action.clone()).await;
+        let result = self
+            .dispatch_via_backend(resolved, backend, action.clone())
+            .await;
 
         if result.is_ok() {
-            self.schedule_timers_for_held_keys(&action);
+            self.schedule_timers_for_held_keys(&action, resolved);
         }
 
         result
@@ -38,12 +40,15 @@ impl ActionEmitter {
 
     async fn dispatch_via_backend(
         &mut self,
+        resolved: ResolvedBackend,
         backend: Arc<dyn ActionBackend>,
         action: Action,
     ) -> ActionResult<()> {
         let mut state = std::mem::take(&mut self.state);
         let task = tokio::task::spawn_blocking(move || {
+            state.set_active_backend(resolved);
             let result = backend.execute(&action, &mut state);
+            state.clear_active_backend();
             (result, state)
         });
         match task.await {
@@ -70,14 +75,14 @@ impl ActionEmitter {
     /// to release. Done before backend dispatch so a timer cannot fire mid-call
     /// and enqueue a duplicate `KeyUp` against a key the backend has already
     /// released.
-    fn cancel_timers_for_release_actions(&mut self, action: &Action) {
+    fn cancel_timers_for_release_actions(&mut self, action: &Action, backend: ResolvedBackend) {
         match action {
             Action::KeyPress { key, .. } | Action::KeyUp { key, .. } => {
-                self.cancel_held_key_timer(key);
+                self.cancel_held_key_timer(&HeldKeyTimerKey::new(key.clone(), backend));
             }
             Action::KeyChord { keys, .. } => {
                 for key in keys {
-                    self.cancel_held_key_timer(key);
+                    self.cancel_held_key_timer(&HeldKeyTimerKey::new(key.clone(), backend));
                 }
             }
             Action::Combo { steps, .. } => {
@@ -85,7 +90,7 @@ impl ActionEmitter {
                     if let ComboInput::KeyUp { key } | ComboInput::KeyPress { key, .. } =
                         &step.input
                     {
-                        self.cancel_held_key_timer(key);
+                        self.cancel_held_key_timer(&HeldKeyTimerKey::new(key.clone(), backend));
                     }
                 }
             }
@@ -99,17 +104,17 @@ impl ActionEmitter {
     /// shows them held. A `Combo` like
     /// `[KeyDown(ctrl), KeyUp(ctrl)]` nets to zero held keys, so no
     /// timer is scheduled even though the combo contained a `KeyDown` step.
-    fn schedule_timers_for_held_keys(&mut self, action: &Action) {
+    fn schedule_timers_for_held_keys(&mut self, action: &Action, backend: ResolvedBackend) {
         match action {
-            Action::KeyDown { key, .. } if self.state.is_key_held(key) => {
-                self.schedule_held_key_auto_release(key.clone());
+            Action::KeyDown { key, .. } if self.state.is_key_held_for_backend(key, backend) => {
+                self.schedule_held_key_auto_release(key.clone(), backend);
             }
             Action::Combo { steps, .. } => {
                 for step in steps {
                     if let ComboInput::KeyDown { key } = &step.input
-                        && self.state.is_key_held(key)
+                        && self.state.is_key_held_for_backend(key, backend)
                     {
-                        self.schedule_held_key_auto_release(key.clone());
+                        self.schedule_held_key_auto_release(key.clone(), backend);
                     }
                 }
             }
@@ -162,24 +167,32 @@ impl ActionEmitter {
         let mut release_backends = vec![resolved.as_str()];
         let mut hardware_release_ok = None;
         let mut result = self
-            .dispatch_via_backend(Arc::clone(&primary_backend), Action::ReleaseAll)
+            .dispatch_via_backend(resolved, Arc::clone(&primary_backend), Action::ReleaseAll)
             .await;
-        if released_pads != 0
-            && let Some(vigem_backend) = self.backends.pick_vigem_if_distinct_from(&primary_backend)
-        {
+
+        let vigem_has_held_state = snapshot_has_backend_held_state(&before, ResolvedBackend::Vigem);
+        if resolved != ResolvedBackend::Vigem && (released_pads != 0 || vigem_has_held_state) {
             release_backends.push("vigem");
+            let vigem_backend = self.backends.pick_vigem_for_release();
             let vigem_result = self
-                .dispatch_via_backend(vigem_backend, Action::ReleaseAll)
+                .dispatch_via_backend(ResolvedBackend::Vigem, vigem_backend, Action::ReleaseAll)
                 .await;
             result = combine_release_results(result, vigem_result);
         }
-        if let Some(hardware_backend) = self
-            .backends
-            .pick_hardware_release_if_enabled_and_distinct_from(&primary_backend)
+
+        let hardware_has_held_state =
+            snapshot_has_backend_held_state(&before, ResolvedBackend::Hardware);
+        if resolved != ResolvedBackend::Hardware
+            && (hardware_has_held_state || self.backends.hardware_release_enabled())
         {
             release_backends.push("hardware");
+            let hardware_backend = self.backends.pick_hardware_for_release();
             let hardware_result = self
-                .dispatch_via_backend(hardware_backend, Action::ReleaseAll)
+                .dispatch_via_backend(
+                    ResolvedBackend::Hardware,
+                    hardware_backend,
+                    Action::ReleaseAll,
+                )
                 .await;
             hardware_release_ok = Some(hardware_result.is_ok());
             result = combine_release_results(result, hardware_result);
@@ -220,6 +233,20 @@ impl ActionEmitter {
         }
         result
     }
+}
+
+fn snapshot_has_backend_held_state(
+    snapshot: &super::ActionStateSnapshot,
+    backend: ResolvedBackend,
+) -> bool {
+    snapshot
+        .held_keys_by_backend
+        .get(&backend)
+        .is_some_and(|keys| !keys.is_empty())
+        || snapshot
+            .held_buttons_by_backend
+            .get(&backend)
+            .is_some_and(|buttons| !buttons.is_empty())
 }
 
 fn combine_release_results(current: ActionResult<()>, next: ActionResult<()>) -> ActionResult<()> {

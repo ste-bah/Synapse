@@ -117,19 +117,16 @@ impl Backends {
         }
     }
 
-    pub(super) fn pick_vigem_if_distinct_from(
-        &self,
-        backend: &Arc<dyn ActionBackend>,
-    ) -> Option<Arc<dyn ActionBackend>> {
-        (!Arc::ptr_eq(backend, &self.vigem)).then(|| Arc::clone(&self.vigem))
+    pub(super) fn pick_vigem_for_release(&self) -> Arc<dyn ActionBackend> {
+        Arc::clone(&self.vigem)
     }
 
-    pub(super) fn pick_hardware_release_if_enabled_and_distinct_from(
-        &self,
-        backend: &Arc<dyn ActionBackend>,
-    ) -> Option<Arc<dyn ActionBackend>> {
-        (self.hardware_release_enabled && !Arc::ptr_eq(backend, &self.hardware))
-            .then(|| Arc::clone(&self.hardware))
+    pub(super) fn pick_hardware_for_release(&self) -> Arc<dyn ActionBackend> {
+        Arc::clone(&self.hardware)
+    }
+
+    pub(super) const fn hardware_release_enabled(&self) -> bool {
+        self.hardware_release_enabled
     }
 }
 

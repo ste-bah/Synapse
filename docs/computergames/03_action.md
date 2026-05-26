@@ -77,8 +77,10 @@ pub struct ActionEmitter {
     software: SoftwareBackend,
     vigem: Option<VigemBackend>,
     hardware: Option<HidGateway>,
-    held_keys: BitSet,            // for ReleaseAll safety
+    held_keys: BitSet,            // union for ReleaseAll safety
+    held_key_backends: HashMap<usize, BTreeSet<ResolvedBackend>>,
     held_buttons: BitSet,
+    held_button_backends: HashMap<usize, BTreeSet<ResolvedBackend>>,
     pad_state: HashMap<PadId, GamepadReport>,
 }
 
@@ -122,7 +124,7 @@ Wraps `enigo` 0.6+ with overrides:
 
 - **Absolute mouse moves are sent as relative deltas in steps,** following an `AimCurve`. Single absolute jump reserved for `MouseMove { curve: Instant, .. }`.
 - **`SendInput` is called in batches** when emitting curve steps (e.g., 50 deltas in one `SendInput([..50])` call). Per-call overhead amortizes ~2 µs to ~0.04 µs per delta.
-- **Modifier state tracked locally.** `held_keys` ensures `ReleaseAll` releases everything we pressed, even on panic.
+- **Modifier state tracked locally per backend.** The global `held_keys` union keeps `ReleaseAll` recoverable, while `held_key_backends` lets software, ViGEm, and hardware release only the inputs each backend owns.
 - **Unicode text** uses `KEYEVENTF_UNICODE`. Falls back to per-char scan-code when an active game ignores Unicode input (game profile flag).
 - **Raw scan codes** can be requested for games reading keyboard via raw input (most FPS games). Profile flag `keyboard.use_scancodes = true`.
 
@@ -372,7 +374,7 @@ Combo execution runs on reflex runtime thread for frame-accurate timing.
 
 Three layers ensure no stuck inputs:
 
-1. **Per-action timeout.** `KeyDown` without paired `KeyUp` within `held_key_max_duration_ms` (default 30s) emits an automatic `KeyUp` and logs `STUCK_KEY_AUTO_RELEASED`.
+1. **Per-action timeout.** `KeyDown` without paired `KeyUp` within `held_key_max_duration_ms` (default 30s) emits an automatic `KeyUp` on the backend that owns the held key and logs `STUCK_KEY_AUTO_RELEASED backend=<software|vigem|hardware>`.
 2. **Shutdown handler.** `ReleaseAll` sent on SIGINT / SIGTERM and on tokio cancellation token's cancellation.
 3. **Panic hook.** Process-wide panic hook (`std::panic::set_hook`) calls static `RELEASE_ALL_HANDLE: OnceCell<ActionHandle>` to fire `ReleaseAll` even on unhandled panic before the process dies.
 

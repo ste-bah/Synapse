@@ -71,12 +71,12 @@ pub struct ActionHandle { tx: mpsc::Sender<ActionMessage> }
 
 `EmitState` (`emitter::state` / `state.rs`) owns:
 
-- A `BitSet` of held keys (the M2 source-of-truth for `release_all`/`auto-release-after-`HELD_KEY_MAX_DURATION_MS`) — reflex hold_* must enqueue through `ActionHandle`, not mutate this bitset.
-- Held mouse-button set (`MouseButton` discriminant indices).
+- A global union `BitSet` of held keys plus `held_key_backends: HashMap<usize, BTreeSet<ResolvedBackend>>`, which records which concrete backend owns each held key. Reflex `hold_*` flows must enqueue through `ActionHandle`, not mutate this state directly.
+- A global union held mouse-button set plus `held_button_backends: HashMap<usize, BTreeSet<ResolvedBackend>>`.
 - Per-pad `GamepadReport` cache (last-emitted neutralizable state).
-- Per-key timers for auto-release.
+- Per-key auto-release timers keyed by `(Key, ResolvedBackend)`.
 
-`ActionStateSnapshot` (exposed via `ActionEmitterSnapshotHandle::snapshot().await`) is the public read of `held_keys: Vec<Key>`, `held_buttons: Vec<MouseButton>`, `pad_state: HashMap<PadId, GamepadReport>`, `held_key_timer_count: usize`.
+`ActionStateSnapshot` (exposed via `ActionEmitterSnapshotHandle::snapshot().await`) is the public read of `held_keys: Vec<Key>`, `held_buttons: Vec<MouseButton>`, `pad_state: HashMap<PadId, GamepadReport>`, `held_key_timer_count: usize`, plus `held_keys_by_backend` and `held_buttons_by_backend` for backend-owned held-state readback.
 
 ### 3.2 Per-message dispatch (`emitter::dispatch`)
 
@@ -98,8 +98,8 @@ For each `(Action, oneshot::Sender)` pulled from the channel:
    - **`RecordingBackend`** (`backend/recording/*`): appends a `RecordedInput` to an in-memory log (used in tests and via `SYNAPSE_MCP_RECORDING_BACKEND=1`)
    - **`HardwareBackend`** (`backend/hardware/*`): serializes supported key, mouse-relative, absolute-mouse-to-relative batch, pad, combo, and release commands through `synapse-hid-host::HidGateway`
    - **`HardwareUnavailableBackend`** (`backend/unavailable`): fail-closed response when hardware HID is not enabled, returning `ACTION_BACKEND_UNAVAILABLE` with `--hardware-hid <port|auto>` guidance
-5. **Auto-release timers.** `emitter::keyboard` enforces `HELD_KEY_MAX_DURATION_MS` per held key — after the limit, the emitter inserts a synthetic `KeyUp` and emits a `STUCK_KEY_AUTO_RELEASED` warn-log + event.
-6. **ReleaseAll**: walks `EmitState`, emits a `KeyUp` for each held key, `MouseButton::Up` for each held button, and a `GamepadReport::neutral` for each tracked pad. When a real hardware HID backend was configured at startup, the emitter also dispatches `Action::ReleaseAll` to `HardwareBackend`, which sends one firmware `RELEASE_ALL (0x40)` command and clears the host mirror. The safety log records `code=SAFETY_RELEASE_ALL_FIRED`, `backend="hardware"`, `primary_backend`, `release_backends`, and `hardware_release_ok` for this path. Reflexes that observe `Action::ReleaseAll` are also expected to expire any held-state controllers.
+5. **Auto-release timers.** `emitter::keyboard` enforces `HELD_KEY_MAX_DURATION_MS` per `(Key, ResolvedBackend)` held key. After the limit, the emitter inserts a synthetic `KeyUp` for the backend that owns the hold and emits a `STUCK_KEY_AUTO_RELEASED` warn-log + event with `backend=<software|vigem|hardware>`.
+6. **ReleaseAll**: reads the full `EmitState` union, aborts held-key timers, and dispatches `Action::ReleaseAll` through every backend that owns releasable state. Each backend sees only its own `held_keys`/`held_buttons` snapshot while executing, so software release cannot claim hardware-held inputs and hardware release cannot claim software-held inputs. ViGEm pad state is released through the ViGEm backend when pads are held. When a real hardware HID backend was configured at startup, the emitter also dispatches `Action::ReleaseAll` to `HardwareBackend`, which sends one firmware `RELEASE_ALL (0x40)` command and clears the hardware host mirror. The safety log records `code=SAFETY_RELEASE_ALL_FIRED`, `backend="hardware"`, `primary_backend`, `release_backends`, and `hardware_release_ok` for this path. Reflexes that observe `Action::ReleaseAll` are also expected to expire any held-state controllers.
 7. **Ack.** Send `Ok(())` or the `ActionError` back on the oneshot.
 
 ### 3.3 Lifecycle (`emitter::lifecycle`)

@@ -26,7 +26,7 @@ pub trait ActionBackend: Send + Sync {
     fn execute(&self, action: &Action, state: &mut EmitState) -> Result<(), ActionError>;
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ResolvedBackend {
     Software,
     Vigem,
@@ -40,6 +40,15 @@ impl ResolvedBackend {
             Self::Software => "software",
             Self::Vigem => "vigem",
             Self::Hardware => "hardware",
+        }
+    }
+
+    #[must_use]
+    pub const fn to_backend(self) -> Backend {
+        match self {
+            Self::Software => Backend::Software,
+            Self::Vigem => Backend::Vigem,
+            Self::Hardware => Backend::Hardware,
         }
     }
 }

@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use crate::{ActionBackend, RecordedInput, RecordingBackend, TokenBucket};
+use crate::{ActionBackend, RecordedInput, RecordingBackend, ResolvedBackend, TokenBucket};
 use synapse_core::{Action, Backend, GamepadReport, Key, KeyCode, PadButton, error_codes};
 use tokio::{
     sync::mpsc,
@@ -17,6 +17,7 @@ use super::keyboard::key_log_label;
 use super::*;
 
 mod auto_release;
+mod held_state;
 mod rate_limit;
 
 fn one_token_limits() -> BackendRateLimits {
@@ -58,17 +59,30 @@ fn assert_no_pending_auto_release(emitter: &mut ActionEmitter) {
 }
 
 fn current_timer_id(emitter: &ActionEmitter, key: &Key) -> u64 {
-    emitter.held_key_timer_ids.get(key).map_or_else(
-        || panic!("expected held key timer id for {key:?}"),
+    current_timer_id_for_backend(emitter, key, ResolvedBackend::Software)
+}
+
+fn current_timer_id_for_backend(
+    emitter: &ActionEmitter,
+    key: &Key,
+    backend: ResolvedBackend,
+) -> u64 {
+    let timer_key = HeldKeyTimerKey::new(key.clone(), backend);
+    emitter.held_key_timer_ids.get(&timer_key).map_or_else(
+        || panic!("expected held key timer id for {timer_key:?}"),
         |timer_id| *timer_id,
     )
 }
 
 fn assert_auto_key_up(action: Option<&Action>, expected_key: &Key) {
+    assert_auto_key_up_for_backend(action, expected_key, Backend::Software);
+}
+
+fn assert_auto_key_up_for_backend(action: Option<&Action>, expected_key: &Key, expected: Backend) {
     match action {
         Some(Action::KeyUp { key, backend }) => {
             assert_eq!(key, expected_key);
-            assert_eq!(*backend, Backend::Auto);
+            assert_eq!(*backend, expected);
         }
         other => panic!("expected emitted auto KeyUp for {expected_key:?}, got {other:?}"),
     }

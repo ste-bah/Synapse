@@ -23,6 +23,15 @@ async fn key_down_timer_auto_releases_held_key_and_clears_hashmap() {
     tokio::task::yield_now().await;
     let auto_release = read_pending_auto_release(&mut emitter);
     let emitted_action = emitter.auto_release_held_key(&auto_release);
+    let after_auto_release_decision = emitter.snapshot();
+    emitter
+        .execute(
+            emitted_action
+                .clone()
+                .unwrap_or_else(|| panic!("auto-release should emit KeyUp action")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("auto-release KeyUp should execute: {error}"));
     let after_auto_release = emitter.snapshot();
 
     assert!(before.held_keys.is_empty());
@@ -30,11 +39,14 @@ async fn key_down_timer_auto_releases_held_key_and_clears_hashmap() {
     assert_eq!(after_key_down.held_key_timer_keys, vec![key.clone()]);
     assert_eq!(after_key_down.held_key_timer_count, 1);
     assert_auto_key_up(emitted_action.as_ref(), &key);
+    assert_eq!(after_auto_release_decision.held_keys, vec![key.clone()]);
+    assert!(after_auto_release_decision.held_key_timer_keys.is_empty());
+    assert_eq!(after_auto_release_decision.held_key_timer_count, 0);
     assert!(after_auto_release.held_keys.is_empty());
     assert!(after_auto_release.held_key_timer_keys.is_empty());
     assert_eq!(after_auto_release.held_key_timer_count, 0);
     println!(
-        "readback=held_keys_bitset_and_timer_hashmap edge=happy_auto_release before={before:?} after_key_down={after_key_down:?} after_auto_release={after_auto_release:?} data.code={}",
+        "readback=held_keys_bitset_and_timer_hashmap edge=happy_auto_release before={before:?} after_key_down={after_key_down:?} after_auto_release_decision={after_auto_release_decision:?} after_auto_release={after_auto_release:?} data.code={}",
         error_codes::STUCK_KEY_AUTO_RELEASED
     );
 }
@@ -96,7 +108,7 @@ async fn stuck_key_auto_release_tracing_event_and_recording_keyup_are_observable
     assert!(before_empty.held_keys.is_empty());
     assert_eq!(before_auto_release.held_keys, vec![key.clone()]);
     assert_eq!(before_auto_release.held_key_timer_count, 1);
-    assert!(after_auto_release.held_keys.is_empty());
+    assert_eq!(after_auto_release.held_keys, vec![key.clone()]);
     assert_eq!(after_auto_release.held_key_timer_count, 0);
     assert_eq!(recording_events, expected_events);
     assert_auto_key_up(Some(&emitted_action), &key);
@@ -104,7 +116,7 @@ async fn stuck_key_auto_release_tracing_event_and_recording_keyup_are_observable
     assert!(log_line.contains("held_ms=30000"));
     assert!(log_line.contains("key=a"));
     println!(
-        "readback=stuck_key edge=auto_release before=held:{:?} after=held:{:?} log_line={} recording_events={recording_events:?}",
+        "readback=stuck_key edge=auto_release before=held:{:?} after_decision_held:{:?} log_line={} recording_events={recording_events:?}",
         held_key_labels(&before_auto_release),
         held_key_labels(&after_auto_release),
         log_line
@@ -174,7 +186,7 @@ async fn key_up_cancels_timer_before_releasing_even_when_buckets_are_empty() {
         ActionEmitter::channel_with_rate_limits(empty_limits());
     let key = key_named("manual-key-up-cancel");
     emitter.state.hold_key(&key);
-    emitter.schedule_held_key_auto_release(key.clone());
+    emitter.schedule_held_key_auto_release(key.clone(), ResolvedBackend::Software);
     let before = emitter.snapshot();
     let before_limits = emitter.rate_limits.snapshot();
 
@@ -250,6 +262,15 @@ async fn repeated_key_down_replaces_timer_without_old_timer_release() {
     tokio::task::yield_now().await;
     let auto_release = read_pending_auto_release(&mut emitter);
     let emitted_action = emitter.auto_release_held_key(&auto_release);
+    let after_new_deadline_decision = emitter.snapshot();
+    emitter
+        .execute(
+            emitted_action
+                .clone()
+                .unwrap_or_else(|| panic!("auto-release should emit KeyUp action")),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("auto-release KeyUp should execute: {error}"));
     let after_new_deadline = emitter.snapshot();
 
     assert_ne!(first_timer_id, second_timer_id);
@@ -258,10 +279,12 @@ async fn repeated_key_down_replaces_timer_without_old_timer_release() {
     assert_eq!(after_old_deadline.held_keys, vec![key.clone()]);
     assert_eq!(after_old_deadline.held_key_timer_count, 1);
     assert_auto_key_up(emitted_action.as_ref(), &key);
+    assert_eq!(after_new_deadline_decision.held_keys, vec![key.clone()]);
+    assert_eq!(after_new_deadline_decision.held_key_timer_count, 0);
     assert!(after_new_deadline.held_keys.is_empty());
     assert_eq!(after_new_deadline.held_key_timer_count, 0);
     println!(
-        "readback=held_keys_bitset_and_timer_hashmap edge=repeated_keydown_reset before={before:?} after_first={after_first:?} first_timer_id={first_timer_id} after_second={after_second:?} second_timer_id={second_timer_id} after_old_deadline={after_old_deadline:?} after_new_deadline={after_new_deadline:?}"
+        "readback=held_keys_bitset_and_timer_hashmap edge=repeated_keydown_reset before={before:?} after_first={after_first:?} first_timer_id={first_timer_id} after_second={after_second:?} second_timer_id={second_timer_id} after_old_deadline={after_old_deadline:?} after_new_deadline_decision={after_new_deadline_decision:?} after_new_deadline={after_new_deadline:?}"
     );
 }
 
