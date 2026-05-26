@@ -3250,6 +3250,7 @@ dependencies = [
  "serialport",
  "synapse-core",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 

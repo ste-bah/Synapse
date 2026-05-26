@@ -12,6 +12,7 @@ serde.workspace = true
 serialport.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 thiserror.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 
 [lints.rust]
