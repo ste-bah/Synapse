@@ -1,5 +1,7 @@
+#[cfg(windows)]
 use synapse_core::Rect;
 
+#[cfg(windows)]
 use crate::{CaptureError, CapturedFrame, CapturedSoftwareBitmap, platform};
 
 #[cfg(windows)]
