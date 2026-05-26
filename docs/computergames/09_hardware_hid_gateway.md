@@ -342,8 +342,7 @@ Status LED:
 
 | LED state | Meaning |
 |---|---|
-| Off | Idle, watchdog not running |
-| Slow heartbeat (1 Hz) | Connected, no recent commands |
+| Slow heartbeat (0.5 Hz) | Idle / no commands for at least 5 s |
 | Steady on | Receiving commands actively |
 | Fast blink (5 Hz) | Watchdog fired (released all) |
 | SOS pattern | Firmware error; reflash needed |
