@@ -102,6 +102,16 @@ impl HidPipeline {
         self.config
     }
 
+    #[must_use]
+    pub const fn pending_rx_len(&self) -> usize {
+        self.rx.len()
+    }
+
+    #[must_use]
+    pub const fn pending_rx_capacity(&self) -> usize {
+        self.rx.capacity()
+    }
+
     /// Sends one ACK/NAK command and waits until the firmware accepts it.
     ///
     /// # Errors

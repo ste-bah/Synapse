@@ -3326,6 +3326,7 @@ version = "0.1.0"
 dependencies = [
  "crc16",
  "criterion",
+ "proptest",
  "serde",
  "serialport",
  "synapse-core",
