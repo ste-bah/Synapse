@@ -3264,6 +3264,7 @@ dependencies = [
  "synapse-a11y",
  "synapse-capture",
  "synapse-core",
+ "synapse-hid-host",
  "thiserror",
  "tokio",
  "tokio-util",

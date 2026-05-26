@@ -10,6 +10,7 @@ repository.workspace = true
 bit-set = "0.10.0"
 serde.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
+synapse-hid-host = { version = "0.1.0", path = "../synapse-hid-host" }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

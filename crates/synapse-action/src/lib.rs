@@ -16,6 +16,7 @@ pub mod validation;
 
 pub use backend::{
     ActionBackend, ResolvedBackend,
+    hardware::{HardwareBackend, HardwareGateway},
     recording::{RecordedInput, RecordingBackend},
     resolve_backend,
     unavailable::HardwareUnavailableBackend,
