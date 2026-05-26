@@ -157,7 +157,7 @@ cuda = ["ort", "ort/cuda"]
 directml = ["ort", "ort/directml"]
 ```
 
-`synapse-audio` enables `directml`. `synapse-mcp` does not pull in CUDA or DirectML features explicitly; the operator-side install path is responsible for ensuring the ONNX runtime DLL is present.
+`synapse-audio` enables `directml`. `synapse-mcp` does not pull in CUDA or DirectML features explicitly; the configured-host install/setup path is responsible for ensuring the ONNX runtime DLL is present. If it is missing during issue work, the agent must acquire or configure it through local reversible workflows where possible and then read the physical DLL/path/source-of-truth directly.
 
 ### 2.2 Public surface
 
@@ -235,6 +235,6 @@ See `tests/fixtures/audio/README.md` for the synthesis recipe.
 
 - **STT models other than Whisper-tiny.** The model id is hard-coded `whisper_tiny_int8` in `m3/audio.rs` and only one language ("en") is accepted.
 - **No streaming transcription.** `audio_transcribe` returns a complete `Transcription` after running over the buffered tail; there is no incremental streaming API.
-- **Model auto-download.** `MODEL_DOWNLOAD_FAILED` is reserved as an error code but there is no download path; the operator places the ONNX file at `synapse-audio::stt::default_model_path()` manually.
+- **Model auto-download.** `MODEL_DOWNLOAD_FAILED` is reserved as an error code but there is no download path; when a workflow requires the ONNX file, the agent acquires or imports it on the configured host through a license-compliant local setup path and verifies `synapse-audio::stt::default_model_path()` plus the expected hash directly.
 - **Custom audio devices.** WASAPI loopback always uses the default render endpoint; there is no selector for non-default outputs.
 - **YOLO inference pipeline.** `synapse-models::Detector::load` works end-to-end but no `M1State` code path runs detection yet (entities are populated only by synthetic fixtures).

@@ -253,7 +253,7 @@ Not committed; v2 roadmap decided after v1 ships.
 | M0 | rmcp API churn | Pin version; vet dep PRs |
 | M1 | UIA performance | Cache request batching day one; fall back to depth-1 |
 | M1 | DirectML on AMD/Intel | CPU fallback for detection; warn at startup if no GPU EP |
-| M2 | ViGEm install friction | Document Win11 GUI clickthrough; auto-detect; skip ViGEm features if absent |
+| M2 | ViGEm install friction | Document Win11 GUI clickthrough; auto-detect; if ViGEm is absent on the configured host, acquire/install it through local workflows before treating gamepad work as blocked |
 | M3 | Time-critical thread jitter | Multimedia timer; fall back to `tokio::time` 2 ms tick if no MMCSS |
 | M3 | RocksDB Windows hiccups | pinned RocksDB version; alternate backend requires future ADR |
 | M4 | RP2040 firmware debug pain | Loopback build feature off-target; configured-host Pico checks |

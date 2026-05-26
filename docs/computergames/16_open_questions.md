@@ -302,9 +302,16 @@ the next tick, and `REFLEX_RECURSION_LIMIT` is emitted/audited.
 
 **Q.** YOLOv8/YOLOv10/YOLOv11 are AGPL (Ultralytics). Can we bundle weights?
 
-**Trade-off.** AGPL incompatible with MIT/Apache. Bundling forbidden. Operator-downloaded weights are operator's problem.
+**Trade-off.** AGPL incompatible with MIT/Apache. Bundling forbidden. Local
+acquisition is still work when a configured-host workflow requires the weights:
+the agent must use a license-compliant download/import path, then verify the
+model file and hash at the physical SoT.
 
-**Default.** **DO NOT BUNDLE Ultralytics-trained weights.** Provide model loader infrastructure; operator downloads weights. Bundle alternatively licensed models (CC0 / Apache) when available — e.g., RT-DETR-s with Apache-2.0-friendly checkpoints.
+**Default.** **DO NOT BUNDLE Ultralytics-trained weights.** Provide model loader
+infrastructure; acquire weights on the configured host only through
+operator-approved/license-compliant local setup. Bundle alternatively licensed
+models (CC0 / Apache) when available — e.g., RT-DETR-s with
+Apache-2.0-friendly checkpoints.
 
 **Target.** Locked. Track post-v1 alternatives we CAN bundle (license permitting).
 

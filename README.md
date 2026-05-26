@@ -20,6 +20,11 @@ truth directly. Ask only before hard-to-reverse external actions.
 Do not stop at "missing": if the operator could do it from this computer,
 the agent must use Synapse and local host workflows to make it happen, then
 inspect the source of truth.
+Browser downloads, GUI installers, Device Manager checks, package-manager
+installs, model/file generation, firmware flashing, app launching, and UI
+inspection are agent-owned work when they are reversible on this host. A blocker
+exists only for the exact hard-to-reverse external action left after that local
+work is exhausted.
 
 ## Status: M1
 

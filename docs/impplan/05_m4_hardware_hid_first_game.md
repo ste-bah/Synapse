@@ -22,6 +22,10 @@ asking the operator. Then read the authoritative source of truth directly. Ask
 only for narrow approval before hard-to-reverse external actions such as
 spending money, private credentials, billing, external-account changes, or
 irreversible shared-state changes.
+Within M4, browser downloads, GUI installers, Device Manager checks,
+package-manager installs, model/file generation, firmware flashing, launching
+apps, USB/COM inspection, and Synapse-driven UI inspection are agent-owned work
+when reversible on this host; they are not reasons to stop.
 
 **No GitHub Actions or CI gate.** Agent commits pushed during M4 include
 `[skip ci]`. Local checks may support regression confidence, but the shipping
@@ -754,6 +758,9 @@ Strict prohibitions:
 - Do not ask the operator to download, install, or connect something while a
   reversible local acquisition/setup path remains available through Synapse or
   host workflows.
+- Do not leave a Pico, cable, COM port, driver, Rust target, UF2, model, asset,
+  profile, installer, or app state "missing" when a reversible local path exists
+  to acquire, connect, generate, flash, launch, or inspect it from this host.
 
 Supporting evidence allowed:
 

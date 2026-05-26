@@ -20,6 +20,11 @@ external actions.
 Do not stop at "missing": if the operator could do it from this computer, the
 agent must use Synapse/local host control to make it happen, then inspect the
 resulting source of truth.
+Browser downloads, GUI installers, Device Manager checks, package-manager
+installs, model/file generation, firmware flashing, app launching, and UI
+inspection are agent-owned work when they are reversible on this host. Blocking
+is limited to the exact hard-to-reverse external action left after that work is
+exhausted.
 
 ---
 

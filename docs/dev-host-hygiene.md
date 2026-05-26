@@ -19,6 +19,10 @@ Do not stop at "missing." If the operator could make it happen from this
 computer, the agent must use Synapse and local host workflows to do the
 reversible work, then inspect the resulting source of truth. Missing
 configured-host state is never a blocker by itself.
+That includes browser downloads, GUI installers, Device Manager checks,
+package-manager installs, model/file generation, firmware flashing, app
+launching, and UI inspection through Synapse. Treat those as agent-owned work,
+not operator errands.
 Then read the physical source of truth where the prerequisite must appear:
 package inventory, driver/service list, `Get-PnpDevice`, registry Enum key,
 firmware volume, config file, model path plus hash, or equivalent.

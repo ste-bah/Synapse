@@ -61,6 +61,9 @@ Comprehensive technical reference for the Synapse MCP server, produced by readin
   reversible local prerequisites real, then read the physical source of truth.
   Do not stop at "missing"; if the operator could do it from this computer,
   the agent must do it through Synapse/local host workflows and inspect the SoT.
+  Browser downloads, GUI installers, Device Manager checks, package-manager
+  installs, model/file generation, firmware flashing, app launching, and UI
+  inspection are agent-owned work when reversible on this host.
 - For the contract-level PRD, see `docs/computergames/` (numbered 00–17).
 - For the per-milestone work-item ledger, see `docs/impplan/` (numbered 00–07).
 
@@ -111,7 +114,7 @@ Source files covered:
 
 Synapse is a Rust [Model Context Protocol](https://modelcontextprotocol.io) (MCP) server that exposes a Windows 11/10 host's local desktop and game state as low-token structured JSON, accepts high-level action intents (click, type, aim, press, drag, combo), and runs sub-frame reflex controllers so model latency never costs a frame. The shipping binary is `synapse-mcp` (`crates/synapse-mcp/src/main.rs`); MCP clients (Claude Desktop/Code, Codex, custom runners) connect over **stdio** (newline-delimited JSON-RPC) or **streamable HTTP** (loopback by default, bearer-auth required).
 
-The repository operates under the doctrine in `AGENTS.md`: manual Full State Verification (FSV) on the configured Windows host is the shipping gate; GitHub Actions, CI, scripts, tests, and benches are supporting evidence only; missing configured-host prerequisites are acquisition/setup work where the agent figures out where the thing must come from, where it must physically appear, uses Synapse/local control as the operator-equivalent host control surface to make it happen when reversible local steps exist, does not stop at "missing" when the operator could do it from this computer, and verifies the real source of truth; and agent commits include `[skip ci]`.
+The repository operates under the doctrine in `AGENTS.md`: manual Full State Verification (FSV) on the configured Windows host is the shipping gate; GitHub Actions, CI, scripts, tests, and benches are supporting evidence only; missing configured-host prerequisites are acquisition/setup work where the agent figures out where the thing must come from, where it must physically appear, uses Synapse/local control as the operator-equivalent host control surface to make it happen when reversible local steps exist, treats browser downloads, GUI installers, Device Manager checks, package-manager installs, model/file generation, firmware flashing, app launching, and UI inspection as agent-owned work on this host, does not stop at "missing" when the operator could do it from this computer, and verifies the real source of truth; and agent commits include `[skip ci]`.
 
 ## 2. Architecture map
 
@@ -3070,7 +3073,7 @@ cuda = ["ort", "ort/cuda"]
 directml = ["ort", "ort/directml"]
 ```
 
-`synapse-audio` enables `directml`. `synapse-mcp` does not pull in CUDA or DirectML features explicitly; the operator-side install path is responsible for ensuring the ONNX runtime DLL is present.
+`synapse-audio` enables `directml`. `synapse-mcp` does not pull in CUDA or DirectML features explicitly; the configured-host install/setup path is responsible for ensuring the ONNX runtime DLL is present. If it is missing during issue work, the agent must acquire or configure it through local reversible workflows where possible and then read the physical DLL/path/source-of-truth directly.
 
 ### 2.2 Public surface
 
@@ -3148,7 +3151,7 @@ See `tests/fixtures/audio/README.md` for the synthesis recipe.
 
 - **STT models other than Whisper-tiny.** The model id is hard-coded `whisper_tiny_int8` in `m3/audio.rs` and only one language ("en") is accepted.
 - **No streaming transcription.** `audio_transcribe` returns a complete `Transcription` after running over the buffered tail; there is no incremental streaming API.
-- **Model auto-download.** `MODEL_DOWNLOAD_FAILED` is reserved as an error code but there is no download path; the operator places the ONNX file at `synapse-audio::stt::default_model_path()` manually.
+- **Model auto-download.** `MODEL_DOWNLOAD_FAILED` is reserved as an error code but there is no download path; when a workflow requires the ONNX file, the agent acquires or imports it on the configured host through a license-compliant local setup path and verifies `synapse-audio::stt::default_model_path()` plus the expected hash directly.
 - **Custom audio devices.** WASAPI loopback always uses the default render endpoint; there is no selector for non-default outputs.
 - **YOLO inference pipeline.** `synapse-models::Detector::load` works end-to-end but no `M1State` code path runs detection yet (entities are populated only by synthetic fixtures).
 
@@ -3604,7 +3607,7 @@ These are doctrine — **NEVER violate**:
 3. **Full-State Verification (FSV) is mandatory and manual.** The agent reads the SoT before, executes the trigger, performs a separate read for "after", exercises ≥3 edge cases (empty/boundary/structurally-invalid), and records actual state. **Scripts, tests, benchmarks, harnesses, GitHub Actions, and CI are supporting evidence only.** They never count as FSV. Do not add `*_fsv` tests, FSV harnesses, or FSV scripts.
 4. **Natural-only motion (OQ-004 DECIDED 2026-05-22).** `Natural` curves + `Natural` keystroke dynamics tuned `FAST` are the resolved default of every tool, profile, and reflex. `Instant`/`Burst` exist for explicit opt-in only.
 5. **Manual FSV on the configured Windows host is the shipping gate, not CI** (operator decision 2026-05-24, issues #246/#247/#350/#351). Do not dispatch, wait on, or block a tag on GitHub Actions/CI. Do not add `*_fsv` tests.
-6. **Missing configured-host prerequisites are agent work, not blockers.** Do not stop at "missing." If the operator could download, install, connect, configure, generate, flash, launch, or inspect it from this computer, the agent must use Synapse/local host control to make it happen and then inspect the physical SoT. Ask only for narrow approval on hard-to-reverse external actions after reversible local work is exhausted.
+6. **Missing configured-host prerequisites are agent work, not blockers.** Do not stop at "missing." If the operator could download, install, connect, configure, generate, flash, launch, or inspect it from this computer, the agent must use Synapse/local host control to make it happen and then inspect the physical SoT. Browser downloads, GUI installers, Device Manager checks, package-manager installs, model/file generation, firmware flashing, app launching, and UI inspection are agent-owned work when reversible on this host. Ask only for narrow approval on hard-to-reverse external actions after reversible local work is exhausted.
 
 `AGENTS.md` reinforces these and pins **`[skip ci]` on every agent commit**.
 

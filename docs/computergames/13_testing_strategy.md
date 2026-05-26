@@ -373,6 +373,11 @@ shipping.
 Do not stop at "missing." If the operator could make the prerequisite real from
 this computer, the agent must do the reversible local work through Synapse and
 host workflows, then inspect the physical SoT.
+Browser downloads, GUI installers, Device Manager checks, package-manager
+installs, model/file generation, firmware flashing, app launching, and UI
+inspection count as that reversible local work. They are agent-owned on the
+configured host and must not be handed back to the operator while Synapse/local
+control can perform them.
 Only hard-to-reverse external actions such as spending money, private
 credentials, billing, or external account changes require narrow operator
 approval, and every reversible local step must be complete before asking.

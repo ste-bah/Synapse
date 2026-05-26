@@ -53,6 +53,9 @@ while reversible local acquisition/setup remains possible.
 Do not stop at "missing." If the operator could do it from this computer, the
 agent must use Synapse and host workflows to make it happen, then inspect the
 physical source of truth.
+Browser downloads, GUI installers, Device Manager checks, package-manager
+installs, model/file generation, firmware flashing, app launching, and UI
+inspection are agent-owned work when reversible on this host.
 
 The source of truth is the physical place the prerequisite should appear:
 package inventory, Rust target list, driver/service list, `Get-PnpDevice`,

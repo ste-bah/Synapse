@@ -56,6 +56,13 @@ operator has through Synapse. If it can be done from this computer, do it and
 then inspect the resulting source of truth. Missing configured-host state is
 never a blocker by itself.
 
+Every reversible host action the operator could perform from this computer is
+agent-owned work: browser downloads, GUI installers, Device Manager checks,
+package-manager installs, model/file generation, firmware flashing, launching
+apps, and UI inspection through Synapse. "Blocked" is reserved for the exact
+operator-only external action that remains after those local steps are
+exhausted.
+
 Missing prerequisites become concrete work items with source-of-truth readback:
 identify what is missing, identify the authoritative place it should appear,
 perform the acquisition/setup step, then read that source of truth directly. If
