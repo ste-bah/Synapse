@@ -426,7 +426,7 @@ Top-level flags:
   --log-level <level>
   --reflex-disabled
   --vigem-disabled
-  --hardware-hid <port>
+  --hardware-hid <port|auto>
   --allow-launch <regex>
   --allow-shell <regex>
   --allow-hardware-hid

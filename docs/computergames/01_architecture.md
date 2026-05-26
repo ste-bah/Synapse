@@ -310,7 +310,7 @@ Dev-only:
 
 `synapse-mcp/src/main.rs` is small:
 
-1. Parse CLI args (`clap` derive) — `--mode {stdio|http}`, `--bind`, `--db`, `--profile-dir`, `--log-level`, `--reflex-disabled`, `--vigem-disabled`, `--hardware-hid {port}`.
+1. Parse CLI args (`clap` derive) — `--mode {stdio|http}`, `--bind`, `--db`, `--profile-dir`, `--log-level`, `--reflex-disabled`, `--enable-audio`, `--allow-unknown-profile`, `--allowed-permissions`, `--reflex-force-degraded`, `--storage-pressure-free-bytes-sample`, `--max-subscriptions`, `--hardware-hid <port|auto>`.
 2. Init `tracing` via `synapse-telemetry`.
 3. Open RocksDB via `synapse-storage`.
 4. Load profile dir via `synapse-profiles`.
@@ -323,7 +323,7 @@ Total LoC for `main.rs`: target ≤ 300.
 ## 8. Configuration sources (precedence high → low)
 
 1. **CLI flags** — explicit overrides
-2. **Environment variables** — `SYNAPSE_*` (e.g., `SYNAPSE_HARDWARE_HID_PORT=COM7`)
+2. **Environment variables** — `SYNAPSE_*` (e.g., `SYNAPSE_HARDWARE_HID=COM7`)
 3. **Config file** — `%APPDATA%\synapse\config.toml` if present
 4. **Built-in defaults** — `synapse-core::defaults`
 

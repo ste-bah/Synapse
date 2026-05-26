@@ -74,9 +74,15 @@ struct Cli {
         value_name = "COUNT"
     )]
     max_subscriptions: NonZeroUsize,
+    #[arg(long, env = "SYNAPSE_HARDWARE_HID", value_name = "PORT_OR_AUTO")]
+    hardware_hid: Option<String>,
 }
 
 impl Cli {
+    fn m2_config(&self) -> m2::M2ServiceConfig {
+        m2::M2ServiceConfig::from_cli_parts(self.hardware_hid.clone())
+    }
+
     fn m3_config(&self) -> m3::M3ServiceConfig {
         m3::M3ServiceConfig::from_cli_parts(
             self.db.clone(),
@@ -116,10 +122,14 @@ async fn run() -> anyhow::Result<ExitCode> {
         "capture dpi awareness initialized"
     );
 
+    let m2_config = cli.m2_config();
+    let m3_config = cli.m3_config();
+
     match cli.mode {
-        Mode::Stdio => run_stdio(telemetry_guard, cli.m3_config()).await,
+        Mode::Stdio => run_stdio(telemetry_guard, &m2_config, m3_config).await,
         Mode::Http => {
-            let code = http::serve(&cli.bind, cli.allow_non_loopback, cli.m3_config()).await?;
+            let code =
+                http::serve(&cli.bind, cli.allow_non_loopback, &m2_config, m3_config).await?;
             drop(telemetry_guard);
             Ok(code)
         }
@@ -143,6 +153,7 @@ fn configure_telemetry(cli: &Cli) -> anyhow::Result<TelemetryGuard> {
 
 async fn run_stdio(
     telemetry_guard: TelemetryGuard,
+    m2_config: &m2::M2ServiceConfig,
     m3_config: m3::M3ServiceConfig,
 ) -> anyhow::Result<ExitCode> {
     tracing::info!(code = "MCP_STDIO_STARTED", "starting stdio MCP transport");
@@ -153,6 +164,7 @@ async fn run_stdio(
         emitter_shutdown_token.clone(),
         "sigint",
         emitter_connection_closed_token.clone(),
+        m2_config,
         m3_config,
     )
     .context("initialize Synapse service state")?;

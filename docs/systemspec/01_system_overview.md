@@ -56,7 +56,7 @@ The repository operates under the doctrine in `AGENTS.md`: manual Full State Ver
 | Audio loopback | WASAPI loopback on default render device | `wasapi` v0.23 | Ring buffer + STT (Whisper tiny) for `audio_tail` / `audio_transcribe` tools |
 | Capture | DXGI duplication or Windows.Graphics.Capture | `windows-capture` v2.0 + `windows` v0.62 | Zero-copy GPU frame surface for OCR/CNN paths |
 | ViGEm virtual pad | ViGEmBus driver, user-space client | `vigem-client` v0.1.4 (X360 default, optional DS4) | Virtual Xbox/DualShock controller for `act_pad` |
-| Pi Pico HID gateway | USB serial, RP2040 firmware (M4) | `serialport` v4.9 + `crc16` | Hardware HID future surface; crate `synapse-hid-host` currently empty stub (1 LoC) — M4 work, see `docs/computergames/09_hardware_hid_gateway.md` |
+| Pi Pico HID gateway | USB serial, RP2040 firmware (M4) | `serialport` v4.9 + `crc16` | Hardware HID host surface; `synapse-hid-host` implements serial discovery, connect/IDENTIFY, framing, pipelined send, and reconnect paths. See `docs/computergames/09_hardware_hid_gateway.md` |
 | `synapse-overlay` binary | currently a placeholder (`crates/synapse-overlay/src/main.rs` is 1 line) | n/a | Future debug overlay for M5 production polish |
 
 ## 3. Technology stack
@@ -186,6 +186,7 @@ CLI flags on `synapse-mcp` (parsed in `main.rs::Cli`, full table: [03_configurat
                                 [env: SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE]
 --max-subscriptions <COUNT>     [env: SYNAPSE_MAX_SUBSCRIPTIONS]
                                 default: synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO
+--hardware-hid <PORT_OR_AUTO>   [env: SYNAPSE_HARDWARE_HID]
 ```
 
 ## 6. Runtime directory layout
@@ -258,7 +259,7 @@ Opens RocksDB with LZ4 base, ZSTD on `CF_OBSERVATIONS`/`CF_SESSIONS`, no-compres
 `ReflexRuntime` (`crates/synapse-reflex/src/lib.rs`) owns the scheduler, `EventBus`, and a `Db` handle for audit persistence. Reflex kinds: `AimTrack` (PID-style aim controller with EMA smoothing), `HoldMove` (held key set with optional re-assert), `HoldButton` (held mouse/pad button), `Combo` (timed step list), `OnEvent` (event-filtered action firing with recursion guard, default cap `MAX_ON_EVENT_FIRINGS_PER_TICK`). Scheduler runs at 1 ms tick (default), records `TickSample` with jitter, computes p99, exposes `degraded_latency()` and `recursion_clamps_total()` for `health`. Each register/cancel/disable/fire writes a `StoredReflexAudit` row into `CF_REFLEX_AUDIT`. Subscriber bus is bounded by `SUBSCRIBER_QUEUE_CAPACITY` with drop accounting. See [07_reflex_runtime.md](07_reflex_runtime.md).
 
 ### 9.5 synapse-action (input emission)
-The `ActionEmitter` actor (mpsc channel, `ACTION_QUEUE_CAPACITY=256`) consumes `Action` messages, applies token-bucket rate limits per backend (`SOFTWARE_RATE_LIMIT_PER_S`, `VIGEM_RATE_LIMIT_PER_S`), tracks held keys/buttons/pad state in a `BitSet`, and dispatches to one of: Software (`enigo`), ViGEm (`vigem-client`), Recording (in-memory buffer, used by tests), or `HardwareUnavailable` (typed stub returning `ACTION_HID_PORT_DISCONNECTED`). Owns the operator panic hotkey (`Ctrl+Alt+Shift+P`) which fires a 50 ms-budgeted `ReleaseAll` (`crates/synapse-mcp/src/safety.rs`). Curve sampling, keystroke-dynamics samplers (`BIGRAMS`, `KeystrokeNaturalParams::FAST`), click-timing caches, clipboard read/write/clear, and per-action validation (`validate_action`, `MAX_DRAG_DISTANCE_PX`) all live here. See [08_action_subsystem.md](08_action_subsystem.md).
+The `ActionEmitter` actor (mpsc channel, `ACTION_QUEUE_CAPACITY=256`) consumes `Action` messages, applies token-bucket rate limits per backend (`SOFTWARE_RATE_LIMIT_PER_S`, `VIGEM_RATE_LIMIT_PER_S`), tracks held keys/buttons/pad state in a `BitSet`, and dispatches to one of: Software (`enigo`), ViGEm (`vigem-client`), Recording (in-memory buffer, used by tests), `HardwareBackend` (when `--hardware-hid <port|auto>` connects and identifies a Synapse Pico), or `HardwareUnavailable` (fail-closed `ACTION_BACKEND_UNAVAILABLE` when hardware HID is not enabled). Owns the operator panic hotkey (`Ctrl+Alt+Shift+P`) which fires a 50 ms-budgeted `ReleaseAll` (`crates/synapse-mcp/src/safety.rs`). Curve sampling, keystroke-dynamics samplers (`BIGRAMS`, `KeystrokeNaturalParams::FAST`), click-timing caches, clipboard read/write/clear, and per-action validation (`validate_action`, `MAX_DRAG_DISTANCE_PX`) all live here. See [08_action_subsystem.md](08_action_subsystem.md).
 
 ### 9.6 synapse-perception (observation assembly)
 Aggregates inputs from `synapse-a11y` (UIA tree) and `synapse-capture` (frame sources, OCR) into an `Observation`. Owns the `ObservationAssembler` with per-slot include flags (`ObserveInclude`), auto perception-mode resolution (`auto_mode`, `auto_mode_with_a11y`), and `ObservationInput` (synthetic fixture or live OS data). Provides OCR with WinRT and CRNN backends (`OcrProvider`, `read_text`, `read_text_with_provider`). See [09_perception_and_capture.md](09_perception_and_capture.md).
@@ -281,8 +282,8 @@ Owns the process-wide `tracing` subscriber: JSON file appender (daily rolling, l
 ### 9.12 synapse-models (ONNX runtime wrappers)
 Holds `ModelDescriptor` (id, path, sha256, input_shape, class_map), `Detector` trait (`infer(frame, opts)`), `DetectionFrame::validate`. Wraps `ort` v2.0.0-rc.12 with optional `cuda` and `directml` features (`directml` is required by `synapse-audio` for the Whisper-tiny inference). Validates SHA-256 before loading; emits `MODEL_HASH_MISMATCH` on drift.
 
-### 9.13 synapse-hid-host (M4 placeholder)
-Currently a 1-LoC stub (`crates/synapse-hid-host/src/lib.rs`). Planned M4 deliverable: USB-serial driver to talk to the RP2040 HID gateway firmware (`firmware/pico-hid/`, excluded from the workspace via `Cargo.toml::exclude`). Pulls in `serialport` and `crc16` as direct deps so the dependency tree is stable, but exposes nothing yet.
+### 9.13 synapse-hid-host
+USB-serial driver for the RP2040 HID gateway firmware (`firmware/pico-hid/`, excluded from the root workspace via `Cargo.toml::exclude`). The crate exposes serial discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frame encode/decode, pipelined send, reconnect state, and HID error mapping. `synapse-mcp --hardware-hid <port|auto>` uses this crate to build the live `HardwareBackend`.
 
 ### 9.14 synapse-test-utils (shared test rig)
 Provides `StdioMcpClient` for spawning `synapse-mcp` over stdio and driving JSON-RPC initialize → tool calls in integration tests, plus Notepad/audio fixtures (`launch_notepad`, `wait_for_window_title_regex`, `notepad_process_ids`).
@@ -298,7 +299,7 @@ Currently `fn main() {}`. Will hold the debug overlay UI shipped at M5.
 | M1 — perception MVP | DONE | `v0.1.0-m1` (2026-05-23) | `observe` + `find` + `read_text` + `set_capture_target` + `set_perception_mode` + a11y/capture wiring |
 | M2 — action MVP | DONE | `v0.1.0-m2` (2026-05-24) | Nine action tools, Software + ViGEm + Recording backends, operator panic hotkey, `release_all` safety paths |
 | M3 — reflex / MCP surface | DONE | `v0.1.0-m3` (2026-05-25, @ `97019ec`) | SSE bus, reflex runtime + 1 ms time-critical scheduler, RocksDB (11 CFs) + GC + 4-level disk pressure, profile loader + watcher (4 bundled), WASAPI loopback + Whisper-tiny STT, replay JSONL recorder, streamable HTTP/SSE transport with Bearer + Origin/Host + Mcp-Session-Id, 15 M3 tools (incl. four `storage_*` diagnostics) |
-| M4 — hardware HID + first game | ACTIVE | — | RP2040 firmware (`firmware/pico-hid/` — not yet created) + `synapse-hid-host` serial driver + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch` |
+| M4 — hardware HID + first game | ACTIVE | — | RP2040 firmware (`firmware/pico-hid/`) + `synapse-hid-host` serial driver + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch` |
 | M5 — production polish | blocked by M4 | — | Installer, overlay, ≥10 profiles, VLM `describe`, soak |
 
 ## 11. What is NOT covered

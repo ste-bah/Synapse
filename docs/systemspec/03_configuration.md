@@ -45,6 +45,7 @@ All flags are defined in `crates/synapse-mcp/src/main.rs::Cli` (clap derive).
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | `bool` | `false` | same as bool flags above | Forces the reflex scheduler into degraded-latency mode (test-only knob). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | `Option<u64>` | `None` | unsigned integer | If set, applies one synthetic free-byte sample at startup to validate disk-pressure responder paths (`Db::run_pressure_check_with_free_bytes_sample`). |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | `NonZeroUsize` | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | `>=1` | SSE event subscription cap on the bus. |
+| `--hardware-hid` | `SYNAPSE_HARDWARE_HID` | `Option<String>` | `None` | `auto` or a serial port name such as `COM7` | Enables the hardware HID backend. `auto` enumerates matching Synapse Pico serial ports and proves identity; a port value opens that port directly. Missing/no-match fails startup with `HID_PORT_NOT_FOUND`; omission leaves `Backend::Hardware` fail-closed through `ACTION_BACKEND_UNAVAILABLE`. |
 
 CLI examples (`README.md`):
 
@@ -152,17 +153,18 @@ Sentinel values `NONE` / `DENY_ALL` produce an empty grants set (every M3 tool w
 
 ## 5. Config loading order
 
-The `Cli::m3_config` method (`crates/synapse-mcp/src/main.rs:78`) constructs the `M3ServiceConfig` from clap fields and additionally consults `SYNAPSE_BEARER_TOKEN` at that point (`crates/synapse-mcp/src/m3.rs::from_cli_parts`). All other env vars are read at their respective construction sites:
+The `Cli::m2_config` method constructs `M2ServiceConfig` from `--hardware-hid` / `SYNAPSE_HARDWARE_HID` and `SYNAPSE_MCP_RECORDING_BACKEND`; `Cli::m3_config` constructs `M3ServiceConfig` from clap fields and additionally consults `SYNAPSE_BEARER_TOKEN` at that point (`crates/synapse-mcp/src/m3.rs::from_cli_parts`). All other env vars are read at their respective construction sites:
 
 ```text
 clap (CLI flag > env via clap) → Cli
         │
+        ├→ Cli::m2_config()  → M2ServiceConfig (hardware HID + recording backend)
         └→ Cli::m3_config()  → M3ServiceConfig (also reads SYNAPSE_BEARER_TOKEN)
                 │
                 ├→ configure_telemetry()  → reads SYNAPSE_LOG_DIR + SYNAPSE_LOG_GC_INTERVAL_S
                 │
                 └→ run_stdio / http::serve
-                    ├→ M2State::from_env*       → reads SYNAPSE_MCP_RECORDING_BACKEND
+                    ├→ M2State::try_from_config → connects hardware HID if configured; reads SYNAPSE_MCP_RECORDING_BACKEND from M2ServiceConfig
                     ├→ M1State::from_env        → reads SYNAPSE_MCP_SYNTHETIC_FIXTURE, _FORCE_NO_PERCEPTION, _FORCE_OBSERVE_INTERNAL
                     ├→ M3State::from_*          → reads SYNAPSE_BIND, SYNAPSE_BEARER_TOKEN, SYNAPSE_AUDIO_LOOPBACK
                     │      (additional env mirrors of --reflex-disabled etc. when used via M3ServiceConfig::from_env)

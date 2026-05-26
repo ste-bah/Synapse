@@ -54,8 +54,8 @@ M3 carry-over open for M4 to address:
 
 Open M4 work (per `docs/impplan/05_m4_hardware_hid_first_game.md`):
 
-- `firmware/pico-hid/` — currently absent (referenced in `Cargo.toml::exclude`); created from scratch in M4 work-item 1 as a separate `thumbv6m-none-eabi` workspace.
-- `synapse-hid-host` — currently a 1-LoC stub; M4 fills it with an async serial driver + CRC16 framing + firmware handshake. `Backend::Hardware` route currently returns `ACTION_HID_PORT_DISCONNECTED` via `HardwareUnavailableBackend`; M4 replaces it with a real `HardwareBackend`.
+- `firmware/pico-hid/` — standalone RP2040 firmware project excluded from the root Cargo workspace; remaining firmware issues close only with real device evidence.
+- `synapse-hid-host` — serial driver with discovery, connect/IDENTIFY, CRC16 framing, pipeline/backpressure, and reconnect paths. `Backend::Hardware` uses `HardwareBackend` when `--hardware-hid <port|auto>` connects successfully, otherwise it fails closed through `HardwareUnavailableBackend`.
 - `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 → 33.
 - `minecraft.java` profile (the first game profile) — fifth bundled profile, validated against a single-player creative world per `15_roadmap_and_milestones.md` §6.
 - M3 hold-over items still open: per-subscriber `subscribe.buffer_size` (currently hard-pinned to 4096); persistent writers for `CF_EVENTS`/`CF_OBSERVATIONS`/`CF_SESSIONS`/`CF_TELEMETRY`/`CF_ACTION_LOG`/`CF_PROCESS_HISTORY`/`CF_KV` (only `CF_REFLEX_AUDIT` has a live writer); audio detector → SSE-bus sink integration; HUD extraction pipeline. VLM `describe` and Florence-2 remain M5.

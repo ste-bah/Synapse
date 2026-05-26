@@ -54,7 +54,7 @@ Crate-level lints override `unsafe_code` to `allow` in five FFI crates:
 | `synapse-a11y` | UI Automation COM interop |
 | `synapse-audio` | WASAPI loopback FFI |
 | `synapse-capture` | DXGI / Direct3D11 FFI |
-| `synapse-hid-host` | serial-port + OS-handle interop (M4 stub) |
+| `synapse-hid-host` | serial-port + OS-handle interop |
 
 `synapse-mcp`, `synapse-core`, `synapse-perception`, `synapse-models`, `synapse-profiles`, `synapse-reflex`, `synapse-storage`, `synapse-telemetry`, `synapse-test-utils`, `synapse-overlay` all retain `unsafe_code = forbid`.
 
@@ -104,7 +104,7 @@ Per-crate `lib.rs`/`main.rs` size (the deepest single-file entry points):
 | `synapse-models` | `src/lib.rs` | 535 |
 | `synapse-telemetry` | `src/lib.rs` | (per source) |
 | `synapse-telemetry` | `src/metrics.rs` | (per source) |
-| `synapse-hid-host` | `src/lib.rs` | 1 (M4 stub) |
+| `synapse-hid-host` | `src/` | multi-file serial gateway (see source map) |
 | `synapse-overlay` | `src/main.rs` | (M5 stub) |
 
 Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impplan/04_m3_reflex_mcp_surface.md` — M4 Block A.0 splits before adding hardware HID):

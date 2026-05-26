@@ -33,7 +33,7 @@ Source files covered:
 - `emitter_state.rs` — held bitset / pad cache after sequences
 - `error_codes_match.rs` — `ActionError::code()` mapping
 - `handle_queue.rs` — bounded mpsc + ack behavior
-- `hardware_unavailable.rs` — `HardwareUnavailableBackend` returns `ACTION_HID_PORT_DISCONNECTED`
+- `hardware_unavailable.rs` — `HardwareUnavailableBackend` returns `ACTION_BACKEND_UNAVAILABLE` with `--hardware-hid <port|auto>` guidance
 - `mouse_drag_validation.rs` — `MAX_DRAG_DISTANCE_PX` enforcement
 - `rate_limit_overshoot.rs` — token bucket retry_after_ms accuracy
 - `recording_backend.rs` — `RecordingBackend` event log

@@ -112,6 +112,29 @@ async fn stdio_mode_reaches_transport_path_on_closed_stdin() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn hardware_hid_missing_literal_fails_startup_with_hid_code() -> anyhow::Result<()> {
+    let _guard = cli_mode_test_lock().lock().await;
+    let output = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
+        .args([
+            "--mode",
+            "stdio",
+            "--hardware-hid",
+            "SYNAPSE_MISSING_PORT_393",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .output()
+        .await?;
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("HID_PORT_NOT_FOUND"), "{stderr}");
+    assert!(stderr.contains("SYNAPSE_MISSING_PORT_393"), "{stderr}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn invalid_env_mode_exits_with_clap_error() -> anyhow::Result<()> {
     let _guard = cli_mode_test_lock().lock().await;
     let output = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))

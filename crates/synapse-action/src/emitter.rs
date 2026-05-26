@@ -16,7 +16,7 @@ mod state;
 #[cfg(test)]
 mod tests;
 
-pub use backends::Backends;
+pub use backends::{Backends, HardwareHidConfig};
 pub use state::{
     ActionEmitterSnapshotHandle, ActionSnapshotMessage, ActionStateSnapshot, EmitState,
 };

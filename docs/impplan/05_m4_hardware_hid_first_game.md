@@ -624,7 +624,7 @@ code exists; it is done only when the issue is closed with manual FSV evidence.
 
 | Issue | State | Work item |
 |---|---|---|
-| #392 | open | C-01 `HardwareBackend` struct in `synapse-action`. |
+| #392 | closed | C-01 `HardwareBackend` struct in `synapse-action`. |
 | #393 | open | C-02 replace `HardwareUnavailableBackend` when `--hardware-hid` is set. |
 | #394 | open | C-03 Synapse key to HID usage-code mapping. |
 | #395 | open | C-04 HID boot keyboard 6KRO and modifier handling. |

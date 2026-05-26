@@ -20,6 +20,7 @@ use crate::{
     http::auth::{self, HttpAuth},
     http::session,
     http::sse::{self, SseState},
+    m2::M2ServiceConfig,
     m3::M3ServiceConfig,
     server::SynapseService,
 };
@@ -36,6 +37,7 @@ struct HttpState {
 pub(super) async fn serve(
     bind: &str,
     allow_non_loopback: bool,
+    m2_config: &M2ServiceConfig,
     m3_config: M3ServiceConfig,
 ) -> anyhow::Result<ExitCode> {
     synapse_action::install_panic_hook();
@@ -70,6 +72,7 @@ pub(super) async fn serve(
         shutdown_cancel.clone(),
         connection_closed_cancel.clone(),
         sse_state.clone(),
+        m2_config,
         m3_config,
     )
     .context("initialize shared HTTP service state")?;
@@ -158,6 +161,7 @@ fn http_service(
     shutdown_cancel: CancellationToken,
     connection_closed_cancel: CancellationToken,
     sse_state: SseState,
+    m2_config: &M2ServiceConfig,
     m3_config: M3ServiceConfig,
 ) -> io::Result<SynapseService> {
     SynapseService::try_with_m2_shutdown_reason_and_sse_state_and_m3_config(
@@ -165,6 +169,7 @@ fn http_service(
         "http",
         connection_closed_cancel,
         sse_state,
+        m2_config,
         m3_config,
     )
     .map_err(|error| io::Error::other(format!("{error:#}")))

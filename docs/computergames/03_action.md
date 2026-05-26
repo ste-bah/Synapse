@@ -26,7 +26,7 @@ Selection rules:
 2. Else, if active profile names a default back-end, use it.
 3. Else, use `software`.
 
-ViGEm requires ViGEmBus driver installed (one-time, signed). Hardware requires a flashed RP2040 board and `--hardware-hid <COM_port>` argument or `SYNAPSE_HARDWARE_HID_PORT` env.
+ViGEm requires ViGEmBus driver installed (one-time, signed). Hardware requires a flashed RP2040 board and `--hardware-hid <port|auto>` argument or `SYNAPSE_HARDWARE_HID` env.
 
 ---
 
@@ -286,7 +286,9 @@ Smoothing: by default, stick deltas >0.5 in 16ms snap immediately (game-driven s
 
 ## 9. Hardware HID back-end
 
-When `--hardware-hid <port>` is set, an additional back-end is available. Routes to a serial-protocol driver in `synapse-hid-host` talking to an RP2040 board running our firmware (`firmware/pico-hid/`).
+When `--hardware-hid <port|auto>` is set and `synapse-hid-host` connects and completes `IDENTIFY`, the hardware back-end routes to `HardwareBackend`. Without explicit hardware HID enablement, `Backend::Hardware` fails closed through `HardwareUnavailableBackend` with `ACTION_BACKEND_UNAVAILABLE`; it never silently downgrades to software or ViGEm.
+
+The live hardware route talks to an RP2040 board running our firmware (`firmware/pico-hid/`) through the serial-protocol driver in `synapse-hid-host`.
 
 The board enumerates as generic HID composite device (mouse + keyboard + gamepad). PC sees a real USB peripheral. No `SendInput`, no virtual driver, no signal interception possible.
 
@@ -378,7 +380,7 @@ Not every action is allowed by default. MCP handler applies:
 | Action class | Default | Override |
 |---|---|---|
 | Mouse / keyboard / pad | allowed | — |
-| Hardware HID | requires `--hardware-hid <port>` flag | per-call `backend: hardware` |
+| Hardware HID | requires `--hardware-hid <port|auto>` flag/env and successful HID connection | per-call `backend: hardware` |
 | Launch process | gated behind `--allow-launch <exe>` allowlist | profile may extend |
 | Run shell | gated behind `--allow-shell <pattern>` allowlist | profile may extend |
 | Clipboard write of sensitive content | per-call `confirm_sensitive: true` | env var disables prompt |

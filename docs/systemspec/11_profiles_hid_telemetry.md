@@ -162,15 +162,17 @@ pub struct ForegroundWindow {
 | `profile_list { include_inactive: bool default true }` | calls `runtime.list(include_inactive)` and `runtime.active_profile_id()`; permission: `READ_PROFILE` |
 | `profile_activate { profile_id }` | look up the profile; if `use_scope = Unknown` and `--allow-unknown-profile` is not set, return `SAFETY_PROFILE_ACTION_DENIED`; if already active, return `changed = false`; else `runtime.activate(profile_id)`; permission: `WRITE_PROFILE_ACTIVE` |
 
-## 2. `synapse-hid-host` — M4 placeholder
+## 2. `synapse-hid-host`
 
 ```text
-crates/synapse-hid-host/src/lib.rs:  1 LoC
+crates/synapse-hid-host/src/
+  discover.rs, error.rs, handshake.rs, lib.rs, pipeline.rs,
+  protocol.rs, reconnect.rs, transport.rs
 ```
 
-Direct dependencies (`Cargo.toml`): `crc16`, `serde`, `serialport`, `synapse-core`, `thiserror`, `tokio`, `tracing`. The crate compiles into a no-symbol library; pulled into the dep graph so the resolver pins serialport/crc16 versions ahead of M4 work.
+Direct dependencies (`Cargo.toml`): `crc16`, `serde`, `serialport`, `synapse-core`, `thiserror`, `tokio`, `tracing`. The crate implements the host-side serial gateway used by `HardwareBackend`: port discovery, `HidGateway::connect`, IDENTIFY parsing/version validation, CRC16 frames, pipelined send, reconnect state, and structured HID errors.
 
-Planned (per `docs/computergames/09_hardware_hid_gateway.md`): an async serial driver that talks to the RP2040 firmware over USB CDC; CRC16 frames; firmware version handshake. Error codes already reserved: `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, `HID_LINK_TIMEOUT`.
+The live driver talks to the RP2040 firmware over USB CDC at 1 Mbaud, with CRC16 frames and a firmware version handshake. Error codes surfaced by the driver include `HID_PORT_NOT_FOUND`, `HID_PORT_OPEN_FAILED`, `HID_PROTOCOL_HANDSHAKE_FAILED`, `HID_FIRMWARE_VERSION_MISMATCH`, `HID_COMMAND_REJECTED`, and `HID_LINK_TIMEOUT`.
 
 ## 3. `synapse-telemetry`
 
@@ -301,7 +303,7 @@ These are gated behind `cfg(windows)` and the Notepad fixture is the basis for t
 
 ## 6. What is NOT covered
 
-- **`synapse-hid-host` runtime.** Currently a stub; expected to land in M4 (RP2040 firmware milestone).
+- **Physical `synapse-hid-host` runtime FSV.** Source inspection covers the host driver shape; issue closure still requires real Pico/COM-device source-of-truth evidence on the configured host.
 - **OTLP export.** `opentelemetry` and `opentelemetry-otlp` are in workspace deps but not wired in `synapse-telemetry::init_tracing` — the file/console layers are the only sinks.
 - **Prometheus exporter binding.** `metrics-exporter-prometheus` is referenced in workspace deps but not bound to an HTTP port by `synapse-telemetry`; the `register_m3_metrics` path only describes the metrics so the `metrics` crate global recorder can hold them.
 - **Profile-driven action defaults.** `Profile.backends` and `ProfileDefaults` are parsed but not consulted by the M2 emitter wrappers in the current build; tools use their own per-tool defaults (e.g. `act_click.curve = Natural`).

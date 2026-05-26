@@ -183,7 +183,12 @@ crates/synapse-action/
         ├── mod.rs                  # ActionBackend trait, ResolvedBackend, resolve_backend
         ├── mouse_coordinates.rs    # Screen→virtual desktop coord conversion
         ├── text_dispatch.rs        # Text-input dispatch (clipboard paste vs synthesized keystrokes)
-        ├── unavailable.rs          # HardwareUnavailableBackend stub
+        ├── hardware.rs             # HardwareBackend public facade
+        ├── hardware/keyboard.rs    # Key to HID usage encoding
+        ├── hardware/mouse.rs       # Relative mouse/button/wheel command encoding
+        ├── hardware/pad.rs         # Gamepad report command encoding
+        ├── hardware/tests.rs       # HardwareBackend command/state tests
+        ├── unavailable.rs          # Fail-closed hardware slot when --hardware-hid is absent
         ├── recording.rs            # RecordingBackend (in-memory event log)
         ├── recording/state.rs      # RecordingBackend internal state
         ├── software.rs             # SoftwareBackend (Windows SendInput)
@@ -264,13 +269,20 @@ crates/synapse-profiles/
     └── watcher.rs                  # ProfileRuntime (notify watcher, 200ms debounce, ProfileStatus)
 ```
 
-### 2.11 `crates/synapse-hid-host/` — M4 placeholder
+### 2.11 `crates/synapse-hid-host/`
 
 ```
 crates/synapse-hid-host/
 ├── Cargo.toml
 └── src/
-    └── lib.rs                      # 1 LoC stub; M4 RP2040 serial driver target
+    ├── discover.rs                 # Synapse Pico serial-port discovery / auto-detect
+    ├── error.rs                    # HidError + code mapping
+    ├── handshake.rs                # IDENTIFY parsing and expected-version checks
+    ├── lib.rs                      # Public exports
+    ├── pipeline.rs                 # ACK/NAK pipeline, retries, backpressure
+    ├── protocol.rs                 # CRC16 frame encoding/parsing
+    ├── reconnect.rs                # Reconnect state machine and snapshots
+    └── transport.rs                # Serialport-backed HidGateway
 ```
 
 ### 2.12 `crates/synapse-models/` — ONNX runtime wrapper
@@ -356,7 +368,7 @@ synapse-core            (no synapse-* deps; standalone shared types)
   ├── synapse-action        (synapse-core; cfg(windows): synapse-a11y, synapse-capture)
   ├── synapse-perception    (synapse-core; cfg(windows): synapse-a11y, synapse-capture, synapse-models)
   ├── synapse-reflex        (synapse-core, synapse-storage, synapse-action)
-  └── synapse-hid-host      (synapse-core; M4 stub)
+  └── synapse-hid-host      (synapse-core; serialport + crc16 HID gateway)
 
 synapse-mcp (binary)
   ↑

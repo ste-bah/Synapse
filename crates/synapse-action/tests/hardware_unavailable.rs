@@ -43,7 +43,8 @@ fn hardware_unavailable_backend_rejects_every_action_variant() {
         assert_eq!(error.code(), error_codes::ACTION_BACKEND_UNAVAILABLE);
         assert_eq!(before, after);
         assert!(error.detail().contains("backend=hardware"));
-        assert!(error.detail().contains("M4"));
+        assert!(error.detail().contains("not enabled"));
+        assert!(error.detail().contains("--hardware-hid"));
         assert!(error.detail().contains(action_kind(&action)));
         println!(
             "readback=hardware_m2 edge={edge} before={before:?} after={after:?} after_code={} detail={}",

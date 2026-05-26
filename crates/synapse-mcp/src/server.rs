@@ -30,11 +30,11 @@ use crate::{
         ActAimParams, ActAimResponse, ActClickParams, ActClickResponse, ActClipboardParams,
         ActClipboardResponse, ActDragParams, ActDragResponse, ActPadParams, ActPadResponse,
         ActPressParams, ActPressResponse, ActScrollParams, ActScrollResponse, ActTypeParams,
-        ActTypeResponse, ReleaseAllParams, ReleaseAllResponse, SharedM2State, act_aim_with_handle,
-        act_click_with_handle, act_clipboard, act_drag_with_handle, act_pad_with_handle,
-        act_press_with_handle, act_scroll_with_handle, act_type_with_handle,
-        release_all_with_handles, shared_m2_state_from_env,
-        shared_m2_state_from_env_with_shutdown_reason,
+        ActTypeResponse, M2ServiceConfig, ReleaseAllParams, ReleaseAllResponse, SharedM2State,
+        act_aim_with_handle, act_click_with_handle, act_clipboard, act_drag_with_handle,
+        act_pad_with_handle, act_press_with_handle, act_scroll_with_handle, act_type_with_handle,
+        release_all_with_handles, shared_m2_state_from_config_with_shutdown_reason,
+        shared_m2_state_from_env,
     },
     m3::{
         M3ServiceConfig, SharedM3State,
@@ -104,7 +104,7 @@ impl SynapseService {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
-            m2_state: shared_m2_state_from_env(),
+            m2_state: shared_m2_state_from_env()?,
             m3_state: shared_m3_state_from_env()?,
         })
     }
@@ -113,6 +113,7 @@ impl SynapseService {
         shutdown_cancel: CancellationToken,
         shutdown_reason: &'static str,
         connection_closed_cancel: CancellationToken,
+        m2_config: &M2ServiceConfig,
         m3_config: M3ServiceConfig,
     ) -> anyhow::Result<Self> {
         let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
@@ -120,11 +121,12 @@ impl SynapseService {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
-            m2_state: shared_m2_state_from_env_with_shutdown_reason(
+            m2_state: shared_m2_state_from_config_with_shutdown_reason(
+                m2_config,
                 shutdown_cancel.clone(),
                 shutdown_reason,
                 Some(connection_closed_cancel.clone()),
-            ),
+            )?,
             m3_state: shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
                 m3_config,
                 shutdown_cancel,
@@ -140,17 +142,19 @@ impl SynapseService {
         shutdown_reason: &'static str,
         connection_closed_cancel: CancellationToken,
         sse_state: SseState,
+        m2_config: &M2ServiceConfig,
         m3_config: M3ServiceConfig,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
-            m2_state: shared_m2_state_from_env_with_shutdown_reason(
+            m2_state: shared_m2_state_from_config_with_shutdown_reason(
+                m2_config,
                 shutdown_cancel.clone(),
                 shutdown_reason,
                 Some(connection_closed_cancel.clone()),
-            ),
+            )?,
             m3_state: shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
                 m3_config,
                 shutdown_cancel,

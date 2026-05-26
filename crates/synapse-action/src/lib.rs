@@ -34,7 +34,7 @@ pub use curve::sample_curve;
 pub use dynamics::{BIGRAMS, KeystrokeEvent, ModifierMask, sample_typing_schedule};
 pub use emitter::{
     ActionEmitter, ActionEmitterSnapshotHandle, ActionSnapshotMessage, ActionStateSnapshot,
-    EmitState, HELD_KEY_MAX_DURATION_MS,
+    Backends, EmitState, HELD_KEY_MAX_DURATION_MS, HardwareHidConfig,
 };
 pub use error::{ActionError, ActionResult};
 pub use handle::{ACTION_QUEUE_CAPACITY, ActionHandle, ActionMessage, RELEASE_ALL_HANDLE};
