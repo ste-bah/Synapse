@@ -1,10 +1,13 @@
-use synapse_core::{ButtonAction, MouseButton};
+use synapse_core::{
+    AimCurve, AimNaturalParams, AimStyle, AimTarget, ButtonAction, MouseButton, MouseTarget, Point,
+};
 use synapse_hid_host::{
     HOST_COMMAND_MOUSE_BUTTON, HOST_COMMAND_MOUSE_MOVE_REL, HOST_COMMAND_MOUSE_WHEEL,
+    HostCommandRequest,
 };
 
 use super::{HardwareGateway, send_empty_if_zero, sleep_ms};
-use crate::{ActionError, EmitState};
+use crate::{ActionError, EmitState, sample_curve};
 
 pub(super) fn move_relative<G>(gateway: &mut G, dx: f32, dy: f32) -> Result<(), ActionError>
 where
@@ -12,16 +15,165 @@ where
 {
     let dx = bounded_delta(dx, "dx")?;
     let dy = bounded_delta(dy, "dy")?;
-    let payload = [
-        dx.to_le_bytes()[0],
-        dx.to_le_bytes()[1],
-        dy.to_le_bytes()[0],
-        dy.to_le_bytes()[1],
-    ];
-    if let Some((command, payload)) = send_empty_if_zero(HOST_COMMAND_MOUSE_MOVE_REL, &payload) {
-        gateway.send_command(command, payload)?;
+    send_relative_deltas(gateway, &[RelativeMouseDelta { dx, dy }])
+}
+
+pub(super) fn move_absolute<G>(
+    gateway: &mut G,
+    target: &MouseTarget,
+    curve: &AimCurve,
+    duration_ms: u32,
+) -> Result<(), ActionError>
+where
+    G: HardwareGateway,
+{
+    let target = screen_mouse_target(target)?;
+    let start = crate::backend::software::cursor_position()?;
+    move_curve_from(gateway, start, target, curve, duration_ms)
+}
+
+pub(super) fn drag<G>(
+    gateway: &mut G,
+    current: Point,
+    to: Point,
+    mouse_button: MouseButton,
+    curve: &AimCurve,
+    duration_ms: u32,
+    state: &mut EmitState,
+) -> Result<(), ActionError>
+where
+    G: HardwareGateway,
+{
+    let start = crate::backend::software::cursor_position()?;
+    move_curve_from(gateway, start, current, &AimCurve::Instant, 0)?;
+    button(gateway, mouse_button, ButtonAction::Down, 0, state)?;
+    if let Err(error) = move_curve_from(gateway, current, to, curve, duration_ms) {
+        let _ = button(gateway, mouse_button, ButtonAction::Up, 0, state);
+        return Err(error);
+    }
+    button(gateway, mouse_button, ButtonAction::Up, 0, state)
+}
+
+pub(super) fn aim_at<G>(
+    gateway: &mut G,
+    target: &AimTarget,
+    style: AimStyle,
+    deadline_ms: u32,
+) -> Result<(), ActionError>
+where
+    G: HardwareGateway,
+{
+    if style == AimStyle::Track {
+        return Err(ActionError::BackendUnavailable {
+            detail: "hardware track aim requires the M3 reflex runtime".to_owned(),
+        });
+    }
+    let target = screen_aim_target(target)?;
+    let start = crate::backend::software::cursor_position()?;
+    let curve = AimCurve::Natural {
+        params: AimNaturalParams::FAST,
+    };
+    move_curve_from(gateway, start, target, &curve, deadline_ms)
+}
+
+pub(super) fn move_curve_from<G>(
+    gateway: &mut G,
+    start: Point,
+    target: Point,
+    curve: &AimCurve,
+    duration_ms: u32,
+) -> Result<(), ActionError>
+where
+    G: HardwareGateway,
+{
+    let samples = sample_curve(curve, start, target, duration_ms, None);
+    let mut current = start;
+    let mut deltas = Vec::with_capacity(samples.len().saturating_sub(1));
+    for point in samples.into_iter().skip(1) {
+        append_relative_deltas_to_point(&mut current, point, &mut deltas);
+    }
+    send_relative_deltas(gateway, &deltas)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RelativeMouseDelta {
+    dx: i16,
+    dy: i16,
+}
+
+fn send_relative_deltas<G>(
+    gateway: &mut G,
+    deltas: &[RelativeMouseDelta],
+) -> Result<(), ActionError>
+where
+    G: HardwareGateway,
+{
+    let payloads = deltas
+        .iter()
+        .filter_map(|delta| relative_payload(*delta))
+        .collect::<Vec<_>>();
+    let commands = payloads
+        .iter()
+        .map(|payload| HostCommandRequest::new(HOST_COMMAND_MOUSE_MOVE_REL, payload))
+        .collect::<Vec<_>>();
+    if !commands.is_empty() {
+        gateway.send_commands(&commands)?;
     }
     Ok(())
+}
+
+fn relative_payload(delta: RelativeMouseDelta) -> Option<[u8; 4]> {
+    let payload = [
+        delta.dx.to_le_bytes()[0],
+        delta.dx.to_le_bytes()[1],
+        delta.dy.to_le_bytes()[0],
+        delta.dy.to_le_bytes()[1],
+    ];
+    payload.iter().any(|byte| *byte != 0).then_some(payload)
+}
+
+fn append_relative_deltas_to_point(
+    current: &mut Point,
+    target: Point,
+    deltas: &mut Vec<RelativeMouseDelta>,
+) {
+    let mut remaining_x = i64::from(target.x) - i64::from(current.x);
+    let mut remaining_y = i64::from(target.y) - i64::from(current.y);
+    while remaining_x != 0 || remaining_y != 0 {
+        let dx = clamp_relative_step(remaining_x);
+        let dy = clamp_relative_step(remaining_y);
+        deltas.push(RelativeMouseDelta { dx, dy });
+        remaining_x -= i64::from(dx);
+        remaining_y -= i64::from(dy);
+        current.x = add_step_to_coord(current.x, dx);
+        current.y = add_step_to_coord(current.y, dy);
+    }
+}
+
+fn screen_mouse_target(target: &MouseTarget) -> Result<Point, ActionError> {
+    match target {
+        MouseTarget::Screen { point } => Ok(*point),
+        MouseTarget::Element { element_id } => crate::invoke::element_screen_point(element_id),
+    }
+}
+
+fn screen_aim_target(target: &AimTarget) -> Result<Point, ActionError> {
+    match target {
+        AimTarget::Screen { point } => Ok(*point),
+        AimTarget::Element { element_id } => crate::invoke::element_screen_point(element_id),
+        AimTarget::Track { track_id } => Err(ActionError::BackendUnavailable {
+            detail: format!("hardware aim track target {track_id} requires the M3 reflex runtime"),
+        }),
+    }
+}
+
+fn clamp_relative_step(value: i64) -> i16 {
+    let step = value.clamp(-127, 127);
+    i16::try_from(step).unwrap_or_else(|_| unreachable!("step is clamped to i16 range"))
+}
+
+fn add_step_to_coord(coord: i32, step: i16) -> i32 {
+    coord.saturating_add(i32::from(step))
 }
 
 pub(super) fn button<G>(

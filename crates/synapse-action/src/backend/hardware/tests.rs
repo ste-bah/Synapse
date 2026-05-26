@@ -1,29 +1,38 @@
 use std::sync::{Arc, Mutex};
 
 use synapse_core::{
-    Action, AimCurve, AimStyle, AimTarget, Backend, ButtonAction, ComboInput, ComboStep,
-    GamepadController, GamepadReport, Key, KeyCode, MouseButton, MouseTarget, PadButton, Point,
-    Stick, Trigger,
+    Action, AimCurve, AimNaturalParams, AimStyle, AimTarget, Backend, ButtonAction, ComboInput,
+    ComboStep, ElementId, GamepadController, GamepadReport, Key, KeyCode, MouseButton, MouseTarget,
+    PadButton, Point, Stick, Trigger,
 };
 use synapse_hid_host::{
     HOST_COMMAND_KEY_DOWN, HOST_COMMAND_KEY_MODS, HOST_COMMAND_KEY_UP, HOST_COMMAND_MOUSE_BUTTON,
     HOST_COMMAND_MOUSE_MOVE_REL, HOST_COMMAND_MOUSE_WHEEL, HOST_COMMAND_PAD_REPORT,
-    HOST_COMMAND_RELEASE_ALL,
+    HOST_COMMAND_RELEASE_ALL, HostCommandRequest,
 };
 
 use super::{HardwareBackend, HardwareGateway, pad};
 use crate::{ActionBackend, ActionError, EmitState};
 
 type CommandRecords = Arc<Mutex<Vec<(u8, Vec<u8>)>>>;
+type BatchRecords = Arc<Mutex<Vec<usize>>>;
 
 #[derive(Clone, Debug, Default)]
 struct StubGateway {
     commands: CommandRecords,
+    batch_lengths: BatchRecords,
 }
 
 impl StubGateway {
     fn commands(&self) -> Vec<(u8, Vec<u8>)> {
         self.commands
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn batch_lengths(&self) -> Vec<usize> {
+        self.batch_lengths
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -38,6 +47,20 @@ impl HardwareGateway for StubGateway {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         commands.push((command, payload.to_vec()));
         Ok(u32::try_from(commands.len()).unwrap_or(u32::MAX))
+    }
+
+    fn send_commands(
+        &mut self,
+        commands: &[HostCommandRequest<'_>],
+    ) -> Result<Vec<u32>, ActionError> {
+        self.batch_lengths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(commands.len());
+        commands
+            .iter()
+            .map(|request| self.send_command(request.command, request.payload))
+            .collect()
     }
 }
 
@@ -390,6 +413,144 @@ fn named_symbol_and_text_keys_emit_hid_usage_payloads() {
 }
 
 #[test]
+fn absolute_hardware_mouse_uses_natural_fast_relative_curve() {
+    let mut gateway = StubGateway::default();
+    let records = gateway.clone();
+    let start = Point { x: 0, y: 0 };
+    let target = Point { x: 200, y: 200 };
+    let curve = AimCurve::Natural {
+        params: AimNaturalParams::FAST,
+    };
+    println!(
+        "readback=hardware_mouse_absolute edge=happy before=start:{start:?} target:{target:?} commands:{:?} batches:{:?}",
+        records.commands(),
+        records.batch_lengths()
+    );
+
+    super::mouse::move_curve_from(&mut gateway, start, target, &curve, 50)
+        .unwrap_or_else(|error| panic!("absolute hardware mouse fallback should emit: {error}"));
+
+    let commands = records.commands();
+    let actual_points = cumulative_mouse_points(&commands, start);
+    let expected_points = crate::sample_curve(&curve, start, target, 50, None)
+        .into_iter()
+        .skip(1)
+        .collect::<Vec<_>>();
+    assert!(!commands.is_empty());
+    assert_eq!(actual_points, expected_points);
+    assert_eq!(actual_points.last(), Some(&target));
+    assert!(relative_payloads_within_firmware_range(&commands));
+    assert_eq!(records.batch_lengths(), vec![commands.len()]);
+    println!(
+        "readback=hardware_mouse_absolute edge=happy after=commands:{commands:?} points:{actual_points:?} batches:{:?}",
+        records.batch_lengths()
+    );
+}
+
+#[test]
+fn absolute_hardware_mouse_chunks_large_relative_deltas() {
+    let mut gateway = StubGateway::default();
+    let records = gateway.clone();
+    let start = Point { x: 0, y: 0 };
+    let target = Point { x: 400, y: -300 };
+    println!(
+        "readback=hardware_mouse_absolute edge=large_delta before=start:{start:?} target:{target:?} commands:{:?} batches:{:?}",
+        records.commands(),
+        records.batch_lengths()
+    );
+
+    super::mouse::move_curve_from(&mut gateway, start, target, &AimCurve::Instant, 0)
+        .unwrap_or_else(|error| panic!("large absolute fallback should chunk: {error}"));
+
+    let commands = records.commands();
+    let actual_points = cumulative_mouse_points(&commands, start);
+    assert_eq!(actual_points.last(), Some(&target));
+    assert_eq!(commands.len(), 4);
+    assert_eq!(
+        commands,
+        vec![
+            (HOST_COMMAND_MOUSE_MOVE_REL, vec![127, 0, 129, 255]),
+            (HOST_COMMAND_MOUSE_MOVE_REL, vec![127, 0, 129, 255]),
+            (HOST_COMMAND_MOUSE_MOVE_REL, vec![127, 0, 210, 255]),
+            (HOST_COMMAND_MOUSE_MOVE_REL, vec![19, 0, 0, 0]),
+        ]
+    );
+    assert!(relative_payloads_within_firmware_range(&commands));
+    assert_eq!(records.batch_lengths(), vec![commands.len()]);
+    println!(
+        "readback=hardware_mouse_absolute edge=large_delta after=commands:{commands:?} points:{actual_points:?} batches:{:?}",
+        records.batch_lengths()
+    );
+}
+
+#[test]
+fn absolute_hardware_mouse_zero_delta_emits_no_commands() {
+    let mut gateway = StubGateway::default();
+    let records = gateway.clone();
+    let point = Point { x: 77, y: -12 };
+    println!(
+        "readback=hardware_mouse_absolute edge=zero_delta before=point:{point:?} commands:{:?} batches:{:?}",
+        records.commands(),
+        records.batch_lengths()
+    );
+
+    super::mouse::move_curve_from(&mut gateway, point, point, &AimCurve::Instant, 0)
+        .unwrap_or_else(|error| panic!("zero absolute fallback should no-op: {error}"));
+
+    assert!(records.commands().is_empty());
+    assert!(records.batch_lengths().is_empty());
+    println!(
+        "readback=hardware_mouse_absolute edge=zero_delta after=commands:{:?} batches:{:?}",
+        records.commands(),
+        records.batch_lengths()
+    );
+}
+
+#[test]
+fn absolute_hardware_mouse_repeated_warps_do_not_accumulate_drift() {
+    let mut gateway = StubGateway::default();
+    let records = gateway.clone();
+    let curve = AimCurve::Natural {
+        params: AimNaturalParams::FAST,
+    };
+    let mut current = Point { x: 0, y: 0 };
+    let mut cumulative_drift_px = 0_i64;
+    println!(
+        "readback=hardware_mouse_absolute edge=repeated_warps before=current:{current:?} commands:{:?} batches:{:?}",
+        records.commands(),
+        records.batch_lengths()
+    );
+
+    for index in 0..100 {
+        let target = Point {
+            x: (index * 7 % 600) - 300,
+            y: (index * 11 % 400) - 200,
+        };
+        let before_count = records.commands().len();
+
+        super::mouse::move_curve_from(&mut gateway, current, target, &curve, 50)
+            .unwrap_or_else(|error| panic!("repeated absolute fallback should emit: {error}"));
+
+        let commands = records.commands();
+        let new_commands = &commands[before_count..];
+        assert!(relative_payloads_within_firmware_range(new_commands));
+        let actual_points = cumulative_mouse_points(new_commands, current);
+        let final_point = actual_points.last().copied().unwrap_or(current);
+        cumulative_drift_px += i64::from((final_point.x - target.x).abs());
+        cumulative_drift_px += i64::from((final_point.y - target.y).abs());
+        current = target;
+    }
+
+    assert!(cumulative_drift_px < 5);
+    assert_eq!(records.batch_lengths().len(), 100);
+    println!(
+        "readback=hardware_mouse_absolute edge=repeated_warps after=final_current:{current:?} cumulative_drift_px:{cumulative_drift_px} command_count:{} batch_count:{}",
+        records.commands().len(),
+        records.batch_lengths().len()
+    );
+}
+
+#[test]
 fn modifier_chords_emit_mod_bits_before_and_after_key_usage() {
     let gateway = StubGateway::default();
     let records = gateway.clone();
@@ -528,25 +689,23 @@ fn unsupported_or_later_scoped_variants_fail_closed_without_commands() {
             backend: Backend::Hardware,
         },
         Action::MouseMove {
-            to: MouseTarget::Screen {
-                point: Point { x: 1, y: 2 },
+            to: MouseTarget::Element {
+                element_id: element_id(),
             },
-            curve: AimCurve::Instant,
-            duration_ms: 0,
-            backend: Backend::Hardware,
-        },
-        Action::MouseDrag {
-            from: Point { x: 1, y: 2 },
-            to: Point { x: 3, y: 4 },
-            button: MouseButton::Left,
             curve: AimCurve::Instant,
             duration_ms: 0,
             backend: Backend::Hardware,
         },
         Action::AimAt {
-            target: AimTarget::Screen {
-                point: Point { x: 5, y: 6 },
+            target: AimTarget::Element {
+                element_id: element_id(),
             },
+            style: AimStyle::Snap,
+            deadline_ms: 0,
+            backend: Backend::Hardware,
+        },
+        Action::AimAt {
+            target: AimTarget::Track { track_id: 7 },
             style: AimStyle::Snap,
             deadline_ms: 0,
             backend: Backend::Hardware,
@@ -615,6 +774,34 @@ fn payload_array<const N: usize>(payload: &[u8]) -> [u8; N] {
     }
 }
 
+fn cumulative_mouse_points(commands: &[(u8, Vec<u8>)], start: Point) -> Vec<Point> {
+    let mut current = start;
+    let mut points = Vec::new();
+    for (command, payload) in commands {
+        assert_eq!(*command, HOST_COMMAND_MOUSE_MOVE_REL);
+        let (dx, dy) = relative_mouse_payload(payload);
+        current.x += i32::from(dx);
+        current.y += i32::from(dy);
+        points.push(current);
+    }
+    points
+}
+
+fn relative_payloads_within_firmware_range(commands: &[(u8, Vec<u8>)]) -> bool {
+    commands.iter().all(|(_command, payload)| {
+        let (dx, dy) = relative_mouse_payload(payload);
+        (-127..=127).contains(&dx) && (-127..=127).contains(&dy)
+    })
+}
+
+fn relative_mouse_payload(payload: &[u8]) -> (i16, i16) {
+    let bytes = payload_array::<4>(payload);
+    (
+        i16::from_le_bytes([bytes[0], bytes[1]]),
+        i16::from_le_bytes([bytes[2], bytes[3]]),
+    )
+}
+
 fn hid_key(value: u8) -> Key {
     Key {
         code: KeyCode::HidCode { value },
@@ -636,4 +823,9 @@ fn symbol_key(value: char) -> Key {
         code: KeyCode::Symbol { value },
         use_scancode: false,
     }
+}
+
+fn element_id() -> ElementId {
+    ElementId::parse("0x1:1")
+        .unwrap_or_else(|error| panic!("static element id should parse: {error}"))
 }

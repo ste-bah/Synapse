@@ -305,6 +305,8 @@ variants supported by the firmware:
 | Action variant | Hardware command |
 |---|---|
 | `MouseMoveRelative` | `MOUSE_MOVE_REL [i16 dx][i16 dy]` |
+| `MouseMove` / `AimAt` screen target | `GetPhysicalCursorPos` readback + sampled `MOUSE_MOVE_REL` batch |
+| `MouseMove` / `AimAt` element target | UIA bbox center resolution + sampled `MOUSE_MOVE_REL` batch |
 | mouse button down/up | `MOUSE_BUTTON [u8 button][u8 down_flag]` |
 | wheel | `MOUSE_WHEEL [i8 dy][i8 dx]` |
 | key down/up | `KEY_DOWN [u8 hid_code]`, `KEY_UP [u8 hid_code]` |
@@ -313,9 +315,12 @@ variants supported by the firmware:
 | release all | `RELEASE_ALL` |
 
 The backend must never silently downgrade hardware requests to software or
-ViGEm. Unsupported absolute hardware mouse moves must be split or rejected by
-the documented fallback rule in issue #396; source-of-truth evidence must show
-which path fired.
+ViGEm. Absolute hardware mouse requests read the current cursor position,
+resolve element targets to a screen point when UIA can re-resolve them, sample
+the requested curve, chunk every delta to the firmware's `-127..=127` relative
+range, and send the resulting `MOUSE_MOVE_REL` stream as a HID pipeline batch.
+Unresolved element and track targets still fail closed with no command stream.
+Source-of-truth evidence must show which path fired.
 
 ### 3.4 MCP and CLI deliverables
 
@@ -634,7 +639,7 @@ code exists; it is done only when the issue is closed with manual FSV evidence.
 | #393 | closed | C-02 replace `HardwareUnavailableBackend` when `--hardware-hid` is set. |
 | #394 | closed | C-03 Synapse key to HID usage-code mapping. |
 | #395 | closed | C-04 HID boot keyboard 6KRO and modifier handling. |
-| #396 | open | C-05 hardware mouse relative-only rule and absolute fallback. |
+| #396 | closed | C-05 hardware mouse relative-only rule and absolute fallback. |
 | #397 | open | C-06 hardware `ReleaseAll` to firmware `RELEASE_ALL`. |
 | #398 | open | C-07 held-state interlock between hardware and software backends. |
 | #399 | open | C-08 `Backend::Auto` resolution for hardware-capable hosts. |

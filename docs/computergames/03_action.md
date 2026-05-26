@@ -292,12 +292,26 @@ The live hardware route talks to an RP2040 board running our firmware (`firmware
 
 The board enumerates as generic HID composite device (mouse + keyboard + gamepad). PC sees a real USB peripheral. No `SendInput`, no virtual driver, no signal interception possible.
 
+Boot mouse HID reports only relative deltas, so the hardware backend converts
+absolute `MouseMove` and one-shot `AimAt` screen targets into a relative
+`MOUSE_MOVE_REL` stream. It reads the current cursor position, resolves
+`MouseTarget::Element` / `AimTarget::Element` to a UIA bounding-rectangle center
+when possible, samples the requested curve, chunks every relative step to the
+firmware `-127..=127` delta range, and sends the command stream through the HID
+pipeline. Unresolved element targets and `Track` targets fail closed; hardware
+requests never silently downgrade to software.
+
 Routing:
 
 ```rust
 match action {
     Action::MouseMoveRelative { dx, dy, backend: Backend::Hardware } => {
         hid_gateway.send_mouse_delta(dx, dy)?;
+    }
+    Action::MouseMove { to, curve, duration, backend: Backend::Hardware } => {
+        let start = GetPhysicalCursorPos()?;
+        let target = resolve_screen_point(to)?;
+        hid_gateway.send_mouse_delta_batch(sample_relative_curve(start, target, curve, duration))?;
     }
     Action::KeyPress { key, hold, backend: Backend::Hardware } => {
         hid_gateway.send_key(hid_code_for(key), hold)?;

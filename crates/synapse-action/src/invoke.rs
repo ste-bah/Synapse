@@ -105,3 +105,16 @@ where
         detail: format!("UI Automation element click requires Windows for element {element_id}"),
     })
 }
+
+#[cfg(windows)]
+pub(crate) fn element_screen_point(element_id: &ElementId) -> ActionResult<Point> {
+    let element = resolver::resolve_element(element_id)?;
+    resolver::coordinate_fallback_plan(element_id, &element).map(|plan| plan.screen_point)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn element_screen_point(element_id: &ElementId) -> ActionResult<Point> {
+    Err(ActionError::BackendUnavailable {
+        detail: format!("UI Automation element target requires Windows for element {element_id}"),
+    })
+}

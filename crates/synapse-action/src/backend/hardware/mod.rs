@@ -4,7 +4,7 @@ use std::time::Duration;
 use synapse_core::{Action, ComboInput, Key, KeystrokeDynamics};
 use synapse_hid_host::{
     HOST_COMMAND_KEY_DOWN, HOST_COMMAND_KEY_MODS, HOST_COMMAND_KEY_UP, HOST_COMMAND_RELEASE_ALL,
-    HidError, HidGateway,
+    HidError, HidGateway, HostCommandRequest,
 };
 
 use crate::{ActionBackend, ActionError, EmitState};
@@ -29,12 +29,37 @@ pub trait HardwareGateway: Send {
     /// Returns an `ActionError` when the underlying HID link rejects or cannot
     /// deliver the command.
     fn send_command(&mut self, command: u8, payload: &[u8]) -> Result<u32, ActionError>;
+
+    /// Sends a bounded batch of firmware commands and waits for ACK/NAK
+    /// completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an `ActionError` when any command in the batch cannot be
+    /// delivered or accepted by the underlying HID link.
+    fn send_commands(
+        &mut self,
+        commands: &[HostCommandRequest<'_>],
+    ) -> Result<Vec<u32>, ActionError> {
+        commands
+            .iter()
+            .map(|request| self.send_command(request.command, request.payload))
+            .collect()
+    }
 }
 
 impl HardwareGateway for HidGateway {
     #[allow(clippy::use_self)]
     fn send_command(&mut self, command: u8, payload: &[u8]) -> Result<u32, ActionError> {
         HidGateway::send_command(self, command, payload).map_err(action_error_from_hid)
+    }
+
+    #[allow(clippy::use_self)]
+    fn send_commands(
+        &mut self,
+        commands: &[HostCommandRequest<'_>],
+    ) -> Result<Vec<u32>, ActionError> {
+        HidGateway::send_commands(self, commands).map_err(action_error_from_hid)
     }
 }
 
@@ -96,14 +121,21 @@ where
         Action::KeyUp { key, .. } => key_up(gateway, key, state),
         Action::KeyChord { keys, hold_ms, .. } => key_chord(gateway, keys, *hold_ms, state),
         Action::TypeText { text, dynamics, .. } => type_text(gateway, text, dynamics, state),
-        Action::MouseMove { .. } | Action::MouseDrag { .. } | Action::AimAt { .. } => {
-            Err(ActionError::TargetInvalid {
-                detail:
-                    "hardware absolute mouse targets require the relative-coordinate fallback from issue #396"
-                        .to_owned(),
-            })
-        }
+        Action::MouseMove {
+            to,
+            curve,
+            duration_ms,
+            ..
+        } => mouse::move_absolute(gateway, to, curve, *duration_ms),
         Action::MouseMoveRelative { dx, dy, .. } => mouse::move_relative(gateway, *dx, *dy),
+        Action::MouseDrag {
+            from,
+            to,
+            button,
+            curve,
+            duration_ms,
+            ..
+        } => mouse::drag(gateway, *from, *to, *button, curve, *duration_ms, state),
         Action::MouseButton {
             button,
             action,
@@ -111,15 +143,19 @@ where
             ..
         } => mouse::button(gateway, *button, *action, *hold_ms, state),
         Action::MouseScroll { dy, dx, .. } => mouse::scroll(gateway, *dy, *dx),
+        Action::AimAt {
+            target,
+            style,
+            deadline_ms,
+            ..
+        } => mouse::aim_at(gateway, target, *style, *deadline_ms),
         Action::PadButton {
             pad,
             button,
             action,
             hold_ms,
         } => pad::button(gateway, state, *pad, *button, *action, *hold_ms),
-        Action::PadStick { pad, stick, x, y } => {
-            pad::stick(gateway, state, *pad, *stick, *x, *y)
-        }
+        Action::PadStick { pad, stick, x, y } => pad::stick(gateway, state, *pad, *stick, *x, *y),
         Action::PadTrigger {
             pad,
             trigger,

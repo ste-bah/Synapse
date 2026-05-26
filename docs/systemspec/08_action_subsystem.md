@@ -96,7 +96,7 @@ For each `(Action, oneshot::Sender)` pulled from the channel:
    - **`SoftwareBackend`** (`backend/software/*`): SendInput-based keyboard/mouse/text, see §4
    - **`VigemBackend`** (`backend/vigem/*`): X360/DS4 controller report via `vigem-client`
    - **`RecordingBackend`** (`backend/recording/*`): appends a `RecordedInput` to an in-memory log (used in tests and via `SYNAPSE_MCP_RECORDING_BACKEND=1`)
-   - **`HardwareBackend`** (`backend/hardware/*`): serializes supported key, mouse-relative, pad, combo, and release commands through `synapse-hid-host::HidGateway`
+   - **`HardwareBackend`** (`backend/hardware/*`): serializes supported key, mouse-relative, absolute-mouse-to-relative batch, pad, combo, and release commands through `synapse-hid-host::HidGateway`
    - **`HardwareUnavailableBackend`** (`backend/unavailable`): fail-closed response when hardware HID is not enabled, returning `ACTION_BACKEND_UNAVAILABLE` with `--hardware-hid <port|auto>` guidance
 5. **Auto-release timers.** `emitter::keyboard` enforces `HELD_KEY_MAX_DURATION_MS` per held key — after the limit, the emitter inserts a synthetic `KeyUp` and emits a `STUCK_KEY_AUTO_RELEASED` warn-log + event.
 6. **ReleaseAll**: walks `EmitState`, emits a `KeyUp` for each held key, `MouseButton::Up` for each held button, and a `GamepadReport::neutral` for each tracked pad. Reflexes that observe `Action::ReleaseAll` are also expected to expire any held-state controllers.
@@ -248,6 +248,6 @@ Each M2 tool wrapper builds one or more `synapse_core::Action`s and dispatches t
 
 ## 17. What is NOT covered
 
-- **Remaining hardware HID gaps.** The live `Backend::Hardware` path is enabled by `--hardware-hid <port|auto>` and maps Synapse keys to USB HID Keyboard/Keypad usage IDs with boot-report modifier byte handling, 6KRO limit enforcement, and shifted US-layout text. Absolute-mouse fallback (#396) and broader supported-use gates remain M4 work.
+- **Remaining hardware HID gaps.** The live `Backend::Hardware` path is enabled by `--hardware-hid <port|auto>` and maps Synapse keys to USB HID Keyboard/Keypad usage IDs with boot-report modifier byte handling, 6KRO limit enforcement, shifted US-layout text, and absolute mouse fallback by converting screen or resolved-element targets into batched `MOUSE_MOVE_REL` commands. Broader supported-use gates remain M4 work.
 - **Modifiers on `act_click`.** The schema accepts `Vec<ClickModifier>` but emitting a non-empty list currently returns `ACTION_BACKEND_UNAVAILABLE` with the message "act_click modifiers are not wired in the M2 click schema slice".
 - **Element-target aim and drag**. `act_aim` with an `Element` target returns `ACTION_BACKEND_UNAVAILABLE` ("requires the dedicated target resolution issue"); same for `Track` targets. `act_drag` supports `Element` targets via UIA bbox resolution.
