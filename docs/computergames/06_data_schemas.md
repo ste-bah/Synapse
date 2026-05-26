@@ -2,7 +2,9 @@
 
 Canonical types live in `synapse-core`. JSON serialization via `serde` (`#[serde(rename_all = "snake_case")]` everywhere). RocksDB stored records use JSON; bincode is excluded by ADR-0001 / RUSTSEC-2025-0141.
 
-This doc is the spec; `synapse-core/src/types.rs` is the implementation. Drift between them is a local check failure and release blocker.
+This doc is the spec; `synapse-core/src/types/` plus
+`synapse-core/src/error_codes.rs` are the implementation source of truth. Drift
+between them is a local check failure and release blocker.
 
 ---
 
@@ -528,13 +530,14 @@ pub struct GamepadReport {
     pub rt: f32,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ComboStep {
     pub at_ms: u32,
     pub input: ComboInput,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ComboInput {
     KeyDown { key: Key },
     KeyUp   { key: Key },
@@ -545,6 +548,26 @@ pub enum ComboInput {
     PadStick  { pad: PadId, stick: Stick, x: f32, y: f32 },
 }
 ```
+
+`ComboInput` is the complete M4 combo payload surface. It is intentionally
+smaller than the full `Action` enum: shell, launch, storage, profile writes,
+subscriptions, and nested combo tools are not valid combo inputs.
+
+| JSON `kind` | Payload fields | Effect |
+|---|---|---|
+| `key_down` | `key` | press and hold one key |
+| `key_up` | `key` | release one key |
+| `key_press` | `key`, `hold_ms` | down, wait, up |
+| `mouse_button` | `button`, `action` | mouse button press/down/up |
+| `mouse_move_rel` | `dx`, `dy` | relative mouse movement |
+| `pad_button` | `pad`, `button`, `action` | gamepad button press/down/up |
+| `pad_stick` | `pad`, `stick`, `x`, `y` | gamepad stick position |
+
+`ComboStep.at_ms` is relative to combo start and must be monotonic in the
+validated step list. Runtime backend routing is carried by the enclosing
+`Action::Combo`/`ReflexThen::Combo` backend, with M4 `act_combo` optionally
+providing per-step backend hints at the MCP layer before lowering to this core
+shape.
 
 ### 4.2 Key name vocabulary
 
@@ -797,6 +820,18 @@ pub struct EventExtension {
 }
 ```
 
+Serialized `use_scope` values and policy behavior:
+
+| TOML/JSON value | Intended scope | Default action posture |
+|---|---|---|
+| `productivity` | Operator productivity apps such as editors, browsers, terminals, chat, and file managers. | Actions allowed according to normal session/tool permissions. |
+| `single_player` | Local single-player games such as Minecraft Java local worlds. | Game actions allowed; hardware HID still requires explicit enablement. |
+| `operator_owned_test` | Local QA fixtures, private test servers, simulators, and replay harnesses owned by the operator. | Actions allowed when the profile declares the test boundary. |
+| `sanctioned_research` | University, tournament, or research rigs where automation is explicitly authorized. | Actions allowed with explicit profile metadata and operator setup. |
+| `unknown` | Unreviewed apps/games or profiles without a supported-use declaration. | Observation allowed; write/action tools refuse with `SAFETY_PROFILE_ACTION_DENIED` unless the operator explicitly permits the reviewed override path. |
+
+Bundled profiles must set `use_scope`; the loader rejects unknown enum strings.
+
 Profile TOML examples in `07_storage_and_profiles.md`.
 
 ---
@@ -967,6 +1002,17 @@ SAFETY_RELEASE_ALL_FIRED
 SAFETY_OPERATOR_HOTKEY_FIRED
 ```
 
+M4 action-path codes:
+
+| Code | Trigger path |
+|---|---|
+| `ACTION_QUEUE_FULL` | Action queue or hardware emitter backpressure rejects a new action. |
+| `ACTION_BACKEND_UNAVAILABLE` | Requested backend is disabled, unavailable, or missing required host setup. |
+| `ACTION_TARGET_INVALID` | Launch/window target, action target, or hardware route target cannot be resolved. |
+| `ACTION_HID_PORT_DISCONNECTED` | `Backend::Hardware` is disconnected, reconnecting, or failed after serial loss. |
+| `SAFETY_RELEASE_ALL_FIRED` | Release-all interlock cancels pending or held inputs. |
+| `SAFETY_OPERATOR_HOTKEY_FIRED` | Operator panic hotkey cancels pending or held inputs. |
+
 ### 8.3 Reflex
 
 ```
@@ -984,6 +1030,12 @@ REFLEX_LIFETIME_EXPIRED
 REFLEX_RECURSION_LIMIT
 REFLEX_ACTION_PERMISSION_DENIED
 ```
+
+M4 reflex-path codes:
+
+| Code | Trigger path |
+|---|---|
+| `REFLEX_ACTION_PERMISSION_DENIED` | Combo or event-triggered reflex suppresses an action because the active profile or session policy denies it. |
 
 ### 8.4 Profile & config
 
@@ -1014,6 +1066,12 @@ HTTP_SESSION_INVALID
 REPLAY_TARGET_INVALID
 REPLAY_FORMAT_INVALID
 ```
+
+M4 MCP/session-path codes:
+
+| Code | Trigger path |
+|---|---|
+| `TOOL_PARAMS_INVALID` | Invalid `act_combo`, `act_run_shell`, `act_launch`, `hid identify`, or `hid flash` parameters after schema/default resolution. |
 
 ### 8.6 Storage
 
@@ -1050,6 +1108,17 @@ HID_COMMAND_REJECTED
 HID_LINK_TIMEOUT
 ```
 
+M4 hardware-HID path codes:
+
+| Code | Trigger path |
+|---|---|
+| `HID_PORT_NOT_FOUND` | Auto-discovery or configured serial path cannot find a candidate RP2040 CDC ACM port. |
+| `HID_PORT_OPEN_FAILED` | Candidate serial port exists but cannot be opened with the requested access/settings. |
+| `HID_PROTOCOL_HANDSHAKE_FAILED` | Host and firmware fail the initial protocol handshake. |
+| `HID_FIRMWARE_VERSION_MISMATCH` | Firmware reports an incompatible protocol or firmware version. |
+| `HID_COMMAND_REJECTED` | Firmware receives a syntactically valid command but rejects it by status code. |
+| `HID_LINK_TIMEOUT` | Host does not receive the expected firmware response before the command deadline. |
+
 ### 8.9 Safety
 
 ```
@@ -1061,6 +1130,15 @@ SAFETY_SECRET_REDACTED
 SAFETY_PERMISSION_DENIED
 SAFETY_PROFILE_ACTION_DENIED
 ```
+
+M4 safety-policy path codes:
+
+| Code | Trigger path |
+|---|---|
+| `SAFETY_SHELL_DENIED_BY_POLICY` | `act_run_shell` is refused by the active allowlist, supported-use scope, or operator permission policy. |
+| `SAFETY_LAUNCH_DENIED_BY_POLICY` | `act_launch` is refused by the active allowlist, supported-use scope, or operator permission policy. |
+| `SAFETY_PERMISSION_DENIED` | A generic M4 tool/action request lacks the session or operator permission required for the requested side effect. |
+| `SAFETY_PROFILE_ACTION_DENIED` | Active `Profile.use_scope` blocks write/action tools for an unsupported or unknown target profile. |
 
 All codes exported as `pub const NAME: &str = "NAME";` in `synapse-core::error_codes`. Tests assert constants match their literal string.
 
