@@ -17,7 +17,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+pico-hid = { path = "../../firmware/pico-hid", default-features = false }
 proptest.workspace = true
+synapse-test-utils = { version = "0.1.0", path = "../synapse-test-utils" }
 
 [[bench]]
 name = "hid_protocol_encode_1mb"

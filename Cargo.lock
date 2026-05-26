@@ -2363,6 +2363,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pico-hid"
+version = "0.1.0"
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3326,10 +3330,12 @@ version = "0.1.0"
 dependencies = [
  "crc16",
  "criterion",
+ "pico-hid",
  "proptest",
  "serde",
  "serialport",
  "synapse-core",
+ "synapse-test-utils",
  "thiserror",
  "tokio",
  "tracing",
@@ -3495,9 +3501,11 @@ name = "synapse-test-utils"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "pico-hid",
  "regex",
  "serde",
  "serde_json",
+ "serialport",
  "synapse-a11y",
  "synapse-core",
  "tempfile",
