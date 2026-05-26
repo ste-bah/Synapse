@@ -105,7 +105,7 @@ Release profile: `opt-level=3`, `lto="thin"`, `codegen-units=16`, `panic="abort"
 
 ## 4. Public MCP tool surface (live)
 
-All 22 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[tool_router]`). Grouped by milestone:
+All 30 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[tool_router]`). Grouped by milestone:
 
 ### 4.1 M1 — perception (6 tools)
 
@@ -132,7 +132,7 @@ All 22 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[to
 | `act_clipboard` | Read / write / clear the Win32 clipboard (text or unicode format) | `server.rs::act_clipboard`, `m2/clipboard.rs` |
 | `release_all` | Synchronously release all held keys, mouse buttons, pad axes | `server.rs::release_all`, `m2/release_all.rs` |
 
-### 4.3 M3 — reflex / events / profiles / replay / audio (11 tools)
+### 4.3 M3 — reflex / events / profiles / replay / audio / storage diagnostics (15 tools)
 
 | Tool | Description | Source |
 |---|---|---|
@@ -147,12 +147,16 @@ All 22 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[to
 | `replay_record` | Stream observations and/or events to a JSONL file under `%LOCALAPPDATA%/synapse/replays` | `server.rs::replay_record`, `m3/replay.rs` |
 | `audio_tail` | Return the most-recent loopback audio tail as PCM s16le bytes (max 5 s; `synapse_audio::MAX_RING_SECONDS`) | `server.rs::audio_tail`, `m3/audio.rs` |
 | `audio_transcribe` | Transcribe the loopback tail via Whisper-tiny (language pinned to `"en"`) | `server.rs::audio_transcribe`, `m3/audio.rs` |
+| `storage_inspect` | Return per-CF row counts and byte sizes from RocksDB for the operator-visible CFs | `server.rs::storage_inspect`, `m3/storage.rs` |
+| `storage_put_probe_rows` | Insert probe rows into a chosen CF to validate write-batch + flush + GC paths during FSV | `server.rs::storage_put_probe_rows`, `m3/storage.rs` |
+| `storage_gc_once` | Run one synchronous GC pass and return the per-CF before/after sizes | `server.rs::storage_gc_once`, `m3/storage.rs` |
+| `storage_pressure_sample` | Apply one synthetic free-byte sample to drive the disk-pressure responder | `server.rs::storage_pressure_sample`, `m3/storage.rs` |
 
 Full parameter/return tables: [13_mcp_tool_reference.md](13_mcp_tool_reference.md).
 
 ### 4.4 PRD-planned tools NOT live in this build
 
-`docs/computergames/05_mcp_tool_surface.md` defines a 30-tool cap. The following PRD entries are not yet implemented in `server.rs`: `describe`, `read_hud`, `act_combo`, `act_run_shell`, `act_launch`.
+`docs/computergames/05_mcp_tool_surface.md` defines a 30-tool surface cap for the agent-facing tools. Synapse's live build extends this with four operator-only `storage_*` diagnostics added during M3. The following PRD-planned entries remain unimplemented: `describe` (M5 VLM), `read_hud` (M4 HUD pipeline), `act_combo`, `act_run_shell`, `act_launch` (all M4).
 
 ## 5. Entry points
 
@@ -293,9 +297,9 @@ Currently `fn main() {}`. Will hold the debug overlay UI shipped at M5.
 | M0 — bootstrap | DONE | `v0.1.0-m0` (2026-05-23) | Rust workspace, `synapse-mcp` stdio, `health` tool, telemetry skeleton |
 | M1 — perception MVP | DONE | `v0.1.0-m1` (2026-05-23) | `observe` + `find` + `read_text` + `set_capture_target` + `set_perception_mode` + a11y/capture wiring |
 | M2 — action MVP | DONE | `v0.1.0-m2` (2026-05-24) | Nine action tools, Software + ViGEm + Recording backends, operator panic hotkey, `release_all` safety paths |
-| M3 — reflex / MCP surface | ACTIVE | — | Live: SSE bus, reflex runtime, RocksDB (11 CFs), profile loader, audio runtime, replay recorder, HTTP transport with Bearer + Origin/Host checks |
-| M4 — hardware HID + first game | not started | — | RP2040 firmware + Minecraft profile |
-| M5 — production polish | not started | — | Installer, overlay, ≥10 profiles, soak |
+| M3 — reflex / MCP surface | DONE | `v0.1.0-m3` (2026-05-25, @ `97019ec`) | SSE bus, reflex runtime + 1 ms time-critical scheduler, RocksDB (11 CFs) + GC + 4-level disk pressure, profile loader + watcher (4 bundled), WASAPI loopback + Whisper-tiny STT, replay JSONL recorder, streamable HTTP/SSE transport with Bearer + Origin/Host + Mcp-Session-Id, 15 M3 tools (incl. four `storage_*` diagnostics) |
+| M4 — hardware HID + first game | ACTIVE | — | RP2040 firmware (`firmware/pico-hid/` — not yet created) + `synapse-hid-host` serial driver + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch` |
+| M5 — production polish | blocked by M4 | — | Installer, overlay, ≥10 profiles, VLM `describe`, soak |
 
 ## 11. What is NOT covered
 

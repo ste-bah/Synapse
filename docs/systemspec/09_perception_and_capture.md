@@ -71,7 +71,7 @@ Source files covered:
 
 ## 3. `synapse-a11y`
 
-Single-file 2087 LoC crate. Wraps `uiautomation` 0.25 and `chromiumoxide` 0.9.
+Single-file 2087 LoC crate on `main` (HEAD `e54ca57`). Wraps `uiautomation` 0.25 and `chromiumoxide` 0.9. M3 carry-over: a `platform/*` module split is queued for M4 Block A.0 (see `docs/impplan/04_m3_reflex_mcp_surface.md`); when that lands, `lib.rs` becomes a 30-LoC re-export surface with logic in `cdp.rs` / `events.rs` / `ids.rs` / `re_resolve.rs` / `snapshot.rs` / `window.rs` / `platform/{non_windows.rs, windows/{common,events,resolve,snapshot,window}.rs}`.
 
 ### 3.1 Public surface
 

@@ -6,7 +6,7 @@ Source files covered:
 - `CHANGELOG.md`, `README.md`, `AGENTS.md`
 - `docs/impplan/README.md`
 
-This is the snapshot of the codebase health and basic metrics derived directly from the source tree as of `git status` shown at session start (branch `main`, `2026-05-25`).
+This is the snapshot of the codebase health and basic metrics derived directly from the source tree on branch `main`, HEAD `e54ca57`, post-M3 (tag `v0.1.0-m3` @ `97019ec`, 2026-05-25).
 
 ## 1. Test results summary
 
@@ -71,10 +71,10 @@ Counted by walking `crates/` and slicing by path. Comments, blank lines, and `mo
 | Total Rust source files (excluding tests/benches) | **148** |
 | Total Rust integration-test files | 76 |
 | Total Rust bench files | 13 |
-| MCP tools registered in `server.rs` | **22** (M1: 6, M2: 9, M3 dispatched via `m3_tool_stubs() len=11`; 2 of those — `subscribe` and `subscribe_cancel` — are paired) |
-| MCP tools planned by PRD `05_mcp_tool_surface.md` (hard cap) | 30 |
+| MCP tools registered in `server.rs` | **30** (M1: 6, M2: 9, M3: 15 — dispatched via `m3_tool_stubs() len=15`; M3 includes 4 operator-only `storage_*` diagnostics added beyond the PRD agent surface) |
+| MCP tools planned by PRD `05_mcp_tool_surface.md` (agent surface cap) | 30 |
 | RocksDB column families | **11** (`ALL_COLUMN_FAMILIES.len() == 11`; excludes implicit `default` CF) |
-| Stable error-code constants in `synapse_core::error_codes` | **87** |
+| Stable error-code constants in `synapse_core::error_codes` | **95** |
 | Reserved subsystem error enums (mapped to those codes) | 11 (`StorageError`, `ReflexError`, `ActionError`, `ProfileError`, `ProfileLoadError`, `AudioError`, `PerceptionError`, `CaptureError`, `ModelError`, `A11yError`, `TelemetryError` + parse errors `ElementIdParseError`/`EventFilterValidationError`) |
 | M3 metric specs declared in `synapse_telemetry::metrics::M3_METRICS` | **19** (12 counters, 5 gauges, 2 histograms) |
 | Permissions in M3 grant model | **11** (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`, `INPUT_HARDWARE_HID`) |
@@ -89,32 +89,38 @@ Per-crate `lib.rs`/`main.rs` size (the deepest single-file entry points):
 | Crate | Entry file | LoC |
 |---|---|---|
 | `synapse-mcp` | `src/main.rs` | 302 |
-| `synapse-mcp` | `src/server.rs` | 1 250 |
+| `synapse-mcp` | `src/server.rs` | 1 335 |
 | `synapse-core` | `src/types.rs` | 1 567 |
 | `synapse-core` | `src/error_codes.rs` | 112 |
-| `synapse-storage` | `src/lib.rs` | 452 |
-| `synapse-reflex` | `src/lib.rs` | 854 |
-| `synapse-action` | `src/lib.rs` | 51 (re-exports only) |
-| `synapse-audio` | `src/lib.rs` | 253 |
-| `synapse-a11y` | `src/lib.rs` | 2 087 |
+| `synapse-storage` | `src/lib.rs` | (per source) |
+| `synapse-reflex` | `src/lib.rs` | 986 |
+| `synapse-reflex` | `src/scheduler.rs` | 890 |
+| `synapse-action` | `src/lib.rs` | re-exports only |
+| `synapse-audio` | `src/lib.rs` | (per source) |
+| `synapse-a11y` | `src/lib.rs` | 2 087 (single-file lib on `main`; modular split queued for M4 Block A.0) |
 | `synapse-capture` | `src/lib.rs` | 1 798 |
-| `synapse-perception` | `src/lib.rs` | 14 (re-exports only) |
-| `synapse-profiles` | `src/lib.rs` | 13 (re-exports only) |
+| `synapse-perception` | `src/lib.rs` | re-exports only |
+| `synapse-profiles` | `src/lib.rs` | re-exports only |
 | `synapse-models` | `src/lib.rs` | 535 |
-| `synapse-telemetry` | `src/lib.rs` | 352 |
-| `synapse-telemetry` | `src/metrics.rs` | 382 |
-| `synapse-hid-host` | `src/lib.rs` | 1 (stub) |
-| `synapse-overlay` | `src/main.rs` | 3 (stub) |
+| `synapse-telemetry` | `src/lib.rs` | (per source) |
+| `synapse-telemetry` | `src/metrics.rs` | (per source) |
+| `synapse-hid-host` | `src/lib.rs` | 1 (M4 stub) |
+| `synapse-overlay` | `src/main.rs` | (M5 stub) |
 
-Files exceeding the 500-LoC impplan rule (acknowledged carry-over per `docs/impplan/04_m3_reflex_mcp_surface.md`):
+Files exceeding the 500-LoC impplan rule on `main` (M3 carry-over per `docs/impplan/04_m3_reflex_mcp_surface.md` — M4 Block A.0 splits before adding hardware HID):
 
-| File | LoC |
-|---|---|
-| `crates/synapse-mcp/src/server.rs` | 1 250 — tool router; exempt by design |
-| `crates/synapse-core/src/types.rs` | 1 567 — type catalog; exempt |
-| `crates/synapse-a11y/src/lib.rs` | 2 087 — flagged in impplan as needing split |
-| `crates/synapse-capture/src/lib.rs` | 1 798 — flagged in impplan as needing split |
-| `crates/synapse-reflex/src/lib.rs` | 854 |
+| File | LoC | Note |
+|---|---|---|
+| `crates/synapse-mcp/src/server.rs` | 1 335 | tool router; exempt by design |
+| `crates/synapse-core/src/types.rs` | 1 567 | type catalog; exempt by design |
+| `crates/synapse-a11y/src/lib.rs` | 2 087 | M4 Block A.0 splits into `platform/*` modules |
+| `crates/synapse-capture/src/lib.rs` | 1 798 | M4 Block A.0 splits |
+| `crates/synapse-mcp/src/m3/reflex.rs` | 1 165 | M4 Block A.0 splits |
+| `crates/synapse-reflex/src/lib.rs` | 986 | M4 Block A.0 splits |
+| `crates/synapse-reflex/src/scheduler.rs` | 890 | M4 Block A.0 splits |
+| `crates/synapse-mcp/src/http/sse.rs` | 764 | M4 Block A.0 splits |
+| `crates/synapse-mcp/src/m3/replay.rs` | 651 | M4 Block A.0 splits |
+| `crates/synapse-models/src/lib.rs` | 535 | M4 Block A.0 splits |
 
 ## 4. Build / packaging summary
 
@@ -202,7 +208,7 @@ Files exceeding the 500-LoC impplan rule (acknowledged carry-over per `docs/impp
 
 | File | Topic |
 |---|---|
-| [01_system_overview.md](01_system_overview.md) | High-level architecture, tech stack, all 22 live tools |
+| [01_system_overview.md](01_system_overview.md) | High-level architecture, tech stack, all 30 live tools |
 | [02_source_code_map.md](02_source_code_map.md) | Per-file tree with descriptions + dep graph + entry-point traces |
 | [03_configuration.md](03_configuration.md) | All CLI flags, env vars, validation rules, default constants |
 | [04_storage_layer.md](04_storage_layer.md) | RocksDB CFs, schema sentinel, TTL filter, GC, disk pressure |
@@ -218,38 +224,20 @@ Files exceeding the 500-LoC impplan rule (acknowledged carry-over per `docs/impp
 | [14_test_suite.md](14_test_suite.md) | Test inventory by crate, run commands, fixtures |
 | [15_verification_report.md](15_verification_report.md) | This file |
 
-## 8. Pre-existing dirty state (informational)
+## 8. Recent commits (informational)
 
-`git status` at session start showed the following modified files (uncommitted as of `2026-05-25`, branch `main`):
-
-```
-M crates/synapse-audio/src/lib.rs
-M crates/synapse-core/src/types.rs
-M crates/synapse-core/tests/types.rs
-M crates/synapse-mcp/src/http/sse.rs
-M crates/synapse-mcp/src/http/transport.rs
-M crates/synapse-mcp/src/m3.rs
-M crates/synapse-mcp/src/m3/tests.rs
-M crates/synapse-mcp/src/main.rs
-M crates/synapse-mcp/src/server.rs
-M crates/synapse-profiles/src/watcher.rs
-M crates/synapse-reflex/src/lib.rs
-M crates/synapse-storage/src/lib.rs
-M docs/computergames/05_mcp_tool_surface.md
-?? docs/compressionprompt.md
-```
-
-Recent commits (M3 work-items in flight):
+Recent commits on `main` after the M3 tag was cut:
 
 ```
-2da0162 feat(mcp): gate m3 tools by permissions [skip ci]
-7c9be6d test(mcp): pin m3 default resolution [skip ci]
-742d2e6 feat(reflex): configure subscription cap [skip ci]
-2480265 feat(telemetry): register m3 metrics [skip ci]
-86a33ce fix(sse): use stream sequence cursors [skip ci]
+e54ca57 docs(impplan): roll forward to M3-closed / M4-active state [skip ci]
+6ed52e4 docs: add systemspec reference and compression prompt [skip ci]
+97019ec fix: tolerate transient replay perception gaps [skip ci]    ← v0.1.0-m3 tag here
+95af9a0 docs: add m3 release notes [skip ci]
+eef654f fix: route recording mode through action actor [skip ci]
+6c9fec0 bench: pace software press benchmark [skip ci]
 ```
 
-The doctrine `[skip ci]` suffix is present on every recent agent commit, consistent with `AGENTS.md`.
+The doctrine `[skip ci]` suffix is present on every agent commit, consistent with `AGENTS.md`.
 
 ## 9. Limitations of this verification
 

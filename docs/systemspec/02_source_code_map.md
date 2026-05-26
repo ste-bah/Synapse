@@ -36,7 +36,7 @@ crates/synapse-mcp/
 ├── Cargo.toml                      # Binary crate; depends on every other library crate
 └── src/
     ├── main.rs                     # Process entrypoint, clap CLI, telemetry init, stdio/http dispatch
-    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 22 MCP tools
+    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 30 MCP tools
     ├── safety.rs                   # Operator-hotkey handler that disables reflexes + fires release_all
     ├── http/
     │   ├── mod.rs                  # Re-exports http::serve entrypoint
@@ -77,6 +77,7 @@ crates/synapse-mcp/
         ├── profile.rs              # profile_list + profile_activate tool implementations
         ├── reflex.rs               # reflex_register/cancel/list/history tools + ScheduledReflex construction
         ├── replay.rs               # replay_record: observation + event JSONL writer
+        ├── storage.rs              # storage_inspect/_put_probe_rows/_gc_once/_pressure_sample diagnostic tools
         ├── subscribe.rs            # subscribe + subscribe_cancel tool wrappers around SseState
         └── tests.rs                # M3-level integration scaffolding tests
 ```
@@ -89,7 +90,7 @@ crates/synapse-core/
 └── src/
     ├── lib.rs                      # Re-exports public types + SCHEMA_VERSION
     ├── defaults.rs                 # SCHEMA_VERSION=1 + reference-host perf budgets
-    ├── error_codes.rs              # 87 SCREAMING_SNAKE_CASE error-code pub const strs
+    ├── error_codes.rs              # 95 SCREAMING_SNAKE_CASE error-code pub const strs
     ├── filter.rs                   # EventFilter and DataPredicate matchers
     ├── retention.rs                # Per-CF TTL + soft/hard cap MB defaults (11 CFs)
     └── types.rs                    # All wire-level types (1567 LoC): Action, Observation, Event, Profile, Reflex*, Stored*, Health, etc.
@@ -138,9 +139,10 @@ crates/synapse-reflex/
     │   └── on_event.rs             # OnEvent: filter-matched action firing with recursion guard (MAX_ON_EVENT_FIRINGS_PER_TICK)
     ├── scheduler.rs                # ReflexScheduler: spawn, validate_reflexes, MAX_REFLEX_PRIORITY/MAX_SCHEDULED_REFLEXES
     ├── scheduler_combo.rs          # Combo-specific tick handling
+    ├── scheduler_stateful.rs       # Stateful tick driver (held reflexes + lifetime + conflict resolution)
     ├── scheduler_stats.rs          # TickSample + p99_jitter_us
     ├── scheduler_tick.rs           # Per-tick driver loop
-    └── scheduler_windows.rs        # Windows-specific scheduler (high-priority thread)
+    └── scheduler_windows.rs        # Windows-specific scheduler (TIME_CRITICAL thread + MMCSS Pro Audio)
 ```
 
 ### 2.5 `crates/synapse-action/` — input emission
@@ -218,10 +220,10 @@ crates/synapse-perception/
 crates/synapse-a11y/
 ├── Cargo.toml
 └── src/
-    └── lib.rs                      # 2087 LoC: UIA wrapper, AccessibleEvent, snapshot, find, foreground context, CDP attach
+    └── lib.rs                      # 2087 LoC on main (HEAD `e54ca57`): UIA wrapper, AccessibleEvent, snapshot, find, foreground context, CDP attach
 ```
 
-(Single-file lib by design; the file is ~500-line cyclical sections per the impplan ≤500 LoC rule but here exceeds — verified.)
+(Single-file lib as-shipped at `v0.1.0-m3`. A platform/* module split is in-progress as an M4 Block A.0 carry-over per `docs/impplan/04_m3_reflex_mcp_surface.md` — when it lands, `lib.rs` becomes a 30-LoC re-export surface with logic in `cdp.rs`, `events.rs`, `ids.rs`, `re_resolve.rs`, `snapshot.rs`, `window.rs`, `platform/non_windows.rs`, and `platform/windows/{common,events,resolve,snapshot,window}.rs`. Update this section in the same PR that lands the split.)
 
 ### 2.8 `crates/synapse-capture/` — frame capture
 
@@ -331,6 +333,9 @@ crates/synapse-overlay/
 | `docs/adr/0002-rocksdb-primary-storage.md` | ADR: RocksDB chosen over LMDB/sled for primary storage |
 | `docs/adr/0003-reflex-recursion-guard.md` | ADR: on-event recursion guard design |
 | `docs/adr/0004-reflex-priority.md` | ADR: reflex scheduler priority semantics |
+| `docs/adr/0005-multi-monitor-capture-target.md` | ADR: multi-monitor capture target resolution rules |
+| `docs/adr/0006-profile-match-precedence.md` | ADR: profile match precedence when multiple profiles match the foreground |
+| `docs/adr/0007-per-event-vs-batched-notifications.md` | ADR: per-event notifications over the SSE bus rather than batching |
 | `docs/AICodingAgentSuperPrompt.md` | Agent prompt that AGENTS.md references for wake-up context |
 | `docs/compressionprompt.md` | Doctrine for compressed implementation-plan authoring |
 | `docs/dev-host-hygiene.md` | Configured-host hygiene checklist (toolchain, drivers) |

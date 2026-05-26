@@ -4,7 +4,7 @@ Comprehensive technical reference for the Synapse MCP server, produced by readin
 
 ## Read order
 
-1. [01_system_overview.md](01_system_overview.md) — architecture map, tech stack, 22-tool inventory, error hierarchy
+1. [01_system_overview.md](01_system_overview.md) — architecture map, tech stack, 30-tool inventory, error hierarchy
 2. [02_source_code_map.md](02_source_code_map.md) — file tree with per-file descriptions, dep graph, entry-point traces
 3. [03_configuration.md](03_configuration.md) — CLI flags, env vars, validation, all numeric defaults
 4. [04_storage_layer.md](04_storage_layer.md) — RocksDB schema (11 CFs), schema sentinel, TTL filter, GC, disk pressure

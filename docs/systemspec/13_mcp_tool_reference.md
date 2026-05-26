@@ -7,7 +7,7 @@ Source files covered:
 - `crates/synapse-mcp/src/m3/{audio, permissions, profile, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 22 tools below are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 30 tools below are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -406,6 +406,60 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 
 **Errors:** `TOOL_PARAMS_INVALID`, `AUDIO_STT_MODEL_NOT_LOADED`, `MODEL_HASH_MISMATCH`, `MODEL_LOAD_FAILED`, `MODEL_BACKEND_UNAVAILABLE`.
 
+## 27. `storage_inspect`
+
+**Description:** "Inspect RocksDB column families: row counts and byte sizes"
+**Permissions:** none gated at the M3 layer (operator-only tool surface; not in the agent-facing 30-tool PRD list)
+**Side effects:** none; reads `Db::cf_sizes` and per-CF scan counts
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `cf` | `Option<String>` | no | — | When set, restricts the report to one CF (must match one of `ALL_COLUMN_FAMILIES`); otherwise all 11 CFs |
+
+**Returns:** `StorageInspectResponse { db_path: String, schema_version: u32, pressure_level: String, cfs: Vec<StorageCfInspectRow { name, row_count, bytes }> }`.
+**Errors:** `STORAGE_OPEN_FAILED`, `TOOL_PARAMS_INVALID` (unknown CF name).
+
+## 28. `storage_put_probe_rows`
+
+**Description:** "Insert probe rows into a CF to exercise the write batcher + flush + GC paths"
+**Permissions:** none gated at the M3 layer (operator-only)
+**Side effects:** writes N synthetic rows into the chosen CF; calls `Db::flush`.
+
+| Parameter | Type | Required | Default | Range | Description |
+|---|---|---|---|---|---|
+| `cf` | `String` | yes | — | one of `ALL_COLUMN_FAMILIES` | Target CF |
+| `count` | `u32` | yes | — | `1..=10000` | Number of probe rows |
+| `value_bytes` | `Option<u32>` | no | `256` | `1..=65536` | Per-row payload size |
+
+**Returns:** `StoragePutProbeRowsResponse { cf, rows_written, bytes_written, flush_elapsed_ms }`.
+**Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_WRITE_FAILED`, `STORAGE_DISK_PRESSURE_LEVEL_1..4` (writes silently dropped at the higher pressure levels).
+
+## 29. `storage_gc_once`
+
+**Description:** "Run one synchronous storage GC pass and return per-CF before/after sizes"
+**Permissions:** none gated at the M3 layer (operator-only)
+**Side effects:** evicts rows from any CF whose size exceeds its soft cap; emits `cache_evictions_total{cf,reason="soft_cap"}` counter increments.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| (none) | — | — | — | Empty params |
+
+**Returns:** `StorageGcOnceResponse { elapsed_ms, cf_reports: Vec<StorageGcCfReport { cf, before_bytes, after_bytes, rows_evicted, hit_hard_cap: bool }> }`.
+**Errors:** `STORAGE_OPEN_FAILED`.
+
+## 30. `storage_pressure_sample`
+
+**Description:** "Apply one synthetic free-byte sample to drive the disk-pressure responder"
+**Permissions:** none gated at the M3 layer (operator-only)
+**Side effects:** updates `Db::pressure_level()` for subsequent writes; may trigger compaction on selected CFs at higher levels.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `free_bytes` | `u64` | yes | — | Synthetic free-bytes value applied via `Db::run_pressure_check_with_free_bytes_sample` |
+
+**Returns:** `StoragePressureSampleResponse { previous_level: String, current_level: String, frozen_cfs: Vec<String> }`. Levels: `Normal` / `Level1` / `Level2` / `Level3` / `Level4`.
+**Errors:** `STORAGE_OPEN_FAILED`.
+
 ## Permission mapping reference
 
 For convenience the M3 tool-call gating is summarized here (live source: `crates/synapse-mcp/src/m3/permissions.rs`, plus per-module `required_permissions_*` functions):
@@ -419,6 +473,7 @@ For convenience the M3 tool-call gating is summarized here (live source: `crates
 | `profile_activate` | `WRITE_PROFILE_ACTIVE` |
 | `replay_record` | `WRITE_REPLAY` |
 | `audio_tail`, `audio_transcribe` | `READ_AUDIO` |
+| `storage_inspect`, `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample` | (operator-only — no M3 permission gate; intended for FSV from the configured host) |
 
 `reflex_register`'s effective permission set is computed by `add_action_permissions` over the compiled `Vec<Action>` (e.g., `Action::PadReport` requires `INPUT_PAD`; any action with `Backend::Hardware` adds `INPUT_HARDWARE_HID`).
 

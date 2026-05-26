@@ -182,17 +182,17 @@ There is no merge step: CLI/env values configure individual subsystems independe
 | `REFERENCE_REFLEX_TICK_JITTER_IDLE_P99_US` | `200` | `crates/synapse-core/src/defaults.rs` |
 | `REFERENCE_EVENT_TO_SUBSCRIBER_P99_MS` | `50.0` | `crates/synapse-core/src/defaults.rs` |
 | `ACTION_QUEUE_CAPACITY` | `256` | `crates/synapse-action/src/handle.rs` |
-| `MAX_DRAG_DISTANCE_PX` | (validated via `validate_action`) | `crates/synapse-action/src/validation.rs` |
-| `SOFTWARE_RATE_LIMIT_PER_S` | per-spec; see source | `crates/synapse-action/src/rate_limit.rs` |
-| `VIGEM_RATE_LIMIT_PER_S` | per-spec; see source | `crates/synapse-action/src/rate_limit.rs` |
+| `MAX_DRAG_DISTANCE_PX` | `4096.0` | `crates/synapse-action/src/validation.rs` |
+| `SOFTWARE_RATE_LIMIT_PER_S` | `5000` | `crates/synapse-action/src/rate_limit.rs` |
+| `VIGEM_RATE_LIMIT_PER_S` | `1000` | `crates/synapse-action/src/rate_limit.rs` |
 | `CAPTURE_CHANNEL_CAPACITY` | `2` | `crates/synapse-capture/src/lib.rs` |
-| `SUBSCRIBER_QUEUE_CAPACITY` | per-spec; see source | `crates/synapse-reflex/src/bus.rs` |
-| `DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | per-spec; see source | `crates/synapse-reflex/src/bus.rs` |
-| `MAX_ON_EVENT_FIRINGS_PER_TICK` | per-spec; see source | `crates/synapse-reflex/src/kinds/on_event.rs` |
-| `MAX_REFLEX_PRIORITY` / `MAX_SCHEDULED_REFLEXES` / `DEFAULT_REFLEX_PRIORITY` | per-spec; see source | `crates/synapse-reflex/src/scheduler.rs` |
-| `STARVATION_AFTER` / `REFLEX_STARVED_KIND` | per-spec; see source | `crates/synapse-reflex/src/conflict.rs` |
+| `SUBSCRIBER_QUEUE_CAPACITY` | `4096` | `crates/synapse-reflex/src/bus.rs` |
+| `DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | `64` | `crates/synapse-reflex/src/bus.rs` |
+| `MAX_ON_EVENT_FIRINGS_PER_TICK` | `4` | `crates/synapse-reflex/src/kinds/on_event.rs` |
+| `MAX_REFLEX_PRIORITY` / `MAX_SCHEDULED_REFLEXES` / `DEFAULT_REFLEX_PRIORITY` | `1000` / `32` / `100` | `crates/synapse-reflex/src/scheduler.rs` |
+| `STARVATION_AFTER` / `REFLEX_STARVED_KIND` | conflict-resolver constants | `crates/synapse-reflex/src/conflict.rs` |
 | `DEFAULT_RING_SECONDS` / `MAX_RING_SECONDS` | `5` / `5` | `crates/synapse-audio/src/lib.rs` |
-| `DEFAULT_SAMPLE_RATE_HZ` / `STEREO_CHANNELS` | per-spec; see source | `crates/synapse-audio/src/ring.rs` |
+| `DEFAULT_SAMPLE_RATE_HZ` / `STEREO_CHANNELS` | `48_000` / `2` | `crates/synapse-audio/src/ring.rs` |
 | `WHISPER_TINY_MODEL_ID` | `"whisper_tiny_int8"` | `crates/synapse-mcp/src/m3/audio.rs` |
 | `CARDINALITY_LIMIT` (metrics) | `1000` | `crates/synapse-telemetry/src/metrics.rs` |
 | `BLOCK_CACHE_BYTES` | `64 MiB` | `crates/synapse-storage/src/lib.rs` |

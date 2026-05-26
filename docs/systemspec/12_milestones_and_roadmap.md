@@ -15,7 +15,7 @@ Source files covered:
 - `docs/impplan/07_cross_cutting.md`
 - `docs/computergames/15_roadmap_and_milestones.md`
 - `docs/computergames/16_open_questions.md`
-- `docs/adr/0001..0004*.md`
+- `docs/adr/0001..0007*.md`
 
 ## 1. Authority order
 
@@ -25,74 +25,84 @@ Per `docs/impplan/README.md` §"State-tracking", the authority order is:
 2. **`main` branch** — what is in code now (impplan is wrong if it disagrees; patch the impplan in the same PR).
 3. **GitHub Issues** — every PR-sized task, `[DECISION]`, `[DISCOVERY]`, bug, risk, context (labels: `phase:m{N}`, `area:*`).
 
-## 2. Milestone state (as of 2026-05-25)
+## 2. Milestone state (as of 2026-05-26, HEAD `e54ca57`)
 
 | # | Milestone | Tag | Date | Source |
 |---|---|---|---|---|
 | M0 | Workspace + rmcp stdio + `health` tool | `v0.1.0-m0` | 2026-05-23 | `CHANGELOG.md::v0.1.0-m0` |
 | M1 | Perception MVP — capture + UIA + `observe()` + 5 tools | `v0.1.0-m1` | 2026-05-23 | `docs/impplan/README.md` |
 | M2 | Action MVP — `synapse-action` + 9 tools + `release_all` | `v0.1.0-m2` | 2026-05-24 | `CHANGELOG.md::v0.1.0-m2` |
-| **M3** | **Reflex + RocksDB + profiles + HTTP/SSE + audio + 11 tools** | — | **ACTIVE** | `docs/impplan/04_m3_reflex_mcp_surface.md` |
-| M4 | RP2040 firmware + first game profile (Minecraft) | — | blocked by M3 | `docs/impplan/05_m4_hardware_hid_first_game.md` |
-| M5 | Production polish — installer, overlay, ≥10 profiles, soak | — | blocked by M4 | `docs/impplan/06_m5_production_polish.md` |
+| M3 | Reflex + RocksDB + profiles + HTTP/SSE + audio + 15 tools | `v0.1.0-m3` (@ `97019ec`) | 2026-05-25 | `CHANGELOG.md::v0.1.0-m3` + `docs/impplan/04_m3_reflex_mcp_surface.md` |
+| **M4** | **RP2040 firmware + `synapse-hid-host` serial driver + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch`** | — | **ACTIVE** | `docs/impplan/05_m4_hardware_hid_first_game.md` |
+| M5 | Production polish — installer, overlay, ≥10 profiles, VLM `describe`, soak | — | blocked by M4 | `docs/impplan/06_m5_production_polish.md` |
 
-M3 is in flight on `main` and has already landed:
+M3 closed 2026-05-25 (`v0.1.0-m3` @ `97019ec`). What landed on `main`:
 
-- `synapse-storage` (RocksDB open + 11 CFs + GC + disk pressure + JSON codecs)
-- `synapse-reflex` (event bus + scheduler + 5 reflex kinds + audit persistence)
-- `synapse-profiles` (TOML loader + live reload via `notify`)
-- `synapse-audio` (WASAPI loopback + Whisper-tiny STT scaffold)
-- HTTP transport in `synapse-mcp/src/http/*` with Bearer auth, Origin/Host allow-list, MCP-Session-Id enforcement, SSE bridge
-- 11 new MCP tools (see §3)
+- `synapse-storage` — RocksDB open + 11 CFs + per-CF TTL filter + 5 min GC + 4-level disk-pressure responder + JSON codecs (ADR-0001/0002)
+- `synapse-reflex` — `EventBus` (bounded crossbeam per subscriber, configurable cap), 1 ms time-critical scheduler (Windows: `THREAD_PRIORITY_TIME_CRITICAL` + MMCSS Pro Audio), 5 reflex kinds (`AimTrack`/`HoldMove`/`HoldButton`/`Combo`/`OnEvent`), recursion guard (ADR-0003), priority resolution (ADR-0004), `CF_REFLEX_AUDIT` persistence
+- `synapse-profiles` — TOML parser + `notify`-debounced watcher (200 ms) + match resolver (ADR-0006) + 4 bundled profiles (`notepad`, `vscode`, `chrome`, `terminal`, all Natural defaults)
+- `synapse-audio` — WASAPI loopback (5 s ring) + detectors (loud-transient / speech start-end / Silero VAD) + Whisper-tiny-int8 STT + GCC-PHAT stereo direction
+- HTTP transport — streamable HTTP + SSE (ADR-0007 per-event notifications); Bearer auth via `subtle::ConstantTimeEq`; Origin/Host loopback allow-list; `Mcp-Session-Id` enforcement
+- 15 M3 tools (11 PRD M3 tools + 4 operator-only `storage_*` diagnostics added during M3 — see §3)
+- Operator panic hotkey (`Ctrl+Alt+Shift+P`) wired with 50 ms `ReleaseAll` budget
+- ADRs landed: 0003 (recursion guard, OQ-022), 0004 (priority, OQ-005), 0005 (multi-monitor capture target, OQ-012), 0006 (profile match precedence, OQ-015), 0007 (per-event notifications, OQ-029)
 
-Outstanding M3 work (per `docs/impplan/04_m3_reflex_mcp_surface.md`):
+M3 carry-over open for M4 to address:
 
-- "subscribe `buffer_size` parameter is currently hard-pinned to 4096" — schema accepts any value but the live code rejects anything else (see `crates/synapse-mcp/src/m3/subscribe.rs::subscribe_to_events`). PRD calls for this to be honored per-subscriber.
-- Persistent writers for `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_TELEMETRY`, `CF_ACTION_LOG`, `CF_PROCESS_HISTORY`, `CF_KV` — only `CF_REFLEX_AUDIT` has a live writer in this build.
-- Audio detectors are wired in `synapse-audio` but `M3State::ensure_audio_runtime` calls `AudioConfig { detectors_enabled: false }`. The detector→event_bus integration is reserved.
-- HUD extraction pipeline (profile-driven OCR/template-match) is parsed but not run against live frames; `Observation.hud` stays empty unless populated by synthetic fixtures.
-- VLM `describe` tool and Florence-2 integration → M5 (`docs/impplan/README.md`).
-- `act_combo` standalone tool — combos work via `reflex_register(kind: combo, ...)`; standalone tool deferred to M4 per impplan §1.6.
-- `act_run_shell`, `act_launch` — gated tools deferred to M4.
+- **LoC overrun** — 500-LoC file cap was violated during M3. On `main` (HEAD `e54ca57`): `synapse-a11y/src/lib.rs` (2087), `synapse-capture/src/lib.rs` (1798), `synapse-core/src/types.rs` (1567), `synapse-mcp/src/server.rs` (1335), `synapse-mcp/src/m3/reflex.rs` (1165), `synapse-reflex/src/lib.rs` (986), `synapse-reflex/src/scheduler.rs` (890), `synapse-mcp/src/http/sse.rs` (764), `synapse-mcp/src/m3/replay.rs` (651), `synapse-models/src/lib.rs` (535). M4's Block A.0 splits these before adding hardware HID. Several test files also exceed cap.
+- **CHANGELOG M3 entry tool-name drift** — the `v0.1.0-m3` entry names `profile_get`/`profile_set_active`; shipped names are `profile_list`/`profile_activate`. The four `storage_*` diagnostic tools are also missing from the entry. First M4 docs sweep fixes both.
+
+Open M4 work (per `docs/impplan/05_m4_hardware_hid_first_game.md`):
+
+- `firmware/pico-hid/` — currently absent (referenced in `Cargo.toml::exclude`); created from scratch in M4 work-item 1 as a separate `thumbv6m-none-eabi` workspace.
+- `synapse-hid-host` — currently a 1-LoC stub; M4 fills it with an async serial driver + CRC16 framing + firmware handshake. `Backend::Hardware` route currently returns `ACTION_HID_PORT_DISCONNECTED` via `HardwareUnavailableBackend`; M4 replaces it with a real `HardwareBackend`.
+- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 → 33.
+- `minecraft.java` profile (the first game profile) — fifth bundled profile, validated against a single-player creative world per `15_roadmap_and_milestones.md` §6.
+- M3 hold-over items still open: per-subscriber `subscribe.buffer_size` (currently hard-pinned to 4096); persistent writers for `CF_EVENTS`/`CF_OBSERVATIONS`/`CF_SESSIONS`/`CF_TELEMETRY`/`CF_ACTION_LOG`/`CF_PROCESS_HISTORY`/`CF_KV` (only `CF_REFLEX_AUDIT` has a live writer); audio detector → SSE-bus sink integration; HUD extraction pipeline. VLM `describe` and Florence-2 remain M5.
 
 ## 3. Tools delivered vs planned
 
-PRD `docs/computergames/05_mcp_tool_surface.md` defines a 30-tool hard cap. As of M3:
+PRD `docs/computergames/05_mcp_tool_surface.md` defines a 30-tool surface cap for the agent-facing tools. Synapse's live build extends this with four operator-only `storage_*` diagnostics added during M3. As of M3 close:
 
 | # | Tool | Milestone | Status | Note |
 |---|---|---|---|---|
-| 1 | `observe` | M1 | live | |
-| 2 | `find` | M1 | live | |
-| 3 | `describe` | M5 (VLM) | not live | reserved |
+| 1 | `health` | M0 | live | |
+| 2 | `observe` | M1 | live | |
+| 3 | `find` | M1 | live | |
 | 4 | `read_text` | M1 | live | |
-| 5 | `read_hud` | M3 | **not live** | HUD pipeline not yet wired |
-| 6 | `audio_tail` | M3 | live | |
-| 7 | `audio_transcribe` | M3 | live (en only) | |
-| 8 | `subscribe` (+`subscribe_cancel`) | M3 | live | `buffer_size` pinned at 4096 |
-| 9 | `set_capture_target` | M1 | live | |
-| 10 | `set_perception_mode` | M1 | live | |
-| 11 | `act_click` | M2 | live | modifiers not yet wired |
-| 12 | `act_type` | M2 | live | |
-| 13 | `act_press` | M2 | live | |
-| 14 | `act_aim` | M2 | live | Element / Track targets return `ACTION_BACKEND_UNAVAILABLE` |
-| 15 | `act_drag` | M2 | live | |
-| 16 | `act_scroll` | M2 | live | |
-| 17 | `act_pad` | M2 | live | |
-| 18 | `act_combo` | M4 | not live | replicated via `reflex_register` |
-| 19 | `act_clipboard` | M2 | live | |
-| 20 | `act_run_shell` | M4 (gated) | not live | |
-| 21 | `act_launch` | M4 (gated) | not live | |
-| 22 | `reflex_register` | M3 | live | |
-| 23 | `reflex_cancel` | M3 | live | |
-| 24 | `reflex_list` | M3 | live | |
-| 25 | `reflex_history` | M3 | live | |
-| 26 | `release_all` | M2 | live | |
-| 27 | `profile_list` | M3 | live | |
-| 28 | `profile_activate` | M3 | live | use_scope=unknown requires `--allow-unknown-profile` |
-| 29 | `health` | M0 | live | |
-| 30 | `replay_record` | M3 | live | JSONL only |
+| 5 | `set_capture_target` | M1 | live | |
+| 6 | `set_perception_mode` | M1 | live | |
+| 7 | `act_click` | M2 | live | modifiers not yet wired |
+| 8 | `act_type` | M2 | live | |
+| 9 | `act_press` | M2 | live | |
+| 10 | `act_aim` | M2 | live | Element / Track targets return `ACTION_BACKEND_UNAVAILABLE` |
+| 11 | `act_drag` | M2 | live | |
+| 12 | `act_scroll` | M2 | live | |
+| 13 | `act_pad` | M2 | live | |
+| 14 | `act_clipboard` | M2 | live | |
+| 15 | `release_all` | M2 | live | |
+| 16 | `subscribe` | M3 | live | `buffer_size` pinned at 4096 |
+| 17 | `subscribe_cancel` | M3 | live | |
+| 18 | `reflex_register` | M3 | live | |
+| 19 | `reflex_cancel` | M3 | live | |
+| 20 | `reflex_list` | M3 | live | |
+| 21 | `reflex_history` | M3 | live | |
+| 22 | `profile_list` | M3 | live | |
+| 23 | `profile_activate` | M3 | live | use_scope=unknown requires `--allow-unknown-profile` |
+| 24 | `replay_record` | M3 | live | JSONL only |
+| 25 | `audio_tail` | M3 | live | |
+| 26 | `audio_transcribe` | M3 | live (en only) | |
+| 27 | `storage_inspect` | M3 (operator) | live | per-CF row+byte size readback |
+| 28 | `storage_put_probe_rows` | M3 (operator) | live | FSV write-path probe |
+| 29 | `storage_gc_once` | M3 (operator) | live | synchronous GC pass with before/after sizes |
+| 30 | `storage_pressure_sample` | M3 (operator) | live | synthetic disk-pressure trigger |
+| — | `read_hud` | (deferred to M4) | not live | HUD extraction pipeline not yet wired |
+| — | `act_combo` | M4 | not live | replicated via `reflex_register` |
+| — | `act_run_shell` | M4 (gated) | not live | |
+| — | `act_launch` | M4 (gated) | not live | |
+| — | `describe` | M5 (VLM) | not live | Florence-2 |
 
-Live count in `crates/synapse-mcp/src/server.rs`: **22** (M1: 6, M2: 9, M3: 7 unique tool methods, with `subscribe`+`subscribe_cancel` counted as 2 in the M3 stub array of 11; the M3 `m3_tool_stubs()` length-asserts to 11).
+Live count in `crates/synapse-mcp/src/server.rs`: **30** (M1: 6, M2: 9, M3: 15 — including 4 operator-only `storage_*` diagnostics; the M3 `m3_tool_stubs()` length-asserts to 15).
 
 ## 4. Architecture Decision Records (ADRs)
 
@@ -102,6 +112,9 @@ Live count in `crates/synapse-mcp/src/server.rs`: **22** (M1: 6, M2: 9, M3: 7 un
 | `docs/adr/0002-rocksdb-primary-storage.md` | RocksDB as primary storage | Chose RocksDB over LMDB/sled for the 11-CF schema; rationale around column-family compaction filters and prefix bloom |
 | `docs/adr/0003-reflex-recursion-guard.md` | Reflex recursion guard | OnEvent fires are capped at `MAX_ON_EVENT_FIRINGS_PER_TICK = 4` per tick; overflow emits `REFLEX_RECURSION_LIMIT` audit + bus event exactly once per tick |
 | `docs/adr/0004-reflex-priority.md` | Reflex priority semantics | Lower number = higher priority; ties broken by registration order; `MAX_REFLEX_PRIORITY = 1000`, `DEFAULT_REFLEX_PRIORITY = 100` |
+| `docs/adr/0005-multi-monitor-capture-target.md` | Multi-monitor capture target | Resolution rules for `Primary`/`Monitor`/`Window`/`ElementWindow` capture targets across multi-monitor configurations |
+| `docs/adr/0006-profile-match-precedence.md` | Profile match precedence | When multiple profiles match the current foreground, the most-specific match (most non-`None` fields satisfied) wins; ties broken by load order |
+| `docs/adr/0007-per-event-vs-batched-notifications.md` | Per-event vs batched SSE notifications | One Event = one SSE frame; no in-process batching to keep `event-to-subscriber p99 ≤ 50 ms` achievable |
 
 ## 5. Operator-level invariants (from `docs/impplan/00_methodology.md`)
 
@@ -134,13 +147,19 @@ Every PR must satisfy:
 ✓ Manual issue evidence captures SoT before/readback-after state
 ```
 
-The 500-LoC file cap is violated in three places per impplan and per current code:
+The 500-LoC file cap is violated in the following places per current code (HEAD `e54ca57`); M4's first PR splits them before adding hardware HID:
 
-- `crates/synapse-mcp/src/server.rs` (1250 LoC) — the tool router is exempt by design
-- `crates/synapse-action/src/emitter.rs` (split across `emitter/*.rs` submodules; the umbrella file is under cap)
-- `crates/synapse-a11y/src/lib.rs` (2087 LoC) — single-file lib; impplan calls it out as needing a split before M3 builds on top
-- `crates/synapse-capture/src/lib.rs` (1798 LoC) — same
-- `crates/synapse-core/src/types.rs` (1567 LoC) — type catalog, exempt
+- `crates/synapse-mcp/src/server.rs` (1335 LoC) — tool router; exempt by design
+- `crates/synapse-core/src/types.rs` (1567 LoC) — type catalog; exempt by design
+- `crates/synapse-capture/src/lib.rs` (1798 LoC) — M4 Block A.0 splits
+- `crates/synapse-mcp/src/m3/reflex.rs` (1165 LoC) — M4 Block A.0 splits
+- `crates/synapse-reflex/src/lib.rs` (986 LoC) — M4 Block A.0 splits
+- `crates/synapse-reflex/src/scheduler.rs` (890 LoC) — M4 Block A.0 splits
+- `crates/synapse-mcp/src/http/sse.rs` (764 LoC) — M4 Block A.0 splits
+- `crates/synapse-mcp/src/m3/replay.rs` (651 LoC) — M4 Block A.0 splits
+- `crates/synapse-models/src/lib.rs` (535 LoC) — M4 Block A.0 splits
+
+(`crates/synapse-a11y/src/lib.rs` was 2087 LoC at the start of M3 and is now 30 LoC after the platform/* split landed on `main` — this is the template for the M4 Block A.0 splits above.)
 
 ## 7. Performance budgets (binding — from PRD §11)
 
@@ -167,10 +186,16 @@ The PRD's "Open Questions" file enumerates roughly 30 numbered items (OQ-001 …
 | OQ | Decision | Code/artifact |
 |---|---|---|
 | OQ-004 | Natural-only motion defaults (Natural curves + Natural keystroke dynamics tuned `FAST`) | `AimNaturalParams::FAST`, `KeystrokeNaturalParams::FAST` in `synapse-core/src/types.rs` |
-| OQ-001/005/010/012/015/022/023/024/029 | Various M3 design closures (event filter depth, reflex recursion, audit retention, etc.) | See ADRs 0003/0004 and `synapse-reflex` source |
+| OQ-001 | RocksDB as primary storage | ADR-0002 |
+| OQ-005 | Reflex priority semantics | ADR-0004 |
+| OQ-012 | Multi-monitor capture target | ADR-0005 |
+| OQ-015 | Profile match precedence | ADR-0006 |
+| OQ-022 | Reflex recursion guard | ADR-0003 |
+| OQ-029 | Per-event vs batched SSE notifications | ADR-0007 |
+| OQ-009/010/023/024 | M1 perception closures (max_elements default, CDP auto-attach, element_id stability, token budget) | M1 source |
 | operator decisions 2026-05-24 (issues #246/#247/#350/#351) | No GitHub Actions / CI as a shipping gate | `AGENTS.md` |
 
-Open items remaining (PRD §16) cover: VLM `describe` model selection (M5), `act_combo` API ergonomics (M4), profile schema v2 plans, packaging/signing strategy, telemetry export endpoint.
+Open items remaining (PRD §16): OQ-003 (detection model default — YOLOv10n vs RT-DETR-s), OQ-013 (aim_track EMA smoothing), OQ-016 (action coalescing on hardware) closed in M4; OQ-008 (VLM bundling), OQ-014 (Whisper-tiny vs base), OQ-017 (disk-pressure thresholds final), OQ-019 (telemetry split), OQ-020 (`game_screenshot_once` exposure), OQ-030 (GC cadence final) closed in M5; OQ-006/007/021/027/028/026/018 remain v1.x.
 
 ## 9. Doctrine documents
 
@@ -203,9 +228,9 @@ Open items remaining (PRD §16) cover: VLM `describe` model selection (M5), `act
 | `docs/AICodingAgentSuperPrompt.md` | Repository agent wake-up prompt |
 | `docs/compressionprompt.md` | Doctrine for compressed implementation-plan authoring |
 
-## 10. M3 demo gate (acceptance criteria)
+## 10. M3 demo gate (acceptance — passed 2026-05-25)
 
-From `docs/impplan/04_m3_reflex_mcp_surface.md::§2`:
+From `docs/impplan/04_m3_reflex_mcp_surface.md::§2`, validated for the `v0.1.0-m3` tag:
 
 1. Real Win11 box. Notepad open. Claude Desktop configured with `synapse-mcp` over stdio.
 2. Agent registers an `on_event` reflex that fires when a `Save As` window appears.
@@ -216,6 +241,8 @@ From `docs/impplan/04_m3_reflex_mcp_surface.md::§2`:
    - The audit row is present in `CF_REFLEX_AUDIT`.
    - The reflex priority and lifetime evolved correctly.
 6. Operator hotkey `Ctrl+Alt+Shift+P` cleanly disables all reflexes and fires `release_all` within 50 ms.
+
+The M4 demo gate is defined in `docs/impplan/05_m4_hardware_hid_first_game.md` and exercises the RP2040 firmware + `synapse-hid-host` serial driver + Minecraft single-player creative world via `act_press`/`act_aim`/`act_combo` over `Backend::Hardware`.
 
 ## 11. What is NOT covered in this doc
 
