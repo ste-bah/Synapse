@@ -9,7 +9,7 @@ use synapse_storage::{cf, decode_json};
 use super::{
     ProfileCompatibilitySummary, ProfileQualityContribution, ProfileQualityCounts,
     ProfileQualityRates, ProfileQualityRedaction, ProfileQualityRefreshParams, ProfileQualityScore,
-    ProfileQualitySnapshot, ProfileQualitySource, hex_encode,
+    ProfileQualitySnapshot, ProfileQualitySource, ProfileQualityVersionSummary, hex_encode,
 };
 
 const QUALITY_SCHEMA_VERSION: u32 = 1;
@@ -25,7 +25,9 @@ struct ParsedAuditRow {
     status: String,
     error_code: Option<String>,
     active_profile_id: Option<String>,
+    active_profile_schema_version: Option<u32>,
     foreground_profile_id: Option<String>,
+    foreground_profile_schema_version: Option<u32>,
     foreground_process_name: Option<String>,
     response_backend: Option<String>,
 }
@@ -68,10 +70,16 @@ fn parse_audit_row(value: &[u8]) -> Result<ParsedAuditRow, ()> {
         status,
         error_code: optional_string(&row, "error_code"),
         active_profile_id: optional_string(&row, "active_profile_id"),
+        active_profile_schema_version: optional_u32(&row, "active_profile_schema_version")
+            .or_else(|| optional_u32(&row, "profile_schema_version")),
         foreground_profile_id: row
             .pointer("/foreground/profile_id")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        foreground_profile_schema_version: row
+            .pointer("/foreground/profile_schema_version")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok()),
         foreground_process_name: row
             .pointer("/foreground/process_name")
             .and_then(Value::as_str)
@@ -91,11 +99,18 @@ fn optional_string(row: &Value, field: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn optional_u32(row: &Value, field: &str) -> Option<u32> {
+    row.get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+}
+
 struct SnapshotBuilder {
     profile_id: String,
     source: ProfileQualitySource,
     counts: ProfileQualityCounts,
     compatibility: ProfileCompatibilitySummary,
+    versioning: ProfileQualityVersionSummary,
     generated_at_ns: u64,
     evidence_parts: Vec<String>,
     profile_label: String,
@@ -151,6 +166,16 @@ impl SnapshotBuilder {
                 observed_process_names: BTreeMap::new(),
                 observed_backends: BTreeMap::new(),
             },
+            versioning: ProfileQualityVersionSummary {
+                current_profile_schema_version: profile.schema_version,
+                rows_with_profile_schema_version: 0,
+                current_version_rows: 0,
+                older_version_rows: 0,
+                newer_version_rows: 0,
+                unknown_version_rows: 0,
+                mixed_profile_schema_versions: false,
+                observed_profile_schema_versions: BTreeMap::new(),
+            },
             generated_at_ns,
             evidence_parts: Vec::new(),
             profile_label: profile.label.clone(),
@@ -192,6 +217,7 @@ impl SnapshotBuilder {
                 .or_default() += 1;
         }
         self.record_status(row, foreground_match);
+        self.record_version(row, foreground_match);
         self.evidence_parts.push(evidence_part(row));
     }
 
@@ -271,10 +297,38 @@ impl SnapshotBuilder {
         }
     }
 
+    fn record_version(&mut self, row: &ParsedAuditRow, foreground_match: bool) {
+        let row_version = if foreground_match {
+            row.foreground_profile_schema_version
+        } else {
+            row.active_profile_schema_version
+        };
+        let Some(row_version) = row_version else {
+            self.versioning.unknown_version_rows += 1;
+            return;
+        };
+
+        self.versioning.rows_with_profile_schema_version += 1;
+        *self
+            .versioning
+            .observed_profile_schema_versions
+            .entry(row_version.to_string())
+            .or_default() += 1;
+
+        match row_version.cmp(&self.profile_schema_version) {
+            std::cmp::Ordering::Equal => self.versioning.current_version_rows += 1,
+            std::cmp::Ordering::Less => self.versioning.older_version_rows += 1,
+            std::cmp::Ordering::Greater => self.versioning.newer_version_rows += 1,
+        }
+    }
+
     fn finish(self) -> ProfileQualitySnapshot {
         let score = score_from_counts(&self.counts);
         let rates = rates_from_counts(&self.counts);
         let evidence_hash = evidence_hash(&self.profile_id, &self.evidence_parts, &self.source);
+        let mut versioning = self.versioning;
+        versioning.mixed_profile_schema_versions =
+            versioning.observed_profile_schema_versions.len() > 1;
         ProfileQualitySnapshot {
             schema_version: QUALITY_SCHEMA_VERSION,
             profile_id: self.profile_id,
@@ -288,6 +342,7 @@ impl SnapshotBuilder {
             rates,
             score,
             compatibility: self.compatibility,
+            versioning,
             redaction: ProfileQualityRedaction {
                 local_only: true,
                 snapshot_redacts_process_path: true,
@@ -365,13 +420,19 @@ fn ratio(numerator: u64, denominator: u64) -> f64 {
 
 fn evidence_part(row: &ParsedAuditRow) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
         row.audit_id.as_deref().unwrap_or(""),
         row.ts_ns,
         row.tool,
         row.status,
         row.error_code.as_deref().unwrap_or(""),
-        row.foreground_profile_id.as_deref().unwrap_or("")
+        row.foreground_profile_id.as_deref().unwrap_or(""),
+        row.foreground_profile_schema_version
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        row.active_profile_schema_version
+            .map(|value| value.to_string())
+            .unwrap_or_default()
     )
 }
 

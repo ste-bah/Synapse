@@ -50,6 +50,7 @@ pub struct ProfileQualitySnapshot {
     pub rates: ProfileQualityRates,
     pub score: ProfileQualityScore,
     pub compatibility: ProfileCompatibilitySummary,
+    pub versioning: ProfileQualityVersionSummary,
     pub redaction: ProfileQualityRedaction,
     pub contribution: ProfileQualityContribution,
 }
@@ -120,6 +121,19 @@ pub struct ProfileCompatibilitySummary {
     pub target_denied_rows: u64,
     pub observed_process_names: BTreeMap<String, u64>,
     pub observed_backends: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileQualityVersionSummary {
+    pub current_profile_schema_version: u32,
+    pub rows_with_profile_schema_version: u64,
+    pub current_version_rows: u64,
+    pub older_version_rows: u64,
+    pub newer_version_rows: u64,
+    pub unknown_version_rows: u64,
+    pub mixed_profile_schema_versions: bool,
+    pub observed_profile_schema_versions: BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]

@@ -317,7 +317,10 @@ used as acceptance evidence.
 Real action tools write minimal JSON rows to `CF_ACTION_LOG`. For manual action
 FSV, read `storage_inspect.cf_row_counts.CF_ACTION_LOG` before and after the
 action, then read `storage_inspect.cf_row_samples.CF_ACTION_LOG` and record the
-actual sampled JSON row. A count delta alone is not enough evidence.
+actual sampled JSON row. Rows include active and foreground profile ids plus
+their schema versions when profile resolution is available, which lets later
+quality scoring distinguish current, older, newer, and unknown profile-version
+evidence. A count delta alone is not enough evidence.
 
 `profile_quality_refresh` is the first profile-registry/audit-data scoring
 surface. It reads real `CF_ACTION_LOG` rows, ignores stale/corrupt/non-matching
@@ -325,8 +328,9 @@ audit rows for scoring, writes a redacted JSON snapshot to
 `CF_PROFILES` under `profile_quality/v1/<profile_id>`, and reads that exact row
 back before returning. The snapshot stores counts, rates, a Wilson 95% lower
 bound score for foreground-profile `ok` vs `error` outcomes, compatibility
-signals, source row range, evidence hash, and a local-only contribution policy.
-It never exports or shares data; contribution bundles require a future
+signals, profile-schema-version recency/mixed-version counters, source row
+range, evidence hash, and a local-only contribution policy. It never exports or
+shares data; contribution bundles require a future
 operator-approved path.
 
 ---

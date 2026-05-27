@@ -68,9 +68,10 @@ Profile quality scoring is local-first. The Luanti benchmark feeds the
 profile-registry/audit-data loop only through observed runtime outcomes in
 `CF_ACTION_LOG`; `profile_quality_refresh` ignores stale, corrupt, and
 non-matching rows for the quality score, records compatibility and denial
-counters separately, redacts process paths/window titles from the score
-snapshot, and does not export/share anything without a future explicit operator
-approval path.
+counters separately, records profile-schema-version recency/mixed-version
+evidence where audit rows carry it, redacts process paths/window titles from
+the score snapshot, and does not export/share anything without a future
+explicit operator approval path.
 
 ---
 

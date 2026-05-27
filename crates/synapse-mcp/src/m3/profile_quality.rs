@@ -26,7 +26,7 @@ pub use model::{
     ProfileCompatibilitySummary, ProfileQualityContribution, ProfileQualityCounts,
     ProfileQualityRates, ProfileQualityRedaction, ProfileQualityRefreshParams,
     ProfileQualityRefreshResponse, ProfileQualityScore, ProfileQualitySnapshot,
-    ProfileQualitySource,
+    ProfileQualitySource, ProfileQualityVersionSummary,
 };
 
 #[must_use]

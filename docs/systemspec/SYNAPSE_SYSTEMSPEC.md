@@ -1267,7 +1267,7 @@ These are the `serde_json` payloads written into each CF. Source: `crates/synaps
 | `CF_REFLEX_AUDIT` | `StoredReflexAudit` | `schema_version`, `audit_id`, `reflex_id`, `ts_ns`, `status: ReflexState`, `event_id: Option<String>`, `steps: Vec<StoredReflexStep>`, `error_code: Option<String>`, `details: serde_json::Value`, `redacted`, `redactions` | `format!("{reflex_id}:{audit_id}")` (see §4.2) |
 | `CF_OCR_CACHE` | not yet wired | — | — |
 | `CF_TELEMETRY` | not yet wired | — | — |
-| `CF_ACTION_LOG` | action audit JSON | `schema_version`, `audit_id`, `ts_ns`, `seq`, `tool`, `status`, `error_code`, `foreground`, `active_profile_id`, `details` | action tools via `server/action_audit.rs`; diagnostic probe writes may create malformed rows for manual corrupt-row checks |
+| `CF_ACTION_LOG` | action audit JSON | `schema_version`, `audit_id`, `ts_ns`, `seq`, `tool`, `status`, `error_code`, `foreground` with `profile_id`/`profile_schema_version`, `active_profile_id`, `active_profile_schema_version`, `details` | action tools via `server/action_audit.rs`; diagnostic probe writes may create malformed rows for manual corrupt-row checks |
 | `CF_PROCESS_HISTORY` | not yet wired | — | — |
 | `CF_KV` | not yet wired (generic) | — | — |
 
@@ -4189,7 +4189,8 @@ Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32
 key_hex, wrote_snapshot, previous_evidence_hash, stored_value_len_bytes,
 stored_value_utf8_prefix, snapshot }`. `snapshot` contains source counters,
 ignored corrupt/stale rows, counts/rates, Wilson lower-bound score,
-compatibility counters, redaction policy, and contribution policy.
+compatibility counters, profile-schema-version recency/mixed-version counters,
+redaction policy, and contribution policy.
 
 The score-bearing sample is foreground-profile `ok` vs `error` rows only.
 Denied, stale, corrupt, active-profile-only, and profile-mismatch rows are

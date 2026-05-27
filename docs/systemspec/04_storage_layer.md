@@ -106,7 +106,7 @@ These are the `serde_json` payloads written into each CF. Source: `crates/synaps
 | `CF_REFLEX_AUDIT` | `StoredReflexAudit` | `schema_version`, `audit_id`, `reflex_id`, `ts_ns`, `status: ReflexState`, `event_id: Option<String>`, `steps: Vec<StoredReflexStep>`, `error_code: Option<String>`, `details: serde_json::Value`, `redacted`, `redactions` | `format!("{reflex_id}:{audit_id}")` (see §4.2) |
 | `CF_OCR_CACHE` | not yet wired | — | — |
 | `CF_TELEMETRY` | not yet wired | — | — |
-| `CF_ACTION_LOG` | action audit JSON | `schema_version`, `audit_id`, `ts_ns`, `seq`, `tool`, `status`, `error_code`, `foreground`, `active_profile_id`, `details` | action tools via `server/action_audit.rs`; diagnostic probe writes may create malformed rows for manual corrupt-row checks |
+| `CF_ACTION_LOG` | action audit JSON | `schema_version`, `audit_id`, `ts_ns`, `seq`, `tool`, `status`, `error_code`, `foreground` with `profile_id`/`profile_schema_version`, `active_profile_id`, `active_profile_schema_version`, `details` | action tools via `server/action_audit.rs`; diagnostic probe writes may create malformed rows for manual corrupt-row checks |
 | `CF_PROCESS_HISTORY` | not yet wired | — | — |
 | `CF_KV` | not yet wired (generic) | — | — |
 

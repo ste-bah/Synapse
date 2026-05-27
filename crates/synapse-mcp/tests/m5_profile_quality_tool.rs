@@ -63,6 +63,22 @@ async fn profile_quality_refresh_persists_explainable_snapshot() -> anyhow::Resu
         first["snapshot"]["compatibility"]["profile_mismatch_rows"],
         1
     );
+    assert_eq!(
+        first["snapshot"]["versioning"]["current_profile_schema_version"],
+        1
+    );
+    assert_eq!(
+        first["snapshot"]["versioning"]["rows_with_profile_schema_version"],
+        5
+    );
+    assert_eq!(first["snapshot"]["versioning"]["current_version_rows"], 4);
+    assert_eq!(first["snapshot"]["versioning"]["older_version_rows"], 1);
+    assert_eq!(first["snapshot"]["versioning"]["newer_version_rows"], 0);
+    assert_eq!(first["snapshot"]["versioning"]["unknown_version_rows"], 0);
+    assert_eq!(
+        first["snapshot"]["versioning"]["mixed_profile_schema_versions"],
+        true
+    );
     assert_eq!(first["snapshot"]["redaction"]["local_only"], true);
     assert_eq!(first["snapshot"]["contribution"]["export_allowed"], false);
 
@@ -94,6 +110,7 @@ async fn profile_quality_refresh_persists_explainable_snapshot() -> anyhow::Resu
     assert_eq!(stored["profile_id"], "quality.synthetic");
     assert_eq!(stored["counts"]["quality_eligible_ok_rows"], 1);
     assert_eq!(stored["counts"]["quality_eligible_error_rows"], 1);
+    assert_eq!(stored["versioning"]["mixed_profile_schema_versions"], true);
     Ok(())
 }
 
@@ -127,8 +144,8 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
             "act_press",
             "started",
             None,
-            "quality.synthetic",
-            "quality.synthetic",
+            ProfileRefs::same("quality.synthetic"),
+            ProfileSchemaVersions::same(1),
         )?,
         action_row(
             now - 5_000,
@@ -136,8 +153,8 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
             "act_press",
             "ok",
             None,
-            "quality.synthetic",
-            "quality.synthetic",
+            ProfileRefs::same("quality.synthetic"),
+            ProfileSchemaVersions::same(1),
         )?,
         action_row(
             now - 4_000,
@@ -145,8 +162,8 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
             "act_press",
             "error",
             Some(error_codes::ACTION_BACKEND_UNAVAILABLE),
-            "quality.synthetic",
-            "quality.synthetic",
+            ProfileRefs::same("quality.synthetic"),
+            ProfileSchemaVersions::same(1),
         )?,
         action_row(
             now - 3_000,
@@ -154,8 +171,8 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
             "act_press",
             "denied",
             Some(error_codes::SAFETY_PROFILE_ACTION_DENIED),
-            "quality.synthetic",
-            "quality.synthetic",
+            ProfileRefs::same("quality.synthetic"),
+            ProfileSchemaVersions::same(1),
         )?,
         action_row(
             now - 2_000,
@@ -163,8 +180,14 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
             "act_launch",
             "error",
             Some("LAUNCH_FAILED"),
-            "quality.synthetic",
-            "other.profile",
+            ProfileRefs {
+                active: "quality.synthetic",
+                foreground: "other.profile",
+            },
+            ProfileSchemaVersions {
+                active: 0,
+                foreground: 2,
+            },
         )?,
         stale_action_row(1, 5)?,
         (audit_key(now - 1_000, 6), b"not-json-audit-row".to_vec()),
@@ -183,8 +206,8 @@ fn action_row(
     tool: &str,
     status: &str,
     error_code: Option<&str>,
-    active_profile_id: &str,
-    foreground_profile_id: &str,
+    profiles: ProfileRefs<'_>,
+    schema_versions: ProfileSchemaVersions,
 ) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let value = json!({
         "schema_version": 1,
@@ -195,12 +218,14 @@ fn action_row(
         "status": status,
         "error_code": error_code,
         "foreground": {
-            "process_name": if foreground_profile_id == "quality.synthetic" { "notepad.exe" } else { "calc.exe" },
+            "process_name": if profiles.foreground == "quality.synthetic" { "notepad.exe" } else { "calc.exe" },
             "process_path": "C:\\redacted-by-quality-snapshot\\synthetic.exe",
             "window_title": "Synthetic title not copied into quality snapshot",
-            "profile_id": foreground_profile_id,
+            "profile_id": profiles.foreground,
+            "profile_schema_version": schema_versions.foreground,
         },
-        "active_profile_id": active_profile_id,
+        "active_profile_id": profiles.active,
+        "active_profile_schema_version": schema_versions.active,
         "details": {
             "response": {
                 "backend": "software"
@@ -220,9 +245,39 @@ fn stale_action_row(ts_ns: u64, seq: u32) -> anyhow::Result<(Vec<u8>, Vec<u8>)> 
         "act_press",
         "ok",
         None,
-        "quality.synthetic",
-        "quality.synthetic",
+        ProfileRefs::same("quality.synthetic"),
+        ProfileSchemaVersions::same(1),
     )
+}
+
+#[derive(Clone, Copy)]
+struct ProfileRefs<'a> {
+    active: &'a str,
+    foreground: &'a str,
+}
+
+impl<'a> ProfileRefs<'a> {
+    const fn same(profile_id: &'a str) -> Self {
+        Self {
+            active: profile_id,
+            foreground: profile_id,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProfileSchemaVersions {
+    active: u32,
+    foreground: u32,
+}
+
+impl ProfileSchemaVersions {
+    const fn same(version: u32) -> Self {
+        Self {
+            active: version,
+            foreground: version,
+        }
+    }
 }
 
 fn audit_key(ts_ns: u64, seq: u32) -> Vec<u8> {

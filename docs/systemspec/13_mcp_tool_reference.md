@@ -375,7 +375,8 @@ Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32
 key_hex, wrote_snapshot, previous_evidence_hash, stored_value_len_bytes,
 stored_value_utf8_prefix, snapshot }`. `snapshot` contains source counters,
 ignored corrupt/stale rows, counts/rates, Wilson lower-bound score,
-compatibility counters, redaction policy, and contribution policy.
+compatibility counters, profile-schema-version recency/mixed-version counters,
+redaction policy, and contribution policy.
 
 The score-bearing sample is foreground-profile `ok` vs `error` rows only.
 Denied, stale, corrupt, active-profile-only, and profile-mismatch rows are

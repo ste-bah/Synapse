@@ -907,8 +907,9 @@ back before returning.
 Returns the `CF_PROFILES` key, whether a new snapshot was written, stored value
 length/prefix, and an explainable snapshot containing source row counts,
 ignored corrupt/stale rows, quality counts/rates, Wilson lower-bound score,
-compatibility counters, redaction policy, and contribution policy. Export is
-always `false`; sharing requires a future explicit operator-approved path.
+compatibility counters, profile-schema-version recency/mixed-version counters,
+redaction policy, and contribution policy. Export is always `false`; sharing
+requires a future explicit operator-approved path.
 
 ### 3.29 `health`
 

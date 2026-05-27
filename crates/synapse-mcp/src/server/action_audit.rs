@@ -86,6 +86,7 @@ impl SynapseService {
         details: &Value,
     ) -> Result<(), ErrorData> {
         let (ts_ns, seq) = next_audit_key_parts();
+        let active_profile = self.action_audit_active_profile();
         let value = json!({
             "schema_version": 1,
             "audit_id": format!("{ts_ns:020}-{seq:010}"),
@@ -95,7 +96,8 @@ impl SynapseService {
             "status": status,
             "error_code": error_code,
             "foreground": self.action_audit_foreground(),
-            "active_profile_id": self.action_audit_active_profile_id(),
+            "active_profile_id": active_profile.profile_id,
+            "active_profile_schema_version": active_profile.schema_version,
             "details": details,
         });
         let encoded = synapse_storage::encode_json(&value).map_err(|error| {
@@ -132,14 +134,15 @@ impl SynapseService {
             .and_then(|state| crate::m1::current_input(&state, 1));
         match input {
             Ok(input) => {
-                let observed_profile_id = self.action_audit_observed_profile_id(&input.foreground);
+                let observed_profile = self.action_audit_observed_profile(&input.foreground);
                 json!({
                     "hwnd": input.foreground.hwnd,
                     "pid": input.foreground.pid,
                     "process_name": input.foreground.process_name,
                     "process_path": input.foreground.process_path,
                     "window_title": input.foreground.window_title,
-                    "profile_id": observed_profile_id,
+                    "profile_id": observed_profile.profile_id,
+                    "profile_schema_version": observed_profile.schema_version,
                 })
             }
             Err(error) => json!({
@@ -149,27 +152,57 @@ impl SynapseService {
         }
     }
 
-    fn action_audit_observed_profile_id(
+    fn action_audit_observed_profile(
         &self,
         foreground: &synapse_core::ForegroundContext,
-    ) -> Option<String> {
+    ) -> ActionAuditProfileRef {
         let window = synapse_profiles::ForegroundWindow {
             exe: non_empty(&foreground.process_name),
             title: non_empty(&foreground.window_title),
             steam_appid: foreground.steam_appid,
             window_class: None,
         };
-        self.profile_runtime()
+        let profile_id = self
+            .profile_runtime()
             .ok()
             .and_then(|runtime| runtime.resolve_foreground(&window).ok().flatten())
-            .map(|resolution| resolution.profile_id)
+            .map(|resolution| resolution.profile_id);
+        ActionAuditProfileRef {
+            schema_version: profile_id
+                .as_deref()
+                .and_then(|profile_id| self.action_audit_profile_schema_version(profile_id)),
+            profile_id,
+        }
     }
 
-    fn action_audit_active_profile_id(&self) -> Option<String> {
-        self.profile_runtime()
+    fn action_audit_active_profile(&self) -> ActionAuditProfileRef {
+        let profile_id = self
+            .profile_runtime()
             .ok()
-            .and_then(|runtime| runtime.active_profile_id().ok().flatten())
+            .and_then(|runtime| runtime.active_profile_id().ok().flatten());
+        ActionAuditProfileRef {
+            schema_version: profile_id
+                .as_deref()
+                .and_then(|profile_id| self.action_audit_profile_schema_version(profile_id)),
+            profile_id,
+        }
     }
+
+    fn action_audit_profile_schema_version(&self, profile_id: &str) -> Option<u32> {
+        self.profile_runtime().ok().and_then(|runtime| {
+            runtime
+                .list(true)
+                .ok()?
+                .into_iter()
+                .find(|profile| profile.id == profile_id)
+                .map(|profile| profile.schema_version)
+        })
+    }
+}
+
+struct ActionAuditProfileRef {
+    profile_id: Option<String>,
+    schema_version: Option<u32>,
 }
 
 fn next_audit_key_parts() -> (u64, u32) {
