@@ -379,6 +379,9 @@ this computer, the agent must do the reversible local work through Synapse and
 host workflows, then inspect the physical SoT.
 Missing local state creates the next action for the agent, not a blocker while
 reversible host work remains.
+Nothing is ever `status:blocked` because a configured-host prerequisite is
+absent; the only blockable item is the exact operator-only hard-to-reverse
+external action left after every reversible local step is exhausted.
 Browser downloads, GUI installers, Device Manager checks, package-manager
 installs, model/file generation, firmware flashing, app launching, USB/COM
 inspection, and UI inspection count as that reversible local work. They are

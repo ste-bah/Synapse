@@ -32,6 +32,9 @@ Missing local state creates the next action for the agent, not a blocker while
 reversible host work remains. Use Synapse's local computer-control surface to
 keep moving until the remaining step is a specific operator-only external
 decision.
+Nothing is ever `status:blocked` because a configured-host prerequisite is
+absent; the only blockable item is the exact operator-only hard-to-reverse
+external action left after every reversible local step is exhausted.
 
 **No GitHub Actions or CI gate.** Agent commits pushed during M4 include
 `[skip ci]`. Local checks may support regression confidence, but the shipping

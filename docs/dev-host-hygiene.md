@@ -22,6 +22,9 @@ reversible work, then inspect the resulting source of truth. Missing
 configured-host state is never a blocker by itself.
 Missing local state creates the next action for the agent, not a blocker while
 reversible host work remains.
+Nothing is ever `status:blocked` because a configured-host prerequisite is
+absent; the only blockable item is the exact operator-only hard-to-reverse
+external action left after every reversible local step is exhausted.
 That includes browser downloads, GUI installers, Device Manager checks,
 package-manager installs, model/file generation, firmware flashing, app
 launching, USB/COM inspection, and UI inspection through Synapse. Treat those

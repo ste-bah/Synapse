@@ -11,6 +11,9 @@ inspection, firmware flashing, and UI inspection are agent-owned while they are
 locally reversible.
 Missing local state creates the next action for the agent, not a blocker while
 reversible host work remains.
+Nothing is ever `status:blocked` because a configured-host prerequisite is
+absent; the only blockable item is the exact operator-only hard-to-reverse
+external action left after every reversible local step is exhausted.
 
 ## Recommended board
 

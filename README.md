@@ -23,6 +23,9 @@ the agent must use Synapse and local host workflows to make it happen, then
 inspect the source of truth.
 Missing local state creates the next action for the agent; it is not a blocker
 while reversible host work remains.
+Nothing is ever `status:blocked` because a configured-host prerequisite is
+absent; the only blockable item is the exact operator-only hard-to-reverse
+external action left after every reversible local step is exhausted.
 Synapse gives the agent full local computer-control responsibility for this
 host. Browser downloads, GUI installers, Device Manager checks, package-manager
 installs, model/file generation, firmware flashing, app launching, USB/COM

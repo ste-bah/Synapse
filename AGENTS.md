@@ -56,6 +56,9 @@ Operationally: do not stop at "missing." Use the same local host control the
 operator has through Synapse. If it can be done from this computer, do it and
 then inspect the resulting source of truth. Missing configured-host state is
 never a blocker by itself.
+Nothing is ever `status:blocked` because a configured-host prerequisite is
+absent; the only blockable item is the exact operator-only hard-to-reverse
+external action left after every reversible local step is exhausted.
 
 Treat missing local state as the next action, not as an excuse to pause. Synapse
 gives enough local computer control to do every reversible host action the
