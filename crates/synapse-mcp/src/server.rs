@@ -108,7 +108,7 @@ impl SynapseService {
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_env()?,
             m3_state: shared_m3_state_from_env()?,
-            m4_config: M4ServiceConfig::from_env(),
+            m4_config: M4ServiceConfig::from_env()?,
         })
     }
 

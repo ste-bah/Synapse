@@ -673,7 +673,9 @@ Returns:
   "stdout": "...",
   "stderr": "...",
   "duration_ms": 152,
-  "timed_out": false
+  "timed_out": false,
+  "stdout_truncated": false,
+  "stderr_truncated": false
 }
 ```
 
@@ -684,10 +686,13 @@ allowlist is the required permission surface.
 Rules:
 
 - `command + args` are resolved into a command line before allowlist matching.
-- `env` defaults to `{}` and only extends the child environment.
+- `env` defaults to `{}` and extends a restricted child environment containing
+  only `PATH`, `USERPROFILE`, `TEMP`, `SystemRoot`, plus any variables the child
+  interpreter synthesizes after launch.
 - `working_dir` defaults to the daemon's current directory if omitted.
-- Timeout kills the process tree and returns `timed_out: true` with captured
-  output up to the implementation cap.
+- Stdout/stderr are capped at 1 MiB each and report truncation flags.
+- Timeout kills the subprocess and returns `timed_out: true` with captured
+  output up to the cap.
 
 Errors: `TOOL_PARAMS_INVALID`, `SAFETY_SHELL_DENIED_BY_POLICY`,
 `SAFETY_PERMISSION_DENIED`, `ACTION_TARGET_INVALID`.

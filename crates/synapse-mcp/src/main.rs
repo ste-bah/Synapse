@@ -114,7 +114,7 @@ impl Cli {
         )
     }
 
-    fn m4_config(&self) -> m4::M4ServiceConfig {
+    fn m4_config(&self) -> anyhow::Result<m4::M4ServiceConfig> {
         m4::M4ServiceConfig::from_cli_parts(self.allow_shell.clone(), self.allow_launch.clone())
     }
 }
@@ -144,7 +144,7 @@ async fn run() -> anyhow::Result<ExitCode> {
 
     let m2_config = cli.m2_config();
     let m3_config = cli.m3_config();
-    let m4_config = cli.m4_config();
+    let m4_config = cli.m4_config()?;
 
     match cli.mode {
         Mode::Stdio => run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await,

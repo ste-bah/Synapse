@@ -456,7 +456,10 @@ Rules:
 - Startup config must include `--allow-shell <regex>`.
 - Broad patterns such as `.*` are rejected at startup.
 - The resolved command line must match an allowlist entry.
-- Stdout/stderr are capped; timeout kills the process tree.
+- The child starts with restricted inherited env (`PATH`, `USERPROFILE`,
+  `TEMP`, `SystemRoot`) plus request `env`; shell interpreters may synthesize
+  additional process-local variables.
+- Stdout/stderr are capped at 1 MiB each; timeout kills the subprocess.
 - Denied commands return `SAFETY_SHELL_DENIED_BY_POLICY`.
 
 Output shape:
@@ -466,7 +469,9 @@ Output shape:
   "exit_code": 0,
   "stdout": "synapse-m4-shell-ok\r\n",
   "stderr": "",
-  "timed_out": false
+  "timed_out": false,
+  "stdout_truncated": false,
+  "stderr_truncated": false
 }
 ```
 

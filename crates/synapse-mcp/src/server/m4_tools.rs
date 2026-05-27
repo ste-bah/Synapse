@@ -34,7 +34,7 @@ impl SynapseService {
             command = %params.0.command,
             "tool.invocation kind=act_run_shell"
         );
-        run_shell(params.0).await.map(Json)
+        run_shell(&self.m4_config, params.0).await.map(Json)
     }
 
     #[tool(description = "Launch an allowlisted local process and optionally wait for a window")]
