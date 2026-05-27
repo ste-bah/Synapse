@@ -105,7 +105,7 @@ Release profile: `opt-level=3`, `lto="thin"`, `codegen-units=16`, `panic="abort"
 
 ## 4. Public MCP tool surface (live)
 
-All 34 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[tool_router]`). Grouped by milestone:
+All 41 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[tool_router]`). Grouped by milestone:
 
 ### 4.1 M1 — perception (6 tools)
 
@@ -160,11 +160,18 @@ All 34 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[to
 | `act_run_shell` | Run an allowlisted local shell command | `server.rs::act_run_shell`, `m4.rs` |
 | `act_launch` | Launch an allowlisted local process and optionally wait for a window | `server.rs::act_launch`, `m4.rs` |
 
-### 4.5 M5 — profile registry/audit loop (1 tool)
+### 4.5 M5 — profile registry/audit loop (8 tools)
 
 | Tool | Description | Source |
 |---|---|---|
 | `profile_quality_refresh` | Refresh a local profile-quality snapshot from real `CF_ACTION_LOG` rows and persist/read it in `CF_PROFILES` | `server.rs::profile_quality_refresh`, `m3/profile_quality.rs` |
+| `profile_registry_search` | Search local registry rows under `profile_registry/v1/` in `CF_PROFILES` | `server.rs::profile_registry_search`, `m3/profile_registry.rs` |
+| `profile_registry_inspect` | Inspect one registry row in `CF_PROFILES` or registry head row in `CF_KV` | `server.rs::profile_registry_inspect`, `m3/profile_registry.rs` |
+| `profile_registry_install` | Validate a local package manifest/profile TOML, write registry rows, and return row keys/readbacks | `server.rs::profile_registry_install`, `m3/profile_registry.rs` |
+| `profile_registry_disable` | Mark an installed registry profile disabled or removed and read the stored row back | `server.rs::profile_registry_disable`, `m3/profile_registry.rs` |
+| `profile_registry_export` | Export local registry rows to a JSON bundle file | `server.rs::profile_registry_export`, `m3/profile_registry.rs` |
+| `profile_registry_import` | Import a validated local registry JSON bundle into `CF_PROFILES`/`CF_KV` | `server.rs::profile_registry_import`, `m3/profile_registry.rs` |
+| `audit_intelligence_query` | Summarize profile-linked action/event/reflex/session outcomes and quality snapshots | `server.rs::audit_intelligence_query`, `m3/profile_registry.rs` |
 
 The profile-registry / audit-data network effect is the P1 strategic moat
 tracked by #454 and child issues #455-#470. Profiles encode app/game operating
@@ -177,7 +184,8 @@ Physical sources of truth for this loop are profile TOML files, future registry
 index/package files, RocksDB `CF_ACTION_LOG`, `CF_REFLEX_AUDIT`, `CF_EVENTS`,
 `CF_OBSERVATIONS`, `CF_SESSIONS`, and `CF_PROFILES` rows, consent/export
 bundles, and MCP readbacks such as `profile_list`, `profile_quality_refresh`,
-`storage_inspect`, and future registry/audit tools. Manual FSV must trigger the
+`profile_registry_*`, `audit_intelligence_query`, and `storage_inspect`.
+Manual FSV must trigger the
 real runtime path and then read these physical stores directly; GitHub
 Actions/CI and automated checks never substitute for FSV.
 
@@ -191,7 +199,7 @@ Full parameter/return tables: [13_mcp_tool_reference.md](13_mcp_tool_reference.m
 
 ### 4.6 PRD-planned tools NOT live in this build
 
-`docs/computergames/05_mcp_tool_surface.md` defines the tool surface. Synapse's live build now has the M3 baseline, four operator storage diagnostics, M4 `act_combo`/`act_run_shell`/`act_launch`, and the M5 `profile_quality_refresh` local registry/audit scorer. The following PRD-planned entries remain unimplemented: `describe` (M5 VLM) and `read_hud` (M4 HUD pipeline).
+`docs/computergames/05_mcp_tool_surface.md` defines the tool surface. Synapse's live build now has the M3 baseline, four operator storage diagnostics, M4 `act_combo`/`act_run_shell`/`act_launch`, and the M5 local registry/audit tools (`profile_quality_refresh`, `profile_registry_*`, and `audit_intelligence_query`). The following PRD-planned entries remain unimplemented: `describe` (M5 VLM) and `read_hud` (M4 HUD pipeline).
 
 ## 5. Entry points
 

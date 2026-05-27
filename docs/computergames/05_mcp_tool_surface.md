@@ -5,9 +5,10 @@
 1. **Tool count cap:** M3 shipped 30 live MCP tools. M4 expands the target
    surface to 33 live MCP tools by adding `act_combo`, `act_run_shell`, and
    `act_launch` per the M4 phase plan. M5 adds the local registry/audit scoring
-   tool `profile_quality_refresh`, bringing the live surface to 34. Any further
-   agent-facing tools require an ADR-approved cap change. Overlapping tools
-   merge. Profile and parameter knobs are the escape hatches.
+   tool `profile_quality_refresh` plus the #458 local registry/intelligence
+   tool set, bringing the live surface to 41. Any further agent-facing tools
+   require an ADR-approved cap change. Overlapping tools merge. Profile and
+   parameter knobs are the escape hatches.
 2. **One tool, one verb.** No `do_everything(action_kind, ...)` mega-tools.
 3. **Structured input, structured output.** Every tool defines a JSON Schema with `additionalProperties: false`. Every response carries explicit fields, no free-form text.
 4. **No silent success.** If a tool did not do the work, it returns an MCP error with `code: SCREAMING_SNAKE_CASE`, never `success: true` with a partial result.
@@ -16,7 +17,8 @@
 7. **Stable identifiers.** `element_id`, `entity_id`, `track_id`, `reflex_id`, `session_id` are returned by tools and accepted unchanged by subsequent calls. Agent never invents these.
 
 The first 30 tools below are the live M3 baseline. M4 adds rows 31-33, and M5
-adds row 34 for local profile-registry/audit quality scoring.
+adds rows 34-41 for local profile-registry/audit quality scoring, registry row
+operations, import/export, and audit intelligence.
 Schemas use abbreviated JSON Schema syntax; canonical schema is exported by the
 daemon through standard MCP `tools/list`. Until the M4 tools are implemented,
 their schemas in this doc are the target contract for #401/#403/#406 and the
@@ -62,8 +64,15 @@ future `tools/list` snapshots in #447/#448.
 | 32 | `act_run_shell` | write | runs an allowlisted local shell command |
 | 33 | `act_launch` | write | launches an allowlisted local process |
 | 34 | `profile_quality_refresh` | write/read | refreshes local profile quality from action audit rows |
+| 35 | `profile_registry_search` | read | searches local registry rows in `CF_PROFILES` |
+| 36 | `profile_registry_inspect` | read | reads one registry row from `CF_PROFILES` or `CF_KV` |
+| 37 | `profile_registry_install` | write/read | validates a package manifest and writes registry rows |
+| 38 | `profile_registry_disable` | write/read | marks an installed profile disabled or removed |
+| 39 | `profile_registry_export` | read/write | writes a local JSON registry bundle file |
+| 40 | `profile_registry_import` | write/read | validates and imports a local JSON registry bundle |
+| 41 | `audit_intelligence_query` | read | summarizes profile-linked audit outcomes |
 
-M3 live count: 30 tools. M4 live count: 33 tools. Current M5 live count: 34
+M3 live count: 30 tools. M4 live count: 33 tools. Current M5 live count: 41
 tools.
 
 Deferred ideas from earlier drafts (`describe` and `read_hud`) are still not
@@ -910,6 +919,180 @@ ignored corrupt/stale rows, quality counts/rates, Wilson lower-bound score,
 compatibility counters, profile-schema-version recency/mixed-version counters,
 redaction policy, and contribution policy. Export is always `false`; sharing
 requires a future explicit operator-approved path.
+
+### 3.28b `profile_registry_search`
+
+Searches local registry rows under `profile_registry/v1/` in `CF_PROFILES`.
+This is the operator-facing list/search readback for source/package/profile/
+installed/compatibility/quality-link rows.
+
+```json
+{
+  "name": "profile_registry_search",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "query": {"type": "string"},
+      "row_kind": {"type": "string"},
+      "include_disabled": {"type": "boolean", "default": false},
+      "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}
+    }
+  }
+}
+```
+
+Returns `cf_name`, `prefix`, filters, `total_matched`, and row summaries with
+UTF-8 keys, hex keys, row kind/id, state, profile/package ids, update time, and
+bounded value prefix.
+
+### 3.28c `profile_registry_inspect`
+
+Reads one registry row by exact key or derived id. `profile_registry/v1/head/*`
+keys read `CF_KV`; all other `profile_registry/v1/*` keys read `CF_PROFILES`.
+
+```json
+{
+  "name": "profile_registry_inspect",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "row_key": {"type": "string"},
+      "source_id": {"type": "string"},
+      "package_id": {"type": "string"},
+      "package_version": {"type": "string"},
+      "profile_id": {"type": "string"},
+      "profile_version": {"type": "string"},
+      "installed_profile_id": {"type": "string"}
+    }
+  }
+}
+```
+
+Returns `cf_name`, `row_key`, `found`, and when found the full decoded JSON row
+plus the same row summary used by search.
+
+### 3.28d `profile_registry_install`
+
+Validates a local profile package manifest, parses the referenced profile TOML,
+checks manifest/profile id agreement, writes local registry rows to
+`CF_PROFILES`, writes the source head pointer to `CF_KV`, and reads the written
+rows back before returning.
+
+```json
+{
+  "name": "profile_registry_install",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["manifest_path"],
+    "properties": {
+      "manifest_path": {"type": "string"},
+      "expected_manifest_digest": {"type": "string"},
+      "source_id": {"type": "string", "default": "registry.local"}
+    }
+  }
+}
+```
+
+Duplicate package id/version with the same manifest digest is idempotent.
+Duplicate id/version with a different digest fails closed with no companion-row
+rewrite. The response returns `manifest_digest`, profile TOML path, `wrote_rows`,
+`idempotent`, `cf_profile_row_keys`, `cf_kv_row_keys`, and row summaries.
+
+### 3.28e `profile_registry_disable`
+
+Marks an installed registry row disabled or removed in `CF_PROFILES` and reads
+the updated row back.
+
+```json
+{
+  "name": "profile_registry_disable",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["profile_id"],
+    "properties": {
+      "profile_id": {"type": "string"},
+      "state": {"enum": ["disabled", "removed"], "default": "disabled"},
+      "reason": {"type": "string"}
+    }
+  }
+}
+```
+
+Returns previous/current state, the row key, and the decoded stored row.
+
+### 3.28f `profile_registry_export`
+
+Exports local registry rows from `CF_PROFILES` and `CF_KV` into a JSON bundle on
+disk. The bundle is a local file artifact and is not a consent/share path.
+
+```json
+{
+  "name": "profile_registry_export",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["output_path"],
+    "properties": {
+      "output_path": {"type": "string"},
+      "query": {"type": "string"},
+      "row_kind": {"type": "string"},
+      "include_disabled": {"type": "boolean", "default": false},
+      "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}
+    }
+  }
+}
+```
+
+Returns output path, bytes written, exported row count, and row summaries.
+
+### 3.28g `profile_registry_import`
+
+Imports a local JSON registry bundle after validating schema version, supported
+CF names, `profile_registry/v1/` key namespace, and object-valued rows.
+
+```json
+{
+  "name": "profile_registry_import",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["bundle_path"],
+    "properties": {"bundle_path": {"type": "string"}}
+  }
+}
+```
+
+Returns read row count, per-CF write counts, and summaries for the imported
+rows.
+
+### 3.28h `audit_intelligence_query`
+
+Summarizes profile-linked outcomes across the audit SoTs now populated by
+profile activation, action, and reflex paths.
+
+```json
+{
+  "name": "audit_intelligence_query",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["profile_id"],
+    "properties": {
+      "profile_id": {"type": "string"},
+      "max_rows": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}
+    }
+  }
+}
+```
+
+Reads newest rows from `CF_ACTION_LOG`, `CF_EVENTS`, `CF_REFLEX_AUDIT`, and
+`CF_SESSIONS`, reads `CF_PROFILES` quality snapshot
+`profile_quality/v1/<profile_id>` when present, and returns bucket counts by
+status/tool/kind/error code plus learning candidates.
 
 ### 3.29 `health`
 

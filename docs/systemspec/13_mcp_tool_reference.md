@@ -4,10 +4,10 @@ Source files covered:
 - `crates/synapse-mcp/src/server.rs`
 - `crates/synapse-mcp/src/m1.rs` (+ `m1/{ocr, search, sources}.rs`)
 - `crates/synapse-mcp/src/m2/{aim, click, clipboard, drag, pad, press, release_all, scroll, type_text}.rs`
-- `crates/synapse-mcp/src/m3/{audio, permissions, profile, profile_quality, reflex, replay, subscribe}.rs`
+- `crates/synapse-mcp/src/m3/{audio, permissions, profile, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 34 tools below are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 41 tools below are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -387,6 +387,128 @@ operator-approved path.
 **Errors:** `PROFILE_NOT_FOUND`, `TOOL_PARAMS_INVALID`, `STORAGE_READ_FAILED`,
 `STORAGE_WRITE_FAILED`, `TOOL_INTERNAL_ERROR`.
 
+## 23b. `profile_registry_search`
+
+**Description:** "Search local profile registry rows"
+**Permissions:** `READ_PROFILE`, `READ_STORAGE`
+**Side effects:** none; scans `CF_PROFILES` rows whose keys start with `profile_registry/v1/`
+
+| Parameter | Type | Required | Default | Range | Description |
+|---|---|---|---|---|---|
+| `query` | `Option<String>` | no | — | — | Case-insensitive key/value text filter |
+| `row_kind` | `Option<String>` | no | — | non-empty when present | Filters decoded row envelope kind |
+| `include_disabled` | `bool` | no | `false` | — | Includes `state=disabled` / `state=removed` rows |
+| `limit` | `u32` | no | `100` | `1..=1000` | Maximum returned summaries |
+
+**Returns:** `ProfileRegistrySearchResponse { cf_name, prefix, query,
+row_kind, include_disabled, limit, total_matched, rows }`. Rows are
+`ProfileRegistryRowSummary` values with UTF-8 key, key hex, row kind/id,
+profile/package ids, state, update time, value length, and bounded value prefix.
+
+## 23c. `profile_registry_inspect`
+
+**Description:** "Inspect one local profile registry row by key or id"
+**Permissions:** `READ_PROFILE`, `READ_STORAGE`
+**Side effects:** none; reads `CF_PROFILES` or `CF_KV`
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `row_key` | `Option<String>` | no | Exact `profile_registry/v1/*` key; `head/*` keys read `CF_KV`, others read `CF_PROFILES` |
+| `source_id` | `Option<String>` | no | Builds `profile_registry/v1/source/<source_id>` |
+| `package_id` + `package_version` | `Option<String>` | no | Builds package row key |
+| `profile_id` + `profile_version` | `Option<String>` | no | Builds profile version row key |
+| `installed_profile_id` | `Option<String>` | no | Builds installed row key |
+
+**Returns:** `ProfileRegistryInspectResponse { cf_name, row_key, found, row }`
+where `row` includes the decoded JSON value when found.
+**Errors:** `TOOL_PARAMS_INVALID`, storage read/decode errors.
+
+## 23d. `profile_registry_install`
+
+**Description:** "Install or update a local profile registry package manifest"
+**Permissions:** `READ_PROFILE`, `READ_STORAGE`, `WRITE_STORAGE`
+**Side effects:** validates manifest/profile files; writes `CF_PROFILES`
+registry rows and a `CF_KV` source head pointer; reads written rows back
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `manifest_path` | `String` | yes | — | Local package manifest TOML path |
+| `expected_manifest_digest` | `Option<String>` | no | — | Optional `sha256:<hex>` digest that must match manifest bytes |
+| `source_id` | `String` | no | `registry.local` | Lowercase source id for source/head rows |
+
+**Returns:** `ProfileRegistryInstallResponse { operation, source_id,
+package_id, package_version, profile_id, profile_version, manifest_path,
+manifest_digest, profile_toml_path, wrote_rows, idempotent,
+cf_profile_row_keys, cf_kv_row_keys, row_summaries }`.
+
+Duplicate package id/version with the same manifest digest is an idempotent
+no-op. Duplicate id/version with a different digest fails closed.
+
+## 23e. `profile_registry_disable`
+
+**Description:** "Disable or remove an installed local profile registry row"
+**Permissions:** `READ_PROFILE`, `READ_STORAGE`, `WRITE_STORAGE`
+**Side effects:** updates one `CF_PROFILES` installed-profile row and reads it back
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `profile_id` | `String` | yes | — | Installed profile id |
+| `state` | `String` | no | `disabled` | `disabled` or `removed` |
+| `reason` | `Option<String>` | no | — | Optional local reason stored on the row |
+
+**Returns:** `ProfileRegistryDisableResponse { profile_id, row_key,
+previous_state, state, wrote_row, row }`.
+
+## 23f. `profile_registry_export`
+
+**Description:** "Export local profile registry rows to a JSON bundle"
+**Permissions:** `READ_PROFILE`, `READ_STORAGE`
+**Side effects:** writes a local JSON bundle file
+
+| Parameter | Type | Required | Default | Range | Description |
+|---|---|---|---|---|---|
+| `output_path` | `String` | yes | — | — | Destination JSON bundle path |
+| `query` | `Option<String>` | no | — | — | Same filter as search |
+| `row_kind` | `Option<String>` | no | — | — | Same filter as search |
+| `include_disabled` | `bool` | no | `false` | — | Include disabled/removed rows |
+| `limit` | `u32` | no | `100` | `1..=1000` | Maximum exported rows |
+
+**Returns:** `ProfileRegistryExportResponse { output_path, bytes_written,
+rows_exported, rows }`.
+
+## 23g. `profile_registry_import`
+
+**Description:** "Import a local profile registry JSON bundle"
+**Permissions:** `READ_PROFILE`, `READ_STORAGE`, `WRITE_STORAGE`
+**Side effects:** writes validated `CF_PROFILES` and `CF_KV` registry rows
+
+| Parameter | Type | Required | Description |
+|---|---|---|---|
+| `bundle_path` | `String` | yes | Local JSON bundle path |
+
+**Returns:** `ProfileRegistryImportResponse { bundle_path, rows_read,
+cf_profile_rows_written, cf_kv_rows_written, rows }`.
+**Errors:** `TOOL_PARAMS_INVALID` for malformed bundle schema, unsupported CF,
+non-registry key, invalid `CF_KV` namespace, or non-object row values.
+
+## 23h. `audit_intelligence_query`
+
+**Description:** "Summarize profile-linked audit outcomes for registry intelligence"
+**Permissions:** `READ_PROFILE`, `READ_STORAGE`
+**Side effects:** none; reads audit/storage rows
+
+| Parameter | Type | Required | Default | Range | Description |
+|---|---|---|---|---|---|
+| `profile_id` | `String` | yes | — | loaded or registry profile id | Profile id to match across stored audit contexts |
+| `max_rows` | `u32` | no | `100` | `1..=1000` | Newest rows scanned per audit CF |
+
+**Returns:** `AuditIntelligenceQueryResponse { profile_id, max_rows, action,
+events, reflexes, sessions, quality_snapshot_key, quality_snapshot,
+learning_candidates }`. Buckets summarize matches by status, tool/kind, and
+error code across `CF_ACTION_LOG`, `CF_EVENTS`, `CF_REFLEX_AUDIT`, and
+`CF_SESSIONS`; the quality snapshot is read from
+`CF_PROFILES/profile_quality/v1/<profile_id>` when present.
+
 ## 24. `replay_record`
 
 **Description:** "Record observations and/or events to a replay JSONL file"
@@ -443,10 +565,10 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `cf` | `Option<String>` | no | — | When set, restricts the report to one CF (must match one of `ALL_COLUMN_FAMILIES`); otherwise all 11 CFs |
+| none | `{}` | no | `{}` | Always reports every operator-visible RocksDB column family. |
 
 **Returns:** `StorageInspectResponse { schema_version: u32, pressure_level, pressure_transition_codes, cf_sizes, cf_row_counts, cf_row_samples }`. Each `cf_row_samples` value is a bounded newest-row list with `key_hex`, `value_len_bytes`, `value_utf8_prefix`, and `value_truncated`.
-**Errors:** `STORAGE_OPEN_FAILED`, `TOOL_PARAMS_INVALID` (unknown CF name).
+**Errors:** `STORAGE_OPEN_FAILED`, `TOOL_PARAMS_INVALID` (unknown parameter).
 
 ## 28. `storage_put_probe_rows`
 
@@ -503,6 +625,8 @@ For convenience the M3 tool-call gating is summarized here (live source: `crates
 | `replay_record` | `WRITE_REPLAY` |
 | `audio_tail`, `audio_transcribe` | `READ_AUDIO` |
 | `profile_quality_refresh` | `READ_PROFILE`, `READ_STORAGE`, `WRITE_STORAGE` |
+| `profile_registry_search`, `profile_registry_inspect`, `profile_registry_export`, `audit_intelligence_query` | `READ_PROFILE`, `READ_STORAGE` |
+| `profile_registry_install`, `profile_registry_disable`, `profile_registry_import` | `READ_PROFILE`, `READ_STORAGE`, `WRITE_STORAGE` |
 | `storage_inspect` | `READ_STORAGE` |
 | `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample` | `WRITE_STORAGE` |
 

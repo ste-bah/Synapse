@@ -50,6 +50,17 @@ use crate::{
         profile_quality::{
             ProfileQualityRefreshParams, ProfileQualityRefreshResponse, refresh_profile_quality,
         },
+        profile_registry::{
+            AuditIntelligenceQueryParams, AuditIntelligenceQueryResponse,
+            ProfileRegistryDisableParams, ProfileRegistryDisableResponse,
+            ProfileRegistryExportParams, ProfileRegistryExportResponse,
+            ProfileRegistryImportParams, ProfileRegistryImportResponse,
+            ProfileRegistryInspectParams, ProfileRegistryInspectResponse,
+            ProfileRegistryInstallParams, ProfileRegistryInstallResponse,
+            ProfileRegistrySearchParams, ProfileRegistrySearchResponse, disable_registry_profile,
+            export_registry, import_registry, inspect_registry, install_registry_package,
+            query_audit_intelligence, search_registry,
+        },
         reflex::{
             ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse,
             ReflexListParams, ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse,

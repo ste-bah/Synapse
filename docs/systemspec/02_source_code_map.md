@@ -36,7 +36,7 @@ crates/synapse-mcp/
 ├── Cargo.toml                      # Binary crate; depends on every other library crate
 └── src/
     ├── main.rs                     # Process entrypoint, clap CLI, telemetry init, stdio/http dispatch
-    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 34 MCP tools
+    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 41 MCP tools
     ├── server/
     │   ├── action_audit.rs         # CF_ACTION_LOG start/result audit rows with profile/session context
     │   ├── audit_context.rs        # Profile activation/session/event audit context persistence helpers

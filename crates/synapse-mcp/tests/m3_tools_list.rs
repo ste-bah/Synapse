@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 31] = [
+const EXPECTED_TOOLS: [&str; 38] = [
     "act_aim",
     "act_click",
     "act_clipboard",
@@ -15,12 +15,19 @@ const EXPECTED_TOOLS: [&str; 31] = [
     "act_type",
     "audio_tail",
     "audio_transcribe",
+    "audit_intelligence_query",
     "find",
     "health",
     "observe",
     "profile_activate",
     "profile_list",
     "profile_quality_refresh",
+    "profile_registry_disable",
+    "profile_registry_export",
+    "profile_registry_import",
+    "profile_registry_inspect",
+    "profile_registry_install",
+    "profile_registry_search",
     "read_text",
     "reflex_cancel",
     "reflex_history",
@@ -215,6 +222,55 @@ fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
     read_default(
         readbacks,
         tools,
+        "profile_registry_search",
+        "inputSchema.properties.include_disabled.default",
+        &json!(false),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "profile_registry_search",
+        "inputSchema.properties.limit.default",
+        &json!(100),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "profile_registry_install",
+        "inputSchema.properties.source_id.default",
+        &json!("registry.local"),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "profile_registry_disable",
+        "inputSchema.properties.state.default",
+        &json!("disabled"),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "profile_registry_export",
+        "inputSchema.properties.include_disabled.default",
+        &json!(false),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "profile_registry_export",
+        "inputSchema.properties.limit.default",
+        &json!(100),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "audit_intelligence_query",
+        "inputSchema.properties.max_rows.default",
+        &json!(100),
+    )?;
+    read_default(
+        readbacks,
+        tools,
         "replay_record",
         "inputSchema.properties.format.default",
         &json!("jsonl"),
@@ -255,6 +311,16 @@ fn read_required_fields(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
     read_required(readbacks, tools, "reflex_cancel", "reflex_id")?;
     read_required(readbacks, tools, "profile_activate", "profile_id")?;
     read_required(readbacks, tools, "profile_quality_refresh", "profile_id")?;
+    read_required(
+        readbacks,
+        tools,
+        "profile_registry_install",
+        "manifest_path",
+    )?;
+    read_required(readbacks, tools, "profile_registry_disable", "profile_id")?;
+    read_required(readbacks, tools, "profile_registry_export", "output_path")?;
+    read_required(readbacks, tools, "profile_registry_import", "bundle_path")?;
+    read_required(readbacks, tools, "audit_intelligence_query", "profile_id")?;
     read_required(readbacks, tools, "storage_put_probe_rows", "cf_name")?;
     read_required(readbacks, tools, "storage_put_probe_rows", "key_prefix")?;
     read_required(readbacks, tools, "storage_put_probe_rows", "rows")?;

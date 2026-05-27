@@ -1,17 +1,24 @@
 use super::{
-    AudioTailParams, AudioTailResponse, AudioTranscribeParams, AudioTranscribeResponse, ErrorData,
-    Json, Parameters, ProfileActivateParams, ProfileActivateResponse, ProfileListParams,
-    ProfileListResponse, ProfileQualityRefreshParams, ProfileQualityRefreshResponse,
-    ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse,
-    ReflexListParams, ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse,
-    ReplayRecordParams, ReplayRecordResponse, StorageGcOnceParams, StorageGcOnceResponse,
-    StorageInspectParams, StorageInspectResponse, StoragePressureSampleParams,
-    StoragePressureSampleResponse, StoragePutProbeRowsParams, StoragePutProbeRowsResponse,
-    SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams, SubscribeResponse,
-    SynapseService, apply_storage_pressure_sample, cancel_reflex, cancel_subscription,
-    history_reflexes, inspect_storage, list_profiles, list_reflexes, put_probe_rows, record_replay,
-    refresh_profile_quality, register_reflex, run_storage_gc_once, subscribe_to_events, tail_audio,
-    tool, tool_router, transcribe_audio,
+    AudioTailParams, AudioTailResponse, AudioTranscribeParams, AudioTranscribeResponse,
+    AuditIntelligenceQueryParams, AuditIntelligenceQueryResponse, ErrorData, Json, Parameters,
+    ProfileActivateParams, ProfileActivateResponse, ProfileListParams, ProfileListResponse,
+    ProfileQualityRefreshParams, ProfileQualityRefreshResponse, ProfileRegistryDisableParams,
+    ProfileRegistryDisableResponse, ProfileRegistryExportParams, ProfileRegistryExportResponse,
+    ProfileRegistryImportParams, ProfileRegistryImportResponse, ProfileRegistryInspectParams,
+    ProfileRegistryInspectResponse, ProfileRegistryInstallParams, ProfileRegistryInstallResponse,
+    ProfileRegistrySearchParams, ProfileRegistrySearchResponse, ReflexCancelParams,
+    ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse, ReflexListParams,
+    ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse, ReplayRecordParams,
+    ReplayRecordResponse, StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams,
+    StorageInspectResponse, StoragePressureSampleParams, StoragePressureSampleResponse,
+    StoragePutProbeRowsParams, StoragePutProbeRowsResponse, SubscribeCancelParams,
+    SubscribeCancelResponse, SubscribeParams, SubscribeResponse, SynapseService,
+    apply_storage_pressure_sample, cancel_reflex, cancel_subscription, disable_registry_profile,
+    export_registry, history_reflexes, import_registry, inspect_registry, inspect_storage,
+    install_registry_package, list_profiles, list_reflexes, put_probe_rows,
+    query_audit_intelligence, record_replay, refresh_profile_quality, register_reflex,
+    run_storage_gc_once, search_registry, subscribe_to_events, tail_audio, tool, tool_router,
+    transcribe_audio,
 };
 
 #[tool_router(router = m3_tool_router, vis = "pub(super)")]
@@ -205,6 +212,149 @@ impl SynapseService {
         let profile_runtime = self.profile_runtime()?;
         let reflex_runtime = self.reflex_runtime()?;
         refresh_profile_quality(&profile_runtime, &reflex_runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "Search local profile registry rows")]
+    pub async fn profile_registry_search(
+        &self,
+        params: Parameters<ProfileRegistrySearchParams>,
+    ) -> Result<Json<ProfileRegistrySearchResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "profile_registry_search",
+            row_kind = ?params.0.row_kind,
+            include_disabled = params.0.include_disabled,
+            limit = params.0.limit,
+            "tool.invocation kind=profile_registry_search"
+        );
+        self.require_m3_permissions(
+            "profile_registry_search",
+            &crate::m3::profile_registry::required_permissions_search(&params.0),
+        )?;
+        let reflex_runtime = self.reflex_runtime()?;
+        search_registry(&reflex_runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "Inspect one local profile registry row by key or id")]
+    pub async fn profile_registry_inspect(
+        &self,
+        params: Parameters<ProfileRegistryInspectParams>,
+    ) -> Result<Json<ProfileRegistryInspectResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "profile_registry_inspect",
+            row_key = ?params.0.row_key,
+            package_id = ?params.0.package_id,
+            profile_id = ?params.0.profile_id,
+            installed_profile_id = ?params.0.installed_profile_id,
+            "tool.invocation kind=profile_registry_inspect"
+        );
+        self.require_m3_permissions(
+            "profile_registry_inspect",
+            &crate::m3::profile_registry::required_permissions_inspect(&params.0),
+        )?;
+        let reflex_runtime = self.reflex_runtime()?;
+        inspect_registry(&reflex_runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "Install or update a local profile registry package manifest")]
+    pub async fn profile_registry_install(
+        &self,
+        params: Parameters<ProfileRegistryInstallParams>,
+    ) -> Result<Json<ProfileRegistryInstallResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "profile_registry_install",
+            source_id = %params.0.source_id,
+            manifest_path = %params.0.manifest_path,
+            "tool.invocation kind=profile_registry_install"
+        );
+        self.require_m3_permissions(
+            "profile_registry_install",
+            &crate::m3::profile_registry::required_permissions_install(&params.0),
+        )?;
+        let reflex_runtime = self.reflex_runtime()?;
+        install_registry_package(&reflex_runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "Disable or remove an installed local profile registry row")]
+    pub async fn profile_registry_disable(
+        &self,
+        params: Parameters<ProfileRegistryDisableParams>,
+    ) -> Result<Json<ProfileRegistryDisableResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "profile_registry_disable",
+            profile_id = %params.0.profile_id,
+            state = %params.0.state,
+            "tool.invocation kind=profile_registry_disable"
+        );
+        self.require_m3_permissions(
+            "profile_registry_disable",
+            &crate::m3::profile_registry::required_permissions_disable(&params.0),
+        )?;
+        let reflex_runtime = self.reflex_runtime()?;
+        disable_registry_profile(&reflex_runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "Export local profile registry rows to a JSON bundle")]
+    pub async fn profile_registry_export(
+        &self,
+        params: Parameters<ProfileRegistryExportParams>,
+    ) -> Result<Json<ProfileRegistryExportResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "profile_registry_export",
+            output_path = %params.0.output_path,
+            row_kind = ?params.0.row_kind,
+            limit = params.0.limit,
+            "tool.invocation kind=profile_registry_export"
+        );
+        self.require_m3_permissions(
+            "profile_registry_export",
+            &crate::m3::profile_registry::required_permissions_export(&params.0),
+        )?;
+        let reflex_runtime = self.reflex_runtime()?;
+        export_registry(&reflex_runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "Import a local profile registry JSON bundle")]
+    pub async fn profile_registry_import(
+        &self,
+        params: Parameters<ProfileRegistryImportParams>,
+    ) -> Result<Json<ProfileRegistryImportResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "profile_registry_import",
+            bundle_path = %params.0.bundle_path,
+            "tool.invocation kind=profile_registry_import"
+        );
+        self.require_m3_permissions(
+            "profile_registry_import",
+            &crate::m3::profile_registry::required_permissions_import(&params.0),
+        )?;
+        let reflex_runtime = self.reflex_runtime()?;
+        import_registry(&reflex_runtime, &params.0).map(Json)
+    }
+
+    #[tool(description = "Summarize profile-linked audit outcomes for registry intelligence")]
+    pub async fn audit_intelligence_query(
+        &self,
+        params: Parameters<AuditIntelligenceQueryParams>,
+    ) -> Result<Json<AuditIntelligenceQueryResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "audit_intelligence_query",
+            profile_id = %params.0.profile_id,
+            max_rows = params.0.max_rows,
+            "tool.invocation kind=audit_intelligence_query"
+        );
+        self.require_m3_permissions(
+            "audit_intelligence_query",
+            &crate::m3::profile_registry::required_permissions_audit(&params.0),
+        )?;
+        let reflex_runtime = self.reflex_runtime()?;
+        query_audit_intelligence(&reflex_runtime, &params.0).map(Json)
     }
 
     #[tool(description = "Record observations and/or events to a replay JSONL file")]

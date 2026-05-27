@@ -65,6 +65,25 @@ impl ReflexRuntime {
         Ok(rows.split_off(keep_from))
     }
 
+    /// Returns rows in one storage column family whose keys start with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the column family cannot be scanned.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", cf_name, prefix_len = prefix.len(), limit))]
+    pub fn storage_cf_prefix_rows(
+        &self,
+        cf_name: &str,
+        prefix: &[u8],
+        limit: usize,
+    ) -> StorageResult<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut rows = self.db.scan_cf_prefix(cf_name, prefix)?;
+        if rows.len() > limit {
+            rows.truncate(limit);
+        }
+        Ok(rows)
+    }
+
     /// Writes a bounded diagnostic batch to storage and flushes it immediately.
     ///
     /// # Errors
@@ -124,6 +143,17 @@ impl ReflexRuntime {
         self.db.flush()
     }
 
+    /// Writes local registry key-value rows and flushes them immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the write or flush fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
+    pub fn storage_put_kv_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
+        self.db.put_batch(cf::CF_KV, rows)?;
+        self.db.flush()
+    }
+
     /// Returns one exact profile-registry row by key.
     ///
     /// # Errors
@@ -134,6 +164,20 @@ impl ReflexRuntime {
         Ok(self
             .db
             .scan_cf(cf::CF_PROFILES)?
+            .into_iter()
+            .find_map(|(row_key, value)| (row_key == key).then_some(value)))
+    }
+
+    /// Returns one exact local registry key-value row by key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the key-value CF cannot be scanned.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", key_len = key.len()))]
+    pub fn storage_kv_row(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .scan_cf(cf::CF_KV)?
             .into_iter()
             .find_map(|(row_key, value)| (row_key == key).then_some(value)))
     }

@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m3_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 31,
+  "count": 38,
   "m3_defaults": [
     {
       "actual": [],
@@ -63,6 +63,41 @@ expression: snapshot
       "tool": "profile_quality_refresh"
     },
     {
+      "actual": false,
+      "path": "inputSchema.properties.include_disabled.default",
+      "tool": "profile_registry_search"
+    },
+    {
+      "actual": 100,
+      "path": "inputSchema.properties.limit.default",
+      "tool": "profile_registry_search"
+    },
+    {
+      "actual": "registry.local",
+      "path": "inputSchema.properties.source_id.default",
+      "tool": "profile_registry_install"
+    },
+    {
+      "actual": "disabled",
+      "path": "inputSchema.properties.state.default",
+      "tool": "profile_registry_disable"
+    },
+    {
+      "actual": false,
+      "path": "inputSchema.properties.include_disabled.default",
+      "tool": "profile_registry_export"
+    },
+    {
+      "actual": 100,
+      "path": "inputSchema.properties.limit.default",
+      "tool": "profile_registry_export"
+    },
+    {
+      "actual": 100,
+      "path": "inputSchema.properties.max_rows.default",
+      "tool": "audit_intelligence_query"
+    },
+    {
       "actual": "jsonl",
       "path": "inputSchema.properties.format.default",
       "tool": "replay_record"
@@ -106,6 +141,31 @@ expression: snapshot
       "actual_contains": "profile_id",
       "path": "inputSchema.required",
       "tool": "profile_quality_refresh"
+    },
+    {
+      "actual_contains": "manifest_path",
+      "path": "inputSchema.required",
+      "tool": "profile_registry_install"
+    },
+    {
+      "actual_contains": "profile_id",
+      "path": "inputSchema.required",
+      "tool": "profile_registry_disable"
+    },
+    {
+      "actual_contains": "output_path",
+      "path": "inputSchema.required",
+      "tool": "profile_registry_export"
+    },
+    {
+      "actual_contains": "bundle_path",
+      "path": "inputSchema.required",
+      "tool": "profile_registry_import"
+    },
+    {
+      "actual_contains": "profile_id",
+      "path": "inputSchema.required",
+      "tool": "audit_intelligence_query"
     },
     {
       "actual_contains": "cf_name",
@@ -159,12 +219,19 @@ expression: snapshot
     "act_type",
     "audio_tail",
     "audio_transcribe",
+    "audit_intelligence_query",
     "find",
     "health",
     "observe",
     "profile_activate",
     "profile_list",
     "profile_quality_refresh",
+    "profile_registry_disable",
+    "profile_registry_export",
+    "profile_registry_import",
+    "profile_registry_inspect",
+    "profile_registry_install",
+    "profile_registry_search",
     "read_text",
     "reflex_cancel",
     "reflex_history",

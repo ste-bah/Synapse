@@ -354,6 +354,14 @@ operator-approved path and the governance metadata defined in
 license SPDX expression, attribution, provenance, revocation state, redaction
 policy, and operator consent id.
 
+The M5 runtime registry surface now includes `profile_registry_search`,
+`profile_registry_inspect`, `profile_registry_install`,
+`profile_registry_disable`, `profile_registry_export`,
+`profile_registry_import`, and `audit_intelligence_query`. These tools operate
+on the physical `CF_PROFILES` / `CF_KV` row namespaces below and return exact
+row keys or bundle paths so manual FSV can trigger the real MCP tool and then
+separately read the stored RocksDB rows or filesystem bundle.
+
 ### 7.1 Local profile registry row namespaces
 
 The local profile registry uses existing `CF_PROFILES` JSON rows for M5 v0; no

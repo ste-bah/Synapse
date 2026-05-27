@@ -18,9 +18,13 @@ Decision:
    a separate inspectable JSON row set that links profile TOML/package metadata,
    provenance, trust, compatibility, quality, and audit evidence.
 
-Future runtime tools must write these rows through Synapse and then verify them
-by reading `CF_PROFILES`/`CF_KV` with `storage_inspect` or a registry-specific
-readback tool. The fixtures in
+Runtime tools now write these rows through Synapse: `profile_registry_install`
+validates a local package manifest/profile TOML and writes source, package,
+profile, installed, compatibility, optional quality-link, and source-head rows;
+`profile_registry_disable` updates installed state; `profile_registry_export`
+and `profile_registry_import` move local bundles. Manual FSV must verify them
+by reading `CF_PROFILES`/`CF_KV` with `storage_inspect` and registry-specific
+readback tools. The fixtures in
 `docs/computergames/fixtures/profile_registry_data_model/` are synthetic row
 SoTs for this docs/data-model baseline.
 
@@ -179,7 +183,8 @@ Required fields beyond the envelope:
 
 ## 6. Install/register transaction shape
 
-A successful local package registration writes these rows in one batch:
+A successful local package registration writes these rows through the real MCP
+`profile_registry_install` path:
 
 1. `profile_registry/v1/source/<source_id>` if missing or changed.
 2. `profile_registry/v1/package/<package_id>/<package_version>`.
@@ -217,8 +222,9 @@ Runtime FSV for this model must:
 4. Exercise duplicate id/version, corrupt manifest, and incompatible schema
    version edges and prove no silent partial install.
 
-For this docs baseline, the synthetic fixture row files are the physical SoT.
-They show the exact keys and row values future runtime work must produce.
+For this docs baseline, the synthetic fixture row files remain the physical SoT
+for expected row shape. Runtime acceptance must additionally prove the same row
+classes exist in RocksDB after the MCP trigger.
 
 ## 9. Fixture row index
 

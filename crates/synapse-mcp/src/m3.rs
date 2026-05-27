@@ -3,6 +3,7 @@ pub mod audio;
 pub mod permissions;
 pub mod profile;
 pub mod profile_quality;
+pub mod profile_registry;
 pub mod reflex;
 pub mod replay;
 pub mod storage;
@@ -421,7 +422,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 16] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 23] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -432,6 +433,13 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 16] {
         profile::profile_list(),
         profile::profile_activate(),
         profile_quality::profile_quality_refresh(),
+        profile_registry::profile_registry_search(),
+        profile_registry::profile_registry_inspect(),
+        profile_registry::profile_registry_install(),
+        profile_registry::profile_registry_disable(),
+        profile_registry::profile_registry_export(),
+        profile_registry::profile_registry_import(),
+        profile_registry::audit_intelligence_query(),
         replay::replay_record(),
         audio::audio_tail(),
         audio::audio_transcribe(),

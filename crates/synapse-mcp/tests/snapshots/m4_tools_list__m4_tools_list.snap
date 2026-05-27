@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 34,
+  "count": 41,
   "m4_defaults": [
     {
       "actual": "auto",
@@ -70,12 +70,19 @@ expression: snapshot
     "act_type",
     "audio_tail",
     "audio_transcribe",
+    "audit_intelligence_query",
     "find",
     "health",
     "observe",
     "profile_activate",
     "profile_list",
     "profile_quality_refresh",
+    "profile_registry_disable",
+    "profile_registry_export",
+    "profile_registry_import",
+    "profile_registry_inspect",
+    "profile_registry_install",
+    "profile_registry_search",
     "read_text",
     "reflex_cancel",
     "reflex_history",
