@@ -52,6 +52,7 @@ on the TOML file alone.
 | Hardware HID parity | profile metadata marks keyboard/mouse hardware HID as the parity target when configured |
 | ViGEm pad | profile metadata marks pad support as available when the ViGEm backend is configured |
 | Action audit | `storage_inspect.cf_row_counts.CF_ACTION_LOG` plus `cf_row_samples.CF_ACTION_LOG` |
+| Profile quality | `profile_quality_refresh(profile_id="luanti.minetest")` writes/reads `CF_PROFILES` key `profile_quality/v1/luanti.minetest` |
 
 The HUD baseline is deliberately a minimal visible-state extractor, not the
 full HUD template matcher. It samples raw foreground-window pixels and reports
@@ -62,6 +63,14 @@ Profile event extensions declare the benchmark outcomes that the profile/audit
 loop should learn from as the event-extension evaluator matures: launched,
 joined world, observed HUD, moved, dug/placed, inventory opened, and release-all
 applied.
+
+Profile quality scoring is local-first. The Luanti benchmark feeds the
+profile-registry/audit-data loop only through observed runtime outcomes in
+`CF_ACTION_LOG`; `profile_quality_refresh` ignores stale, corrupt, and
+non-matching rows for the quality score, records compatibility and denial
+counters separately, redacts process paths/window titles from the score
+snapshot, and does not export/share anything without a future explicit operator
+approval path.
 
 ---
 

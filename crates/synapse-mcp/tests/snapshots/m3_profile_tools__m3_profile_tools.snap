@@ -253,5 +253,498 @@ expression: profile_tool_shapes
       "title": "ProfileListResponse",
       "type": "object"
     }
+  },
+  {
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "max_audit_rows": {
+          "default": 5000,
+          "format": "uint32",
+          "maximum": 50000,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "stale_after_ns": {
+          "default": 86400000000000,
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "profile_id"
+      ],
+      "title": "ProfileQualityRefreshParams",
+      "type": "object"
+    },
+    "name": "profile_quality_refresh",
+    "outputSchema": {
+      "$defs": {
+        "ProfileCompatibilitySummary": {
+          "additionalProperties": false,
+          "properties": {
+            "active_profile_only_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "foreground_match_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "observed_backends": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "observed_process_names": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "profile_mismatch_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "target_denied_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "foreground_match_rows",
+            "active_profile_only_rows",
+            "profile_mismatch_rows",
+            "target_denied_rows",
+            "observed_process_names",
+            "observed_backends"
+          ],
+          "type": "object"
+        },
+        "ProfileQualityContribution": {
+          "additionalProperties": false,
+          "properties": {
+            "export_allowed": {
+              "type": "boolean"
+            },
+            "future_bundle_shape": {
+              "type": "string"
+            },
+            "operator_consent_required": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "export_allowed",
+            "operator_consent_required",
+            "future_bundle_shape"
+          ],
+          "type": "object"
+        },
+        "ProfileQualityCounts": {
+          "additionalProperties": false,
+          "properties": {
+            "backend_unavailable_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "denied_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "error_code_counts": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "error_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "launch_error_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "launch_ok_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "ok_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "quality_eligible_error_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "quality_eligible_ok_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "release_all_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "started_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tool_counts": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "object"
+            },
+            "unknown_status_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "started_rows",
+            "ok_rows",
+            "error_rows",
+            "denied_rows",
+            "unknown_status_rows",
+            "quality_eligible_ok_rows",
+            "quality_eligible_error_rows",
+            "backend_unavailable_rows",
+            "release_all_rows",
+            "launch_ok_rows",
+            "launch_error_rows",
+            "tool_counts",
+            "error_code_counts"
+          ],
+          "type": "object"
+        },
+        "ProfileQualityRates": {
+          "additionalProperties": false,
+          "properties": {
+            "backend_unavailable_rate": {
+              "format": "double",
+              "type": "number"
+            },
+            "denied_rate": {
+              "format": "double",
+              "type": "number"
+            },
+            "error_rate": {
+              "format": "double",
+              "type": "number"
+            },
+            "success_rate": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "success_rate",
+            "error_rate",
+            "denied_rate",
+            "backend_unavailable_rate"
+          ],
+          "type": "object"
+        },
+        "ProfileQualityRedaction": {
+          "additionalProperties": false,
+          "properties": {
+            "local_only": {
+              "type": "boolean"
+            },
+            "retained_identifiers": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "snapshot_redacts_process_path": {
+              "type": "boolean"
+            },
+            "snapshot_redacts_window_title": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "local_only",
+            "snapshot_redacts_process_path",
+            "snapshot_redacts_window_title",
+            "retained_identifiers"
+          ],
+          "type": "object"
+        },
+        "ProfileQualityScore": {
+          "additionalProperties": false,
+          "properties": {
+            "confidence_0_1": {
+              "format": "double",
+              "type": "number"
+            },
+            "method": {
+              "type": "string"
+            },
+            "sample_size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "score_0_100": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "wilson_success_lower_95": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "score_0_100",
+            "confidence_0_1",
+            "wilson_success_lower_95",
+            "sample_size",
+            "method"
+          ],
+          "type": "object"
+        },
+        "ProfileQualitySnapshot": {
+          "additionalProperties": false,
+          "properties": {
+            "compatibility": {
+              "$ref": "#/$defs/ProfileCompatibilitySummary"
+            },
+            "contribution": {
+              "$ref": "#/$defs/ProfileQualityContribution"
+            },
+            "counts": {
+              "$ref": "#/$defs/ProfileQualityCounts"
+            },
+            "evidence_hash": {
+              "type": "string"
+            },
+            "generated_at_ns": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "profile_id": {
+              "type": "string"
+            },
+            "profile_label": {
+              "type": "string"
+            },
+            "profile_schema_version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "quality_signal": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "rates": {
+              "$ref": "#/$defs/ProfileQualityRates"
+            },
+            "redaction": {
+              "$ref": "#/$defs/ProfileQualityRedaction"
+            },
+            "schema_version": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "score": {
+              "$ref": "#/$defs/ProfileQualityScore"
+            },
+            "source": {
+              "$ref": "#/$defs/ProfileQualitySource"
+            }
+          },
+          "required": [
+            "schema_version",
+            "profile_id",
+            "profile_label",
+            "profile_schema_version",
+            "generated_at_ns",
+            "evidence_hash",
+            "source",
+            "counts",
+            "rates",
+            "score",
+            "compatibility",
+            "redaction",
+            "contribution"
+          ],
+          "type": "object"
+        },
+        "ProfileQualitySource": {
+          "additionalProperties": false,
+          "properties": {
+            "audit_cf_name": {
+              "type": "string"
+            },
+            "audit_rows_decode_failed": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "audit_rows_future": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "audit_rows_other_profile": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "audit_rows_profile_relevant": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "audit_rows_scanned": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "audit_rows_stale": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "first_relevant_audit_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "first_relevant_ts_ns": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "last_relevant_audit_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_relevant_ts_ns": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "max_audit_rows": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "profile_cf_name": {
+              "type": "string"
+            },
+            "stale_after_ns": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "audit_cf_name",
+            "profile_cf_name",
+            "audit_rows_scanned",
+            "audit_rows_decode_failed",
+            "audit_rows_stale",
+            "audit_rows_future",
+            "audit_rows_other_profile",
+            "audit_rows_profile_relevant",
+            "max_audit_rows",
+            "stale_after_ns"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "cf_name": {
+          "type": "string"
+        },
+        "key_hex": {
+          "type": "string"
+        },
+        "previous_evidence_hash": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "profile_id": {
+          "type": "string"
+        },
+        "snapshot": {
+          "$ref": "#/$defs/ProfileQualitySnapshot"
+        },
+        "stored_value_len_bytes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "stored_value_utf8_prefix": {
+          "type": "string"
+        },
+        "wrote_snapshot": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "profile_id",
+        "cf_name",
+        "key_hex",
+        "wrote_snapshot",
+        "stored_value_len_bytes",
+        "stored_value_utf8_prefix",
+        "snapshot"
+      ],
+      "title": "ProfileQualityRefreshResponse",
+      "type": "object"
+    }
   }
 ]

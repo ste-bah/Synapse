@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m3_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 30,
+  "count": 31,
   "m3_defaults": [
     {
       "actual": [],
@@ -53,6 +53,16 @@ expression: snapshot
       "tool": "profile_list"
     },
     {
+      "actual": 5000,
+      "path": "inputSchema.properties.max_audit_rows.default",
+      "tool": "profile_quality_refresh"
+    },
+    {
+      "actual": 86400000000000,
+      "path": "inputSchema.properties.stale_after_ns.default",
+      "tool": "profile_quality_refresh"
+    },
+    {
       "actual": "jsonl",
       "path": "inputSchema.properties.format.default",
       "tool": "replay_record"
@@ -91,6 +101,11 @@ expression: snapshot
       "actual_contains": "profile_id",
       "path": "inputSchema.required",
       "tool": "profile_activate"
+    },
+    {
+      "actual_contains": "profile_id",
+      "path": "inputSchema.required",
+      "tool": "profile_quality_refresh"
     },
     {
       "actual_contains": "cf_name",
@@ -149,6 +164,7 @@ expression: snapshot
     "observe",
     "profile_activate",
     "profile_list",
+    "profile_quality_refresh",
     "read_text",
     "reflex_cancel",
     "reflex_history",

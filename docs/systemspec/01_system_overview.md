@@ -105,7 +105,7 @@ Release profile: `opt-level=3`, `lto="thin"`, `codegen-units=16`, `panic="abort"
 
 ## 4. Public MCP tool surface (live)
 
-All 30 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[tool_router]`). Grouped by milestone:
+All 34 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[tool_router]`). Grouped by milestone:
 
 ### 4.1 M1 — perception (6 tools)
 
@@ -152,11 +152,25 @@ All 30 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[to
 | `storage_gc_once` | Run one synchronous GC pass and return the per-CF before/after sizes | `server.rs::storage_gc_once`, `m3/storage.rs` |
 | `storage_pressure_sample` | Apply one synthetic free-byte sample to drive the disk-pressure responder | `server.rs::storage_pressure_sample`, `m3/storage.rs` |
 
+### 4.4 M4 — local shell/launch/combo (3 tools)
+
+| Tool | Description | Source |
+|---|---|---|
+| `act_combo` | Schedule a timed one-shot sequence through the reflex combo scheduler | `server.rs::act_combo`, `m4.rs` |
+| `act_run_shell` | Run an allowlisted local shell command | `server.rs::act_run_shell`, `m4.rs` |
+| `act_launch` | Launch an allowlisted local process and optionally wait for a window | `server.rs::act_launch`, `m4.rs` |
+
+### 4.5 M5 — profile registry/audit loop (1 tool)
+
+| Tool | Description | Source |
+|---|---|---|
+| `profile_quality_refresh` | Refresh a local profile-quality snapshot from real `CF_ACTION_LOG` rows and persist/read it in `CF_PROFILES` | `server.rs::profile_quality_refresh`, `m3/profile_quality.rs` |
+
 Full parameter/return tables: [13_mcp_tool_reference.md](13_mcp_tool_reference.md).
 
-### 4.4 PRD-planned tools NOT live in this build
+### 4.6 PRD-planned tools NOT live in this build
 
-`docs/computergames/05_mcp_tool_surface.md` defines a 30-tool surface cap for the agent-facing tools. Synapse's live build extends this with four operator-only `storage_*` diagnostics added during M3. The following PRD-planned entries remain unimplemented: `describe` (M5 VLM), `read_hud` (M4 HUD pipeline), `act_combo`, `act_run_shell`, `act_launch` (all M4).
+`docs/computergames/05_mcp_tool_surface.md` defines the tool surface. Synapse's live build now has the M3 baseline, four operator storage diagnostics, M4 `act_combo`/`act_run_shell`/`act_launch`, and the M5 `profile_quality_refresh` local registry/audit scorer. The following PRD-planned entries remain unimplemented: `describe` (M5 VLM) and `read_hud` (M4 HUD pipeline).
 
 ## 5. Entry points
 

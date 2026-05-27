@@ -47,6 +47,9 @@ use crate::{
             ProfileActivateParams, ProfileActivateResponse, ProfileListParams, ProfileListResponse,
             activate_profile, list_profiles,
         },
+        profile_quality::{
+            ProfileQualityRefreshParams, ProfileQualityRefreshResponse, refresh_profile_quality,
+        },
         reflex::{
             ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse,
             ReflexListParams, ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse,

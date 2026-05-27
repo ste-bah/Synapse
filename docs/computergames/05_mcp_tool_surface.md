@@ -4,9 +4,10 @@
 
 1. **Tool count cap:** M3 shipped 30 live MCP tools. M4 expands the target
    surface to 33 live MCP tools by adding `act_combo`, `act_run_shell`, and
-   `act_launch` per the M4 phase plan. Any further agent-facing tools require
-   an ADR-approved cap change. Overlapping tools merge. Profile and parameter
-   knobs are the escape hatches.
+   `act_launch` per the M4 phase plan. M5 adds the local registry/audit scoring
+   tool `profile_quality_refresh`, bringing the live surface to 34. Any further
+   agent-facing tools require an ADR-approved cap change. Overlapping tools
+   merge. Profile and parameter knobs are the escape hatches.
 2. **One tool, one verb.** No `do_everything(action_kind, ...)` mega-tools.
 3. **Structured input, structured output.** Every tool defines a JSON Schema with `additionalProperties: false`. Every response carries explicit fields, no free-form text.
 4. **No silent success.** If a tool did not do the work, it returns an MCP error with `code: SCREAMING_SNAKE_CASE`, never `success: true` with a partial result.
@@ -14,7 +15,8 @@
 6. **Idempotency tokens where it matters.** `act_run_shell`, `act_launch`, and similar accept an optional `idempotency_key` for safe retries.
 7. **Stable identifiers.** `element_id`, `entity_id`, `track_id`, `reflex_id`, `session_id` are returned by tools and accepted unchanged by subsequent calls. Agent never invents these.
 
-The first 30 tools below are the current live M3 contract. M4 adds rows 31-33.
+The first 30 tools below are the live M3 baseline. M4 adds rows 31-33, and M5
+adds row 34 for local profile-registry/audit quality scoring.
 Schemas use abbreviated JSON Schema syntax; canonical schema is exported by the
 daemon through standard MCP `tools/list`. Until the M4 tools are implemented,
 their schemas in this doc are the target contract for #401/#403/#406 and the
@@ -59,8 +61,10 @@ future `tools/list` snapshots in #447/#448.
 | 31 | `act_combo` | write | schedules a one-shot timed action sequence |
 | 32 | `act_run_shell` | write | runs an allowlisted local shell command |
 | 33 | `act_launch` | write | launches an allowlisted local process |
+| 34 | `profile_quality_refresh` | write/read | refreshes local profile quality from action audit rows |
 
-M3 live count: 30 tools. M4 target count: 33 tools.
+M3 live count: 30 tools. M4 live count: 33 tools. Current M5 live count: 34
+tools.
 
 Deferred ideas from earlier drafts (`describe` and `read_hud`) are still not
 live M3/M4 agent-facing tools. `act_combo`, `act_run_shell`, and `act_launch`
@@ -876,6 +880,36 @@ Returns:
 }
 ```
 
+### 3.28a `profile_quality_refresh`
+
+Refreshes the local profile-registry quality snapshot for one profile from real
+stored action audit rows. This is a local-only read/aggregate/write/readback
+surface: it scans `CF_ACTION_LOG`, writes the redacted snapshot to
+`CF_PROFILES` at `profile_quality/v1/<profile_id>`, then reads that exact row
+back before returning.
+
+```json
+{
+  "name": "profile_quality_refresh",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["profile_id"],
+    "properties": {
+      "profile_id": {"type": "string"},
+      "max_audit_rows": {"type": "integer", "minimum": 1, "maximum": 50000, "default": 5000},
+      "stale_after_ns": {"type": "integer", "minimum": 1, "default": 86400000000000}
+    }
+  }
+}
+```
+
+Returns the `CF_PROFILES` key, whether a new snapshot was written, stored value
+length/prefix, and an explainable snapshot containing source row counts,
+ignored corrupt/stale rows, quality counts/rates, Wilson lower-bound score,
+compatibility counters, redaction policy, and contribution policy. Export is
+always `false`; sharing requires a future explicit operator-approved path.
+
 ### 3.29 `health`
 
 ```json
@@ -959,9 +993,12 @@ change.
 ### 3.32 `storage_put_probe_rows`
 
 Writes bounded synthetic rows to a small allow-list of diagnostic column
-families (`CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_KV`) and flushes
-them. This exists so manual storage FSV can use known synthetic inputs and then
-read the physical storage state through `storage_inspect`.
+families (`CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_ACTION_LOG`,
+`CF_KV`) and flushes them. This exists so manual storage FSV can use known
+synthetic inputs and then read the physical storage state through
+`storage_inspect`; `CF_ACTION_LOG` probe rows are deliberately useful for
+corrupt-audit-row edge checks because profile quality scoring ignores malformed
+rows for score changes.
 
 ```json
 {

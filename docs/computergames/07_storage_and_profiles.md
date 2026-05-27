@@ -51,7 +51,7 @@ override:   --db <path>     (CLI flag)
 |---|---|---|---|---|---|---|---|
 | `CF_EVENTS` | `[seq u64 BE]` | `StoredEvent` | json | 24h | 2 GB | 4 GB | Append-only ring; the replay log |
 | `CF_OBSERVATIONS` | `[seq u64 BE]` | `StoredObservation` | json | 6h | 500 MB | 1 GB | 1Hz sample + reason-triggered snapshots |
-| `CF_PROFILES` | `[profile_id utf8]` | TOML bytes | raw bytes | none | 20 MB | 50 MB | Cached load; source of truth is on-disk TOML |
+| `CF_PROFILES` | `[profile_id utf8]` or `[profile_quality/v1/<profile_id>]` | cached TOML/profile-registry rows | raw bytes/json | none | 20 MB | 50 MB | Cached load plus local profile-quality snapshots; authored profile source remains on-disk TOML |
 | `CF_MODEL_CACHE` | `[model_sha256 32 bytes]` | model bytes | raw bytes | LRU when full | 1 GB | 2 GB | Downloaded ONNX models, sha-verified |
 | `CF_SESSIONS` | `[session_id utf8]` | `StoredSession` | json | 30d | 50 MB | 100 MB | One row per session |
 | `CF_REFLEX_AUDIT` | `[reflex_id 16 bytes][at_ns u64 BE]` | `StoredReflexAudit` | json | 7d | 200 MB | 500 MB | Per-reflex audit |
@@ -306,7 +306,7 @@ FSV:
 | MCP tool | Effect |
 |---|---|
 | `storage_inspect` | Reads schema version, pressure level, transition codes, per-CF row counts, logical bytes, and bounded newest-row samples |
-| `storage_put_probe_rows` | Writes bounded synthetic rows to `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, or `CF_KV` and flushes |
+| `storage_put_probe_rows` | Writes bounded synthetic rows to `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_ACTION_LOG`, or `CF_KV` and flushes |
 | `storage_gc_once` | Runs one row-cap GC pass for a diagnostic CF |
 | `storage_pressure_sample` | Applies one synthetic free-byte sample through the production disk-pressure responder |
 
@@ -318,6 +318,16 @@ Real action tools write minimal JSON rows to `CF_ACTION_LOG`. For manual action
 FSV, read `storage_inspect.cf_row_counts.CF_ACTION_LOG` before and after the
 action, then read `storage_inspect.cf_row_samples.CF_ACTION_LOG` and record the
 actual sampled JSON row. A count delta alone is not enough evidence.
+
+`profile_quality_refresh` is the first profile-registry/audit-data scoring
+surface. It reads real `CF_ACTION_LOG` rows, ignores stale/corrupt/non-matching
+audit rows for scoring, writes a redacted JSON snapshot to
+`CF_PROFILES` under `profile_quality/v1/<profile_id>`, and reads that exact row
+back before returning. The snapshot stores counts, rates, a Wilson 95% lower
+bound score for foreground-profile `ok` vs `error` outcomes, compatibility
+signals, source row range, evidence hash, and a local-only contribution policy.
+It never exports or shares data; contribution bundles require a future
+operator-approved path.
 
 ---
 

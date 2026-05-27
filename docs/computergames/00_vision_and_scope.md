@@ -120,7 +120,7 @@ Synapse v1 is successful when:
 | Screenshot-loop fallback masquerading as "structured" perception | Hard rule: `observe()` returns structured data; if both a11y and detection fail, return `OBSERVE_NO_PERCEPTION_AVAILABLE` error with diagnostics, never silently include a screenshot |
 | Slow path becoming the only path | Per-tool p99 latency budgets enforced through local benchmark exports and manual review; perf regressions block merge |
 | Sensitive input paths enabled by accident | Hardware HID, shell, process launch, non-loopback networking, and redaction changes require explicit operator configuration |
-| Tool-bloat (200+ MCP tools, agent confused) | Hard cap: ≤ 30 tools at v1. Anything else is a profile, a parameter, or a sub-command of an existing tool |
+| Tool-bloat (200+ MCP tools, agent confused) | Hard cap: current approved live surface is 34 tools after M4/M5 expansion. Anything else is a profile, a parameter, or a sub-command of an existing tool unless an ADR approves the cap change |
 | Token bloat per observation | Hard cap: `observe()` returns ≤ 1500 tokens by default; agent must `expand(slot)` for more |
 | Per-game special-casing in core code | Per-game logic lives in declarative profiles (`profiles/<id>.toml`), not Rust code |
 | Build complexity sprawl | Workspace ≤ 15 crates; one binary; no procmacro forests; no build.rs that hits the network |

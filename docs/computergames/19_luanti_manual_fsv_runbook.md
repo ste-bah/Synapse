@@ -27,12 +27,11 @@ triggered action.
 | Game session | `synapse_benchmark_mtg.log` lines for world path, gameid, player join |
 | Supported-use target policy | Foreground process command line plus `world.mt` plus latest Luanti log session |
 | Action/reflex/audit state | MCP `storage_inspect`, `CF_ACTION_LOG`, `CF_REFLEX_AUDIT`, `cf_row_samples`, and tool logs |
+| Profile quality state | MCP `profile_quality_refresh` plus `storage_inspect.cf_row_samples.CF_PROFILES` key `profile_quality/v1/luanti.minetest` |
 | Visual/HUD state | `observe` pixel/a11y payload, `luanti.crosshair_contrast`, and `luanti.hotbar_contrast` |
 
 If a surface is not implemented yet, record the missing physical SoT and keep
-or open the implementation issue. Current known follow-ups:
-
-- #476 covers registry/audit quality scoring from benchmark outcomes.
+or open the implementation issue.
 
 ---
 
@@ -155,6 +154,35 @@ approved benchmark world. After trigger, read `CF_REFLEX_AUDIT`, scheduler
 logs, and the Luanti process/window/world state. If no reflex path is available
 for Luanti yet, record the absence and do not claim reflex FSV.
 
+### 3.5 Profile Quality
+
+Before trigger:
+
+- Read `storage_inspect.cf_row_counts.CF_PROFILES` and
+  `cf_row_samples.CF_PROFILES` for `profile_quality/v1/luanti.minetest`.
+- Read `storage_inspect.cf_row_counts.CF_ACTION_LOG` and
+  `cf_row_samples.CF_ACTION_LOG`.
+- Read `profile_list` for `luanti.minetest` metadata
+  `registry.quality_signal`.
+
+Trigger:
+
+- Call real MCP `profile_quality_refresh` with
+  `profile_id="luanti.minetest"` after the benchmark action rows exist.
+
+After trigger:
+
+- Read the returned `snapshot.source`, `snapshot.counts`, `snapshot.rates`,
+  `snapshot.score`, `snapshot.compatibility`, `snapshot.redaction`, and
+  `snapshot.contribution`.
+- Separately call `storage_inspect` and read `CF_PROFILES` row count/sample to
+  prove the physical profile-quality row exists.
+- Confirm score-bearing fields changed only from observed Luanti foreground
+  outcomes. Denied target, failed launch, stale, corrupt, and profile-mismatch
+  rows may change source/compatibility counters, but must not be counted as
+  foreground `ok`/`error` score samples unless the foreground profile is
+  actually `luanti.minetest`.
+
 ---
 
 ## 4. Required Edge Cases
@@ -171,6 +199,8 @@ for these edges.
 | Inventory/menu open | Press `i` or `esc`, then `observe` | foreground remains Luanti; HUD/entity readings reflect menu/world-view change; restore with `esc` |
 | Unfocused/minimized | Focus another window or minimize Luanti, then `observe` | foreground/profile changes or capture reports degraded/disabled; no invented Luanti HUD pass |
 | Backend unavailable or denied | Request unavailable backend or denied supported-use target | action response/log names the denial/unavailable reason; `CF_ACTION_LOG` sample records the attempted/failed action when dispatch path reached audit |
+| Profile-quality failed launch | Trigger denied or failed `act_launch`, then `profile_quality_refresh` | `CF_ACTION_LOG` records launch failure; `CF_PROFILES` quality snapshot records launch/error compatibility counters without inventing foreground success |
+| Profile-quality stale/corrupt audit | Use stale cutoff or diagnostic corrupt `CF_ACTION_LOG` probe row, then `profile_quality_refresh` | source counters show stale/corrupt rows ignored; score sample counts do not increase |
 
 ---
 

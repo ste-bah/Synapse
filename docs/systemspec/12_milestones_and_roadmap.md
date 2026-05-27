@@ -34,7 +34,7 @@ Per `docs/impplan/README.md` §"State-tracking", the authority order is:
 | M2 | Action MVP — `synapse-action` + 9 tools + `release_all` | `v0.1.0-m2` | 2026-05-24 | `CHANGELOG.md::v0.1.0-m2` |
 | M3 | Reflex + RocksDB + profiles + HTTP/SSE + audio + 15 tools | `v0.1.0-m3` (@ `97019ec`) | 2026-05-25 | `CHANGELOG.md::v0.1.0-m3` + `docs/impplan/04_m3_reflex_mcp_surface.md` |
 | **M4** | **RP2040 firmware + `synapse-hid-host` serial driver + Minecraft profile + `act_combo`/`act_run_shell`/`act_launch`** | — | **ACTIVE** | `docs/impplan/05_m4_hardware_hid_first_game.md` |
-| M5 | Production polish — installer, overlay, ≥10 profiles, VLM `describe`, soak | — | blocked by M4 | `docs/impplan/06_m5_production_polish.md` |
+| M5 | Production polish — installer, overlay, ≥10 profiles, profile-registry/audit quality loop, VLM `describe`, soak | — | active for registry/audit child issues | `docs/impplan/06_m5_production_polish.md` |
 
 M3 closed 2026-05-25 (`v0.1.0-m3` @ `97019ec`). What landed on `main`:
 
@@ -56,13 +56,15 @@ Open M4 work (per `docs/impplan/05_m4_hardware_hid_first_game.md`):
 
 - `firmware/pico-hid/` — standalone RP2040 firmware project excluded from the root Cargo workspace; remaining firmware issues close only with real device evidence.
 - `synapse-hid-host` — serial driver with discovery, connect/IDENTIFY, CRC16 framing, pipeline/backpressure, and reconnect paths. `Backend::Hardware` uses `HardwareBackend` when `--hardware-hid <port|auto>` connects successfully, otherwise it fails closed through `HardwareUnavailableBackend`.
-- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 → 33.
+- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 → 33; M5 profile-registry/audit scoring adds `profile_quality_refresh` as tool 34.
 - `minecraft.java` profile (the first game profile) — fifth bundled profile, validated against a single-player creative world per `15_roadmap_and_milestones.md` §6.
-- M3 hold-over items still open: per-subscriber `subscribe.buffer_size` (currently hard-pinned to 4096); persistent writers for `CF_EVENTS`/`CF_OBSERVATIONS`/`CF_SESSIONS`/`CF_TELEMETRY`/`CF_ACTION_LOG`/`CF_PROCESS_HISTORY`/`CF_KV` (only `CF_REFLEX_AUDIT` has a live writer); audio detector → SSE-bus sink integration; HUD extraction pipeline. VLM `describe` and Florence-2 remain M5.
+- M3 hold-over items still open: per-subscriber `subscribe.buffer_size` (currently hard-pinned to 4096); persistent writers for `CF_EVENTS`/`CF_OBSERVATIONS`/`CF_SESSIONS`/`CF_TELEMETRY`/`CF_PROCESS_HISTORY`/`CF_KV` (`CF_REFLEX_AUDIT` and `CF_ACTION_LOG` have live writers); audio detector → SSE-bus sink integration; HUD extraction pipeline. VLM `describe` and Florence-2 remain M5.
 
 ## 3. Tools delivered vs planned
 
-PRD `docs/computergames/05_mcp_tool_surface.md` defines a 30-tool surface cap for the agent-facing tools. Synapse's live build extends this with four operator-only `storage_*` diagnostics added during M3. As of M3 close:
+PRD `docs/computergames/05_mcp_tool_surface.md` started from a 30-tool M3
+baseline and now records the approved 34-tool live surface after M4/M5
+expansion. Current build:
 
 | # | Tool | Milestone | Status | Note |
 |---|---|---|---|---|
@@ -97,12 +99,16 @@ PRD `docs/computergames/05_mcp_tool_surface.md` defines a 30-tool surface cap fo
 | 29 | `storage_gc_once` | M3 (operator) | live | synchronous GC pass with before/after sizes |
 | 30 | `storage_pressure_sample` | M3 (operator) | live | synthetic disk-pressure trigger |
 | — | `read_hud` | (deferred to M4) | not live | HUD extraction pipeline not yet wired |
-| — | `act_combo` | M4 | not live | replicated via `reflex_register` |
-| — | `act_run_shell` | M4 (gated) | not live | |
-| — | `act_launch` | M4 (gated) | not live | |
+| 31 | `act_combo` | M4 | live | one-shot timed action sequence |
+| 32 | `act_run_shell` | M4 (gated) | live | allowlisted local shell command |
+| 33 | `act_launch` | M4 (gated) | live | allowlisted local process launch |
+| 34 | `profile_quality_refresh` | M5 (registry/audit) | live | writes `CF_PROFILES` quality snapshot from `CF_ACTION_LOG` |
 | — | `describe` | M5 (VLM) | not live | Florence-2 |
 
-Live count in `crates/synapse-mcp/src/server.rs`: **30** (M1: 6, M2: 9, M3: 15 — including 4 operator-only `storage_*` diagnostics; the M3 `m3_tool_stubs()` length-asserts to 15).
+Live count in `crates/synapse-mcp/src/server.rs`: **34** (M1: 6, M2: 9,
+M3: 16 including `profile_quality_refresh` and 4 operator storage
+diagnostics, plus M4 `act_combo`/`act_run_shell`/`act_launch`; the M3
+`m3_tool_stubs()` length-asserts to 16).
 
 ## 4. Architecture Decision Records (ADRs)
 
@@ -208,7 +214,7 @@ Open items remaining (PRD §16): OQ-003 (detection model default — YOLOv10n vs
 | `docs/computergames/02_perception.md` | Capture/A11y/OCR/Audio sensors and the perception mode auto-selector |
 | `docs/computergames/03_action.md` | Action emitter design, backends, rate limits, curve/dynamics |
 | `docs/computergames/04_reflex_runtime.md` | Reflex semantics, scheduler, conflict resolution |
-| `docs/computergames/05_mcp_tool_surface.md` | The 30-tool registry (the contract) |
+| `docs/computergames/05_mcp_tool_surface.md` | The live MCP tool registry contract |
 | `docs/computergames/06_data_schemas.md` | Wire schemas + error code catalog |
 | `docs/computergames/07_storage_and_profiles.md` | RocksDB CFs, retention defaults, profile TOML |
 | `docs/computergames/08_supported_use_policy.md` | Allowed/disallowed contexts, operator acknowledgments |

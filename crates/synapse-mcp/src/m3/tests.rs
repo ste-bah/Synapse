@@ -77,6 +77,7 @@ fn m3_tool_stub_names_are_stable() {
         "reflex_history",
         "profile_list",
         "profile_activate",
+        "profile_quality_refresh",
         "replay_record",
         "audio_tail",
         "audio_transcribe",

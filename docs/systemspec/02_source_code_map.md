@@ -36,7 +36,7 @@ crates/synapse-mcp/
 ├── Cargo.toml                      # Binary crate; depends on every other library crate
 └── src/
     ├── main.rs                     # Process entrypoint, clap CLI, telemetry init, stdio/http dispatch
-    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 30 MCP tools
+    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 34 MCP tools
     ├── safety.rs                   # Operator-hotkey handler that disables reflexes + fires release_all
     ├── http/
     │   ├── mod.rs                  # Re-exports http::serve entrypoint

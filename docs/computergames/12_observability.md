@@ -227,7 +227,7 @@ hid_round_trip_seconds (histogram)
 
 Labels are bounded. Never use unbounded values (session IDs, reflex IDs, image hashes) — cardinality explodes.
 
-Allowed labels: subsystem name, error code (closed set from `06_data_schemas.md` §8), CF name (closed set), backend, model_id (~5 values), tool name (30 tools).
+Allowed labels: subsystem name, error code (closed set from `06_data_schemas.md` §8), CF name (closed set), backend, model_id (~5 values), tool name (current live MCP tool set).
 
 ### 4.3 Exposition
 

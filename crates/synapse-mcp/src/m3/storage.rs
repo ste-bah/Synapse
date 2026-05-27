@@ -22,10 +22,11 @@ const MAX_KEY_PREFIX_BYTES: usize = 128;
 const MAX_ROW_CAP: u64 = 1_000_000;
 const MAX_INSPECT_SAMPLE_ROWS_PER_CF: usize = 3;
 const MAX_INSPECT_SAMPLE_VALUE_CHARS: usize = 512;
-const PROBE_WRITABLE_CFS: [&str; 4] = [
+const PROBE_WRITABLE_CFS: [&str; 5] = [
     cf::CF_EVENTS,
     cf::CF_OBSERVATIONS,
     cf::CF_SESSIONS,
+    cf::CF_ACTION_LOG,
     cf::CF_KV,
 ];
 

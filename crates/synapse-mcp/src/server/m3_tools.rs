@@ -1,16 +1,17 @@
 use super::{
     AudioTailParams, AudioTailResponse, AudioTranscribeParams, AudioTranscribeResponse, ErrorData,
     Json, Parameters, ProfileActivateParams, ProfileActivateResponse, ProfileListParams,
-    ProfileListResponse, ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams,
-    ReflexHistoryResponse, ReflexListParams, ReflexListResponse, ReflexRegisterParams,
-    ReflexRegisterResponse, ReplayRecordParams, ReplayRecordResponse, StorageGcOnceParams,
-    StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
-    StoragePressureSampleParams, StoragePressureSampleResponse, StoragePutProbeRowsParams,
-    StoragePutProbeRowsResponse, SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams,
-    SubscribeResponse, SynapseService, apply_storage_pressure_sample, cancel_reflex,
-    cancel_subscription, history_reflexes, inspect_storage, list_profiles, list_reflexes,
-    put_probe_rows, record_replay, register_reflex, run_storage_gc_once, subscribe_to_events,
-    tail_audio, tool, tool_router, transcribe_audio,
+    ProfileListResponse, ProfileQualityRefreshParams, ProfileQualityRefreshResponse,
+    ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse,
+    ReflexListParams, ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse,
+    ReplayRecordParams, ReplayRecordResponse, StorageGcOnceParams, StorageGcOnceResponse,
+    StorageInspectParams, StorageInspectResponse, StoragePressureSampleParams,
+    StoragePressureSampleResponse, StoragePutProbeRowsParams, StoragePutProbeRowsResponse,
+    SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams, SubscribeResponse,
+    SynapseService, apply_storage_pressure_sample, cancel_reflex, cancel_subscription,
+    history_reflexes, inspect_storage, list_profiles, list_reflexes, put_probe_rows, record_replay,
+    refresh_profile_quality, register_reflex, run_storage_gc_once, subscribe_to_events, tail_audio,
+    tool, tool_router, transcribe_audio,
 };
 
 #[tool_router(router = m3_tool_router, vis = "pub(super)")]
@@ -174,6 +175,27 @@ impl SynapseService {
         let response = self.activate_profile_locked(&params.0, self.allow_unknown_profile()?)?;
         self.apply_backend_resolution_for_profile(&response.active_profile_id)?;
         Ok(Json(response))
+    }
+
+    #[tool(description = "Refresh local profile quality scoring from stored action audit rows")]
+    pub async fn profile_quality_refresh(
+        &self,
+        params: Parameters<ProfileQualityRefreshParams>,
+    ) -> Result<Json<ProfileQualityRefreshResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "profile_quality_refresh",
+            profile_id = %params.0.profile_id,
+            max_audit_rows = params.0.max_audit_rows,
+            "tool.invocation kind=profile_quality_refresh"
+        );
+        self.require_m3_permissions(
+            "profile_quality_refresh",
+            &crate::m3::profile_quality::required_permissions_refresh(&params.0),
+        )?;
+        let profile_runtime = self.profile_runtime()?;
+        let reflex_runtime = self.reflex_runtime()?;
+        refresh_profile_quality(&profile_runtime, &reflex_runtime, &params.0).map(Json)
     }
 
     #[tool(description = "Record observations and/or events to a replay JSONL file")]

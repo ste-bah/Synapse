@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 30] = [
+const EXPECTED_TOOLS: [&str; 31] = [
     "act_aim",
     "act_click",
     "act_clipboard",
@@ -20,6 +20,7 @@ const EXPECTED_TOOLS: [&str; 30] = [
     "observe",
     "profile_activate",
     "profile_list",
+    "profile_quality_refresh",
     "read_text",
     "reflex_cancel",
     "reflex_history",
@@ -132,6 +133,7 @@ fn m3_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
     Ok(readbacks)
 }
 
+#[allow(clippy::too_many_lines)]
 fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::Result<()> {
     read_default(
         readbacks,
@@ -199,6 +201,20 @@ fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
     read_default(
         readbacks,
         tools,
+        "profile_quality_refresh",
+        "inputSchema.properties.max_audit_rows.default",
+        &json!(5000),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "profile_quality_refresh",
+        "inputSchema.properties.stale_after_ns.default",
+        &json!(86_400_000_000_000_u64),
+    )?;
+    read_default(
+        readbacks,
+        tools,
         "replay_record",
         "inputSchema.properties.format.default",
         &json!("jsonl"),
@@ -238,6 +254,7 @@ fn read_required_fields(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
     read_required(readbacks, tools, "subscribe_cancel", "subscription_id")?;
     read_required(readbacks, tools, "reflex_cancel", "reflex_id")?;
     read_required(readbacks, tools, "profile_activate", "profile_id")?;
+    read_required(readbacks, tools, "profile_quality_refresh", "profile_id")?;
     read_required(readbacks, tools, "storage_put_probe_rows", "cf_name")?;
     read_required(readbacks, tools, "storage_put_probe_rows", "key_prefix")?;
     read_required(readbacks, tools, "storage_put_probe_rows", "rows")?;

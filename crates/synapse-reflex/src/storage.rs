@@ -91,6 +91,31 @@ impl ReflexRuntime {
         self.db.flush()
     }
 
+    /// Writes profile-registry rows and flushes them immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the write or flush fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
+    pub fn storage_put_profile_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
+        self.db.put_batch(cf::CF_PROFILES, rows)?;
+        self.db.flush()
+    }
+
+    /// Returns one exact profile-registry row by key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the profile CF cannot be scanned.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", key_len = key.len()))]
+    pub fn storage_profile_row(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
+        Ok(self
+            .db
+            .scan_cf(cf::CF_PROFILES)?
+            .into_iter()
+            .find_map(|(row_key, value)| (row_key == key).then_some(value)))
+    }
+
     /// Runs one row-cap storage GC pass for operator diagnostics.
     ///
     /// # Errors

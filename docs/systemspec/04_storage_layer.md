@@ -80,7 +80,7 @@ Defined in `crates/synapse-storage/src/cf.rs`. `ALL_COLUMN_FAMILIES` (line 25) i
 |---|---|---|---|---|---|
 | 1 | `CF_EVENTS` | `"CF_EVENTS"` | Replay event log (M3 reflex bus persistence) | Lz4 | fixed-prefix 8 |
 | 2 | `CF_OBSERVATIONS` | `"CF_OBSERVATIONS"` | Observation snapshots retained for replay and debugging | Zstd | — |
-| 3 | `CF_PROFILES` | `"CF_PROFILES"` | Cached profile loads; on-disk TOML remains the source of truth | Lz4 | — |
+| 3 | `CF_PROFILES` | `"CF_PROFILES"` | Cached profile loads plus local profile-registry quality snapshots; on-disk TOML remains authored profile source | Lz4 | — |
 | 4 | `CF_MODEL_CACHE` | `"CF_MODEL_CACHE"` | Downloaded ONNX model cache | None | — |
 | 5 | `CF_SESSIONS` | `"CF_SESSIONS"` | MCP session continuity records | Zstd | — |
 | 6 | `CF_REFLEX_AUDIT` | `"CF_REFLEX_AUDIT"` | Per-reflex audit trail (registered/fired/cancelled/expired/disabled) | Lz4 | fixed-prefix 8 |
@@ -100,13 +100,13 @@ These are the `serde_json` payloads written into each CF. Source: `crates/synaps
 |---|---|---|---|
 | `CF_EVENTS` | `StoredEvent` | `schema_version: u32`, `event_id: String`, `ts_ns: u64`, `session_id: Option<String>`, `source: EventSource`, `kind: String`, `data: serde_json::Value`, `window_id: Option<i64>`, `element_id: Option<ElementId>`, `redacted: bool`, `redactions: Vec<StoredRedaction>` | — (no live writer in this build; PRD §7 calls for `ts_ns` big-endian prefix + `event_id`) |
 | `CF_OBSERVATIONS` | `StoredObservation` | `schema_version`, `observation_id`, `ts_ns`, `session_id`, `mode: PerceptionMode`, `foreground: ForegroundContext`, `focused: Option<FocusedElement>`, `elements: Vec<AccessibleNode>`, `entities: Vec<DetectedEntity>`, `hud: HudReadings`, `audio: AudioContext`, `recent_events: Vec<EventSummary>`, `clipboard_summary: Option<ClipboardSummary>`, `fs_recent: Vec<FsEvent>`, `diagnostics: ObservationDiagnostics`, `reason: String`, `redacted: bool`, `redactions: Vec<StoredRedaction>` | — (no live writer in this build; produced by future M3 replay backends. `replay_record` writes JSONL to disk, not to this CF.) |
-| `CF_PROFILES` | (per PRD) cached `Profile` rows | `Profile { id, label, version, use_scope, matches, mode, capture, detection, ocr, hud, keymap, backends, metadata, event_extensions }` | not written in current build; profiles read from TOML and held in `synapse-profiles::ProfileRuntime` memory |
+| `CF_PROFILES` | cached profile rows plus profile quality snapshots | `Profile { id, label, version, use_scope, matches, mode, capture, detection, ocr, hud, keymap, backends, metadata, event_extensions }`; `ProfileQualitySnapshot` at key `profile_quality/v1/<profile_id>` | `profile_quality_refresh` writes redacted quality snapshots; authored profiles read from TOML and held in `synapse-profiles::ProfileRuntime` memory |
 | `CF_MODEL_CACHE` | raw bytes + `ModelDescriptor` | binary ONNX blob behind a JSON-encoded descriptor key | not exercised in current build (no model auto-download yet) |
 | `CF_SESSIONS` | `StoredSession` | `schema_version`, `session_id`, `started_at`, `ended_at`, `transport`, `client`, `mode`, `active_profile`, `profile_history: Vec<StoredProfileHistoryEntry>`, `redacted`, `redactions` | not written in this build |
 | `CF_REFLEX_AUDIT` | `StoredReflexAudit` | `schema_version`, `audit_id`, `reflex_id`, `ts_ns`, `status: ReflexState`, `event_id: Option<String>`, `steps: Vec<StoredReflexStep>`, `error_code: Option<String>`, `details: serde_json::Value`, `redacted`, `redactions` | `format!("{reflex_id}:{audit_id}")` (see §4.2) |
 | `CF_OCR_CACHE` | not yet wired | — | — |
 | `CF_TELEMETRY` | not yet wired | — | — |
-| `CF_ACTION_LOG` | not yet wired | — | — |
+| `CF_ACTION_LOG` | action audit JSON | `schema_version`, `audit_id`, `ts_ns`, `seq`, `tool`, `status`, `error_code`, `foreground`, `active_profile_id`, `details` | action tools via `server/action_audit.rs`; diagnostic probe writes may create malformed rows for manual corrupt-row checks |
 | `CF_PROCESS_HISTORY` | not yet wired | — | — |
 | `CF_KV` | not yet wired (generic) | — | — |
 
@@ -115,7 +115,8 @@ These are the `serde_json` payloads written into each CF. Source: `crates/synaps
 
 ### 4.2 Active write paths (current build)
 
-The only CF actively written by the live build is `CF_REFLEX_AUDIT`:
+The live build actively writes `CF_REFLEX_AUDIT`, `CF_ACTION_LOG`, and
+profile-quality rows in `CF_PROFILES`:
 
 | Caller | Trigger | Audit payload | Key format |
 |---|---|---|---|
@@ -125,7 +126,19 @@ The only CF actively written by the live build is `CF_REFLEX_AUDIT`:
 | `ReflexScheduler` fire path (in `crates/synapse-reflex/src/scheduler.rs` + `kinds/on_event.rs`) | each reflex fire | `details.kind = "reflex_fired"`, `status = Active`, optional `event_id` and per-step `steps` | same |
 | recursion-guard clamp (`kinds/on_event.rs`) | exceeded `MAX_ON_EVENT_FIRINGS_PER_TICK` | `error_code = REFLEX_RECURSION_LIMIT` | same |
 
-Writers go through `synapse_reflex::audit::write_audit` (`crates/synapse-reflex/src/audit.rs`), which is just a thin wrapper around `Db::put_batch(CF_REFLEX_AUDIT, ...)` followed (by the caller) by `Db::flush()`.
+Reflex writers go through `synapse_reflex::audit::write_audit`
+(`crates/synapse-reflex/src/audit.rs`), which is just a thin wrapper around
+`Db::put_batch(CF_REFLEX_AUDIT, ...)` followed (by the caller) by `Db::flush()`.
+Action tools write minimal action-audit rows to `CF_ACTION_LOG` through
+`crates/synapse-mcp/src/server/action_audit.rs`; the key is
+`[ts_ns u64 BE][seq u32 BE]`, and each write is flushed before the action
+result audit returns. `profile_quality_refresh` reads those action rows,
+aggregates profile-relevant outcomes, writes a redacted
+`ProfileQualitySnapshot` JSON row to `CF_PROFILES` at
+`profile_quality/v1/<profile_id>`, and reads that exact row back before
+returning. The score uses the Wilson 95% lower bound over foreground-profile
+`ok` vs `error` rows; denied, stale, corrupt, and profile-mismatch rows are
+explainability/compatibility counters, not invented success samples.
 
 ## 5. Index strategy
 

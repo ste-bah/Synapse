@@ -4,10 +4,10 @@ Source files covered:
 - `crates/synapse-mcp/src/server.rs`
 - `crates/synapse-mcp/src/m1.rs` (+ `m1/{ocr, search, sources}.rs`)
 - `crates/synapse-mcp/src/m2/{aim, click, clipboard, drag, pad, press, release_all, scroll, type_text}.rs`
-- `crates/synapse-mcp/src/m3/{audio, permissions, profile, reflex, replay, subscribe}.rs`
+- `crates/synapse-mcp/src/m3/{audio, permissions, profile, profile_quality, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 30 tools below are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 34 tools below are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -358,6 +358,34 @@ Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32
 **Returns:** `ProfileActivateResponse { profile_id, active_profile_id, previous_active_profile_id, changed: bool }`. `changed=false` if `profile_id` was already active.
 **Errors:** `PROFILE_NOT_FOUND`, `SAFETY_PROFILE_ACTION_DENIED` (use_scope=Unknown without `--allow-unknown-profile`).
 
+## 23a. `profile_quality_refresh`
+
+**Description:** "Refresh local profile quality scoring from stored action audit rows"
+**Permissions:** `READ_PROFILE`, `READ_STORAGE`, `WRITE_STORAGE`
+**Side effects:** reads `CF_ACTION_LOG`; writes and immediately reads back
+`CF_PROFILES` key `profile_quality/v1/<profile_id>`
+
+| Parameter | Type | Required | Default | Range | Description |
+|---|---|---|---|---|---|
+| `profile_id` | `String` | yes | — | loaded profile id | Profile whose quality snapshot should be refreshed |
+| `max_audit_rows` | `u32` | no | `5000` | `1..=50000` | Newest action audit rows scanned |
+| `stale_after_ns` | `u64` | no | `86400000000000` | `1..=2592000000000000` | Rows older than this are counted as stale and ignored for scoring |
+
+**Returns:** `ProfileQualityRefreshResponse { profile_id, cf_name,
+key_hex, wrote_snapshot, previous_evidence_hash, stored_value_len_bytes,
+stored_value_utf8_prefix, snapshot }`. `snapshot` contains source counters,
+ignored corrupt/stale rows, counts/rates, Wilson lower-bound score,
+compatibility counters, redaction policy, and contribution policy.
+
+The score-bearing sample is foreground-profile `ok` vs `error` rows only.
+Denied, stale, corrupt, active-profile-only, and profile-mismatch rows are
+reported as explainability/compatibility counters and do not invent success
+samples. Export is always disabled; contribution requires a future explicit
+operator-approved path.
+
+**Errors:** `PROFILE_NOT_FOUND`, `TOOL_PARAMS_INVALID`, `STORAGE_READ_FAILED`,
+`STORAGE_WRITE_FAILED`, `TOOL_INTERNAL_ERROR`.
+
 ## 24. `replay_record`
 
 **Description:** "Record observations and/or events to a replay JSONL file"
@@ -409,7 +437,7 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 ## 27. `storage_inspect`
 
 **Description:** "Inspect RocksDB column families: row counts, byte sizes, and bounded newest-row samples"
-**Permissions:** none gated at the M3 layer (operator-only tool surface; not in the agent-facing 30-tool PRD list)
+**Permissions:** `READ_STORAGE` (operator diagnostic)
 **Side effects:** none; reads `Db::cf_sizes`, per-CF scan counts, and bounded newest-row samples
 
 | Parameter | Type | Required | Default | Description |
@@ -422,7 +450,7 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 ## 28. `storage_put_probe_rows`
 
 **Description:** "Insert probe rows into a CF to exercise the write batcher + flush + GC paths"
-**Permissions:** none gated at the M3 layer (operator-only)
+**Permissions:** `WRITE_STORAGE` (operator diagnostic)
 **Side effects:** writes N synthetic rows into the chosen CF; calls `Db::flush`.
 
 | Parameter | Type | Required | Default | Range | Description |
@@ -437,7 +465,7 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 ## 29. `storage_gc_once`
 
 **Description:** "Run one synchronous storage GC pass and return per-CF before/after sizes"
-**Permissions:** none gated at the M3 layer (operator-only)
+**Permissions:** `WRITE_STORAGE` (operator diagnostic)
 **Side effects:** evicts rows from any CF whose size exceeds its soft cap; emits `cache_evictions_total{cf,reason="soft_cap"}` counter increments.
 
 | Parameter | Type | Required | Default | Description |
@@ -450,7 +478,7 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 ## 30. `storage_pressure_sample`
 
 **Description:** "Apply one synthetic free-byte sample to drive the disk-pressure responder"
-**Permissions:** none gated at the M3 layer (operator-only)
+**Permissions:** `WRITE_STORAGE` (operator diagnostic)
 **Side effects:** updates `Db::pressure_level()` for subsequent writes; may trigger compaction on selected CFs at higher levels.
 
 | Parameter | Type | Required | Default | Description |
@@ -473,7 +501,9 @@ For convenience the M3 tool-call gating is summarized here (live source: `crates
 | `profile_activate` | `WRITE_PROFILE_ACTIVE` |
 | `replay_record` | `WRITE_REPLAY` |
 | `audio_tail`, `audio_transcribe` | `READ_AUDIO` |
-| `storage_inspect`, `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample` | (operator-only — no M3 permission gate; support manual FSV from the configured host) |
+| `profile_quality_refresh` | `READ_PROFILE`, `READ_STORAGE`, `WRITE_STORAGE` |
+| `storage_inspect` | `READ_STORAGE` |
+| `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample` | `WRITE_STORAGE` |
 
 `reflex_register`'s effective permission set is computed by `add_action_permissions` over the compiled `Vec<Action>` (e.g., `Action::PadReport` requires `INPUT_PAD`; any action with `Backend::Hardware` adds `INPUT_HARDWARE_HID`).
 

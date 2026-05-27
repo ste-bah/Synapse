@@ -2,6 +2,7 @@ mod a11y_events;
 pub mod audio;
 pub mod permissions;
 pub mod profile;
+pub mod profile_quality;
 pub mod reflex;
 pub mod replay;
 pub mod storage;
@@ -410,7 +411,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 15] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 16] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -420,6 +421,7 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 15] {
         reflex::reflex_history(),
         profile::profile_list(),
         profile::profile_activate(),
+        profile_quality::profile_quality_refresh(),
         replay::replay_record(),
         audio::audio_tail(),
         audio::audio_transcribe(),

@@ -42,7 +42,7 @@ impl SynapseService {
                     .as_ref()
                     .map(CancellationToken::is_cancelled),
             );
-            state.scaffold_ready() && m3_stub_count == 15
+            state.scaffold_ready() && m3_stub_count == 16
         });
         match (recording_enabled, m3_scaffold_ready) {
             (true, true) => {

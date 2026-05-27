@@ -71,13 +71,13 @@ Counted by walking `crates/` and slicing by path. Comments, blank lines, and `mo
 | Total Rust source files (excluding tests/benches) | **148** |
 | Total Rust integration-test files | 76 |
 | Total Rust bench files | 13 |
-| MCP tools registered in `server.rs` | **30** (M1: 6, M2: 9, M3: 15 — dispatched via `m3_tool_stubs() len=15`; M3 includes 4 operator-only `storage_*` diagnostics added beyond the PRD agent surface) |
-| MCP tools planned by PRD `05_mcp_tool_surface.md` (agent surface cap) | 30 |
+| MCP tools registered in `server.rs` | **34** (M1: 6, M2: 9, M3 module stubs: 16 including `profile_quality_refresh`; M4: `act_combo`, `act_run_shell`, `act_launch`) |
+| MCP tools approved by `05_mcp_tool_surface.md` (agent surface cap) | 34 |
 | RocksDB column families | **11** (`ALL_COLUMN_FAMILIES.len() == 11`; excludes implicit `default` CF) |
 | Stable error-code constants in `synapse_core::error_codes` | **95** |
 | Reserved subsystem error enums (mapped to those codes) | 11 (`StorageError`, `ReflexError`, `ActionError`, `ProfileError`, `ProfileLoadError`, `AudioError`, `PerceptionError`, `CaptureError`, `ModelError`, `A11yError`, `TelemetryError` + parse errors `ElementIdParseError`/`EventFilterValidationError`) |
 | M3 metric specs declared in `synapse_telemetry::metrics::M3_METRICS` | **19** (12 counters, 5 gauges, 2 histograms) |
-| Permissions in M3 grant model | **11** (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`, `INPUT_HARDWARE_HID`) |
+| Permissions in M3 grant model | **13** (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `READ_STORAGE`, `WRITE_STORAGE`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`, `INPUT_HARDWARE_HID`) |
 | Reflex kinds | 5 (`AimTrack`, `HoldMove`, `HoldButton`, `Combo`, `OnEvent`) |
 | Lines of code (source, excl. tests/benches) | **~36 914** |
 | Lines of code (integration tests) | **~18 260** |
