@@ -50,6 +50,7 @@ pub(super) struct RuntimeState {
     pub(super) aim_track_states: Vec<Option<AimTrackController>>,
     pub(super) hold_move_states: Vec<Option<HoldMoveController>>,
     pub(super) hold_button_states: Vec<Option<HoldButtonController>>,
+    pub(super) combo_states: Vec<Option<ComboController>>,
     pub(super) on_event_states: Vec<OnEventState>,
     pub(super) starvation_states: Vec<crate::conflict::StarvationState>,
     pub(super) subscription: SubscriberHandle,
@@ -73,7 +74,8 @@ pub(super) fn aim_track_states(
             }
             ScheduledReflexDriver::Actions
             | ScheduledReflexDriver::HoldMove(_)
-            | ScheduledReflexDriver::HoldButton(_) => Ok(None),
+            | ScheduledReflexDriver::HoldButton(_)
+            | ScheduledReflexDriver::Combo(_) => Ok(None),
         })
         .collect()
 }
@@ -92,7 +94,8 @@ pub(super) fn hold_move_states(
             .map(Some),
             ScheduledReflexDriver::Actions
             | ScheduledReflexDriver::AimTrack(_)
-            | ScheduledReflexDriver::HoldButton(_) => Ok(None),
+            | ScheduledReflexDriver::HoldButton(_)
+            | ScheduledReflexDriver::Combo(_) => Ok(None),
         })
         .collect()
 }
@@ -111,7 +114,24 @@ pub(super) fn hold_button_states(
             .map(Some),
             ScheduledReflexDriver::Actions
             | ScheduledReflexDriver::AimTrack(_)
-            | ScheduledReflexDriver::HoldMove(_) => Ok(None),
+            | ScheduledReflexDriver::HoldMove(_)
+            | ScheduledReflexDriver::Combo(_) => Ok(None),
+        })
+        .collect()
+}
+
+pub(super) fn combo_states(reflexes: &[ScheduledReflex]) -> Vec<Option<ComboController>> {
+    reflexes
+        .iter()
+        .map(|reflex| match &reflex.driver {
+            ScheduledReflexDriver::Combo(params) => Some(ComboController::new(
+                reflex.reflex_id.clone(),
+                params.clone(),
+            )),
+            ScheduledReflexDriver::Actions
+            | ScheduledReflexDriver::AimTrack(_)
+            | ScheduledReflexDriver::HoldMove(_)
+            | ScheduledReflexDriver::HoldButton(_) => None,
         })
         .collect()
 }
@@ -255,6 +275,7 @@ fn kind_summary(reflex: &ScheduledReflex) -> String {
         ScheduledReflexDriver::AimTrack(_params) => "aim_track".to_owned(),
         ScheduledReflexDriver::HoldMove(params) => format!("hold_move:{} keys", params.keys.len()),
         ScheduledReflexDriver::HoldButton(_params) => "hold_button".to_owned(),
+        ScheduledReflexDriver::Combo(params) => format!("combo:{} steps", params.steps.len()),
     }
 }
 

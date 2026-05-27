@@ -19,8 +19,8 @@ impl SynapseService {
         );
         let required = required_combo_permissions(&params.0)?;
         self.require_m3_permissions("act_combo", &required)?;
-        let (handle, _recording, _connection_closed_cancel) = self.m2_action_context()?;
-        execute_combo(handle, params.0).await.map(Json)
+        let runtime = self.reflex_runtime()?;
+        execute_combo(runtime, params.0).await.map(Json)
     }
 
     #[tool(description = "Run a local shell command only when startup policy permits it")]

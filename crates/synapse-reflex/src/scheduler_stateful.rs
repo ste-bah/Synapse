@@ -7,6 +7,7 @@ use crate::{
     ReflexError,
     kinds::{
         aim_track::{AimTrackContext, AimTrackOutput},
+        combo::{ComboContext, ComboOutput},
         hold_button::{HoldButtonOutput, HoldButtonPhase},
         hold_lifetime::HoldLifetimeContext,
         hold_move::{HoldMoveOutput, HoldMovePhase},
@@ -30,11 +31,15 @@ pub(super) fn step_stateful_controllers(
             step_aim_track(runtime, index, elapsed),
             step_hold_move(runtime, index, events, elapsed),
             step_hold_button(runtime, index, events, elapsed),
+            step_combo(runtime, index, elapsed),
         ]
         .into_iter()
         .flatten()
         {
             match outcome {
+                StatefulOutcome::Progressed { actions } => {
+                    *dispatched_actions = dispatched_actions.saturating_add(actions);
+                }
                 StatefulOutcome::Fired { actions } => {
                     *dispatched_actions = dispatched_actions.saturating_add(actions);
                     super::mark_reflex_fired(runtime, index);
@@ -57,6 +62,9 @@ pub(super) fn step_stateful_controllers(
 
 #[derive(Clone, Debug)]
 enum StatefulOutcome {
+    Progressed {
+        actions: usize,
+    },
     Fired {
         actions: usize,
     },
@@ -68,6 +76,30 @@ enum StatefulOutcome {
     Blocked {
         error: ReflexError,
     },
+}
+
+fn step_combo(
+    runtime: &mut RuntimeState,
+    index: usize,
+    elapsed: Duration,
+) -> Option<StatefulOutcome> {
+    let controller = runtime.combo_states.get_mut(index)?.as_mut()?;
+    let context = ComboContext {
+        tick_elapsed: elapsed,
+    };
+    match controller.step_dispatch(&context, &runtime.action_handle, &runtime.event_bus) {
+        Ok(ComboOutput::Completed { actions, .. }) => Some(StatefulOutcome::Expired {
+            actions,
+            reason: "completed",
+        }),
+        Ok(output) if output.action_count() > 0 => Some(StatefulOutcome::Progressed {
+            actions: output.action_count(),
+        }),
+        Ok(
+            ComboOutput::Idle { .. } | ComboOutput::Started { .. } | ComboOutput::Dispatched { .. },
+        ) => Some(StatefulOutcome::Idle),
+        Err(error) => Some(StatefulOutcome::Blocked { error }),
+    }
 }
 
 fn step_aim_track(

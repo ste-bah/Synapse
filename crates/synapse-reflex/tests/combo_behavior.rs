@@ -1,11 +1,19 @@
 use std::{error::Error, time::Duration};
 
+use std::sync::Arc;
 use synapse_action::{ActionHandle, ActionMessage};
-use synapse_core::{Action, Backend, ComboInput, ComboStep, EventFilter, Key, KeyCode};
+
+use synapse_core::{
+    Action, Backend, ComboInput, ComboStep, EventFilter, Key, KeyCode, ReflexState, SCHEMA_VERSION,
+    StoredReflexAudit, error_codes,
+};
 use synapse_reflex::{
     ComboContext, ComboController, ComboOutput, ComboParams, ComboPhase, EventBus,
-    REFLEX_COMBO_COMPLETED_KIND, ReflexScheduler, ScheduledReflex, SchedulerConfig,
+    REFLEX_COMBO_COMPLETED_KIND, REFLEX_LIFETIME_EXPIRED_KIND, ReflexScheduler, ScheduledReflex,
+    SchedulerConfig,
 };
+use synapse_storage::{Db, cf, decode_json};
+use tempfile::tempdir;
 use tokio::sync::mpsc;
 
 #[test]
@@ -261,6 +269,77 @@ fn scheduler_starts_combo_actions_when_trigger_fires() -> Result<(), Box<dyn Err
         }]
     );
     assert!(samples.iter().any(|sample| sample.dispatched_actions == 1));
+    Ok(())
+}
+
+#[test]
+fn scheduler_combo_driver_expires_after_final_step_and_writes_audit() -> Result<(), Box<dyn Error>>
+{
+    let temp = tempdir()?;
+    let db_path = temp.path().join("db");
+    let db = Arc::new(Db::open(&db_path, SCHEMA_VERSION)?);
+    let bus = EventBus::default();
+    let (action_handle, mut action_rx) = ActionHandle::channel();
+    let key = named_key("x");
+    let reflex = ScheduledReflex::combo(
+        "combo-driver",
+        ComboParams::new(
+            vec![
+                ComboStep {
+                    at_ms: 0,
+                    input: ComboInput::KeyDown { key: key.clone() },
+                },
+                ComboStep {
+                    at_ms: 5,
+                    input: ComboInput::KeyUp { key: key.clone() },
+                },
+            ],
+            Backend::Software,
+        ),
+    );
+
+    let mut scheduler = ReflexScheduler::spawn_with_audit_db(
+        bus,
+        action_handle,
+        vec![reflex],
+        SchedulerConfig::default().with_max_ticks(32),
+        Arc::clone(&db),
+    )?;
+    let samples = scheduler.wait_for_samples(32, Duration::from_secs(3));
+    let statuses = scheduler.statuses();
+    scheduler.stop()?;
+
+    assert_eq!(
+        drain(&mut action_rx),
+        vec![
+            Action::KeyDown {
+                key: key.clone(),
+                backend: Backend::Software,
+            },
+            Action::KeyUp {
+                key,
+                backend: Backend::Software,
+            },
+        ]
+    );
+    assert!(samples.iter().any(|sample| sample.dispatched_actions > 0));
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].state, ReflexState::Expired);
+    assert_eq!(statuses[0].fire_count, 1);
+
+    db.flush()?;
+    let rows = db.scan_cf(cf::CF_REFLEX_AUDIT)?;
+    let audits = rows
+        .iter()
+        .map(|(_key, value)| decode_json::<StoredReflexAudit>(value))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert!(audits.iter().any(|audit| {
+        audit.reflex_id == "combo-driver"
+            && audit.status == ReflexState::Expired
+            && audit.error_code.as_deref() == Some(error_codes::REFLEX_LIFETIME_EXPIRED)
+            && audit.details["kind"] == REFLEX_LIFETIME_EXPIRED_KIND
+            && audit.details["reason"] == "completed"
+    }));
     Ok(())
 }
 

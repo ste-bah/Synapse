@@ -12,8 +12,8 @@ use synapse_core::{
     ReflexStatus, error_codes, new_reflex_id,
 };
 use synapse_reflex::{
-    AimTrackParams, AimTrackTarget, HoldButtonParams, HoldMoveParams, ReflexError, ReflexRuntime,
-    ScheduledReflex,
+    AimTrackParams, AimTrackTarget, ComboParams, HoldButtonParams, HoldMoveParams, ReflexError,
+    ReflexRuntime, ScheduledReflex,
 };
 
 use crate::m1::mcp_error;
@@ -180,16 +180,12 @@ pub(super) fn scheduled_reflex_from_params(
         }
         "combo" => {
             let steps = combo_steps_from_params(params.steps, params.then)?;
-            Ok(ScheduledReflex::every_tick(
-                reflex_id,
-                vec![Action::Combo {
-                    steps,
-                    backend: params.backend,
-                }],
+            Ok(
+                ScheduledReflex::combo(reflex_id, ComboParams::new(steps, params.backend))
+                    .with_priority(params.priority)
+                    .with_lifetime(ReflexLifetime::OneShot)
+                    .with_exclusive(params.exclusive),
             )
-            .with_priority(params.priority)
-            .with_lifetime(ReflexLifetime::OneShot)
-            .with_exclusive(params.exclusive))
         }
         other => Err(ReflexError::KindInvalid {
             detail: format!("unknown reflex kind: {other}"),

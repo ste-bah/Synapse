@@ -1,9 +1,14 @@
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use rmcp::{ErrorData, model::ErrorCode, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use synapse_core::{Action, Backend, ComboInput, ComboStep, Key, error_codes};
+use synapse_core::{Action, Backend, ComboInput, ComboStep, Key, error_codes, new_reflex_id};
+use synapse_reflex::{ComboParams, ReflexRuntime, ScheduledReflex};
 
 use crate::{
     m1::mcp_error,
@@ -113,7 +118,7 @@ pub struct ActLaunchResponse {
 }
 
 pub async fn execute_combo(
-    handle: synapse_action::ActionHandle,
+    runtime: Arc<Mutex<ReflexRuntime>>,
     params: ActComboParams,
 ) -> Result<ActComboResponse, ErrorData> {
     validate_combo_params(&params)?;
@@ -126,23 +131,29 @@ pub async fn execute_combo(
             "act_combo expanded steps length exceeds u32::MAX",
         )
     })?;
-    let action = Action::Combo {
-        steps,
-        backend: params.backend,
-    };
-    handle
-        .execute(action)
-        .await
+    let combo_id = new_reflex_id();
+    let reflex = ScheduledReflex::combo(combo_id.clone(), ComboParams::new(steps, params.backend));
+    let state = runtime
+        .lock()
+        .map_err(|_err| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "reflex runtime lock poisoned",
+            )
+        })?
+        .register(&reflex)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     tracing::info!(
         code = "M4_ACT_COMBO_EXECUTED",
+        combo_id = %combo_id,
         idempotency_present,
         scheduled_steps,
         backend = ?params.backend,
-        "readback=act_combo after=action_emitter_execute"
+        state = ?state.state,
+        "readback=act_combo after=reflex_runtime_register"
     );
     Ok(ActComboResponse {
-        combo_id: synapse_core::new_session_id(),
+        combo_id,
         scheduled_steps,
         backend: params.backend,
         started_at_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -222,16 +233,8 @@ fn validate_combo_params(params: &ActComboParams) -> Result<(), ErrorData> {
                 format!("act_combo steps[{index}].at_ms must be monotonic"),
             ));
         }
-        if let Some(step_backend) = step.backend
-            && step_backend != params.backend
-            && params.backend != Backend::Auto
-        {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "act_combo steps[{index}].backend differs from top-level backend; per-step backend routing is not lowerable yet"
-                ),
-            ));
+        if let Some(step_backend) = step.backend {
+            ensure_combo_step_backend_matches(index, "backend", step_backend, params.backend)?;
         }
         previous = step.at_ms;
     }
@@ -250,7 +253,7 @@ fn combo_steps_from_params(params: &ActComboParams) -> Result<Vec<ComboStep>, Er
                             format!("act_combo steps[{index}].act_press params invalid: {error}"),
                         )
                     })?;
-                push_press_combo_steps(&mut out, index, step.at_ms, &press)?;
+                push_press_combo_steps(&mut out, index, step.at_ms, &press, params.backend)?;
             }
             other => {
                 return Err(mcp_error(
@@ -270,9 +273,20 @@ fn push_press_combo_steps(
     index: usize,
     at_ms: u32,
     params: &ActPressParams,
+    combo_backend: Backend,
 ) -> Result<(), ErrorData> {
     match action_from_press_params(params)? {
-        Action::KeyPress { key, hold_ms, .. } => {
+        Action::KeyPress {
+            key,
+            hold_ms,
+            backend,
+        } => {
+            ensure_combo_step_backend_matches(
+                index,
+                "act_press params.backend",
+                backend,
+                combo_backend,
+            )?;
             let hold_ms = u16::try_from(hold_ms).map_err(|_err| {
                 mcp_error(
                     error_codes::TOOL_PARAMS_INVALID,
@@ -284,7 +298,17 @@ fn push_press_combo_steps(
                 input: ComboInput::KeyPress { key, hold_ms },
             });
         }
-        Action::KeyChord { keys, hold_ms, .. } => {
+        Action::KeyChord {
+            keys,
+            hold_ms,
+            backend,
+        } => {
+            ensure_combo_step_backend_matches(
+                index,
+                "act_press params.backend",
+                backend,
+                combo_backend,
+            )?;
             push_key_chord_combo_steps(out, at_ms, keys, hold_ms);
         }
         other => {
@@ -295,6 +319,23 @@ fn push_press_combo_steps(
         }
     }
     Ok(())
+}
+
+fn ensure_combo_step_backend_matches(
+    index: usize,
+    field: &'static str,
+    requested: Backend,
+    combo_backend: Backend,
+) -> Result<(), ErrorData> {
+    if requested == Backend::Auto || requested == combo_backend {
+        return Ok(());
+    }
+    Err(mcp_error(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!(
+            "act_combo steps[{index}].{field} differs from top-level backend; per-step backend routing is not lowerable yet"
+        ),
+    ))
 }
 
 fn push_key_chord_combo_steps(out: &mut Vec<ComboStep>, at_ms: u32, keys: Vec<Key>, hold_ms: u32) {
@@ -356,4 +397,72 @@ const fn default_shell_timeout_ms() -> u32 {
 
 const fn default_launch_timeout_ms() -> u32 {
     DEFAULT_LAUNCH_TIMEOUT_MS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combo_rejects_nested_press_backend_mismatch() {
+        let params = ActComboParams {
+            steps: vec![ActComboStep {
+                at_ms: 0,
+                action: ActComboAction::ActPress,
+                params: json!({
+                    "keys": ["f17"],
+                    "hold_ms": 5,
+                    "backend": "hardware"
+                }),
+                backend: None,
+            }],
+            backend: Backend::Software,
+            idempotency_key: None,
+        };
+
+        let error = match combo_steps_from_params(&params) {
+            Ok(steps) => panic!("mismatched backend should reject, got {steps:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(|code| code.as_str()),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert!(
+            error
+                .message
+                .contains("act_press params.backend differs from top-level backend")
+        );
+    }
+
+    #[test]
+    fn combo_allows_nested_press_auto_backend_to_use_top_level_backend() {
+        let params = ActComboParams {
+            steps: vec![ActComboStep {
+                at_ms: 0,
+                action: ActComboAction::ActPress,
+                params: json!({
+                    "keys": ["f18"],
+                    "hold_ms": 5,
+                    "backend": "auto"
+                }),
+                backend: None,
+            }],
+            backend: Backend::Software,
+            idempotency_key: None,
+        };
+
+        let steps = match combo_steps_from_params(&params) {
+            Ok(steps) => steps,
+            Err(error) => panic!("auto backend should lower: {error}"),
+        };
+
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].at_ms, 0);
+    }
 }

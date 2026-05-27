@@ -187,7 +187,7 @@ fn hold_move_shape_maps_key_string_and_duration() {
 }
 
 #[test]
-fn combo_timed_act_press_steps_map_to_one_shot_combo_action() {
+fn combo_timed_act_press_steps_map_to_one_shot_combo_driver() {
     let params: ReflexRegisterParams = serde_json::from_value(json!({
         "kind": "combo",
         "steps": [
@@ -200,12 +200,13 @@ fn combo_timed_act_press_steps_map_to_one_shot_combo_action() {
 
     let reflex = scheduled_reflex_from_params(params).expect("combo should build a reflex");
 
-    assert!(matches!(reflex.driver, ScheduledReflexDriver::Actions));
-    assert_eq!(reflex.lifetime, ReflexLifetime::OneShot);
-    let [Action::Combo { steps, backend }] = reflex.then.as_slice() else {
-        panic!("combo should map to one combo action");
+    let ScheduledReflexDriver::Combo(combo) = reflex.driver else {
+        panic!("combo should map to stateful combo driver");
     };
-    assert_eq!(*backend, Backend::Software);
+    assert_eq!(reflex.lifetime, ReflexLifetime::OneShot);
+    assert!(reflex.then.is_empty());
+    assert_eq!(combo.backend, Backend::Software);
+    let steps = combo.steps;
     assert_eq!(steps.len(), 2);
     assert_eq!(steps[0].at_ms, 0);
     assert_eq!(steps[1].at_ms, 200);
