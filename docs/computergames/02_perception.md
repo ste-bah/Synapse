@@ -250,6 +250,7 @@ name = "minecraft.hp_hearts"
 region = { kind = "anchored_to_edge", edge = "bottom_left", x_offset = 220, y_offset = -50, w = 180, h = 18 }
 extractor = { kind = "template_match", templates = ["hearts/full.png", "hearts/half.png", "hearts/empty.png"] }
 parser = { kind = "number" }
+confidence_threshold = 0.85
 ```
 
 Profile-driven extraction runs in `synapse-perception::hud`. Returns:
@@ -279,9 +280,19 @@ client rect `1920x1080` plus `bottom_left`, offsets `(8, -32)`, and size
 The template extractor takes a cropped grayscale HUD region plus
 full/half/empty templates and scans each slot with zero-mean normalized
 cross-correlation. The default status-bar config is 10 slots, full=2, half=1,
-empty=0, max value 20, and minimum per-slot confidence 0.85. Synthetic 180x16
-regions with three 9x9 templates measure at roughly 0.29 ms locally, leaving
-the 5 ms HUD budget for capture and future live-frame wiring.
+empty=0, and max value 20. Each `HudFieldSpec` carries a
+`confidence_threshold` defaulting to 0.85. `synapse-perception::hud::extract_field`
+runs template counters permissively, accepts readings whose aggregate
+confidence meets the field threshold, and falls back to WinRT OCR plus the
+profile parser when template confidence is lower. The default
+`SystemOcrProvider` uses the real platform OCR path (`Windows.Media.Ocr` on
+Windows). If OCR produces no parseable value or stays below the field threshold,
+the extractor fails closed with `HUD_EXTRACTION_FAILED`.
+
+Synthetic 180x16 regions with three 9x9 templates measure under the HUD budget
+locally; the synthetic OCR fallback path has a p99 under 30 ms with the local
+provider fixture. Live-frame wiring still needs to account for capture and
+window targeting costs separately.
 
 ### OCR cache
 

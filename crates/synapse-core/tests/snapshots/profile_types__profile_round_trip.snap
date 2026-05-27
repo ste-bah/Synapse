@@ -76,7 +76,8 @@ expression: "round_trip(\"Profile\", \"snapshot\", full_profile())?"
         "kind": "regex",
         "pattern": "([0-9]+)/[0-9]+",
         "group": 1
-      }
+      },
+      "confidence_threshold": 0.85
     }
   ],
   "keymap": {

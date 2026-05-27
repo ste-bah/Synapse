@@ -183,13 +183,17 @@ pub fn hud_field_spec_strategy() -> impl Strategy<Value = HudFieldSpec> {
         hud_region_strategy(),
         hud_extractor_strategy(),
         hud_parser_strategy(),
+        0.0_f32..1.0,
     )
-        .prop_map(|(name, region, extractor, parser)| HudFieldSpec {
-            name,
-            region,
-            extractor,
-            parser,
-        })
+        .prop_map(
+            |(name, region, extractor, parser, confidence_threshold)| HudFieldSpec {
+                name,
+                region,
+                extractor,
+                parser,
+                confidence_threshold,
+            },
+        )
 }
 
 pub fn profile_backends_strategy() -> impl Strategy<Value = ProfileBackends> {

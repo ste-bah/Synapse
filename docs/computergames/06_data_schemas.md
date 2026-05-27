@@ -780,6 +780,7 @@ pub struct HudFieldSpec {
     pub region: HudRegion,
     pub extractor: HudExtractor,
     pub parser: HudParser,
+    pub confidence_threshold: f32,              // default 0.85; template fallback threshold
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -792,7 +793,7 @@ pub enum HudRegion {
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WindowEdge { TopLeft, TopRight, BottomLeft, BottomRight }
+pub enum WindowEdge { TopLeft, TopRight, BottomLeft, BottomRight, Center }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

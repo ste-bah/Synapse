@@ -175,6 +175,7 @@ pub fn minimal_hud_field(name: &str) -> HudFieldSpec {
         },
         extractor: HudExtractor::WinrtOcr,
         parser: HudParser::Number,
+        confidence_threshold: 0.85,
     }
 }
 
@@ -184,6 +185,7 @@ pub fn full_hud_field() -> HudFieldSpec {
         region: anchored_region(),
         extractor: full_extractor(),
         parser: full_parser(),
+        confidence_threshold: 0.85,
     }
 }
 

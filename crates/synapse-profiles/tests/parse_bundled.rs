@@ -1,9 +1,19 @@
 use std::{fs, time::UNIX_EPOCH};
 
-use synapse_core::{Backend, HudExtractor, HudRegion, ProfileUseScope, WindowEdge, error_codes};
+use synapse_core::{
+    Backend, HudExtractor, HudParser, HudRegion, ProfileUseScope, WindowEdge,
+    default_hud_confidence_threshold, error_codes,
+};
 use synapse_profiles::{
     ProfileError, ScreenBounds, bundled_profiles_dir, parse_profile_bytes, parse_profile_file,
 };
+
+fn assert_f32_close(actual: f32, expected: f32) {
+    assert!(
+        (actual - expected).abs() <= f32::EPSILON,
+        "actual={actual} expected={expected}"
+    );
+}
 
 #[test]
 fn bundled_profiles_parse_and_keep_natural_defaults() -> Result<(), Box<dyn std::error::Error>> {
@@ -392,6 +402,118 @@ region = { kind = "anchored_to_edge", edge = "center", x_offset = -40, y_offset 
             h: 24,
         }
     ));
+    assert_f32_close(
+        loaded.profile.hud[0].confidence_threshold,
+        default_hud_confidence_threshold(),
+    );
+}
+
+#[test]
+fn parser_accepts_hud_confidence_threshold_default_and_override() {
+    let toml = r#"
+id = "hud_threshold"
+label = "HUD Threshold"
+schema_version = 1
+use_scope = "operator_owned_test"
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "hud-threshold.exe"
+
+[[hud]]
+name = "hp.default"
+x = 10
+y = 10
+w = 100
+h = 20
+
+[[hud]]
+name = "hp.custom"
+confidence_threshold = 0.73
+extractor = { kind = "winrt_ocr" }
+parser = { kind = "regex", pattern = "([0-9]+)", group = 1 }
+x = 10
+y = 40
+w = 100
+h = 20
+"#;
+
+    println!("readback=profile_hud_threshold edge=parse before=default:absent custom:0.73");
+    let loaded = parse_profile_bytes(
+        "hud_threshold.toml",
+        toml.as_bytes(),
+        UNIX_EPOCH,
+        ScreenBounds {
+            width: 1920,
+            height: 1080,
+        },
+    )
+    .unwrap_or_else(|error| panic!("HUD confidence thresholds should parse: {error}"));
+    println!(
+        "readback=profile_hud_threshold edge=parse after=default:{:.2} custom:{:.2} parser:{:?}",
+        loaded.profile.hud[0].confidence_threshold,
+        loaded.profile.hud[1].confidence_threshold,
+        loaded.profile.hud[1].parser
+    );
+
+    assert_f32_close(
+        loaded.profile.hud[0].confidence_threshold,
+        default_hud_confidence_threshold(),
+    );
+    assert_f32_close(loaded.profile.hud[1].confidence_threshold, 0.73);
+    assert!(matches!(
+        loaded.profile.hud[1].parser,
+        HudParser::Regex { .. }
+    ));
+}
+
+#[test]
+fn parser_rejects_hud_confidence_threshold_outside_unit_interval() {
+    let toml = r#"
+id = "bad_hud_threshold"
+label = "Bad HUD Threshold"
+schema_version = 1
+use_scope = "operator_owned_test"
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "bad-hud-threshold.exe"
+
+[[hud]]
+name = "hp.bad"
+confidence_threshold = 1.01
+x = 10
+y = 10
+w = 100
+h = 20
+"#;
+
+    println!("readback=profile_hud_threshold edge=invalid before=confidence_threshold:1.01");
+    let result = parse_profile_bytes(
+        "bad_hud_threshold.toml",
+        toml.as_bytes(),
+        UNIX_EPOCH,
+        ScreenBounds {
+            width: 1920,
+            height: 1080,
+        },
+    );
+    let Err(error) = result else {
+        panic!("out-of-range HUD confidence threshold parsed successfully");
+    };
+    println!(
+        "readback=profile_hud_threshold edge=invalid after=code:{} error:{}",
+        error.code(),
+        error
+    );
+    assert_eq!(error.code(), error_codes::PROFILE_PARSE_ERROR);
+    assert!(
+        error
+            .to_string()
+            .contains("confidence_threshold must be finite and in 0..=1")
+    );
 }
 
 #[test]

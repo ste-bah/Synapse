@@ -4,7 +4,7 @@ Source files covered:
 - `crates/synapse-perception/src/lib.rs`
 - `crates/synapse-perception/src/error.rs`
 - `crates/synapse-perception/src/event_extensions.rs`
-- `crates/synapse-perception/src/hud/{mod,anchor}.rs`
+- `crates/synapse-perception/src/hud/{mod,anchor,extractor}.rs`
 - `crates/synapse-perception/src/observe.rs`
 - `crates/synapse-perception/src/ocr.rs`
 - `crates/synapse-perception/src/template_match.rs`
@@ -129,9 +129,10 @@ The crate ensures a per-thread COM apartment (`ComApartmentKind`) before any UIA
 | `bounded_sensor_latency` | `observe.rs` — helper that clamps measured latency for `ObservationDiagnostics` |
 | `is_known_game_process(process_name) -> bool` | hardcoded list of "common game / fullscreen render-only process names |
 | `parse_perception_mode(&str) -> PerceptionResult<PerceptionMode>` | string parse used by `set_perception_mode` |
-| `OcrProvider`, `TextRegion`, `is_empty_region`, `read_text`, `read_text_with_provider` | `ocr.rs` |
+| `OcrProvider`, `SystemOcrProvider`, `TextRegion`, `is_empty_region`, `read_text`, `read_text_with_provider` | `ocr.rs` |
 | `read_text_from_software_bitmap` (Windows only) | `ocr.rs` |
 | `HudAnchor`, `HudAnchorRegion`, `ResolvedHudRegion`, `resolve_anchor_region`, `resolve_hud_region`, `resolve_hud_region_rect` | `hud/anchor.rs` — resolves profile/compact HUD anchors against a foreground window client rect and returns left/top/right/bottom plus `Rect` readback |
+| `ExtractionSource`, `FieldExtraction`, `FieldExtractionRequest`, `extract_field`, `parse_hud_text` | `hud/extractor.rs` — applies per-field HUD confidence thresholds, accepts high-confidence template counters, and falls back to OCR plus parser when template confidence is low |
 | `HudTemplate`, `TemplateCounterConfig`, `extract_template_counter_from_region`, `extract_template_counter_from_frame` | `template_match.rs` — slotted normalized-correlation HUD counter extraction for hearts/hunger-style icon bars |
 | `evaluate_event_extensions`, `validate_event_extension`, `validate_event_extensions` | `event_extensions.rs` — profile `EventExtension` validation and synthetic event derivation using `synapse-core::EventFilter` |
 
@@ -158,18 +159,36 @@ the window and use screen coordinates directly.
 `OcrProvider` trait:
 
 ```rust
-pub trait OcrProvider: Send + Sync {
-    fn read_text(&self, region: TextRegion, lang_hint: Option<&str>) -> PerceptionResult<OcrResult>;
+pub trait OcrProvider {
+    fn read_text(&self, region: Rect) -> PerceptionResult<Vec<TextRegion>>;
 }
 ```
 
-`TextRegion` is `{ rect: Rect, source: TextRegionSource }` where source distinguishes screen-coord regions vs an `ElementId` reference. `is_empty_region(rect)` checks `w <= 0 || h <= 0`.
+`TextRegion` is `{ text, bbox: Rect, confidence }`. `is_empty_region(rect)` checks `w <= 0 || h <= 0`.
 
-`read_text(region, lang_hint)` picks the default `OcrProvider` (Windows: WinRT OCR via `Media.Ocr`; non-Windows: returns `OCR_BACKEND_UNAVAILABLE`).
+`read_text(region)` picks the default OCR path. On Windows this captures the
+screen region to a `SoftwareBitmap` and calls WinRT `Windows.Media.Ocr`; on
+WSL/Linux it delegates to the configured Windows host PowerShell OCR bridge;
+other targets return `OCR_BACKEND_UNAVAILABLE`.
 
-`read_text_with_provider(provider, region, lang_hint)` lets callers inject a provider (used in tests with a fixture).
+`read_text_with_provider(provider, region)` lets callers inject a provider for
+deterministic fallback-path verification.
 
-Windows-only `read_text_from_software_bitmap(bitmap: SoftwareBitmap, lang_hint)` is the lower-level entrypoint for code paths that already have a `SoftwareBitmap` in hand.
+`SystemOcrProvider` implements `OcrProvider` by calling `read_text(region)`,
+which is the real WinRT OCR path on Windows.
+
+Windows-only `read_text_from_software_bitmap(region, bitmap)` is the lower-level
+entrypoint for code paths that already have a `SoftwareBitmap` in hand.
+
+HUD field extraction uses `FieldExtractionRequest { field, screen_region,
+region_image, templates, ocr_provider, stale_ms }`. For `TemplateMatch`, it
+runs the slotted template counter with a permissive threshold, compares the
+aggregate confidence against `HudFieldSpec.confidence_threshold` (default
+0.85), and returns a numeric `HudReading` when accepted. If the template
+confidence is below threshold, it calls the supplied OCR provider over the same
+screen region, joins recognized words, applies the `HudParser`, and returns
+`ExtractionSource::OcrFallback`. If OCR is empty, below threshold, or
+unparseable, the field fails closed as `HUD_EXTRACTION_FAILED`.
 
 ## 5. `synapse-mcp/src/m1` glue
 
@@ -278,9 +297,10 @@ The fixed JSON-RPC code `-32099` is the rmcp custom-error slot; the structured `
 
 - **CNN object detection.** `synapse-models` ships the `Detector` trait and ONNX session loader, but `M1State` does not invoke detectors in the current build; `entities: Vec<DetectedEntity>` is populated only by synthetic fixtures.
 - **Live HUD extraction wiring.** `Profile.hud` carries `HudFieldSpec`s and
-  `synapse-perception` exposes a client-rect anchor resolver plus a
-  template-match extractor for cropped frame regions, but `observe()` does not
-  yet run profile HUD extractors against live captured frames. `hud:
+  `synapse-perception` exposes a client-rect anchor resolver, slotted
+  template-match extraction, and template-confidence to OCR/parser fallback for
+  cropped frame regions, but `observe()` does not yet run profile HUD
+  extractors against live captured frames. `hud:
   HudReadings` is empty unless populated synthetically or by a caller that
   invokes the extractor directly.
 - **Event extension runtime wiring.** `synapse-perception` exposes the

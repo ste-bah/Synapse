@@ -20,6 +20,15 @@ pub trait OcrProvider {
     fn read_text(&self, region: Rect) -> PerceptionResult<Vec<TextRegion>>;
 }
 
+#[derive(Copy, Clone, Debug, Default)]
+pub struct SystemOcrProvider;
+
+impl OcrProvider for SystemOcrProvider {
+    fn read_text(&self, region: Rect) -> PerceptionResult<Vec<TextRegion>> {
+        read_text(region)
+    }
+}
+
 /// Reads OCR text from a screen-coordinate region.
 ///
 /// # Errors

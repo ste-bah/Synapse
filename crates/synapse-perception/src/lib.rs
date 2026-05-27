@@ -10,7 +10,8 @@ pub use event_extensions::{
     evaluate_event_extensions, validate_event_extension, validate_event_extensions,
 };
 pub use hud::{
-    HudAnchor, HudAnchorRegion, ResolvedHudRegion, resolve_anchor_region, resolve_hud_region,
+    ExtractionSource, FieldExtraction, FieldExtractionRequest, HudAnchor, HudAnchorRegion,
+    ResolvedHudRegion, extract_field, parse_hud_text, resolve_anchor_region, resolve_hud_region,
     resolve_hud_region_rect,
 };
 pub use observe::{
@@ -18,7 +19,9 @@ pub use observe::{
     assemble_from_input, auto_mode, auto_mode_with_a11y, bounded_sensor_latency,
     is_known_game_process, parse_perception_mode,
 };
-pub use ocr::{OcrProvider, TextRegion, is_empty_region, read_text, read_text_with_provider};
+pub use ocr::{
+    OcrProvider, SystemOcrProvider, TextRegion, is_empty_region, read_text, read_text_with_provider,
+};
 pub use template_match::{
     HudTemplate, TemplateCounterConfig, TemplateCounterReading, TemplateSlotReading,
     extract_template_counter_from_frame, extract_template_counter_from_region,

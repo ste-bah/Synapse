@@ -603,12 +603,14 @@ default_backend = "winrt"
 name = "hp_hearts"
 extractor = { kind = "template_match", templates = ["hearts/full.png", "hearts/half.png", "hearts/empty.png"] }
 parser = { kind = "number" }
+confidence_threshold = 0.85
 region = { kind = "anchored_to_edge", edge = "bottom_left", x_offset = 220, y_offset = -50, w = 180, h = 18 }
 
 [[hud]]
 name = "hunger"
 extractor = { kind = "template_match", templates = ["hunger/full.png", "hunger/half.png", "hunger/empty.png"] }
 parser = { kind = "number" }
+confidence_threshold = 0.85
 region = { kind = "anchored_to_edge", edge = "bottom_right", x_offset = -400, y_offset = -50, w = 180, h = 18 }
 
 [keymap]

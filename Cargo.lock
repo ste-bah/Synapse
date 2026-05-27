@@ -3668,6 +3668,7 @@ dependencies = [
  "chrono",
  "criterion",
  "image",
+ "regex",
  "serde",
  "serde_json",
  "synapse-a11y",

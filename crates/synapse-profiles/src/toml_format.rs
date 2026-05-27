@@ -4,6 +4,7 @@ use serde::Deserialize;
 use synapse_core::{
     EventExtension, HudExtractor, HudFieldSpec, HudParser, HudRegion, Profile, ProfileBackends,
     ProfileCapture, ProfileDetection, ProfileId, ProfileMatch, ProfileOcr, SCHEMA_VERSION,
+    default_hud_confidence_threshold,
 };
 
 use crate::{
@@ -251,6 +252,8 @@ struct RawHudField {
     extractor: Option<HudExtractor>,
     #[serde(default)]
     parser: Option<HudParser>,
+    #[serde(default = "default_hud_confidence_threshold")]
+    confidence_threshold: f32,
     #[serde(default)]
     region_kind: Option<String>,
     #[serde(default)]
@@ -270,11 +273,13 @@ impl RawHudField {
             None => self.flat_region(path)?,
         };
         validate_hud_region(path, &self.name, &region, bounds)?;
+        validate_hud_confidence_threshold(path, &self.name, self.confidence_threshold)?;
         Ok(HudFieldSpec {
             name: self.name,
             region,
             extractor: self.extractor.unwrap_or(HudExtractor::WinrtOcr),
             parser: self.parser.unwrap_or(HudParser::Number),
+            confidence_threshold: self.confidence_threshold,
         })
     }
 
@@ -296,6 +301,22 @@ impl RawHudField {
             }),
         }
     }
+}
+
+fn validate_hud_confidence_threshold(
+    path: &Path,
+    name: &str,
+    confidence_threshold: f32,
+) -> Result<(), ProfileError> {
+    if !confidence_threshold.is_finite() || !(0.0..=1.0).contains(&confidence_threshold) {
+        return Err(ProfileError::Parse {
+            path: path.to_path_buf(),
+            message: format!(
+                "HUD field {name:?} confidence_threshold must be finite and in 0..=1, got {confidence_threshold}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn required_hud_coord(

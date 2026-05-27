@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 chrono.workspace = true
 image.workspace = true
+regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }

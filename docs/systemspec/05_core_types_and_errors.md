@@ -27,6 +27,7 @@ Source files covered:
 | `REFERENCE_REFLEX_TICK_JITTER_IDLE_P99_US` | `200` | Perf budget tests |
 | `REFERENCE_EVENT_TO_SUBSCRIBER_P99_MS` | `50.0` | Perf budget tests |
 | `EVENT_FILTER_MAX_DEPTH` | `8` | `EventFilter::validate` |
+| `DEFAULT_HUD_CONFIDENCE_THRESHOLD` | `0.85` | `HudFieldSpec.confidence_threshold` default |
 
 ## 3. Error code catalog
 
@@ -222,7 +223,7 @@ Supporting types:
 | `ProfileCaptureTarget` | `ForegroundWindow` \| `PrimaryMonitor` \| `MonitorIndex { index: u32 }` |
 | `ProfileDetection` | `{ model_id, classes_of_interest: Vec<String>, confidence_threshold: f32, max_detections: u32 }` |
 | `ProfileOcr` | `{ default_backend: OcrBackend, regions: Vec<HudRegion>, parser_config: BTreeMap<String, String> }` |
-| `HudFieldSpec` | `{ name, region: HudRegion, extractor: HudExtractor, parser: HudParser }` |
+| `HudFieldSpec` | `{ name, region: HudRegion, extractor: HudExtractor, parser: HudParser, confidence_threshold: f32 }` |
 | `HudRegion` | `Absolute { x, y, w, h }` \| `FractionOfWindow { x, y, w, h }` (f32) \| `AnchoredToEdge { edge: WindowEdge, x_offset, y_offset, w, h }` |
 | `WindowEdge` | `TopLeft` / `TopRight` / `BottomLeft` / `BottomRight` / `Center` |
 | `HudExtractor` | `WinrtOcr` \| `Crnn { model_id }` \| `TemplateMatch { templates }` \| `ColorRatio { sample_points: Vec<(i32, i32)>, mapping }` |

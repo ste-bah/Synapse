@@ -91,6 +91,13 @@ pub struct ProfileOcr {
     pub parser_config: BTreeMap<String, String>,
 }
 
+pub const DEFAULT_HUD_CONFIDENCE_THRESHOLD: f32 = 0.85;
+
+#[must_use]
+pub const fn default_hud_confidence_threshold() -> f32 {
+    DEFAULT_HUD_CONFIDENCE_THRESHOLD
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HudFieldSpec {
@@ -98,6 +105,8 @@ pub struct HudFieldSpec {
     pub region: HudRegion,
     pub extractor: HudExtractor,
     pub parser: HudParser,
+    #[serde(default = "default_hud_confidence_threshold")]
+    pub confidence_threshold: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

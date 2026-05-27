@@ -235,7 +235,8 @@ crates/synapse-perception/
     ├── event_extensions.rs         # Profile event_extension validation and derived event emission
     ├── hud/
     │   ├── mod.rs                  # HUD module exports
-    │   └── anchor.rs               # Client-rect HUD anchor resolver to LTRB/Rect
+    │   ├── anchor.rs               # Client-rect HUD anchor resolver to LTRB/Rect
+    │   └── extractor.rs            # HUD field extractor: template threshold plus OCR/parser fallback
     ├── observe.rs                  # ObservationAssembler, ObservationInput, ObserveInclude, auto_mode, A11yTreeSummary
     ├── ocr.rs                      # OcrProvider, TextRegion, read_text/read_text_with_provider, WinRT vs CRNN
     └── template_match.rs           # Slotted template HUD counter extraction
