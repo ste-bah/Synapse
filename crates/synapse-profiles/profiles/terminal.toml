@@ -1,6 +1,6 @@
 id = "terminal"
 label = "Windows Terminal"
-schema_version = 1
+schema_version = 2
 use_scope = "productivity"
 mode = "a11y_only"
 mouse_curve_default = "natural"

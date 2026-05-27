@@ -1,6 +1,6 @@
 id = "luanti.minetest"
 label = "Luanti / Minetest Game Benchmark"
-schema_version = 1
+schema_version = 2
 use_scope = "operator_owned_test"
 mode = "pixel_only"
 mouse_curve_default = "natural"

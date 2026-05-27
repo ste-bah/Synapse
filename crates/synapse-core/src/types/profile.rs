@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use super::{Backend, EventFilter, OcrBackend, PerceptionMode, ProfileId};
 
+pub const PROFILE_SCHEMA_VERSION: u32 = 2;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Profile {

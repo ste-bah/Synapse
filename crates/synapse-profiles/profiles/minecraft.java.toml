@@ -1,6 +1,6 @@
 id = "minecraft.java"
 label = "Minecraft Java Edition"
-schema_version = 1
+schema_version = 2
 use_scope = "single_player"
 mode = "pixel_only"
 mouse_curve_default = "natural"

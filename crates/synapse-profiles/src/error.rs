@@ -14,7 +14,7 @@ pub enum ProfileError {
     #[error("profile parse failed for {path}: {message}")]
     Parse { path: PathBuf, message: String },
     #[error(
-        "profile schema version {schema_version} in {path} is newer than supported version {supported_version}"
+        "profile schema version {schema_version} in {path} is incompatible with supported version {supported_version}"
     )]
     VersionIncompatible {
         path: PathBuf,

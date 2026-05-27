@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Context;
 use serde_json::{Value, json};
-use synapse_core::{SCHEMA_VERSION, error_codes};
+use synapse_core::{PROFILE_SCHEMA_VERSION, SCHEMA_VERSION, error_codes};
 use synapse_storage::{Db, cf, encode_json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 use tempfile::TempDir;
@@ -65,7 +65,7 @@ async fn profile_quality_refresh_persists_explainable_snapshot() -> anyhow::Resu
     );
     assert_eq!(
         first["snapshot"]["versioning"]["current_profile_schema_version"],
-        1
+        PROFILE_SCHEMA_VERSION
     );
     assert_eq!(
         first["snapshot"]["versioning"]["rows_with_profile_schema_version"],
@@ -120,7 +120,7 @@ fn write_profile(path: &Path) -> anyhow::Result<()> {
         r#"
 id = "quality.synthetic"
 label = "Quality Synthetic"
-schema_version = 1
+schema_version = 2
 use_scope = "operator_owned_test"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -145,7 +145,7 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
             "started",
             None,
             ProfileRefs::same("quality.synthetic"),
-            ProfileSchemaVersions::same(1),
+            ProfileSchemaVersions::same(PROFILE_SCHEMA_VERSION),
         )?,
         action_row(
             now - 5_000,
@@ -154,7 +154,7 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
             "ok",
             None,
             ProfileRefs::same("quality.synthetic"),
-            ProfileSchemaVersions::same(1),
+            ProfileSchemaVersions::same(PROFILE_SCHEMA_VERSION),
         )?,
         action_row(
             now - 4_000,
@@ -163,7 +163,7 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
             "error",
             Some(error_codes::ACTION_BACKEND_UNAVAILABLE),
             ProfileRefs::same("quality.synthetic"),
-            ProfileSchemaVersions::same(1),
+            ProfileSchemaVersions::same(PROFILE_SCHEMA_VERSION),
         )?,
         action_row(
             now - 3_000,
@@ -172,7 +172,7 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
             "denied",
             Some(error_codes::SAFETY_PROFILE_ACTION_DENIED),
             ProfileRefs::same("quality.synthetic"),
-            ProfileSchemaVersions::same(1),
+            ProfileSchemaVersions::same(PROFILE_SCHEMA_VERSION),
         )?,
         action_row(
             now - 2_000,
@@ -185,8 +185,8 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
                 foreground: "other.profile",
             },
             ProfileSchemaVersions {
-                active: 0,
-                foreground: 2,
+                active: 1,
+                foreground: PROFILE_SCHEMA_VERSION + 1,
             },
         )?,
         stale_action_row(1, 5)?,
@@ -246,7 +246,7 @@ fn stale_action_row(ts_ns: u64, seq: u32) -> anyhow::Result<(Vec<u8>, Vec<u8>)> 
         "ok",
         None,
         ProfileRefs::same("quality.synthetic"),
-        ProfileSchemaVersions::same(1),
+        ProfileSchemaVersions::same(PROFILE_SCHEMA_VERSION),
     )
 }
 

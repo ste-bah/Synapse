@@ -1,8 +1,8 @@
 use std::{fs, time::UNIX_EPOCH};
 
 use synapse_core::{
-    Backend, HudExtractor, HudParser, HudRegion, ProfileUseScope, WindowEdge,
-    default_hud_confidence_threshold, error_codes,
+    Backend, HudExtractor, HudParser, HudRegion, PROFILE_SCHEMA_VERSION, ProfileUseScope,
+    WindowEdge, default_hud_confidence_threshold, error_codes,
 };
 use synapse_profiles::{
     ProfileError, ScreenBounds, bundled_profiles_dir, parse_profile_bytes, parse_profile_file,
@@ -25,7 +25,12 @@ fn bundled_profiles_parse_and_keep_natural_defaults() -> Result<(), Box<dyn std:
             continue;
         }
         let loaded = parse_profile_file(&path)?;
-        assert_eq!(loaded.schema_version, 1, "{}", path.display());
+        assert_eq!(
+            loaded.schema_version,
+            PROFILE_SCHEMA_VERSION,
+            "{}",
+            path.display()
+        );
         assert_eq!(
             loaded.defaults.mouse_curve_default,
             "natural",
@@ -102,7 +107,7 @@ fn parser_rejects_synthetic_invalid_profiles_with_exact_codes() {
             r#"
 id = "missing_matches"
 label = "Missing Matches"
-schema_version = 1
+schema_version = 2
 use_scope = "productivity"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -114,7 +119,7 @@ keyboard_dynamics_default = "natural"
             r#"
 id = "bad_regex"
 label = "Bad Regex"
-schema_version = 1
+schema_version = 2
 use_scope = "productivity"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -144,7 +149,7 @@ exe = "future.exe"
             r#"
 id = "invalid_keymap"
 label = "Invalid Keymap"
-schema_version = 1
+schema_version = 2
 use_scope = "productivity"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -162,7 +167,7 @@ bad = "ctrl+dragon"
             r#"
 id = "instant_default"
 label = "Instant Default"
-schema_version = 1
+schema_version = 2
 use_scope = "productivity"
 mouse_curve_default = "instant"
 keyboard_dynamics_default = "natural"
@@ -192,11 +197,68 @@ exe = "instant.exe"
 }
 
 #[test]
+fn parser_rejects_legacy_schema_and_missing_use_scope() {
+    let cases = [
+        (
+            "legacy_schema.toml",
+            r#"
+id = "legacy_schema"
+label = "Legacy Schema"
+schema_version = 1
+use_scope = "productivity"
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "legacy.exe"
+"#,
+            error_codes::PROFILE_VERSION_INCOMPATIBLE,
+        ),
+        (
+            "missing_use_scope.toml",
+            r#"
+id = "missing_use_scope"
+label = "Missing Use Scope"
+schema_version = 2
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "missing-use-scope.exe"
+"#,
+            error_codes::PROFILE_PARSE_ERROR,
+        ),
+    ];
+
+    for (path, toml, code) in cases {
+        println!("readback=profile_schema edge={path} before={toml}");
+        let result = parse_profile_bytes(
+            path,
+            toml.as_bytes(),
+            UNIX_EPOCH,
+            ScreenBounds {
+                width: 1920,
+                height: 1080,
+            },
+        );
+        let Err(error) = result else {
+            panic!("{path} parsed successfully but should have failed");
+        };
+        println!(
+            "readback=profile_schema edge={path} after=code:{} error:{}",
+            error.code(),
+            error
+        );
+        assert_eq!(error.code(), code, "{path}: {error}");
+    }
+}
+
+#[test]
 fn parser_accepts_default_backend_alias_for_action_backends() {
     let toml = r#"
 id = "hardware_alias"
 label = "Hardware Alias"
-schema_version = 1
+schema_version = 2
 use_scope = "operator_owned_test"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -234,7 +296,7 @@ fn parser_accepts_mouse_button_keymap_aliases_and_metadata() {
     let toml = r#"
 id = "mouse_aliases"
 label = "Mouse Aliases"
-schema_version = 1
+schema_version = 2
 use_scope = "operator_owned_test"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -276,7 +338,7 @@ fn parser_accepts_nested_hud_fields_and_event_extensions() {
     let toml = r#"
 id = "luanti_nested"
 label = "Luanti Nested"
-schema_version = 1
+schema_version = 2
 use_scope = "operator_owned_test"
 mode = "pixel_only"
 mouse_curve_default = "natural"
@@ -359,7 +421,7 @@ fn parser_accepts_center_anchored_hud_region() {
     let toml = r#"
 id = "center_hud"
 label = "Center HUD"
-schema_version = 1
+schema_version = 2
 use_scope = "operator_owned_test"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -413,7 +475,7 @@ fn parser_accepts_hud_confidence_threshold_default_and_override() {
     let toml = r#"
 id = "hud_threshold"
 label = "HUD Threshold"
-schema_version = 1
+schema_version = 2
 use_scope = "operator_owned_test"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -473,7 +535,7 @@ fn parser_rejects_hud_confidence_threshold_outside_unit_interval() {
     let toml = r#"
 id = "bad_hud_threshold"
 label = "Bad HUD Threshold"
-schema_version = 1
+schema_version = 2
 use_scope = "operator_owned_test"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -521,7 +583,7 @@ fn parser_rejects_trivially_true_event_extension_filter() {
     let toml = r#"
 id = "always_true_event"
 label = "Always True Event"
-schema_version = 1
+schema_version = 2
 use_scope = "operator_owned_test"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -565,7 +627,7 @@ fn parser_rejects_hud_regions_outside_screen_bounds() {
     let toml = r#"
 id = "bad_hud"
 label = "Bad HUD"
-schema_version = 1
+schema_version = 2
 use_scope = "productivity"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"

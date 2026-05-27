@@ -1,6 +1,6 @@
 id = "chrome"
 label = "Google Chrome"
-schema_version = 1
+schema_version = 2
 use_scope = "productivity"
 mode = "hybrid"
 mouse_curve_default = "natural"

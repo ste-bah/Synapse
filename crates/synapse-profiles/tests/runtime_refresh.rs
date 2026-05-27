@@ -30,7 +30,7 @@ fn runtime_refresh_add_replace_delete_and_preserve_prior_valid_profile()
         r#"
 id = "scratch"
 label = "Scratch Broken"
-schema_version = 1
+schema_version = 2
 use_scope = "productivity"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"
@@ -87,7 +87,7 @@ fn write_profile(
             r#"
 id = "{id}"
 label = "{label}"
-schema_version = 1
+schema_version = 2
 use_scope = "productivity"
 mouse_curve_default = "natural"
 keyboard_dynamics_default = "natural"

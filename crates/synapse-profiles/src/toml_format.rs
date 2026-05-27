@@ -2,9 +2,9 @@ use std::{collections::BTreeMap, path::Path, path::PathBuf, time::SystemTime};
 
 use serde::Deserialize;
 use synapse_core::{
-    EventExtension, HudExtractor, HudFieldSpec, HudParser, HudRegion, Profile, ProfileBackends,
-    ProfileCapture, ProfileDetection, ProfileId, ProfileMatch, ProfileOcr, SCHEMA_VERSION,
-    default_hud_confidence_threshold,
+    EventExtension, HudExtractor, HudFieldSpec, HudParser, HudRegion, PROFILE_SCHEMA_VERSION,
+    Profile, ProfileBackends, ProfileCapture, ProfileDetection, ProfileId, ProfileMatch,
+    ProfileOcr, default_hud_confidence_threshold,
 };
 
 use crate::{
@@ -56,11 +56,11 @@ impl RawProfile {
         modified: SystemTime,
         bounds: ScreenBounds,
     ) -> Result<LoadedProfile, ProfileError> {
-        if self.schema_version > SCHEMA_VERSION {
+        if self.schema_version != PROFILE_SCHEMA_VERSION {
             return Err(ProfileError::VersionIncompatible {
                 path,
                 schema_version: self.schema_version,
-                supported_version: SCHEMA_VERSION,
+                supported_version: PROFILE_SCHEMA_VERSION,
             });
         }
         if self.matches.is_empty() {
