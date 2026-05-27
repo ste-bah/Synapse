@@ -3,6 +3,8 @@
 This document is the configured-host source for the local Luanti benchmark
 target selected in issue #471. It defines the installed engine/game paths,
 world fixture, provenance, and physical sources of truth used by manual FSV.
+The step-by-step whole-system runbook lives in
+`19_luanti_manual_fsv_runbook.md`.
 
 Automated tests, helper scripts, benchmark harnesses, GitHub Actions, and CI
 are not FSV. The agent must trigger the real runtime surface where one exists,

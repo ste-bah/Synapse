@@ -103,6 +103,7 @@ Two separate products would duplicate ~90% of engineering. **Synapse ships them 
 | 16 | [`16_open_questions.md`](16_open_questions.md) | Unresolved decisions, ADRs needed. |
 | 17 | [`17_research_appendix.md`](17_research_appendix.md) | Web research, comparable projects, references. |
 | 18 | [`18_luanti_benchmark.md`](18_luanti_benchmark.md) | Local Luanti / Minetest Game benchmark install, world fixture, and provenance. |
+| 19 | [`19_luanti_manual_fsv_runbook.md`](19_luanti_manual_fsv_runbook.md) | Manual whole-system FSV runbook for the Luanti benchmark. |
 
 ---
 
