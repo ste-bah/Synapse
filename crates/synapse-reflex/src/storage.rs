@@ -95,8 +95,46 @@ impl ReflexRuntime {
         cf_name: &str,
         rows: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> StorageResult<()> {
+        self.storage_put_rows(cf_name, rows)
+    }
+
+    /// Writes rows to one storage column family and flushes them immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the write or flush fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", cf_name, row_count = rows.len()))]
+    pub fn storage_put_rows(
+        &self,
+        cf_name: &str,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> StorageResult<()> {
         self.db.put_batch(cf_name, rows)?;
         self.db.flush()
+    }
+
+    /// Writes storage-maintenance rows while bypassing the pressure ingestion gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the write or flush fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", cf_name, row_count = rows.len()))]
+    pub fn storage_put_rows_pressure_bypass(
+        &self,
+        cf_name: &str,
+        rows: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> StorageResult<()> {
+        self.db.put_batch_pressure_bypass(cf_name, rows)
+    }
+
+    /// Deletes rows from one storage column family and flushes them immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the delete or flush fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", cf_name, row_count = keys.len()))]
+    pub fn storage_delete_rows(&self, cf_name: &str, keys: Vec<Vec<u8>>) -> StorageResult<()> {
+        self.db.delete_batch(cf_name, keys)
     }
 
     /// Writes action audit rows and flushes them immediately.
@@ -106,8 +144,7 @@ impl ReflexRuntime {
     /// Returns a storage error when the write or flush fails.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
     pub fn storage_put_action_log_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
-        self.db.put_batch(cf::CF_ACTION_LOG, rows)?;
-        self.db.flush()
+        self.storage_put_rows(cf::CF_ACTION_LOG, rows)
     }
 
     /// Writes profile-linked event rows and flushes them immediately.
@@ -117,8 +154,7 @@ impl ReflexRuntime {
     /// Returns a storage error when the write or flush fails.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
     pub fn storage_put_event_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
-        self.db.put_batch(cf::CF_EVENTS, rows)?;
-        self.db.flush()
+        self.storage_put_rows(cf::CF_EVENTS, rows)
     }
 
     /// Writes session rows and flushes them immediately.
@@ -128,8 +164,7 @@ impl ReflexRuntime {
     /// Returns a storage error when the write or flush fails.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
     pub fn storage_put_session_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
-        self.db.put_batch(cf::CF_SESSIONS, rows)?;
-        self.db.flush()
+        self.storage_put_rows(cf::CF_SESSIONS, rows)
     }
 
     /// Writes profile-registry rows and flushes them immediately.
@@ -139,8 +174,7 @@ impl ReflexRuntime {
     /// Returns a storage error when the write or flush fails.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
     pub fn storage_put_profile_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
-        self.db.put_batch(cf::CF_PROFILES, rows)?;
-        self.db.flush()
+        self.storage_put_rows(cf::CF_PROFILES, rows)
     }
 
     /// Writes local registry key-value rows and flushes them immediately.
@@ -150,8 +184,7 @@ impl ReflexRuntime {
     /// Returns a storage error when the write or flush fails.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", row_count = rows.len()))]
     pub fn storage_put_kv_rows(&self, rows: Vec<(Vec<u8>, Vec<u8>)>) -> StorageResult<()> {
-        self.db.put_batch(cf::CF_KV, rows)?;
-        self.db.flush()
+        self.storage_put_rows(cf::CF_KV, rows)
     }
 
     /// Returns one exact profile-registry row by key.

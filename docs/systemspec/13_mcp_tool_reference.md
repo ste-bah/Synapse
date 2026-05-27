@@ -764,7 +764,7 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 |---|---|---|---|---|
 | none | `{}` | no | `{}` | Always reports every operator-visible RocksDB column family. |
 
-**Returns:** `StorageInspectResponse { schema_version: u32, pressure_level, pressure_transition_codes, cf_sizes, cf_row_counts, cf_row_samples }`. Each `cf_row_samples` value is a bounded newest-row list with `key_hex`, `value_len_bytes`, `value_utf8_prefix`, and `value_truncated`.
+**Returns:** `StorageInspectResponse { schema_version: u32, pressure_level, pressure_transition_codes, audit_retention_policies, cf_sizes, cf_row_counts, cf_row_samples }`. Each `cf_row_samples` value is a bounded newest-row list with `key_hex`, `value_len_bytes`, `value_utf8_prefix`, and `value_truncated`. `audit_retention_policies` lists the #463 audit classes and strategic prefixes that `storage_gc_once` uses in `AUDIT_RETENTION` mode.
 **Errors:** `STORAGE_OPEN_FAILED`, `TOOL_PARAMS_INVALID` (unknown parameter).
 
 ## 28. `storage_put_probe_rows`
@@ -775,24 +775,34 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 
 | Parameter | Type | Required | Default | Range | Description |
 |---|---|---|---|---|---|
-| `cf` | `String` | yes | — | one of `ALL_COLUMN_FAMILIES` | Target CF |
-| `count` | `u32` | yes | — | `1..=10000` | Number of probe rows |
-| `value_bytes` | `Option<u32>` | no | `256` | `1..=65536` | Per-row payload size |
+| `cf_name` | `String` | yes | — | `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_ACTION_LOG`, or `CF_KV` | Target CF |
+| `key_prefix` | `String` | yes | — | non-empty, <= 128 bytes | Prefix used in generated row keys |
+| `rows` | `u32` | yes | — | `0..=10000` | Number of probe rows |
+| `value_bytes` | `u32` | yes | — | `0..=65536` | Per-row byte filler size when `value_json` is absent |
+| `value_json` | `Option<object>` | no | — | JSON object | When present, writes this JSON object as the row value instead of byte filler |
+| `ts_ns_start` / `ts_ns_step` | `Option<u64>` | no | — | any `u64` | Deterministic timestamp generation for JSON probe rows |
 
-**Returns:** `StoragePutProbeRowsResponse { cf, rows_written, bytes_written, flush_elapsed_ms }`.
+**Returns:** `StoragePutProbeRowsResponse { cf_name, key_prefix, requested_rows, value_bytes, before_rows, after_rows, rows_added, after_cf_size_bytes, pressure_level }`.
 **Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_WRITE_FAILED`, `STORAGE_DISK_PRESSURE_LEVEL_1..4` (writes silently dropped at the higher pressure levels).
 
 ## 29. `storage_gc_once`
 
-**Description:** "Run one synchronous storage GC pass and return per-CF before/after sizes"
+**Description:** "Run one synchronous storage GC pass and return per-CF before/after row counts"
 **Permissions:** `WRITE_STORAGE` (operator diagnostic)
-**Side effects:** evicts rows from any CF whose size exceeds its soft cap; emits `cache_evictions_total{cf,reason="soft_cap"}` counter increments.
+**Side effects:** evicts rows from a diagnostic CF whose row count exceeds its soft cap. With `cf_name="AUDIT_RETENTION"`, scans profile-linked audit rows, backfills missing profile linkage, dedupes repeated outcomes, deletes expired/capped rows, preserves unknown-schema and strategic rows, and writes `CF_KV/audit_retention/v1/report/<run_id>`. Audit-retention backfills and report rows use the bounded storage-maintenance write path so Level3/Level4 pressure cannot silently drop the migration/report evidence; ordinary probe or ingestion writes remain pressure-gated.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| (none) | — | — | — | Empty params |
+| `cf_name` | `String` | yes | — | Diagnostic CF name or `AUDIT_RETENTION` |
+| `soft_cap_rows` | `u64` | yes | — | Row soft cap; for `AUDIT_RETENTION`, per-CF non-strategic row cap |
+| `hard_cap_rows` | `u64` | yes | — | Row hard cap; must be >= soft cap |
+| `run_id` | `Option<String>` | no | generated | `AUDIT_RETENTION` report id |
+| `now_ns` | `Option<u64>` | no | system clock | Synthetic/manual-FSV clock for expiry decisions |
+| `max_age_ns` | `Option<u64>` | no | policy TTL | Override age threshold for all non-strategic audit classes |
+| `dedupe_window_ns` | `Option<u64>` | no | `1_000_000_000` | Window for repeated-outcome dedupe |
+| `profile_id` | `Option<String>` | no | all profiles | Limit retention decisions to one profile id |
 
-**Returns:** `StorageGcOnceResponse { elapsed_ms, cf_reports: Vec<StorageGcCfReport { cf, before_bytes, after_bytes, rows_evicted, hit_hard_cap: bool }> }`.
+**Returns:** `StorageGcOnceResponse { cf_name, before_rows, after_rows, total_evicted_rows, cache_evictions_total_delta, cf_reports, audit_retention_report_key?, audit_retention? }`. `audit_retention` is present only for `cf_name="AUDIT_RETENTION"` and is read back from the persisted `CF_KV` report row before return.
 **Errors:** `STORAGE_OPEN_FAILED`.
 
 ## 30. `storage_pressure_sample`

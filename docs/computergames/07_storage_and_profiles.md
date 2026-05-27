@@ -306,8 +306,8 @@ FSV:
 | MCP tool | Effect |
 |---|---|
 | `storage_inspect` | Reads schema version, pressure level, transition codes, per-CF row counts, logical bytes, and bounded newest-row samples |
-| `storage_put_probe_rows` | Writes bounded synthetic rows to `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_ACTION_LOG`, or `CF_KV` and flushes |
-| `storage_gc_once` | Runs one row-cap GC pass for a diagnostic CF |
+| `storage_put_probe_rows` | Writes bounded synthetic byte rows or JSON-template rows to `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_ACTION_LOG`, or `CF_KV` and flushes |
+| `storage_gc_once` | Runs one row-cap GC pass for a diagnostic CF; `cf_name="AUDIT_RETENTION"` runs the M5 profile-linked audit retention/dedupe/backfill path and writes a report row |
 | `storage_pressure_sample` | Applies one synthetic free-byte sample through the production disk-pressure responder |
 
 These tools are operator diagnostics for direct state verification. They are not
@@ -367,6 +367,22 @@ The M5 runtime registry surface now includes `profile_registry_search`,
 and local bundle files; they return exact row keys or bundle paths so manual
 FSV can trigger the real MCP tool and then separately read the stored RocksDB
 rows or filesystem bundle.
+
+For #463, `storage_inspect` also returns `audit_retention_policies` for the
+operator-visible audit classes. `storage_gc_once` with
+`cf_name="AUDIT_RETENTION"` is the real runtime trigger for retention,
+dedupe, compaction, migration, and backfill. It scans `CF_ACTION_LOG`,
+`CF_REFLEX_AUDIT`, `CF_EVENTS`, `CF_OBSERVATIONS`, and `CF_SESSIONS`,
+preserves unknown-schema/malformed rows, backfills profile linkage into known
+schema-v1 rows where existing audit context has it, dedupes repeated outcomes,
+applies the requested row cap, and writes a readback report to
+`CF_KV/audit_retention/v1/report/<run_id>`. Strategic rows such as
+`CF_PROFILES/profile_quality/v1/<profile_id>` and
+`CF_KV/audit_export/v1/consent/<profile_id>` are policy-visible and preserved
+under disk pressure rather than compacted away by this path. Retention
+backfills and report rows use the bounded storage-maintenance write path so
+Level3/Level4 pressure cannot silently drop the migration/report evidence;
+ordinary probe and ingestion writes remain pressure-gated.
 
 `profile_registry_install` enforces signed package trust when a package or
 operator call requires it. Successful signed installs write trust status and a

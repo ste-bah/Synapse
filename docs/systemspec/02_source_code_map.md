@@ -92,6 +92,7 @@ crates/synapse-mcp/
         ├── reflex.rs               # reflex_register/cancel/list/history tools + ScheduledReflex construction
         ├── replay.rs               # replay_record: observation + event JSONL writer
         ├── storage.rs              # storage_inspect/_put_probe_rows/_gc_once/_pressure_sample diagnostic tools
+        ├── audit_retention.rs      # AUDIT_RETENTION mode for storage_gc_once; report rows in CF_KV
         ├── subscribe.rs            # subscribe + subscribe_cancel tool wrappers around SseState
         └── tests.rs                # M3-level integration scaffolding tests
 ```

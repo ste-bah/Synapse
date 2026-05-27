@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use rocksdb::{
     BlockBasedOptions, Cache, ColumnFamilyDescriptor, ColumnFamilyRef, DB, DBCompressionType,
-    Direction, IteratorMode, Options, SliceTransform,
+    Direction, IteratorMode, Options, SliceTransform, WriteBatch,
 };
 use synapse_core::error_codes;
 
@@ -127,6 +127,100 @@ impl Db {
             return Ok(());
         }
         self.batcher.put_batch(cf_name, kvs)
+    }
+
+    /// Writes a key/value batch while bypassing the pressure ingestion gate.
+    ///
+    /// This is reserved for bounded storage-maintenance rewrites, such as
+    /// retention backfills and durable maintenance reports. Normal data
+    /// ingestion must use [`Self::put_batch`] so disk-pressure policy can
+    /// shed non-critical writes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::WriteFailed`] when the column family is missing
+    /// or `RocksDB` rejects the write batch.
+    #[tracing::instrument(skip_all, fields(cf_name))]
+    pub fn put_batch_pressure_bypass<I, K, V>(&self, cf_name: &str, kvs: I) -> StorageResult<()>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<Vec<u8>>,
+        V: Into<Vec<u8>>,
+    {
+        let cf = self
+            .inner
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::WriteFailed {
+                cf_name: cf_name.to_owned(),
+                detail: "column family handle missing".to_owned(),
+            })?;
+        let kvs = kvs
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        if kvs.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        for (key, value) in kvs {
+            batch.put_cf(&cf, key, value);
+        }
+        self.inner
+            .write(batch)
+            .map_err(|source| StorageError::WriteFailed {
+                cf_name: cf_name.to_owned(),
+                detail: source.to_string(),
+            })?;
+        self.inner
+            .flush_cf(&cf)
+            .map_err(|source| StorageError::WriteFailed {
+                cf_name: cf_name.to_owned(),
+                detail: source.to_string(),
+            })
+    }
+
+    /// Deletes key rows from one column family and flushes them immediately.
+    ///
+    /// Deletions are allowed under disk pressure because they reduce retained
+    /// local state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError::WriteFailed`] when the column family is missing
+    /// or `RocksDB` rejects the delete batch.
+    #[tracing::instrument(skip_all, fields(cf_name))]
+    pub fn delete_batch<I, K>(&self, cf_name: &str, keys: I) -> StorageResult<()>
+    where
+        I: IntoIterator<Item = K>,
+        K: Into<Vec<u8>>,
+    {
+        let cf = self
+            .inner
+            .cf_handle(cf_name)
+            .ok_or_else(|| StorageError::WriteFailed {
+                cf_name: cf_name.to_owned(),
+                detail: "column family handle missing".to_owned(),
+            })?;
+        let keys = keys.into_iter().map(Into::into).collect::<Vec<_>>();
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut batch = WriteBatch::default();
+        for key in keys {
+            batch.delete_cf(&cf, key);
+        }
+        self.inner
+            .write(batch)
+            .map_err(|source| StorageError::WriteFailed {
+                cf_name: cf_name.to_owned(),
+                detail: source.to_string(),
+            })?;
+        self.inner
+            .flush_cf(&cf)
+            .map_err(|source| StorageError::WriteFailed {
+                cf_name: cf_name.to_owned(),
+                detail: source.to_string(),
+            })
     }
 
     /// Flushes pending batched writes with synchronous `RocksDB` write options.

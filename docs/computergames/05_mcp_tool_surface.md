@@ -1425,6 +1425,18 @@ Returns:
   "schema_version": 1,
   "pressure_level": {"name": "Normal", "value": 0},
   "pressure_transition_codes": [],
+  "audit_retention_policies": [
+    {
+      "audit_class": "actions",
+      "cf_name": "CF_ACTION_LOG",
+      "key_prefix": null,
+      "ttl": "24h",
+      "ttl_ns": 86400000000000,
+      "dedupe_key_fields": ["profile_id", "tool", "status", "error_code"],
+      "pressure_preserve": false,
+      "strategic": false
+    }
+  ],
   "cf_row_counts": {"CF_EVENTS": 4},
   "cf_sizes": {"CF_EVENTS": 248},
   "cf_row_samples": {
@@ -1466,17 +1478,35 @@ rows for score changes.
       "cf_name": {"type": "string"},
       "key_prefix": {"type": "string", "maxLength": 128},
       "rows": {"type": "integer", "minimum": 0, "maximum": 10000},
-      "value_bytes": {"type": "integer", "minimum": 0, "maximum": 65536}
+      "value_bytes": {"type": "integer", "minimum": 0, "maximum": 65536},
+      "value_json": {"type": "object"},
+      "ts_ns_start": {"type": "integer"},
+      "ts_ns_step": {"type": "integer"}
     }
   }
 }
 ```
 
+When `value_json` is supplied, the tool writes that JSON object as the row
+value, adding deterministic `probe_id`, `seq`, and optional `ts_ns`/`audit_id`
+from `ts_ns_start` + `ts_ns_step` only when those fields are absent. This keeps
+manual storage/audit FSV on the real MCP runtime surface while still using
+known synthetic input rows.
+
 ### 3.33 `storage_gc_once`
 
-Runs one row-cap GC pass for a diagnostic column family. Manual FSV reads
-`storage_inspect` before, calls this trigger, then reads `storage_inspect` and
-the daemon log afterward.
+Runs one row-cap GC pass for a diagnostic column family. When `cf_name` is
+`AUDIT_RETENTION`, the same tool runs the M5 audit-data retention path without
+adding another MCP tool: it classifies profile-linked audit rows, preserves
+unknown-schema rows, backfills missing top-level `profile_id` /
+`profile_schema_version` from existing M3/M4 audit context, dedupes repeated
+outcomes, applies row caps, and writes a durable report row to
+`CF_KV/audit_retention/v1/report/<run_id>`. Manual FSV reads `storage_inspect`
+before, calls this trigger, then reads `storage_inspect` and the report row
+afterward.
+Retention backfills and report rows use the storage-maintenance write path, so
+Level3/Level4 disk pressure cannot silently drop the migration/report evidence;
+ordinary probe and ingestion writes remain pressure-gated.
 
 ```json
 {
@@ -1488,11 +1518,23 @@ the daemon log afterward.
     "properties": {
       "cf_name": {"type": "string"},
       "soft_cap_rows": {"type": "integer", "minimum": 1, "maximum": 1000000},
-      "hard_cap_rows": {"type": "integer", "minimum": 1, "maximum": 1000000}
+      "hard_cap_rows": {"type": "integer", "minimum": 1, "maximum": 1000000},
+      "run_id": {"type": "string"},
+      "now_ns": {"type": "integer"},
+      "max_age_ns": {"type": "integer"},
+      "dedupe_window_ns": {"type": "integer"},
+      "profile_id": {"type": "string"}
     }
   }
 }
 ```
+
+`run_id`, `now_ns`, `max_age_ns`, `dedupe_window_ns`, and `profile_id` are
+valid only with `cf_name="AUDIT_RETENTION"`. The response then includes
+`audit_retention_report_key` and an `audit_retention` report with before/after
+row counts, per-CF scanned/deleted/backfilled/unknown-schema counts,
+`dedupe_keys`, and the readback report state that was actually persisted to
+`CF_KV`.
 
 ### 3.34 `storage_pressure_sample`
 

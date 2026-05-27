@@ -69,7 +69,9 @@ profile TOML files, future registry index/package files, RocksDB
 `CF_SESSIONS`, and `CF_PROFILES` rows, consent/export bundles, and MCP
 readbacks (`profile_list`, `profile_quality_refresh`, `profile_authoring_*`,
 `profile_registry_*`, `audit_intelligence_query`, `audit_export_*`, and
-`storage_inspect`). GitHub Actions/CI, scripts, tests, and benchmarks are
+`storage_inspect`; #463 retention uses `storage_gc_once` with
+`cf_name="AUDIT_RETENTION"` and a persisted `CF_KV` report row). GitHub
+Actions/CI, scripts, tests, and benchmarks are
 supporting evidence only.
 
 The governance baseline for #470 is
@@ -158,7 +160,7 @@ A work-item is "done" iff:
 | `synapse-test-utils` | `crates/synapse-test-utils` | `StdioMcpClient::launch_and_init_with_env(...)` + Notepad fixture (`launch_notepad`, `wait_for_window_title_regex`) + `notepad_process_ids` + M3 RocksDB scratch helpers + profile scratch + audio test asset loaders | M4 adds Pico/serial-port fixture |
 | `synapse-action` | `crates/synapse-action` | **FULL** — emitter actor (split per A.0a refactor) + bounded mpsc(256) + held `BitSet` + token-bucket rate limit + curve/dynamics samplers + Software/ViGEm/Recording/Hardware/HardwareUnavailable backends + InvokePattern bridge + click_timing + clipboard (with open-contention retry) + safety panic hook + operator panic hotkey (`Ctrl+Alt+Shift+P`) + auto-release backend KeyUp (#231 closed) + DPI-aware `GetCursorPos` (#234 closed) + dynamics threaded through `text_dispatch` (#233 closed) + recording mode routed through the emitter actor | Hardware backend routes to `synapse-hid-host` only when `--hardware-hid <port|auto>` is configured and connected; otherwise it fails closed |
 | `synapse-reflex` | `crates/synapse-reflex` | **FULL** — `EventBus` (drop-oldest 4096/sub, subscription cap configurable via `--max-subscriptions`/`SYNAPSE_MAX_SUBSCRIPTIONS`), 1 ms scheduler thread at `THREAD_PRIORITY_TIME_CRITICAL` + MMCSS Pro Audio on Windows with tokio fallback, `aim_track`/`hold_move`/`hold_button`/`combo`/`on_event` kinds, recursion guard (≤4/tick), conflict resolution (priority + newer-wins + starvation log), `CF_REFLEX_AUDIT` writes via `synapse-storage` | M4 reuses scheduler for `act_combo` (compiles to a `combo` reflex) |
-| `synapse-storage` | `crates/synapse-storage` | **FULL** — RocksDB open w/ 11 CFs (per `07_storage_and_profiles.md` §4), `pub const CF_*` names, per-CF TTL compaction filter, 100 ms / 64 KB / explicit-flush write batcher, 5-min row-cap GC task, 4-level disk-pressure responder | unchanged at M4 |
+| `synapse-storage` | `crates/synapse-storage` | **FULL** — RocksDB open w/ 11 CFs (per `07_storage_and_profiles.md` §4), `pub const CF_*` names, per-CF TTL compaction filter, 100 ms / 64 KB / explicit-flush write batcher, 5-min row-cap GC task, 4-level disk-pressure responder, and bounded maintenance writes for audit-retention backfill/report rows under pressure | M5 audit-retention pressure behavior shipped in #463 |
 | `synapse-profiles` | `crates/synapse-profiles` | **FULL** — TOML parser + `notify`-based watcher (debounced 200 ms) + match resolver (precedence per ADR-0006) + 4 bundled profiles (`notepad`, `vscode`, `chrome`, `terminal` — all Natural defaults) | M4 adds `minecraft.java` profile + `use_scope` field |
 | `synapse-audio` | `crates/synapse-audio` | **FULL** — WASAPI loopback 5 s ring + detectors (loud transient / speech start-end / Silero VAD) + Whisper-tiny-int8 STT (lazy load + sha256) + GCC-PHAT stereo direction | unchanged at M4 |
 | `synapse-hid-host` | `crates/synapse-hid-host` | **PARTIAL** — serial discovery, connect/IDENTIFY, CRC16 framing, pipeline/backpressure, reconnect state | M4 — remaining hardware-bound issues require real Pico/COM-device manual FSV |

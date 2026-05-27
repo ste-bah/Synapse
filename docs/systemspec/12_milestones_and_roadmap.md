@@ -138,7 +138,7 @@ expansion. Current build:
 | 26 | `audio_transcribe` | M3 | live (en only) | |
 | 27 | `storage_inspect` | M3 (operator) | live | per-CF row+byte size readback |
 | 28 | `storage_put_probe_rows` | M3 (operator) | live | manual storage write/readback support tool |
-| 29 | `storage_gc_once` | M3 (operator) | live | synchronous GC pass with before/after sizes |
+| 29 | `storage_gc_once` | M3/M5 (operator) | live | synchronous GC pass; `AUDIT_RETENTION` mode writes #463 retention/dedupe/backfill report rows |
 | 30 | `storage_pressure_sample` | M3 (operator) | live | synthetic disk-pressure trigger |
 | — | `read_hud` | (deferred to M4) | not live | HUD extraction pipeline not yet wired |
 | 31 | `act_combo` | M4 | live | one-shot timed action sequence |

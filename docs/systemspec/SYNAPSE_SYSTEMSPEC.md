@@ -234,9 +234,9 @@ All 50 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[to
 | `replay_record` | Stream observations and/or events to a JSONL file under `%LOCALAPPDATA%/synapse/replays` | `server.rs::replay_record`, `m3/replay.rs` |
 | `audio_tail` | Return the most-recent loopback audio tail as PCM s16le bytes (max 5 s; `synapse_audio::MAX_RING_SECONDS`) | `server.rs::audio_tail`, `m3/audio.rs` |
 | `audio_transcribe` | Transcribe the loopback tail via Whisper-tiny (language pinned to `"en"`) | `server.rs::audio_transcribe`, `m3/audio.rs` |
-| `storage_inspect` | Return per-CF row counts and byte sizes from RocksDB for the operator-visible CFs | `server.rs::storage_inspect`, `m3/storage.rs` |
+| `storage_inspect` | Return per-CF row counts/byte sizes plus audit-retention policy metadata from RocksDB for the operator-visible CFs | `server.rs::storage_inspect`, `m3/storage.rs` |
 | `storage_put_probe_rows` | Insert bounded probe rows into a chosen CF so manual FSV can trigger storage writes, then separately read the RocksDB/log SoT | `server.rs::storage_put_probe_rows`, `m3/storage.rs` |
-| `storage_gc_once` | Run one synchronous GC pass and return the per-CF before/after sizes | `server.rs::storage_gc_once`, `m3/storage.rs` |
+| `storage_gc_once` | Run one synchronous GC pass; `cf_name="AUDIT_RETENTION"` performs #463 audit retention/dedupe/backfill and writes a `CF_KV` report row | `server.rs::storage_gc_once`, `m3/storage.rs`, `m3/audit_retention.rs` |
 | `storage_pressure_sample` | Apply one synthetic free-byte sample to drive the disk-pressure responder | `server.rs::storage_pressure_sample`, `m3/storage.rs` |
 
 ### 4.4 M4 — local shell/launch/combo (3 tools)
@@ -558,6 +558,7 @@ crates/synapse-mcp/
         ├── reflex.rs               # reflex_register/cancel/list/history tools + ScheduledReflex construction
         ├── replay.rs               # replay_record: observation + event JSONL writer
         ├── storage.rs              # storage_inspect/_put_probe_rows/_gc_once/_pressure_sample diagnostic tools
+        ├── audit_retention.rs      # AUDIT_RETENTION mode for storage_gc_once; report rows in CF_KV
         ├── subscribe.rs            # subscribe + subscribe_cancel tool wrappers around SseState
         └── tests.rs                # M3-level integration scaffolding tests
 ```
@@ -1431,6 +1432,38 @@ For CFs without a `ts_ns` field (e.g. `CF_PROFILES`, `CF_KV`) the filter is stil
   5. After eviction, re-collects keys for `after_value`, and increments the Prometheus counter `cache_evictions_total{cf=<name>, reason="soft_cap"}` by the evicted row count.
 - Returns `GcReport { cf_reports: Vec<GcCfReport> }` (one entry per budget) so callers can readback before/after sizes.
 
+### 7.1 Audit retention runtime path
+
+#463 adds the profile-linked audit retention path on top of the existing
+`storage_gc_once` MCP tool rather than adding another live tool. When the
+runtime receives `storage_gc_once` with `cf_name = "AUDIT_RETENTION"`, it:
+
+1. Reads `CF_ACTION_LOG`, `CF_REFLEX_AUDIT`, `CF_EVENTS`, `CF_OBSERVATIONS`,
+   `CF_SESSIONS`, plus strategic prefixes in `CF_PROFILES` and `CF_KV`.
+2. Preserves malformed or unknown-schema rows; they are counted in the report
+   and are not deleted.
+3. Backfills known schema-v1 rows with top-level `profile_id` and
+   `profile_schema_version` when those values already exist in
+   `audit_context`, foreground profile state, active profile fields, or session
+   state.
+4. Dedupes repeated action/reflex/event/observation/session outcomes using
+   bounded class-specific keys such as profile id, tool/reflex/kind, status,
+   error code, foreground process, and backend.
+5. Applies the requested row cap to non-strategic rows and then writes a
+   durable report to `CF_KV/audit_retention/v1/report/<run_id>`.
+
+Retention backfills and retention report rows use the storage-maintenance write
+path (`Db::put_batch_pressure_bypass`) so Level3/Level4 disk pressure cannot
+silently drop the migration/report evidence. Normal ingestion still goes
+through `Db::put_batch` and remains pressure-gated.
+
+`storage_inspect` exposes the static `audit_retention_policies` list before
+the trigger. Manual FSV then reads the row counts/samples, triggers
+`storage_gc_once` in `AUDIT_RETENTION` mode, and separately reads
+`storage_inspect` plus the persisted `CF_KV` report row after the trigger.
+Strategic profile-quality snapshots and audit-export consent rows are policy
+visible and preserved, including under disk pressure.
+
 ## 8. Disk pressure monitor
 
 `crates/synapse-storage/src/pressure.rs`:
@@ -1449,7 +1482,7 @@ For CFs without a `ts_ns` field (e.g. `CF_PROFILES`, `CF_KV`) the filter is stil
 (`GB`/`MB` use decimal: `1_000_000_000` and `1_000_000`.)
 
 - `PressureState` holds the current level as `AtomicU8`; `Db::pressure_level()` reads it.
-- `Db::put_batch` consults `pressure.permits_write(cf_name)` before submitting the batch. At higher levels the responder freezes specific CFs; writes are then silently dropped after a `tracing::warn` with `code = STORAGE_WRITE_FAILED`. (`Db::put_batch` in `lib.rs:120-130`.)
+- `Db::put_batch` consults `pressure.permits_write(cf_name)` before submitting the batch. At higher levels the responder freezes specific CFs; writes are then silently dropped after a `tracing::warn` with `code = STORAGE_WRITE_FAILED`. Bounded storage-maintenance rewrites use `Db::put_batch_pressure_bypass` instead, and the audit retention path reserves that bypass for backfilled rows and report rows.
 - The poller may also trigger compaction on selected CFs at higher levels.
 - Test-only entrypoint `Db::run_pressure_check_with_free_bytes_sample(free_bytes)` lets the daemon apply a synthetic sample at startup via `--storage-pressure-free-bytes-sample`. (See [03_configuration.md](#file-03).)
 
@@ -3815,7 +3848,7 @@ expansion. Current build:
 | 26 | `audio_transcribe` | M3 | live (en only) | |
 | 27 | `storage_inspect` | M3 (operator) | live | per-CF row+byte size readback |
 | 28 | `storage_put_probe_rows` | M3 (operator) | live | manual storage write/readback support tool |
-| 29 | `storage_gc_once` | M3 (operator) | live | synchronous GC pass with before/after sizes |
+| 29 | `storage_gc_once` | M3/M5 (operator) | live | synchronous GC pass; `AUDIT_RETENTION` mode writes #463 retention/dedupe/backfill report rows |
 | 30 | `storage_pressure_sample` | M3 (operator) | live | synthetic disk-pressure trigger |
 | — | `read_hud` | (deferred to M4) | not live | HUD extraction pipeline not yet wired |
 | 31 | `act_combo` | M4 | live | one-shot timed action sequence |
@@ -4774,7 +4807,7 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 |---|---|---|---|---|
 | none | `{}` | no | `{}` | Always reports every operator-visible RocksDB column family. |
 
-**Returns:** `StorageInspectResponse { schema_version: u32, pressure_level, pressure_transition_codes, cf_sizes, cf_row_counts, cf_row_samples }`. Each `cf_row_samples` value is a bounded newest-row list with `key_hex`, `value_len_bytes`, `value_utf8_prefix`, and `value_truncated`.
+**Returns:** `StorageInspectResponse { schema_version: u32, pressure_level, pressure_transition_codes, audit_retention_policies, cf_sizes, cf_row_counts, cf_row_samples }`. Each `cf_row_samples` value is a bounded newest-row list with `key_hex`, `value_len_bytes`, `value_utf8_prefix`, and `value_truncated`. `audit_retention_policies` lists the #463 audit classes and strategic prefixes that `storage_gc_once` uses in `AUDIT_RETENTION` mode.
 **Errors:** `STORAGE_OPEN_FAILED`, `TOOL_PARAMS_INVALID` (unknown parameter).
 
 ## 28. `storage_put_probe_rows`
@@ -4785,24 +4818,34 @@ Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250
 
 | Parameter | Type | Required | Default | Range | Description |
 |---|---|---|---|---|---|
-| `cf` | `String` | yes | — | one of `ALL_COLUMN_FAMILIES` | Target CF |
-| `count` | `u32` | yes | — | `1..=10000` | Number of probe rows |
-| `value_bytes` | `Option<u32>` | no | `256` | `1..=65536` | Per-row payload size |
+| `cf_name` | `String` | yes | — | `CF_EVENTS`, `CF_OBSERVATIONS`, `CF_SESSIONS`, `CF_ACTION_LOG`, or `CF_KV` | Target CF |
+| `key_prefix` | `String` | yes | — | non-empty, <= 128 bytes | Prefix used in generated row keys |
+| `rows` | `u32` | yes | — | `0..=10000` | Number of probe rows |
+| `value_bytes` | `u32` | yes | — | `0..=65536` | Per-row byte filler size when `value_json` is absent |
+| `value_json` | `Option<object>` | no | — | JSON object | When present, writes this JSON object as the row value instead of byte filler |
+| `ts_ns_start` / `ts_ns_step` | `Option<u64>` | no | — | any `u64` | Deterministic timestamp generation for JSON probe rows |
 
-**Returns:** `StoragePutProbeRowsResponse { cf, rows_written, bytes_written, flush_elapsed_ms }`.
+**Returns:** `StoragePutProbeRowsResponse { cf_name, key_prefix, requested_rows, value_bytes, before_rows, after_rows, rows_added, after_cf_size_bytes, pressure_level }`.
 **Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_WRITE_FAILED`, `STORAGE_DISK_PRESSURE_LEVEL_1..4` (writes silently dropped at the higher pressure levels).
 
 ## 29. `storage_gc_once`
 
-**Description:** "Run one synchronous storage GC pass and return per-CF before/after sizes"
+**Description:** "Run one synchronous storage GC pass and return per-CF before/after row counts"
 **Permissions:** `WRITE_STORAGE` (operator diagnostic)
-**Side effects:** evicts rows from any CF whose size exceeds its soft cap; emits `cache_evictions_total{cf,reason="soft_cap"}` counter increments.
+**Side effects:** evicts rows from a diagnostic CF whose row count exceeds its soft cap. With `cf_name="AUDIT_RETENTION"`, scans profile-linked audit rows, backfills missing profile linkage, dedupes repeated outcomes, deletes expired/capped rows, preserves unknown-schema and strategic rows, and writes `CF_KV/audit_retention/v1/report/<run_id>`. Audit-retention backfills and report rows use the bounded storage-maintenance write path so Level3/Level4 pressure cannot silently drop the migration/report evidence; ordinary probe or ingestion writes remain pressure-gated.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| (none) | — | — | — | Empty params |
+| `cf_name` | `String` | yes | — | Diagnostic CF name or `AUDIT_RETENTION` |
+| `soft_cap_rows` | `u64` | yes | — | Row soft cap; for `AUDIT_RETENTION`, per-CF non-strategic row cap |
+| `hard_cap_rows` | `u64` | yes | — | Row hard cap; must be >= soft cap |
+| `run_id` | `Option<String>` | no | generated | `AUDIT_RETENTION` report id |
+| `now_ns` | `Option<u64>` | no | system clock | Synthetic/manual-FSV clock for expiry decisions |
+| `max_age_ns` | `Option<u64>` | no | policy TTL | Override age threshold for all non-strategic audit classes |
+| `dedupe_window_ns` | `Option<u64>` | no | `1_000_000_000` | Window for repeated-outcome dedupe |
+| `profile_id` | `Option<String>` | no | all profiles | Limit retention decisions to one profile id |
 
-**Returns:** `StorageGcOnceResponse { elapsed_ms, cf_reports: Vec<StorageGcCfReport { cf, before_bytes, after_bytes, rows_evicted, hit_hard_cap: bool }> }`.
+**Returns:** `StorageGcOnceResponse { cf_name, before_rows, after_rows, total_evicted_rows, cache_evictions_total_delta, cf_reports, audit_retention_report_key?, audit_retention? }`. `audit_retention` is present only for `cf_name="AUDIT_RETENTION"` and is read back from the persisted `CF_KV` report row before return.
 **Errors:** `STORAGE_OPEN_FAILED`.
 
 ## 30. `storage_pressure_sample`

@@ -5,6 +5,7 @@ use std::{
 
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use synapse_core::error_codes;
 use synapse_reflex::ReflexRuntime;
 use synapse_storage::{DiskPressureLevel, GcReport, PressureReport, cf};
@@ -13,6 +14,10 @@ use crate::m1::mcp_error;
 
 use super::{
     M3ToolStub,
+    audit_retention::{
+        AUDIT_RETENTION_MODE, AuditRetentionPolicy, AuditRetentionReport, AuditRetentionRunConfig,
+        audit_retention_policies, run_audit_retention, validate_audit_retention_config,
+    },
     permissions::{Permission, RequiredPermissions, required},
 };
 
@@ -43,6 +48,12 @@ pub struct StoragePutProbeRowsParams {
     pub rows: u32,
     #[schemars(range(min = 0, max = 65536))]
     pub value_bytes: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_json: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts_ns_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts_ns_step: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -53,6 +64,16 @@ pub struct StorageGcOnceParams {
     pub soft_cap_rows: u64,
     #[schemars(range(min = 1, max = 1_000_000))]
     pub hard_cap_rows: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_window_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -67,6 +88,7 @@ pub struct StorageInspectResponse {
     pub schema_version: u32,
     pub pressure_level: StoragePressureLevel,
     pub pressure_transition_codes: Vec<String>,
+    pub audit_retention_policies: Vec<AuditRetentionPolicy>,
     pub cf_sizes: BTreeMap<String, u64>,
     pub cf_row_counts: BTreeMap<String, u64>,
     pub cf_row_samples: BTreeMap<String, Vec<StorageRowSample>>,
@@ -104,6 +126,10 @@ pub struct StorageGcOnceResponse {
     pub total_evicted_rows: u64,
     pub cache_evictions_total_delta: u64,
     pub cf_reports: Vec<StorageGcCfReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_retention_report_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_retention: Option<AuditRetentionReport>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -235,6 +261,41 @@ pub fn run_storage_gc_once(
     params: &StorageGcOnceParams,
 ) -> Result<StorageGcOnceResponse, ErrorData> {
     validate_gc_params(params)?;
+    if params.cf_name.trim() == AUDIT_RETENTION_MODE {
+        let runtime = lock_runtime(runtime)?;
+        let before_counts = runtime
+            .storage_cf_row_counts()
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let before = audit_rows_total(&before_counts);
+        let result = run_audit_retention(
+            &runtime,
+            &AuditRetentionRunConfig {
+                run_id: params.run_id.clone(),
+                now_ns: params.now_ns,
+                max_age_ns: params.max_age_ns,
+                dedupe_window_ns: params.dedupe_window_ns,
+                profile_id: params.profile_id.clone(),
+                soft_cap_rows: params.soft_cap_rows,
+                hard_cap_rows: params.hard_cap_rows,
+            },
+        )?;
+        let after_counts = runtime
+            .storage_cf_row_counts()
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let after = audit_rows_total(&after_counts);
+        drop(runtime);
+        return Ok(StorageGcOnceResponse {
+            cf_name: AUDIT_RETENTION_MODE.to_owned(),
+            before_rows: before,
+            after_rows: after,
+            total_evicted_rows: result.readback_report.total_deleted_rows,
+            cache_evictions_total_delta: result.readback_report.total_deleted_rows,
+            cf_reports: Vec::new(),
+            audit_retention_report_key: Some(result.report_key),
+            audit_retention: Some(result.readback_report),
+        });
+    }
+    reject_audit_retention_fields(params)?;
     let cf_name = probe_writable_cf(&params.cf_name)?;
     let runtime = lock_runtime(runtime)?;
     let before = cf_count(
@@ -291,6 +352,7 @@ fn inspect_locked(runtime: &ReflexRuntime) -> Result<StorageInspectResponse, Err
             .into_iter()
             .map(str::to_owned)
             .collect(),
+        audit_retention_policies: audit_retention_policies(),
         cf_sizes: runtime
             .storage_cf_sizes()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?,
@@ -368,6 +430,14 @@ fn validate_probe_params(params: &StoragePutProbeRowsParams) -> Result<(), Error
             format!("storage_put_probe_rows key_prefix must be <= {MAX_KEY_PREFIX_BYTES} bytes"),
         ));
     }
+    if let Some(value_json) = &params.value_json
+        && !value_json.is_object()
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage_put_probe_rows value_json must be a JSON object",
+        ));
+    }
     Ok(())
 }
 
@@ -388,6 +458,32 @@ fn validate_gc_params(params: &StorageGcOnceParams) -> Result<(), ErrorData> {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "storage_gc_once hard_cap_rows must be >= soft_cap_rows",
+        ));
+    }
+    if params.cf_name.trim() == AUDIT_RETENTION_MODE {
+        validate_audit_retention_config(&AuditRetentionRunConfig {
+            run_id: params.run_id.clone(),
+            now_ns: params.now_ns,
+            max_age_ns: params.max_age_ns,
+            dedupe_window_ns: params.dedupe_window_ns,
+            profile_id: params.profile_id.clone(),
+            soft_cap_rows: params.soft_cap_rows,
+            hard_cap_rows: params.hard_cap_rows,
+        })?;
+    }
+    Ok(())
+}
+
+fn reject_audit_retention_fields(params: &StorageGcOnceParams) -> Result<(), ErrorData> {
+    if params.run_id.is_some()
+        || params.now_ns.is_some()
+        || params.max_age_ns.is_some()
+        || params.dedupe_window_ns.is_some()
+        || params.profile_id.is_some()
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage_gc_once audit retention fields require cf_name=\"AUDIT_RETENTION\"",
         ));
     }
     Ok(())
@@ -414,13 +510,20 @@ fn build_probe_rows(params: &StoragePutProbeRowsParams) -> Vec<(Vec<u8>, Vec<u8>
     (0..params.rows)
         .map(|index| {
             let key = format!("{prefix}:{index:020}").into_bytes();
-            let value = probe_value(prefix, index, params.value_bytes as usize);
+            let value = probe_value(params, prefix, index);
             (key, value)
         })
         .collect()
 }
 
-fn probe_value(prefix: &str, index: u32, len: usize) -> Vec<u8> {
+fn probe_value(params: &StoragePutProbeRowsParams, prefix: &str, index: u32) -> Vec<u8> {
+    if let Some(template) = &params.value_json {
+        return json_probe_value(params, template, prefix, index);
+    }
+    byte_probe_value(prefix, index, params.value_bytes as usize)
+}
+
+fn byte_probe_value(prefix: &str, index: u32, len: usize) -> Vec<u8> {
     if len == 0 {
         return Vec::new();
     }
@@ -431,6 +534,37 @@ fn probe_value(prefix: &str, index: u32, len: usize) -> Vec<u8> {
     }
     value.truncate(len);
     value
+}
+
+fn json_probe_value(
+    params: &StoragePutProbeRowsParams,
+    template: &Value,
+    prefix: &str,
+    index: u32,
+) -> Vec<u8> {
+    let mut value = template.clone();
+    if let Some(object) = value.as_object_mut() {
+        object
+            .entry("probe_id")
+            .or_insert_with(|| Value::String(format!("{prefix}:{index:020}")));
+        object
+            .entry("seq")
+            .or_insert_with(|| Value::from(u64::from(index)));
+        if let Some(start) = params.ts_ns_start {
+            let ts_ns = start.saturating_add(
+                params
+                    .ts_ns_step
+                    .unwrap_or_default()
+                    .saturating_mul(u64::from(index)),
+            );
+            object.entry("ts_ns").or_insert_with(|| Value::from(ts_ns));
+            object
+                .entry("audit_id")
+                .or_insert_with(|| Value::String(format!("{ts_ns:020}-{index:010}")));
+        }
+    }
+    synapse_storage::encode_json(&value)
+        .unwrap_or_else(|_error| byte_probe_value(prefix, index, params.value_bytes as usize))
 }
 
 fn gc_response(
@@ -460,7 +594,24 @@ fn gc_response(
                 hard_cap_code: report.hard_cap_code.map(str::to_owned),
             })
             .collect(),
+        audit_retention_report_key: None,
+        audit_retention: None,
     }
+}
+
+fn audit_rows_total(counts: &BTreeMap<String, u64>) -> u64 {
+    [
+        cf::CF_ACTION_LOG,
+        cf::CF_REFLEX_AUDIT,
+        cf::CF_EVENTS,
+        cf::CF_OBSERVATIONS,
+        cf::CF_SESSIONS,
+        cf::CF_PROFILES,
+        cf::CF_KV,
+    ]
+    .into_iter()
+    .map(|cf_name| cf_count(counts, cf_name))
+    .sum()
 }
 
 fn pressure_report(report: PressureReport) -> StoragePressureReport {

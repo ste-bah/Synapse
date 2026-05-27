@@ -1,6 +1,7 @@
 mod a11y_events;
 pub mod audio;
 pub mod audit_export;
+pub mod audit_retention;
 pub mod permissions;
 pub mod profile;
 pub mod profile_authoring;

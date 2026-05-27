@@ -148,9 +148,9 @@ All 50 live tools live in `crates/synapse-mcp/src/server.rs` (declared via `#[to
 | `replay_record` | Stream observations and/or events to a JSONL file under `%LOCALAPPDATA%/synapse/replays` | `server.rs::replay_record`, `m3/replay.rs` |
 | `audio_tail` | Return the most-recent loopback audio tail as PCM s16le bytes (max 5 s; `synapse_audio::MAX_RING_SECONDS`) | `server.rs::audio_tail`, `m3/audio.rs` |
 | `audio_transcribe` | Transcribe the loopback tail via Whisper-tiny (language pinned to `"en"`) | `server.rs::audio_transcribe`, `m3/audio.rs` |
-| `storage_inspect` | Return per-CF row counts and byte sizes from RocksDB for the operator-visible CFs | `server.rs::storage_inspect`, `m3/storage.rs` |
+| `storage_inspect` | Return per-CF row counts/byte sizes plus audit-retention policy metadata from RocksDB for the operator-visible CFs | `server.rs::storage_inspect`, `m3/storage.rs` |
 | `storage_put_probe_rows` | Insert bounded probe rows into a chosen CF so manual FSV can trigger storage writes, then separately read the RocksDB/log SoT | `server.rs::storage_put_probe_rows`, `m3/storage.rs` |
-| `storage_gc_once` | Run one synchronous GC pass and return the per-CF before/after sizes | `server.rs::storage_gc_once`, `m3/storage.rs` |
+| `storage_gc_once` | Run one synchronous GC pass; `cf_name="AUDIT_RETENTION"` performs #463 audit retention/dedupe/backfill and writes a `CF_KV` report row | `server.rs::storage_gc_once`, `m3/storage.rs`, `m3/audit_retention.rs` |
 | `storage_pressure_sample` | Apply one synthetic free-byte sample to drive the disk-pressure responder | `server.rs::storage_pressure_sample`, `m3/storage.rs` |
 
 ### 4.4 M4 — local shell/launch/combo (3 tools)

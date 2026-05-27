@@ -202,6 +202,38 @@ For CFs without a `ts_ns` field (e.g. `CF_PROFILES`, `CF_KV`) the filter is stil
   5. After eviction, re-collects keys for `after_value`, and increments the Prometheus counter `cache_evictions_total{cf=<name>, reason="soft_cap"}` by the evicted row count.
 - Returns `GcReport { cf_reports: Vec<GcCfReport> }` (one entry per budget) so callers can readback before/after sizes.
 
+### 7.1 Audit retention runtime path
+
+#463 adds the profile-linked audit retention path on top of the existing
+`storage_gc_once` MCP tool rather than adding another live tool. When the
+runtime receives `storage_gc_once` with `cf_name = "AUDIT_RETENTION"`, it:
+
+1. Reads `CF_ACTION_LOG`, `CF_REFLEX_AUDIT`, `CF_EVENTS`, `CF_OBSERVATIONS`,
+   `CF_SESSIONS`, plus strategic prefixes in `CF_PROFILES` and `CF_KV`.
+2. Preserves malformed or unknown-schema rows; they are counted in the report
+   and are not deleted.
+3. Backfills known schema-v1 rows with top-level `profile_id` and
+   `profile_schema_version` when those values already exist in
+   `audit_context`, foreground profile state, active profile fields, or session
+   state.
+4. Dedupes repeated action/reflex/event/observation/session outcomes using
+   bounded class-specific keys such as profile id, tool/reflex/kind, status,
+   error code, foreground process, and backend.
+5. Applies the requested row cap to non-strategic rows and then writes a
+   durable report to `CF_KV/audit_retention/v1/report/<run_id>`.
+
+Retention backfills and retention report rows use the storage-maintenance write
+path (`Db::put_batch_pressure_bypass`) so Level3/Level4 disk pressure cannot
+silently drop the migration/report evidence. Normal ingestion still goes
+through `Db::put_batch` and remains pressure-gated.
+
+`storage_inspect` exposes the static `audit_retention_policies` list before
+the trigger. Manual FSV then reads the row counts/samples, triggers
+`storage_gc_once` in `AUDIT_RETENTION` mode, and separately reads
+`storage_inspect` plus the persisted `CF_KV` report row after the trigger.
+Strategic profile-quality snapshots and audit-export consent rows are policy
+visible and preserved, including under disk pressure.
+
 ## 8. Disk pressure monitor
 
 `crates/synapse-storage/src/pressure.rs`:
@@ -220,7 +252,7 @@ For CFs without a `ts_ns` field (e.g. `CF_PROFILES`, `CF_KV`) the filter is stil
 (`GB`/`MB` use decimal: `1_000_000_000` and `1_000_000`.)
 
 - `PressureState` holds the current level as `AtomicU8`; `Db::pressure_level()` reads it.
-- `Db::put_batch` consults `pressure.permits_write(cf_name)` before submitting the batch. At higher levels the responder freezes specific CFs; writes are then silently dropped after a `tracing::warn` with `code = STORAGE_WRITE_FAILED`. (`Db::put_batch` in `lib.rs:120-130`.)
+- `Db::put_batch` consults `pressure.permits_write(cf_name)` before submitting the batch. At higher levels the responder freezes specific CFs; writes are then silently dropped after a `tracing::warn` with `code = STORAGE_WRITE_FAILED`. Bounded storage-maintenance rewrites use `Db::put_batch_pressure_bypass` instead, and the audit retention path reserves that bypass for backfilled rows and report rows.
 - The poller may also trigger compaction on selected CFs at higher levels.
 - Test-only entrypoint `Db::run_pressure_check_with_free_bytes_sample(free_bytes)` lets the daemon apply a synthetic sample at startup via `--storage-pressure-free-bytes-sample`. (See [03_configuration.md](03_configuration.md).)
 
