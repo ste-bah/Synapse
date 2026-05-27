@@ -735,21 +735,41 @@ Returns:
   "pid": 12345,
   "hwnd": 67890,
   "matched_title": "Untitled - Notepad",
-  "launched_at": "..."
+  "launched_at": "...",
+  "reason": null
+}
+```
+
+If a window wait was requested but no matching title appears before the
+timeout, the process launch can still succeed with:
+
+```json
+{
+  "pid": 12345,
+  "hwnd": null,
+  "matched_title": null,
+  "launched_at": "...",
+  "reason": "no_match_within_timeout"
 }
 ```
 
 Required policy gate: startup `--allow-launch <regex>` must match the resolved
-launch target. M4 may add a dedicated permission enum later; until then the
+command line made from `target` plus `args` using the same quoting rules as
+`act_run_shell`. M4 may add a dedicated permission enum later; until then the
 allowlist is the required permission surface.
 
 Rules:
 
 - `args` defaults to `[]`.
-- `env` defaults to `{}` and only extends the child environment.
-- `working_dir` defaults to the target resolver's process directory if omitted.
+- `env` defaults to `{}` and extends a restricted child environment containing
+  only `PATH`, `USERPROFILE`, `TEMP`, `SystemRoot`.
+- `working_dir` defaults to the daemon's current directory if omitted.
 - `wait_for_window_title_regex` is optional. When present, the tool reads real
   window state until `timeout_ms` expires.
+- `reason` is `null` on full process/window success, `no_match_within_timeout`
+  when the launch succeeds but the optional title wait times out, and
+  `window_readback_unavailable` when the host window-readback layer is
+  unavailable.
 
 Errors: `TOOL_PARAMS_INVALID`, `SAFETY_LAUNCH_DENIED_BY_POLICY`,
 `SAFETY_PERMISSION_DENIED`, `ACTION_TARGET_INVALID`.

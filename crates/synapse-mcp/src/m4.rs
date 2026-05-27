@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     io,
     process::Stdio,
     sync::{Arc, Mutex},
@@ -10,7 +10,9 @@ use anyhow::Context;
 use rmcp::{ErrorData, model::ErrorCode, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use synapse_core::{Action, Backend, ComboInput, ComboStep, Key, error_codes, new_reflex_id};
+use synapse_core::{
+    Action, Backend, ComboInput, ComboStep, ForegroundContext, Key, error_codes, new_reflex_id,
+};
 use synapse_reflex::{ComboParams, ReflexRuntime, ScheduledReflex};
 use tokio::{io::AsyncReadExt, process::Command};
 
@@ -27,7 +29,8 @@ const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
 const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
 const SHELL_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 const ALLOW_PATTERN_SIZE_LIMIT_BYTES: usize = 256 * 1024;
-const SHELL_BASE_ENV_KEYS: [&str; 4] = ["PATH", "USERPROFILE", "TEMP", "SystemRoot"];
+const PROCESS_BASE_ENV_KEYS: [&str; 4] = ["PATH", "USERPROFILE", "TEMP", "SystemRoot"];
+const LAUNCH_WINDOW_POLL_INTERVAL_MS: u64 = 20;
 pub const SHELL_PATTERN_TOO_BROAD: &str = "SHELL_PATTERN_TOO_BROAD";
 
 #[derive(Clone, Debug, Default)]
@@ -116,6 +119,13 @@ impl M4ServiceConfig {
 
     fn shell_match<'a>(&'a self, command_line: &str) -> Option<&'a str> {
         self.allow_shell
+            .iter()
+            .find(|pattern| pattern.regex.is_match(command_line))
+            .map(|pattern| pattern.raw.as_str())
+    }
+
+    fn launch_match<'a>(&'a self, command_line: &str) -> Option<&'a str> {
+        self.allow_launch
             .iter()
             .find(|pattern| pattern.regex.is_match(command_line))
             .map(|pattern| pattern.raw.as_str())
@@ -219,6 +229,7 @@ pub struct ActLaunchResponse {
     pub hwnd: Option<i64>,
     pub matched_title: Option<String>,
     pub launched_at: String,
+    pub reason: Option<String>,
 }
 
 pub async fn execute_combo(
@@ -324,22 +335,93 @@ pub async fn run_shell(
     Ok(result)
 }
 
-pub async fn launch(params: ActLaunchParams) -> Result<ActLaunchResponse, ErrorData> {
+pub async fn launch(
+    config: &M4ServiceConfig,
+    params: ActLaunchParams,
+) -> Result<ActLaunchResponse, ErrorData> {
     validate_launch_params(&params)?;
-    Err(policy_error(
-        error_codes::SAFETY_LAUNCH_DENIED_BY_POLICY,
-        "act_launch is disabled until --allow-launch policy is configured",
-        json!({
-            "code": error_codes::SAFETY_LAUNCH_DENIED_BY_POLICY,
-            "target": params.target,
-            "args": params.args,
-            "working_dir": params.working_dir,
-            "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
-            "timeout_ms": params.timeout_ms,
-            "idempotency_key_present": params.idempotency_key.is_some(),
-            "reason": "no_allow_launch_policy",
-        }),
-    ))
+    let command_line = launch_command_line(&params);
+    let Some(matched_pattern) = config.launch_match(&command_line) else {
+        let reason = if config.allow_launch_count() == 0 {
+            "no_allow_launch_policy"
+        } else {
+            "launch_command_not_allowlisted"
+        };
+        return Err(policy_error(
+            error_codes::SAFETY_LAUNCH_DENIED_BY_POLICY,
+            "act_launch target is not permitted by --allow-launch policy",
+            json!({
+                "code": error_codes::SAFETY_LAUNCH_DENIED_BY_POLICY,
+                "target": params.target,
+                "args": params.args,
+                "command_line": command_line,
+                "working_dir": params.working_dir,
+                "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
+                "timeout_ms": params.timeout_ms,
+                "idempotency_key_present": params.idempotency_key.is_some(),
+                "allow_launch_patterns": config.allow_launch_count(),
+                "reason": reason,
+            }),
+        ));
+    };
+    let matched_pattern = matched_pattern.to_owned();
+    let wait_regex = params
+        .wait_for_window_title_regex
+        .as_ref()
+        .map(|pattern| {
+            regex::Regex::new(pattern).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("act_launch wait_for_window_title_regex is invalid: {error}"),
+                )
+            })
+        })
+        .transpose()?;
+    let excluded_hwnds = if wait_regex.is_some() {
+        snapshot_visible_window_hwnds()
+    } else {
+        HashSet::new()
+    };
+    let child = spawn_launch_child(&params)?;
+    let pid = child.id().ok_or_else(|| {
+        launch_tool_error(
+            error_codes::ACTION_TARGET_INVALID,
+            "act_launch spawned process without a process id",
+            json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "target": params.target,
+                "args": params.args,
+                "reason": "spawned_process_missing_pid",
+            }),
+        )
+    })?;
+    drop(child);
+
+    let window = if let Some(regex) = wait_regex {
+        wait_for_launch_window(pid, &regex, params.timeout_ms, &excluded_hwnds).await
+    } else {
+        WindowWaitResult::not_requested()
+    };
+    let launched_at = chrono::Utc::now().to_rfc3339();
+    tracing::info!(
+        code = "M4_ACT_LAUNCH_EXECUTED",
+        command_line = %command_line,
+        matched_pattern = %matched_pattern,
+        pid,
+        hwnd = ?window.hwnd,
+        matched_title = ?window.matched_title,
+        reason = ?window.reason,
+        wait_requested = params.wait_for_window_title_regex.is_some(),
+        idempotency_present = params.idempotency_key.is_some(),
+        "readback=act_launch after=process_spawn"
+    );
+    Ok(ActLaunchResponse {
+        pid,
+        hwnd: window.hwnd,
+        matched_title: window.matched_title,
+        launched_at,
+        reason: window.reason,
+    })
 }
 
 fn validate_combo_params(params: &ActComboParams) -> Result<(), ErrorData> {
@@ -515,6 +597,162 @@ fn validate_launch_params(params: &ActLaunchParams) -> Result<(), ErrorData> {
     Ok(())
 }
 
+fn spawn_launch_child(params: &ActLaunchParams) -> Result<tokio::process::Child, ErrorData> {
+    let mut command = Command::new(&params.target);
+    command.args(&params.args);
+    if let Some(working_dir) = &params.working_dir {
+        command.current_dir(working_dir);
+    }
+    command.env_clear();
+    for key in PROCESS_BASE_ENV_KEYS {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command.envs(&params.env);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    command.spawn().map_err(|error| {
+        launch_tool_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!("act_launch failed to spawn target: {error}"),
+            json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "target": params.target,
+                "args": params.args,
+                "working_dir": params.working_dir,
+                "reason": "spawn_failed",
+            }),
+        )
+    })
+}
+
+#[derive(Debug)]
+struct WindowWaitResult {
+    hwnd: Option<i64>,
+    matched_title: Option<String>,
+    reason: Option<String>,
+}
+
+impl WindowWaitResult {
+    const fn not_requested() -> Self {
+        Self {
+            hwnd: None,
+            matched_title: None,
+            reason: None,
+        }
+    }
+
+    fn matched(context: ForegroundContext) -> Self {
+        Self {
+            hwnd: Some(context.hwnd),
+            matched_title: Some(context.window_title),
+            reason: None,
+        }
+    }
+
+    fn no_match() -> Self {
+        Self {
+            hwnd: None,
+            matched_title: None,
+            reason: Some("no_match_within_timeout".to_owned()),
+        }
+    }
+
+    fn unavailable() -> Self {
+        Self {
+            hwnd: None,
+            matched_title: None,
+            reason: Some("window_readback_unavailable".to_owned()),
+        }
+    }
+}
+
+async fn wait_for_launch_window(
+    pid: u32,
+    title_regex: &regex::Regex,
+    timeout_ms: u32,
+    excluded_hwnds: &HashSet<i64>,
+) -> WindowWaitResult {
+    let started = Instant::now();
+    let timeout = Duration::from_millis(u64::from(timeout_ms));
+    let mut last_error: Option<String>;
+    loop {
+        match synapse_a11y::visible_top_level_window_contexts() {
+            Ok(contexts) => {
+                if let Some(context) =
+                    select_launch_window(&contexts, pid, title_regex, excluded_hwnds)
+                {
+                    return WindowWaitResult::matched(context.clone());
+                }
+                last_error = None;
+            }
+            Err(error) if error.code() == error_codes::A11Y_NOT_AVAILABLE => {
+                tracing::warn!(
+                    code = error.code(),
+                    error = %error,
+                    "act_launch window readback unavailable"
+                );
+                return WindowWaitResult::unavailable();
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            tracing::warn!(
+                code = "M4_ACT_LAUNCH_WINDOW_WAIT_TIMEOUT",
+                pid,
+                title_regex = title_regex.as_str(),
+                ?excluded_hwnds,
+                last_error,
+                "act_launch window title wait timed out"
+            );
+            return WindowWaitResult::no_match();
+        }
+        tokio::time::sleep(Duration::from_millis(LAUNCH_WINDOW_POLL_INTERVAL_MS)).await;
+    }
+}
+
+fn select_launch_window<'a>(
+    contexts: &'a [ForegroundContext],
+    pid: u32,
+    title_regex: &regex::Regex,
+    excluded_hwnds: &HashSet<i64>,
+) -> Option<&'a ForegroundContext> {
+    contexts
+        .iter()
+        .find(|context| {
+            context.pid == pid
+                && !excluded_hwnds.contains(&context.hwnd)
+                && title_regex.is_match(&context.window_title)
+        })
+        .or_else(|| {
+            contexts.iter().find(|context| {
+                !excluded_hwnds.contains(&context.hwnd)
+                    && title_regex.is_match(&context.window_title)
+            })
+        })
+}
+
+fn snapshot_visible_window_hwnds() -> HashSet<i64> {
+    match synapse_a11y::visible_top_level_window_contexts() {
+        Ok(contexts) => contexts.into_iter().map(|context| context.hwnd).collect(),
+        Err(error) => {
+            tracing::warn!(
+                code = error.code(),
+                error = %error,
+                "act_launch could not snapshot pre-existing windows"
+            );
+            HashSet::new()
+        }
+    }
+}
+
 async fn run_allowlisted_shell(
     params: ActRunShellParams,
 ) -> Result<ActRunShellResponse, ErrorData> {
@@ -542,7 +780,7 @@ fn spawn_shell_child(params: &ActRunShellParams) -> Result<tokio::process::Child
         command.current_dir(working_dir);
     }
     command.env_clear();
-    for key in SHELL_BASE_ENV_KEYS {
+    for key in PROCESS_BASE_ENV_KEYS {
         if let Some(value) = std::env::var_os(key) {
             command.env(key, value);
         }
@@ -707,6 +945,14 @@ fn shell_command_line(params: &ActRunShellParams) -> String {
         .join(" ")
 }
 
+fn launch_command_line(params: &ActLaunchParams) -> String {
+    std::iter::once(&params.target)
+        .chain(params.args.iter())
+        .map(|part| quote_command_part(part))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn quote_command_part(part: &str) -> String {
     if part.is_empty() {
         return "\"\"".to_owned();
@@ -734,6 +980,16 @@ fn shell_tool_error(
 ) -> ErrorData {
     let message = message.into();
     tracing::warn!(code, "M4 shell tool error: {message}");
+    ErrorData::new(ErrorCode(-32099), message, Some(data))
+}
+
+fn launch_tool_error(
+    code: &'static str,
+    message: impl Into<String>,
+    data: serde_json::Value,
+) -> ErrorData {
+    let message = message.into();
+    tracing::warn!(code, "M4 launch tool error: {message}");
     ErrorData::new(ErrorCode(-32099), message, Some(data))
 }
 
@@ -962,6 +1218,28 @@ mod tests {
         }
     }
 
+    fn launch_config_for(params: &ActLaunchParams) -> M4ServiceConfig {
+        match M4ServiceConfig::from_cli_parts(
+            Vec::new(),
+            vec![format!("^{}$", regex::escape(&launch_command_line(params)))],
+        ) {
+            Ok(config) => config,
+            Err(error) => panic!("synthetic launch allowlist should compile: {error:#}"),
+        }
+    }
+
+    fn launch_params(target: &str, args: Vec<&str>, timeout_ms: u32) -> ActLaunchParams {
+        ActLaunchParams {
+            target: target.to_owned(),
+            args: args.into_iter().map(str::to_owned).collect(),
+            working_dir: None,
+            env: BTreeMap::new(),
+            wait_for_window_title_regex: None,
+            timeout_ms,
+            idempotency_key: None,
+        }
+    }
+
     #[test]
     fn combo_rejects_nested_press_backend_mismatch() {
         let params = ActComboParams {
@@ -1036,6 +1314,16 @@ mod tests {
     }
 
     #[test]
+    fn launch_command_line_quotes_empty_and_space_args() {
+        let params = launch_params("notepad.exe", vec!["C:\\tmp\\hello world.txt", ""], 10_000);
+
+        assert_eq!(
+            launch_command_line(&params),
+            "notepad.exe \"C:\\tmp\\hello world.txt\" \"\""
+        );
+    }
+
+    #[test]
     fn shell_allowlist_accepts_narrow_startup_patterns() {
         let config = M4ServiceConfig::from_cli_parts(
             vec![
@@ -1100,6 +1388,98 @@ mod tests {
                 .and_then(|data| data.get("reason"))
                 .and_then(|reason| reason.as_str()),
             Some("no_allow_shell_policy")
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_denies_without_allowlist() {
+        let params = launch_params("synthetic-launch-denied", Vec::new(), 10_000);
+
+        let error = match launch(&M4ServiceConfig::default(), params).await {
+            Ok(response) => panic!("unallowlisted launch should deny, got {response:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(|code| code.as_str()),
+            Some(error_codes::SAFETY_LAUNCH_DENIED_BY_POLICY)
+        );
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("reason"))
+                .and_then(|reason| reason.as_str()),
+            Some("no_allow_launch_policy")
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn launch_applies_working_dir_and_env() {
+        let dir = match tempfile::TempDir::new() {
+            Ok(dir) => dir,
+            Err(error) => panic!("create temp launch dir: {error}"),
+        };
+        let output_path = dir.path().join("launch-env.txt");
+        let mut params = launch_params(
+            "cmd.exe",
+            vec!["/c", "echo %SYNAPSE_LAUNCH_ENV%>launch-env.txt"],
+            10_000,
+        );
+        params.working_dir = Some(dir.path().display().to_string());
+        params.env.insert(
+            "SYNAPSE_LAUNCH_ENV".to_owned(),
+            "synapse-launch-ok".to_owned(),
+        );
+        let config = launch_config_for(&params);
+
+        let response = match launch(&config, params).await {
+            Ok(response) => response,
+            Err(error) => panic!("allowlisted cmd launch should spawn: {error}"),
+        };
+
+        assert!(response.pid > 0);
+        assert_eq!(response.hwnd, None);
+        assert_eq!(response.matched_title, None);
+        assert_eq!(response.reason, None);
+        let text = read_text_file_with_retry(&output_path).await;
+        assert_eq!(text.trim(), "synapse-launch-ok");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn launch_wait_returns_reason_when_window_does_not_match() {
+        let mut params = launch_params("cmd.exe", vec!["/c", "exit 0"], 50);
+        params.wait_for_window_title_regex = Some("^SynapseLaunchNoSuchWindow$".to_owned());
+        let config = launch_config_for(&params);
+
+        let response = match launch(&config, params).await {
+            Ok(response) => response,
+            Err(error) => panic!("allowlisted cmd launch should spawn: {error}"),
+        };
+
+        assert!(response.pid > 0);
+        assert_eq!(response.hwnd, None);
+        assert_eq!(response.matched_title, None);
+        assert_eq!(response.reason.as_deref(), Some("no_match_within_timeout"));
+    }
+
+    #[cfg(windows)]
+    async fn read_text_file_with_retry(path: &std::path::Path) -> String {
+        for _ in 0..100 {
+            match std::fs::read_to_string(path) {
+                Ok(text) => return text,
+                Err(_error) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        panic!(
+            "file {} was not created by launched process",
+            path.display()
         );
     }
 

@@ -500,7 +500,12 @@ Rules:
 
 - Startup config must include `--allow-launch <regex>`.
 - Broad patterns such as `.*` are rejected at startup.
-- The resolved target must match an allowlist entry.
+- The resolved command line made from `target` plus `args` must match an
+  allowlist entry.
+- `working_dir`, when present, is applied as the child process working
+  directory.
+- `env` is merged into a restricted child environment containing only `PATH`,
+  `USERPROFILE`, `TEMP`, and `SystemRoot` from the daemon environment.
 - Window wait is optional but must read real window state when requested.
 - Denied launches return `SAFETY_LAUNCH_DENIED_BY_POLICY`.
 
@@ -509,10 +514,16 @@ Output shape:
 ```json
 {
   "pid": 1234,
-  "hwnd": "0x00123456",
-  "matched_title": "Untitled - Notepad"
+  "hwnd": 1193046,
+  "matched_title": "Untitled - Notepad",
+  "launched_at": "...",
+  "reason": null
 }
 ```
+
+When a process launches but the optional window-title wait times out, `hwnd`
+and `matched_title` are `null` and `reason` is
+`"no_match_within_timeout"`.
 
 ### 4.4 `synapse-mcp hid identify`
 
@@ -839,9 +850,10 @@ the minimum phase contract each implementation issue should align with.
 | Happy shell | Allowlisted `cmd /c echo synapse-m4-shell-ok`. | Exit 0 and capped stdout exact string. | Process exit, stdout bytes, log entry. |
 | Happy launch | Allowlisted Notepad launch with title wait. | PID/HWND returned and window exists. | Process table and UIA/window enumeration. |
 | Edge 1 | Shell command outside allowlist. | `SAFETY_SHELL_DENIED_BY_POLICY`. | Startup allowlist and MCP error data. |
-| Edge 2 | Launch target outside allowlist. | `SAFETY_LAUNCH_DENIED_BY_POLICY`. | Startup allowlist and MCP error data. |
+| Edge 2 | Launch command line outside allowlist. | `SAFETY_LAUNCH_DENIED_BY_POLICY`. | Startup allowlist, MCP error data, and no process/file side effect. |
 | Edge 3 | Broad pattern `.*` at startup. | Startup refuses configuration. | CLI stderr/exit and no server listening. |
-| Edge 4 | Combo empty or non-monotonic steps. | `TOOL_PARAMS_INVALID` or schema-specific error. | MCP error and no audit/action side effect. |
+| Edge 4 | Launch title wait regex never matches. | Process launch succeeds with `hwnd=null`, `matched_title=null`, and `reason="no_match_within_timeout"`. | MCP response, process table/log, and window enumeration. |
+| Edge 5 | Combo empty or non-monotonic steps. | `TOOL_PARAMS_INVALID` or schema-specific error. | MCP error and no audit/action side effect. |
 
 ### 8.5 Minecraft profile and supported-use
 

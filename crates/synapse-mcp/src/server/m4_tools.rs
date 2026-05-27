@@ -48,6 +48,6 @@ impl SynapseService {
             target = %params.0.target,
             "tool.invocation kind=act_launch"
         );
-        launch(params.0).await.map(Json)
+        launch(&self.m4_config, params.0).await.map(Json)
     }
 }
