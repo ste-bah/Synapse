@@ -7,7 +7,7 @@ use std::{
 
 use chrono::Utc;
 use synapse_action::ActionHandle;
-use synapse_core::{Action, EventFilter, ReflexId, ReflexLifetime};
+use synapse_core::{Action, EventFilter, ReflexId, ReflexLifetime, StoredAuditContext};
 use synapse_storage::Db;
 
 use crate::{
@@ -280,7 +280,7 @@ impl ReflexScheduler {
         reflexes: Vec<ScheduledReflex>,
         config: SchedulerConfig,
     ) -> ReflexResult<SchedulerHandle> {
-        Self::spawn_inner(event_bus, action_handle, reflexes, config, None)
+        Self::spawn_inner(event_bus, action_handle, reflexes, config, None, None)
     }
 
     /// Spawns the scheduler and writes reflex audit rows into `audit_db`.
@@ -295,7 +295,37 @@ impl ReflexScheduler {
         config: SchedulerConfig,
         audit_db: Arc<Db>,
     ) -> ReflexResult<SchedulerHandle> {
-        Self::spawn_inner(event_bus, action_handle, reflexes, config, Some(audit_db))
+        Self::spawn_inner(
+            event_bus,
+            action_handle,
+            reflexes,
+            config,
+            Some(audit_db),
+            None,
+        )
+    }
+
+    /// Spawns the scheduler and writes reflex audit rows with an attached audit context.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same setup errors as [`Self::spawn`].
+    pub fn spawn_with_audit_db_and_context(
+        event_bus: EventBus,
+        action_handle: ActionHandle,
+        reflexes: Vec<ScheduledReflex>,
+        config: SchedulerConfig,
+        audit_db: Arc<Db>,
+        audit_context: Option<StoredAuditContext>,
+    ) -> ReflexResult<SchedulerHandle> {
+        Self::spawn_inner(
+            event_bus,
+            action_handle,
+            reflexes,
+            config,
+            Some(audit_db),
+            audit_context,
+        )
     }
 
     fn spawn_inner(
@@ -304,6 +334,7 @@ impl ReflexScheduler {
         reflexes: Vec<ScheduledReflex>,
         config: SchedulerConfig,
         audit_db: Option<Arc<Db>>,
+        audit_context: Option<StoredAuditContext>,
     ) -> ReflexResult<SchedulerHandle> {
         config.validate()?;
         validate_reflexes(&reflexes)?;
@@ -369,6 +400,7 @@ impl ReflexScheduler {
             statuses: Arc::clone(&statuses),
             config,
             audit_db,
+            audit_context,
             tick_index: 0,
         };
 

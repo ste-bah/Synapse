@@ -37,6 +37,18 @@ crates/synapse-mcp/
 └── src/
     ├── main.rs                     # Process entrypoint, clap CLI, telemetry init, stdio/http dispatch
     ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 34 MCP tools
+    ├── server/
+    │   ├── action_audit.rs         # CF_ACTION_LOG start/result audit rows with profile/session context
+    │   ├── audit_context.rs        # Profile activation/session/event audit context persistence helpers
+    │   ├── context.rs              # Shared tool context helpers
+    │   ├── handler.rs              # ServerHandler implementation glue
+    │   ├── health.rs               # health subsystem assembly
+    │   ├── m1_tools.rs             # M1 tool wrappers
+    │   ├── m2_tools.rs             # M2 action tool wrappers
+    │   ├── m3_tools.rs             # M3 profile/reflex/storage tool wrappers
+    │   ├── m4_tools.rs             # M4 combo/shell/launch tool wrappers
+    │   ├── target_policy.rs        # Supported-use target gating and policy evidence
+    │   └── tests.rs                # Server-level unit tests
     ├── safety.rs                   # Operator-hotkey handler that disables reflexes + fires release_all
     ├── http/
     │   ├── mod.rs                  # Re-exports http::serve entrypoint

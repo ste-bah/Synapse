@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use serde_json::json;
 use synapse_core::{
-    Action, Event, EventRef, EventSource, ReflexId, ReflexState, SCHEMA_VERSION, StoredReflexAudit,
-    StoredReflexStep, error_codes,
+    Action, Event, EventRef, EventSource, ReflexId, ReflexState, SCHEMA_VERSION,
+    StoredAuditContext, StoredReflexAudit, StoredReflexStep, error_codes,
 };
 use synapse_storage::Db;
 use uuid::Uuid;
@@ -55,13 +55,14 @@ impl OnEventTickGuard {
         reflex_id: &ReflexId,
         tick_index: u64,
         trigger_event: &Event,
+        audit_context: Option<&StoredAuditContext>,
     ) {
         if self.limit_reported {
             return;
         }
         self.limit_reported = true;
         publish_limit_event(event_bus, reflex_id, tick_index, trigger_event);
-        let audit = recursion_limit_audit(reflex_id, tick_index, trigger_event);
+        let audit = recursion_limit_audit(reflex_id, tick_index, trigger_event, audit_context);
         write_audit_if_configured(audit_db, &audit);
     }
 }
@@ -73,6 +74,7 @@ pub(crate) fn publish_fired(
     tick_index: u64,
     trigger_event: &Event,
     actions: &[Action],
+    audit_context: Option<&StoredAuditContext>,
 ) {
     let event = Event {
         seq: tick_index,
@@ -88,7 +90,7 @@ pub(crate) fn publish_fired(
         correlations: trigger_correlation(trigger_event),
     };
     let _report = event_bus.publish(event);
-    let audit = fired_audit(reflex_id, tick_index, trigger_event, actions);
+    let audit = fired_audit(reflex_id, tick_index, trigger_event, actions, audit_context);
     write_audit_if_configured(audit_db, &audit);
     tracing::info!(
         code = "REFLEX_FIRED",
@@ -130,6 +132,7 @@ fn fired_audit(
     tick_index: u64,
     trigger_event: &Event,
     actions: &[Action],
+    audit_context: Option<&StoredAuditContext>,
 ) -> StoredReflexAudit {
     StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
@@ -138,6 +141,7 @@ fn fired_audit(
         ts_ns: now_ts_ns(),
         status: ReflexState::Active,
         event_id: Some(trigger_event.seq.to_string()),
+        audit_context: audit_context.cloned(),
         steps: completed_steps(actions),
         error_code: None,
         details: json!({
@@ -154,6 +158,7 @@ fn recursion_limit_audit(
     reflex_id: &ReflexId,
     tick_index: u64,
     trigger_event: &Event,
+    audit_context: Option<&StoredAuditContext>,
 ) -> StoredReflexAudit {
     StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
@@ -162,6 +167,7 @@ fn recursion_limit_audit(
         ts_ns: now_ts_ns(),
         status: ReflexState::Active,
         event_id: Some(trigger_event.seq.to_string()),
+        audit_context: audit_context.cloned(),
         steps: Vec::new(),
         error_code: Some(error_codes::REFLEX_RECURSION_LIMIT.to_owned()),
         details: json!({

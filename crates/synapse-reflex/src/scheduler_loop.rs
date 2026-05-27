@@ -11,7 +11,8 @@ use chrono::Utc;
 use serde_json::json;
 use synapse_action::ActionHandle;
 use synapse_core::{
-    ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION, StoredReflexAudit, error_codes,
+    ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION, StoredAuditContext,
+    StoredReflexAudit, error_codes,
 };
 use synapse_storage::Db;
 use uuid::Uuid;
@@ -60,6 +61,7 @@ pub(super) struct RuntimeState {
     pub(super) statuses: Arc<Mutex<Vec<ReflexStatus>>>,
     pub(super) config: SchedulerConfig,
     pub(super) audit_db: Option<Arc<Db>>,
+    pub(super) audit_context: Option<StoredAuditContext>,
     pub(super) tick_index: u64,
 }
 
@@ -341,6 +343,7 @@ fn write_lifetime_expired_audit(runtime: &RuntimeState, status: &ReflexStatus, r
         ts_ns: now_ts_ns(),
         status: ReflexState::Expired,
         event_id: None,
+        audit_context: runtime.audit_context.clone(),
         steps: Vec::new(),
         error_code: Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned()),
         details: json!({

@@ -9,6 +9,24 @@ expression: "round_trip(\"StoredReflexAudit\", \"snapshot\", full_reflex_audit()
   "ts_ns": 42,
   "status": "starved",
   "event_id": "event-full",
+  "audit_context": {
+    "session_id": "session-full",
+    "profile_id": "notepad",
+    "profile_version": "1.0.0",
+    "profile_schema_version": 1,
+    "backend_policy": {
+      "default": "software",
+      "keyboard_default": "software",
+      "mouse_default": "software",
+      "pad_default": "vigem"
+    },
+    "app_context": {
+      "process_name": "notepad.exe",
+      "process_path": "C:\\Windows\\System32\\notepad.exe",
+      "window_title": "Untitled - Notepad",
+      "target_id": "windows.notepad"
+    }
+  },
   "steps": [
     {
       "index": 1,

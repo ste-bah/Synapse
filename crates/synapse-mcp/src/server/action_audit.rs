@@ -87,17 +87,29 @@ impl SynapseService {
     ) -> Result<(), ErrorData> {
         let (ts_ns, seq) = next_audit_key_parts();
         let active_profile = self.action_audit_active_profile();
+        let audit_context = self.current_action_audit_context()?;
+        let session_id = audit_context.session_id.clone();
+        let profile_id = audit_context.profile_id.clone();
+        let profile_version = audit_context.profile_version.clone();
+        let profile_schema_version = audit_context.profile_schema_version;
         let value = json!({
             "schema_version": 1,
             "audit_id": format!("{ts_ns:020}-{seq:010}"),
             "ts_ns": ts_ns,
             "seq": seq,
+            "session_id": session_id,
+            "profile_id": profile_id,
+            "profile_version": profile_version,
+            "profile_schema_version": profile_schema_version,
+            "audit_context": audit_context,
             "tool": tool,
             "status": status,
             "error_code": error_code,
             "foreground": self.action_audit_foreground(),
             "active_profile_id": active_profile.profile_id,
             "active_profile_schema_version": active_profile.schema_version,
+            "redacted": false,
+            "redactions": [],
             "details": details,
         });
         let encoded = synapse_storage::encode_json(&value).map_err(|error| {

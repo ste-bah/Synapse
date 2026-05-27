@@ -98,28 +98,37 @@ These are the `serde_json` payloads written into each CF. Source: `crates/synaps
 
 | CF | Persisted type | Fields | Key shape (current writer) |
 |---|---|---|---|
-| `CF_EVENTS` | `StoredEvent` | `schema_version: u32`, `event_id: String`, `ts_ns: u64`, `session_id: Option<String>`, `source: EventSource`, `kind: String`, `data: serde_json::Value`, `window_id: Option<i64>`, `element_id: Option<ElementId>`, `redacted: bool`, `redactions: Vec<StoredRedaction>` | — (no live writer in this build; PRD §7 calls for `ts_ns` big-endian prefix + `event_id`) |
+| `CF_EVENTS` | `StoredEvent` | `schema_version: u32`, `event_id: String`, `ts_ns: u64`, `session_id: Option<String>`, `audit_context: Option<StoredAuditContext>`, `source: EventSource`, `kind: String`, `data: serde_json::Value`, `window_id: Option<i64>`, `element_id: Option<ElementId>`, `redacted: bool`, `redactions: Vec<StoredRedaction>` | profile activation/denial events use `[ts_ns u64 BE][seq u32 BE]` |
 | `CF_OBSERVATIONS` | `StoredObservation` | `schema_version`, `observation_id`, `ts_ns`, `session_id`, `mode: PerceptionMode`, `foreground: ForegroundContext`, `focused: Option<FocusedElement>`, `elements: Vec<AccessibleNode>`, `entities: Vec<DetectedEntity>`, `hud: HudReadings`, `audio: AudioContext`, `recent_events: Vec<EventSummary>`, `clipboard_summary: Option<ClipboardSummary>`, `fs_recent: Vec<FsEvent>`, `diagnostics: ObservationDiagnostics`, `reason: String`, `redacted: bool`, `redactions: Vec<StoredRedaction>` | — (no live writer in this build; produced by future M3 replay backends. `replay_record` writes JSONL to disk, not to this CF.) |
 | `CF_PROFILES` | cached profile rows plus profile quality snapshots | `Profile { id, label, version, use_scope, matches, mode, capture, detection, ocr, hud, keymap, backends, metadata, event_extensions }`; `ProfileQualitySnapshot` at key `profile_quality/v1/<profile_id>` | `profile_quality_refresh` writes redacted quality snapshots; authored profiles read from TOML and held in `synapse-profiles::ProfileRuntime` memory |
 | `CF_MODEL_CACHE` | raw bytes + `ModelDescriptor` | binary ONNX blob behind a JSON-encoded descriptor key | not exercised in current build (no model auto-download yet) |
-| `CF_SESSIONS` | `StoredSession` | `schema_version`, `session_id`, `started_at`, `ended_at`, `transport`, `client`, `mode`, `active_profile`, `profile_history: Vec<StoredProfileHistoryEntry>`, `redacted`, `redactions` | not written in this build |
-| `CF_REFLEX_AUDIT` | `StoredReflexAudit` | `schema_version`, `audit_id`, `reflex_id`, `ts_ns`, `status: ReflexState`, `event_id: Option<String>`, `steps: Vec<StoredReflexStep>`, `error_code: Option<String>`, `details: serde_json::Value`, `redacted`, `redactions` | `format!("{reflex_id}:{audit_id}")` (see §4.2) |
+| `CF_SESSIONS` | `StoredSession` | `schema_version`, `session_id`, `started_at`, `ended_at`, `transport`, `client`, `mode`, `active_profile`, `audit_context: Option<StoredAuditContext>`, `profile_history: Vec<StoredProfileHistoryEntry>`, `redacted`, `redactions` | `session/v1/<session_id>` when a profile activation starts/updates the MCP audit session |
+| `CF_REFLEX_AUDIT` | `StoredReflexAudit` | `schema_version`, `audit_id`, `reflex_id`, `ts_ns`, `status: ReflexState`, `event_id: Option<String>`, `audit_context: Option<StoredAuditContext>`, `steps: Vec<StoredReflexStep>`, `error_code: Option<String>`, `details: serde_json::Value`, `redacted`, `redactions` | `format!("{reflex_id}:{audit_id}")` (see §4.2) |
 | `CF_OCR_CACHE` | not yet wired | — | — |
 | `CF_TELEMETRY` | not yet wired | — | — |
-| `CF_ACTION_LOG` | action audit JSON | `schema_version`, `audit_id`, `ts_ns`, `seq`, `tool`, `status`, `error_code`, `foreground` with `profile_id`/`profile_schema_version`, `active_profile_id`, `active_profile_schema_version`, `details` | action tools via `server/action_audit.rs`; diagnostic probe writes may create malformed rows for manual corrupt-row checks |
+| `CF_ACTION_LOG` | action audit JSON | `schema_version`, `audit_id`, `ts_ns`, `seq`, `session_id`, `profile_id`, `profile_version`, `profile_schema_version`, `audit_context`, `tool`, `status`, `error_code`, `foreground`, `active_profile_id`, `active_profile_schema_version`, `details`, `redacted`, `redactions` | action tools via `server/action_audit.rs`; diagnostic probe writes may create malformed rows for manual corrupt-row checks |
 | `CF_PROCESS_HISTORY` | not yet wired | — | — |
 | `CF_KV` | not yet wired (generic) | — | — |
 
 `StoredReflexStep` is `{ index: u32, action: Action, status: String, error_code: Option<String> }`.
+`StoredAuditContext` is the shared profile/audit linkage payload:
+`{ session_id, profile_id, profile_version, profile_schema_version,
+backend_policy, app_context }`. `StoredBackendPolicy` captures default,
+keyboard, mouse, and pad backend resolution from the active profile.
+`StoredAppContext` captures foreground process/window plus profile metadata
+such as benchmark target id, gameid, world path/name, and log path when
+available.
 `StoredRedaction` is `{ kind: String, offset: u32, len: u32 }`.
 
 ### 4.2 Active write paths (current build)
 
-The live build actively writes `CF_REFLEX_AUDIT`, `CF_ACTION_LOG`, and
-profile-quality rows in `CF_PROFILES`:
+The live build actively writes `CF_REFLEX_AUDIT`, `CF_ACTION_LOG`,
+`CF_EVENTS`, `CF_SESSIONS`, and profile-quality rows in `CF_PROFILES`:
 
 | Caller | Trigger | Audit payload | Key format |
 |---|---|---|---|
+| `SynapseService::profile_activate` | tool `profile_activate` succeeds | `StoredSession` with active profile, profile history, backend policy, app/game context, redaction flags | `session/v1/<session_id>` in `CF_SESSIONS` |
+| `SynapseService::profile_activate` | tool `profile_activate` succeeds or fails after dispatch | `StoredEvent` kind `profile.activated` or `profile.activation_denied`, linked to the current audit context when available | `[ts_ns u64 BE][seq u32 BE]` in `CF_EVENTS` |
 | `ReflexRuntime::register` (`crates/synapse-reflex/src/lib.rs:146`) | tool `reflex_register` | `details.kind = "reflex_registered"`, `status = Active`, `error_code = None` | `"<reflex_id>:<audit_id>"` (v7 UUID for audit_id) |
 | `ReflexRuntime::cancel` (`lib.rs:198`) | tool `reflex_cancel` | `details.kind = "reflex_cancelled"`, `status = Cancelled` | same |
 | `ReflexRuntime::disable_all_by_operator` (`lib.rs:245`) | operator panic hotkey (`crates/synapse-mcp/src/safety.rs::handle_operator_hotkey`) | `details.kind = "reflex_disabled_by_operator"`, `status = Disabled`, `error_code = REFLEX_DISABLED_BY_OPERATOR` | same |
@@ -129,10 +138,13 @@ profile-quality rows in `CF_PROFILES`:
 Reflex writers go through `synapse_reflex::audit::write_audit`
 (`crates/synapse-reflex/src/audit.rs`), which is just a thin wrapper around
 `Db::put_batch(CF_REFLEX_AUDIT, ...)` followed (by the caller) by `Db::flush()`.
-Action tools write minimal action-audit rows to `CF_ACTION_LOG` through
+Action tools write profile-linked action-audit rows to `CF_ACTION_LOG` through
 `crates/synapse-mcp/src/server/action_audit.rs`; the key is
 `[ts_ns u64 BE][seq u32 BE]`, and each write is flushed before the action
-result audit returns. `profile_quality_refresh` reads those action rows,
+result audit returns. Rows carry the MCP audit `session_id`, active
+profile id/version/schema, backend policy, app/game context, result/error
+codes, and redaction/export flags where available. `profile_quality_refresh`
+reads those action rows,
 aggregates profile-relevant outcomes, writes a redacted
 `ProfileQualitySnapshot` JSON row to `CF_PROFILES` at
 `profile_quality/v1/<profile_id>`, and reads that exact row back before
@@ -214,7 +226,12 @@ For CFs without a `ts_ns` field (e.g. `CF_PROFILES`, `CF_KV`) the filter is stil
 3. `Db::flush()` issues a synchronous flush (`WriteOptions::sync`-style). The current reflex audit pattern is `write_audit(&db, &audit)` followed by `db.flush()`, so each persisted audit is durable before the tool response returns.
 4. Empty key sets are no-ops (`if kvs.is_empty() { return Ok(()) }`).
 
-There are no transactions. Reflex audit consistency is achieved by the single-writer model: only `ReflexRuntime` writes `CF_REFLEX_AUDIT`, holding its own `Mutex` while it does so (`crates/synapse-mcp/src/m3/reflex.rs::register_reflex`).
+There are no transactions. Reflex audit consistency is achieved by the
+single-writer model for `CF_REFLEX_AUDIT`: `ReflexRuntime` writes reflex audit
+rows while holding its own `Mutex`. Profile activation/session/event and
+action-audit consistency is a local MCP-service contract: the tool writes and
+flushes each physical row before returning the corresponding activation or
+action result.
 
 ## 10. Query helpers
 
@@ -246,4 +263,7 @@ There is no higher-level query API (no SQL, no secondary indexes). All RocksDB o
 - **Cross-process locking.** A single `synapse-mcp` process owns the directory; running two daemons against the same `--db` path will fail on `Db::open` because RocksDB's exclusive lock kicks in.
 - **Backups.** The daemon does not export, snapshot, or back up its own DB; any backup strategy is operator-side (e.g. file-system snapshot while the process is stopped).
 - **Encryption-at-rest.** RocksDB is not configured with encryption.
-- **`CF_EVENTS` / `CF_OBSERVATIONS` writers.** The persistence pipeline for these CFs is wired in retention defaults and tested, but no production code path currently writes events/observations through them — they remain reserved for upcoming work. The reflex audit is the only live writer in M3.
+- **`CF_OBSERVATIONS` writer.** The persistence pipeline for observations is
+  wired in retention defaults and tested, but no production code path
+  currently writes observation snapshots through it. `CF_EVENTS` is now used by
+  profile activation/denial audit events.

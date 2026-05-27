@@ -49,15 +49,15 @@ override:   --db <path>     (CLI flag)
 
 | CF | Key | Value | Encoding | TTL | Soft cap | Hard cap | Notes |
 |---|---|---|---|---|---|---|---|
-| `CF_EVENTS` | `[seq u64 BE]` | `StoredEvent` | json | 24h | 2 GB | 4 GB | Append-only ring; the replay log |
+| `CF_EVENTS` | `[at_ns u64 BE][seq u32 BE]` | `StoredEvent` | json | 24h | 2 GB | 4 GB | Append-only ring; profile activation/denial and future replay events |
 | `CF_OBSERVATIONS` | `[seq u64 BE]` | `StoredObservation` | json | 6h | 500 MB | 1 GB | 1Hz sample + reason-triggered snapshots |
 | `CF_PROFILES` | `[profile_id utf8]` or `[profile_quality/v1/<profile_id>]` | cached TOML/profile-registry rows | raw bytes/json | none | 20 MB | 50 MB | Cached load plus local profile-quality snapshots; authored profile source remains on-disk TOML |
 | `CF_MODEL_CACHE` | `[model_sha256 32 bytes]` | model bytes | raw bytes | LRU when full | 1 GB | 2 GB | Downloaded ONNX models, sha-verified |
-| `CF_SESSIONS` | `[session_id utf8]` | `StoredSession` | json | 30d | 50 MB | 100 MB | One row per session |
-| `CF_REFLEX_AUDIT` | `[reflex_id 16 bytes][at_ns u64 BE]` | `StoredReflexAudit` | json | 7d | 200 MB | 500 MB | Per-reflex audit |
+| `CF_SESSIONS` | `[session/v1/<session_id>]` | `StoredSession` | json | 30d | 50 MB | 100 MB | One row per MCP audit session, including active profile history |
+| `CF_REFLEX_AUDIT` | `[reflex_id][audit_id]` | `StoredReflexAudit` | json | 7d | 200 MB | 500 MB | Per-reflex audit with optional profile/session context |
 | `CF_OCR_CACHE` | `[image_sha256 32 bytes]` | `OcrResult` | json | 1h | 50 MB | 100 MB | Memoization of OCR on stable regions |
 | `CF_TELEMETRY` | `[metric_name utf8][at_ns u64 BE]` | `f64 LE` | raw 8 bytes | 6h | 100 MB | 200 MB | Local metric ringbuffer |
-| `CF_ACTION_LOG` | `[at_ns u64 BE][seq u32 BE]` | `StoredActionRecord` | json | 24h | 200 MB | 500 MB | Every action emitted |
+| `CF_ACTION_LOG` | `[at_ns u64 BE][seq u32 BE]` | profile-linked action audit JSON | json | 24h | 200 MB | 500 MB | Every action start/result row, linked to active profile/session when available |
 | `CF_PROCESS_HISTORY` | `[at_ns u64 BE][pid u32]` | json | json | 6h | 20 MB | 50 MB | Process started/exited events |
 | `CF_KV` | `[utf8]` | bytes | raw | none | 10 MB | 50 MB | Generic key-value extension |
 
@@ -314,13 +314,31 @@ These tools are operator diagnostics for direct state verification. They are not
 FSV automation, and their responses must be followed by separate SoT reads when
 used as acceptance evidence.
 
-Real action tools write minimal JSON rows to `CF_ACTION_LOG`. For manual action
-FSV, read `storage_inspect.cf_row_counts.CF_ACTION_LOG` before and after the
-action, then read `storage_inspect.cf_row_samples.CF_ACTION_LOG` and record the
-actual sampled JSON row. Rows include active and foreground profile ids plus
-their schema versions when profile resolution is available, which lets later
-quality scoring distinguish current, older, newer, and unknown profile-version
-evidence. A count delta alone is not enough evidence.
+Real action tools write profile-linked JSON rows to `CF_ACTION_LOG`. For
+manual action FSV, read `storage_inspect.cf_row_counts.CF_ACTION_LOG` before
+and after the action, then read
+`storage_inspect.cf_row_samples.CF_ACTION_LOG` and record the actual sampled
+JSON row. Rows include the MCP audit session id, active profile id/version/
+schema, foreground profile/schema, backend policy, app/game context, status,
+error code, and redaction fields when profile resolution is available. A count
+delta alone is not enough evidence.
+
+M5 profile-linked audit rows extend that contract across `CF_SESSIONS`,
+`CF_EVENTS`, `CF_ACTION_LOG`, and `CF_REFLEX_AUDIT`. A successful
+`profile_activate` starts or updates the local MCP audit session, writes the
+current `StoredSession`, and writes a `profile.activated` `StoredEvent`.
+Action audit rows and reflex audit rows then carry the same `audit_context`
+payload where the active profile is known: session id, profile id/version/
+schema, backend policy, foreground app/game context, redaction flag, and
+redaction spans. Profile-denied paths write `profile.activation_denied` events
+with the attempted profile id and current session context when one exists.
+
+For manual FSV of this linkage, trigger the real MCP tool (`profile_activate`,
+an action tool such as `act_press`/`act_combo`, and a reflex path), then read
+`storage_inspect.cf_row_counts` and the 4096-character `cf_row_samples` for
+`CF_SESSIONS`, `CF_EVENTS`, `CF_ACTION_LOG`, and `CF_REFLEX_AUDIT`. The row
+samples must show the same `session_id`/`profile_id` chain and the expected
+redaction fields; return values alone do not prove the row exists.
 
 `profile_quality_refresh` is the first profile-registry/audit-data scoring
 surface. It reads real `CF_ACTION_LOG` rows, ignores stale/corrupt/non-matching

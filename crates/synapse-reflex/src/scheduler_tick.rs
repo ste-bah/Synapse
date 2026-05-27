@@ -123,6 +123,7 @@ fn dispatch_triggered_reflexes(
                         &trigger.reflex_id,
                         runtime.tick_index,
                         event,
+                        runtime.audit_context.as_ref(),
                     );
                     break;
                 }
@@ -138,6 +139,7 @@ fn dispatch_triggered_reflexes(
                             runtime.tick_index,
                             event,
                             &trigger.actions,
+                            runtime.audit_context.as_ref(),
                         );
                         super::mark_reflex_fired(runtime, trigger.reflex_index);
                     }
@@ -223,6 +225,7 @@ fn record_starvation(
                 loser,
                 runtime.tick_index,
                 runtime.starvation_states[loser.loser_slot].contended_for(),
+                runtime.audit_context.as_ref(),
             );
             super::mark_reflex_starved(runtime, loser.loser_slot);
         }
@@ -245,6 +248,7 @@ fn publish_starved(
     loser: &ConflictLoser,
     tick_index: u64,
     starved_for: Duration,
+    audit_context: Option<&synapse_core::StoredAuditContext>,
 ) {
     let starved_for_ms = u64::try_from(starved_for.as_millis()).unwrap_or(u64::MAX);
     let event = Event {
@@ -273,6 +277,7 @@ fn publish_starved(
         ts_ns: now_ts_ns(),
         status: ReflexState::Starved,
         event_id: None,
+        audit_context: audit_context.cloned(),
         steps: Vec::new(),
         error_code: Some(error_codes::REFLEX_STARVED.to_owned()),
         details: json!({

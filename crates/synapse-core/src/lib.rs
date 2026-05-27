@@ -25,10 +25,11 @@ pub use types::{
     Point, Profile, ProfileBackends, ProfileCapture, ProfileCaptureTarget, ProfileDetection,
     ProfileId, ProfileMatch, ProfileOcr, ProfileUseScope, Rect, ReflexAimAxis, ReflexButtonTarget,
     ReflexId, ReflexKind, ReflexLifetime, ReflexRegistration, ReflexState, ReflexStatus,
-    ReflexThen, SensorStatus, SessionId, Size, Stick, StoredEvent, StoredObservation,
-    StoredProfileHistoryEntry, StoredRedaction, StoredReflexAudit, StoredReflexStep, StoredSession,
-    SubscriptionId, SubsystemHealth, Trigger, UiaPattern, WindowEdge, element_id, entity_id,
-    new_reflex_id, new_session_id, new_subscription_id,
+    ReflexThen, SensorStatus, SessionId, Size, Stick, StoredAppContext, StoredAuditContext,
+    StoredBackendPolicy, StoredEvent, StoredObservation, StoredProfileHistoryEntry,
+    StoredRedaction, StoredReflexAudit, StoredReflexStep, StoredSession, SubscriptionId,
+    SubsystemHealth, Trigger, UiaPattern, WindowEdge, element_id, entity_id, new_reflex_id,
+    new_session_id, new_subscription_id,
 };
 pub use usb_identity::{
     SYNAPSE_PICO_HID_MANUFACTURER, SYNAPSE_PICO_HID_PRODUCT, SYNAPSE_PICO_HID_SERIAL_PREFIX,

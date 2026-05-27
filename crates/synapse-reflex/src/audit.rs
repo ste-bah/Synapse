@@ -84,6 +84,7 @@ mod tests {
             ts_ns,
             status,
             event_id: None,
+            audit_context: None,
             steps: Vec::new(),
             error_code: None,
             details: json!({ "case": "duplicate_ts" }),

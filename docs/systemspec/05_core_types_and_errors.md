@@ -313,6 +313,10 @@ Used as the JSON payload values in RocksDB column families. See [04_storage_laye
 - `StoredObservation` (CF_OBSERVATIONS)
 - `StoredReflexAudit` + `StoredReflexStep` (CF_REFLEX_AUDIT)
 - `StoredSession` + `StoredProfileHistoryEntry` (CF_SESSIONS)
+- `StoredAuditContext` + `StoredBackendPolicy` + `StoredAppContext` reused by
+  stored events, sessions, reflex audit rows, and action-audit JSON so
+  profile-linked rows carry the same `session_id`, profile id/version/schema,
+  backend policy, foreground app/game context, and redaction/export linkage.
 - `StoredRedaction` reused across the above (`{ kind: String, offset: u32, len: u32 }`)
 
 Every stored type carries `schema_version: u32` so a future migration framework can branch on version. The current code unconditionally writes `synapse_core::SCHEMA_VERSION = 1`.

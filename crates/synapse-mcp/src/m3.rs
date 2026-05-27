@@ -10,6 +10,7 @@ pub mod subscribe;
 #[cfg(test)]
 mod tests;
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use std::{
     num::NonZeroUsize,
     path::PathBuf,
@@ -17,7 +18,7 @@ use std::{
 };
 use synapse_action::ActionHandle;
 use synapse_audio::{AudioConfig, AudioError, AudioRuntime, DEFAULT_RING_SECONDS};
-use synapse_core::SCHEMA_VERSION;
+use synapse_core::{SCHEMA_VERSION, SessionId, StoredProfileHistoryEntry};
 use synapse_profiles::{ProfileError, ProfileRuntime, bundled_profiles_dir};
 use synapse_reflex::{
     DEFAULT_MAX_SUBSCRIPTIONS_NONZERO, EventBus, ReflexError, ReflexRuntime,
@@ -162,6 +163,14 @@ pub struct M3State {
     pub reflex_runtime: Option<Arc<Mutex<ReflexRuntime>>>,
     pub a11y_event_bridge: Option<A11yEventBridge>,
     pub audio_runtime: Option<Arc<AudioRuntime>>,
+    pub audit_session: Option<AuditSessionState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AuditSessionState {
+    pub session_id: SessionId,
+    pub started_at: DateTime<Utc>,
+    pub profile_history: Vec<StoredProfileHistoryEntry>,
 }
 
 pub fn shared_m3_state_from_env() -> Result<SharedM3State> {
@@ -273,6 +282,7 @@ impl M3State {
             reflex_runtime: None,
             a11y_event_bridge: None,
             audio_runtime: None,
+            audit_session: None,
         })
     }
 

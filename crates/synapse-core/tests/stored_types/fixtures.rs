@@ -6,8 +6,9 @@ use synapse_core::{
     DetectedEntity, DirectionEstimate, EventSource, EventSummary, FocusedElement,
     ForegroundContext, FsEvent, FsEventKind, HudReading, HudReadings, HudValue, Key, KeyCode,
     MouseButton, ObservationDiagnostics, PerceptionMode, Rect, ReflexState, SCHEMA_VERSION,
-    SensorStatus, StoredEvent, StoredObservation, StoredProfileHistoryEntry, StoredRedaction,
-    StoredReflexAudit, StoredReflexStep, StoredSession, UiaPattern, element_id, entity_id,
+    SensorStatus, StoredAppContext, StoredAuditContext, StoredBackendPolicy, StoredEvent,
+    StoredObservation, StoredProfileHistoryEntry, StoredRedaction, StoredReflexAudit,
+    StoredReflexStep, StoredSession, UiaPattern, element_id, entity_id,
 };
 
 pub fn empty_event() -> StoredEvent {
@@ -16,6 +17,7 @@ pub fn empty_event() -> StoredEvent {
         event_id: String::new(),
         ts_ns: 0,
         session_id: None,
+        audit_context: None,
         source: EventSource::System,
         kind: String::new(),
         data: serde_json::Value::Null,
@@ -42,6 +44,7 @@ pub fn full_event() -> StoredEvent {
         event_id: "event-full".to_owned(),
         ts_ns: 42,
         session_id: Some("session-full".to_owned()),
+        audit_context: Some(full_audit_context()),
         source: EventSource::PerceptionHud,
         kind: "hud_value_changed".to_owned(),
         data: serde_json::json!({"field":"hp","new":20}),
@@ -170,6 +173,7 @@ pub fn empty_reflex_audit() -> StoredReflexAudit {
         ts_ns: 0,
         status: ReflexState::Active,
         event_id: None,
+        audit_context: None,
         steps: Vec::new(),
         error_code: None,
         details: serde_json::Value::Null,
@@ -195,6 +199,7 @@ pub fn full_reflex_audit() -> StoredReflexAudit {
         ts_ns: 42,
         status: ReflexState::Starved,
         event_id: Some("event-full".to_owned()),
+        audit_context: Some(full_audit_context()),
         steps: vec![full_reflex_step()],
         error_code: Some("REFLEX_STARVED".to_owned()),
         details: serde_json::json!({"lost_for_ms": 2000}),
@@ -213,6 +218,7 @@ pub fn empty_session() -> StoredSession {
         client: None,
         mode: PerceptionMode::Auto,
         active_profile: None,
+        audit_context: None,
         profile_history: Vec::new(),
         redacted: false,
         redactions: Vec::new(),
@@ -237,6 +243,7 @@ pub fn full_session() -> StoredSession {
         client: Some("claude-desktop/0.4.2".to_owned()),
         mode: PerceptionMode::Hybrid,
         active_profile: Some("notepad".to_owned()),
+        audit_context: Some(full_audit_context()),
         profile_history: vec![full_profile_history_entry()],
         redacted: true,
         redactions: vec![full_redaction()],
@@ -300,6 +307,8 @@ pub fn full_reflex_step() -> StoredReflexStep {
 pub fn empty_profile_history_entry() -> StoredProfileHistoryEntry {
     StoredProfileHistoryEntry {
         profile_id: String::new(),
+        profile_version: None,
+        profile_schema_version: None,
         activated_at: fixed_time(0),
         reason: String::new(),
     }
@@ -308,6 +317,8 @@ pub fn empty_profile_history_entry() -> StoredProfileHistoryEntry {
 pub fn required_profile_history_entry() -> StoredProfileHistoryEntry {
     StoredProfileHistoryEntry {
         profile_id: "notepad".to_owned(),
+        profile_version: Some("1.0.0".to_owned()),
+        profile_schema_version: Some(SCHEMA_VERSION),
         activated_at: fixed_time(1),
         reason: "manual".to_owned(),
     }
@@ -316,8 +327,35 @@ pub fn required_profile_history_entry() -> StoredProfileHistoryEntry {
 pub fn full_profile_history_entry() -> StoredProfileHistoryEntry {
     StoredProfileHistoryEntry {
         profile_id: "vscode".to_owned(),
+        profile_version: Some("2.1.0".to_owned()),
+        profile_schema_version: Some(SCHEMA_VERSION),
         activated_at: fixed_time(2),
         reason: "window_match".to_owned(),
+    }
+}
+
+pub fn full_audit_context() -> StoredAuditContext {
+    StoredAuditContext {
+        session_id: Some("session-full".to_owned()),
+        profile_id: Some("notepad".to_owned()),
+        profile_version: Some("1.0.0".to_owned()),
+        profile_schema_version: Some(SCHEMA_VERSION),
+        backend_policy: Some(StoredBackendPolicy {
+            default: Backend::Software,
+            keyboard_default: Backend::Software,
+            mouse_default: Backend::Software,
+            pad_default: Backend::Vigem,
+        }),
+        app_context: Some(StoredAppContext {
+            process_name: Some("notepad.exe".to_owned()),
+            process_path: Some("C:\\Windows\\System32\\notepad.exe".to_owned()),
+            window_title: Some("Untitled - Notepad".to_owned()),
+            target_id: Some("windows.notepad".to_owned()),
+            gameid: None,
+            world_name: None,
+            world_path: None,
+            log_path: None,
+        }),
     }
 }
 

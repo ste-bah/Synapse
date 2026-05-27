@@ -4,6 +4,8 @@ expression: "round_trip(\"StoredProfileHistoryEntry\", \"snapshot\",\nfull_profi
 ---
 {
   "profile_id": "vscode",
+  "profile_version": "2.1.0",
+  "profile_schema_version": 1,
   "activated_at": "1970-01-01T00:00:02Z",
   "reason": "window_match"
 }

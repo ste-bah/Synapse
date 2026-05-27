@@ -5,8 +5,9 @@ use proptest::prelude::*;
 use synapse_core::{
     Action, AudioContext, Backend, ElementId, EventSource, FocusedElement, ForegroundContext,
     HudReadings, Key, KeyCode, ObservationDiagnostics, PerceptionMode, Rect, ReflexState,
-    SCHEMA_VERSION, SensorStatus, StoredEvent, StoredObservation, StoredProfileHistoryEntry,
-    StoredRedaction, StoredReflexAudit, StoredReflexStep, StoredSession, UiaPattern, element_id,
+    SCHEMA_VERSION, SensorStatus, StoredAppContext, StoredAuditContext, StoredBackendPolicy,
+    StoredEvent, StoredObservation, StoredProfileHistoryEntry, StoredRedaction, StoredReflexAudit,
+    StoredReflexStep, StoredSession, UiaPattern, element_id,
 };
 
 use super::fixtures::fixed_time;
@@ -73,6 +74,94 @@ pub fn stored_redaction_strategy() -> impl Strategy<Value = StoredRedaction> {
         offset,
         len,
     })
+}
+
+pub fn backend_strategy() -> impl Strategy<Value = Backend> {
+    prop_oneof![
+        Just(Backend::Software),
+        Just(Backend::Hardware),
+        Just(Backend::Vigem),
+        Just(Backend::Auto),
+    ]
+}
+
+pub fn stored_backend_policy_strategy() -> impl Strategy<Value = StoredBackendPolicy> {
+    (
+        backend_strategy(),
+        backend_strategy(),
+        backend_strategy(),
+        backend_strategy(),
+    )
+        .prop_map(|(default, keyboard_default, mouse_default, pad_default)| {
+            StoredBackendPolicy {
+                default,
+                keyboard_default,
+                mouse_default,
+                pad_default,
+            }
+        })
+}
+
+pub fn stored_app_context_strategy() -> impl Strategy<Value = StoredAppContext> {
+    (
+        prop::option::of(small_string()),
+        prop::option::of(small_string()),
+        prop::option::of(small_string()),
+        prop::option::of(small_string()),
+        prop::option::of(small_string()),
+        prop::option::of(small_string()),
+        prop::option::of(small_string()),
+        prop::option::of(small_string()),
+    )
+        .prop_map(
+            |(
+                process_name,
+                process_path,
+                window_title,
+                target_id,
+                gameid,
+                world_name,
+                world_path,
+                log_path,
+            )| StoredAppContext {
+                process_name,
+                process_path,
+                window_title,
+                target_id,
+                gameid,
+                world_name,
+                world_path,
+                log_path,
+            },
+        )
+}
+
+pub fn stored_audit_context_strategy() -> impl Strategy<Value = StoredAuditContext> {
+    (
+        prop::option::of(small_string()),
+        prop::option::of(small_string()),
+        prop::option::of(small_string()),
+        prop::option::of(0_u32..10),
+        prop::option::of(stored_backend_policy_strategy()),
+        prop::option::of(stored_app_context_strategy()),
+    )
+        .prop_map(
+            |(
+                session_id,
+                profile_id,
+                profile_version,
+                profile_schema_version,
+                backend_policy,
+                app_context,
+            )| StoredAuditContext {
+                session_id,
+                profile_id,
+                profile_version,
+                profile_schema_version,
+                backend_policy,
+                app_context,
+            },
+        )
 }
 
 pub fn rect_strategy() -> impl Strategy<Value = Rect> {
@@ -198,6 +287,7 @@ pub fn stored_event_strategy() -> impl Strategy<Value = StoredEvent> {
         small_string(),
         0_u64..1_000_000,
         prop::option::of(small_string()),
+        prop::option::of(stored_audit_context_strategy()),
         event_source_strategy(),
         small_string(),
         json_value_strategy(),
@@ -211,6 +301,7 @@ pub fn stored_event_strategy() -> impl Strategy<Value = StoredEvent> {
                 event_id,
                 ts_ns,
                 session_id,
+                audit_context,
                 source,
                 kind,
                 data,
@@ -223,6 +314,7 @@ pub fn stored_event_strategy() -> impl Strategy<Value = StoredEvent> {
                 event_id,
                 ts_ns,
                 session_id,
+                audit_context,
                 source,
                 kind,
                 data,
@@ -333,6 +425,7 @@ pub fn stored_reflex_audit_strategy() -> impl Strategy<Value = StoredReflexAudit
         0_u64..1_000_000,
         reflex_state_strategy(),
         prop::option::of(small_string()),
+        prop::option::of(stored_audit_context_strategy()),
         prop::collection::vec(stored_reflex_step_strategy(), 0..3),
         prop::option::of(small_string()),
         json_value_strategy(),
@@ -346,6 +439,7 @@ pub fn stored_reflex_audit_strategy() -> impl Strategy<Value = StoredReflexAudit
                 ts_ns,
                 status,
                 event_id,
+                audit_context,
                 steps,
                 error_code,
                 details,
@@ -358,6 +452,7 @@ pub fn stored_reflex_audit_strategy() -> impl Strategy<Value = StoredReflexAudit
                 ts_ns,
                 status,
                 event_id,
+                audit_context,
                 steps,
                 error_code,
                 details,
@@ -368,13 +463,24 @@ pub fn stored_reflex_audit_strategy() -> impl Strategy<Value = StoredReflexAudit
 }
 
 pub fn stored_profile_history_entry_strategy() -> impl Strategy<Value = StoredProfileHistoryEntry> {
-    (small_string(), instant_strategy(), small_string()).prop_map(
-        |(profile_id, activated_at, reason)| StoredProfileHistoryEntry {
-            profile_id,
-            activated_at,
-            reason,
-        },
+    (
+        small_string(),
+        prop::option::of(small_string()),
+        prop::option::of(0_u32..10),
+        instant_strategy(),
+        small_string(),
     )
+        .prop_map(
+            |(profile_id, profile_version, profile_schema_version, activated_at, reason)| {
+                StoredProfileHistoryEntry {
+                    profile_id,
+                    profile_version,
+                    profile_schema_version,
+                    activated_at,
+                    reason,
+                }
+            },
+        )
 }
 
 pub fn stored_session_strategy() -> impl Strategy<Value = StoredSession> {
@@ -386,6 +492,7 @@ pub fn stored_session_strategy() -> impl Strategy<Value = StoredSession> {
         prop::option::of(small_string()),
         perception_mode_strategy(),
         prop::option::of(small_string()),
+        prop::option::of(stored_audit_context_strategy()),
         prop::collection::vec(stored_profile_history_entry_strategy(), 0..3),
         any::<bool>(),
         redactions_strategy(),
@@ -399,6 +506,7 @@ pub fn stored_session_strategy() -> impl Strategy<Value = StoredSession> {
                 client,
                 mode,
                 active_profile,
+                audit_context,
                 profile_history,
                 redacted,
                 redactions,
@@ -411,6 +519,7 @@ pub fn stored_session_strategy() -> impl Strategy<Value = StoredSession> {
                 client,
                 mode,
                 active_profile,
+                audit_context,
                 profile_history,
                 redacted,
                 redactions,

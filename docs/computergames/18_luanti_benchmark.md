@@ -51,7 +51,8 @@ on the TOML file alone.
 | Software mouse | `act_click`, `act_aim`, `act_drag`, and `act_scroll` through `mouse_default=auto/software` |
 | Hardware HID parity | profile metadata marks keyboard/mouse hardware HID as the parity target when configured |
 | ViGEm pad | profile metadata marks pad support as available when the ViGEm backend is configured |
-| Action audit | `storage_inspect.cf_row_counts.CF_ACTION_LOG` plus `cf_row_samples.CF_ACTION_LOG` |
+| Action audit | `storage_inspect.cf_row_counts.CF_ACTION_LOG` plus `cf_row_samples.CF_ACTION_LOG` carrying `audit_context.profile_id = luanti.minetest` |
+| Session/event/reflex audit linkage | `storage_inspect.cf_row_samples.CF_SESSIONS`, `CF_EVENTS`, and `CF_REFLEX_AUDIT` carrying the same session/profile context |
 | Profile quality | `profile_quality_refresh(profile_id="luanti.minetest")` writes/reads `CF_PROFILES` key `profile_quality/v1/luanti.minetest` |
 
 The HUD baseline is deliberately a minimal visible-state extractor, not the
@@ -65,13 +66,16 @@ joined world, observed HUD, moved, dug/placed, inventory opened, and release-all
 applied.
 
 Profile quality scoring is local-first. The Luanti benchmark feeds the
-profile-registry/audit-data loop only through observed runtime outcomes in
-`CF_ACTION_LOG`; `profile_quality_refresh` ignores stale, corrupt, and
-non-matching rows for the quality score, records compatibility and denial
-counters separately, records profile-schema-version recency/mixed-version
-evidence where audit rows carry it, redacts process paths/window titles from
-the score snapshot, and does not export/share anything without a future
-explicit operator approval path.
+profile-registry/audit-data loop through observed runtime outcomes in
+`CF_SESSIONS`, `CF_EVENTS`, `CF_ACTION_LOG`, and `CF_REFLEX_AUDIT`;
+`profile_quality_refresh` currently scores from `CF_ACTION_LOG`, and future
+registry/audit tools can join the sibling session/event/reflex rows by
+`session_id` and `audit_context.profile_id`. The scorer ignores stale,
+corrupt, and non-matching rows for the quality score, records compatibility
+and denial counters separately, records profile-schema-version recency/
+mixed-version evidence where audit rows carry it, redacts process paths/window
+titles from the score snapshot, and does not export/share anything without a
+future explicit operator approval path.
 
 ---
 

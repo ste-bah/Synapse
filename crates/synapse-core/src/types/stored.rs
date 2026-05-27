@@ -3,9 +3,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    AccessibleNode, Action, AudioContext, ClipboardSummary, DetectedEntity, ElementId, EventSource,
-    EventSummary, FocusedElement, ForegroundContext, FsEvent, HudReadings, ObservationDiagnostics,
-    PerceptionMode, ProfileId, ReflexId, ReflexState, SessionId,
+    AccessibleNode, Action, AudioContext, Backend, ClipboardSummary, DetectedEntity, ElementId,
+    EventSource, EventSummary, FocusedElement, ForegroundContext, FsEvent, HudReadings,
+    ObservationDiagnostics, PerceptionMode, ProfileId, ReflexId, ReflexState, SessionId,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -18,12 +18,61 @@ pub struct StoredRedaction {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StoredBackendPolicy {
+    pub default: Backend,
+    pub keyboard_default: Backend,
+    pub mouse_default: Backend,
+    pub pad_default: Backend,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoredAppContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gameid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoredAuditContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<ProfileId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_policy: Option<StoredBackendPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_context: Option<StoredAppContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StoredEvent {
     pub schema_version: u32,
     pub event_id: String,
     pub ts_ns: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_context: Option<StoredAuditContext>,
     pub source: EventSource,
     pub kind: String,
     pub data: serde_json::Value,
@@ -89,6 +138,8 @@ pub struct StoredReflexAudit {
     pub status: ReflexState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_context: Option<StoredAuditContext>,
     #[serde(default)]
     pub steps: Vec<StoredReflexStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,6 +155,10 @@ pub struct StoredReflexAudit {
 #[serde(deny_unknown_fields)]
 pub struct StoredProfileHistoryEntry {
     pub profile_id: ProfileId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_schema_version: Option<u32>,
     pub activated_at: DateTime<Utc>,
     pub reason: String,
 }
@@ -122,6 +177,8 @@ pub struct StoredSession {
     pub mode: PerceptionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile: Option<ProfileId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_context: Option<StoredAuditContext>,
     #[serde(default)]
     pub profile_history: Vec<StoredProfileHistoryEntry>,
     pub redacted: bool,

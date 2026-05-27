@@ -7,6 +7,24 @@ expression: "round_trip(\"StoredEvent\", \"snapshot\", full_event())?"
   "event_id": "event-full",
   "ts_ns": 42,
   "session_id": "session-full",
+  "audit_context": {
+    "session_id": "session-full",
+    "profile_id": "notepad",
+    "profile_version": "1.0.0",
+    "profile_schema_version": 1,
+    "backend_policy": {
+      "default": "software",
+      "keyboard_default": "software",
+      "mouse_default": "software",
+      "pad_default": "vigem"
+    },
+    "app_context": {
+      "process_name": "notepad.exe",
+      "process_path": "C:\\Windows\\System32\\notepad.exe",
+      "window_title": "Untitled - Notepad",
+      "target_id": "windows.notepad"
+    }
+  },
   "source": "perception_hud",
   "kind": "hud_value_changed",
   "data": {

@@ -181,6 +181,12 @@ bundles, and MCP readbacks such as `profile_list`, `profile_quality_refresh`,
 real runtime path and then read these physical stores directly; GitHub
 Actions/CI and automated checks never substitute for FSV.
 
+M5 profile-linked audit linkage starts at `profile_activate`: the daemon writes
+`CF_SESSIONS` and `CF_EVENTS` rows with `StoredAuditContext`, and action/reflex
+paths propagate that same context into `CF_ACTION_LOG` and
+`CF_REFLEX_AUDIT`. That keeps every local outcome joinable by
+`session_id` + `profile_id` without requiring cloud upload.
+
 Full parameter/return tables: [13_mcp_tool_reference.md](13_mcp_tool_reference.md).
 
 ### 4.6 PRD-planned tools NOT live in this build

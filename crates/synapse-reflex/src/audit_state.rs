@@ -17,6 +17,7 @@ impl ReflexRuntime {
             ts_ns: now_ts_ns(),
             status: ReflexState::Active,
             event_id: None,
+            audit_context: self.audit_context.clone(),
             steps: Vec::new(),
             error_code: None,
             details: json!({
@@ -45,6 +46,7 @@ impl ReflexRuntime {
             ts_ns: now_ts_ns(),
             status: ReflexState::Cancelled,
             event_id: None,
+            audit_context: self.audit_context.clone(),
             steps: Vec::new(),
             error_code: None,
             details: json!({
@@ -77,6 +79,7 @@ impl ReflexRuntime {
                 ts_ns: now_ts_ns(),
                 status: ReflexState::Disabled,
                 event_id: None,
+                audit_context: self.audit_context.clone(),
                 steps: Vec::new(),
                 error_code: Some(error_codes::REFLEX_DISABLED_BY_OPERATOR.to_owned()),
                 details: json!({

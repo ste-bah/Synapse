@@ -1,7 +1,7 @@
 use std::{collections::HashSet, fmt, sync::Arc};
 
 use synapse_action::ActionHandle;
-use synapse_core::{ReflexId, ReflexState, ReflexStatus};
+use synapse_core::{ReflexId, ReflexState, ReflexStatus, StoredAuditContext};
 use synapse_storage::Db;
 
 use crate::{EventBus, ReflexResult, ScheduledReflex, SchedulerConfig, SchedulerHandle};
@@ -18,6 +18,7 @@ pub struct ReflexRuntime {
     pub(crate) action_handle: ActionHandle,
     pub(crate) event_bus: EventBus,
     pub(crate) scheduler_config: SchedulerConfig,
+    pub(crate) audit_context: Option<StoredAuditContext>,
     pub(crate) reflexes: Vec<ScheduledReflex>,
     pub(crate) disabled_reflex_ids: HashSet<ReflexId>,
     pub(crate) scheduler: Option<SchedulerHandle>,
@@ -69,6 +70,7 @@ impl ReflexRuntime {
             action_handle,
             event_bus,
             scheduler_config,
+            audit_context: None,
             reflexes: Vec::new(),
             disabled_reflex_ids: HashSet::new(),
             scheduler: None,
@@ -133,5 +135,16 @@ impl ReflexRuntime {
             .filter(|status| matches!(status.state, ReflexState::Cancelled | ReflexState::Expired))
             .map(|status| status.id)
             .collect()
+    }
+
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn set_audit_context(&mut self, audit_context: Option<StoredAuditContext>) {
+        self.audit_context = audit_context;
+    }
+
+    #[must_use]
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn audit_context(&self) -> Option<StoredAuditContext> {
+        self.audit_context.clone()
     }
 }

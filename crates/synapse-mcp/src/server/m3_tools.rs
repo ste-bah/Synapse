@@ -74,6 +74,7 @@ impl SynapseService {
         let required = crate::m3::reflex::required_permissions_register(&params.0)?;
         self.require_m3_permissions("reflex_register", &required)?;
         self.ensure_supported_use_allows_action("reflex_register")?;
+        self.refresh_reflex_audit_context()?;
         if crate::m3::reflex::requires_a11y_event_bridge(&params.0) {
             self.ensure_a11y_event_bridge()?;
         }
@@ -172,8 +173,16 @@ impl SynapseService {
             "profile_activate",
             &crate::m3::profile::required_permissions_activate(&params.0),
         )?;
-        let response = self.activate_profile_locked(&params.0, self.allow_unknown_profile()?)?;
+        let response = match self.activate_profile_locked(&params.0, self.allow_unknown_profile()?)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                self.persist_profile_activation_denied(&params.0.profile_id, &error);
+                return Err(error);
+            }
+        };
         self.apply_backend_resolution_for_profile(&response.active_profile_id)?;
+        self.persist_profile_activation_success(&response.active_profile_id, response.changed)?;
         Ok(Json(response))
     }
 
