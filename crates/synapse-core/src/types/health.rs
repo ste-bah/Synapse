@@ -50,4 +50,6 @@ pub struct SubsystemHealth {
     pub active_sessions: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sse_subscribers: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend_resolution: Option<BTreeMap<String, String>>,
 }

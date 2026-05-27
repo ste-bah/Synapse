@@ -17,6 +17,7 @@ use super::keyboard::key_log_label;
 use super::*;
 
 mod auto_release;
+mod backend_resolution;
 mod held_state;
 mod rate_limit;
 

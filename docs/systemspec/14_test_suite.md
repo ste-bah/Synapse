@@ -23,7 +23,7 @@ Source files covered:
 
 ### 2.1 `synapse-action` (21 files)
 - `auto_release_keyboard_hook.rs` — verifies `HELD_KEY_MAX_DURATION_MS` auto-release path
-- `backend_resolution.rs` — `resolve_backend(Backend, &Action)` mapping
+- `backend_resolution.rs` — `resolve_backend` / `resolve_backend_with_policy` mapping
 - `curve_natural_seed_42.rs` — fixed-seed natural-curve sampling determinism
 - `curve_sampling.rs` — `sample_curve` for `Linear`/`EaseInOut`/`Bezier`/`Natural`
 - `dynamics_modifier_order_proptest.rs` — keystroke modifier-ordering invariants

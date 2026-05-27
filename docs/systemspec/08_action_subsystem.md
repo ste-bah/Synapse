@@ -18,13 +18,13 @@ Source files covered:
 
 ## 1. Architecture
 
-The action subsystem is an actor-style emitter with an Tokio mpsc producer (`ActionHandle`) and a backend-dispatching consumer (`ActionEmitter`). Backends implement `ActionBackend::execute(&Action, &mut EmitState)`; the concrete one is chosen by `resolve_backend` based on the action's `backend` field plus the action kind for `Backend::Auto`.
+The action subsystem is an actor-style emitter with an Tokio mpsc producer (`ActionHandle`) and a backend-dispatching consumer (`ActionEmitter`). Backends implement `ActionBackend::execute(&Action, &mut EmitState)`; the concrete one is chosen by `resolve_backend_with_policy` based on the action's `backend` field plus the active `BackendResolutionPolicy` for `Backend::Auto`.
 
 ### 1.1 Public re-exports (`lib.rs`)
 
 | Symbol | Source |
 |---|---|
-| `ActionBackend`, `ResolvedBackend`, `resolve_backend` | `backend::mod` |
+| `ActionBackend`, `BackendResolutionPolicy`, `ResolvedBackend`, `resolve_backend`, `resolve_backend_with_policy` | `backend::mod` |
 | `HardwareBackend` | `backend::hardware` |
 | `RecordedInput`, `RecordingBackend` | `backend::recording` |
 | `HardwareUnavailableBackend` | `backend::unavailable` |
@@ -83,11 +83,13 @@ pub struct ActionHandle { tx: mpsc::Sender<ActionMessage> }
 For each `(Action, oneshot::Sender)` pulled from the channel:
 
 1. **Validate.** `validate_action(&action)` (re-checked here even though `ActionHandle::execute` already validates, to defend against `try_execute` callers that bypassed it).
-2. **Resolve backend.** `routing.rs` → `backend::resolve_backend(action.backend(), &action)`:
+2. **Resolve backend.** `routing.rs` reads the emitter's active `BackendResolutionPolicy` and calls `backend::resolve_backend_with_policy(action.backend(), &action, policy)`:
    - `Software` → `ResolvedBackend::Software`
    - `Vigem` → `ResolvedBackend::Vigem`
    - `Hardware` → `ResolvedBackend::Hardware`; the selected backend is `HardwareBackend` only when `synapse-mcp` was started with `--hardware-hid <port|auto>` and the HID connection/IDENTIFY succeeded. Otherwise the hardware slot is `HardwareUnavailableBackend`.
-   - `Auto` → `ResolvedBackend::Vigem` for `Pad*` actions, `Software` for everything else
+   - `Auto` with the global default policy → `ResolvedBackend::Vigem` for `Pad*` actions and `Software` for keyboard, mouse, combo, and release-all.
+   - `Auto` after activating a profile with `[backends] default_backend = "hardware"` → `ResolvedBackend::Hardware` for keyboard, mouse, pad, combo, and release-all unless `keyboard_default`, `mouse_default`, or `pad_default` is explicitly set for that class.
+   - The active policy and resolved table are readable at `health.subsystems.action.backend_resolution`.
 3. **Rate-limit.** `rate_limits.rs` consumes one token from the per-backend `TokenBucket`:
    - `SOFTWARE_RATE_LIMIT_PER_S = 5000`
    - `VIGEM_RATE_LIMIT_PER_S = 1000`

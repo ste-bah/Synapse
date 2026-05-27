@@ -1,9 +1,12 @@
 use synapse_core::{Action, Backend};
 
-use crate::{ActionResult, ResolvedBackend, resolve_backend};
+use crate::{ActionResult, BackendResolutionPolicy, ResolvedBackend, resolve_backend_with_policy};
 
-pub(super) fn resolved_backend_for_action(action: &Action) -> ActionResult<ResolvedBackend> {
-    resolve_backend(requested_backend(action), action)
+pub(super) fn resolved_backend_for_action(
+    action: &Action,
+    policy: BackendResolutionPolicy,
+) -> ActionResult<ResolvedBackend> {
+    resolve_backend_with_policy(requested_backend(action), action, policy)
 }
 
 pub(super) const fn action_consumes_rate_limit(action: &Action) -> bool {

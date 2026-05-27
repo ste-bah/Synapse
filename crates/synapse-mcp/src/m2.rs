@@ -11,12 +11,13 @@ mod type_text;
 
 use std::{
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
 };
 
 use synapse_action::{
     ActionBackend, ActionEmitter, ActionEmitterSnapshotHandle, ActionHandle, ActionStateSnapshot,
-    RELEASE_ALL_HANDLE, RecordingBackend, initialize_double_click_timing_cache,
+    BackendResolutionPolicy, RELEASE_ALL_HANDLE, RecordingBackend,
+    initialize_double_click_timing_cache,
 };
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -44,6 +45,8 @@ pub struct M2State {
     pub recording: Option<Arc<RecordingBackend>>,
     pub connection_closed_cancel: Option<CancellationToken>,
     hardware_hid: Option<String>,
+    backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
+    backend_resolution_source: String,
     retained_emitter: Option<ActionEmitter>,
     emitter_cancel: Option<CancellationToken>,
     emitter_task: Option<JoinHandle<ActionStateSnapshot>>,
@@ -179,13 +182,31 @@ impl M2State {
                 .as_ref()
                 .map(|recording| Arc::clone(recording) as Arc<dyn ActionBackend>)
         });
+        let backend_resolution = Arc::new(RwLock::new(BackendResolutionPolicy::default()));
         let tool_connection_closed_cancel = connection_closed_cancel.clone();
         let (emitter_handle, snapshot_handle, emitter) = actor_backend.map_or_else(
             || {
-                action_backends
-                    .map_or_else(ActionEmitter::channel, ActionEmitter::channel_with_backends)
+                action_backends.map_or_else(
+                    || {
+                        ActionEmitter::channel_with_backends_and_policy(
+                            synapse_action::Backends::production(),
+                            Arc::clone(&backend_resolution),
+                        )
+                    },
+                    |backends| {
+                        ActionEmitter::channel_with_backends_and_policy(
+                            backends,
+                            Arc::clone(&backend_resolution),
+                        )
+                    },
+                )
             },
-            ActionEmitter::channel_with_backend,
+            |backend| {
+                ActionEmitter::channel_with_backends_and_policy(
+                    synapse_action::Backends::all_routed_to(backend),
+                    Arc::clone(&backend_resolution),
+                )
+            },
         );
         if tokio::runtime::Handle::try_current().is_ok() {
             let _release_handle_result = RELEASE_ALL_HANDLE.set(emitter_handle.clone());
@@ -207,6 +228,8 @@ impl M2State {
                 recording,
                 connection_closed_cancel: tool_connection_closed_cancel,
                 hardware_hid,
+                backend_resolution,
+                backend_resolution_source: "global_default".to_owned(),
                 retained_emitter: None,
                 emitter_cancel: None,
                 emitter_task: Some(emitter_task),
@@ -220,6 +243,8 @@ impl M2State {
             recording,
             connection_closed_cancel: tool_connection_closed_cancel,
             hardware_hid,
+            backend_resolution,
+            backend_resolution_source: "global_default".to_owned(),
             retained_emitter: Some(emitter),
             emitter_cancel: None,
             emitter_task: None,
@@ -258,6 +283,33 @@ impl M2State {
     pub fn hardware_hid(&self) -> Option<&str> {
         self.hardware_hid.as_deref()
     }
+
+    #[must_use]
+    pub fn backend_resolution_source(&self) -> &str {
+        &self.backend_resolution_source
+    }
+
+    pub fn backend_resolution_readback(&self) -> Result<(String, BackendResolutionPolicy), String> {
+        self.backend_resolution
+            .read()
+            .map(|policy| (self.backend_resolution_source.clone(), *policy))
+            .map_err(|_err| "backend resolution policy lock poisoned".to_owned())
+    }
+
+    pub fn set_backend_resolution(
+        &mut self,
+        source: String,
+        policy: BackendResolutionPolicy,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .backend_resolution
+            .write()
+            .map_err(|_err| "backend resolution policy lock poisoned".to_owned())?;
+        *guard = policy;
+        drop(guard);
+        self.backend_resolution_source = source;
+        Ok(())
+    }
 }
 
 impl Default for M2State {
@@ -268,6 +320,7 @@ impl Default for M2State {
 
 impl fmt::Debug for M2State {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let backend_resolution = self.backend_resolution_readback().ok();
         formatter
             .debug_struct("M2State")
             .field("emitter_handle", &self.emitter_handle)
@@ -278,6 +331,11 @@ impl fmt::Debug for M2State {
                 &self.connection_closed_cancel.is_some(),
             )
             .field("hardware_hid", &self.hardware_hid())
+            .field("backend_resolution", &backend_resolution)
+            .field(
+                "backend_resolution_source",
+                &self.backend_resolution_source(),
+            )
             .field("retained_emitter", &self.emitter_retained())
             .field("emitter_cancel", &self.emitter_cancel.is_some())
             .field("emitter_task", &self.emitter_running())

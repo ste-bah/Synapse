@@ -216,6 +216,55 @@ impl SynapseService {
         activate_profile(&runtime, params, allow_unknown_profile)
     }
 
+    pub(super) fn apply_backend_resolution_for_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<(), ErrorData> {
+        let runtime = self.profile_runtime()?;
+        let profile = runtime
+            .profile(profile_id)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::PROFILE_NOT_FOUND,
+                    format!("profile {profile_id} was not found after activation"),
+                )
+            })?;
+        let policy =
+            synapse_action::BackendResolutionPolicy::from_profile_backends(profile.backends);
+        let source = format!("profile:{profile_id}");
+        self.m2_state
+            .lock()
+            .map_err(|_err| {
+                mcp_error(
+                    synapse_core::error_codes::OBSERVE_INTERNAL,
+                    "M2 service state lock poisoned",
+                )
+            })?
+            .set_backend_resolution(source.clone(), policy)
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::ACTION_BACKEND_UNAVAILABLE,
+                    format!("could not update action backend resolution: {error}"),
+                )
+            })?;
+        tracing::info!(
+            code = "ACTION_BACKEND_RESOLUTION_UPDATED",
+            profile_id,
+            source,
+            default_backend = ?policy.default_backend,
+            keyboard_default = ?policy.keyboard_default,
+            mouse_default = ?policy.mouse_default,
+            pad_default = ?policy.pad_default,
+            keyboard_auto = policy.keyboard_auto_backend().as_str(),
+            mouse_auto = policy.mouse_auto_backend().as_str(),
+            pad_auto = policy.pad_auto_backend().as_str(),
+            release_all_auto = policy.release_all_auto_backend().as_str(),
+            "action backend resolution updated from active profile"
+        );
+        Ok(())
+    }
+
     pub(super) fn ensure_act_type_foreground(
         &self,
         recording: Option<&Arc<RecordingBackend>>,

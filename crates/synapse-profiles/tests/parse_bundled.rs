@@ -1,6 +1,6 @@
 use std::{fs, time::UNIX_EPOCH};
 
-use synapse_core::error_codes;
+use synapse_core::{Backend, error_codes};
 use synapse_profiles::{
     ProfileError, ScreenBounds, bundled_profiles_dir, parse_profile_bytes, parse_profile_file,
 };
@@ -130,6 +130,44 @@ exe = "instant.exe"
         };
         assert_eq!(error.code(), code, "{path}: {error}");
     }
+}
+
+#[test]
+fn parser_accepts_default_backend_alias_for_action_backends() {
+    let toml = r#"
+id = "hardware_alias"
+label = "Hardware Alias"
+schema_version = 1
+use_scope = "operator_owned_test"
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "hardware-alias.exe"
+
+[backends]
+default_backend = "hardware"
+"#;
+
+    let loaded = parse_profile_bytes(
+        "hardware_alias.toml",
+        toml.as_bytes(),
+        UNIX_EPOCH,
+        ScreenBounds {
+            width: 1920,
+            height: 1080,
+        },
+    )
+    .unwrap_or_else(|error| panic!("default_backend alias should parse: {error}"));
+
+    assert_eq!(loaded.profile.backends.default, Backend::Hardware);
+    assert_eq!(loaded.profile.backends.keyboard_default, Backend::Auto);
+    assert_eq!(loaded.profile.backends.mouse_default, Backend::Auto);
+    assert_eq!(loaded.profile.backends.pad_default, Backend::Auto);
+    println!(
+        "readback=profile_backend_alias edge=default_backend before=default_backend after={:?} profile_id={}",
+        loaded.profile.backends, loaded.profile.id
+    );
 }
 
 #[test]

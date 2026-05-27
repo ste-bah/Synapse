@@ -15,10 +15,10 @@ pub mod safety;
 pub mod validation;
 
 pub use backend::{
-    ActionBackend, ResolvedBackend,
+    ActionBackend, BackendResolutionPolicy, ResolvedBackend,
     hardware::{HardwareBackend, HardwareGateway},
     recording::{RecordedInput, RecordingBackend},
-    resolve_backend,
+    resolve_backend, resolve_backend_with_policy,
     unavailable::HardwareUnavailableBackend,
     vigem::VigemBackend,
 };

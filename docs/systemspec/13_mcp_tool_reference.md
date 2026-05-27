@@ -21,7 +21,7 @@ Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32
 |---|---|---|---|---|
 | (none) | — | — | — | uses an empty input schema (`empty_input_schema()`) |
 
-**Returns:** `synapse_core::Health` (`{ ok, version, build, uptime_s, subsystems: BTreeMap<String, SubsystemHealth> }`). Subsystems: `storage`, `reflex`, `profiles`, `audio`, `http` (see [05_core_types_and_errors.md §5.8](05_core_types_and_errors.md)).
+**Returns:** `synapse_core::Health` (`{ ok, version, build, uptime_s, subsystems: BTreeMap<String, SubsystemHealth> }`). Subsystems: `storage`, `action`, `reflex`, `profiles`, `audio`, `http` (see [05_core_types_and_errors.md §5.8](05_core_types_and_errors.md)). `subsystems.action.backend_resolution` reports `source`, configured defaults, and resolved `keyboard_auto`, `mouse_auto`, `pad_auto`, and `release_all_auto`.
 
 ## 2. `observe`
 

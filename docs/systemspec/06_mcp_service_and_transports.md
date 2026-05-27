@@ -147,7 +147,11 @@ Router::new()
 
 ### 3.1 `GET /health`
 
-Returns a JSON `Health` payload — same as the MCP `health` tool — plus `active_sessions = state.session_manager.sessions.read().await.len()` populated into `subsystems.http.active_sessions`.
+Returns a JSON `Health` payload — same as the MCP `health` tool — plus
+`active_sessions = state.session_manager.sessions.read().await.len()` populated
+into `subsystems.http.active_sessions`. The payload includes
+`subsystems.action.backend_resolution`, the active session's configured backend
+defaults and resolved Auto table.
 
 ### 3.2 `/mcp` (streamable HTTP MCP)
 

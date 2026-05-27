@@ -276,7 +276,7 @@ impl RawHudField {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawBackends {
-    #[serde(default = "default_backend")]
+    #[serde(default = "default_backend", alias = "default_backend")]
     default: String,
     #[serde(default = "default_backend")]
     keyboard_default: String,

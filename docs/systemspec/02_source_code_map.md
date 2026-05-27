@@ -173,14 +173,14 @@ crates/synapse-action/
     │   ├── keyboard.rs             # Keyboard hold tracking + auto-release timers
     │   ├── lifecycle.rs            # run / run_with_shutdown_reason main loop
     │   ├── rate_limits.rs          # Per-backend rate-limit application
-    │   ├── routing.rs              # Backend resolution (auto → software / vigem / hardware)
+    │   ├── routing.rs              # Profile-aware Backend::Auto resolution
     │   ├── state.rs                # Snapshot exporter (snapshot_handle)
     │   └── tests/
     │       ├── mod.rs              # Test wiring
     │       ├── auto_release.rs     # Keyboard auto-release timer tests
     │       └── rate_limit.rs       # Token-bucket / rate-limit tests
     └── backend/
-        ├── mod.rs                  # ActionBackend trait, ResolvedBackend, resolve_backend
+        ├── mod.rs                  # ActionBackend trait, BackendResolutionPolicy, ResolvedBackend, resolve_backend
         ├── mouse_coordinates.rs    # Screen→virtual desktop coord conversion
         ├── text_dispatch.rs        # Text-input dispatch (clipboard paste vs synthesized keystrokes)
         ├── hardware.rs             # HardwareBackend public facade

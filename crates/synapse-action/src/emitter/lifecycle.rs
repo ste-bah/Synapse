@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -7,7 +10,9 @@ use super::{
     ActionEmitter, ActionEmitterSnapshotHandle, ActionSnapshotMessage, ActionStateSnapshot,
     BackendRateLimits, Backends, EmitState,
 };
-use crate::{ACTION_QUEUE_CAPACITY, ActionBackend, ActionHandle, ActionMessage};
+use crate::{
+    ACTION_QUEUE_CAPACITY, ActionBackend, ActionHandle, ActionMessage, BackendResolutionPolicy,
+};
 
 impl ActionEmitter {
     #[must_use]
@@ -25,6 +30,21 @@ impl ActionEmitter {
         snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
         backends: Backends,
     ) -> Self {
+        Self::new_with_backends_and_policy(
+            rx,
+            snapshot_rx,
+            backends,
+            Arc::new(RwLock::new(BackendResolutionPolicy::default())),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_backends_and_policy(
+        rx: mpsc::Receiver<ActionMessage>,
+        snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
+        backends: Backends,
+        backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
+    ) -> Self {
         let (auto_release_tx, auto_release_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         Self {
             rx,
@@ -33,6 +53,7 @@ impl ActionEmitter {
             auto_release_rx,
             state: EmitState::new(),
             backends,
+            backend_resolution,
             rate_limits: BackendRateLimits::new(),
             held_key_timers: HashMap::new(),
             held_key_timer_ids: HashMap::new(),
@@ -47,6 +68,23 @@ impl ActionEmitter {
         backends: Backends,
         rate_limits: BackendRateLimits,
     ) -> Self {
+        Self::with_rate_limits_and_policy(
+            rx,
+            snapshot_rx,
+            backends,
+            rate_limits,
+            Arc::new(RwLock::new(BackendResolutionPolicy::default())),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_rate_limits_and_policy(
+        rx: mpsc::Receiver<ActionMessage>,
+        snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
+        backends: Backends,
+        rate_limits: BackendRateLimits,
+        backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
+    ) -> Self {
         let (auto_release_tx, auto_release_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         Self {
             rx,
@@ -55,6 +93,7 @@ impl ActionEmitter {
             auto_release_rx,
             state: EmitState::new(),
             backends,
+            backend_resolution,
             rate_limits,
             held_key_timers: HashMap::new(),
             held_key_timer_ids: HashMap::new(),
@@ -86,12 +125,23 @@ impl ActionEmitter {
     pub fn channel_with_backends(
         backends: Backends,
     ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
+        Self::channel_with_backends_and_policy(
+            backends,
+            Arc::new(RwLock::new(BackendResolutionPolicy::default())),
+        )
+    }
+
+    #[must_use]
+    pub fn channel_with_backends_and_policy(
+        backends: Backends,
+        backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
+    ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
         let (handle, rx) = ActionHandle::channel();
         let (snapshot_tx, snapshot_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         (
             handle,
             ActionEmitterSnapshotHandle::new(snapshot_tx),
-            Self::new_with_backends(rx, snapshot_rx, backends),
+            Self::new_with_backends_and_policy(rx, snapshot_rx, backends, backend_resolution),
         )
     }
 

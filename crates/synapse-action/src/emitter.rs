@@ -1,8 +1,11 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::ActionMessage;
+use crate::{ActionMessage, BackendResolutionPolicy};
 
 mod backends;
 mod dispatch;
@@ -32,6 +35,7 @@ pub struct ActionEmitter {
     auto_release_rx: mpsc::Receiver<HeldKeyAutoRelease>,
     state: EmitState,
     backends: Backends,
+    backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
     rate_limits: BackendRateLimits,
     held_key_timers: HashMap<HeldKeyTimerKey, JoinHandle<()>>,
     held_key_timer_ids: HashMap<HeldKeyTimerKey, u64>,

@@ -57,7 +57,7 @@ Full table in [04_storage_layer.md §6](04_storage_layer.md).
 
 | Type | Source | Notes |
 |---|---|---|
-| `Backend` | enum `Software` \| `Vigem` \| `Hardware` \| `Auto` | All four lowercased on the wire |
+| `Backend` | enum `Software` \| `Vigem` \| `Hardware` \| `Auto` | All four lowercased on the wire. `Auto` resolves from the active action backend policy: default session = keyboard/mouse/combo/release-all `software`, pad `vigem`; profile `default_backend = "hardware"` makes Auto resolve to `hardware` unless a class default overrides it. |
 | `Point` | `{ x: i32, y: i32 }` | screen coords; provides `distance_to(other: Self) -> f64` |
 | `Rect` | `{ x: i32, y: i32, w: i32, h: i32 }` | `contains(point: Point)` with exclusive right/bottom edges; non-positive width/height treated as empty |
 | `Size` | `{ w: u32, h: u32 }` | |
@@ -207,7 +207,7 @@ Supporting types:
 | `WindowEdge` | `TopLeft` / `TopRight` / `BottomLeft` / `BottomRight` |
 | `HudExtractor` | `WinrtOcr` \| `Crnn { model_id }` \| `TemplateMatch { templates }` \| `ColorRatio { sample_points: Vec<(i32, i32)>, mapping }` |
 | `HudParser` | `Number` \| `FractionNumerator` \| `FractionDenominator` \| `Regex { pattern, group }` \| `Enum { mapping }` |
-| `ProfileBackends` | `{ default, keyboard_default, mouse_default, pad_default: Backend }` |
+| `ProfileBackends` | `{ default, keyboard_default, mouse_default, pad_default: Backend }`; TOML accepts `default_backend` as an alias for `default` |
 | `EventExtension` | `{ name, from_filter: EventFilter, emits_kind }` |
 
 ### 5.6 Reflex
@@ -289,6 +289,7 @@ pub struct SubsystemHealth {
     pub bind_addr: Option<String>,
     pub active_sessions: Option<usize>,
     pub sse_subscribers: Option<usize>,
+    pub backend_resolution: Option<BTreeMap<String, String>>,
 }
 ```
 
@@ -297,6 +298,7 @@ Subsystem status strings emitted by `synapse-mcp/src/server.rs`:
 | Subsystem | Status values |
 |---|---|
 | `storage` | `initializing` \| `ok` \| `error` \| `disk_pressure_l1..4` |
+| `action` | `ok` \| `error` |
 | `reflex` | `initializing` \| `ok` \| `degraded_latency` \| `disabled` \| `error` |
 | `profiles` | `initializing` \| `ok` \| `error` |
 | `audio` | `initializing` \| `ok` \| `disabled` \| `error` |

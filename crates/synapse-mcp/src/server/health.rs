@@ -1,4 +1,6 @@
 use super::{BTreeMap, Health, SubsystemHealth, SynapseService};
+use synapse_action::BackendResolutionPolicy;
+use synapse_core::Backend;
 
 fn state_lock_health() -> SubsystemHealth {
     SubsystemHealth {
@@ -32,6 +34,7 @@ impl SynapseService {
         subsystems.insert("storage".to_owned(), self.storage_health());
         subsystems.insert("reflex".to_owned(), self.reflex_health());
         subsystems.insert("profiles".to_owned(), self.profile_health());
+        subsystems.insert("action".to_owned(), self.action_health());
         subsystems.insert("audio".to_owned(), self.audio_health());
         subsystems.insert("http".to_owned(), self.http_health(active_sessions));
         let ok = subsystems.values().all(|health| health.status != "error");
@@ -216,6 +219,38 @@ impl SynapseService {
         }
     }
 
+    fn action_health(&self) -> SubsystemHealth {
+        match self.m2_state.lock() {
+            Ok(state) => match state.backend_resolution_readback() {
+                Ok((source, policy)) => {
+                    let emitter_available = state.emitter_available();
+                    SubsystemHealth {
+                        status: if emitter_available { "ok" } else { "error" }.to_owned(),
+                        detail: Some(format!(
+                            "emitter_available={} recording_enabled={} hardware_hid={}",
+                            emitter_available,
+                            state.recording_enabled(),
+                            state.hardware_hid().unwrap_or("disabled")
+                        )),
+                        device_name: state.hardware_hid().map(str::to_owned),
+                        backend_resolution: Some(backend_resolution_health(source, policy)),
+                        ..SubsystemHealth::default()
+                    }
+                }
+                Err(error) => SubsystemHealth {
+                    status: "error".to_owned(),
+                    detail: Some(error),
+                    ..SubsystemHealth::default()
+                },
+            },
+            Err(_err) => SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some("M2 service state lock poisoned".to_owned()),
+                ..SubsystemHealth::default()
+            },
+        }
+    }
+
     fn audio_health(&self) -> SubsystemHealth {
         match self.m3_state.lock() {
             Ok(state) => {
@@ -299,5 +334,55 @@ impl SynapseService {
             }
             Err(_err) => state_lock_health(),
         }
+    }
+}
+
+fn backend_resolution_health(
+    source: String,
+    policy: BackendResolutionPolicy,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("source".to_owned(), source),
+        (
+            "default_backend".to_owned(),
+            backend_config_name(policy.default_backend).to_owned(),
+        ),
+        (
+            "keyboard_default".to_owned(),
+            backend_config_name(policy.keyboard_default).to_owned(),
+        ),
+        (
+            "mouse_default".to_owned(),
+            backend_config_name(policy.mouse_default).to_owned(),
+        ),
+        (
+            "pad_default".to_owned(),
+            backend_config_name(policy.pad_default).to_owned(),
+        ),
+        (
+            "keyboard_auto".to_owned(),
+            policy.keyboard_auto_backend().as_str().to_owned(),
+        ),
+        (
+            "mouse_auto".to_owned(),
+            policy.mouse_auto_backend().as_str().to_owned(),
+        ),
+        (
+            "pad_auto".to_owned(),
+            policy.pad_auto_backend().as_str().to_owned(),
+        ),
+        (
+            "release_all_auto".to_owned(),
+            policy.release_all_auto_backend().as_str().to_owned(),
+        ),
+    ])
+}
+
+const fn backend_config_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Software => "software",
+        Backend::Vigem => "vigem",
+        Backend::Hardware => "hardware",
+        Backend::Auto => "auto",
     }
 }

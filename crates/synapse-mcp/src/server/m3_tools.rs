@@ -170,8 +170,9 @@ impl SynapseService {
             "profile_activate",
             &crate::m3::profile::required_permissions_activate(&params.0),
         )?;
-        self.activate_profile_locked(&params.0, self.allow_unknown_profile()?)
-            .map(Json)
+        let response = self.activate_profile_locked(&params.0, self.allow_unknown_profile()?)?;
+        self.apply_backend_resolution_for_profile(&response.active_profile_id)?;
+        Ok(Json(response))
     }
 
     #[tool(description = "Record observations and/or events to a replay JSONL file")]

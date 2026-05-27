@@ -160,7 +160,13 @@ pub struct ForegroundWindow {
 | Tool | Behavior |
 |---|---|
 | `profile_list { include_inactive: bool default true }` | calls `runtime.list(include_inactive)` and `runtime.active_profile_id()`; permission: `READ_PROFILE` |
-| `profile_activate { profile_id }` | look up the profile; if `use_scope = Unknown` and `--allow-unknown-profile` is not set, return `SAFETY_PROFILE_ACTION_DENIED`; if already active, return `changed = false`; else `runtime.activate(profile_id)`; permission: `WRITE_PROFILE_ACTIVE` |
+| `profile_activate { profile_id }` | look up the profile; if `use_scope = Unknown` and `--allow-unknown-profile` is not set, return `SAFETY_PROFILE_ACTION_DENIED`; activate the profile (or return `changed = false` if already active); then apply `Profile.backends` to M2's `BackendResolutionPolicy`; permission: `WRITE_PROFILE_ACTIVE` |
+
+Activating a profile updates the action emitter's shared backend-resolution
+policy. `[backends] default_backend = "hardware"` is accepted as a TOML alias
+for `default = "hardware"` and causes `Backend::Auto` actions to resolve to
+hardware for that profile unless a class-specific default overrides it. The
+separate source-of-truth readback is `health.subsystems.action.backend_resolution`.
 
 ## 2. `synapse-hid-host`
 
@@ -306,5 +312,4 @@ These are gated behind `cfg(windows)` and the Notepad fixture is the basis for t
 - **Physical `synapse-hid-host` runtime FSV.** Source inspection covers the host driver shape; issue closure still requires real Pico/COM-device source-of-truth evidence on the configured host.
 - **OTLP export.** `opentelemetry` and `opentelemetry-otlp` are in workspace deps but not wired in `synapse-telemetry::init_tracing` — the file/console layers are the only sinks.
 - **Prometheus exporter binding.** `metrics-exporter-prometheus` is referenced in workspace deps but not bound to an HTTP port by `synapse-telemetry`; the `register_m3_metrics` path only describes the metrics so the `metrics` crate global recorder can hold them.
-- **Profile-driven action defaults.** `Profile.backends` and `ProfileDefaults` are parsed but not consulted by the M2 emitter wrappers in the current build; tools use their own per-tool defaults (e.g. `act_click.curve = Natural`).
 - **Profile activation persistence.** Activating a profile updates in-memory state only; nothing is persisted to `CF_PROFILES` in this build (PRD §7 reserves that CF for future use).

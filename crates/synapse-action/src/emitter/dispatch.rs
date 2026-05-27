@@ -18,7 +18,7 @@ impl ActionEmitter {
             return self.do_release_all("tool_invocation").await;
         }
 
-        let resolved = resolved_backend_for_action(&action)?;
+        let resolved = resolved_backend_for_action(&action, self.backend_resolution_policy()?)?;
 
         if action_consumes_rate_limit(&action) {
             self.consume_rate_limit(resolved)?;
@@ -162,7 +162,8 @@ impl ActionEmitter {
 
         let cancelled_key_timers = self.abort_all_held_key_timers();
 
-        let resolved = resolved_backend_for_action(&Action::ReleaseAll)?;
+        let resolved =
+            resolved_backend_for_action(&Action::ReleaseAll, self.backend_resolution_policy()?)?;
         let primary_backend = self.backends.pick(resolved);
         let mut release_backends = vec![resolved.as_str()];
         let mut hardware_release_ok = None;
@@ -232,6 +233,18 @@ impl ActionEmitter {
             self.state.release_all();
         }
         result
+    }
+
+    fn backend_resolution_policy(&self) -> ActionResult<crate::BackendResolutionPolicy> {
+        self.backend_resolution
+            .read()
+            .map(|policy| *policy)
+            .map_err(|_err| ActionError::BackendUnavailable {
+                detail: format!(
+                    "code={} backend resolution policy lock poisoned",
+                    error_codes::ACTION_BACKEND_UNAVAILABLE
+                ),
+            })
     }
 }
 

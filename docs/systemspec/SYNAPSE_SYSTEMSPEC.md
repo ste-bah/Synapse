@@ -576,14 +576,14 @@ crates/synapse-action/
     │   ├── keyboard.rs             # Keyboard hold tracking + auto-release timers
     │   ├── lifecycle.rs            # run / run_with_shutdown_reason main loop
     │   ├── rate_limits.rs          # Per-backend rate-limit application
-    │   ├── routing.rs              # Backend resolution (auto → software / vigem / hardware)
+    │   ├── routing.rs              # Profile-aware Backend::Auto resolution
     │   ├── state.rs                # Snapshot exporter (snapshot_handle)
     │   └── tests/
     │       ├── mod.rs              # Test wiring
     │       ├── auto_release.rs     # Keyboard auto-release timer tests
     │       └── rate_limit.rs       # Token-bucket / rate-limit tests
     └── backend/
-        ├── mod.rs                  # ActionBackend trait, ResolvedBackend, resolve_backend
+        ├── mod.rs                  # ActionBackend trait, BackendResolutionPolicy, ResolvedBackend, resolve_backend
         ├── mouse_coordinates.rs    # Screen→virtual desktop coord conversion
         ├── text_dispatch.rs        # Text-input dispatch (clipboard paste vs synthesized keystrokes)
         ├── hardware.rs             # HardwareBackend public facade
@@ -1444,7 +1444,7 @@ Full table in [04_storage_layer.md §6](#file-04).
 
 | Type | Source | Notes |
 |---|---|---|
-| `Backend` | enum `Software` \| `Vigem` \| `Hardware` \| `Auto` | All four lowercased on the wire |
+| `Backend` | enum `Software` \| `Vigem` \| `Hardware` \| `Auto` | All four lowercased on the wire. `Auto` resolves from the active action backend policy: default session = keyboard/mouse/combo/release-all `software`, pad `vigem`; profile `default_backend = "hardware"` makes Auto resolve to `hardware` unless a class default overrides it. |
 | `Point` | `{ x: i32, y: i32 }` | screen coords; provides `distance_to(other: Self) -> f64` |
 | `Rect` | `{ x: i32, y: i32, w: i32, h: i32 }` | `contains(point: Point)` with exclusive right/bottom edges; non-positive width/height treated as empty |
 | `Size` | `{ w: u32, h: u32 }` | |
@@ -1594,7 +1594,7 @@ Supporting types:
 | `WindowEdge` | `TopLeft` / `TopRight` / `BottomLeft` / `BottomRight` |
 | `HudExtractor` | `WinrtOcr` \| `Crnn { model_id }` \| `TemplateMatch { templates }` \| `ColorRatio { sample_points: Vec<(i32, i32)>, mapping }` |
 | `HudParser` | `Number` \| `FractionNumerator` \| `FractionDenominator` \| `Regex { pattern, group }` \| `Enum { mapping }` |
-| `ProfileBackends` | `{ default, keyboard_default, mouse_default, pad_default: Backend }` |
+| `ProfileBackends` | `{ default, keyboard_default, mouse_default, pad_default: Backend }`; TOML accepts `default_backend` as an alias for `default` |
 | `EventExtension` | `{ name, from_filter: EventFilter, emits_kind }` |
 
 ### 5.6 Reflex
@@ -1676,6 +1676,7 @@ pub struct SubsystemHealth {
     pub bind_addr: Option<String>,
     pub active_sessions: Option<usize>,
     pub sse_subscribers: Option<usize>,
+    pub backend_resolution: Option<BTreeMap<String, String>>,
 }
 ```
 
@@ -1684,6 +1685,7 @@ Subsystem status strings emitted by `synapse-mcp/src/server.rs`:
 | Subsystem | Status values |
 |---|---|
 | `storage` | `initializing` \| `ok` \| `error` \| `disk_pressure_l1..4` |
+| `action` | `ok` \| `error` |
 | `reflex` | `initializing` \| `ok` \| `degraded_latency` \| `disabled` \| `error` |
 | `profiles` | `initializing` \| `ok` \| `error` |
 | `audio` | `initializing` \| `ok` \| `disabled` \| `error` |
@@ -1907,7 +1909,11 @@ Router::new()
 
 ### 3.1 `GET /health`
 
-Returns a JSON `Health` payload — same as the MCP `health` tool — plus `active_sessions = state.session_manager.sessions.read().await.len()` populated into `subsystems.http.active_sessions`.
+Returns a JSON `Health` payload — same as the MCP `health` tool — plus
+`active_sessions = state.session_manager.sessions.read().await.len()` populated
+into `subsystems.http.active_sessions`. The payload includes
+`subsystems.action.backend_resolution`, the active session's configured backend
+defaults and resolved Auto table.
 
 ### 3.2 `/mcp` (streamable HTTP MCP)
 
@@ -2403,13 +2409,13 @@ Source files covered:
 
 ## 1. Architecture
 
-The action subsystem is an actor-style emitter with an Tokio mpsc producer (`ActionHandle`) and a backend-dispatching consumer (`ActionEmitter`). Backends implement `ActionBackend::execute(&Action, &mut EmitState)`; the concrete one is chosen by `resolve_backend` based on the action's `backend` field plus the action kind for `Backend::Auto`.
+The action subsystem is an actor-style emitter with an Tokio mpsc producer (`ActionHandle`) and a backend-dispatching consumer (`ActionEmitter`). Backends implement `ActionBackend::execute(&Action, &mut EmitState)`; the concrete one is chosen by `resolve_backend_with_policy` based on the action's `backend` field plus the active `BackendResolutionPolicy` for `Backend::Auto`.
 
 ### 1.1 Public re-exports (`lib.rs`)
 
 | Symbol | Source |
 |---|---|
-| `ActionBackend`, `ResolvedBackend`, `resolve_backend` | `backend::mod` |
+| `ActionBackend`, `BackendResolutionPolicy`, `ResolvedBackend`, `resolve_backend`, `resolve_backend_with_policy` | `backend::mod` |
 | `HardwareBackend` | `backend::hardware` |
 | `RecordedInput`, `RecordingBackend` | `backend::recording` |
 | `HardwareUnavailableBackend` | `backend::unavailable` |
@@ -2468,11 +2474,13 @@ pub struct ActionHandle { tx: mpsc::Sender<ActionMessage> }
 For each `(Action, oneshot::Sender)` pulled from the channel:
 
 1. **Validate.** `validate_action(&action)` (re-checked here even though `ActionHandle::execute` already validates, to defend against `try_execute` callers that bypassed it).
-2. **Resolve backend.** `routing.rs` → `backend::resolve_backend(action.backend(), &action)`:
+2. **Resolve backend.** `routing.rs` reads the emitter's active `BackendResolutionPolicy` and calls `backend::resolve_backend_with_policy(action.backend(), &action, policy)`:
    - `Software` → `ResolvedBackend::Software`
    - `Vigem` → `ResolvedBackend::Vigem`
    - `Hardware` → `ResolvedBackend::Hardware`; the selected backend is `HardwareBackend` only when `synapse-mcp` was started with `--hardware-hid <port|auto>` and the HID connection/IDENTIFY succeeded. Otherwise the hardware slot is `HardwareUnavailableBackend`.
-   - `Auto` → `ResolvedBackend::Vigem` for `Pad*` actions, `Software` for everything else
+   - `Auto` with the global default policy → `ResolvedBackend::Vigem` for `Pad*` actions and `Software` for keyboard, mouse, combo, and release-all.
+   - `Auto` after activating a profile with `[backends] default_backend = "hardware"` → `ResolvedBackend::Hardware` for keyboard, mouse, pad, combo, and release-all unless `keyboard_default`, `mouse_default`, or `pad_default` is explicitly set for that class.
+   - The active policy and resolved table are readable at `health.subsystems.action.backend_resolution`.
 3. **Rate-limit.** `rate_limits.rs` consumes one token from the per-backend `TokenBucket`:
    - `SOFTWARE_RATE_LIMIT_PER_S = 5000`
    - `VIGEM_RATE_LIMIT_PER_S = 1000`
@@ -3331,7 +3339,13 @@ pub struct ForegroundWindow {
 | Tool | Behavior |
 |---|---|
 | `profile_list { include_inactive: bool default true }` | calls `runtime.list(include_inactive)` and `runtime.active_profile_id()`; permission: `READ_PROFILE` |
-| `profile_activate { profile_id }` | look up the profile; if `use_scope = Unknown` and `--allow-unknown-profile` is not set, return `SAFETY_PROFILE_ACTION_DENIED`; if already active, return `changed = false`; else `runtime.activate(profile_id)`; permission: `WRITE_PROFILE_ACTIVE` |
+| `profile_activate { profile_id }` | look up the profile; if `use_scope = Unknown` and `--allow-unknown-profile` is not set, return `SAFETY_PROFILE_ACTION_DENIED`; activate the profile (or return `changed = false` if already active); then apply `Profile.backends` to M2's `BackendResolutionPolicy`; permission: `WRITE_PROFILE_ACTIVE` |
+
+Activating a profile updates the action emitter's shared backend-resolution
+policy. `[backends] default_backend = "hardware"` is accepted as a TOML alias
+for `default = "hardware"` and causes `Backend::Auto` actions to resolve to
+hardware for that profile unless a class-specific default overrides it. The
+separate source-of-truth readback is `health.subsystems.action.backend_resolution`.
 
 ## 2. `synapse-hid-host`
 
@@ -3477,7 +3491,6 @@ These are gated behind `cfg(windows)` and the Notepad fixture is the basis for t
 - **Physical `synapse-hid-host` runtime FSV.** Source inspection covers the host driver shape; issue closure still requires real Pico/COM-device source-of-truth evidence on the configured host.
 - **OTLP export.** `opentelemetry` and `opentelemetry-otlp` are in workspace deps but not wired in `synapse-telemetry::init_tracing` — the file/console layers are the only sinks.
 - **Prometheus exporter binding.** `metrics-exporter-prometheus` is referenced in workspace deps but not bound to an HTTP port by `synapse-telemetry`; the `register_m3_metrics` path only describes the metrics so the `metrics` crate global recorder can hold them.
-- **Profile-driven action defaults.** `Profile.backends` and `ProfileDefaults` are parsed but not consulted by the M2 emitter wrappers in the current build; tools use their own per-tool defaults (e.g. `act_click.curve = Natural`).
 - **Profile activation persistence.** Activating a profile updates in-memory state only; nothing is persisted to `CF_PROFILES` in this build (PRD §7 reserves that CF for future use).
 
 
@@ -3770,7 +3783,7 @@ Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32
 |---|---|---|---|---|
 | (none) | — | — | — | uses an empty input schema (`empty_input_schema()`) |
 
-**Returns:** `synapse_core::Health` (`{ ok, version, build, uptime_s, subsystems: BTreeMap<String, SubsystemHealth> }`). Subsystems: `storage`, `reflex`, `profiles`, `audio`, `http` (see [05_core_types_and_errors.md §5.8](#file-05)).
+**Returns:** `synapse_core::Health` (`{ ok, version, build, uptime_s, subsystems: BTreeMap<String, SubsystemHealth> }`). Subsystems: `storage`, `action`, `reflex`, `profiles`, `audio`, `http` (see [05_core_types_and_errors.md §5.8](#file-05)). `subsystems.action.backend_resolution` reports `source`, configured defaults, and resolved `keyboard_auto`, `mouse_auto`, `pad_auto`, and `release_all_auto`.
 
 ## 2. `observe`
 
@@ -4271,7 +4284,7 @@ Source files covered:
 
 ### 2.1 `synapse-action` (21 files)
 - `auto_release_keyboard_hook.rs` — verifies `HELD_KEY_MAX_DURATION_MS` auto-release path
-- `backend_resolution.rs` — `resolve_backend(Backend, &Action)` mapping
+- `backend_resolution.rs` — `resolve_backend` / `resolve_backend_with_policy` mapping
 - `curve_natural_seed_42.rs` — fixed-seed natural-curve sampling determinism
 - `curve_sampling.rs` — `sample_curve` for `Linear`/`EaseInOut`/`Bezier`/`Natural`
 - `dynamics_modifier_order_proptest.rs` — keystroke modifier-ordering invariants

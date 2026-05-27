@@ -23,8 +23,25 @@ Three back-ends ship at v1. Per call, the caller (or active profile) picks one.
 Selection rules:
 
 1. If caller explicitly names a back-end, use it.
-2. Else, if active profile names a default back-end, use it.
-3. Else, use `software`.
+2. If caller passes `Backend::Auto`, resolve from the active session policy:
+
+| Action class | No profile override | Profile `[backends] default_backend = "hardware"` |
+|---|---|---|
+| Keyboard (`Key*`, `TypeText`, `Combo`) | `software` | `hardware` |
+| Mouse (`Mouse*`, `AimAt`) | `software` | `hardware` |
+| Pad (`Pad*`) | `vigem` | `hardware` |
+| `ReleaseAll` primary backend | `software` | `hardware` |
+
+Profile class-specific fields (`keyboard_default`, `mouse_default`, `pad_default`) override
+the profile default for that class when set to `software`, `vigem`, or `hardware`.
+The literal per-call backend still wins over every profile setting. Hardware remains
+opt-in: if Auto resolves to `hardware` but no real HID backend was configured, the
+request fails closed with `ACTION_BACKEND_UNAVAILABLE`.
+
+The active table is visible at
+`health.subsystems.action.backend_resolution` with `source`, configured defaults,
+and the resolved `keyboard_auto` / `mouse_auto` / `pad_auto` / `release_all_auto`
+values.
 
 ViGEm requires ViGEmBus driver installed (one-time, signed). Hardware requires a flashed RP2040 board and `--hardware-hid <port|auto>` argument or `SYNAPSE_HARDWARE_HID` env.
 

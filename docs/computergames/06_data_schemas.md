@@ -19,9 +19,17 @@ pub enum Backend {
     Software,    // Win32 SendInput
     Vigem,       // Virtual Xbox/DS4 via ViGEm
     Hardware,    // RP2040 HID gateway
-    Auto,        // Resolve per call from profile + caller hint
+    Auto,        // Resolve from active session policy + action class
 }
 ```
+
+`Auto` preserves M2 defaults when no profile override is active: keyboard,
+mouse, combo, and release-all choose `software`; pad actions choose `vigem`.
+When the active profile declares `[backends] default_backend = "hardware"`,
+`Auto` resolves to `hardware` for keyboard, mouse, pad, combo, and release-all
+unless a class-specific `keyboard_default`, `mouse_default`, or `pad_default`
+overrides that class. The active table is exposed at
+`health.subsystems.action.backend_resolution`.
 
 ### 1.2 Perception mode
 
@@ -811,6 +819,9 @@ pub struct ProfileBackends {
     pub mouse_default: Backend,
     pub pad_default: Backend,
 }
+
+// TOML accepts both `default` and `default_backend`; the canonical field is
+// `default`. Omitted fields parse as Auto.
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EventExtension {
