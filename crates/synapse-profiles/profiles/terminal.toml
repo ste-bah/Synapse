@@ -8,7 +8,6 @@ keyboard_dynamics_default = "natural"
 
 [[matches]]
 exe = "WindowsTerminal.exe"
-title_regex = ".*(PowerShell|Command Prompt|Windows Terminal).*"
 
 [[matches]]
 exe = "wt.exe"
@@ -19,9 +18,12 @@ min_update_interval_ms = 50
 cursor_visible = true
 
 [keymap]
+command_palette = "ctrl+shift+p"
 copy = "ctrl+c"
+find = "ctrl+shift+f"
 new_tab = "ctrl+shift+t"
 paste = "ctrl+v"
+select_all = "ctrl+shift+a"
 split_pane = "alt+shift+d"
 switch_tab_left = "ctrl+shift+tab"
 switch_tab_right = "ctrl+tab"
@@ -35,11 +37,18 @@ pad_default = "auto"
 [metadata]
 "registry.family" = "profile-registry/audit-data"
 "registry.curated_seed" = "starter.v1"
-"registry.curated_status" = "shipped_profile_needs_package"
+"registry.curated_status" = "shipped_curated_package"
 "registry.curated_tier" = "productivity.seed"
 "registry.curated_priority" = "p1"
 "registry.backlog_issue" = "#480"
 "registry.quality_signal" = "profile_quality.terminal"
-"registry.minimum_manual_fsv" = "profile_list,profile_registry_install,observe,act_type,storage_inspect,profile_quality_refresh"
+"registry.minimum_manual_fsv" = "profile_list,profile_registry_install,observe,act_clipboard,act_press,storage_inspect,profile_quality_refresh,terminal_command_output_readback,terminal_settings_readback"
 "registry.compatibility_target" = "terminal.windows"
-"registry.safe_default_backend_policy" = "auto; local productivity only; no remote execution; audit export requires explicit consent"
+"registry.safe_default_backend_policy" = "auto; local productivity only; prefer clipboard paste keybinding for Terminal command text; act_type dispatch requires target readback; no remote execution; audit export requires explicit consent"
+"action.copy_key" = "ctrl+c"
+"action.paste_key" = "ctrl+v"
+"action.find_key" = "ctrl+shift+f"
+"action.command_palette_key" = "ctrl+shift+p"
+"action.split_pane_key" = "alt+shift+d"
+"action.text_entry_verified_path" = "act_clipboard write + ctrl+v paste + enter + terminal_command_output_readback"
+"action.act_type_direct_policy" = "dispatch_only_requires_target_readback; not a verified Windows Terminal command-output path on this host"

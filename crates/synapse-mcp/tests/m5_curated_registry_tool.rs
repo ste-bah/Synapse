@@ -149,6 +149,41 @@ async fn curated_vscode_package_writes_editor_targets_and_edges() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test]
+async fn curated_terminal_package_writes_shell_target_and_edges() -> anyhow::Result<()> {
+    let _guard = CURATED_REGISTRY_TEST_LOCK.lock().await;
+    let logs = TempDir::new()?;
+    let db = TempDir::new()?;
+    let db_path = db.path().join("db");
+    let db_path_string = db_path.to_string_lossy().to_string();
+    let mut client = StdioMcpClient::launch_and_init_with_env(
+        Some(logs.path()),
+        &[("SYNAPSE_DB", db_path_string.as_str())],
+    )
+    .await?;
+
+    let before = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
+    assert_eq!(before["cf_row_counts"][cf::CF_PROFILES], 0);
+    assert_eq!(before["cf_row_counts"][cf::CF_KV], 0);
+
+    let manifests = TempDir::new()?;
+    let manifest_path = install_terminal_curated_manifest(&mut client, manifests.path()).await?;
+    assert_terminal_curated_search_and_inspect(&mut client).await?;
+    assert_duplicate_is_idempotent(&mut client, &manifest_path).await?;
+    let after_duplicate = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
+    assert_eq!(after_duplicate["cf_row_counts"][cf::CF_PROFILES], 6);
+    assert_eq!(after_duplicate["cf_row_counts"][cf::CF_KV], 1);
+
+    assert_terminal_edge_manifests_fail_closed(&mut client, manifests.path()).await?;
+    let after_edges = structured(&client.tools_call("storage_inspect", json!({})).await?)?;
+    assert_eq!(after_edges["cf_row_counts"][cf::CF_PROFILES], 6);
+    assert_eq!(after_edges["cf_row_counts"][cf::CF_KV], 1);
+
+    let status = client.shutdown().await?;
+    assert!(status.success());
+    Ok(())
+}
+
 async fn install_curated_manifest(
     client: &mut StdioMcpClient,
     manifest_dir: &Path,
@@ -284,6 +319,80 @@ async fn assert_vscode_curated_search_and_inspect(
     Ok(())
 }
 
+async fn install_terminal_curated_manifest(
+    client: &mut StdioMcpClient,
+    manifest_dir: &Path,
+) -> anyhow::Result<PathBuf> {
+    let manifest_path = prepare_manifest(
+        "docs/computergames/fixtures/curated_starter_registry/curated_terminal_package_manifest.toml",
+        manifest_dir,
+        "curated-terminal.toml",
+    )?;
+    let install = structured(
+        &client
+            .tools_call(
+                "profile_registry_install",
+                json!({"manifest_path": manifest_path.display().to_string()}),
+            )
+            .await?,
+    )?;
+    assert_eq!(install["wrote_rows"], true);
+    assert_eq!(install["profile_id"], "terminal");
+    let row_keys = install["cf_profile_row_keys"]
+        .as_array()
+        .context("cf_profile_row_keys missing")?;
+    assert!(row_keys.iter().any(|key| {
+        key.as_str() == Some("profile_registry/v1/curated_target/starter.v1/terminal.windows")
+    }));
+    assert!(row_keys.iter().any(|key| {
+        key.as_str() == Some("profile_registry/v1/compat/terminal.windows/terminal/1.0.0")
+    }));
+    Ok(manifest_path)
+}
+
+async fn assert_terminal_curated_search_and_inspect(
+    client: &mut StdioMcpClient,
+) -> anyhow::Result<()> {
+    let search = structured(
+        &client
+            .tools_call(
+                "profile_registry_search",
+                json!({"row_kind": "curated_profile_target"}),
+            )
+            .await?,
+    )?;
+    assert_eq!(search["total_matched"], 1);
+    assert_eq!(
+        search["rows"][0]["key"],
+        "profile_registry/v1/curated_target/starter.v1/terminal.windows"
+    );
+    let inspect = structured(
+        &client
+            .tools_call(
+                "profile_registry_inspect",
+                json!({"row_key": "profile_registry/v1/curated_target/starter.v1/terminal.windows"}),
+            )
+            .await?,
+    )?;
+    let value = &inspect["row"]["value"];
+    assert_eq!(value["row_kind"], "curated_profile_target");
+    assert_eq!(value["target_id"], "terminal.windows");
+    assert_eq!(value["profile_id"], "terminal");
+    assert_eq!(value["use_scope"], "productivity");
+    assert_eq!(value["quality_signal"], "profile_quality.terminal");
+    assert_eq!(
+        value["app_version"],
+        "package:1.24.11321.0; file:1.24.2605.12001"
+    );
+    let fsv = value["minimum_manual_fsv"]
+        .as_array()
+        .context("minimum_manual_fsv array missing")?;
+    assert_eq!(fsv.len(), 9);
+    assert!(fsv.iter().any(|entry| entry == "act_clipboard"));
+    assert!(!fsv.iter().any(|entry| entry == "act_type"));
+    Ok(())
+}
+
 async fn assert_duplicate_is_idempotent(
     client: &mut StdioMcpClient,
     manifest_path: &Path,
@@ -345,6 +454,50 @@ async fn assert_vscode_edge_manifests_fail_closed(
     Ok(())
 }
 
+async fn assert_terminal_edge_manifests_fail_closed(
+    client: &mut StdioMcpClient,
+    manifest_dir: &Path,
+) -> anyhow::Result<()> {
+    let unknown_scope_path = prepare_manifest(
+        "docs/computergames/fixtures/curated_starter_registry/edge_terminal_unknown_use_scope_manifest.toml",
+        manifest_dir,
+        "terminal-unknown-scope.toml",
+    )?;
+    let unknown_scope = client
+        .tools_call_error(
+            "profile_registry_install",
+            json!({"manifest_path": unknown_scope_path.display().to_string()}),
+        )
+        .await?;
+    assert_eq!(unknown_scope["data"]["code"], "PROFILE_PARSE_ERROR");
+    let missing_compat_path = prepare_manifest(
+        "docs/computergames/fixtures/curated_starter_registry/edge_terminal_missing_compatibility_manifest.toml",
+        manifest_dir,
+        "terminal-missing-compat.toml",
+    )?;
+    let missing_compat = client
+        .tools_call_error(
+            "profile_registry_install",
+            json!({"manifest_path": missing_compat_path.display().to_string()}),
+        )
+        .await?;
+    assert_eq!(missing_compat["data"]["code"], "PROFILE_PARSE_ERROR");
+    let mismatch_path = prepare_manifest(
+        "docs/computergames/fixtures/curated_starter_registry/edge_terminal_profile_mismatch_manifest.toml",
+        manifest_dir,
+        "terminal-profile-mismatch.toml",
+    )?;
+    let mismatch = client
+        .tools_call_error(
+            "profile_registry_install",
+            json!({"manifest_path": mismatch_path.display().to_string()}),
+        )
+        .await?;
+    assert_eq!(mismatch["data"]["code"], "TOOL_PARAMS_INVALID");
+    assert_eq!(mismatch["data"]["reason"], "profile_toml_id_mismatch");
+    Ok(())
+}
+
 async fn assert_edge_manifests_fail_closed(
     client: &mut StdioMcpClient,
     manifest_dir: &Path,
@@ -394,6 +547,10 @@ fn prepare_manifest(
         .join("crates/synapse-profiles/profiles/vscode.toml")
         .canonicalize()
         .context("canonicalize VS Code profile TOML")?;
+    let terminal_profile_toml = root
+        .join("crates/synapse-profiles/profiles/terminal.toml")
+        .canonicalize()
+        .context("canonicalize Windows Terminal profile TOML")?;
     let source = fs::read_to_string(root.join(fixture_relative_path))
         .with_context(|| format!("read fixture manifest {fixture_relative_path}"))?;
     let rewritten = source
@@ -408,6 +565,10 @@ fn prepare_manifest(
         .replace(
             "profile_toml = \"crates/synapse-profiles/profiles/vscode.toml\"",
             &format!("profile_toml = \"{}\"", toml_path(&vscode_profile_toml)),
+        )
+        .replace(
+            "profile_toml = \"crates/synapse-profiles/profiles/terminal.toml\"",
+            &format!("profile_toml = \"{}\"", toml_path(&terminal_profile_toml)),
         );
     let path = output_dir.join(output_name);
     fs::write(&path, rewritten)?;

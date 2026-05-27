@@ -88,6 +88,30 @@ fn package_manifest_accepts_curated_vscode_fixture() -> TestResult {
 }
 
 #[test]
+fn package_manifest_accepts_curated_terminal_fixture() -> TestResult {
+    let path = curated_fixture("curated_terminal_package_manifest.toml");
+    let manifest = parse_package_manifest_file(&path)?;
+
+    assert_eq!(manifest.package_id, "profile.terminal.curated");
+    assert_eq!(manifest.profile_id, "terminal");
+    assert_eq!(
+        manifest.permissions.use_scope,
+        ProfileUseScope::Productivity
+    );
+    assert_eq!(manifest.targets[0].target_id, "terminal.windows");
+    assert_eq!(
+        manifest
+            .metadata
+            .get("curated.minimum_manual_fsv")
+            .map(String::as_str),
+        Some(
+            "profile_list,profile_registry_install,observe,act_clipboard,act_press,storage_inspect,profile_quality_refresh,terminal_command_output_readback,terminal_settings_readback"
+        )
+    );
+    Ok(())
+}
+
+#[test]
 fn package_manifest_accepts_signed_fixture_metadata() -> TestResult {
     let path = fixture("signed_good_package_manifest.toml");
     let manifest = parse_package_manifest_file(&path)?;

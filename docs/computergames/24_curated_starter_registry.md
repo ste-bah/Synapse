@@ -30,7 +30,7 @@ Seed set id: `starter.v1`
 | P0 | Luanti / Minetest Game benchmark | `luanti.minetest` | Shipped benchmark profile | #471-#476 | `operator_owned_test` | `profile_list`, registry install/search/inspect, `observe`, action audit rows, Luanti process/log/world files, `profile_quality_refresh` |
 | P1 | Notepad | `notepad` | Shipped productivity package | #478 | `productivity` | `profile_list`, registry package install/search/inspect, foreground observe, text/action audit row, profile quality refresh, Notepad value readback |
 | P1 | Visual Studio Code / VSCodium | `vscode` | Shipped productivity package | #479 | `productivity` | `profile_list`, registry package install/search/inspect, foreground observe, key/text action audit rows, profile quality refresh, VS Code file/command-palette/terminal readback |
-| P1 | Windows Terminal / PowerShell | `terminal` | Bundled profile, package backlog | #480 | `productivity` | `profile_list`, registry package install, foreground observe, text/action audit row, profile quality refresh |
+| P1 | Windows Terminal / PowerShell | `terminal` | Shipped productivity package | #480 | `productivity` | `profile_list`, registry package install/search/inspect, foreground observe, clipboard paste/enter action audit rows, command output readback, profile quality refresh, terminal settings readback |
 | P1 | Chromium-family browsers | `chrome` | Bundled profile, package backlog | #481 | `productivity` | `profile_list`, registry package install, foreground observe, navigation/tab action audit row, profile quality refresh |
 | P1 | Minecraft Java | `minecraft.java` | Planned game profile | #482 | `operator_owned_test` / `single_player` only after policy decision | Real game process/window/world/log SoTs, supported-use denial edges, registry package install, action/reflex audit rows |
 
@@ -139,6 +139,11 @@ Fixture directory:
 | `cf_profiles_curated_notepad_row.json` | Static expected row shape for the Notepad starter package; runtime FSV must still inspect RocksDB. |
 | `curated_vscode_package_manifest.toml` | Valid curated package manifest that writes a `curated_profile_target` row for `vscode.windows` and compatibility rows for VS Code/VSCodium. |
 | `cf_profiles_curated_vscode_row.json` | Static expected row shape for the VS Code starter package; runtime FSV must still inspect RocksDB. |
+| `curated_terminal_package_manifest.toml` | Valid curated package manifest that writes a `curated_profile_target` row for `terminal.windows`. |
+| `cf_profiles_curated_terminal_row.json` | Static expected row shape for the Windows Terminal starter package; runtime FSV must still inspect RocksDB. |
+| `edge_terminal_unknown_use_scope_manifest.toml` | Invalid Windows Terminal package: installable curated package cannot use `use_scope = "unknown"`. |
+| `edge_terminal_missing_compatibility_manifest.toml` | Invalid Windows Terminal package: curated target cannot ship without a compatibility target. |
+| `edge_terminal_profile_mismatch_manifest.toml` | Invalid Windows Terminal package: manifest `profile_id` must match the authored profile TOML id. |
 | `edge_vscode_unknown_use_scope_manifest.toml` | Invalid VS Code package: installable curated package cannot use `use_scope = "unknown"`. |
 | `edge_vscode_missing_compatibility_manifest.toml` | Invalid VS Code package: curated target cannot ship without a compatibility target. |
 | `edge_vscode_profile_mismatch_manifest.toml` | Invalid VS Code package: manifest `profile_id` must match the authored profile TOML id. |
