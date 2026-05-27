@@ -224,7 +224,7 @@ Supporting types:
 | `ProfileOcr` | `{ default_backend: OcrBackend, regions: Vec<HudRegion>, parser_config: BTreeMap<String, String> }` |
 | `HudFieldSpec` | `{ name, region: HudRegion, extractor: HudExtractor, parser: HudParser }` |
 | `HudRegion` | `Absolute { x, y, w, h }` \| `FractionOfWindow { x, y, w, h }` (f32) \| `AnchoredToEdge { edge: WindowEdge, x_offset, y_offset, w, h }` |
-| `WindowEdge` | `TopLeft` / `TopRight` / `BottomLeft` / `BottomRight` |
+| `WindowEdge` | `TopLeft` / `TopRight` / `BottomLeft` / `BottomRight` / `Center` |
 | `HudExtractor` | `WinrtOcr` \| `Crnn { model_id }` \| `TemplateMatch { templates }` \| `ColorRatio { sample_points: Vec<(i32, i32)>, mapping }` |
 | `HudParser` | `Number` \| `FractionNumerator` \| `FractionDenominator` \| `Regex { pattern, group }` \| `Enum { mapping }` |
 | `ProfileBackends` | `{ default, keyboard_default, mouse_default, pad_default: Backend }`; TOML accepts `default_backend` as an alias for `default` |

@@ -245,10 +245,11 @@ Default: read focused element's bounds (UIA-resolved) or, no a11y, full screen.
 Per-game profile defines named HUD regions:
 
 ```toml
-[hud.hp]
-region = { x = 50, y = 980, w = 120, h = 30 }
-extractor = "crnn"           # or "winrt"
-preprocessing = ["threshold:128", "invert"]
+[[hud]]
+name = "minecraft.hp_hearts"
+region = { kind = "anchored_to_edge", edge = "bottom_left", x_offset = 220, y_offset = -50, w = 180, h = 18 }
+extractor = { kind = "template_match", templates = ["hearts/full.png", "hearts/half.png", "hearts/empty.png"] }
+parser = { kind = "number" }
 ```
 
 Profile-driven extraction runs in `synapse-perception::hud`. Returns:
@@ -266,13 +267,21 @@ pub struct HudReading {
 ```
 
 For icon counters such as Minecraft hearts and hunger, `synapse-perception`
-exposes a slotted template extractor. It
-takes a cropped grayscale HUD region plus full/half/empty templates and scans
-each slot with zero-mean normalized cross-correlation. The default status-bar
-config is 10 slots, full=2, half=1, empty=0, max value 20, and minimum
-per-slot confidence 0.85. Synthetic 180x16 regions with three 9x9 templates
-measure at roughly 0.29 ms locally, leaving the 5 ms HUD budget for capture and
-future live-frame wiring.
+exposes a client-rect anchor resolver plus a slotted template extractor. HUD
+anchors can be `top_left`, `top_right`, `bottom_left`, `bottom_right`, or
+`center`; `none`/absolute regions use screen coordinates directly. The anchor
+resolver takes the foreground window client rect, treats the offset as the
+top-left point of the crop relative to the selected anchor, and returns both
+`Rect { x, y, w, h }` and explicit left/top/right/bottom readback. Example:
+client rect `1920x1080` plus `bottom_left`, offsets `(8, -32)`, and size
+`180x16` resolves to `(8, 1048, 188, 1064)`.
+
+The template extractor takes a cropped grayscale HUD region plus
+full/half/empty templates and scans each slot with zero-mean normalized
+cross-correlation. The default status-bar config is 10 slots, full=2, half=1,
+empty=0, max value 20, and minimum per-slot confidence 0.85. Synthetic 180x16
+regions with three 9x9 templates measure at roughly 0.29 ms locally, leaving
+the 5 ms HUD budget for capture and future live-frame wiring.
 
 ### OCR cache
 
@@ -467,6 +476,11 @@ Total ceiling at v1: 10% CPU, 25% GPU, 1.5 GB VRAM when fully active. Idle: <2% 
 | Monitor (per-monitor) | Top-left of one monitor | Per-target capture coords |
 | Window client | Top-left of a specific window's client area | A11y bounding rects when window-relative |
 | Capture frame | Top-left of captured texture | Detection bboxes |
+
+HUD anchored regions resolve against the foreground window client rect after it
+has been translated to screen coordinates. Returned tuples use
+left/top/right/bottom with the bottom-right edge exclusive; `Rect` keeps the
+same region as `x/y/w/h`.
 
 DPI: all coordinates use **physical pixels** (per-monitor-aware v2 DPI scaling). Synapse calls `SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)` at startup.
 

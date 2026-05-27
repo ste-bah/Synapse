@@ -131,6 +131,7 @@ pub enum WindowEdge {
     TopRight,
     BottomLeft,
     BottomRight,
+    Center,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

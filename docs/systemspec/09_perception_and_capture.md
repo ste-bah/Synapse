@@ -3,8 +3,11 @@
 Source files covered:
 - `crates/synapse-perception/src/lib.rs`
 - `crates/synapse-perception/src/error.rs`
+- `crates/synapse-perception/src/event_extensions.rs`
+- `crates/synapse-perception/src/hud/{mod,anchor}.rs`
 - `crates/synapse-perception/src/observe.rs`
 - `crates/synapse-perception/src/ocr.rs`
+- `crates/synapse-perception/src/template_match.rs`
 - `crates/synapse-a11y/src/lib.rs`
 - `crates/synapse-capture/src/lib.rs`
 - `crates/synapse-mcp/src/m1.rs`
@@ -16,7 +19,7 @@ Source files covered:
 |---|---|
 | `synapse-capture` | Zero-copy GPU frame capture (`windows-capture` / DXGI). Owns `CaptureBackend`, `CaptureTarget`, `CaptureConfig`, `CapturedFrame`, DPI awareness, screen↔window coordinate helpers. |
 | `synapse-a11y` | UIA tree walk + WinEvent hook + Chromium DevTools attach + accessible-event coalescing. |
-| `synapse-perception` | Glue layer: assembles `Observation` from a11y + capture + OCR inputs; resolves perception mode (auto/a11y_only/pixel_only/hybrid); exposes OCR provider abstraction. |
+| `synapse-perception` | Glue layer: assembles `Observation` from a11y + capture + OCR inputs; resolves perception mode (auto/a11y_only/pixel_only/hybrid); exposes OCR, HUD anchor, HUD template, and event-extension helpers. |
 | `synapse-mcp/src/m1` | MCP tool wrappers (`observe`, `find`, `read_text`, `set_capture_target`, `set_perception_mode`). |
 
 ## 2. `synapse-capture`
@@ -128,8 +131,16 @@ The crate ensures a per-thread COM apartment (`ComApartmentKind`) before any UIA
 | `parse_perception_mode(&str) -> PerceptionResult<PerceptionMode>` | string parse used by `set_perception_mode` |
 | `OcrProvider`, `TextRegion`, `is_empty_region`, `read_text`, `read_text_with_provider` | `ocr.rs` |
 | `read_text_from_software_bitmap` (Windows only) | `ocr.rs` |
+| `HudAnchor`, `HudAnchorRegion`, `ResolvedHudRegion`, `resolve_anchor_region`, `resolve_hud_region`, `resolve_hud_region_rect` | `hud/anchor.rs` — resolves profile/compact HUD anchors against a foreground window client rect and returns left/top/right/bottom plus `Rect` readback |
 | `HudTemplate`, `TemplateCounterConfig`, `extract_template_counter_from_region`, `extract_template_counter_from_frame` | `template_match.rs` — slotted normalized-correlation HUD counter extraction for hearts/hunger-style icon bars |
 | `evaluate_event_extensions`, `validate_event_extension`, `validate_event_extensions` | `event_extensions.rs` — profile `EventExtension` validation and synthetic event derivation using `synapse-core::EventFilter` |
+
+`HudAnchorRegion` accepts `none`, `top_left`, `top_right`, `bottom_left`,
+`bottom_right`, and `center`. Offsets locate the top-left point of the HUD crop
+relative to the selected client-rect anchor. For example, a `1920x1080` client
+rect plus `bottom_left`, offsets `(8, -32)`, and size `180x16` resolves to
+left/top/right/bottom `(8, 1048, 188, 1064)`. `none`/absolute regions ignore
+the window and use screen coordinates directly.
 
 ### 4.2 `ObservationAssembler::assemble` algorithm
 
@@ -267,10 +278,11 @@ The fixed JSON-RPC code `-32099` is the rmcp custom-error slot; the structured `
 
 - **CNN object detection.** `synapse-models` ships the `Detector` trait and ONNX session loader, but `M1State` does not invoke detectors in the current build; `entities: Vec<DetectedEntity>` is populated only by synthetic fixtures.
 - **Live HUD extraction wiring.** `Profile.hud` carries `HudFieldSpec`s and
-  `synapse-perception` exposes a template-match extractor for cropped frame
-  regions, but `observe()` does not yet run profile HUD extractors against live
-  captured frames. `hud: HudReadings` is empty unless populated synthetically or
-  by a caller that invokes the extractor directly.
+  `synapse-perception` exposes a client-rect anchor resolver plus a
+  template-match extractor for cropped frame regions, but `observe()` does not
+  yet run profile HUD extractors against live captured frames. `hud:
+  HudReadings` is empty unless populated synthetically or by a caller that
+  invokes the extractor directly.
 - **Event extension runtime wiring.** `synapse-perception` exposes the
   `event_extensions` evaluator and validator, but the current `observe()` path
   does not yet automatically feed live detection/HUD events through profile

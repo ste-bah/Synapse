@@ -51,6 +51,7 @@ pub fn window_edge_strategy() -> impl Strategy<Value = WindowEdge> {
         Just(WindowEdge::TopRight),
         Just(WindowEdge::BottomLeft),
         Just(WindowEdge::BottomRight),
+        Just(WindowEdge::Center),
     ]
 }
 

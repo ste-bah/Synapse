@@ -1,5 +1,6 @@
 mod error;
 mod event_extensions;
+pub mod hud;
 mod observe;
 mod ocr;
 mod template_match;
@@ -7,6 +8,10 @@ mod template_match;
 pub use error::{PerceptionError, PerceptionResult};
 pub use event_extensions::{
     evaluate_event_extensions, validate_event_extension, validate_event_extensions,
+};
+pub use hud::{
+    HudAnchor, HudAnchorRegion, ResolvedHudRegion, resolve_anchor_region, resolve_hud_region,
+    resolve_hud_region_rect,
 };
 pub use observe::{
     A11yTreeSummary, ObservationAssembler, ObservationInput, ObserveInclude, assemble,

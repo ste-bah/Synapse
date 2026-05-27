@@ -232,8 +232,13 @@ crates/synapse-perception/
 └── src/
     ├── lib.rs                      # Crate-level re-exports
     ├── error.rs                    # PerceptionError with .code() mapping to OBSERVE_* / OCR_*
+    ├── event_extensions.rs         # Profile event_extension validation and derived event emission
+    ├── hud/
+    │   ├── mod.rs                  # HUD module exports
+    │   └── anchor.rs               # Client-rect HUD anchor resolver to LTRB/Rect
     ├── observe.rs                  # ObservationAssembler, ObservationInput, ObserveInclude, auto_mode, A11yTreeSummary
-    └── ocr.rs                      # OcrProvider, TextRegion, read_text/read_text_with_provider, WinRT vs CRNN
+    ├── ocr.rs                      # OcrProvider, TextRegion, read_text/read_text_with_provider, WinRT vs CRNN
+    └── template_match.rs           # Slotted template HUD counter extraction
 ```
 
 ### 2.7 `crates/synapse-a11y/` — UIA + WinEvent + CDP

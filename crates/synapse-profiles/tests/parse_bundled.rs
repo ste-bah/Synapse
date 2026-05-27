@@ -1,6 +1,6 @@
 use std::{fs, time::UNIX_EPOCH};
 
-use synapse_core::{Backend, HudExtractor, HudRegion, ProfileUseScope, error_codes};
+use synapse_core::{Backend, HudExtractor, HudRegion, ProfileUseScope, WindowEdge, error_codes};
 use synapse_profiles::{
     ProfileError, ScreenBounds, bundled_profiles_dir, parse_profile_bytes, parse_profile_file,
 };
@@ -342,6 +342,56 @@ emits_kind = "benchmark.luanti.action_observed"
         loaded.profile.event_extensions[2].emits_kind,
         "benchmark.luanti.action_observed"
     );
+}
+
+#[test]
+fn parser_accepts_center_anchored_hud_region() {
+    let toml = r#"
+id = "center_hud"
+label = "Center HUD"
+schema_version = 1
+use_scope = "operator_owned_test"
+mouse_curve_default = "natural"
+keyboard_dynamics_default = "natural"
+
+[[matches]]
+exe = "center-hud.exe"
+
+[[hud]]
+name = "center.prompt"
+extractor = { kind = "winrt_ocr" }
+parser = { kind = "number" }
+region = { kind = "anchored_to_edge", edge = "center", x_offset = -40, y_offset = -12, w = 80, h = 24 }
+"#;
+
+    println!(
+        "readback=profile_hud_anchor edge=center_parse before=toml_edge:center offsets=(-40,-12) size=(80,24)"
+    );
+    let loaded = parse_profile_bytes(
+        "center_hud.toml",
+        toml.as_bytes(),
+        UNIX_EPOCH,
+        ScreenBounds {
+            width: 1920,
+            height: 1080,
+        },
+    )
+    .unwrap_or_else(|error| panic!("center anchored HUD region should parse: {error}"));
+    println!(
+        "readback=profile_hud_anchor edge=center_parse after=region:{:?}",
+        loaded.profile.hud[0].region
+    );
+
+    assert!(matches!(
+        loaded.profile.hud[0].region,
+        HudRegion::AnchoredToEdge {
+            edge: WindowEdge::Center,
+            x_offset: -40,
+            y_offset: -12,
+            w: 80,
+            h: 24,
+        }
+    ));
 }
 
 #[test]
