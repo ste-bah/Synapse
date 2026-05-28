@@ -6,6 +6,7 @@ use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 use tempfile::TempDir;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn reflex_history_schema_defaults_and_audit_boundaries() -> anyhow::Result<()> {
     let logs = TempDir::new()?;
     let db = TempDir::new()?;
@@ -16,6 +17,7 @@ async fn reflex_history_schema_defaults_and_audit_boundaries() -> anyhow::Result
         &[("SYNAPSE_DB", db_path_string.as_str())],
     )
     .await?;
+    activate_notepad_profile(&mut client).await?;
 
     let tools = client.tools_list().await?;
     let tools = tools
@@ -132,6 +134,14 @@ async fn register(client: &mut StdioMcpClient, kind: &str) -> anyhow::Result<Str
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
         .context("reflex_id missing")
+}
+
+async fn activate_notepad_profile(client: &mut StdioMcpClient) -> anyhow::Result<()> {
+    let response = client
+        .tools_call("profile_activate", json!({"profile_id": "notepad"}))
+        .await?;
+    assert_eq!(structured(&response)?["active_profile_id"], "notepad");
+    Ok(())
 }
 
 fn valid_register_args(kind: &str) -> Value {

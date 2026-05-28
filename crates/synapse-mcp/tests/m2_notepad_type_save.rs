@@ -78,6 +78,7 @@ async fn notepad_type_save_writes_byte_correct_file_live() -> anyhow::Result<()>
         "readback=NotepadHandle edge=ownership after_hwnd=0x{hwnd:x} after_pid={pid} pid_preexisting={pid_preexisting}"
     );
     let mut client = StdioMcpClient::launch_and_init_with_log_dir(Some(log_dir.path())).await?;
+    activate_notepad_profile(&mut client).await?;
 
     let editor_node = editor_node_from_uia_snapshot(hwnd)?;
     let editor_id = editor_node.element_id.clone();
@@ -299,6 +300,7 @@ async fn notepad_save_invalid_dir_shows_dialog_and_writes_no_file_live() -> anyh
         handle.pid_preexisting()
     );
     let mut client = StdioMcpClient::launch_and_init_with_log_dir(Some(log_dir.path())).await?;
+    activate_notepad_profile(&mut client).await?;
 
     let editor_node = editor_node_from_uia_snapshot(hwnd)?;
     let editor_id = editor_node.element_id.clone();
@@ -528,6 +530,7 @@ async fn notepad_act_type_foreground_lost_returns_error_without_recording_events
         &[("SYNAPSE_MCP_RECORDING_BACKEND", "1")],
     )
     .await?;
+    activate_notepad_profile(&mut client).await?;
     let observed_target = observe(&mut client).await?;
     println!(
         "readback=foreground edge=lost before_hwnd=0x{:x} before_pid={} before_title={:?}",
@@ -639,6 +642,7 @@ async fn notepad_double_click_selects_word_and_clipboard_reads_selection_live() 
         handle.pid_preexisting()
     );
     let mut client = StdioMcpClient::launch_and_init_with_log_dir(Some(log_dir.path())).await?;
+    activate_notepad_profile(&mut client).await?;
 
     let original_clipboard = client
         .tools_call("act_clipboard", json!({"verb": "read"}))
@@ -880,6 +884,16 @@ fn focus_editor(hwnd: i64, editor_id: &ElementId) -> anyhow::Result<()> {
     println!(
         "readback=synapse_a11y::UIElement::set_focus edge=editor after=ok element_id={editor_id}"
     );
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn activate_notepad_profile(client: &mut StdioMcpClient) -> anyhow::Result<()> {
+    let response = client
+        .tools_call("profile_activate", json!({"profile_id": "notepad"}))
+        .await?;
+    let active: Value = structured(&response)?;
+    assert_eq!(active["active_profile_id"], "notepad");
     Ok(())
 }
 

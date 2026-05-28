@@ -19,7 +19,10 @@ impl SynapseService {
         );
         let required = required_combo_permissions(&params.0)?;
         self.require_m3_permissions("act_combo", &required)?;
-        self.ensure_supported_use_allows_action("act_combo")?;
+        if let Err(error) = self.ensure_supported_use_allows_action("act_combo") {
+            self.audit_action_denied("act_combo", &error);
+            return Err(error);
+        }
         self.refresh_reflex_audit_context()?;
         self.audit_action_started("act_combo")?;
         let runtime = self.reflex_runtime()?;
@@ -39,6 +42,10 @@ impl SynapseService {
             command = %params.0.command,
             "tool.invocation kind=act_run_shell"
         );
+        if let Err(error) = self.ensure_supported_use_allows_action("act_run_shell") {
+            self.audit_action_denied("act_run_shell", &error);
+            return Err(error);
+        }
         run_shell(&self.m4_config, params.0).await.map(Json)
     }
 
@@ -53,6 +60,10 @@ impl SynapseService {
             target = %params.0.target,
             "tool.invocation kind=act_launch"
         );
+        if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
+            self.audit_action_denied("act_launch", &error);
+            return Err(error);
+        }
         self.audit_action_started("act_launch")?;
         let result = launch(&self.m4_config, params.0).await;
         self.audit_action_result("act_launch", &result)?;

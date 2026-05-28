@@ -1,9 +1,9 @@
 use super::{
     ActAimParams, ActAimResponse, ActClickParams, ActClickResponse, ActClipboardParams,
-    ActClipboardResponse, ActDragParams, ActDragResponse, ActPadParams, ActPadResponse,
-    ActPressParams, ActPressResponse, ActScrollParams, ActScrollResponse, ActTypeParams,
-    ActTypeResponse, ErrorData, Json, Parameters, ReleaseAllParams, ReleaseAllResponse,
-    SynapseService, act_aim_with_handle, act_click_with_handle, act_clipboard,
+    ActClipboardResponse, ActClipboardVerb, ActDragParams, ActDragResponse, ActPadParams,
+    ActPadResponse, ActPressParams, ActPressResponse, ActScrollParams, ActScrollResponse,
+    ActTypeParams, ActTypeResponse, ErrorData, Json, Parameters, ReleaseAllParams,
+    ReleaseAllResponse, SynapseService, act_aim_with_handle, act_click_with_handle, act_clipboard,
     act_drag_with_handle, act_pad_with_handle, act_press_with_handle, act_scroll_with_handle,
     act_type_with_handle, release_all_with_handles, tool, tool_router,
 };
@@ -171,12 +171,21 @@ impl SynapseService {
         &self,
         params: Parameters<ActClipboardParams>,
     ) -> Result<Json<ActClipboardResponse>, ErrorData> {
+        let params = params.0;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "act_clipboard",
             "tool.invocation kind=act_clipboard"
         );
-        act_clipboard(params.0).await.map(Json)
+        if matches!(
+            params.verb,
+            ActClipboardVerb::Write | ActClipboardVerb::Clear
+        ) && let Err(error) = self.ensure_supported_use_allows_action("act_clipboard")
+        {
+            self.audit_action_denied("act_clipboard", &error);
+            return Err(error);
+        }
+        act_clipboard(params).await.map(Json)
     }
 
     #[tool(description = "Release all held keyboard, mouse, and gamepad input state")]

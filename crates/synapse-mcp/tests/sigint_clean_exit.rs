@@ -58,7 +58,7 @@ async fn stdio_connection_closed_emits_release_all_log() -> anyhow::Result<()> {
         .await?;
     assert_eq!(
         pad_error["data"]["code"],
-        error_codes::ACTION_BACKEND_UNAVAILABLE
+        error_codes::SAFETY_PROFILE_ACTION_DENIED
     );
     println!(
         "readback=daemon_log edge=connection_closed before=safety_count:0 expected_held_pad_ids:[] pad_error={pad_error}"

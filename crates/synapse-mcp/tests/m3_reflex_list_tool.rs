@@ -16,6 +16,7 @@ async fn reflex_list_schema_default_and_cancelled_merge() -> anyhow::Result<()> 
         &[("SYNAPSE_DB", db_path_string.as_str())],
     )
     .await?;
+    activate_notepad_profile(&mut client).await?;
 
     let tools = client.tools_list().await?;
     let tools = tools
@@ -103,6 +104,14 @@ async fn register(client: &mut StdioMcpClient, kind: &str) -> anyhow::Result<Str
         .filter(|id| !id.is_empty())
         .map(str::to_owned)
         .context("reflex_id missing")
+}
+
+async fn activate_notepad_profile(client: &mut StdioMcpClient) -> anyhow::Result<()> {
+    let response = client
+        .tools_call("profile_activate", json!({"profile_id": "notepad"}))
+        .await?;
+    assert_eq!(structured(&response)?["active_profile_id"], "notepad");
+    Ok(())
 }
 
 fn valid_register_args(kind: &str) -> Value {

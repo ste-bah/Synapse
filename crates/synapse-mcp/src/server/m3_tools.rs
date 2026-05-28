@@ -91,7 +91,10 @@ impl SynapseService {
         );
         let required = crate::m3::reflex::required_permissions_register(&params.0)?;
         self.require_m3_permissions("reflex_register", &required)?;
-        self.ensure_supported_use_allows_action("reflex_register")?;
+        if let Err(error) = self.ensure_supported_use_allows_action("reflex_register") {
+            self.audit_action_denied("reflex_register", &error);
+            return Err(error);
+        }
         self.refresh_reflex_audit_context()?;
         if crate::m3::reflex::requires_a11y_event_bridge(&params.0) {
             self.ensure_a11y_event_bridge()?;

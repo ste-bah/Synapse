@@ -14,6 +14,7 @@ async fn reflex_register_schema_defaults_and_edges() -> anyhow::Result<()> {
         &[("SYNAPSE_DB", db_path.as_str())],
     )
     .await?;
+    activate_notepad_profile(&mut client).await?;
 
     let tools = client.tools_list().await?;
     let tools = tools
@@ -93,6 +94,14 @@ fn valid_register_args(kind: &str) -> Value {
         "when": {"op": "kind", "kind": kind},
         "then": {"kind": "action", "action": {"kind": "release_all"}}
     })
+}
+
+async fn activate_notepad_profile(client: &mut StdioMcpClient) -> anyhow::Result<()> {
+    let response = client
+        .tools_call("profile_activate", json!({"profile_id": "notepad"}))
+        .await?;
+    assert_eq!(structured(&response)?["active_profile_id"], "notepad");
+    Ok(())
 }
 
 fn structured(response: &Value) -> anyhow::Result<Value> {

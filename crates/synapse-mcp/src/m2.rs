@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use aim::{ActAimParams, ActAimResponse, act_aim_with_handle};
 pub use click::{ActClickParams, ActClickResponse, act_click_with_handle};
-pub use clipboard::{ActClipboardParams, ActClipboardResponse, act_clipboard};
+pub use clipboard::{ActClipboardParams, ActClipboardResponse, ActClipboardVerb, act_clipboard};
 pub use config::M2ServiceConfig;
 pub use drag::{ActDragParams, ActDragResponse, act_drag_with_handle};
 pub use pad::{ActPadParams, ActPadResponse, act_pad_with_handle};
