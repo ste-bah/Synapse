@@ -101,18 +101,24 @@ visible crop as the SoT and record the OCR mismatch on #495/#500.
 The EverQuest profile owns reviewed keyboard aliases in its `[keymap]` table:
 movement (`forward`, `back`, `left`, `right`, `turn_left`, `turn_right`),
 targeting/consider (`target_nearest_npc`, `target_self`, `con`, `consider`),
-UI recovery (`inventory`, `spellbook`, `menu`, `open_chat`, `sit`), and
+UI recovery (`inventory`, `spellbook`, `menu`, `sit`), and
 hotbar slots (`hotbar1` through `hotbar10`). Runtime action work should prefer
 `act_keymap` for those aliases so the action audit row records both the
 semantic alias and the resolved key/chord. Direct `act_press` remains valid for
 explicit edge checks, but the profile-keymap path is the normal EverQuest
 action surface for manual FSV.
 
-`open_chat` is retained only as a focus-state edge/recovery alias. Chat content
-entry through `act_type`, mutating clipboard, or other text-injection paths is
-not a supported live EverQuest action surface. If chat focus is accidentally
-entered, recover with foreground-visible UI readback and non-text input such as
-`menu`/`Esc`.
+`open_chat` is not a reviewed live alias. Enter/chat focus caused a real
+accidental public-chat side effect during #496 recovery, so the live profile
+must fail closed for `act_keymap open_chat`. Chat content entry through
+`act_type`, mutating clipboard, or other text-injection paths is not a supported
+live EverQuest action surface. If chat focus is accidentally entered, stop,
+read the visible UI/log SoT, and do not continue movement/combat while ordinary
+keys are being captured by chat. The verified recovery for an already-polluted
+chat buffer is bounded Backspace clearing, a single audited Enter only after the
+buffer is expected empty, then `inventory` readback; the EQ log `You say` count
+and timestamp must be read before and after to prove no chat was submitted.
+Do not expose this as `open_chat` or any general chat/recovery alias.
 
 Before claiming an alias effect, manually read the visible UI/log/storage SoT
 before the trigger, call the real MCP `act_keymap` tool while `eqgame.exe` is
@@ -189,6 +195,7 @@ GitHub issues remain the canonical coordination state:
 | #499 | Safe input aliases and foreground action audit |
 | #500 | Full-tool manual FSV coverage matrix against EverQuest |
 | #501 | Gameplay learning, hotkey/focus rules, and durable skill memory |
+| #504 | Remove unsafe `open_chat` alias and verify chat-focus denial |
 
 ## Gameplay Learning Memory
 
@@ -200,8 +207,13 @@ context window to remember how to play after compaction.
 Initial learned rules:
 
 - `i` opens the Inventory character panel used for level/XP readback.
-- `Enter` can focus or submit chat input; when chat input is focused, ordinary
-  keypresses type into chat instead of moving or triggering hotbar actions.
+- `Enter` can focus or submit chat input and is not a safe recovery primitive;
+  when chat input is focused, ordinary keypresses type into chat instead of
+  moving or triggering hotbar actions.
+- If chat focus is already polluted with typed keys, clear it with bounded
+  Backspace presses, read the EQ log `You say` count before and after, and use
+  Enter only after the buffer is expected empty; never expose this as a profile
+  alias or normal gameplay primitive.
 - Restore world focus and read visible UI state before movement or combat
   inputs.
 - Use the in-game Options/keybind UI as the authoritative control list when a
@@ -226,7 +238,7 @@ Required edges:
 | Edge | Before/after SoT | Expected outcome |
 |---|---|---|
 | Unsupported foreground | Focus a non-EverQuest window, then attempt an EverQuest action | Profile/action gate refuses or the action is not sent to EverQuest; no game state changes |
-| Menu/chat focused | Open a UI/menu/chat field, then attempt movement/combat input | Readback identifies non-world/action context; agent restores/backs out before gameplay action |
+| Menu/chat focused | Encounter or simulate pre-existing UI/menu/chat focus, then avoid movement/combat input until the state is read | Readback identifies non-world/action context; agent clears chat text without submitting it, proves the EQ log `You say` count did not change, and restores visible gameplay UI before action |
 | Invalid or empty action | Send an invalid/empty action request through MCP | Tool rejects input and action row/game state do not show unintended input |
 | Loss of game foreground | Alt-tab/minimize or verify another window foreground | `observe` no longer reports `everquest.live`; no level/progress claim is made |
 
