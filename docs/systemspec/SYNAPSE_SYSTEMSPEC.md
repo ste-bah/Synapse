@@ -36,7 +36,7 @@ Comprehensive technical reference for the Synapse MCP server, produced by readin
 
 ## Read order
 
-1. [01_system_overview.md](#file-01) — architecture map, tech stack, 52-tool inventory, error hierarchy
+1. [01_system_overview.md](#file-01) — architecture map, tech stack, 61-tool inventory, error hierarchy
 2. [02_source_code_map.md](#file-02) — file tree with per-file descriptions, dep graph, entry-point traces
 3. [03_configuration.md](#file-03) — CLI flags, env vars, validation, all numeric defaults
 4. [04_storage_layer.md](#file-04) — RocksDB schema (11 CFs), schema sentinel, TTL filter, GC, disk pressure
@@ -3909,15 +3909,15 @@ Open M4 work (per `docs/impplan/05_m4_hardware_hid_first_game.md`):
 
 - `firmware/pico-hid/` — standalone RP2040 firmware project excluded from the root Cargo workspace; remaining firmware issues close only with real device evidence.
 - `synapse-hid-host` — serial driver with discovery, connect/IDENTIFY, CRC16 framing, pipeline/backpressure, and reconnect paths. `Backend::Hardware` uses `HardwareBackend` when `--hardware-hid <port|auto>` connects successfully, otherwise it fails closed through `HardwareUnavailableBackend`.
-- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 -> 33; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`, bringing the live surface to 52.
+- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 -> 33; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`; #508/#510/#525/#526/#527/#528/#531 add the EverQuest `/loc`, current-state, map-sensor, outcome, route, memory, and action-prior tools, bringing the live surface to 61.
 - `minecraft.java` profile (the first game profile) — fifth bundled profile, validated against a single-player creative world per `15_roadmap_and_milestones.md` §6.
 - M3 hold-over items still open: per-subscriber `subscribe.buffer_size` (currently hard-pinned to 4096); persistent writers for `CF_EVENTS`/`CF_OBSERVATIONS`/`CF_SESSIONS`/`CF_TELEMETRY`/`CF_PROCESS_HISTORY`/`CF_KV` (`CF_REFLEX_AUDIT` and `CF_ACTION_LOG` have live writers); audio detector → SSE-bus sink integration. Profile HUD fields now run through `observe`; standalone `read_hud` remains deferred. VLM `describe` and Florence-2 remain M5.
 
 ## 3. Tools delivered vs planned
 
 PRD `docs/computergames/05_mcp_tool_surface.md` started from a 30-tool M3
-baseline and now records the approved 52-tool live surface after M4/M5
-expansion plus the #499 profile-keymap action alias. Current build:
+baseline and now records the approved 61-tool live surface after M4/M5,
+profile-registry/audit, and EverQuest world-model expansion. Current build:
 
 | # | Tool | Milestone | Status | Note |
 |---|---|---|---|---|
@@ -4153,6 +4153,7 @@ Source files covered:
 - `crates/synapse-mcp/src/server/everquest_tools.rs`
 - `crates/synapse-mcp/src/server/everquest_log.rs`
 - `crates/synapse-mcp/src/server/everquest_state.rs`
+- `crates/synapse-mcp/src/server/everquest_map_sensor.rs`
 - `crates/synapse-mcp/src/server/everquest_memory.rs`
 - `crates/synapse-mcp/src/server/everquest_outcome.rs`
 - `crates/synapse-mcp/src/server/everquest_route.rs`
@@ -4162,7 +4163,7 @@ Source files covered:
 - `crates/synapse-mcp/src/m3/{audio, audit_export, permissions, profile, profile_authoring, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 60 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 61 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -4362,7 +4363,28 @@ Manual FSV must read the physical EQ log byte offset, location count, and `You s
 
 Manual FSV must read the EQ log/config/map files and foreground state before the trigger, call the real MCP tool, then independently read `CF_KV/everquest/current_state/v1/everquest.live` through storage readback. The tool's internal row readback is supporting evidence, not the separate manual source-of-truth read required for shipping.
 
-## 9d. `everquest_outcome_ingest`
+## 9d. `everquest_map_sensor`
+
+**Description:** "Persist calibrated EverQuest visible-map sensor state from current-state, screenshot/observe evidence, and local map files"
+**Side effects:** reads the persisted current-state row by default, reads the current zone's local `maps/*.txt` file, fuses visible-map evidence from a separately inspected observe/screenshot source, writes `CF_KV/everquest/map_sensor/v1/everquest.live/<sensor_id>`, then reads the exact row back before returning.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `sensor_id` | `String` | yes | - | Map-sensor row id |
+| `profile_id` | `String` | no | `everquest.live` | EverQuest profile id; other ids fail closed |
+| `state_row_key` | `String` | no | `everquest/current_state/v1/everquest.live` | Current-state source row |
+| `state_override` | `Option<EverQuestMapSensorStateOverride>` | no | - | Synthetic/manual state input with source refs |
+| `visible_map_override` | `Option<EverQuestVisibleMapOverride>` | no | - | Verified visible-map evidence from observe/screenshot readback |
+| `expected_zone_short_name` | `Option<String>` | no | - | Optional zone consistency guard |
+| `stale_after_seconds` | `u64` | no | `300` | Older current-state rows abstain |
+| `max_nearest_labels` | `usize` | no | `8` | Nearest landmark cap; max `16` |
+
+**Returns:** `EverQuestMapSensorResponse { ok, row_key, stored_value_len_bytes, sensor }`. Calibrated rows carry foreground proof, visible map bounds/confidence, current `/loc`, map file SHA-256/mtime/counts, nearest labels/exits, visible label or player-marker anchors, transform confidence, hazards, source refs, and evidence-boundary flags. Hidden maps, occlusion, stale current state, missing `/loc`, non-EQ foreground, zoom/pan changes, low visible confidence, or contradictory zone sources persist abstain rows instead of guessed calibration.
+**Errors:** `TOOL_PARAMS_INVALID`, `ACTION_TARGET_INVALID`, `STORAGE_READ_FAILED`, `STORAGE_WRITE_FAILED`, `STORAGE_CORRUPTED`, `TOOL_INTERNAL_ERROR`.
+
+Manual FSV must read the physical screenshot/observe crop, physical EQ log/current-state row, and local map file before the trigger, call the real MCP tool, then separately inspect the persisted `CF_KV` map-sensor row. The tool does not execute movement.
+
+## 9e. `everquest_outcome_ingest`
 
 **Description:** "Parse active or explicit EverQuest log bytes into compact redacted outcome rows and persist them in CF_KV with offset/hash readback"
 **Side effects:** reads bounded bytes from the active EverQuest log, or an explicit approved `eqlog_<character>_<server>.txt` path, writes deterministic `CF_KV/everquest/outcome_event/v1/everquest.live/<offset>-<hash>` rows, then reads those rows back before returning.
@@ -4382,7 +4404,7 @@ Manual FSV must read the EQ log/config/map files and foreground state before the
 
 Manual FSV must read the physical log bytes before the trigger, call the real MCP tool, then separately inspect durable `CF_KV` rows afterward for offsets, hashes, outcome kinds, duplicate markers, and redaction flags.
 
-## 9e. `everquest_memory_record`
+## 9f. `everquest_memory_record`
 
 **Description:** "Persist one compact EverQuest hazard or safe-area memory row with source refs, stale/conflict handling, and exact CF_KV readback"
 **Side effects:** validates compact/redacted source refs, writes either `CF_KV/everquest/hazard_memory/v1/everquest.live/<memory_id>` or `CF_KV/everquest/safe_area_memory/v1/everquest.live/<memory_id>`, then reads the exact row back before returning.
@@ -4412,7 +4434,7 @@ Manual FSV must read the physical log bytes before the trigger, call the real MC
 
 Manual FSV must read the physical EQ log/UI/storage evidence first, call the real tool with known source refs, then separately inspect the `CF_KV` row. Closed schemas reject attempted raw chat payload fields; storage must remain unchanged for that edge.
 
-## 9f. `everquest_memory_consult`
+## 9g. `everquest_memory_consult`
 
 **Description:** "Consult persisted EverQuest hazard and safe-area memories for one candidate action, write a compact planner consult row, and read it back"
 **Side effects:** reads named memory rows or scans hazard/safe prefixes, matches active rows by target/zone/location radius, writes `CF_KV/everquest/planner_consult/v1/everquest.live/<candidate_id>`, then reads that exact decision row back.
@@ -4431,7 +4453,7 @@ Manual FSV must read the physical EQ log/UI/storage evidence first, call the rea
 **Returns:** `EverQuestMemoryConsultResponse { ok, row_key, stored_value_len_bytes, consult }`. The consult decision is `avoid`, `allow_with_safe_memory`, `allow_no_matching_hazard`, or `abstain_state_unknown`, with matched hazard/safe rows and match reasons.
 **Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_READ_FAILED`, `STORAGE_WRITE_FAILED`, `STORAGE_CORRUPTED`, `TOOL_INTERNAL_ERROR`.
 
-## 9g. `everquest_route_plan`
+## 9h. `everquest_route_plan`
 
 **Description:** "Plan and persist one bounded EverQuest route from current state to a local map landmark or zone line without executing movement"
 **Side effects:** reads the persisted current-state row by default, builds the local map/zone graph from the configured EverQuest install root, writes `CF_KV/everquest/route_plan/v1/everquest.live/<plan_id>`, then reads the exact route-plan row back.
@@ -4453,7 +4475,7 @@ Manual FSV must read the physical EQ log/UI/storage evidence first, call the rea
 
 Manual FSV must read the physical map/current-state SoT before the trigger, call the real MCP tool, then separately inspect the persisted `CF_KV` route-plan row. This tool does not execute movement.
 
-## 9h. `everquest_action_prior_record`
+## 9i. `everquest_action_prior_record`
 
 **Description:** "Persist one EverQuest action-prior prediction/outcome sample with computed correctness and exact CF_KV readback"
 **Side effects:** validates a redacted prediction/outcome sample, computes correctness, writes `CF_KV/everquest/action_prior_eval/v1/everquest.live/<sample_id>`, then reads that exact row back before returning.
@@ -4473,7 +4495,7 @@ Manual FSV must read the physical map/current-state SoT before the trigger, call
 **Returns:** `EverQuestActionPriorRecordResponse { ok, row_key, stored_value_len_bytes, sample }`. `sample.correctness.class` is one of `correct_top1`, `correct_top3`, `correct_context`, `wrong`, `abstained`, or `unknown_actual`; it also carries calibration bucket, useful flag, overconfident-wrong flag, and the evidence boundary that scorecards are not FSV.
 **Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_WRITE_FAILED`, `STORAGE_READ_FAILED`, `STORAGE_CORRUPTED`, `TOOL_INTERNAL_ERROR`.
 
-## 9i. `everquest_action_prior_scorecard`
+## 9j. `everquest_action_prior_scorecard`
 
 **Description:** "Aggregate persisted EverQuest action-prior samples into a floor-not-ceiling competence scorecard with exact CF_KV readback"
 **Side effects:** reads named eval rows from `CF_KV`, writes `CF_KV/everquest/action_prior_scorecard/v1/everquest.live/<window_id>`, then reads that exact row back before returning.
@@ -5328,7 +5350,7 @@ Source files covered:
 - `m3_reflex_cancel_tool.rs`, `m3_reflex_history_tool.rs`, `m3_reflex_list_tool.rs`, `m3_reflex_register_tool.rs` — reflex CRUD
 - `m3_replay_record_tool.rs` — replay JSONL writer
 - `m3_subscribe_tool.rs` — subscribe + cancel
-- `m3_tools_list.rs` / `m4_tools_list.rs` — `tools/list` exposes the current 52-tool surface, including #499 `act_keymap`, M5 profile-registry/audit tools, #462 `profile_authoring_*`, #468 `profile_registry_report`, `profile_registry_rollback`, and the #460 `audit_export_*` tools
+- `m3_tools_list.rs` / `m4_tools_list.rs` — `tools/list` exposes the current 61-tool surface, including #499 `act_keymap`, M5 profile-registry/audit tools, #462 `profile_authoring_*`, #468 `profile_registry_report`, `profile_registry_rollback`, #460 `audit_export_*`, and the EverQuest world-model tools through `everquest_action_prior_scorecard`
 - `sigint_clean_exit.rs` — Ctrl-C / Ctrl-Break shuts the daemon down within deadline
 
 ### 2.5 `synapse-models` (1 file)

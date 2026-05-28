@@ -12,8 +12,9 @@
    #508 adds the narrow EverQuest `/loc` probe, #510 adds the compact
    EverQuest current-state estimator, #526 adds compact EverQuest outcome
    ingest, #528 adds EverQuest hazard/safe memory record and consult tools,
-   #527 adds EverQuest route-plan rows, and #531 adds EverQuest action-prior
-   sample/scorecard tools, bringing the live surface to 60. Any
+   #527 adds EverQuest route-plan rows, #525 adds EverQuest current-map sensor
+   rows, and #531 adds EverQuest action-prior sample/scorecard tools, bringing
+   the live surface to 61. Any
    further agent-facing tools require an ADR-approved cap change.
    Overlapping tools merge. Profile and parameter knobs are the escape hatches.
 2. **One tool, one verb.** No `do_everything(action_kind, ...)` mega-tools.
@@ -28,8 +29,8 @@ profile-keymap action alias, #508 adds `everquest_loc_probe` as a literal
 EverQuest `/loc` readback tool, #510 adds `everquest_current_state` as the
 compact world-state row writer/readback tool, #526 adds
 `everquest_outcome_ingest`, #528 adds `everquest_memory_record` plus
-`everquest_memory_consult`, #527 adds `everquest_route_plan`, and #531 adds
-`everquest_action_prior_record` plus
+`everquest_memory_consult`, #527 adds `everquest_route_plan`, #525 adds
+`everquest_map_sensor`, and #531 adds `everquest_action_prior_record` plus
 `everquest_action_prior_scorecard`. M4 adds `act_combo`, `act_run_shell`, and
 `act_launch`; M5 adds local profile-registry/audit quality scoring, authoring
 candidates, registry row operations, import/export, audit intelligence, and
@@ -99,14 +100,15 @@ future `tools/list` snapshots in #447/#448.
 | 52 | `audit_export_bundle` | read/write | writes a local redacted audit bundle after consent verification |
 | 53 | `everquest_loc_probe` | write/read | sends literal `/loc` to `everquest.live` and verifies the EQ log coordinate line |
 | 54 | `everquest_current_state` | write/read | fuses foreground, EQ log, map, HUD, and action audit into a compact `CF_KV` row and reads it back |
-| 55 | `everquest_outcome_ingest` | write/read | parses bounded EQ log bytes into compact redacted outcome rows with offset/hash readback |
-| 56 | `everquest_memory_record` | write/read | stores one compact hazard or safe-area memory row with source refs, stale/conflict handling, and exact readback |
-| 57 | `everquest_memory_consult` | write/read | consults hazard/safe memories for one candidate action and persists the planner decision row |
-| 58 | `everquest_route_plan` | write/read | stores one bounded route plan from current state to a local map landmark/zone line without movement |
-| 59 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
-| 60 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
+| 55 | `everquest_map_sensor` | write/read | stores one current-map sensor/calibration row from visible map evidence, `/loc`, and local map files |
+| 56 | `everquest_outcome_ingest` | write/read | parses bounded EQ log bytes into compact redacted outcome rows with offset/hash readback |
+| 57 | `everquest_memory_record` | write/read | stores one compact hazard or safe-area memory row with source refs, stale/conflict handling, and exact readback |
+| 58 | `everquest_memory_consult` | write/read | consults hazard/safe memories for one candidate action and persists the planner decision row |
+| 59 | `everquest_route_plan` | write/read | stores one bounded route plan from current state to a local map landmark/zone line without movement |
+| 60 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
+| 61 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
 
-M3 live count: 30 tools. Current live count: 60
+M3 live count: 30 tools. Current live count: 61
 tools.
 
 Deferred ideas from earlier drafts (`describe` and `read_hud`) are still not
@@ -118,6 +120,7 @@ tool;
 `everquest_memory_record` and `everquest_memory_consult` are the #528
 hazard/safe-area memory and planner consult tools;
 `everquest_route_plan` is the #527 bounded local map route planner;
+`everquest_map_sensor` is the #525 current-map calibration/readback row tool;
 `everquest_action_prior_record` and `everquest_action_prior_scorecard` are the
 #531 competence scorecard tools;
 `act_combo`, `act_run_shell`, and `act_launch` remain the M4 phase plan
@@ -624,7 +627,46 @@ before the trigger, call the real MCP tool, then separately read the
 The returned row readback is useful evidence, but it does not replace the
 separate source-of-truth read after the trigger.
 
-### 3.13d `everquest_outcome_ingest`
+### 3.13d `everquest_map_sensor`
+
+```json
+{
+  "name": "everquest_map_sensor",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["sensor_id"],
+    "properties": {
+      "sensor_id": {"type": "string"},
+      "profile_id": {"type": "string", "default": "everquest.live"},
+      "state_row_key": {"type": "string", "default": "everquest/current_state/v1/everquest.live"},
+      "state_override": {"type": "object", "additionalProperties": false},
+      "visible_map_override": {"type": "object", "additionalProperties": false},
+      "expected_zone_short_name": {"type": "string"},
+      "stale_after_seconds": {"type": "integer", "default": 300},
+      "max_nearest_labels": {"type": "integer", "default": 8}
+    }
+  }
+}
+```
+
+`everquest_map_sensor` reads the persisted current-state row by default, fuses
+visible map evidence from an observe/screenshot readback, reads the local map
+file and zone graph, writes
+`CF_KV/everquest/map_sensor/v1/everquest.live/<sensor_id>`, and reads the exact
+row back. Calibrated rows include foreground identity, visible map bounds,
+current `/loc`, map file SHA-256/mtime/counts, nearest labels and exits,
+visible label or player-marker anchors, transform confidence, hazards, and
+source refs. The tool does not execute movement.
+
+Hidden maps, occlusion, stale current state, missing `/loc`, non-EQ foreground,
+zoom/pan changes after calibration, low visible confidence, or contradictory
+zone sources produce persisted fail-closed rows instead of guessed calibration.
+Manual FSV must read the physical screenshot/observe crop, EQ log/current-state
+row, and local map file before the trigger, call this real MCP tool, then
+separately inspect the `CF_KV` row afterward.
+
+### 3.13e `everquest_outcome_ingest`
 
 ```json
 {
@@ -662,7 +704,7 @@ Manual FSV must read the physical log bytes before the trigger, call this real
 MCP tool, then separately read `CF_KV` through storage readback and verify the
 row offsets, hashes, kinds, and redaction flags.
 
-### 3.13e `everquest_memory_record`
+### 3.13f `everquest_memory_record`
 
 ```json
 {
@@ -708,7 +750,7 @@ real MCP tool with known source refs, then separately inspect the durable
 `CF_KV` row afterward. The schema is closed; attempted raw chat payload fields
 are rejected and must leave storage unchanged.
 
-### 3.13f `everquest_memory_consult`
+### 3.13g `everquest_memory_consult`
 
 ```json
 {
@@ -738,7 +780,7 @@ that exact decision row back. Matching active hazards return `avoid`; matching
 safe areas without hazards return `allow_with_safe_memory`; candidates with no
 target, zone, or location return `abstain_state_unknown`.
 
-### 3.13g `everquest_route_plan`
+### 3.13h `everquest_route_plan`
 
 ```json
 {
@@ -776,7 +818,7 @@ calibration produce persisted abstain rows instead of guessed movement.
 Manual FSV must read the physical map/current-state SoT before the trigger,
 call this real MCP tool, and separately inspect `CF_KV` afterward.
 
-### 3.13h `everquest_action_prior_record`
+### 3.13i `everquest_action_prior_record`
 
 ```json
 {
@@ -835,7 +877,7 @@ an FSV substitute. Manual FSV must still read storage state before the trigger,
 call the tool with known synthetic prediction/outcome inputs, and separately
 read `storage_inspect` or another physical storage readback after the write.
 
-### 3.13i `everquest_action_prior_scorecard`
+### 3.13j `everquest_action_prior_scorecard`
 
 ```json
 {
@@ -2105,6 +2147,14 @@ profile-authoring and audit-export defaults below.
 | `audit_export_bundle` | `redaction_policy` | runtime-required; omitted by schema | M5 issue #460 |
 | `audit_export_bundle` | `max_rows` | `100` | M5 issue #460 |
 | `audit_export_bundle` | `max_row_bytes` | `65536` | M5 issue #460 |
+| `everquest_map_sensor` | `sensor_id` | required; no default | #525 |
+| `everquest_map_sensor` | `profile_id` | `"everquest.live"` | #525 |
+| `everquest_map_sensor` | `state_row_key` | `"everquest/current_state/v1/everquest.live"` | #525 |
+| `everquest_map_sensor` | `state_override` | omitted; reads storage current-state row | #525 |
+| `everquest_map_sensor` | `visible_map_override` | omitted; automatic detector fails closed without verified map evidence | #525 |
+| `everquest_map_sensor` | `expected_zone_short_name` | omitted | #525 |
+| `everquest_map_sensor` | `stale_after_seconds` | `300` | #525 |
+| `everquest_map_sensor` | `max_nearest_labels` | `8` | #525 |
 | `everquest_outcome_ingest` | `profile_id` | `"everquest.live"` | #526 |
 | `everquest_outcome_ingest` | `start_offset` | omitted; tails bounded recent bytes | #526 |
 | `everquest_outcome_ingest` | `max_bytes` | `65536` | #526 |

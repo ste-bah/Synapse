@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 60,
+  "count": 61,
   "m4_defaults": [
     {
       "actual": 33,
@@ -93,6 +93,7 @@ expression: snapshot
     "everquest_action_prior_scorecard",
     "everquest_current_state",
     "everquest_loc_probe",
+    "everquest_map_sensor",
     "everquest_memory_consult",
     "everquest_memory_record",
     "everquest_outcome_ingest",

@@ -98,15 +98,15 @@ Open M4 work (per `docs/impplan/05_m4_hardware_hid_first_game.md`):
 
 - `firmware/pico-hid/` — standalone RP2040 firmware project excluded from the root Cargo workspace; remaining firmware issues close only with real device evidence.
 - `synapse-hid-host` — serial driver with discovery, connect/IDENTIFY, CRC16 framing, pipeline/backpressure, and reconnect paths. `Backend::Hardware` uses `HardwareBackend` when `--hardware-hid <port|auto>` connects successfully, otherwise it fails closed through `HardwareUnavailableBackend`.
-- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 -> 33; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`, bringing the live surface to 52.
+- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 -> 33; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`; #508/#510/#525/#526/#527/#528/#531 add the EverQuest `/loc`, current-state, map-sensor, outcome, route, memory, and action-prior tools, bringing the live surface to 61.
 - `minecraft.java` profile (the first game profile) — fifth bundled profile, validated against a single-player creative world per `15_roadmap_and_milestones.md` §6.
 - M3 hold-over items still open: per-subscriber `subscribe.buffer_size` (currently hard-pinned to 4096); persistent writers for `CF_EVENTS`/`CF_OBSERVATIONS`/`CF_SESSIONS`/`CF_TELEMETRY`/`CF_PROCESS_HISTORY`/`CF_KV` (`CF_REFLEX_AUDIT` and `CF_ACTION_LOG` have live writers); audio detector → SSE-bus sink integration. Profile HUD fields now run through `observe`; standalone `read_hud` remains deferred. VLM `describe` and Florence-2 remain M5.
 
 ## 3. Tools delivered vs planned
 
 PRD `docs/computergames/05_mcp_tool_surface.md` started from a 30-tool M3
-baseline and now records the approved 52-tool live surface after M4/M5
-expansion plus the #499 profile-keymap action alias. Current build:
+baseline and now records the approved 61-tool live surface after M4/M5,
+profile-registry/audit, and EverQuest world-model expansion. Current build:
 
 | # | Tool | Milestone | Status | Note |
 |---|---|---|---|---|

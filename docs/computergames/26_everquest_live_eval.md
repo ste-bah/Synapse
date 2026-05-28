@@ -200,6 +200,28 @@ than loading full raw logs into the model context. Its durable row is
 world-model context injection, surprise detection, and scorecards should read
 that row or derived storage rows instead of rereading unbounded log text.
 
+## Current-Map Sensor Rows
+
+#525 adds `everquest_map_sensor`, the runtime surface for turning visible map
+evidence into compact map-calibration/readback rows. The tool reads the
+persisted current-state row, visible-map evidence from an observe/screenshot
+readback, and the local `maps/*.txt` file for the current zone, then writes:
+
+- `CF_KV/everquest/map_sensor/v1/everquest.live/<sensor_id>` for calibrated or
+  fail-closed current-map sensor state.
+
+Rows contain the foreground EQ window identity, visible map bounds/confidence,
+current `/loc`, map file SHA-256/mtime/counts, nearest labels and exits,
+visible label or player-marker anchors, transform confidence, hazards, and
+source refs. Hidden maps, occlusion, stale current state, missing `/loc`,
+non-EQ foreground, zoom/pan changes after calibration, low visible confidence,
+or contradictory zone sources persist abstain rows instead of guessed
+calibration. Map-sensor rows do not execute movement.
+
+Manual FSV for map sensing reads the physical screenshot/observe crop, physical
+EQ log/current-state row, and local map file before the trigger, calls the real
+MCP tool, then separately reads the persisted `CF_KV` map-sensor row.
+
 ## Compact Outcome Rows
 
 #526 adds `everquest_outcome_ingest`, the runtime storage surface for compact,
