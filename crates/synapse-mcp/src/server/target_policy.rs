@@ -13,10 +13,19 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 const KEY_LOCAL_WORLD_ONLY: &str = "supported_use.local_world_only";
 const KEY_APPROVED_WORLDS: &str = "supported_use.approved_worlds";
 const KEY_REMOTE_SERVER_ALLOWED: &str = "supported_use.remote_server_allowed";
+const KEY_LIVE_SERVER_ALLOWED: &str = "supported_use.live_server_allowed";
+const KEY_OPERATOR_ATTENDED_REQUIRED: &str = "supported_use.operator_attended_required";
+const KEY_OPERATOR_OWNED_CHARACTER_REQUIRED: &str =
+    "supported_use.operator_owned_character_required";
+const KEY_FOREGROUND_ONLY: &str = "supported_use.foreground_only";
+const KEY_NO_MEMORY_OR_PROTOCOL_HOOKS: &str = "supported_use.no_memory_or_protocol_hooks";
+const KEY_NO_UNATTENDED_LOOPS: &str = "supported_use.no_unattended_loops";
 const KEY_LAUNCH_TARGET: &str = "launch.target";
 const KEY_LAUNCH_WORLD: &str = "launch.world";
 const KEY_LAUNCH_LOGFILE: &str = "launch.logfile";
 const KEY_BENCHMARK_GAMEID: &str = "benchmark_world_gameid";
+const KEY_RUNTIME_EVERQUEST_EXE: &str = "runtime.everquest.exe";
+const KEY_RUNTIME_EVERQUEST_SERVER: &str = "runtime.everquest.server";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SupportedTargetState {
@@ -162,6 +171,10 @@ fn evaluate_supported_use_with_optional_process(
 ) -> TargetPolicyResult<SupportedTargetState> {
     let local_world_only = metadata_bool(&profile.metadata, KEY_LOCAL_WORLD_ONLY);
     let remote_allowed = metadata_bool(&profile.metadata, KEY_REMOTE_SERVER_ALLOWED);
+    let live_server_allowed = metadata_bool(&profile.metadata, KEY_LIVE_SERVER_ALLOWED);
+    if live_server_allowed {
+        return evaluate_operator_attended_live_server(profile, foreground);
+    }
     if !local_world_only && remote_allowed {
         return Ok(empty_supported_target_state(profile, foreground));
     }
@@ -256,6 +269,87 @@ fn evaluate_supported_use_with_optional_process(
         gameid: readback.gameid,
         logfile_path: readback.logfile_path,
     })
+}
+
+fn evaluate_operator_attended_live_server(
+    profile: &Profile,
+    foreground: &ForegroundContext,
+) -> TargetPolicyResult<SupportedTargetState> {
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_OPERATOR_ATTENDED_REQUIRED,
+        "operator_attended_required_missing",
+    )?;
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_OPERATOR_OWNED_CHARACTER_REQUIRED,
+        "operator_owned_character_required_missing",
+    )?;
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_FOREGROUND_ONLY,
+        "foreground_only_required_missing",
+    )?;
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_NO_MEMORY_OR_PROTOCOL_HOOKS,
+        "no_memory_or_protocol_hooks_missing",
+    )?;
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_NO_UNATTENDED_LOOPS,
+        "no_unattended_loops_missing",
+    )?;
+
+    if let Some(expected_exe) = optional_expanded_path(&profile.metadata, KEY_RUNTIME_EVERQUEST_EXE)
+        && !same_path_text(&expected_exe, Path::new(&foreground.process_path))
+    {
+        return Err(denial(
+            profile,
+            foreground,
+            "process_path_mismatch",
+            format!(
+                "foreground process path {} does not match profile runtime target {}",
+                foreground.process_path,
+                expected_exe.display()
+            ),
+            DenialEvidence::default(),
+        ));
+    }
+    if metadata_trimmed(&profile.metadata, KEY_RUNTIME_EVERQUEST_SERVER).is_none() {
+        return Err(denial(
+            profile,
+            foreground,
+            "live_server_name_missing",
+            format!("{KEY_RUNTIME_EVERQUEST_SERVER} metadata is required"),
+            DenialEvidence::default(),
+        ));
+    }
+
+    Ok(empty_supported_target_state(profile, foreground))
+}
+
+fn require_metadata_bool(
+    profile: &Profile,
+    foreground: &ForegroundContext,
+    key: &'static str,
+    reason: &'static str,
+) -> TargetPolicyResult<()> {
+    if metadata_bool(&profile.metadata, key) {
+        return Ok(());
+    }
+    Err(denial(
+        profile,
+        foreground,
+        reason,
+        format!("{key}=true metadata is required"),
+        DenialEvidence::default(),
+    ))
 }
 
 fn empty_supported_target_state(
@@ -929,6 +1023,63 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn supported_use_allows_operator_attended_live_server() {
+        let exe_path = PathBuf::from(
+            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
+        );
+        let profile = everquest_profile(&exe_path, true);
+        let foreground = foreground_for("eqgame.exe", &exe_path, "EverQuest");
+
+        let state = require_allow(evaluate_supported_use_with_optional_process(
+            &profile,
+            &foreground,
+            None,
+        ));
+
+        assert_eq!(state.profile_id, "everquest.live");
+        assert_eq!(
+            state.foreground_process_path,
+            exe_path.display().to_string()
+        );
+        assert!(state.world_path.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn supported_use_denies_live_server_without_operator_attended_metadata() {
+        let exe_path = PathBuf::from(
+            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
+        );
+        let profile = everquest_profile(&exe_path, false);
+        let foreground = foreground_for("eqgame.exe", &exe_path, "EverQuest");
+
+        let denial = require_denial(evaluate_supported_use_with_optional_process(
+            &profile,
+            &foreground,
+            None,
+        ));
+
+        assert_eq!(denial.reason, "operator_attended_required_missing");
+    }
+
+    #[test]
+    fn supported_use_denies_live_server_process_path_mismatch() {
+        let profile_path = PathBuf::from(
+            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
+        );
+        let foreground_path = PathBuf::from(r"C:\Temp\eqgame.exe");
+        let profile = everquest_profile(&profile_path, true);
+        let foreground = foreground_for("eqgame.exe", &foreground_path, "EverQuest");
+
+        let denial = require_denial(evaluate_supported_use_with_optional_process(
+            &profile,
+            &foreground,
+            None,
+        ));
+
+        assert_eq!(denial.reason, "process_path_mismatch");
+    }
+
     fn profile(
         world_path: &Path,
         logfile_path: &Path,
@@ -951,6 +1102,67 @@ mod tests {
         Profile {
             id: "luanti.minetest".to_owned(),
             label: "Luanti".to_owned(),
+            version: "1".to_owned(),
+            use_scope: ProfileUseScope::OperatorOwnedTest,
+            matches: Vec::new(),
+            mode: PerceptionMode::Auto,
+            capture: ProfileCapture {
+                target: ProfileCaptureTarget::ForegroundWindow,
+                min_update_interval_ms: 100,
+                cursor_visible: true,
+            },
+            detection: ProfileDetection {
+                model_id: None,
+                classes_of_interest: Vec::new(),
+                confidence_threshold: 0.5,
+                max_detections: 0,
+            },
+            ocr: ProfileOcr {
+                default_backend: synapse_core::OcrBackend::Auto,
+                regions: Vec::new(),
+                parser_config: BTreeMap::new(),
+            },
+            hud: Vec::new(),
+            keymap: BTreeMap::new(),
+            backends: ProfileBackends {
+                default: Backend::Auto,
+                keyboard_default: Backend::Auto,
+                mouse_default: Backend::Auto,
+                pad_default: Backend::Auto,
+            },
+            metadata,
+            event_extensions: Vec::new(),
+        }
+    }
+
+    fn everquest_profile(exe_path: &Path, operator_attended: bool) -> Profile {
+        let mut metadata = BTreeMap::new();
+        metadata.insert(KEY_LIVE_SERVER_ALLOWED.to_owned(), "true".to_owned());
+        metadata.insert(
+            KEY_OPERATOR_ATTENDED_REQUIRED.to_owned(),
+            operator_attended.to_string(),
+        );
+        metadata.insert(
+            KEY_OPERATOR_OWNED_CHARACTER_REQUIRED.to_owned(),
+            "true".to_owned(),
+        );
+        metadata.insert(KEY_FOREGROUND_ONLY.to_owned(), "true".to_owned());
+        metadata.insert(
+            KEY_NO_MEMORY_OR_PROTOCOL_HOOKS.to_owned(),
+            "true".to_owned(),
+        );
+        metadata.insert(KEY_NO_UNATTENDED_LOOPS.to_owned(), "true".to_owned());
+        metadata.insert(
+            KEY_RUNTIME_EVERQUEST_EXE.to_owned(),
+            exe_path.display().to_string(),
+        );
+        metadata.insert(
+            KEY_RUNTIME_EVERQUEST_SERVER.to_owned(),
+            "Frostreaver".to_owned(),
+        );
+        Profile {
+            id: "everquest.live".to_owned(),
+            label: "EverQuest".to_owned(),
             version: "1".to_owned(),
             use_scope: ProfileUseScope::OperatorOwnedTest,
             matches: Vec::new(),
@@ -1018,12 +1230,16 @@ mod tests {
     }
 
     fn foreground(path: &Path) -> ForegroundContext {
+        foreground_for("luanti.exe", path, "Luanti 5.16.1 [Multiplayer]")
+    }
+
+    fn foreground_for(process_name: &str, path: &Path, window_title: &str) -> ForegroundContext {
         ForegroundContext {
             hwnd: 7,
             pid: 42,
-            process_name: "luanti.exe".to_owned(),
+            process_name: process_name.to_owned(),
             process_path: path.display().to_string(),
-            window_title: "Luanti 5.16.1 [Multiplayer]".to_owned(),
+            window_title: window_title.to_owned(),
             window_bounds: Rect {
                 x: 0,
                 y: 0,
