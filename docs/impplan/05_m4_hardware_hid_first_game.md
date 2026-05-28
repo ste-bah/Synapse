@@ -812,63 +812,50 @@ Supporting evidence allowed:
 
 ---
 
-## 8. Happy Path And Edge-Case Tables
+## 8. Manual Happy-Path And Edge-Case Test Plan
 
-Issue #435 owns the final detailed M4 manual test matrix. The rows below are
-the minimum phase contract each implementation issue should align with.
+This section is the M4 manual test matrix owned by issue #435. Each row names a
+real trigger, the separate Source of Truth (SoT) the agent must read before and
+after the trigger, and the expected outcome. These rows are not scripts and do
+not authorize FSV automation. Supporting checks may exercise code paths, but M4
+shipping evidence comes from manually driving the real runtime surface and
+reading the listed physical SoT.
 
-### 8.1 Firmware and physical USB
+### 8.1 Happy paths
 
-| Case | Known trigger | Expected outcome | SoT read before/after |
+| ID | Trigger | Source of Truth to read before and after | Expected outcome |
 |---|---|---|---|
-| Happy | Flash bundled UF2 to Pico. | Device reboots as Synapse Pico HID + CDC ACM. | `Get-PnpDevice`, `Win32_SerialPort`, USB Enum registry, `RPI-RP2` volume disappearance/reappearance. |
-| Edge 1 | Invalid CRC frame. | Firmware NAKs, increments `crc_errors`, does not emit HID report. | Telemetry before/after plus external HID observer. |
-| Edge 2 | No host command for >1000 ms while key held. | Watchdog fires, all inputs released. | Telemetry `watchdog_fires` and external key/button state. |
-| Edge 3 | Unsupported command ID. | Firmware NAKs with unknown-command reason, keeps link alive. | Telemetry and next valid PING/PONG readback. |
-| Edge 4 | Bootloader flash flow. | `RPI-RP2` appears, UF2 copied, firmware re-enumerates. | Volume list, file copy target, post-flash `IDENTIFY`. |
+| H1 | Copy the bundled `pico-hid-x.y.z.uf2` to a Pico mounted as `RPI-RP2`. | `Get-CimInstance Win32_LogicalDisk`, `Get-PnpDevice -PresentOnly`, `Win32_SerialPort`, and `HKLM:\SYSTEM\CurrentControlSet\Enum\USB` for VID/PID rows. | The bootloader volume disappears, the board re-enumerates as Synapse Pico HID plus CDC ACM, and a COM port appears for the same USB instance. |
+| H2 | Run `synapse-mcp hid identify --port COMx` against the flashed Pico. | CLI JSON, `Win32_SerialPort` row for `COMx`, matching PnP USB instance, and firmware constants in `synapse-core`. | Exit code 0; JSON reports expected `fw_major`, `fw_minor`, `fw_patch`, build hash, VID `0x2E8A`, PID `0x1F50`, and advertised capabilities. |
+| H3 | Start `synapse-mcp --mode stdio --hardware-hid auto` with the flashed Pico attached. | Process command line, startup log, MCP health/observe response, `Win32_SerialPort`, and PnP USB rows. | Startup selects the hardware backend after IDENTIFY, logs the selected COM port, and does not silently fall back to software or ViGEm. |
+| H4 | Call real MCP `act_press` with `backend="hardware"` and key `w` while a text or hook target is focused. | External low-level keyboard hook or target text state, `CF_ACTION_LOG`, held-state snapshot, and firmware telemetry. | A physical HID KeyDown/KeyUp pair is observed, the target receives exactly one `w`, and the action audit row records hardware backend success. |
+| H5 | Call real MCP `act_aim` with `backend="hardware"`, style `snap`, and a known screen coordinate. | `GetCursorPos` before/after, action audit row, and firmware telemetry command counters. | The cursor lands within +/-1 px of the target and the audit row records the hardware relative-move path. |
+| H6 | Hold a key/button through hardware, then call real MCP `release_all`. | External HID observer or target state, action held-state snapshot, and firmware neutral report telemetry. | All keyboard, mouse, and gamepad reports return to neutral with no stuck inputs. |
+| H7 | Call real MCP `act_combo` for three hardware-backed steps at `0`, `50`, and `100` ms. | Reflex/audit rows, `CF_ACTION_LOG`, external HID timing observer, and target UI/game state. | The one-shot combo fires in order, uses the requested backend for each step, and measured step intervals match the schedule within the M4 tolerance. |
+| H8 | Call real MCP `act_run_shell` with an allowlisted `cmd.exe /c echo synapse-m4-shell-ok`. | MCP response, child process exit code, captured stdout/stderr bytes, process table, and action/safety log row. | Exit code 0; stdout is exactly the synthetic marker; stderr is empty; no truncation or timeout is reported. |
+| H9 | Call real MCP `act_launch` with an allowlisted Notepad launch and a Notepad title wait regex. | Process table, window enumeration/UIA tree, MCP response, and action/safety log row. | A Notepad PID/HWND is returned, the title regex matches an actual window, and the launched process exists independently of the return value. |
+| H10 | Bring Minecraft Java local single-player world to foreground and call real MCP `observe`. | Foreground process/window state, profile runtime state, observation JSON, screenshot/HUD readback, and game UI. | `minecraft.java` resolves, HUD fields populate, and the observation is tied to a local supported-use game window. |
+| H11 | In Minecraft Java single-player, call a profile-allowed action through the real action surface. | Profile policy decision log, `CF_ACTION_LOG`, foreground/window state, and visible game-state change. | The supported-use gate allows the action, the audit row records `use_scope=single_player`, and the game state changes as expected. |
+| H12 | After several hardware actions, call `GET_TELEMETRY` through the host gateway path. | Firmware telemetry before/after, `CF_ACTION_LOG`, and serial link state. | `commands_executed` increases by the known command count, error counters stay unchanged for clean traffic, and the serial link remains usable. |
 
-### 8.2 Host driver
+### 8.2 Edge cases
 
-| Case | Known trigger | Expected outcome | SoT read before/after |
+| ID | Trigger | Source of Truth to read before and after | Expected outcome |
 |---|---|---|---|
-| Happy | `hid identify --port COMx` on Synapse Pico. | Identity fields match core constants and firmware build. | CLI output plus independent COM/PnP read. |
-| Edge 1 | `--port COM_DOES_NOT_EXIST`. | `HID_PORT_NOT_FOUND`. | Port list before/after and CLI structured error. |
-| Edge 2 | Firmware major mismatch fixture or older firmware. | `HID_FIRMWARE_VERSION_MISMATCH`. | Identify response payload and surfaced error code. |
-| Edge 3 | Unplug during send. | Next hardware action fails fast with `ACTION_HID_PORT_DISCONNECTED`. | PnP removal, driver snapshot, action error, reconnect state. |
-| Edge 4 | Replug. | Auto-resume within 1 second. | PnP add, identify success, action success after reconnect. |
-
-### 8.3 Action hardware backend
-
-| Case | Known trigger | Expected outcome | SoT read before/after |
-|---|---|---|---|
-| Happy | `act_press` with backend `hardware` and key `w`. | Real keyboard HID down/up observed. | External low-level hook/UI target state plus action telemetry. |
-| Edge 1 | Hardware backend requested with no enablement. | Refuse with explicit backend-unavailable/disconnected code. | Startup config and MCP error data. |
-| Edge 2 | Absolute mouse move requested on hardware. | Documented relative split/fallback or structured rejection. | Action plan output and actual pointer/HID readback. |
-| Edge 3 | `release_all` while key/button/pad held. | Firmware neutralizes all reports. | HID observer and held-state snapshot before/after. |
-| Edge 4 | Queue/backpressure saturation. | `ACTION_QUEUE_FULL`, no hidden queue growth. | Actor queue metric/snapshot and error response. |
-
-### 8.4 MCP `act_combo`, `act_run_shell`, and `act_launch`
-
-| Case | Known trigger | Expected outcome | SoT read before/after |
-|---|---|---|---|
-| Happy combo | Three-step combo at 0/50/100 ms. | Audit shows one-shot combo fired in order. | Reflex audit DB/log and target UI/HID state. |
-| Happy shell | Allowlisted `cmd /c echo synapse-m4-shell-ok`. | Exit 0 and capped stdout exact string. | Process exit, stdout bytes, log entry. |
-| Happy launch | Allowlisted Notepad launch with title wait. | PID/HWND returned and window exists. | Process table and UIA/window enumeration. |
-| Edge 1 | Shell command outside allowlist. | `SAFETY_SHELL_DENIED_BY_POLICY`. | Startup allowlist and MCP error data. |
-| Edge 2 | Launch command line outside allowlist. | `SAFETY_LAUNCH_DENIED_BY_POLICY`. | Startup allowlist, MCP error data, and no process/file side effect. |
-| Edge 3 | Broad pattern `.*` at startup. | Startup refuses configuration. | CLI stderr/exit and no server listening. |
-| Edge 4 | Launch title wait regex never matches. | Process launch succeeds with `hwnd=null`, `matched_title=null`, and `reason="no_match_within_timeout"`. | MCP response, process table/log, and window enumeration. |
-| Edge 5 | Combo empty or non-monotonic steps. | `TOOL_PARAMS_INVALID` or schema-specific error. | MCP error and no audit/action side effect. |
-
-### 8.5 Minecraft profile and supported-use
-
-| Case | Known trigger | Expected outcome | SoT read before/after |
-|---|---|---|---|
-| Happy | Minecraft Java local world foreground. | Profile resolves, HUD fields populate, actions allowed. | Profile runtime state, observation JSON, game UI. |
-| Edge 1 | Unknown app/profile active. | Observation allowed, write/action denied. | Active profile state and `SAFETY_PROFILE_ACTION_DENIED`. |
-| Edge 2 | HUD frame with zero hearts/empty hunger. | Extractor returns expected boundary values. | Captured frame asset and observation fields. |
-| Edge 3 | Entity event `creeper` bbox width 100. | `creeper-imminent` emitted. | Event bus/log/audit readback. |
-| Edge 4 | Foreground changes from Minecraft to unknown app. | Scope transition suppresses reflex/action emission. | Foreground state, profile state, suppression log/error. |
+| E1 | Unplug the Pico during a hardware `act_press` or held key. | PnP removal event, `Win32_SerialPort` disappearance, external key state, reconnect snapshot/log, and action error row. | Held inputs are released or neutralized within the safety window, the next hardware action fails fast with `ACTION_HID_PORT_DISCONNECTED`, and reconnect begins without fallback. |
+| E2 | Run `hid identify` against firmware with a mismatched major version. | CLI exit code/stderr or JSON error, raw identify payload when available, and firmware version constants. | The command exits with the mismatch code path and surfaces `HID_FIRMWARE_VERSION_MISMATCH`; no hardware backend is enabled. |
+| E3 | Start the daemon with broad shell policy such as `--allow-shell ".*"`. | Process exit code, stderr/log output, and port/listening-state readback. | Startup fails closed with exit code 2 and no MCP server remains listening. |
+| E4 | Request `backend="hardware"` without `--hardware-hid` or a connected gateway. | Startup config, MCP error response, `CF_ACTION_LOG`, and target UI/input state. | The action returns `ACTION_BACKEND_UNAVAILABLE` and emits no software, ViGEm, or target-side fallback input. |
+| E5 | Run hardware auto-detect on a host with no matching Synapse Pico VID/PID. | `serialport`/`Win32_SerialPort` enumeration, `Get-PnpDevice`, USB Enum registry, and command/startup error. | The path returns `HID_PORT_NOT_FOUND` naming the expected VID/PID and leaves no hardware backend active. |
+| E6 | Send a valid frame with one CRC bit flipped. | Firmware telemetry `crc_errors`, link response bytes, and external HID observer. | Firmware returns `NAK_CRC_INVALID`, increments `crc_errors`, emits no HID report, and accepts the next valid frame. |
+| E7 | Hold a key, then stop sending host commands for longer than the watchdog timeout. | Firmware telemetry `watchdog_fires`, external key/button state, and host action/reconnect log. | Watchdog fires, internally performs `RELEASE_ALL`, and all observable reports return to neutral. |
+| E8 | Send an unsupported command ID over the serial protocol. | Link response bytes, firmware telemetry, and a follow-up valid `PING`/`GET_TELEMETRY` read. | Firmware NAKs with the unknown-command reason and keeps the link alive for the next valid command. |
+| E9 | Saturate the host action or HID send queue with more work than the configured capacity. | Queue/backpressure metric or snapshot, MCP error response, `CF_ACTION_LOG`, and memory/process state. | The path returns `ACTION_QUEUE_FULL` without unbounded queue growth or hidden action loss. |
+| E10 | Call `act_combo` with empty steps or non-monotonic `at_ms` values. | MCP error response, `CF_ACTION_LOG` row count before/after, and reflex registry/history state. | The tool fails with `TOOL_PARAMS_INVALID` or the schema-specific code and writes no combo/action side effect. |
+| E11 | Call `act_launch` for a command line outside the startup allowlist. | Process table before/after, MCP error response, action/safety log, and target filesystem if a file would be created. | The tool returns `SAFETY_LAUNCH_DENIED_BY_POLICY`, no new target process exists, and no target side effect appears. |
+| E12 | Call `act_run_shell` for a command outside the startup allowlist. | Process table before/after, MCP error response, stdout/stderr capture, action/safety log, and expected side-effect file path. | The tool returns `SAFETY_SHELL_DENIED_BY_POLICY`, no command output is produced, and the synthetic side-effect file remains absent. |
+| E13 | Change foreground from Minecraft Java to an unknown or unsupported app while a reflex/action path is active. | Foreground window readback, active profile state, reflex audit rows, action audit rows, and target UI/game state. | Scope transition suppresses new reflex/action emissions and records the policy-denied state. |
+| E14 | Load a profile with unknown or remote/server use scope, then call any action/write surface. | Profile registry/runtime state, MCP error response, action/reflex audit rows, and target game/log state. | Every action/write surface fails closed with `SAFETY_PROFILE_ACTION_DENIED` and no target state changes. |
 
 ---
 
