@@ -39,7 +39,7 @@ impl SynapseService {
             .m2_state
             .lock()
             .is_ok_and(|state| state.recording_enabled());
-        let m3_stub_count = crate::m3::m3_tool_stubs().len();
+        let m3_has_tools = !crate::m3::m3_tool_stubs().is_empty();
         let m3_scaffold_ready = self.m3_state.lock().is_ok_and(|state| {
             let _state_readback = (
                 state.db_path.as_ref(),
@@ -56,7 +56,7 @@ impl SynapseService {
                     .as_ref()
                     .map(CancellationToken::is_cancelled),
             );
-            state.scaffold_ready() && m3_stub_count == 16
+            state.scaffold_ready() && m3_has_tools
         });
         match (recording_enabled, m3_scaffold_ready) {
             (true, true) => {
@@ -712,6 +712,17 @@ mod scope_gate_tests {
         "act_launch",
         "reflex_register",
     ];
+
+    #[test]
+    fn instructions_advertise_m3_when_current_m3_tools_are_registered() -> anyhow::Result<()> {
+        let profiles = TempDir::new()?;
+        let service = service_with_profiles(profiles.path(), false)?;
+
+        assert_eq!(crate::m3::m3_tool_stubs().len(), 33);
+        assert!(service.instructions().contains("M3 scaffold"));
+
+        Ok(())
+    }
 
     #[test]
     fn action_scope_gate_denies_no_active_profile_before_dispatch() -> anyhow::Result<()> {

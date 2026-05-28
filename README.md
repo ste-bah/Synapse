@@ -148,13 +148,23 @@ For MCP clients, run stdio mode:
 synapse-mcp --mode stdio
 ```
 
+For issue work that needs a process/socket/log source of truth under repo
+control, run the loopback HTTP transport with an isolated DB and log directory:
+
+```bash
+SYNAPSE_BEARER_TOKEN=local-token synapse-mcp --mode http --bind 127.0.0.1:7700 --db .runs/issue/db
+```
+
 Inspect available flags:
 
 ```bash
 synapse-mcp --help
 ```
 
-The HTTP transport flag is present for the future surface but returns `NOT_YET_IMPLEMENTED` in the local M1 build.
+The pre-wired chat MCP tool is owned by the client process. If it reports
+`Transport closed`, read the configured child process, log, and binary hash
+SoTs; then use the repo-owned stdio or HTTP runtime path for manual FSV. See
+`docs/computergames/25_mcp_runtime_fsv_path.md`.
 
 ## Quick Demo
 
@@ -174,11 +184,15 @@ The health payload shape is:
   "version": "0.1.0",
   "build": "dev",
   "uptime_s": 0,
-  "subsystems": {}
+  "subsystems": {
+    "action": { "status": "ok" },
+    "storage": { "status": "initializing" }
+  }
 }
 ```
 
-`uptime_s` is monotonic and `build` is `dev` unless a build SHA is injected.
+`uptime_s` is monotonic, subsystem details vary by enabled runtime surface, and
+`build` is `dev` unless a build SHA is injected.
 
 ## Configure MCP Clients
 

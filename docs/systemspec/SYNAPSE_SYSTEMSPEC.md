@@ -1,6 +1,6 @@
 # Synapse Systemspec — Bundled Reference
 
-> Auto-generated 2026-05-27 by `docs/systemspec/bundle.ps1`. Source: the 16 individual `docs/systemspec/*.md` files, concatenated in order. In-bundle cross-references between systemspec files are rewritten to anchors; references to files outside the bundle (impplan, computergames, adr, source code) keep their original paths.
+> Auto-generated 2026-05-28 by `docs/systemspec/bundle.ps1`. Source: the 16 individual `docs/systemspec/*.md` files, concatenated in order. In-bundle cross-references between systemspec files are rewritten to anchors; references to files outside the bundle (impplan, computergames, adr, source code) keep their original paths.
 >
 > Re-run the script after editing any source file so the bundle stays in sync. The individual files remain the authoritative copies.
 
@@ -2018,13 +2018,16 @@ Implements `rmcp::ServerHandler` via `#[tool_handler(router = self.tool_router)]
 
 - name = `"synapse-mcp"`, version = `env!("CARGO_PKG_VERSION")` (= `"0.1.0"`)
 - capabilities: `ServerCapabilities::builder().enable_tools().build()`
-- instructions string varies by state (`instructions()` at `server.rs:470`):
+- instructions string varies by state (`instructions()` in
+  `server/context.rs`):
   - `"Synapse M1 perception MCP server with M2 action scaffold and M3 scaffold (recording enabled)"` if `M2State::recording_enabled() && m3_scaffold_ready`
   - `"... and M3 scaffold"` if only M3 ready
   - `"... (recording enabled)"` if only recording on
   - else `"... with M2 action scaffold"`
 
-`m3_scaffold_ready` requires `M3State::scaffold_ready() && m3_tool_stubs().len() == 32` (the original 15 M3 tools plus the M5 profile-registry/audit/profile-authoring tools that live in the M3 module because they use profile and storage state).
+`m3_scaffold_ready` requires `M3State::scaffold_ready()` and a non-empty
+`m3_tool_stubs()` registry. It must not depend on a stale hard-coded tool count:
+M3/M5 tool additions should keep MCP discovery advertising the M3 scaffold.
 
 ### 1.3 Health payload
 
