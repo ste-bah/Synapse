@@ -737,32 +737,32 @@ code exists; it is done only when the issue is closed with manual FSV evidence.
 | #432 | blocked | H-03 `hid_high_volume`, 10k mouse moves no drops; waits on physical RP2040 attach per #487. |
 | #433 | closed | H-04 HID protocol parser fuzz target as supporting evidence. |
 | #434 | blocked | H-05 one-hour hardware reconnect soak, unplug/replug x100; waits on physical RP2040 attach per #487. |
-| #435 | open | H-06 M4 manual happy-path and edge-case test plan. |
-| #436 | open | H-07 HID error codes in `synapse-core::error_codes`. |
-| #437 | open | H-08 PRD 09 stale-claim sweep. |
+| #435 | closed | H-06 M4 manual happy-path and edge-case test plan. |
+| #436 | closed | H-07 HID error codes in `synapse-core::error_codes`. |
+| #437 | closed | H-08 PRD 09 stale-claim sweep. |
 
 ### 6.10 Block I - CLI, release assets, hardware docs
 
 | Issue | State | Work item |
 |---|---|---|
-| #438 | open | I-01 `hid identify` subcommand. |
-| #439 | open | I-02 `hid flash` subcommand. |
-| #440 | open | I-03 bundled `pico-hid-x.y.z.uf2`. |
-| #441 | open | I-04 hardware procurement docs. |
-| #442 | open | I-05 hardware troubleshooting docs. |
+| #438 | blocked | I-01 `hid identify` subcommand; waits on physical RP2040 attach for real `IDENTIFY_RESP` readback. |
+| #439 | blocked | I-02 `hid flash` subcommand; waits on physical RP2040 attach or `RPI-RP2` BOOTSEL volume for copy/re-enumerate/IDENTIFY readback. |
+| #440 | closed | I-03 bundled `pico-hid-x.y.z.uf2`. |
+| #441 | closed | I-04 hardware procurement docs. |
+| #442 | closed | I-05 hardware troubleshooting docs. |
 
 ### 6.11 Block J - release and docs
 
 | Issue | State | Work item |
 |---|---|---|
-| #443 | open | J-01 M4 changelog release notes. |
-| #444 | open | J-02 rewrite this M4 implementation plan. |
-| #445 | open | J-03 PRD 05 tool surface patch. |
-| #446 | open | J-04 PRD 06 data schema patch. |
-| #447 | open | J-05 M4 tools-list snapshot, 33 tools sorted. |
-| #448 | open | J-06 M4 default-resolution values. |
+| #443 | closed | J-01 M4 changelog release notes. |
+| #444 | closed | J-02 rewrite this M4 implementation plan. |
+| #445 | closed | J-03 PRD 05 tool surface patch. |
+| #446 | closed | J-04 PRD 06 data schema patch. |
+| #447 | closed | J-05 M4 tools-list snapshot, 33 tools sorted. |
+| #448 | closed | J-06 M4 default-resolution values. |
 | #449 | open | J-07 tag `v0.1.0-m4` and publish release assets. |
-| #450 | open | J-08 firmware build prereqs and Pico flash procedure in README. |
+| #450 | closed | J-08 firmware build prereqs and Pico flash procedure in README. |
 
 ---
 
