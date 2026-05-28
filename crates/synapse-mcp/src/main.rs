@@ -82,6 +82,8 @@ struct Cli {
     max_subscriptions: NonZeroUsize,
     #[arg(long, env = "SYNAPSE_HARDWARE_HID", value_name = "PORT_OR_AUTO")]
     hardware_hid: Option<String>,
+    #[arg(long)]
+    reset_hardware_consent: bool,
     #[arg(
         long,
         value_name = "REGEX",
@@ -174,8 +176,28 @@ async fn run() -> anyhow::Result<ExitCode> {
     );
 
     let m2_config = cli.m2_config();
-    safety::agreement::ensure_hardware_hid_agreement(&m2_config)
-        .context("ensure hardware HID safety agreement")?;
+    if let Err(error) =
+        safety::agreement::ensure_hardware_hid_agreement(&m2_config, cli.reset_hardware_consent)
+    {
+        if error
+            .downcast_ref::<safety::hardware_consent::HardwareConsentRefused>()
+            .is_some()
+        {
+            tracing::error!(
+                code = safety::hardware_consent::HardwareConsentRefused::code(),
+                reason = safety::hardware_consent::HardwareConsentRefused::reason(),
+                "SAFETY_PROFILE_ACTION_DENIED reason=hardware_consent_refused"
+            );
+            eprintln!(
+                "synapse-mcp error: {} reason={}",
+                safety::hardware_consent::HardwareConsentRefused::code(),
+                safety::hardware_consent::HardwareConsentRefused::reason()
+            );
+            drop(telemetry_guard);
+            return Ok(ExitCode::from(2));
+        }
+        return Err(error).context("ensure hardware HID safety agreement");
+    }
     let m3_config = cli.m3_config();
     let m4_config = match cli.m4_config() {
         Ok(config) => config,

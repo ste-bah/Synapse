@@ -98,6 +98,12 @@ pub(super) fn apply_agreement_acl(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub(super) fn prepare_agreement_for_reset(path: &Path) -> anyhow::Result<()> {
+    let user_sid = current_user_sid_string().context("read current Windows user SID")?;
+    let sddl = reset_sddl(&user_sid);
+    set_acl_from_sddl(path, &sddl)
+}
+
 pub(super) fn read_agreement_acl(path: &Path) -> anyhow::Result<AgreementAclReadback> {
     let user_sid = current_user_sid_string().context("read current Windows user SID")?;
     let expected = expected_sddl(&user_sid);
@@ -132,11 +138,10 @@ pub(super) fn read_agreement_acl(path: &Path) -> anyhow::Result<AgreementAclRead
 #[cfg(test)]
 pub(super) fn restore_current_user_full_control_for_test(path: &Path) -> anyhow::Result<()> {
     let user_sid = current_user_sid_string().context("read current Windows user SID")?;
-    let sddl = format!("D:P(A;;FA;;;SY)(A;;FA;;;{user_sid})");
+    let sddl = reset_sddl(&user_sid);
     set_acl_from_sddl(path, &sddl)
 }
 
-#[cfg(test)]
 fn set_acl_from_sddl(path: &Path, sddl: &str) -> anyhow::Result<()> {
     let sddl_wide = to_wide_null(OsStr::new(sddl));
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
@@ -244,6 +249,10 @@ fn expected_sddl(user_sid: &str) -> String {
     // current-user read access; with a protected DACL, non-listed trustees
     // are denied by Windows' normal DACL evaluation.
     format!("D:PAI(A;;FA;;;SY)(A;;FR;;;{user_sid})")
+}
+
+fn reset_sddl(user_sid: &str) -> String {
+    format!("D:P(A;;FA;;;SY)(A;;FA;;;{user_sid})")
 }
 
 fn security_descriptor_to_sddl(

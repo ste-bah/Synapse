@@ -248,6 +248,7 @@ CLI flags on `synapse-mcp` (parsed in `main.rs::Cli`, full table: [03_configurat
 --max-subscriptions <COUNT>     [env: SYNAPSE_MAX_SUBSCRIPTIONS]
                                 default: synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO
 --hardware-hid <PORT_OR_AUTO>   [env: SYNAPSE_HARDWARE_HID]
+--reset-hardware-consent
 ```
 
 ## 6. Runtime directory layout

@@ -10,7 +10,7 @@ fn agreement_schema_round_trip_matches_expected_synthetic_port() -> anyhow::Resu
     let dir = TempDir::new()?;
     let path = dir.path().join("agreement.json");
     let before_exists = path.exists();
-    let record = create_agreement(&path, "COM427")?;
+    let record = write_agreement(&path, "COM427")?;
     let bytes = fs::read(&path)?;
     let after: AgreementRecord = serde_json::from_slice(&bytes)?;
     println!("readback=agreement_schema edge=happy before_exists={before_exists} after={after:?}");
@@ -23,11 +23,68 @@ fn agreement_schema_round_trip_matches_expected_synthetic_port() -> anyhow::Resu
 fn agreement_accepts_existing_ack_for_changed_configured_port() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let path = dir.path().join("agreement.json");
-    let before = create_agreement(&path, "COM427")?;
-    let after = ensure_hardware_hid_agreement_at_path(&path, "COM428")?;
+    let before = write_agreement(&path, "COM427")?;
+    let after = ensure_hardware_hid_agreement_at_path(
+        &path,
+        "COM428",
+        false,
+        HardwareConsentInput::Provided(HARDWARE_HID_ACK_PHRASE),
+    )?;
     println!(
         "readback=agreement_schema edge=changed_configured_port before={before:?} after={after:?}"
     );
+    assert_eq!(after.hardware_hid.port, "COM427");
+    Ok(())
+}
+
+#[test]
+fn agreement_create_requires_exact_hardware_consent() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("agreement.json");
+    let before_exists = path.exists();
+    let Err(error) = create_agreement(
+        &path,
+        "COM426",
+        HardwareConsentInput::Provided("I AUTHORIZE HARDWARE INPUT "),
+    ) else {
+        bail!("expected consent refusal");
+    };
+    let after_exists = path.exists();
+    println!(
+        "readback=agreement_schema edge=bad_consent before_exists={before_exists} after_exists={after_exists} after_error={error:#}"
+    );
+    assert!(
+        error
+            .downcast_ref::<super::super::hardware_consent::HardwareConsentRefused>()
+            .is_some(),
+        "{error:#}"
+    );
+    assert!(!after_exists);
+
+    let record = create_agreement(
+        &path,
+        "COM426",
+        HardwareConsentInput::Provided(HARDWARE_HID_ACK_PHRASE),
+    )?;
+    let after_bytes = fs::read(&path)?;
+    let after: AgreementRecord = serde_json::from_slice(&after_bytes)?;
+    println!("readback=agreement_schema edge=good_consent after={after:?}");
+    assert_eq!(after, record);
+    Ok(())
+}
+
+#[test]
+fn reset_hardware_consent_rewrites_agreement_for_new_port() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let path = dir.path().join("agreement.json");
+    let before = write_agreement(&path, "COM426")?;
+    let after = ensure_hardware_hid_agreement_at_path(
+        &path,
+        "COM427",
+        true,
+        HardwareConsentInput::Provided(HARDWARE_HID_ACK_PHRASE),
+    )?;
+    println!("readback=agreement_schema edge=reset before={before:?} after={after:?}");
     assert_eq!(after.hardware_hid.port, "COM427");
     Ok(())
 }
@@ -71,7 +128,12 @@ fn windows_acl_readback_matches_agreement_contract() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let path = dir.path().join("agreement.json");
     let before_exists = path.exists();
-    let after = ensure_hardware_hid_agreement_at_path(&path, "COM427")?;
+    let after = ensure_hardware_hid_agreement_at_path(
+        &path,
+        "COM427",
+        false,
+        HardwareConsentInput::Provided(HARDWARE_HID_ACK_PHRASE),
+    )?;
     let acl = read_agreement_acl(&path)?;
     println!(
         "readback=agreement_acl edge=happy before_exists={before_exists} after={after:?} acl={acl:?}"

@@ -91,6 +91,16 @@ Type 'i agree' to continue. (Decline by closing this prompt.)
 
 Acknowledgment is recorded in `%APPDATA%\synapse\agreement.json` with a hash of the prompt text and a timestamp. A new major version may invalidate the previous acknowledgment.
 
+Hardware HID has a separate first-use confirmation because it physically injects
+keyboard, mouse, and gamepad input into the OS. Starting with
+`--hardware-hid <port|auto>` on a configured host prompts for the exact phrase
+`I AUTHORIZE HARDWARE INPUT` before `%APPDATA%\synapse\agreement.json` is
+written. Any other response exits with
+`SAFETY_PROFILE_ACTION_DENIED reason=hardware_consent_refused` and leaves the
+agreement file absent. Subsequent runs skip the prompt after the agreement file
+validates; `--reset-hardware-consent` deletes the existing agreement and
+requires the phrase again.
+
 ---
 
 ## 6. Permission responses

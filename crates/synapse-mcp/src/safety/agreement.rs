@@ -9,11 +9,15 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::m2::{M2ServiceConfig, recording_backend_enabled};
+use crate::{
+    m2::{M2ServiceConfig, recording_backend_enabled},
+    safety::hardware_consent::{
+        HARDWARE_HID_ACK_PHRASE, HardwareConsentInput, require_hardware_hid_consent,
+    },
+};
 
 pub const AGREEMENT_VERSION: u32 = 1;
 pub const AGREEMENT_PATH_ENV: &str = "SYNAPSE_AGREEMENT_PATH";
-pub const HARDWARE_HID_ACK_PHRASE: &str = "I understand Synapse hardware HID can generate real keyboard, mouse, and gamepad input on this computer.";
 const DEFAULT_SUPPORTED_USE_SCOPES: [&str; 2] = ["productivity", "single_player"];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -52,6 +56,7 @@ impl AgreementRecord {
 
 pub fn ensure_hardware_hid_agreement(
     config: &M2ServiceConfig,
+    reset_hardware_consent: bool,
 ) -> anyhow::Result<Option<AgreementRecord>> {
     let Some(port) = config.hardware_hid_readback() else {
         return Ok(None);
@@ -64,7 +69,7 @@ pub fn ensure_hardware_hid_agreement(
         );
         return Ok(None);
     }
-    ensure_hardware_hid_agreement_for_port(&port).map(Some)
+    ensure_hardware_hid_agreement_for_port(&port, reset_hardware_consent).map(Some)
 }
 
 pub fn agreement_path() -> anyhow::Result<PathBuf> {
@@ -85,28 +90,42 @@ pub fn ack_phrase_sha256() -> String {
     hex_lower(&digest)
 }
 
-fn ensure_hardware_hid_agreement_for_port(port: &str) -> anyhow::Result<AgreementRecord> {
+fn ensure_hardware_hid_agreement_for_port(
+    port: &str,
+    reset_hardware_consent: bool,
+) -> anyhow::Result<AgreementRecord> {
     #[cfg(windows)]
     {
-        ensure_hardware_hid_agreement_at_path(&agreement_path()?, port)
+        ensure_hardware_hid_agreement_at_path(
+            &agreement_path()?,
+            port,
+            reset_hardware_consent,
+            HardwareConsentInput::Interactive,
+        )
     }
     #[cfg(not(windows))]
     {
-        let _port = port;
-        Ok(AgreementRecord::for_hardware_hid_port(_port))
+        let _reset_hardware_consent = reset_hardware_consent;
+        require_hardware_hid_consent(port, HardwareConsentInput::Interactive)?;
+        Ok(AgreementRecord::for_hardware_hid_port(port))
     }
 }
 
 fn ensure_hardware_hid_agreement_at_path(
     path: &Path,
     port: &str,
+    reset_hardware_consent: bool,
+    consent_input: HardwareConsentInput,
 ) -> anyhow::Result<AgreementRecord> {
     if port.trim().is_empty() {
         bail!("hardware HID agreement port must not be empty");
     }
+    if reset_hardware_consent {
+        reset_existing_agreement(path)?;
+    }
     let record = match read_existing_agreement(path)? {
         Some(record) => record,
-        None => create_agreement(path, port)?,
+        None => create_agreement(path, port, consent_input)?,
     };
     validate_agreement(&record)?;
     #[cfg(windows)]
@@ -126,6 +145,23 @@ fn ensure_hardware_hid_agreement_at_path(
     Ok(record)
 }
 
+fn reset_existing_agreement(path: &Path) -> anyhow::Result<()> {
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => {
+            #[cfg(windows)]
+            {
+                prepare_agreement_for_reset(path)
+                    .with_context(|| format!("prepare {} for reset", path.display()))?;
+            }
+            fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
+            Ok(())
+        }
+        Ok(_) => bail!("agreement path {} is not a file", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("read metadata {}", path.display())),
+    }
+}
+
 fn read_existing_agreement(path: &Path) -> anyhow::Result<Option<AgreementRecord>> {
     match fs::read(path) {
         Ok(bytes) => {
@@ -140,7 +176,16 @@ fn read_existing_agreement(path: &Path) -> anyhow::Result<Option<AgreementRecord
     }
 }
 
-fn create_agreement(path: &Path, port: &str) -> anyhow::Result<AgreementRecord> {
+fn create_agreement(
+    path: &Path,
+    port: &str,
+    consent_input: HardwareConsentInput,
+) -> anyhow::Result<AgreementRecord> {
+    require_hardware_hid_consent(port, consent_input)?;
+    write_agreement(path, port)
+}
+
+fn write_agreement(path: &Path, port: &str) -> anyhow::Result<AgreementRecord> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -219,6 +264,11 @@ pub fn read_agreement_acl(path: &Path) -> anyhow::Result<AgreementAclReadback> {
 #[cfg(windows)]
 fn apply_agreement_acl(path: &Path) -> anyhow::Result<()> {
     windows_acl::apply_agreement_acl(path)
+}
+
+#[cfg(windows)]
+fn prepare_agreement_for_reset(path: &Path) -> anyhow::Result<()> {
+    windows_acl::prepare_agreement_for_reset(path)
 }
 
 #[cfg(windows)]

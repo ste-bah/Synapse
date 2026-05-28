@@ -6,6 +6,7 @@ use synapse_core::error_codes;
 use crate::m3::SharedM3State;
 
 pub mod agreement;
+pub mod hardware_consent;
 
 const OPERATOR_RELEASE_ALL_TIMEOUT: Duration = Duration::from_millis(50);
 

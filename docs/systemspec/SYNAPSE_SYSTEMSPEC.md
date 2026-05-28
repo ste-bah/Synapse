@@ -334,6 +334,7 @@ CLI flags on `synapse-mcp` (parsed in `main.rs::Cli`, full table: [03_configurat
 --max-subscriptions <COUNT>     [env: SYNAPSE_MAX_SUBSCRIPTIONS]
                                 default: synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO
 --hardware-hid <PORT_OR_AUTO>   [env: SYNAPSE_HARDWARE_HID]
+--reset-hardware-consent
 ```
 
 ## 6. Runtime directory layout
@@ -1046,7 +1047,8 @@ All flags are defined in `crates/synapse-mcp/src/main.rs::Cli` (clap derive).
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | `bool` | `false` | same as bool flags above | Forces the reflex scheduler into degraded-latency mode (test-only knob). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | `Option<u64>` | `None` | unsigned integer | If set, applies one synthetic free-byte sample at startup to validate disk-pressure responder paths (`Db::run_pressure_check_with_free_bytes_sample`). |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | `NonZeroUsize` | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | `>=1` | SSE event subscription cap on the bus. |
-| `--hardware-hid` | `SYNAPSE_HARDWARE_HID` | `Option<String>` | `None` | `auto` or a serial port name such as `COM7` | Enables the hardware HID backend. `auto` enumerates matching Synapse Pico serial ports and proves identity; a port value opens that port directly. Missing/no-match fails startup with `HID_PORT_NOT_FOUND`; omission leaves `Backend::Hardware` fail-closed through `ACTION_BACKEND_UNAVAILABLE`. |
+| `--hardware-hid` | `SYNAPSE_HARDWARE_HID` | `Option<String>` | `None` | `auto` or a serial port name such as `COM7` | Enables the hardware HID backend. First use requires the exact console phrase `I AUTHORIZE HARDWARE INPUT`; refusal exits 2 with `SAFETY_PROFILE_ACTION_DENIED reason=hardware_consent_refused` before the backend starts. Accepted consent writes `%APPDATA%/synapse/agreement.json`; `auto` enumerates matching Synapse Pico serial ports and proves identity; a port value opens that port directly. Missing/no-match fails startup with `HID_PORT_NOT_FOUND`; omission leaves `Backend::Hardware` fail-closed through `ACTION_BACKEND_UNAVAILABLE`. |
+| `--reset-hardware-consent` | — | `bool` | `false` | flag | Deletes the existing hardware HID agreement file, then requires the exact hardware consent phrase again before startup continues. |
 
 CLI examples (`README.md`):
 
@@ -1148,7 +1150,14 @@ Sentinel values `NONE` / `DENY_ALL` produce an empty grants set (every M3 tool w
 - Token-bucket per-backend rate limits: `SOFTWARE_RATE_LIMIT_PER_S`, `VIGEM_RATE_LIMIT_PER_S` (`crates/synapse-action/src/rate_limit.rs`). Over-rate emits return `ACTION_RATE_LIMITED`.
 - Action emitter queue capacity: `ACTION_QUEUE_CAPACITY = 256` (`crates/synapse-action/src/handle.rs`). Backpressure → `ACTION_QUEUE_FULL`.
 
-### 4.9 Telemetry
+### 4.9 Hardware HID Consent
+- If `--hardware-hid <port|auto>` is set and `SYNAPSE_MCP_RECORDING_BACKEND` is not active, startup checks `%APPDATA%/synapse/agreement.json` (or `SYNAPSE_AGREEMENT_PATH` when set) before constructing the action backend.
+- Missing agreement triggers the startup console prompt. The response must exactly equal `I AUTHORIZE HARDWARE INPUT` after line-ending removal only; leading/trailing spaces, case changes, empty input, or EOF are refused.
+- Refusal logs and prints `SAFETY_PROFILE_ACTION_DENIED reason=hardware_consent_refused`, exits 2, and leaves the agreement file absent.
+- A valid agreement records schema version, `acknowledged_at`, the accepted `hardware_hid.port`, the SHA-256 of the phrase, and `supported_use_scopes=["productivity","single_player"]`; Windows readback verifies the protected ACL before continuing.
+- `--reset-hardware-consent` removes the existing agreement first, then follows the same prompt/write/ACL-readback path.
+
+### 4.10 Telemetry
 - Log directory must be writable: probe writes `.synapse-write-probe` and deletes it; failure → `TELEMETRY_LOG_DIR_NOT_WRITABLE`.
 - Max log directory size default: `DEFAULT_MAX_DIR_BYTES = 500 * 1024 * 1024` (500 MiB), keep `DEFAULT_KEEP_DAYS = 7`, GC default interval `6 h` (overridable by `SYNAPSE_LOG_GC_INTERVAL_S`).
 

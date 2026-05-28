@@ -119,7 +119,7 @@ async fn hardware_hid_missing_literal_fails_startup_with_hid_code() -> anyhow::R
     let _guard = cli_mode_test_lock().lock().await;
     let dir = TempDir::new()?;
     let agreement_path = dir.path().join("agreement.json");
-    let output = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
         .args([
             "--mode",
             "stdio",
@@ -127,11 +127,19 @@ async fn hardware_hid_missing_literal_fails_startup_with_hid_code() -> anyhow::R
             "SYNAPSE_MISSING_PORT_393",
         ])
         .env("SYNAPSE_AGREEMENT_PATH", &agreement_path)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
-        .output()
-        .await?;
+        .spawn()?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin
+            .write_all(b"I AUTHORIZE HARDWARE INPUT\n")
+            .await
+            .context("write hardware consent phrase")?;
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().await?;
 
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8(output.stderr)?;
@@ -141,6 +149,32 @@ async fn hardware_hid_missing_literal_fails_startup_with_hid_code() -> anyhow::R
     if agreement_path.exists() {
         restore_test_acl_for_cleanup(&agreement_path)?;
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn hardware_hid_refuses_missing_or_wrong_consent_before_backend_startup() -> anyhow::Result<()>
+{
+    let _guard = cli_mode_test_lock().lock().await;
+    let dir = TempDir::new()?;
+    let agreement_path = dir.path().join("agreement.json");
+    let output = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
+        .args(["--mode", "stdio", "--hardware-hid", "COM426"])
+        .env("SYNAPSE_LOG_DIR", dir.path())
+        .env("SYNAPSE_AGREEMENT_PATH", &agreement_path)
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .output()
+        .await?;
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr)?;
+    assert!(stderr.contains("SAFETY_PROFILE_ACTION_DENIED"), "{stderr}");
+    assert!(stderr.contains("hardware_consent_refused"), "{stderr}");
+    assert!(!agreement_path.exists());
+    let logs = read_logs(dir.path())?;
+    assert!(logs.contains("hardware_consent_refused"), "{logs}");
     Ok(())
 }
 
@@ -165,6 +199,7 @@ async fn help_lists_m4_policy_flags_and_envs() -> anyhow::Result<()> {
     assert!(stdout.contains("SYNAPSE_ALLOW_LAUNCH"), "{stdout}");
     assert!(stdout.contains("--hardware-hid <PORT_OR_AUTO>"), "{stdout}");
     assert!(stdout.contains("SYNAPSE_HARDWARE_HID"), "{stdout}");
+    assert!(stdout.contains("--reset-hardware-consent"), "{stdout}");
     Ok(())
 }
 
