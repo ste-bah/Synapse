@@ -761,7 +761,7 @@ code exists; it is done only when the issue is closed with manual FSV evidence.
 | #446 | closed | J-04 PRD 06 data schema patch. |
 | #447 | closed | J-05 M4 tools-list snapshot, 33 tools sorted. |
 | #448 | closed | J-06 M4 default-resolution values. |
-| #449 | open | J-07 tag `v0.1.0-m4` and publish release assets. |
+| #449 | blocked | J-07 tag `v0.1.0-m4` and publish release assets; waits on blocked M4 hardware/demo gates before release publication. |
 | #450 | closed | J-08 firmware build prereqs and Pico flash procedure in README. |
 
 ---
