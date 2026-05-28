@@ -20,6 +20,12 @@ const KEY_OPERATOR_OWNED_CHARACTER_REQUIRED: &str =
 const KEY_FOREGROUND_ONLY: &str = "supported_use.foreground_only";
 const KEY_NO_MEMORY_OR_PROTOCOL_HOOKS: &str = "supported_use.no_memory_or_protocol_hooks";
 const KEY_NO_UNATTENDED_LOOPS: &str = "supported_use.no_unattended_loops";
+const KEY_NO_SOCIAL_OR_ECONOMY_AUTOMATION: &str = "supported_use.no_social_or_economy_automation";
+const KEY_NO_UNATTENDED_SCALED_OPERATION: &str = "supported_use.no_unattended_scaled_operation";
+const KEY_NO_ACCOUNT_OR_BILLING_AUTOMATION: &str = "supported_use.no_account_or_billing_automation";
+const KEY_NO_PVP_GROUP_GUILD_RAID_AUTOMATION: &str =
+    "supported_use.no_pvp_group_guild_raid_automation";
+const KEY_NO_DESTRUCTIVE_UI_AUTOMATION: &str = "supported_use.no_destructive_ui_automation";
 const KEY_LAUNCH_TARGET: &str = "launch.target";
 const KEY_LAUNCH_WORLD: &str = "launch.world";
 const KEY_LAUNCH_LOGFILE: &str = "launch.logfile";
@@ -127,7 +133,7 @@ pub(super) fn ensure_supported_use_allows(
         ));
     }
 
-    match evaluate_supported_use(&profile, foreground) {
+    match evaluate_supported_use_with_optional_process_for_tool(&profile, foreground, tool, None) {
         Ok(state) => {
             tracing::info!(
                 code = "SAFETY_PROFILE_TARGET_ALLOWED",
@@ -148,13 +154,6 @@ pub(super) fn ensure_supported_use_allows(
     }
 }
 
-fn evaluate_supported_use(
-    profile: &Profile,
-    foreground: &ForegroundContext,
-) -> TargetPolicyResult<SupportedTargetState> {
-    evaluate_supported_use_with_optional_process(profile, foreground, None)
-}
-
 #[cfg(test)]
 fn evaluate_supported_use_with_process(
     profile: &Profile,
@@ -164,16 +163,31 @@ fn evaluate_supported_use_with_process(
     evaluate_supported_use_with_optional_process(profile, foreground, Some(process_state))
 }
 
+#[cfg(test)]
 fn evaluate_supported_use_with_optional_process(
     profile: &Profile,
     foreground: &ForegroundContext,
+    process_state: Option<ForegroundProcessState>,
+) -> TargetPolicyResult<SupportedTargetState> {
+    evaluate_supported_use_with_optional_process_for_tool(
+        profile,
+        foreground,
+        "act_press",
+        process_state,
+    )
+}
+
+fn evaluate_supported_use_with_optional_process_for_tool(
+    profile: &Profile,
+    foreground: &ForegroundContext,
+    tool: &'static str,
     process_state: Option<ForegroundProcessState>,
 ) -> TargetPolicyResult<SupportedTargetState> {
     let local_world_only = metadata_bool(&profile.metadata, KEY_LOCAL_WORLD_ONLY);
     let remote_allowed = metadata_bool(&profile.metadata, KEY_REMOTE_SERVER_ALLOWED);
     let live_server_allowed = metadata_bool(&profile.metadata, KEY_LIVE_SERVER_ALLOWED);
     if live_server_allowed {
-        return evaluate_operator_attended_live_server(profile, foreground);
+        return evaluate_operator_attended_live_server(profile, foreground, tool);
     }
     if !local_world_only && remote_allowed {
         return Ok(empty_supported_target_state(profile, foreground));
@@ -274,6 +288,7 @@ fn evaluate_supported_use_with_optional_process(
 fn evaluate_operator_attended_live_server(
     profile: &Profile,
     foreground: &ForegroundContext,
+    tool: &'static str,
 ) -> TargetPolicyResult<SupportedTargetState> {
     require_metadata_bool(
         profile,
@@ -305,6 +320,45 @@ fn evaluate_operator_attended_live_server(
         KEY_NO_UNATTENDED_LOOPS,
         "no_unattended_loops_missing",
     )?;
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_NO_SOCIAL_OR_ECONOMY_AUTOMATION,
+        "no_social_or_economy_automation_missing",
+    )?;
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_NO_UNATTENDED_SCALED_OPERATION,
+        "no_unattended_scaled_operation_missing",
+    )?;
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_NO_ACCOUNT_OR_BILLING_AUTOMATION,
+        "no_account_or_billing_automation_missing",
+    )?;
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_NO_PVP_GROUP_GUILD_RAID_AUTOMATION,
+        "no_pvp_group_guild_raid_automation_missing",
+    )?;
+    require_metadata_bool(
+        profile,
+        foreground,
+        KEY_NO_DESTRUCTIVE_UI_AUTOMATION,
+        "no_destructive_ui_automation_missing",
+    )?;
+    if let Some(detail) = live_server_denied_tool_detail(tool) {
+        return Err(denial(
+            profile,
+            foreground,
+            "live_server_tool_not_foreground_input",
+            detail.to_owned(),
+            DenialEvidence::default(),
+        ));
+    }
 
     if let Some(expected_exe) = optional_expanded_path(&profile.metadata, KEY_RUNTIME_EVERQUEST_EXE)
         && !same_path_text(&expected_exe, Path::new(&foreground.process_path))
@@ -332,6 +386,30 @@ fn evaluate_operator_attended_live_server(
     }
 
     Ok(empty_supported_target_state(profile, foreground))
+}
+
+fn live_server_denied_tool_detail(tool: &str) -> Option<&'static str> {
+    match tool {
+        "act_type" => Some(
+            "act_type is denied for operator-attended live-server profiles because text entry can drive chat, social, economy, account, or command surfaces",
+        ),
+        "act_clipboard" => Some(
+            "mutating act_clipboard is denied for operator-attended live-server profiles because clipboard text can be pasted into chat, social, economy, account, or command surfaces",
+        ),
+        "act_combo" => Some(
+            "act_combo is denied for operator-attended live-server profiles; use individually prompted foreground actions with source-of-truth readback",
+        ),
+        "act_run_shell" => Some(
+            "act_run_shell is denied for operator-attended live-server profiles because it is not foreground game input",
+        ),
+        "act_launch" => Some(
+            "act_launch is denied for operator-attended live-server profiles because live gameplay must use the already foreground game window",
+        ),
+        "reflex_register" => Some(
+            "reflex_register is denied for operator-attended live-server profiles because background reflex dispatch is not supervised foreground input",
+        ),
+        _ => None,
+    }
 }
 
 fn require_metadata_bool(
@@ -1080,6 +1158,52 @@ mod tests {
         assert_eq!(denial.reason, "process_path_mismatch");
     }
 
+    #[test]
+    fn supported_use_denies_live_server_text_clipboard_shell_launch_combo_and_reflex_tools() {
+        let exe_path = PathBuf::from(
+            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
+        );
+        let profile = everquest_profile(&exe_path, true);
+        let foreground = foreground_for("eqgame.exe", &exe_path, "EverQuest");
+
+        for tool in [
+            "act_type",
+            "act_clipboard",
+            "act_combo",
+            "act_run_shell",
+            "act_launch",
+            "reflex_register",
+        ] {
+            let denial = require_denial(evaluate_supported_use_with_optional_process_for_tool(
+                &profile,
+                &foreground,
+                tool,
+                None,
+            ));
+
+            assert_eq!(denial.reason, "live_server_tool_not_foreground_input");
+            assert!(denial.detail.contains(tool));
+        }
+    }
+
+    #[test]
+    fn supported_use_denies_live_server_without_social_economy_boundary_metadata() {
+        let exe_path = PathBuf::from(
+            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
+        );
+        let mut profile = everquest_profile(&exe_path, true);
+        profile.metadata.remove(KEY_NO_SOCIAL_OR_ECONOMY_AUTOMATION);
+        let foreground = foreground_for("eqgame.exe", &exe_path, "EverQuest");
+
+        let denial = require_denial(evaluate_supported_use_with_optional_process(
+            &profile,
+            &foreground,
+            None,
+        ));
+
+        assert_eq!(denial.reason, "no_social_or_economy_automation_missing");
+    }
+
     fn profile(
         world_path: &Path,
         logfile_path: &Path,
@@ -1152,6 +1276,26 @@ mod tests {
             "true".to_owned(),
         );
         metadata.insert(KEY_NO_UNATTENDED_LOOPS.to_owned(), "true".to_owned());
+        metadata.insert(
+            KEY_NO_SOCIAL_OR_ECONOMY_AUTOMATION.to_owned(),
+            "true".to_owned(),
+        );
+        metadata.insert(
+            KEY_NO_UNATTENDED_SCALED_OPERATION.to_owned(),
+            "true".to_owned(),
+        );
+        metadata.insert(
+            KEY_NO_ACCOUNT_OR_BILLING_AUTOMATION.to_owned(),
+            "true".to_owned(),
+        );
+        metadata.insert(
+            KEY_NO_PVP_GROUP_GUILD_RAID_AUTOMATION.to_owned(),
+            "true".to_owned(),
+        );
+        metadata.insert(
+            KEY_NO_DESTRUCTIVE_UI_AUTOMATION.to_owned(),
+            "true".to_owned(),
+        );
         metadata.insert(
             KEY_RUNTIME_EVERQUEST_EXE.to_owned(),
             exe_path.display().to_string(),

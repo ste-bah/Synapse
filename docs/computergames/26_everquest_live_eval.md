@@ -44,6 +44,10 @@ The allowed evaluation surface is narrow:
 - Play the fresh level 1 character long enough to prove the system can reach
   level 2.
 - Record profile/audit evidence through Synapse storage.
+- Permit only individually prompted foreground action surfaces for the live
+  profile. Broad text entry, clipboard mutation, shell/launch, scheduled combo,
+  and reflex registration are denied because they can drive chat,
+  social/economy/account, destructive UI, or background automation paths.
 
 The following are out of scope:
 
@@ -54,6 +58,8 @@ The following are out of scope:
 - Scaled unattended account operation or multi-account operation.
 - Credential, billing, subscription, marketplace, or account-management
   actions.
+- Destructive UI actions such as deleting characters/items, changing account
+  settings, or accepting irreversible dialogs.
 - Claiming level-up success from an action return value alone.
 
 ## Sources Of Truth
@@ -101,6 +107,12 @@ hotbar slots (`hotbar1` through `hotbar10`). Runtime action work should prefer
 semantic alias and the resolved key/chord. Direct `act_press` remains valid for
 explicit edge checks, but the profile-keymap path is the normal EverQuest
 action surface for manual FSV.
+
+`open_chat` is retained only as a focus-state edge/recovery alias. Chat content
+entry through `act_type`, mutating clipboard, or other text-injection paths is
+not a supported live EverQuest action surface. If chat focus is accidentally
+entered, recover with foreground-visible UI readback and non-text input such as
+`menu`/`Esc`.
 
 Before claiming an alias effect, manually read the visible UI/log/storage SoT
 before the trigger, call the real MCP `act_keymap` tool while `eqgame.exe` is
