@@ -122,13 +122,27 @@ Do not expose this as `open_chat` or any general chat/recovery alias.
 
 `everquest_loc_probe` is the only reviewed live text-like EverQuest command
 surface. It takes no command string and no free-text parameters; it emits only
-the literal `/loc` key sequence after foreground/profile/logging preconditions,
-then proves the result by reading the physical EQ log tail. The coordinate
-payload is stored in EverQuest display order as `display_y`, `display_x`, and
-`display_z`. A successful probe must add a `Your Location is ...` log line and
-must not add a new `You say` line. Unknown parameters, disabled `Log=0`, non-EQ
-foreground, missing/malformed location output, or any player-say output are
-hard failures.
+the literal `/loc` key sequence after foreground/profile/logging preconditions
+and after #524's visible chat input pollution gate reads trusted
+`everquest.chat_input_state` with `text_present=false`. The gate reads the
+active `UI_<character>_<server>_<class>.ini` `[MainChat]` layout, foreground
+window bounds, OCR-scored `Windowed`/resolution/scaled-resolution coordinate
+candidates, and a WinRT OCR crop of the bottom chat input strip; unsafe states
+fail closed before key emission and are recorded in `CF_ACTION_LOG`.
+The probe then proves the result by reading the physical EQ log tail. The
+coordinate payload is stored in EverQuest display order as `display_y`,
+`display_x`, and `display_z`. A successful probe must add a `Your Location is
+...` log line and must not add a new `You say` line. Unknown parameters,
+disabled `Log=0`, non-EQ foreground, visible unsent chat text, untrusted chat
+state, missing/malformed location output, or any player-say output are hard
+failures.
+
+Manual FSV for the chat gate must read the physical UI file, visible OCR crop,
+EQ log `You say` count, and `CF_ACTION_LOG` rows before and after. Required
+edges are: visible unsent buffer text denies before key emission; invisible or
+low-confidence OCR fails closed; layout/foreground disagreement fails closed;
+and the post-trigger `You say` detector still catches pollution if the preflight
+is bypassed by an unexpected game state.
 
 `everquest_current_state` is the compact world-state bridge for #510. It does
 not send gameplay input. It reads foreground/profile/HUD state, the active EQ

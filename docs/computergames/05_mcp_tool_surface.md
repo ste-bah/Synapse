@@ -9,12 +9,13 @@
    tool set, #460 adds local audit-export consent/bundle tools, and #462 adds
    six local profile-authoring candidate tools, and #468 adds the read-only
    registry/audit inspector, #499 adds a profile-keymap action alias tool,
-   #508 adds the narrow EverQuest `/loc` probe, #510 adds the compact
+   #508 adds the narrow EverQuest `/loc` probe, #524 adds the visible
+   EverQuest chat-input pollution readback/gate, #510 adds the compact
    EverQuest current-state estimator, #526 adds compact EverQuest outcome
    ingest, #528 adds EverQuest hazard/safe memory record and consult tools,
    #527 adds EverQuest route-plan rows, #525 adds EverQuest current-map sensor
    rows, and #531 adds EverQuest action-prior sample/scorecard tools, bringing
-   the live surface to 61. Any
+   the live surface to 62. Any
    further agent-facing tools require an ADR-approved cap change.
    Overlapping tools merge. Profile and parameter knobs are the escape hatches.
 2. **One tool, one verb.** No `do_everything(action_kind, ...)` mega-tools.
@@ -26,8 +27,9 @@
 
 The first 30 tools below are the live M3 baseline. #499 adds `act_keymap` as a
 profile-keymap action alias, #508 adds `everquest_loc_probe` as a literal
-EverQuest `/loc` readback tool, #510 adds `everquest_current_state` as the
-compact world-state row writer/readback tool, #526 adds
+EverQuest `/loc` readback tool, #524 adds `everquest_chat_input_state` as the
+visible chat-buffer pollution readback that also gates `/loc`, #510 adds
+`everquest_current_state` as the compact world-state row writer/readback tool, #526 adds
 `everquest_outcome_ingest`, #528 adds `everquest_memory_record` plus
 `everquest_memory_consult`, #527 adds `everquest_route_plan`, #525 adds
 `everquest_map_sensor`, and #531 adds `everquest_action_prior_record` plus
@@ -98,22 +100,25 @@ future `tools/list` snapshots in #447/#448.
 | 50 | `audit_intelligence_query` | read | summarizes profile-linked audit outcomes |
 | 51 | `audit_export_consent_set` | write/read | writes local consent state to `CF_KV` and reads it back |
 | 52 | `audit_export_bundle` | read/write | writes a local redacted audit bundle after consent verification |
-| 53 | `everquest_loc_probe` | write/read | sends literal `/loc` to `everquest.live` and verifies the EQ log coordinate line |
-| 54 | `everquest_current_state` | write/read | fuses foreground, EQ log, map, HUD, and action audit into a compact `CF_KV` row and reads it back |
-| 55 | `everquest_map_sensor` | write/read | stores one current-map sensor/calibration row from visible map evidence, `/loc`, and local map files |
-| 56 | `everquest_outcome_ingest` | write/read | parses bounded EQ log bytes into compact redacted outcome rows with offset/hash readback |
-| 57 | `everquest_memory_record` | write/read | stores one compact hazard or safe-area memory row with source refs, stale/conflict handling, and exact readback |
-| 58 | `everquest_memory_consult` | write/read | consults hazard/safe memories for one candidate action and persists the planner decision row |
-| 59 | `everquest_route_plan` | write/read | stores one bounded route plan from current state to a local map landmark/zone line without movement |
-| 60 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
-| 61 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
+| 53 | `everquest_loc_probe` | write/read | sends literal `/loc` to `everquest.live` only after the visible chat-input pollution gate passes, then verifies the EQ log coordinate line |
+| 54 | `everquest_chat_input_state` | read | reads `MainChat` UI layout plus OCR crop to produce compact `everquest.chat_input_state` |
+| 55 | `everquest_current_state` | write/read | fuses foreground, EQ log, map, HUD, and action audit into a compact `CF_KV` row and reads it back |
+| 56 | `everquest_map_sensor` | write/read | stores one current-map sensor/calibration row from visible map evidence, `/loc`, and local map files |
+| 57 | `everquest_outcome_ingest` | write/read | parses bounded EQ log bytes into compact redacted outcome rows with offset/hash readback |
+| 58 | `everquest_memory_record` | write/read | stores one compact hazard or safe-area memory row with source refs, stale/conflict handling, and exact readback |
+| 59 | `everquest_memory_consult` | write/read | consults hazard/safe memories for one candidate action and persists the planner decision row |
+| 60 | `everquest_route_plan` | write/read | stores one bounded route plan from current state to a local map landmark/zone line without movement |
+| 61 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
+| 62 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
 
-M3 live count: 30 tools. Current live count: 61
+M3 live count: 30 tools. Current live count: 62
 tools.
 
 Deferred ideas from earlier drafts (`describe` and `read_hud`) are still not
 live M3/M4 agent-facing tools. `act_keymap` is the #499 profile-keymap alias
 addition; `everquest_loc_probe` is the #508 literal `/loc` readback tool;
+`everquest_chat_input_state` is the #524 visible chat input pollution state
+tool and preflight source for text-like EverQuest commands;
 `everquest_current_state` is the #510 current-state row writer/readback tool;
 `everquest_outcome_ingest` is the #526 compact outcome row writer/readback
 tool;
@@ -582,16 +587,48 @@ separate game/log/storage readback can support an action-effect claim.
 
 `everquest_loc_probe` is deliberately not a general chat or command surface. It
 accepts no command text or parameters, emits only the literal `/loc` key
-sequence for the active `everquest.live` foreground profile, then tails the
+sequence for the active `everquest.live` foreground profile only after the
+visible chat input pollution gate reads `text_present=false`, then tails the
 physical EverQuest log from the pre-trigger byte offset. Success requires a
-new `Your Location is Y, X, Z` line and `you_say_count=0`; otherwise the tool
-fails closed and writes the deny/error row to `CF_ACTION_LOG`.
+new `Your Location is Y, X, Z` line, `you_say_count=0`, and the pre-dispatch
+`chat_input_state` readback; otherwise the tool fails closed and writes the
+deny/error row to `CF_ACTION_LOG`.
 
 Manual FSV must read the EQ log path, byte offset, location count, and `You
-say` count before and after the trigger, plus the `CF_ACTION_LOG` started/ok or
-denied rows through `storage_inspect`. Disabled logging, non-EQ foreground,
-unknown parameters, malformed or absent location output, and any player-say
-output are failure cases, not fallbacks.
+say` count before and after the trigger; read the visible chat input OCR crop
+and `UI_<character>_<server>_<class>.ini` `MainChat` section; plus read the
+`CF_ACTION_LOG` started/ok or denied rows through `storage_inspect` or an
+audit readback. Disabled logging, non-EQ foreground, visible unsent chat text,
+untrusted chat state, unknown parameters, malformed or absent location output,
+and any player-say output are failure cases, not fallbacks.
+
+### 3.13b1 `everquest_chat_input_state`
+
+```json
+{
+  "name": "everquest_chat_input_state",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}
+```
+
+`everquest_chat_input_state` reads the foreground EverQuest window, active
+character UI layout file, and every `[MainChat]` coordinate mode (`Windowed`,
+resolution-specific, and scaled resolution-specific candidates). It selects
+only a candidate with visible WinRT OCR proof, then OCRs the bottom chat input
+strip derived from that visible layout. It returns compact row-kind
+`everquest.chat_input_state` with `visible`, `text_present`, `confidence`,
+`decision`, optional `denial_reason`, `source_region`, foreground proof, layout
+file SHA-256/line refs, OCR status/confidence, and source refs. It does not
+persist or return raw chat text.
+
+Manual FSV must read the physical UI layout file and visible OCR crop before
+calling the real MCP tool, then separately inspect the same crop/layout state.
+Edge reads must include visible unsent text, missing or low-confidence OCR or
+invisible region, and layout/foreground disagreement. Text-like EverQuest tools
+must fail closed unless this state is visible, trusted, and `text_present=false`.
 
 ### 3.13c `everquest_current_state`
 

@@ -36,7 +36,7 @@ Comprehensive technical reference for the Synapse MCP server, produced by readin
 
 ## Read order
 
-1. [01_system_overview.md](#file-01) — architecture map, tech stack, 61-tool inventory, error hierarchy
+1. [01_system_overview.md](#file-01) — architecture map, tech stack, 62-tool inventory, error hierarchy
 2. [02_source_code_map.md](#file-02) — file tree with per-file descriptions, dep graph, entry-point traces
 3. [03_configuration.md](#file-03) — CLI flags, env vars, validation, all numeric defaults
 4. [04_storage_layer.md](#file-04) — RocksDB schema (11 CFs), schema sentinel, TTL filter, GC, disk pressure
@@ -2279,7 +2279,7 @@ The disabling step persists `StoredReflexAudit` rows with `error_code = REFLEX_D
 
 ## 8. Tool list snapshot
 
-The full list of 54 declared tools is in [13_mcp_tool_reference.md](#file-13). They are: `health`, `observe`, `find`, `read_text`, `set_capture_target`, `set_perception_mode`, `act_click`, `act_type`, `act_press`, `act_keymap`, `act_aim`, `act_drag`, `act_scroll`, `act_pad`, `act_clipboard`, `release_all`, `subscribe`, `subscribe_cancel`, `reflex_register`, `reflex_cancel`, `reflex_list`, `reflex_history`, `profile_list`, `profile_activate`, `profile_authoring_generate`, `profile_authoring_list`, `profile_authoring_inspect`, `profile_authoring_accept`, `profile_authoring_reject`, `profile_authoring_export`, `profile_quality_refresh`, `profile_registry_search`, `profile_registry_inspect`, `profile_registry_report`, `profile_registry_install`, `profile_registry_disable`, `profile_registry_export`, `profile_registry_import`, `profile_registry_rollback`, `audit_intelligence_query`, `audit_export_consent_set`, `audit_export_bundle`, `replay_record`, `audio_tail`, `audio_transcribe`, `storage_inspect`, `storage_put_probe_rows`, `storage_gc_once`, `storage_pressure_sample`, `act_combo`, `act_run_shell`, `act_launch`, `everquest_loc_probe`, `everquest_current_state` — note the M3 module set lives in `m3_tool_stubs()` (length-asserted at 33 in `instructions()`).
+The full live tool inventory is in [13_mcp_tool_reference.md](#file-13) and is pinned by the `m4_tools_list` snapshot. Avoid repeating the full list here so this transport overview does not drift when new EverQuest/M5 tools are added.
 
 
 ---
@@ -3909,14 +3909,14 @@ Open M4 work (per `docs/impplan/05_m4_hardware_hid_first_game.md`):
 
 - `firmware/pico-hid/` — standalone RP2040 firmware project excluded from the root Cargo workspace; remaining firmware issues close only with real device evidence.
 - `synapse-hid-host` — serial driver with discovery, connect/IDENTIFY, CRC16 framing, pipeline/backpressure, and reconnect paths. `Backend::Hardware` uses `HardwareBackend` when `--hardware-hid <port|auto>` connects successfully, otherwise it fails closed through `HardwareUnavailableBackend`.
-- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 -> 33; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`; #508/#510/#525/#526/#527/#528/#531 add the EverQuest `/loc`, current-state, map-sensor, outcome, route, memory, and action-prior tools, bringing the live surface to 61.
+- `act_combo`, `act_run_shell`, `act_launch` — three M4 tools that bring the live MCP tool count from 30 -> 33; #499 adds `act_keymap` for profile keymap aliases; M5 profile-registry/audit work adds `profile_quality_refresh`, six `profile_authoring_*` candidate tools, eight `profile_registry_*` tools including the report inspector and rollback, `audit_intelligence_query`, `audit_export_consent_set`, and `audit_export_bundle`; #508/#524/#510/#525/#526/#527/#528/#531 add the EverQuest `/loc`, visible chat-input state, current-state, map-sensor, outcome, route, memory, and action-prior tools, bringing the live surface to 62.
 - `minecraft.java` profile (the first game profile) — fifth bundled profile, validated against a single-player creative world per `15_roadmap_and_milestones.md` §6.
 - M3 hold-over items still open: per-subscriber `subscribe.buffer_size` (currently hard-pinned to 4096); persistent writers for `CF_EVENTS`/`CF_OBSERVATIONS`/`CF_SESSIONS`/`CF_TELEMETRY`/`CF_PROCESS_HISTORY`/`CF_KV` (`CF_REFLEX_AUDIT` and `CF_ACTION_LOG` have live writers); audio detector → SSE-bus sink integration. Profile HUD fields now run through `observe`; standalone `read_hud` remains deferred. VLM `describe` and Florence-2 remain M5.
 
 ## 3. Tools delivered vs planned
 
 PRD `docs/computergames/05_mcp_tool_surface.md` started from a 30-tool M3
-baseline and now records the approved 61-tool live surface after M4/M5,
+baseline and now records the approved 62-tool live surface after M4/M5,
 profile-registry/audit, and EverQuest world-model expansion. Current build:
 
 | # | Tool | Milestone | Status | Note |
@@ -4163,7 +4163,7 @@ Source files covered:
 - `crates/synapse-mcp/src/m3/{audio, audit_export, permissions, profile, profile_authoring, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 61 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 62 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -4338,16 +4338,30 @@ preflight ran.
 ## 9b. `everquest_loc_probe`
 
 **Description:** "Send the literal EverQuest /loc command to the foreground everquest.live window and verify the appended EQ log coordinate line"
-**Side effects:** Emits only the fixed `/`, `l`, `o`, `c`, `enter` keyboard sequence when `eqgame.exe` is foreground under `everquest.live`, then reads the physical EQ log tail.
+**Side effects:** Emits only the fixed `/`, `l`, `o`, `c`, `enter` keyboard sequence when `eqgame.exe` is foreground under `everquest.live` and the visible chat input state is trusted with `text_present=false`, then reads the physical EQ log tail.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | (none) | `{}` | no | `{}` | `deny_unknown_fields`; any parameter is `TOOL_PARAMS_INVALID` |
 
-**Returns:** `EverQuestLocProbeResponse { ok, command, coordinate_order, log_path, start_offset, next_offset, file_len_bytes, bytes_read, event_count, you_say_count, location, elapsed_ms }`, where `location` carries `display_y`, `display_x`, `display_z`, `log_timestamp`, and `summary`.
-**Errors:** `SAFETY_PROFILE_ACTION_DENIED`, `ACTION_TARGET_INVALID` with reasons such as `active_profile_mismatch`, `focused_text_entry_not_empty`, `active_log_unavailable`, `log_tail_failed`, `chat_pollution_detected`, or `location_log_line_absent`.
+**Returns:** `EverQuestLocProbeResponse { ok, command, coordinate_order, log_path, start_offset, next_offset, file_len_bytes, bytes_read, event_count, you_say_count, location, chat_input_state, elapsed_ms }`, where `location` carries `display_y`, `display_x`, `display_z`, `log_timestamp`, and `summary`. `chat_input_state` is the pre-dispatch `everquest.chat_input_state` readback used to prove no visible unsent chat text was present before key emission.
+**Errors:** `SAFETY_PROFILE_ACTION_DENIED`, `ACTION_TARGET_INVALID` with reasons such as `active_profile_mismatch`, `chat_input_state_not_safe`, `focused_text_entry_not_empty`, `active_log_unavailable`, `log_tail_failed`, `chat_pollution_detected`, or `location_log_line_absent`.
 
-Manual FSV must read the physical EQ log byte offset, location count, and `You say` count before and after the trigger, then read `CF_ACTION_LOG` through `storage_inspect` for the started/ok or denied rows. Automated tests are only supporting evidence.
+Manual FSV must read the physical EQ log byte offset, location count, and `You say` count before and after the trigger, read the visible chat input OCR crop and `UI_<character>_<server>_<class>.ini` `[MainChat]` section before key emission, then read `CF_ACTION_LOG` through `storage_inspect` or an audit readback for the started/ok or denied rows. Automated tests are only supporting evidence.
+
+## 9b1. `everquest_chat_input_state`
+
+**Description:** "Read the visible EverQuest chat input pollution state from the foreground window, UI layout file, and OCR crop"
+**Side effects:** none. Reads the foreground EverQuest window, active character UI layout file, every `[MainChat]` coordinate mode (`Windowed`, resolution-specific, and scaled resolution-specific candidates), visible OCR proof for the selected layout, and a WinRT OCR crop of the bottom chat input strip.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| (none) | `{}` | no | `{}` | `deny_unknown_fields`; any parameter is `TOOL_PARAMS_INVALID` |
+
+**Returns:** `EverQuestChatInputStateResponse { ok, chat_input_state }`. `chat_input_state` has row kind `everquest.chat_input_state` and compact fields: `visible`, `text_present`, `confidence`, `decision`, optional `denial_reason`, `source_region`, `source_mode`, `text_len_estimate`, `word_count`, `ocr_status`, `ocr_confidence`, foreground proof, `[MainChat]` layout proof with file SHA-256/line range, and source refs. It does not persist or return raw chat text.
+**Errors:** only structural MCP/schema errors. Unsafe or untrusted chat state returns `ok=false` with `decision`/`denial_reason` so text-like tools can fail closed before emitting keys.
+
+Manual FSV must read the physical UI layout file and visible OCR crop before calling the real MCP tool, then separately inspect the same crop/layout state. Edge reads must include visible unsent text, missing/low-confidence OCR or invisible region, and layout/foreground disagreement.
 
 ## 9c. `everquest_current_state`
 
@@ -5350,7 +5364,7 @@ Source files covered:
 - `m3_reflex_cancel_tool.rs`, `m3_reflex_history_tool.rs`, `m3_reflex_list_tool.rs`, `m3_reflex_register_tool.rs` — reflex CRUD
 - `m3_replay_record_tool.rs` — replay JSONL writer
 - `m3_subscribe_tool.rs` — subscribe + cancel
-- `m3_tools_list.rs` / `m4_tools_list.rs` — `tools/list` exposes the current 61-tool surface, including #499 `act_keymap`, M5 profile-registry/audit tools, #462 `profile_authoring_*`, #468 `profile_registry_report`, `profile_registry_rollback`, #460 `audit_export_*`, and the EverQuest world-model tools through `everquest_action_prior_scorecard`
+- `m3_tools_list.rs` / `m4_tools_list.rs` — `tools/list` exposes the current 62-tool surface, including #499 `act_keymap`, M5 profile-registry/audit tools, #462 `profile_authoring_*`, #468 `profile_registry_report`, `profile_registry_rollback`, #460 `audit_export_*`, and the EverQuest world-model tools through `everquest_chat_input_state` and `everquest_action_prior_scorecard`
 - `sigint_clean_exit.rs` — Ctrl-C / Ctrl-Break shuts the daemon down within deadline
 
 ### 2.5 `synapse-models` (1 file)

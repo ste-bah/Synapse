@@ -15,7 +15,7 @@ Source files covered:
 - `crates/synapse-mcp/src/m3/{audio, audit_export, permissions, profile, profile_authoring, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 61 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 62 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -190,16 +190,30 @@ preflight ran.
 ## 9b. `everquest_loc_probe`
 
 **Description:** "Send the literal EverQuest /loc command to the foreground everquest.live window and verify the appended EQ log coordinate line"
-**Side effects:** Emits only the fixed `/`, `l`, `o`, `c`, `enter` keyboard sequence when `eqgame.exe` is foreground under `everquest.live`, then reads the physical EQ log tail.
+**Side effects:** Emits only the fixed `/`, `l`, `o`, `c`, `enter` keyboard sequence when `eqgame.exe` is foreground under `everquest.live` and the visible chat input state is trusted with `text_present=false`, then reads the physical EQ log tail.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | (none) | `{}` | no | `{}` | `deny_unknown_fields`; any parameter is `TOOL_PARAMS_INVALID` |
 
-**Returns:** `EverQuestLocProbeResponse { ok, command, coordinate_order, log_path, start_offset, next_offset, file_len_bytes, bytes_read, event_count, you_say_count, location, elapsed_ms }`, where `location` carries `display_y`, `display_x`, `display_z`, `log_timestamp`, and `summary`.
-**Errors:** `SAFETY_PROFILE_ACTION_DENIED`, `ACTION_TARGET_INVALID` with reasons such as `active_profile_mismatch`, `focused_text_entry_not_empty`, `active_log_unavailable`, `log_tail_failed`, `chat_pollution_detected`, or `location_log_line_absent`.
+**Returns:** `EverQuestLocProbeResponse { ok, command, coordinate_order, log_path, start_offset, next_offset, file_len_bytes, bytes_read, event_count, you_say_count, location, chat_input_state, elapsed_ms }`, where `location` carries `display_y`, `display_x`, `display_z`, `log_timestamp`, and `summary`. `chat_input_state` is the pre-dispatch `everquest.chat_input_state` readback used to prove no visible unsent chat text was present before key emission.
+**Errors:** `SAFETY_PROFILE_ACTION_DENIED`, `ACTION_TARGET_INVALID` with reasons such as `active_profile_mismatch`, `chat_input_state_not_safe`, `focused_text_entry_not_empty`, `active_log_unavailable`, `log_tail_failed`, `chat_pollution_detected`, or `location_log_line_absent`.
 
-Manual FSV must read the physical EQ log byte offset, location count, and `You say` count before and after the trigger, then read `CF_ACTION_LOG` through `storage_inspect` for the started/ok or denied rows. Automated tests are only supporting evidence.
+Manual FSV must read the physical EQ log byte offset, location count, and `You say` count before and after the trigger, read the visible chat input OCR crop and `UI_<character>_<server>_<class>.ini` `[MainChat]` section before key emission, then read `CF_ACTION_LOG` through `storage_inspect` or an audit readback for the started/ok or denied rows. Automated tests are only supporting evidence.
+
+## 9b1. `everquest_chat_input_state`
+
+**Description:** "Read the visible EverQuest chat input pollution state from the foreground window, UI layout file, and OCR crop"
+**Side effects:** none. Reads the foreground EverQuest window, active character UI layout file, every `[MainChat]` coordinate mode (`Windowed`, resolution-specific, and scaled resolution-specific candidates), visible OCR proof for the selected layout, and a WinRT OCR crop of the bottom chat input strip.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| (none) | `{}` | no | `{}` | `deny_unknown_fields`; any parameter is `TOOL_PARAMS_INVALID` |
+
+**Returns:** `EverQuestChatInputStateResponse { ok, chat_input_state }`. `chat_input_state` has row kind `everquest.chat_input_state` and compact fields: `visible`, `text_present`, `confidence`, `decision`, optional `denial_reason`, `source_region`, `source_mode`, `text_len_estimate`, `word_count`, `ocr_status`, `ocr_confidence`, foreground proof, `[MainChat]` layout proof with file SHA-256/line range, and source refs. It does not persist or return raw chat text.
+**Errors:** only structural MCP/schema errors. Unsafe or untrusted chat state returns `ok=false` with `decision`/`denial_reason` so text-like tools can fail closed before emitting keys.
+
+Manual FSV must read the physical UI layout file and visible OCR crop before calling the real MCP tool, then separately inspect the same crop/layout state. Edge reads must include visible unsent text, missing/low-confidence OCR or invisible region, and layout/foreground disagreement.
 
 ## 9c. `everquest_current_state`
 

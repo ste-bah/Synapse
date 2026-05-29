@@ -125,8 +125,9 @@ not additions to the agent-facing 33-tool count. M5 subsequently added
 `profile_registry_*` tools including `profile_registry_rollback`,
 `audit_intelligence_query`, and #460 `audit_export_consent_set` /
 `audit_export_bundle`. The EverQuest world-model work then added `/loc`,
-current-state, map-sensor, outcome, route, memory, and action-prior tools,
-bringing the current approved live surface to 61 agent-facing tools.
+visible chat-input state, current-state, map-sensor, outcome, route, memory,
+and action-prior tools, bringing the current approved live surface to 62
+agent-facing tools.
 
 ### 1.3 Firmware state
 
