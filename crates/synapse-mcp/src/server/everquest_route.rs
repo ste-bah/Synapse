@@ -999,6 +999,7 @@ fn floor_route_nodes(
         y: target_landmark.map_y,
         z: target_landmark.map_z,
     };
+    let route_node_count = nodes.len();
     let start_index = nodes.len();
     nodes.push(MapRouteNode {
         location: start_coord.clone(),
@@ -1013,8 +1014,20 @@ fn floor_route_nodes(
         source_line_number: target_landmark.source_line_number,
     });
     adjacency.push(Vec::new());
-    connect_nearest_route_nodes(start_index, &start_coord, &nodes, &mut adjacency)?;
-    connect_nearest_route_nodes(target_index, &target_coord, &nodes, &mut adjacency)?;
+    connect_nearest_route_nodes(
+        start_index,
+        &start_coord,
+        &nodes,
+        &mut adjacency,
+        route_node_count,
+    )?;
+    connect_nearest_route_nodes(
+        target_index,
+        &target_coord,
+        &nodes,
+        &mut adjacency,
+        route_node_count,
+    )?;
     let route_indices = dijkstra_path(&adjacency, start_index, target_index)?;
     let path_nodes = route_indices
         .into_iter()
@@ -1052,10 +1065,12 @@ fn connect_nearest_route_nodes(
     location: &EverQuestMapCoord,
     nodes: &[MapRouteNode],
     adjacency: &mut [Vec<(usize, f64)>],
+    route_node_count: usize,
 ) -> Option<()> {
     let mut candidates = nodes
         .iter()
         .enumerate()
+        .filter(|(candidate_index, _)| *candidate_index < route_node_count)
         .filter(|(candidate_index, _)| *candidate_index != index)
         .map(|(candidate_index, node)| (candidate_index, distance(location, &node.location)))
         .filter(|(_, candidate_distance)| *candidate_distance <= FLOOR_ROUTE_CONNECT_RADIUS)
@@ -1802,6 +1817,27 @@ mod tests {
     }
 
     #[test]
+    fn z_level_route_uses_map_lines_when_current_is_near_target() {
+        let mut params = params(
+            "near-target-floor-route",
+            Some("to_Nektulos_Forest"),
+            Some("nektulos"),
+        );
+        params.max_waypoints = MAX_WAYPOINTS;
+        let source = source_state(Some("neriaka"), Some(location(-65.9, -47.98, 19.51)));
+        let row = route_plan_row(&params, &source, &near_target_floor_graph());
+
+        assert_eq!(row.decision, "route_ready");
+        assert!(row.waypoints.len() > 2);
+        assert!(
+            row.waypoints
+                .iter()
+                .any(|waypoint| waypoint.label.starts_with("map_line_"))
+        );
+        assert!(waypoint_max_step(&row.waypoints) <= MAX_GUIDANCE_STEP_DISTANCE);
+    }
+
+    #[test]
     fn z_level_route_abstains_without_map_line_path() {
         let params = params(
             "floor-route-missing",
@@ -2022,6 +2058,22 @@ mod tests {
         };
         graph.edges[0].location = graph.landmarks[1].location.clone();
         graph.segments = vec![segment(10.0, 0.0, 0.0, 270.0, 0.0, 20.0, 10)];
+        graph
+    }
+
+    fn near_target_floor_graph() -> EverQuestZoneGraph {
+        let mut graph = graph();
+        graph.segments = vec![
+            segment(
+                -111.9156, -13.6874, 28.6167, -62.7222, -55.6562, 16.1981, 1760,
+            ),
+            segment(
+                -140.5446, -13.6457, 28.6260, -111.9156, -13.6874, 28.6167, 1762,
+            ),
+            segment(
+                -140.2500, -39.2313, 28.6260, -140.5446, -13.6457, 28.6260, 1763,
+            ),
+        ];
         graph
     }
 
