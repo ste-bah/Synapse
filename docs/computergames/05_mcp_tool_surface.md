@@ -839,6 +839,18 @@ target, zone, or location return `abstain_state_unknown`.
       "target_name": {"type": "string"},
       "target_level": {"type": "integer"},
       "target_con_summary": {"type": "string"},
+      "combat_readiness": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "health_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+          "mana_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+          "is_sitting": {"type": "boolean"},
+          "rest_state": {"type": "string"},
+          "confidence": {"type": "number", "default": 0.0},
+          "source_summary": {"type": "string"}
+        }
+      },
       "state_row_key": {"type": "string", "default": "everquest/current_state/v1/everquest.live"},
       "state_override": {"type": "object", "additionalProperties": false},
       "chat_input_override": {"type": "object", "additionalProperties": false}
@@ -855,7 +867,10 @@ default, writes
 reads the exact row back. Selected rows require `eqgame.exe` plus
 `everquest.live`, empty visible chat input, a current-state row, known zone, and
 candidate-specific guards. `combat_spell` is only selected for verified
-`hotbar4` Blast of Cold, level-1-safe target levels, and non-gamble con text.
+`hotbar4` Blast of Cold, known NPC targets, level-1-safe target levels,
+known non-gamble con text, and explicit health/mana/rest readiness evidence.
+If health, mana, or casting posture is unknown or low confidence, combat
+candidates reject before input.
 
 Rejected rows preserve every failed guard name and reason. The tool never
 executes input; movement/combat FSV must read this row before sending a bounded
@@ -2257,6 +2272,7 @@ profile-authoring and audit-export defaults below.
 | `everquest_planner_guard` | `decision_id` | required; no default | #514 |
 | `everquest_planner_guard` | `profile_id` | `"everquest.live"` | #514 |
 | `everquest_planner_guard` | `candidate_kind` | required; no default | #514 |
+| `everquest_planner_guard` | `combat_readiness` | omitted; combat candidates reject without it | #518 |
 | `everquest_planner_guard` | `state_row_key` | `"everquest/current_state/v1/everquest.live"` | #514 |
 | `everquest_planner_guard` | `state_override` | omitted; reads storage current-state row | #514 |
 | `everquest_planner_guard` | `chat_input_override` | omitted; reads visible chat-input state | #514 |

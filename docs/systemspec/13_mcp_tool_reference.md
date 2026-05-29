@@ -357,11 +357,12 @@ Manual FSV must read the physical map/current-state SoT before the trigger, call
 | `target_name` | `Option<String>` | no | - | Optional target name |
 | `target_level` | `Option<u32>` | no | - | Target level for combat safety checks |
 | `target_con_summary` | `Option<String>` | no | - | Compact consider/con summary for combat safety checks |
+| `combat_readiness` | `Option<EverQuestPlannerGuardCombatReadiness>` | no | - | Explicit health, mana, standing/rest, confidence, and source-summary evidence required for `combat_spell` selection |
 | `state_row_key` | `String` | no | `everquest/current_state/v1/everquest.live` | Current-state source row to read |
 | `state_override` | `Option<EverQuestPlannerGuardStateOverride>` | no | - | Synthetic/manual edge input with source refs |
 | `chat_input_override` | `Option<EverQuestPlannerGuardChatInputOverride>` | no | - | Synthetic/manual edge input; live FSV should use the real detector |
 
-**Returns:** `EverQuestPlannerGuardResponse { ok, row_key, stored_value_len_bytes, decision }`. The decision row is `select` only when foreground/profile, chat-input, current-state, known-zone, no-stop-hazard, and candidate-specific guards pass. Rejections persist every failed guard and reason. `combat_spell` requires verified `hotbar4`, level-1-safe target level, and non-gamble con text.
+**Returns:** `EverQuestPlannerGuardResponse { ok, row_key, stored_value_len_bytes, decision }`. The decision row is `select` only when foreground/profile, chat-input, current-state, known-zone, no-stop-hazard, and candidate-specific guards pass. Rejections persist every failed guard and reason. `combat_spell` requires verified `hotbar4`, a known NPC target, level-1-safe target level, non-gamble con text, and explicit health/mana/rest readiness evidence.
 **Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_READ_FAILED`, `STORAGE_WRITE_FAILED`, `STORAGE_CORRUPTED`, `TOOL_INTERNAL_ERROR`.
 
 Manual FSV must read the physical foreground/chat/UI/log/storage SoT before the trigger, call the real MCP tool, then separately inspect the persisted `CF_KV` guard row. Any later movement/combat action still needs its own before/after physical SoT readback.

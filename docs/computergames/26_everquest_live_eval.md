@@ -324,7 +324,9 @@ active `everquest.live`, empty visible chat input, current-state availability,
 known zone, and candidate-specific guards. Combat candidates are stricter:
 only the verified `hotbar4` Blast of Cold attack spell can be selected, the
 level-1 wizard target must be level-1-safe, and gamble/high-risk con text
-rejects the candidate.
+rejects the candidate. #518 also requires explicit health, mana, and casting
+posture readiness evidence before any `combat_spell` candidate can be
+selected; missing or low-confidence readiness rejects before input.
 
 The guard tool never executes input. It produces the planner verdict and
 source refs only. Manual FSV for any later action still reads physical SoT

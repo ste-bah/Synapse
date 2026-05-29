@@ -36,6 +36,8 @@ pub struct EverQuestPlannerGuardParams {
     pub target_level: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_con_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combat_readiness: Option<EverQuestPlannerGuardCombatReadiness>,
     #[serde(default = "default_state_row_key")]
     pub state_row_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -100,6 +102,23 @@ pub struct EverQuestPlannerGuardChatInputOverride {
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct EverQuestPlannerGuardCombatReadiness {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_percent: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mana_percent: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_sitting: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rest_state: Option<String>,
+    #[serde(default = "default_readiness_confidence")]
+    pub confidence: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct EverQuestPlannerGuardResponse {
     pub ok: bool,
     pub row_key: String,
@@ -117,6 +136,8 @@ pub struct EverQuestPlannerGuardDecisionRow {
     pub row_key: String,
     pub generated_at: DateTime<Utc>,
     pub candidate: EverQuestPlannerGuardCandidate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combat_readiness: Option<EverQuestPlannerGuardCombatReadiness>,
     pub decision: String,
     pub selected: bool,
     pub rejected_reasons: Vec<String>,
@@ -216,6 +237,7 @@ struct NormalizedParams {
     decision_id: String,
     profile_id: String,
     candidate: EverQuestPlannerGuardCandidate,
+    combat_readiness: Option<EverQuestPlannerGuardCombatReadiness>,
     state_row_key: String,
     state_override: Option<EverQuestPlannerGuardStateReadback>,
     chat_input_override: Option<EverQuestPlannerGuardChatInputReadback>,
@@ -408,6 +430,7 @@ fn planner_guard_row(
         row_key: params.row_key.clone(),
         generated_at: Utc::now(),
         candidate: params.candidate.clone(),
+        combat_readiness: params.combat_readiness.clone(),
         decision: if selected { "select" } else { "reject" }.to_owned(),
         selected,
         rejected_reasons,
@@ -514,15 +537,16 @@ fn planner_guard_results(
         "critical",
         hazard_reason(source_state),
     );
-    add_candidate_specific_guards(&mut guards, &params.candidate, source_state);
+    add_candidate_specific_guards(&mut guards, params, source_state);
     guards
 }
 
 fn add_candidate_specific_guards(
     guards: &mut Vec<EverQuestPlannerGuardResult>,
-    candidate: &EverQuestPlannerGuardCandidate,
+    params: &NormalizedParams,
     source_state: &EverQuestPlannerGuardStateReadback,
 ) {
+    let candidate = &params.candidate;
     match candidate.candidate_kind {
         EverQuestPlannerCandidateKind::LocProbe
         | EverQuestPlannerCandidateKind::InventoryRead
@@ -558,6 +582,29 @@ fn add_candidate_specific_guards(
                     candidate.hotbar_alias
                 ),
             );
+            let target_text = candidate
+                .target_name
+                .as_deref()
+                .or(source_state.target_summary.as_deref())
+                .unwrap_or_default();
+            push_guard(
+                guards,
+                "target_known",
+                !target_text.trim().is_empty(),
+                "critical",
+                if target_text.trim().is_empty() {
+                    "no target name or current-state target summary is available".to_owned()
+                } else {
+                    "target evidence is present".to_owned()
+                },
+            );
+            push_guard(
+                guards,
+                "target_is_npc",
+                target_is_npc(source_state),
+                "critical",
+                target_identity_reason(candidate, source_state),
+            );
             let level = source_state.level.unwrap_or_default();
             let target_level = candidate.target_level.unwrap_or(u32::MAX);
             push_guard(
@@ -572,19 +619,102 @@ fn add_candidate_specific_guards(
                 .as_deref()
                 .or(source_state.consider_summary.as_deref())
                 .unwrap_or_default();
+            let con_known = !con.trim().is_empty();
+            push_guard(
+                guards,
+                "target_con_known",
+                con_known,
+                "critical",
+                if con_known {
+                    "consider evidence is present".to_owned()
+                } else {
+                    "no target consider summary is available".to_owned()
+                },
+            );
             push_guard(
                 guards,
                 "target_con_safe",
-                !con_is_unsafe_for_level_one(con),
+                con_known && !con_is_unsafe_for_level_one(con),
                 "critical",
                 if con.is_empty() {
-                    "no unsafe con text provided".to_owned()
+                    "no target consider summary is available".to_owned()
                 } else {
                     format!("con_summary={con}")
                 },
             );
+            add_combat_readiness_guards(guards, params.combat_readiness.as_ref());
         }
     }
+}
+
+fn add_combat_readiness_guards(
+    guards: &mut Vec<EverQuestPlannerGuardResult>,
+    readiness: Option<&EverQuestPlannerGuardCombatReadiness>,
+) {
+    let Some(readiness) = readiness else {
+        push_guard(
+            guards,
+            "combat_readiness_known",
+            false,
+            "critical",
+            "health, mana, and rest-state evidence are absent",
+        );
+        return;
+    };
+    push_guard(
+        guards,
+        "combat_readiness_known",
+        true,
+        "critical",
+        readiness_reason(readiness),
+    );
+    push_guard(
+        guards,
+        "combat_readiness_confident",
+        readiness.confidence >= MIN_STATE_CONFIDENCE,
+        "critical",
+        format!("confidence={:.3}", readiness.confidence),
+    );
+    push_guard(
+        guards,
+        "health_known_safe",
+        readiness.health_percent.is_some_and(|value| value >= 80),
+        "critical",
+        readiness.health_percent.map_or_else(
+            || "health_percent missing".to_owned(),
+            |value| format!("health_percent={value}"),
+        ),
+    );
+    push_guard(
+        guards,
+        "mana_known_safe",
+        readiness.mana_percent.is_some_and(|value| value >= 30),
+        "critical",
+        readiness.mana_percent.map_or_else(
+            || "mana_percent missing".to_owned(),
+            |value| format!("mana_percent={value}"),
+        ),
+    );
+    push_guard(
+        guards,
+        "rest_state_known",
+        readiness.is_sitting.is_some(),
+        "critical",
+        readiness.is_sitting.map_or_else(
+            || "rest/casting posture is unknown".to_owned(),
+            |is_sitting| format!("is_sitting={is_sitting}"),
+        ),
+    );
+    push_guard(
+        guards,
+        "standing_to_cast",
+        readiness.is_sitting == Some(false),
+        "critical",
+        readiness.is_sitting.map_or_else(
+            || "cannot prove standing for casting".to_owned(),
+            |is_sitting| format!("is_sitting={is_sitting}"),
+        ),
+    );
 }
 
 fn push_guard(
@@ -650,6 +780,43 @@ fn con_is_unsafe_for_level_one(text: &str) -> bool {
         || normalized.contains("lvl: 4")
         || normalized.contains("lvl: 5")
         || normalized.contains("lvl: 6")
+}
+
+fn target_is_npc(source_state: &EverQuestPlannerGuardStateReadback) -> bool {
+    if let Some(summary) = source_state.target_summary.as_deref() {
+        let normalized = summary.to_ascii_lowercase();
+        if normalized.contains("target player") {
+            return false;
+        }
+        if normalized.contains("target npc") {
+            return true;
+        }
+    }
+    false
+}
+
+fn target_identity_reason(
+    candidate: &EverQuestPlannerGuardCandidate,
+    source_state: &EverQuestPlannerGuardStateReadback,
+) -> String {
+    if let Some(summary) = source_state.target_summary.as_deref() {
+        return format!("target_summary={summary}");
+    }
+    if candidate.target_name.is_some() {
+        return "candidate target name is present but current-state NPC evidence is absent"
+            .to_owned();
+    }
+    "no target identity evidence is available".to_owned()
+}
+
+fn readiness_reason(readiness: &EverQuestPlannerGuardCombatReadiness) -> String {
+    format!(
+        "health={:?} mana={:?} is_sitting={:?} confidence={:.3}",
+        readiness.health_percent,
+        readiness.mana_percent,
+        readiness.is_sitting,
+        readiness.confidence
+    )
 }
 
 fn state_readback_from_current_row(
@@ -745,6 +912,10 @@ fn normalize_params(params: EverQuestPlannerGuardParams) -> Result<NormalizedPar
             .map(|value| normalize_required_text("target_con_summary", &value))
             .transpose()?,
     };
+    let combat_readiness = params
+        .combat_readiness
+        .map(normalize_combat_readiness)
+        .transpose()?;
     let state_override = params
         .state_override
         .map(|value| normalize_state_override(&state_row_key, value))
@@ -758,10 +929,41 @@ fn normalize_params(params: EverQuestPlannerGuardParams) -> Result<NormalizedPar
         decision_id,
         profile_id,
         candidate,
+        combat_readiness,
         state_row_key,
         state_override,
         chat_input_override,
         row_key,
+    })
+}
+
+fn normalize_combat_readiness(
+    readiness: EverQuestPlannerGuardCombatReadiness,
+) -> Result<EverQuestPlannerGuardCombatReadiness, ErrorData> {
+    if readiness.health_percent.is_some_and(|value| value > 100) {
+        return Err(params_error(
+            "combat_readiness.health_percent must be <= 100",
+        ));
+    }
+    if readiness.mana_percent.is_some_and(|value| value > 100) {
+        return Err(params_error("combat_readiness.mana_percent must be <= 100"));
+    }
+    validate_unit_interval("combat_readiness.confidence", readiness.confidence)?;
+    let rest_state = readiness
+        .rest_state
+        .map(|value| normalize_required_text("combat_readiness.rest_state", &value))
+        .transpose()?;
+    let source_summary = readiness
+        .source_summary
+        .map(|value| normalize_required_text("combat_readiness.source_summary", &value))
+        .transpose()?;
+    Ok(EverQuestPlannerGuardCombatReadiness {
+        health_percent: readiness.health_percent,
+        mana_percent: readiness.mana_percent,
+        is_sitting: readiness.is_sitting,
+        rest_state,
+        confidence: readiness.confidence,
+        source_summary,
     })
 }
 
@@ -886,6 +1088,10 @@ fn default_profile_id() -> String {
 
 fn default_state_row_key() -> String {
     CURRENT_STATE_ROW_KEY.to_owned()
+}
+
+const fn default_readiness_confidence() -> f32 {
+    0.0
 }
 
 fn params_error(message: impl Into<String>) -> ErrorData {
@@ -1066,6 +1272,7 @@ mod tests {
                 target_level: None,
                 target_con_summary: None,
             },
+            combat_readiness: None,
             state_row_key: CURRENT_STATE_ROW_KEY.to_owned(),
             state_override: None,
             chat_input_override: None,
@@ -1124,5 +1331,101 @@ mod tests {
             denial_reason: None,
             source_region: None,
         }
+    }
+
+    fn ready_for_combat() -> EverQuestPlannerGuardCombatReadiness {
+        EverQuestPlannerGuardCombatReadiness {
+            health_percent: Some(100),
+            mana_percent: Some(80),
+            is_sitting: Some(false),
+            rest_state: Some("standing".to_owned()),
+            confidence: 0.9,
+            source_summary: Some("synthetic visible health/mana/rest readback".to_owned()),
+        }
+    }
+
+    #[test]
+    fn guard_selects_level_one_safe_combat_with_readiness() {
+        let mut params = normalized_for(
+            "safe-combat",
+            EverQuestPlannerCandidateKind::CombatSpell,
+            Some("allow_empty_chat_input"),
+        );
+        params.candidate.hotbar_alias = Some("hotbar4".to_owned());
+        params.candidate.target_name = Some("synthetic level-one npc".to_owned());
+        params.candidate.target_level = Some(1);
+        params.candidate.target_con_summary = Some("looks like an even fight. (Lvl: 1)".to_owned());
+        params.combat_readiness = Some(ready_for_combat());
+        let mut source_state = state(Some("nektulos"), Some(1), true, Vec::new());
+        source_state.target_summary = Some("target npc synthetic level-one npc".to_owned());
+        let row = planner_guard_row(&params, foreground(true), &source_state, chat(false));
+
+        assert!(row.selected);
+        assert_eq!(row.decision, "select");
+        assert!(row.combat_readiness.is_some());
+    }
+
+    #[test]
+    fn guard_rejects_combat_without_readiness() {
+        let mut params = normalized_for(
+            "unknown-readiness-combat",
+            EverQuestPlannerCandidateKind::CombatSpell,
+            Some("allow_empty_chat_input"),
+        );
+        params.candidate.hotbar_alias = Some("hotbar4".to_owned());
+        params.candidate.target_name = Some("synthetic level-one npc".to_owned());
+        params.candidate.target_level = Some(1);
+        params.candidate.target_con_summary = Some("looks like an even fight. (Lvl: 1)".to_owned());
+        let mut source_state = state(Some("nektulos"), Some(1), true, Vec::new());
+        source_state.target_summary = Some("target npc synthetic level-one npc".to_owned());
+        let row = planner_guard_row(&params, foreground(true), &source_state, chat(false));
+
+        assert!(!row.selected);
+        assert!(
+            row.rejected_reasons
+                .contains(&"combat_readiness_known".to_owned())
+        );
+    }
+
+    #[test]
+    fn guard_rejects_player_target_combat() {
+        let mut params = normalized_for(
+            "player-target-combat",
+            EverQuestPlannerCandidateKind::CombatSpell,
+            Some("allow_empty_chat_input"),
+        );
+        params.candidate.hotbar_alias = Some("hotbar4".to_owned());
+        params.candidate.target_name = Some("synthetic player".to_owned());
+        params.candidate.target_level = Some(1);
+        params.candidate.target_con_summary = Some("looks like an even fight. (Lvl: 1)".to_owned());
+        params.combat_readiness = Some(ready_for_combat());
+        let mut source_state = state(Some("nektulos"), Some(1), true, Vec::new());
+        source_state.target_summary = Some("target player synthetic player".to_owned());
+        let row = planner_guard_row(&params, foreground(true), &source_state, chat(false));
+
+        assert!(!row.selected);
+        assert!(row.rejected_reasons.contains(&"target_is_npc".to_owned()));
+    }
+
+    #[test]
+    fn guard_rejects_no_target_combat() {
+        let mut params = normalized_for(
+            "no-target-combat",
+            EverQuestPlannerCandidateKind::CombatSpell,
+            Some("allow_empty_chat_input"),
+        );
+        params.candidate.hotbar_alias = Some("hotbar4".to_owned());
+        params.candidate.target_level = Some(1);
+        params.candidate.target_con_summary = Some("looks like an even fight. (Lvl: 1)".to_owned());
+        params.combat_readiness = Some(ready_for_combat());
+        let row = planner_guard_row(
+            &params,
+            foreground(true),
+            &state(Some("nektulos"), Some(1), true, Vec::new()),
+            chat(false),
+        );
+
+        assert!(!row.selected);
+        assert!(row.rejected_reasons.contains(&"target_known".to_owned()));
     }
 }
