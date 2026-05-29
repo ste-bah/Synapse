@@ -21,8 +21,9 @@
    world-model record/inspect storage surfaces, #515 adds the EverQuest
    surprise detector row writer, #516 adds the compact EverQuest world-summary
    context row writer, #531 adds EverQuest action-prior sample/scorecard
-   tools, and #522 adds transparent EverQuest predictive-model fit/predict
-   rows, bringing the live surface to 72. Any
+   tools, #522 adds transparent EverQuest predictive-model fit/predict rows,
+   and #535 adds the narrow EverQuest safe slash-command plus survival
+   readiness row surfaces, bringing the live surface to 74. Any
    further agent-facing tools require an ADR-approved cap change.
    Overlapping tools merge. Profile and parameter knobs are the escape hatches.
 2. **One tool, one verb.** No `do_everything(action_kind, ...)` mega-tools.
@@ -34,8 +35,11 @@
 
 The first 30 tools below are the live M3 baseline. #499 adds `act_keymap` as a
 profile-keymap action alias, #508 adds `everquest_loc_probe` as a literal
-EverQuest `/loc` readback tool, #524 adds `everquest_chat_input_state` as the
-visible chat-buffer pollution readback that also gates `/loc`, #510 adds
+EverQuest `/loc` readback tool, #535 adds `everquest_safe_command` for
+allowlisted non-social survival slash commands and
+`everquest_survival_readiness` for read-only blocker rows, #524 adds
+`everquest_chat_input_state` as the visible chat-buffer pollution readback that
+also gates `/loc` and the safe command tool, #510 adds
 `everquest_current_state` as the compact world-state row writer/readback tool, #526 adds
 `everquest_outcome_ingest`, #528 adds `everquest_memory_record` plus
 `everquest_memory_consult`, #514 adds `everquest_planner_guard`, #527 adds
@@ -113,32 +117,36 @@ future `tools/list` snapshots in #447/#448.
 | 51 | `audit_export_consent_set` | write/read | writes local consent state to `CF_KV` and reads it back |
 | 52 | `audit_export_bundle` | read/write | writes a local redacted audit bundle after consent verification |
 | 53 | `everquest_loc_probe` | write/read | sends literal `/loc` to `everquest.live` only after the visible chat-input pollution gate passes, then verifies the EQ log coordinate line |
-| 54 | `everquest_chat_input_state` | read | reads `MainChat` UI layout plus OCR crop to produce compact `everquest.chat_input_state` |
-| 55 | `everquest_current_state` | write/read | fuses foreground, EQ log, map, HUD, and action audit into a compact `CF_KV` row and reads it back |
-| 56 | `everquest_map_sensor` | write/read | stores one current-map sensor/calibration row from visible map evidence, `/loc`, and local map files |
-| 57 | `everquest_outcome_ingest` | write/read | parses bounded EQ log bytes into compact redacted outcome rows with offset/hash readback |
-| 58 | `everquest_memory_record` | write/read | stores one compact hazard or safe-area memory row with source refs, stale/conflict handling, and exact readback |
-| 59 | `everquest_memory_consult` | write/read | consults hazard/safe memories for one candidate action and persists the planner decision row |
-| 60 | `everquest_planner_guard` | write/read | evaluates one bounded EverQuest candidate against foreground/chat/state/combat guards, persists the guard-decision row, and reads it back |
-| 61 | `everquest_route_plan` | write/read | stores one bounded route plan from current state to a local map landmark/zone line without movement |
-| 62 | `everquest_domain_normalize` | write/read | stores the EverQuest DynamicJEPA domain pack plus typed state/action/outcome/transition rows |
-| 63 | `everquest_trajectory_record` | write/read | stores one ordered trajectory from linked action/observation/event/log/state evidence and writes a JSONL provenance artifact |
-| 64 | `everquest_episode_export` | read/write | exports redacted trajectory/domain rows to ContextGraph-compatible DynamicJEPA episode JSONL and reads the file back |
-| 65 | `everquest_world_model_record` | write/read | stores one compact world-model row under an approved `CF_KV` prefix with exact readback |
-| 66 | `everquest_world_model_inspect` | read | inspects approved EverQuest world-model prefixes, selected keys, counts, and redacted samples |
-| 67 | `everquest_surprise_detect` | write/read | compares predicted EverQuest outcome against observed state/log evidence and stores a compact surprise row |
-| 68 | `everquest_world_summary` | write/read | stores one compact world-state summary row for context injection with map/log/storage provenance and chat redaction |
-| 69 | `everquest_predictive_model_fit` | write/read | fits a transparent action-conditioned predictive baseline from verified trajectory/domain rows and reads the model row back |
-| 70 | `everquest_predictive_model_predict` | write/read | stores one calibrated next-outcome prediction row with abstention and exact readback |
-| 71 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
-| 72 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
+| 54 | `everquest_safe_command` | write/read | sends one allowlisted non-social slash command such as `/sit on` after the chat-input gate and verifies no `You say` pollution |
+| 55 | `everquest_survival_readiness` | write/read | reads foreground/HUD/log/chat survival state, detects food/drink and mana blockers, and persists a compact `CF_KV` row |
+| 56 | `everquest_chat_input_state` | read | reads `MainChat` UI layout plus OCR crop to produce compact `everquest.chat_input_state` |
+| 57 | `everquest_current_state` | write/read | fuses foreground, EQ log, map, HUD, and action audit into a compact `CF_KV` row and reads it back |
+| 58 | `everquest_map_sensor` | write/read | stores one current-map sensor/calibration row from visible map evidence, `/loc`, and local map files |
+| 59 | `everquest_outcome_ingest` | write/read | parses bounded EQ log bytes into compact redacted outcome rows with offset/hash readback |
+| 60 | `everquest_memory_record` | write/read | stores one compact hazard or safe-area memory row with source refs, stale/conflict handling, and exact readback |
+| 61 | `everquest_memory_consult` | write/read | consults hazard/safe memories for one candidate action and persists the planner decision row |
+| 62 | `everquest_planner_guard` | write/read | evaluates one bounded EverQuest candidate against foreground/chat/state/combat guards, persists the guard-decision row, and reads it back |
+| 63 | `everquest_route_plan` | write/read | stores one bounded route plan from current state to a local map landmark/zone line without movement |
+| 64 | `everquest_domain_normalize` | write/read | stores the EverQuest DynamicJEPA domain pack plus typed state/action/outcome/transition rows |
+| 65 | `everquest_trajectory_record` | write/read | stores one ordered trajectory from linked action/observation/event/log/state evidence and writes a JSONL provenance artifact |
+| 66 | `everquest_episode_export` | read/write | exports redacted trajectory/domain rows to ContextGraph-compatible DynamicJEPA episode JSONL and reads the file back |
+| 67 | `everquest_world_model_record` | write/read | stores one compact world-model row under an approved `CF_KV` prefix with exact readback |
+| 68 | `everquest_world_model_inspect` | read | inspects approved EverQuest world-model prefixes, selected keys, counts, and redacted samples |
+| 69 | `everquest_surprise_detect` | write/read | compares predicted EverQuest outcome against observed state/log evidence and stores a compact surprise row |
+| 70 | `everquest_world_summary` | write/read | stores one compact world-state summary row for context injection with map/log/storage provenance and chat redaction |
+| 71 | `everquest_predictive_model_fit` | write/read | fits a transparent action-conditioned predictive baseline from verified trajectory/domain rows and reads the model row back |
+| 72 | `everquest_predictive_model_predict` | write/read | stores one calibrated next-outcome prediction row with abstention and exact readback |
+| 73 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
+| 74 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
 
-M3 live count: 30 tools. Current live count: 72
+M3 live count: 30 tools. Current live count: 74
 tools.
 
 Deferred ideas from earlier drafts (`describe` and `read_hud`) are still not
 live M3/M4 agent-facing tools. `act_keymap` is the #499 profile-keymap alias
 addition; `everquest_loc_probe` is the #508 literal `/loc` readback tool;
+`everquest_safe_command` is the #535 allowlisted non-social slash command tool;
+`everquest_survival_readiness` is the #535 read-only survival row tool;
 `everquest_chat_input_state` is the #524 visible chat input pollution state
 tool and preflight source for text-like EverQuest commands;
 `everquest_current_state` is the #510 current-state row writer/readback tool;
@@ -638,6 +646,64 @@ and `UI_<character>_<server>_<class>.ini` `MainChat` section; plus read the
 audit readback. Disabled logging, non-EQ foreground, visible unsent chat text,
 untrusted chat state, unknown parameters, malformed or absent location output,
 and any player-say output are failure cases, not fallbacks.
+
+### 3.13b0 `everquest_safe_command`
+
+```json
+{
+  "name": "everquest_safe_command",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["command"],
+    "properties": {
+      "command": {"enum": ["sit_on", "sit_off", "stand"]}
+    }
+  }
+}
+```
+
+`everquest_safe_command` is a narrow survival/readiness tool, not a general
+chat or command surface. It emits only one allowlisted literal slash command
+for the active `everquest.live` foreground profile after the same visible chat
+input pollution gate used by `everquest_loc_probe`: `/sit on`, `/sit off`, or
+`/stand`. It then tails the physical EverQuest log from the pre-trigger byte
+offset and succeeds only when no `You say` line appears. The response returns
+the literal command, EQ log byte offsets, bounded compact event summaries,
+`you_say_count`, and the pre-dispatch `chat_input_state` readback.
+
+Manual FSV must still read the visible UI after the command. For rest/readiness
+work, the SoT is the Inventory/Player-window HP/mana/posture readback plus the
+EQ log tail and `CF_ACTION_LOG` rows. This tool must not be extended to social,
+economy, merchant, chat, group, guild, PvP, account, or destructive commands
+without a separate issue and explicit operator approval.
+
+### 3.13b0a `everquest_survival_readiness`
+
+```json
+{
+  "name": "everquest_survival_readiness",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false
+  }
+}
+```
+
+`everquest_survival_readiness` is read-only. It sends no input and writes a
+single compact row to
+`CF_KV/everquest/survival_readiness/v1/everquest.live/latest`. The row fuses
+foreground/profile state, `everquest.chat_input_state`, visible HUD resource
+text (`HP/Mana` pairs when readable), and the physical EQ log tail. It detects
+food/drink absence from the authoritative log signal `You are out of food and
+drink` without persisting raw chat bodies, and records hunger/thirst timestamps
+as compact booleans/timestamps.
+
+This row is a readiness verdict, not an action surface. It can prove current
+blockers such as `mana_below_combat_floor`, `food_drink_absent`,
+`hud_hp_mana_unavailable`, or `standing_posture_not_proven_for_casting`.
+Merchant/economy/item acquisition remains disallowed unless a later issue has
+explicit operator approval and its own manual FSV.
 
 ### 3.13b1 `everquest_chat_input_state`
 

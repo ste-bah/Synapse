@@ -121,22 +121,37 @@ buffer is expected empty, then `inventory` readback; the EQ log `You say` count
 and timestamp must be read before and after to prove no chat was submitted.
 Do not expose this as `open_chat` or any general chat/recovery alias.
 
-`everquest_loc_probe` is the only reviewed live text-like EverQuest command
-surface. It takes no command string and no free-text parameters; it emits only
-the literal `/loc` key sequence after foreground/profile/logging preconditions
-and after #524's visible chat input pollution gate reads trusted
-`everquest.chat_input_state` with `text_present=false`. The gate reads the
-active `UI_<character>_<server>_<class>.ini` `[MainChat]` layout, foreground
-window bounds, OCR-scored `Windowed`/resolution/scaled-resolution coordinate
-candidates, and a WinRT OCR crop of the bottom chat input strip; unsafe states
-fail closed before key emission and are recorded in `CF_ACTION_LOG`.
-The probe then proves the result by reading the physical EQ log tail. The
-coordinate payload is stored in EverQuest display order as `display_y`,
-`display_x`, and `display_z`. A successful probe must add a `Your Location is
-...` log line and must not add a new `You say` line. Unknown parameters,
+`everquest_loc_probe` and `everquest_safe_command` are the only reviewed live
+text-like EverQuest command surfaces. `everquest_loc_probe` takes no command
+string and no free-text parameters; it emits only the literal `/loc` key
+sequence after foreground/profile/logging preconditions and after #524's
+visible chat input pollution gate reads trusted `everquest.chat_input_state`
+with `text_present=false`. `everquest_safe_command` is narrower than
+`act_type`, but broader than `/loc`: it accepts only enum-selected survival
+commands (`sit_on`, `sit_off`, `stand`) and emits the corresponding literal
+slash command (`/sit on`, `/sit off`, `/stand`) through the same gate.
+
+The gate reads the active `UI_<character>_<server>_<class>.ini` `[MainChat]`
+layout, foreground window bounds, OCR-scored `Windowed`/resolution/scaled
+resolution coordinate candidates, and a WinRT OCR crop of the bottom chat input
+strip; unsafe states fail closed before key emission and are recorded in
+`CF_ACTION_LOG`. `/loc` proves the result by reading the physical EQ log tail
+for a new coordinate line. Safe survival commands prove only that no `You say`
+pollution was emitted; manual FSV must separately read the visible
+Inventory/Player-window HP, mana, and posture state. Unknown parameters,
 disabled `Log=0`, non-EQ foreground, visible unsent chat text, untrusted chat
-state, missing/malformed location output, or any player-say output are hard
-failures.
+state, missing/malformed location output for `/loc`, or any player-say output
+are hard failures.
+
+`everquest_survival_readiness` is the read-only #535 survival SoT. It sends no
+gameplay input. It writes
+`CF_KV/everquest/survival_readiness/v1/everquest.live/latest` from current
+foreground/profile state, `everquest.chat_input_state`, visible HUD HP/mana
+text, and the physical EQ log tail. Food/drink absence is detected from the
+physical `You are out of food and drink` log signal; positive item counting from
+bags/merchant windows is not implied. Merchant/economy/item acquisition remains
+outside the supported live surface unless a future issue carries explicit
+operator approval and separate manual FSV.
 
 Manual FSV for the chat gate must read the physical UI file, visible OCR crop,
 EQ log `You say` count, and `CF_ACTION_LOG` rows before and after. Required
