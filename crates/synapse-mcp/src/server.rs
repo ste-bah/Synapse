@@ -132,6 +132,7 @@ mod m1_tools;
 mod m2_tools;
 mod m3_tools;
 mod m4_tools;
+mod reality;
 mod target_policy;
 #[cfg(test)]
 mod tests;
@@ -255,6 +256,7 @@ impl SynapseService {
             + Self::everquest_trajectory_tool_router()
             + Self::everquest_world_model_tool_router()
             + Self::everquest_world_summary_tool_router()
+            + Self::reality_tool_router()
             + Self::m3_tool_router()
             + Self::m4_tool_router()
     }
