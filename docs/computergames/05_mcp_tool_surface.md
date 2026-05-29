@@ -14,9 +14,9 @@
    EverQuest current-state estimator, #526 adds compact EverQuest outcome
    ingest, #528 adds EverQuest hazard/safe memory record and consult tools,
    #527 adds EverQuest route-plan rows, #525 adds EverQuest current-map sensor
-   rows, #514 adds EverQuest planner guard-decision rows, and #531 adds
-   EverQuest action-prior sample/scorecard tools, bringing the live surface to
-   63. Any
+   rows, #514 adds EverQuest planner guard-decision rows, #511 adds the
+   EverQuest DynamicJEPA domain normalizer, and #531 adds EverQuest
+   action-prior sample/scorecard tools, bringing the live surface to 64. Any
    further agent-facing tools require an ADR-approved cap change.
    Overlapping tools merge. Profile and parameter knobs are the escape hatches.
 2. **One tool, one verb.** No `do_everything(action_kind, ...)` mega-tools.
@@ -33,7 +33,8 @@ visible chat-buffer pollution readback that also gates `/loc`, #510 adds
 `everquest_current_state` as the compact world-state row writer/readback tool, #526 adds
 `everquest_outcome_ingest`, #528 adds `everquest_memory_record` plus
 `everquest_memory_consult`, #514 adds `everquest_planner_guard`, #527 adds
-`everquest_route_plan`, #525 adds `everquest_map_sensor`, and #531 adds
+`everquest_route_plan`, #525 adds `everquest_map_sensor`, #511 adds
+`everquest_domain_normalize`, and #531 adds
 `everquest_action_prior_record` plus `everquest_action_prior_scorecard`. M4 adds `act_combo`, `act_run_shell`, and
 `act_launch`; M5 adds local profile-registry/audit quality scoring, authoring
 candidates, registry row operations, import/export, audit intelligence, and
@@ -110,10 +111,11 @@ future `tools/list` snapshots in #447/#448.
 | 59 | `everquest_memory_consult` | write/read | consults hazard/safe memories for one candidate action and persists the planner decision row |
 | 60 | `everquest_planner_guard` | write/read | evaluates one bounded EverQuest candidate against foreground/chat/state/combat guards, persists the guard-decision row, and reads it back |
 | 61 | `everquest_route_plan` | write/read | stores one bounded route plan from current state to a local map landmark/zone line without movement |
-| 62 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
-| 63 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
+| 62 | `everquest_domain_normalize` | write/read | stores the EverQuest DynamicJEPA domain pack plus typed state/action/outcome/transition rows |
+| 63 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
+| 64 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
 
-M3 live count: 30 tools. Current live count: 63
+M3 live count: 30 tools. Current live count: 64
 tools.
 
 Deferred ideas from earlier drafts (`describe` and `read_hud`) are still not
@@ -130,6 +132,8 @@ hazard/safe-area memory and planner consult tools;
 for bounded candidate actions;
 `everquest_route_plan` is the #527 bounded local map route planner;
 `everquest_map_sensor` is the #525 current-map calibration/readback row tool;
+`everquest_domain_normalize` is the #511 DynamicJEPA state/action/outcome
+domain-pack normalizer;
 `everquest_action_prior_record` and `everquest_action_prior_scorecard` are the
 #531 competence scorecard tools;
 `act_combo`, `act_run_shell`, and `act_launch` remain the M4 phase plan
@@ -917,7 +921,71 @@ calibration produce persisted abstain rows instead of guessed movement.
 Manual FSV must read the physical map/current-state SoT before the trigger,
 call this real MCP tool, and separately inspect `CF_KV` afterward.
 
-### 3.13j `everquest_action_prior_record`
+### 3.13j `everquest_domain_normalize`
+
+```json
+{
+  "name": "everquest_domain_normalize",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["transition_id", "state", "action", "outcome", "entity"],
+    "properties": {
+      "transition_id": {"type": "string"},
+      "profile_id": {"type": "string", "default": "everquest.live"},
+      "state": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["zone_short_name", "location", "heading_bucket", "level_bucket", "xp_bucket", "target_kind", "con_bucket", "hp_bucket", "mana_bucket", "ui_focus_bucket", "map_visible", "inventory_visible", "foreground_process_name", "foreground_profile_id"]
+      },
+      "action": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action_kind", "tool_name", "move_duration_bucket", "turn_duration_bucket", "action_origin", "foreground_profile_id"]
+      },
+      "outcome": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["outcome_kind", "next_zone_short_name", "next_location", "target_delta", "con_delta", "log_event_kind", "damage_delta", "death_delta", "xp_delta", "ui_mutation", "surprise", "zone_entry_log"]
+      },
+      "entity": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["character_summary", "server", "trajectory_id", "session_id"]
+      },
+      "source_refs": {"type": "array", "items": {"type": "object"}}
+    }
+  }
+}
+```
+
+`everquest_domain_normalize` defines and persists the #511 EverQuest
+DynamicJEPA-compatible domain pack. Each call writes and reads back:
+
+- `CF_KV/everquest/dynamicjepa_domain_pack/v1/everquest.live/everquest_dynamicjepa_v1`
+- `CF_KV/everquest/dynamicjepa_state/v1/everquest.live/<transition_id>`
+- `CF_KV/everquest/dynamicjepa_action/v1/everquest.live/<transition_id>`
+- `CF_KV/everquest/dynamicjepa_outcome/v1/everquest.live/<transition_id>`
+- `CF_KV/everquest/dynamicjepa_transition/v1/everquest.live/<transition_id>`
+
+The domain pack mirrors ContextGraph DynamicJEPA conventions: explicit
+state/action/outcome/entity fields, enumerated planner candidates, guard names,
+surprise threshold, required verification row prefixes, and compatible
+ContextGraph CF names. The transition row records invariant results for
+zone-entry log updates, EQ foreground for movement/combat, con-safe combat,
+no chat/social/economy actions, and impossible zone transitions.
+
+Accepted rows are planner-eligible. Rejected rows persist failed invariant names
+for inspection. `denied_unsafe` actions persist as denied rows and are never
+planner-eligible. Missing required fields and invalid categorical variants fail
+closed before storage mutation.
+
+Manual FSV must read physical EQ UI/log/action/storage state before the trigger,
+call this real MCP tool with a known action/log/observe cluster, and separately
+inspect the five `CF_KV` rows afterward. The tool is not a training script and
+does not replace runtime FSV for gameplay behavior.
+
+### 3.13k `everquest_action_prior_record`
 
 ```json
 {
@@ -976,7 +1044,7 @@ an FSV substitute. Manual FSV must still read storage state before the trigger,
 call the tool with known synthetic prediction/outcome inputs, and separately
 read `storage_inspect` or another physical storage readback after the write.
 
-### 3.13k `everquest_action_prior_scorecard`
+### 3.13l `everquest_action_prior_scorecard`
 
 ```json
 {

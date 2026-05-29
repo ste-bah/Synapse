@@ -24,7 +24,7 @@ pub struct SynapseService {
 }
 ```
 
-Implements `rmcp::ServerHandler` via `#[tool_handler(router = self.tool_router)]`. The 54 tools are declared on the same struct under the M1/M2/M3/M4 `#[tool_router]` impls; `#[tool(description = "...")]` annotations produce JSON-Schema entries for `tools/list` automatically.
+Implements `rmcp::ServerHandler` via `#[tool_handler(router = self.tool_router)]`. The 64 tools are declared on the same struct under milestone and EverQuest `#[tool_router]` impls; `#[tool(description = "...")]` annotations produce JSON-Schema entries for `tools/list` automatically.
 
 ### 1.1 Constructors
 

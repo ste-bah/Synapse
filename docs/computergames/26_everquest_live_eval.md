@@ -334,6 +334,37 @@ before the trigger, reads the persisted guard-decision row, executes the real
 bounded foreground action manually, and then separately reads the EQ UI/log and
 Synapse storage/audit SoTs afterward.
 
+## DynamicJEPA Domain Rows
+
+#511 adds `everquest_domain_normalize`, the runtime surface that turns one
+observed EverQuest state/action/outcome cluster into ContextGraph-compatible
+typed rows. The tool writes and reads back:
+
+- `CF_KV/everquest/dynamicjepa_domain_pack/v1/everquest.live/everquest_dynamicjepa_v1`
+- `CF_KV/everquest/dynamicjepa_state/v1/everquest.live/<transition_id>`
+- `CF_KV/everquest/dynamicjepa_action/v1/everquest.live/<transition_id>`
+- `CF_KV/everquest/dynamicjepa_outcome/v1/everquest.live/<transition_id>`
+- `CF_KV/everquest/dynamicjepa_transition/v1/everquest.live/<transition_id>`
+
+The domain pack defines the state, action, outcome, and entity fields used by
+trajectory/export work: zone, local coordinate buckets, heading, level/xp,
+target/con/resource/UI focus, action kind/tool/alias/duration/origin, next
+zone/coord, log event kind, damage/death/xp/UI deltas, surprise, character,
+server, trajectory, and session. It also records planner candidates, guard
+names, surprise threshold, and the ContextGraph-compatible CF names.
+
+Fatal invariants are persisted with every transition: zone-entry log must
+update zone, movement/combat requires live EverQuest foreground, combat must
+pass con-safe level-1 target/resource evidence, chat/social/economy actions are
+never planner-eligible, and zone changes cannot be inferred without a
+zone-entry log. Missing required fields and invalid categorical variants fail
+before storage mutation; denied unsafe actions persist as denied rows.
+
+Manual FSV must read physical EQ UI/log/action/storage state before the
+trigger, call the real MCP tool with a known action/log/observe cluster, and
+separately inspect all five durable `CF_KV` rows afterward. This is a domain
+pack/storage surface, not a training script or FSV substitute.
+
 ## Action-Prior Scorecard Rows
 
 #531 adds the runtime storage surface for measuring whether the EverQuest world
@@ -405,6 +436,7 @@ GitHub issues remain the canonical coordination state:
 | #505 | EverQuest world model / DynamicJEPA navigation architecture |
 | #508 | Literal `/loc` probe with EQ log readback |
 | #510 | Current-state estimator fusing logs, `/loc`, map, HUD, and action audit |
+| #511 | EverQuest DynamicJEPA state/action/outcome domain pack |
 | #514 | Planner guard-decision rows for bounded EverQuest candidates |
 | #517 | Stabilize EverQuest foreground before accepted action candidates |
 | #518 | Safe target/combat model for level-1 wizard leveling |

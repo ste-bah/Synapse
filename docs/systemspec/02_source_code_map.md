@@ -36,11 +36,21 @@ crates/synapse-mcp/
 ├── Cargo.toml                      # Binary crate; depends on every other library crate
 └── src/
     ├── main.rs                     # Process entrypoint, clap CLI, telemetry init, stdio/http dispatch
-    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 54 MCP tools
+    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 64 MCP tools
     ├── server/
     │   ├── action_audit.rs         # CF_ACTION_LOG start/result audit rows with profile/session context
     │   ├── audit_context.rs        # Profile activation/session/event audit context persistence helpers
     │   ├── context.rs              # Shared tool context helpers
+    │   ├── everquest_domain.rs     # EverQuest DynamicJEPA domain-pack + typed state/action/outcome transition rows
+    │   ├── everquest_guard.rs      # EverQuest planner guard-decision rows
+    │   ├── everquest_log.rs        # EverQuest log resolution and compact observation event feed
+    │   ├── everquest_map_sensor.rs # EverQuest visible map/current-state/map-file calibration rows
+    │   ├── everquest_memory.rs     # EverQuest hazard/safe-area memory and planner consult rows
+    │   ├── everquest_outcome.rs    # EverQuest compact outcome log ingestion rows
+    │   ├── everquest_route.rs      # EverQuest bounded map/route plan rows
+    │   ├── everquest_scorecard.rs  # EverQuest action-prior sample and scorecard rows
+    │   ├── everquest_state.rs      # EverQuest current-state row fusion
+    │   ├── everquest_tools.rs      # EverQuest /loc and chat-input safety tools
     │   ├── handler.rs              # ServerHandler implementation glue
     │   ├── health.rs               # health subsystem assembly
     │   ├── m1_tools.rs             # M1 tool wrappers

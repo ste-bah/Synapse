@@ -16,7 +16,7 @@ Source files covered:
 - `crates/synapse-mcp/src/m3/{audio, audit_export, permissions, profile, profile_authoring, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 63 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 64 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -367,7 +367,29 @@ Manual FSV must read the physical map/current-state SoT before the trigger, call
 
 Manual FSV must read the physical foreground/chat/UI/log/storage SoT before the trigger, call the real MCP tool, then separately inspect the persisted `CF_KV` guard row. Any later movement/combat action still needs its own before/after physical SoT readback.
 
-## 9j. `everquest_action_prior_record`
+## 9j. `everquest_domain_normalize`
+
+**Description:** "Normalize one EverQuest DynamicJEPA state/action/outcome transition, persist typed CF_KV rows, and read them back"
+**Side effects:** validates one compact state/action/outcome/entity cluster plus source refs, writes the domain-pack row and typed state/action/outcome/transition rows in `CF_KV`, then reads each exact row back before returning.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `transition_id` | `String` | yes | - | ASCII id shared by typed rows |
+| `profile_id` | `String` | no | `everquest.live` | EverQuest profile id; other ids fail closed |
+| `state` | `EverQuestDomainStateInput` | yes | - | Zone, local map coordinate, heading/level/xp/target/con/resource/UI/foreground buckets |
+| `action` | `EverQuestDomainActionInput` | yes | - | Action kind, tool/alias, duration buckets, origin, foreground profile |
+| `outcome` | `EverQuestDomainOutcomeInput` | yes | - | Next zone/coord buckets, target/con/log/damage/death/xp/UI deltas, surprise, zone-entry flag |
+| `entity` | `EverQuestDomainEntityInput` | yes | - | Character summary, server, trajectory id, session id |
+| `source_refs` | `Vec<EverQuestDomainSourceRef>` | yes at runtime | `[]` by schema | Runtime requires at least one physical SoT ref |
+
+**Returns:** `EverQuestDomainNormalizeResponse { ok, profile_id, transition_id, validation_status, accepted_for_planning, row_keys, stored_value_len_bytes, transition }`. Row keys include `everquest/dynamicjepa_domain_pack/v1`, `everquest/dynamicjepa_state/v1`, `everquest/dynamicjepa_action/v1`, `everquest/dynamicjepa_outcome/v1`, and `everquest/dynamicjepa_transition/v1`. Accepted rows are planner-eligible; rejected rows preserve failed invariant ids; denied unsafe rows are persisted but never planner-eligible.
+**Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_WRITE_FAILED`, `STORAGE_READ_FAILED`, `STORAGE_CORRUPTED`, `TOOL_INTERNAL_ERROR`.
+
+The persisted domain pack names explicit state/action/outcome/entity fields, enumerated planner candidates, guard names, surprise threshold, Synapse verification row prefixes, and ContextGraph-compatible DynamicJEPA CF names. Fatal invariants cover zone-entry log updates, EQ foreground for movement/combat, con-safe combat, no chat/social/economy actions, and impossible zone transitions.
+
+Manual FSV must read physical EQ UI/log/action/storage state before the trigger, call this real MCP tool with a known action/log/observe cluster, then separately inspect the five durable `CF_KV` rows afterward. The tool is not a training script and does not replace runtime FSV for gameplay behavior.
+
+## 9k. `everquest_action_prior_record`
 
 **Description:** "Persist one EverQuest action-prior prediction/outcome sample with computed correctness and exact CF_KV readback"
 **Side effects:** validates a redacted prediction/outcome sample, computes correctness, writes `CF_KV/everquest/action_prior_eval/v1/everquest.live/<sample_id>`, then reads that exact row back before returning.
@@ -387,7 +409,7 @@ Manual FSV must read the physical foreground/chat/UI/log/storage SoT before the 
 **Returns:** `EverQuestActionPriorRecordResponse { ok, row_key, stored_value_len_bytes, sample }`. `sample.correctness.class` is one of `correct_top1`, `correct_top3`, `correct_context`, `wrong`, `abstained`, or `unknown_actual`; it also carries calibration bucket, useful flag, overconfident-wrong flag, and the evidence boundary that scorecards are not FSV.
 **Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_WRITE_FAILED`, `STORAGE_READ_FAILED`, `STORAGE_CORRUPTED`, `TOOL_INTERNAL_ERROR`.
 
-## 9k. `everquest_action_prior_scorecard`
+## 9l. `everquest_action_prior_scorecard`
 
 **Description:** "Aggregate persisted EverQuest action-prior samples into a floor-not-ceiling competence scorecard with exact CF_KV readback"
 **Side effects:** reads named eval rows from `CF_KV`, writes `CF_KV/everquest/action_prior_scorecard/v1/everquest.live/<window_id>`, then reads that exact row back before returning.
