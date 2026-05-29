@@ -16,13 +16,15 @@ Source files covered:
 - `crates/synapse-mcp/src/server/everquest_world_model/{model,validation}.rs`
 - `crates/synapse-mcp/src/server/everquest_surprise.rs`
 - `crates/synapse-mcp/src/server/everquest_surprise/{model,compare,validation}.rs`
+- `crates/synapse-mcp/src/server/everquest_world_summary.rs`
+- `crates/synapse-mcp/src/server/everquest_world_summary/{model,validation}.rs`
 - `crates/synapse-mcp/src/server/everquest_scorecard.rs`
 - `crates/synapse-mcp/src/m1.rs` (+ `m1/{ocr, search, sources}.rs`)
 - `crates/synapse-mcp/src/m2/{aim, click, clipboard, drag, pad, press, release_all, scroll, type_text}.rs`
 - `crates/synapse-mcp/src/m3/{audio, audit_export, permissions, profile, profile_authoring, profile_quality, profile_registry, reflex, replay, subscribe}.rs`
 - `crates/synapse-core/src/types.rs`
 
-All 68 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
+All 69 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
@@ -482,7 +484,31 @@ Manual FSV for both #513 tools must read `CF_KV` before the trigger, call the re
 
 Manual FSV must read physical EQ log/current-state/storage before the trigger, call this real MCP tool with known expected/observed inputs, then separately inspect `everquest_world_model_inspect`, `storage_inspect`, and DB/WAL bytes afterward. The row is repair evidence only, not gameplay progress proof.
 
-## 9o. `everquest_action_prior_record`
+## 9o. `everquest_world_summary`
+
+**Description:** "Persist one compact EverQuest world-state summary for context injection with map/log/storage provenance and chat redaction"
+**Side effects:** reads the persisted current-state row by default or a provided synthetic override, builds bounded map context from local EQ map files, writes `CF_KV/everquest/world_summary/v1/everquest.live/<summary_id>`, then reads that exact row back. It does not execute input.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `summary_id` | `String` | yes | - | ASCII id used in the world-summary row key |
+| `profile_id` | `String` | no | `everquest.live` | EverQuest profile id; other ids fail closed |
+| `state_row_key` | `String` | no | `everquest/current_state/v1/everquest.live` | Current-state row to read when no state override is supplied |
+| `state_override` | `Option<EverQuestWorldSummaryStateOverride>` | no | - | Synthetic/manual-FSV state with explicit source refs |
+| `install_root_override` | `Option<String>` | no | - | Alternate EQ install root for map-missing and synthetic edges |
+| `max_exits` | `usize` | no | `5` | Bounded nearest exits, max 16 |
+| `max_landmarks` | `usize` | no | `5` | Bounded nearest landmarks, max 16 |
+| `max_transitions` | `usize` | no | `5` | Bounded transition summaries, max 16 |
+| `max_hazards` | `usize` | no | `5` | Bounded hazards, max 16 |
+| `stale_after_seconds` | `u64` | no | `300` | Older source state becomes a blocker |
+| `source_refs` | `Vec<EverQuestWorldSummarySourceRef>` | no | `[]` | Additional compact provenance refs |
+
+**Returns:** `EverQuestWorldSummaryResponse { ok, row_key, stored_value_len_bytes, summary }`. The summary contains zone/position confidence, level, focus, nearest exits/landmarks, recent transitions, safe next probes, hazards, active blockers, source refs, compaction recovery issue links, redaction flags, and evidence-boundary flags.
+**Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_READ_FAILED`, `STORAGE_WRITE_FAILED`, `STORAGE_CORRUPTED`, `TOOL_INTERNAL_ERROR`.
+
+Manual FSV must read physical EQ map/log/current-state/storage before the trigger, call this real MCP tool with known expected outputs, then separately inspect `storage_inspect` and DB/WAL bytes for the exact summary key. The row is compact context evidence only and not movement, combat, or level-progress proof.
+
+## 9p. `everquest_action_prior_record`
 
 **Description:** "Persist one EverQuest action-prior prediction/outcome sample with computed correctness and exact CF_KV readback"
 **Side effects:** validates a redacted prediction/outcome sample, computes correctness, writes `CF_KV/everquest/action_prior_eval/v1/everquest.live/<sample_id>`, then reads that exact row back before returning.
@@ -502,7 +528,7 @@ Manual FSV must read physical EQ log/current-state/storage before the trigger, c
 **Returns:** `EverQuestActionPriorRecordResponse { ok, row_key, stored_value_len_bytes, sample }`. `sample.correctness.class` is one of `correct_top1`, `correct_top3`, `correct_context`, `wrong`, `abstained`, or `unknown_actual`; it also carries calibration bucket, useful flag, overconfident-wrong flag, and the evidence boundary that scorecards are not FSV.
 **Errors:** `TOOL_PARAMS_INVALID`, `STORAGE_WRITE_FAILED`, `STORAGE_READ_FAILED`, `STORAGE_CORRUPTED`, `TOOL_INTERNAL_ERROR`.
 
-## 9p. `everquest_action_prior_scorecard`
+## 9q. `everquest_action_prior_scorecard`
 
 **Description:** "Aggregate persisted EverQuest action-prior samples into a floor-not-ceiling competence scorecard with exact CF_KV readback"
 **Side effects:** reads named eval rows from `CF_KV`, writes `CF_KV/everquest/action_prior_scorecard/v1/everquest.live/<window_id>`, then reads that exact row back before returning.

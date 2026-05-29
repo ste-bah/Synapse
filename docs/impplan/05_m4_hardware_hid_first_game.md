@@ -127,8 +127,9 @@ not additions to the agent-facing 33-tool count. M5 subsequently added
 `audit_export_bundle`. The EverQuest world-model work then added `/loc`,
 visible chat-input state, current-state, map-sensor, outcome, route, memory,
 planner guard, DynamicJEPA domain normalization, linked trajectory rows,
-approved-prefix world-model rows/readback, surprise detection, and
-action-prior tools, bringing the current approved live surface to 68
+approved-prefix world-model rows/readback, surprise detection, compact
+world-summary context rows, and action-prior tools, bringing the current
+approved live surface to 69
 agent-facing tools.
 
 ### 1.3 Firmware state

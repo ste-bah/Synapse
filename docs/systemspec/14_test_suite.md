@@ -75,7 +75,7 @@ Source files covered:
 - `m3_reflex_cancel_tool.rs`, `m3_reflex_history_tool.rs`, `m3_reflex_list_tool.rs`, `m3_reflex_register_tool.rs` — reflex CRUD
 - `m3_replay_record_tool.rs` — replay JSONL writer
 - `m3_subscribe_tool.rs` — subscribe + cancel
-- `m3_tools_list.rs` / `m4_tools_list.rs` — `tools/list` exposes the current 68-tool surface, including #499 `act_keymap`, M5 profile-registry/audit tools, #462 `profile_authoring_*`, #468 `profile_registry_report`, `profile_registry_rollback`, #460 `audit_export_*`, and the EverQuest world-model tools through `everquest_chat_input_state`, `everquest_planner_guard`, `everquest_domain_normalize`, `everquest_trajectory_record`, `everquest_world_model_record`, `everquest_world_model_inspect`, `everquest_surprise_detect`, and `everquest_action_prior_scorecard`
+- `m3_tools_list.rs` / `m4_tools_list.rs` — `tools/list` exposes the current 69-tool surface, including #499 `act_keymap`, M5 profile-registry/audit tools, #462 `profile_authoring_*`, #468 `profile_registry_report`, `profile_registry_rollback`, #460 `audit_export_*`, and the EverQuest world-model tools through `everquest_chat_input_state`, `everquest_planner_guard`, `everquest_domain_normalize`, `everquest_trajectory_record`, `everquest_world_model_record`, `everquest_world_model_inspect`, `everquest_surprise_detect`, `everquest_world_summary`, and `everquest_action_prior_scorecard`
 - `sigint_clean_exit.rs` — Ctrl-C / Ctrl-Break shuts the daemon down within deadline
 
 ### 2.5 `synapse-models` (1 file)

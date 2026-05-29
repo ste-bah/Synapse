@@ -36,7 +36,7 @@ crates/synapse-mcp/
 ├── Cargo.toml                      # Binary crate; depends on every other library crate
 └── src/
     ├── main.rs                     # Process entrypoint, clap CLI, telemetry init, stdio/http dispatch
-    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 68 MCP tools
+    ├── server.rs                   # SynapseService: ServerHandler + #[tool_router] declaring 69 MCP tools
     ├── server/
     │   ├── action_audit.rs         # CF_ACTION_LOG start/result audit rows with profile/session context
     │   ├── audit_context.rs        # Profile activation/session/event audit context persistence helpers
@@ -62,6 +62,10 @@ crates/synapse-mcp/
     │   │   ├── model.rs            # Row/parameter/response structs and constants
     │   │   ├── tests.rs            # World-model unit tests
     │   │   └── validation.rs       # Prefix/key/payload/source-ref validation plus row readback helpers
+    │   ├── everquest_world_summary.rs # Compact EverQuest context-injection summary row writer/readback
+    │   ├── everquest_world_summary/ # World-summary params, response, validation, and redaction helpers
+    │   │   ├── model.rs            # World-summary params, row, response, and provenance structs
+    │   │   └── validation.rs       # Summary id/default/source-ref validation and chat redaction
     │   ├── handler.rs              # ServerHandler implementation glue
     │   ├── health.rs               # health subsystem assembly
     │   ├── m1_tools.rs             # M1 tool wrappers

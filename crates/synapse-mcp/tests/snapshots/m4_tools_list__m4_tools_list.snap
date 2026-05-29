@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 68,
+  "count": 69,
   "m4_defaults": [
     {
       "actual": 33,
@@ -69,6 +69,46 @@ expression: snapshot
       "actual_contains": "target",
       "path": "inputSchema.required",
       "tool": "act_launch"
+    },
+    {
+      "actual": "everquest.live",
+      "path": "inputSchema.properties.profile_id.default",
+      "tool": "everquest_world_summary"
+    },
+    {
+      "actual": "everquest/current_state/v1/everquest.live",
+      "path": "inputSchema.properties.state_row_key.default",
+      "tool": "everquest_world_summary"
+    },
+    {
+      "actual": 5,
+      "path": "inputSchema.properties.max_exits.default",
+      "tool": "everquest_world_summary"
+    },
+    {
+      "actual": 5,
+      "path": "inputSchema.properties.max_landmarks.default",
+      "tool": "everquest_world_summary"
+    },
+    {
+      "actual": 5,
+      "path": "inputSchema.properties.max_transitions.default",
+      "tool": "everquest_world_summary"
+    },
+    {
+      "actual": 5,
+      "path": "inputSchema.properties.max_hazards.default",
+      "tool": "everquest_world_summary"
+    },
+    {
+      "actual": 300,
+      "path": "inputSchema.properties.stale_after_seconds.default",
+      "tool": "everquest_world_summary"
+    },
+    {
+      "actual_contains": "summary_id",
+      "path": "inputSchema.required",
+      "tool": "everquest_world_summary"
     }
   ],
   "tools": [
@@ -105,6 +145,7 @@ expression: snapshot
     "everquest_trajectory_record",
     "everquest_world_model_inspect",
     "everquest_world_model_record",
+    "everquest_world_summary",
     "find",
     "health",
     "observe",

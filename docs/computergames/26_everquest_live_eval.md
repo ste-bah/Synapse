@@ -439,6 +439,31 @@ tool executes no input. Manual FSV must read the physical EQ log/current-state
 storage before the trigger, call the real MCP tool, then separately read
 `everquest_world_model_inspect`, `storage_inspect`, and DB/WAL bytes afterward.
 
+## World Summary Context Rows
+
+#516 adds `everquest_world_summary`, the compact context-injection surface that
+agents should keep in context after compaction instead of dumping raw EQ logs or
+full map files. It writes
+`CF_KV/everquest/world_summary/v1/everquest.live/<summary_id>` with bounded
+current zone/position confidence, nearest exits and landmarks, recent
+transitions, safe next probes, level state, focus state, hazards, blockers,
+source refs, and compaction recovery links to #501, #500, and #505.
+
+The default path reads the persisted `everquest_current_state` row and local EQ
+map graph. `state_override` exists for synthetic manual FSV with known inputs,
+but every source ref still has to point at a physical SoT such as an EQ map
+line, log cursor, storage row, or issue comment. The row executes no input and
+persists no raw chat bodies. Unknown zone, missing map graph, stale state,
+non-EQ foreground, and low-confidence zone/location state persist explicit
+blockers and safe next probes instead of allowing blind movement.
+
+Manual FSV for this row reads physical map/log/current-state/storage before the
+trigger, calls the real MCP tool, then separately reads `storage_inspect` and
+DB/WAL bytes for the exact summary key. The required happy path is the current
+Neriak context reporting level 1, `neriaka`, and the `to_Nektulos_Forest`
+candidate without raw chat bodies. Required edges are unknown zone, map missing,
+stale state, and chat redaction.
+
 ## Action-Prior Scorecard Rows
 
 #531 adds the runtime storage surface for measuring whether the EverQuest world
@@ -515,6 +540,7 @@ GitHub issues remain the canonical coordination state:
 | #513 | Durable world-model row prefixes and compact readback tools |
 | #514 | Planner guard-decision rows for bounded EverQuest candidates |
 | #515 | Surprise detector for unexpected zone/action outcomes |
+| #516 | Compact world-summary context injection from map/log/storage SoTs |
 | #517 | Stabilize EverQuest foreground before accepted action candidates |
 | #518 | Safe target/combat model for level-1 wizard leveling |
 | #519 | Manual FSV route from Neriak Foreign Quarter to Nektulos safe area |

@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 68] = [
+const EXPECTED_TOOLS: [&str; 69] = [
     "act_aim",
     "act_click",
     "act_clipboard",
@@ -38,6 +38,7 @@ const EXPECTED_TOOLS: [&str; 68] = [
     "everquest_trajectory_record",
     "everquest_world_model_inspect",
     "everquest_world_model_record",
+    "everquest_world_summary",
     "find",
     "health",
     "observe",
@@ -91,7 +92,7 @@ async fn m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<
         .map(str::to_owned)
         .collect::<Vec<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 68);
+    assert_eq!(names.len(), 69);
     assert_no_duplicate_names(&names)?;
 
     assert_schema_roots_closed(tools)?;
@@ -223,6 +224,61 @@ fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
     read_required(&mut readbacks, tools, "act_keymap", "alias")?;
     read_required(&mut readbacks, tools, "act_run_shell", "command")?;
     read_required(&mut readbacks, tools, "act_launch", "target")?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.profile_id.default",
+        &json!("everquest.live"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.state_row_key.default",
+        &json!("everquest/current_state/v1/everquest.live"),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.max_exits.default",
+        &json!(5),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.max_landmarks.default",
+        &json!(5),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.max_transitions.default",
+        &json!(5),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.max_hazards.default",
+        &json!(5),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "inputSchema.properties.stale_after_seconds.default",
+        &json!(300),
+    )?;
+    read_required(
+        &mut readbacks,
+        tools,
+        "everquest_world_summary",
+        "summary_id",
+    )?;
     Ok(readbacks)
 }
 

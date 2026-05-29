@@ -18,8 +18,9 @@
    EverQuest DynamicJEPA domain normalizer, #512 adds linked trajectory rows
    from action/observation/event/log evidence, #513 adds EverQuest
    world-model record/inspect storage surfaces, #515 adds the EverQuest
-   surprise detector row writer, and #531 adds EverQuest action-prior
-   sample/scorecard tools, bringing the live surface to 68. Any
+   surprise detector row writer, #516 adds the compact EverQuest world-summary
+   context row writer, and #531 adds EverQuest action-prior sample/scorecard
+   tools, bringing the live surface to 69. Any
    further agent-facing tools require an ADR-approved cap change.
    Overlapping tools merge. Profile and parameter knobs are the escape hatches.
 2. **One tool, one verb.** No `do_everything(action_kind, ...)` mega-tools.
@@ -39,7 +40,7 @@ visible chat-buffer pollution readback that also gates `/loc`, #510 adds
 `everquest_route_plan`, #525 adds `everquest_map_sensor`, #511 adds
 `everquest_domain_normalize`, #512 adds `everquest_trajectory_record`, #513 adds
 `everquest_world_model_record` plus `everquest_world_model_inspect`, #515 adds
-`everquest_surprise_detect`, and #531 adds
+`everquest_surprise_detect`, #516 adds `everquest_world_summary`, and #531 adds
 `everquest_action_prior_record` plus `everquest_action_prior_scorecard`. M4 adds `act_combo`, `act_run_shell`, and
 `act_launch`; M5 adds local profile-registry/audit quality scoring, authoring
 candidates, registry row operations, import/export, audit intelligence, and
@@ -121,10 +122,11 @@ future `tools/list` snapshots in #447/#448.
 | 64 | `everquest_world_model_record` | write/read | stores one compact world-model row under an approved `CF_KV` prefix with exact readback |
 | 65 | `everquest_world_model_inspect` | read | inspects approved EverQuest world-model prefixes, selected keys, counts, and redacted samples |
 | 66 | `everquest_surprise_detect` | write/read | compares predicted EverQuest outcome against observed state/log evidence and stores a compact surprise row |
-| 67 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
-| 68 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
+| 67 | `everquest_world_summary` | write/read | stores one compact world-state summary row for context injection with map/log/storage provenance and chat redaction |
+| 68 | `everquest_action_prior_record` | write/read | stores one prediction/outcome sample under `CF_KV` with computed correctness and exact readback |
+| 69 | `everquest_action_prior_scorecard` | write/read | aggregates stored samples into a floor-not-ceiling competence scorecard row and reads it back |
 
-M3 live count: 30 tools. Current live count: 68
+M3 live count: 30 tools. Current live count: 69
 tools.
 
 Deferred ideas from earlier drafts (`describe` and `read_hud`) are still not
@@ -147,6 +149,8 @@ domain-pack normalizer;
 `everquest_world_model_record` and `everquest_world_model_inspect` are the
 #513 approved-prefix storage/readback tools;
 `everquest_surprise_detect` is the #515 prediction-vs-observation surprise row
+writer;
+`everquest_world_summary` is the #516 compact context-injection summary row
 writer;
 `everquest_action_prior_record` and `everquest_action_prior_scorecard` are the
 #531 competence scorecard tools;
@@ -1189,7 +1193,50 @@ read physical EQ log/current-state/storage before the trigger, call the real
 MCP tool, then separately inspect `CF_KV`, `everquest_world_model_inspect`, and
 the physical DB bytes afterward.
 
-### 3.13o `everquest_action_prior_record`
+### 3.13o `everquest_world_summary`
+
+```json
+{
+  "name": "everquest_world_summary",
+  "input_schema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["summary_id"],
+    "properties": {
+      "summary_id": {"type": "string"},
+      "profile_id": {"type": "string", "default": "everquest.live"},
+      "state_row_key": {"type": "string", "default": "everquest/current_state/v1/everquest.live"},
+      "state_override": {"type": "object"},
+      "install_root_override": {"type": "string"},
+      "max_exits": {"type": "integer", "default": 5},
+      "max_landmarks": {"type": "integer", "default": 5},
+      "max_transitions": {"type": "integer", "default": 5},
+      "max_hazards": {"type": "integer", "default": 5},
+      "stale_after_seconds": {"type": "integer", "default": 300},
+      "source_refs": {"type": "array", "items": {"type": "object"}}
+    }
+  }
+}
+```
+
+`everquest_world_summary` writes one compact context-injection row at
+`CF_KV/everquest/world_summary/v1/everquest.live/<summary_id>`. It reads the
+persisted current-state row by default, builds local-map context from the EQ
+install maps, and stores bounded zone/position confidence, nearest exits and
+landmarks, recent transitions, safe next probes, level state, focus state,
+hazards, active blockers, source refs, and compaction recovery links to #501,
+#500, and #505.
+
+The summary executes no input and must not carry raw chat bodies. Missing or
+unknown zone, missing map graph, stale state, non-EQ foreground, and
+low-confidence zone/location state persist explicit blockers rather than
+pretending the agent can navigate safely. Manual FSV must read the physical EQ
+map/log/current-state/storage source before the trigger, call the real MCP
+tool with known expected outputs, then separately inspect `storage_inspect` and
+the physical DB bytes afterward. The summary is context evidence only; movement
+and level-progress claims still require separate gameplay FSV.
+
+### 3.13p `everquest_action_prior_record`
 
 ```json
 {
@@ -1248,7 +1295,7 @@ an FSV substitute. Manual FSV must still read storage state before the trigger,
 call the tool with known synthetic prediction/outcome inputs, and separately
 read `storage_inspect` or another physical storage readback after the write.
 
-### 3.13p `everquest_action_prior_scorecard`
+### 3.13q `everquest_action_prior_scorecard`
 
 ```json
 {
@@ -2583,6 +2630,17 @@ profile-authoring and audit-export defaults below.
 | `everquest_surprise_detect` | `threshold` | `0.5` | #515 |
 | `everquest_surprise_detect` | `stale_after_seconds` | `300` | #515 |
 | `everquest_surprise_detect` | `source_refs` | `[]` | #515 |
+| `everquest_world_summary` | `summary_id` | required; no default | #516 |
+| `everquest_world_summary` | `profile_id` | `"everquest.live"` | #516 |
+| `everquest_world_summary` | `state_row_key` | `"everquest/current_state/v1/everquest.live"` | #516 |
+| `everquest_world_summary` | `state_override` | omitted; reads storage current-state row | #516 |
+| `everquest_world_summary` | `install_root_override` | omitted; resolves active EverQuest install | #516 |
+| `everquest_world_summary` | `max_exits` | `5` | #516 |
+| `everquest_world_summary` | `max_landmarks` | `5` | #516 |
+| `everquest_world_summary` | `max_transitions` | `5` | #516 |
+| `everquest_world_summary` | `max_hazards` | `5` | #516 |
+| `everquest_world_summary` | `stale_after_seconds` | `300` | #516 |
+| `everquest_world_summary` | `source_refs` | `[]` | #516 |
 | `everquest_action_prior_record` | `sample_id` | required; no default | #531 |
 | `everquest_action_prior_record` | `profile_id` | `"everquest.live"` | #531 |
 | `everquest_action_prior_record` | `prediction_id` | required; no default | #531 |
