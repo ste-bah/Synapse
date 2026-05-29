@@ -8,6 +8,15 @@ This is not a script, benchmark harness, CI job, or automated FSV substitute.
 Manual FSV must use the real Synapse MCP runtime surface, the visible
 EverQuest client, local client logs/config files, Windows process/window state,
 and Synapse storage/audit rows as the sources of truth.
+Before every EverQuest FSV action cluster, the agent must prove
+`synapse-mcp` is running and active: process or stdio child, loopback transport
+or client state, authenticated `health`, initialized MCP session, and
+`tools/list` containing the EverQuest tool being used. If the daemon is missing
+or stale, launch or reinstall the repo-built runtime first. EverQuest behavior
+must be triggered through the real MCP tool (`observe`, `act_keymap`,
+`everquest_current_state`, `storage_inspect`, etc.) whenever such a tool exists,
+then verified by a separate read of the visible client, EQ logs/config, Windows
+process/window state, and Synapse storage rows.
 
 ## Current Character State
 
@@ -68,6 +77,7 @@ Manual FSV must read these surfaces before and after each trigger:
 
 | SoT | Expected evidence |
 |---|---|
+| Synapse MCP daemon | `synapse-mcp` PID/command line or stdio child, authenticated `health`, initialized session, and `tools/list` containing the tool used |
 | Windows process table | `eqgame.exe` PID and command line from the Daybreak install |
 | Foreground window state | title/class/HWND/process path for the active EverQuest window |
 | Visible game UI | OCR/screenshot evidence for character/server/zone/level/XP or UI text |
@@ -229,6 +239,28 @@ than loading full raw logs into the model context. Its durable row is
 `CF_KV/everquest/current_state/v1/everquest.live`; downstream route planners,
 world-model context injection, surprise detection, and scorecards should read
 that row or derived storage rows instead of rereading unbounded log text.
+
+## Delta Reality For EverQuest
+
+Issue #536 changes the EverQuest context strategy from repeated full-state
+summaries to a baseline plus deltas:
+
+- Baseline: foreground `eqgame.exe`, character/server/profile, zone,
+  latest `/loc`, HUD level/XP/resources, chat-input state, log cursor, nearest
+  map landmarks, and current world-model head rows.
+- Deltas: new EQ log lines, log cursor movement, zone entered, `/loc` changed,
+  HUD field changed, chat-input state changed, action accepted/denied, target or
+  con changed, route/surprise/memory rows written, or profile/audit state
+  changed.
+- Audit: periodically re-read the visible client, physical EQ log/config/map
+  files, Windows process/window state, and Synapse `CF_KV`/audit rows. Compare
+  those physical SoTs against the baseline+delta assumption. Persist drift and
+  force a new baseline before continuing movement/combat if reality disagrees.
+
+The level-2 run should use delta context between audits once #537-#542 are
+implemented. Until then, use existing real MCP tools (`observe`,
+`everquest_current_state`, `everquest_world_summary`, `storage_inspect`) plus
+manual before/after SoT readback.
 
 ## Current-Map Sensor Rows
 

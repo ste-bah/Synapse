@@ -2,12 +2,14 @@
 
 Discipline applied across M0-M5. PRD authority: `docs/computergames/README.md` §"Authoring rules" + `14_build_and_packaging.md` + `13_testing_strategy.md`. State-tracking authority: git tags + `CHANGELOG.md` (final) > codebase on `main` (operational) > GitHub Issues (https://github.com/ChrisRoyse/Synapse/issues — every PR-sized task, `[DECISION]`, `[DISCOVERY]`, `[BUG]`, `[RISK]`, `[CONTEXT]`). Use `gh issue list --state all --search 'phase:m4'` (etc.) to walk landed-decision history for context the commit message did not carry. **All M0/M1/M2/M3 historical issues are closed as of 2026-05-25** (`v0.1.0-m3` tag); new M4 work opens fresh issues with the same labels.
 
-**Four load-bearing operator directives (NEVER violate):**
+**Six load-bearing operator directives (NEVER violate):**
 
 1. **No backwards compatibility (pre-v1).** Schema/API changes break callers. No fallbacks, no compatibility shims, no silent error swallowing. Fail fast with a structured `synapse_core::error_codes::*` code and a `tracing` line carrying that code so the failure is debuggable.
 2. **No mocks gate completion.** Unit fakes are fine for isolation. An OS-bound work-item is **not done** until a real-OS integration test exercises it and a separate source-of-truth read confirms the side effect landed.
 3. **Manual configured-host FSV is the shipping gate, not GitHub Actions** (issues #246/#247/#350/#351, operator decision 2026-05-24). Use local checks for supporting evidence. Do not dispatch, wait on, or block a tag on GitHub Actions/CI. FSV must never be delegated to scripts, automated tests, benchmarks, harnesses, CI jobs, or any other automated substitute.
 4. **Missing prerequisites are acquisition work, not a stopping point.** If a local tool, driver, model, device, file, service, account state, installer, hardware surface, or other prerequisite is absent, do not mark the issue blocked for that reason alone. Missing means: figure out where the thing must come from, where it must physically appear, and make it happen on this configured host. Synapse gives the agent full local computer-control responsibility; treat Synapse/local control as the operator-equivalent host control surface. If the operator could download, install, connect, configure, generate, flash, launch, or inspect it from this host, the agent must attempt those reversible local steps using Synapse plus normal OS, shell, browser, package-manager, and device-management workflows. Do not ask the operator to download or install something while reversible local acquisition/setup remains possible. Operationally: do not stop at "missing"; Synapse gives the agent the same practical local ability the operator has at this keyboard, so if it can be done from this computer, do it and then inspect the resulting SoT. Missing local state creates the next action for the agent and must be made real, not handed back to the operator or treated as a blocker while reversible host work remains. Nothing is ever `status:blocked` because a configured-host prerequisite is absent; the only blockable item is the exact operator-only hard-to-reverse external action left after every reversible local step is exhausted. Browser downloads, GUI installers, Device Manager checks, package-manager installs, model/file generation, firmware flashing, app launching, USB/COM inspection, and UI inspection are agent-owned work on this host. Missing configured-host state is never a blocker by itself. Identify the authoritative SoT where it should appear, perform the setup/acquisition step, then read that SoT directly. Ask only for narrow approval before hard-to-reverse external actions such as spending money, using private credentials, changing billing, modifying an external account, or making an irreversible shared-state change, and complete every reversible local step before asking.
+5. **Synapse MCP runtime is a required FSV precondition and trigger surface.** Before accepting Synapse behavior, prove the real `synapse-mcp` daemon is running and active: read the process/stdout or socket source of truth, authenticate when HTTP is used, call `health`, initialize an MCP session, and call `tools/list` to verify the required tool is present. If the daemon is absent, stale, unreachable, or the direct chat transport is closed, launching/reinstalling the repo-built runtime is setup work. For any behavior with a Synapse MCP tool, the FSV trigger must be the real MCP `tools/call`; CLIs, tests, helper binaries, scripts, benchmarks, or direct storage writes are supporting investigation only. After the tool call, read the separate physical SoT (`CF_*` row, file bytes, visible UI, EQ log, process state, device state, etc.) and record the daemon PID/bind or stdio child, session/tool, expected output, and actual after-read in the issue.
+6. **Reality context should be delta-first with periodic drift audits.** The #536 architecture direction is that a full snapshot establishes a baseline, then routine agent context is ordered reality deltas with source refs, confidence, and before/after values. Synapse must periodically perform a full physical reality audit against UI/log/file/process/storage/device SoTs, compare that to the delta-guided assumption, persist drift findings, and force a new baseline when needed. Until those tools exist, use existing MCP surfaces plus manual SoT readback and keep missing delta work in GitHub issues.
 
 ---
 
@@ -121,6 +123,21 @@ this computer, the agent must do the reversible local work through Synapse and
 host workflows, then read the physical SoT.
 Missing local state is the agent's next action, not a blocker while reversible
 host work remains.
+
+MCP runtime availability is part of the same gate. Before a Synapse tool claim
+is accepted, read the live `synapse-mcp` process/socket or stdio child,
+authenticate and call `health`, initialize a session, and verify the required
+tool exists through `tools/list`. The trigger is the real MCP `tools/call` when
+a tool exists; the verdict is still the separate physical SoT readback after
+the tool call. If the MCP runtime is missing or stale, make it real first.
+
+Delta-first reality is the target context model for Synapse. Use a baseline
+snapshot only to establish or repair state; then prefer ordered reality deltas
+for routine context so the agent receives what changed instead of a fresh full
+snapshot. Periodically run a full reality audit that re-reads physical SoTs and
+compares them against the delta-guided assumption. Any drift must become an
+explicit audit/rebase row, not hidden state. #536 and #537-#543 track the
+implementation work.
 
 ---
 

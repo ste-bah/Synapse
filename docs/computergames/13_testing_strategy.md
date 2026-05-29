@@ -18,6 +18,18 @@ actual state for the happy path plus at least three edge cases. Automated tests,
 benchmarks, scripts, harnesses, GitHub Actions, and CI are supporting evidence
 only.
 
+For Synapse behavior, manual FSV also starts by proving the real `synapse-mcp`
+runtime is active. The agent reads the process/stdout or socket state,
+authenticates when HTTP is used, calls `health`, initializes an MCP session, and
+reads `tools/list` before invoking the behavior under review. When an MCP tool
+exists, the trigger is the real `tools/call`; a CLI, helper binary, test,
+benchmark, or direct database write is supporting evidence only.
+
+For the #536 delta-first reality work, manual FSV must prove both sides of the
+contract: the delta stream contains the known change, and a periodic full audit
+agrees with or corrects the agent's accumulated assumption by reading the
+physical SoT.
+
 "Hard to test" is never an excuse for not testing.
 Likewise, a missing local prerequisite is not an excuse to stop. If the
 operator could acquire, install, connect, configure, generate, launch, flash, or
@@ -202,10 +214,13 @@ Tracked benches:
 
 Configured Windows 11 host. Each manual FSV run:
 
-1. Spawns `synapse-mcp` in stdio mode
-2. Connects as MCP client (Rust client in `synapse-test-utils`)
-3. Drives a scripted scenario
-4. Reads the source of truth separately and records before/after state
+1. Reads whether `synapse-mcp` is already running and active; if not, launches
+   a repo-owned stdio or loopback HTTP daemon with an issue-local DB/log path.
+2. Reads process/socket state, authenticated `health`, initialized MCP session,
+   and `tools/list` to prove the required tool is present.
+3. Calls the real MCP `tools/call` for the behavior under review with known
+   synthetic/manual inputs.
+4. Reads the source of truth separately and records before/after state.
 
 Test scenarios:
 
@@ -395,10 +410,14 @@ approval, and every reversible local step must be complete before asking.
 Before tagging a release, the maintainer runs:
 
 1. **Configured Windows 11 host.** Verify ViGEmBus is installed, Synapse is installed, Claude Desktop is connected, and run "open Notepad, type, save".
-2. **Live game session.** Pick one bundled game profile, play 15 minutes via agent, verify reasonable behavior and no stuck inputs.
-3. **Hardware HID flash + smoke.** Flash a Pico, connect, run hardware aim test.
-4. **Panic hotkey drill.** Start a long-running reflex, hit `Ctrl+Alt+Shift+P`, verify everything stops within 100 ms.
-5. **Disk pressure drill.** Fill a small DB volume, verify pressure transitions, verify operation continues degraded but not broken.
+2. **Live MCP runtime.** Verify `synapse-mcp` is running from the expected
+   binary, authenticated `health` is ok, `tools/list` exposes the required
+   tools, and at least one read tool plus one write/gated tool are exercised
+   through real `tools/call` with separate SoT readback.
+3. **Live game session.** Pick one bundled game profile, play 15 minutes via agent, verify reasonable behavior and no stuck inputs.
+4. **Hardware HID flash + smoke.** Flash a Pico, connect, run hardware aim test.
+5. **Panic hotkey drill.** Start a long-running reflex, hit `Ctrl+Alt+Shift+P`, verify everything stops within 100 ms.
+6. **Disk pressure drill.** Fill a small DB volume, verify pressure transitions, verify operation continues degraded but not broken.
 
 Maintainer signs off with a release-notes entry summarizing what they tested.
 

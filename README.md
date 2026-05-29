@@ -11,6 +11,18 @@ Full State Verification on the configured Windows host is the shipping gate.
 Scripts, tests, benchmarks, GitHub Actions, and CI are supporting evidence only;
 they are never FSV.
 
+When a behavior has a Synapse MCP tool, agents must verify the real
+`synapse-mcp` runtime before FSV: process or stdio child, bind/socket,
+authenticated `health`, initialized MCP session, and `tools/list`. The trigger
+must be the real MCP `tools/call`, followed by a separate read of the physical
+source of truth such as RocksDB rows, file bytes, UI state, logs, or device
+state. Tool return values and `health` are liveness/attempt evidence only.
+
+The active architecture direction in #536 is delta-first reality: Synapse should
+feed the agent ordered changes in reality after a baseline snapshot, then
+periodically audit the accumulated assumption against full physical reality and
+force a rebase when drift is found.
+
 Missing local tools, drivers, models, devices, files, services, account state,
 or other prerequisites are acquisition/setup work, not blockers. Agents must
 use Synapse/local control as the operator-equivalent host control surface, with

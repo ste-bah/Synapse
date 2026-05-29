@@ -231,6 +231,22 @@ pub struct M1State {
 
 `last_observed_foreground` is updated after each successful `observe` call (`server.rs::observe`). This is the SoT consulted by `ensure_act_type_foreground` so `act_type` refuses to type into the wrong window.
 
+### 5.1a Delta-first reality target (#536)
+
+The current `observe` implementation builds full `Observation` values. The
+target architecture in #536 keeps that path for baseline/debug/full-audit reads
+but adds a delta-first context flow:
+
+- `RealityBaseline` establishes epoch, seq, compact state hash, and physical
+  source refs from a bounded full observation plus profile-specific SoTs.
+- `RealityDelta` records ordered foreground/focus/HUD/entity/log/action/storage
+  changes after that baseline.
+- `RealityAudit` periodically re-reads physical SoTs and compares actual state
+  to the baseline+delta assumption; drift produces explicit rebase guidance.
+
+Until #537-#542 land, these schemas/tools are planned surfaces. Existing live
+FSV must still use the current MCP tools and separate physical SoT readback.
+
 ### 5.2 ObserveParams and slot expansion
 
 `ObserveParams`:

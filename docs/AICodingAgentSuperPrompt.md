@@ -50,6 +50,24 @@ Treat the missing item as a concrete setup/acquisition action with source-of-tru
 
 Ask only for narrow approval before hard-to-reverse external actions such as spending money, using private credentials, changing billing, modifying an external account, or making an irreversible shared-state change. Complete every reversible local step before asking. Do not call the work complete until the real prerequisite and the feature that depends on it are manually verified at the SoT.
 
+### §0.0.2 — Synapse MCP runtime is part of FSV
+
+When verifying Synapse behavior, do not treat the MCP daemon as assumed background state. Before FSV, prove the real `synapse-mcp` runtime is alive and usable: read the process table or configured stdio child, read the bind/socket or client transport state, authenticate when HTTP is used, call `health`, initialize an MCP session, and call `tools/list` to verify the required tool is present.
+
+If `synapse-mcp` is absent, stale, unreachable, or the direct chat transport is closed, that is setup work: launch or reinstall the repo-built daemon through the configured host path, then read the process, binary, health, and tool-list SoTs again. Do not proceed as though direct CLI calls, tests, or storage edits are equivalent.
+
+For any behavior that has a Synapse MCP tool, the FSV trigger must be the real MCP `tools/call`. A CLI, helper binary, unit test, benchmark, script, or direct database write can support diagnosis only; it cannot replace the tool trigger. After the tool call, perform the separate SoT read required by §0.0: RocksDB row, file bytes, UI state, external log, process state, or other physical artifact. The MCP return value and `health` response prove attempt/liveness, not success.
+
+Issue evidence must name the daemon PID or stdio child, bind or transport, MCP session/tool used, expected output, and the actual after-read from the separate SoT. If no MCP tool exists for the behavior, explicitly say so and identify the nearest real runtime surface instead of silently substituting a script.
+
+### §0.0.3 — Synapse should feed reality deltas, then audit drift
+
+For Synapse work, the target architecture is delta-first reality (#536). A full snapshot establishes a baseline; routine context should be ordered `reality_delta` records that say what changed, with source refs and confidence. The agent maintains its working assumption from those deltas instead of consuming full reality snapshots every turn.
+
+Because accumulated deltas can drift from actual state, Synapse must periodically perform a full physical reality audit: re-read the authoritative UI/log/file/process/storage/device SoTs, compare them to the assumed state, persist an audit row, and force a new baseline when drift exceeds threshold.
+
+Until the delta tools exist, use the current real MCP tools and manual SoT readback. Do not pretend a script, helper, or memory summary is the delta system. File/update #536 child issues for every missing schema, MCP surface, storage row, perception generator, EverQuest integration, and FSV runbook needed to make delta-first reality real.
+
 ---
 
 ## §0.1 — THE COMPACTION-SURVIVAL CONTRACT

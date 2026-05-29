@@ -30,6 +30,29 @@ surface and then inspect the separate physical source of truth/state it
 produced. Scripts must not stand in for that runtime trigger or source-of-truth
 readback.
 
+Before any Synapse behavior is accepted by FSV, the agent must prove the real
+`synapse-mcp` daemon is running and active on this host. Read the process/socket
+source of truth, authenticate to the daemon, call `health`, initialize an MCP
+session, and read `tools/list` so the required tool is physically present. If
+the daemon is absent, stale, or unreachable, launching or reinstalling the
+repo-built runtime is the next local setup action. For any behavior with an MCP
+tool, the trigger must be the real `tools/call`; a CLI, unit test, helper
+binary, script, or direct storage write may only support investigation and must
+not replace the MCP trigger. FSV evidence must name the daemon PID/bind or stdio
+child, session/tool used, and the separate SoT read after the tool call. A
+`health` response or tool return value is not the verdict by itself.
+
+## Delta-Of-Reality Operating Rule
+
+Synapse should move toward a delta-first reality model tracked by issue #536.
+After a baseline snapshot, routine agent context should be ordered changes in
+reality, not repeated full snapshots. Long-running work must periodically ask
+Synapse to audit the accumulated assumption against physical reality and force
+a rebase when drift is detected. Until the delta tools are implemented, agents
+must continue using the existing real MCP tools and separate SoT readbacks, and
+must file or update the #536 child issues instead of letting delta-reality work
+live only in chat context.
+
 ## No GitHub Actions / CI Gate
 
 Do not dispatch, wait on, or use GitHub Actions/CI as a shipping gate unless a

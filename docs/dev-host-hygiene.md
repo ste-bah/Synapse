@@ -41,6 +41,22 @@ spending money, using private credentials, changing billing, modifying an
 external account, or irreversible shared-state changes.
 Complete every reversible local step before asking for that approval.
 
+## MCP runtime hygiene for FSV
+
+Do not assume a prior `synapse-mcp` process is still valid after compaction,
+repo changes, or client transport errors. Before accepting Synapse behavior,
+read the real runtime state: process table or stdio child, executable path and
+hash when relevant, loopback bind/socket or client transport, authenticated
+`health`, initialized MCP session, and `tools/list` containing the required
+tool.
+
+If the configured chat MCP reports `Transport closed`, treat that as client
+transport state. Launch or reinstall the repo-built runtime, preferably with an
+issue-local `.runs/<run-id>/db` and log directory for shipping evidence, then
+repeat the readback. FSV triggers Synapse behavior through the real MCP
+`tools/call` when a tool exists, and the verdict comes from a separate physical
+SoT read after the call.
+
 ## Coordinates: `act_aim` / `act_click({x,y})` / `act_drag` / `act_scroll`
 
 Synapse interprets all `{x, y}` mouse coordinates as **physical (DPI-aware) pixels** — the same units `GetCursorPos` returns from a per-monitor-DPI-aware process, and the same units UI Automation bounding boxes use. This matches the daemon's own DPI awareness (synapse-mcp is built as per-monitor V2) and `mouse_coordinates.rs::normalize_absolute_mouse_point` which feeds `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`.

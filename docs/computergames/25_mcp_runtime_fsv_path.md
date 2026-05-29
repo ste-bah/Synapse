@@ -6,6 +6,40 @@ benchmark harness, CI job, or GitHub Action. Do not automate this runbook and
 do not call a return value FSV unless the separate source of truth named here
 has been read before and after the trigger.
 
+## 0. Mandatory MCP Runtime Preflight
+
+For Synapse behavior, `synapse-mcp` itself is part of the source-of-truth chain.
+Before every manual FSV action cluster, the agent must read and record:
+
+| Surface | Required readback |
+|---|---|
+| Runtime process | `synapse-mcp.exe` PID, executable path, command line, and start time, or the configured stdio child owned by the MCP client |
+| Transport | loopback bind/socket or stdio transport state; unauthenticated HTTP must fail closed |
+| Liveness | authenticated `health` response with `ok=true` and relevant subsystem state |
+| Session | initialized MCP session id for HTTP, or initialized stdio client state |
+| Tool registry | `tools/list` count plus the exact tool name required for the issue |
+
+If any of those reads fail because the daemon is absent, stale, unreachable, or
+the direct chat transport is closed, make the runtime real first. Build,
+install, or launch the repo-owned `synapse-mcp` process with an issue-local DB
+and log directory, then repeat the preflight reads. Missing or closed MCP
+runtime state is setup work, not permission to bypass Synapse.
+
+When an MCP tool exists for the behavior under review, the FSV trigger is the
+real MCP `tools/call`. Direct CLI calls, helper binaries, unit tests,
+benchmarks, scripts, direct RocksDB writes, or code-level invocations may
+support diagnosis, but they are not the runtime trigger. After `tools/call`, the
+verdict still comes from a separate read of the physical SoT: storage rows,
+file bytes, visible UI, local logs, process/window state, device state, or
+external record. The tool return value and `health` response prove liveness and
+attempt only.
+
+For delta-first reality work (#536), the preflight also records the current
+baseline epoch/seq when one exists. The trigger is the real delta or audit MCP
+tool once implemented; the after-read must compare the emitted delta/audit row
+with the physical UI/log/file/process/storage/device state that actually
+changed.
+
 ## 1. Direct Chat MCP Boundary
 
 The pre-wired chat MCP tool is a convenience surface owned by the MCP client
@@ -48,8 +82,9 @@ binary from the configured path.
 
 ## 2. Dedicated Repo Runtime Path
 
-For issue shipping evidence, prefer a repo-owned runtime process with isolated
-state:
+For issue shipping evidence, use a repo-owned runtime process with isolated
+state whenever the direct chat child is unavailable or whenever the issue needs
+an inspectable process/socket/log/DB source of truth:
 
 ```powershell
 $env:SYNAPSE_BEARER_TOKEN = 'issue-token'
@@ -62,7 +97,8 @@ Then manually:
 
 1. Read process table, command line, installed binary hash, log file path, DB
    path, and `/health` before the trigger.
-2. Initialize `/mcp`, send `notifications/initialized`, and call the real tool.
+2. Initialize `/mcp`, send `notifications/initialized`, read `tools/list`, and
+   call the real tool through `tools/call`.
 3. Read `/health`, logs, process state, and any DB/file/game SoT after the
    trigger.
 4. Stop the temporary daemon before leaving the issue.

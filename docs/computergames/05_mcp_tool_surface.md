@@ -32,6 +32,11 @@
 5. **All async; all cancellable.** Long-running tools support progress notifications via Streamable HTTP SSE upgrade.
 6. **Idempotency tokens where it matters.** `act_run_shell`, `act_launch`, and similar accept an optional `idempotency_key` for safe retries.
 7. **Stable identifiers.** `element_id`, `entity_id`, `track_id`, `reflex_id`, `session_id` are returned by tools and accepted unchanged by subsequent calls. Agent never invents these.
+8. **Delta-first reality.** Per #536, full observations establish or repair a
+   baseline; routine context should be ordered reality deltas, with periodic
+   full audits to detect drift and force rebase. Until #537-#543 land, the
+   existing tools remain the live surface and manual SoT readback remains
+   mandatory.
 
 The first 30 tools below are the live M3 baseline. #499 adds `act_keymap` as a
 profile-keymap action alias, #508 adds `everquest_loc_probe` as a literal
@@ -208,6 +213,25 @@ Returns current unified perception observation.
 Returns `Observation` (see `06_data_schemas.md`). Typical size 1–6 KB.
 
 Errors: `OBSERVE_NO_PERCEPTION_AVAILABLE` (all sensors down), `OBSERVE_INTERNAL`.
+
+### 3.1a `reality_baseline`, `observe_delta`, `reality_audit` (planned, #536-#542)
+
+These are the planned delta-first reality surfaces and are not live until the
+#536 child issues land. They must not be counted in the live tool total yet.
+
+- `reality_baseline` captures or reads a compact baseline for the current
+  profile/session. It returns epoch, baseline seq, physical source refs,
+  baseline hash, and token/size counters.
+- `observe_delta` returns ordered `RealityDelta` records since a cursor or
+  epoch. Empty changes return an explicit no-op delta or empty batch with the
+  current cursor; stale/overflowed cursors return `rebase_required`.
+- `reality_audit` re-reads physical SoTs, compares them against the
+  baseline+delta assumption, persists a `RealityAudit` row, and returns drift
+  status plus rebase guidance.
+
+Manual FSV for these tools must prove live `synapse-mcp`, call the real MCP
+tool, and separately inspect the physical UI/log/file/process/storage/device
+SoTs plus persisted `CF_KV/reality/*` rows. Tool returns are not the verdict.
 
 ### 3.2 `find`
 

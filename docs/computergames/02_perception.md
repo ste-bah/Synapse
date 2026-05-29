@@ -13,6 +13,14 @@ Two paths, simultaneously active:
 
 `observe()` is the unified read. Both paths feed the same `Observation`; agent picks a query, not a path. The subsystem decides which sensors are cheapest and richest for the current foreground.
 
+Issue #536 changes the target context contract from snapshot-first to
+delta-first. `observe()` remains the baseline/debug read, but normal agent
+context should become a stream of ordered reality deltas: what foreground,
+focus, HUD field, entity, log cursor, storage row, action outcome, or world
+state changed since the last cursor. Periodic reality audits re-read full
+physical sources of truth and compare them against the delta-guided assumption
+so drift becomes an explicit rebase event instead of silent context rot.
+
 Output schemas: `06_data_schemas.md`.
 
 ---
@@ -436,6 +444,32 @@ pub struct Observation {
 ```
 
 Tokenization budget: aim for `serde_json::to_string(&observation)` ≤ 6 KB (≈ 1500 tokens) under typical conditions. Larger queries require explicit `expand(slot=...)` calls.
+
+---
+
+## 8.1 Delta-first reality model
+
+The target architecture for M4+ is:
+
+1. Capture a `RealityBaseline` from a bounded full `Observation` plus any
+   profile-specific physical SoTs such as logs, files, process/window state, or
+   storage rows.
+2. Emit append-only `RealityDelta` records for changes after that baseline.
+   Deltas carry epoch, seq, source, kind, field/path, compact before/after
+   values, confidence, and source refs.
+3. Let the agent maintain a working assumption by applying deltas instead of
+   ingesting a fresh full snapshot on every turn.
+4. Periodically run `RealityAudit`: re-read the physical SoTs, compare actual
+   state with the assumed baseline+delta state, persist drift findings, and
+   force `rebase_required` when the assumption is stale or contradictory.
+
+Full snapshots are still required for initialization, explicit expansion,
+debugging, and FSV. Delta payloads are the routine context feed because they are
+smaller and more useful: they tell the agent what changed and why it matters.
+
+Tracked work: #536 (context), #537 (schemas), #538 (MCP tools), #539
+(perception delta generation), #540 (storage rows), #541 (EverQuest
+integration), #542 (manual FSV runbook), and #543 (registry quality signals).
 
 ---
 

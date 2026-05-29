@@ -10,6 +10,15 @@
 configured Windows host is the shipping gate. Automated tests, scripts,
 benchmarks, GitHub Actions, and CI are supporting evidence only and must never
 be presented as FSV.
+For Synapse behavior, FSV must start from a proven live `synapse-mcp` runtime:
+read the daemon process/stdio child or socket, authenticate when HTTP is used,
+call `health`, initialize a session, and read `tools/list`. If an MCP tool
+exists for the behavior, the trigger is the real MCP `tools/call`; then the
+agent separately reads the physical SoT such as RocksDB rows, file bytes,
+visible UI, local logs, process state, or device state.
+The #536 architecture direction is delta-first reality: after a baseline
+snapshot, routine context should be ordered changes in reality, with periodic
+full physical audits to detect drift and rebase the agent's assumption.
 Missing configured-host prerequisites are acquisition/setup work, not blockers:
 agents must use Synapse/local control as the operator-equivalent host control
 surface with full local computer-control responsibility, plus normal OS, shell,
@@ -92,8 +101,9 @@ files, RocksDB `CF_ACTION_LOG`, `CF_REFLEX_AUDIT`, `CF_EVENTS`,
 `CF_OBSERVATIONS`, `CF_SESSIONS`, and `CF_PROFILES` quality rows,
 consent/export bundles, and MCP readbacks such as `profile_list`,
 `profile_quality_refresh`, `storage_inspect`, and future registry/audit tools.
-Manual FSV must trigger the real runtime surface and then read these stores
-directly; scripts, tests, benchmarks, GitHub Actions, and CI are never FSV.
+Manual FSV must first prove `synapse-mcp` is running/active, trigger the real
+MCP tool surface, and then read these stores directly; scripts, tests,
+benchmarks, GitHub Actions, and CI are never FSV.
 
 ---
 

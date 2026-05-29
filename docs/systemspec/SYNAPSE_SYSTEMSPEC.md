@@ -56,6 +56,12 @@ Comprehensive technical reference for the Synapse MCP server, produced by readin
 
 - `AGENTS.md` and `docs/impplan/00_methodology.md` are the operating doctrine.
   Manual FSV is the shipping gate; this systemspec is descriptive only.
+  Synapse behavior must be verified through a live `synapse-mcp` runtime when a
+  tool exists: process/stdio or socket readback, authenticated `health`,
+  initialized MCP session, `tools/list`, real `tools/call`, then separate
+  physical SoT readback.
+  Issue #536 changes the target context model to delta-first reality: baseline,
+  ordered deltas, and periodic full audits to detect drift and rebase.
   Missing configured-host prerequisites are acquisition/setup work: agents use
   Synapse/local control as the operator-equivalent host control surface with
   full local computer-control responsibility to make reversible local
@@ -3201,6 +3207,22 @@ pub struct M1State {
 
 `last_observed_foreground` is updated after each successful `observe` call (`server.rs::observe`). This is the SoT consulted by `ensure_act_type_foreground` so `act_type` refuses to type into the wrong window.
 
+### 5.1a Delta-first reality target (#536)
+
+The current `observe` implementation builds full `Observation` values. The
+target architecture in #536 keeps that path for baseline/debug/full-audit reads
+but adds a delta-first context flow:
+
+- `RealityBaseline` establishes epoch, seq, compact state hash, and physical
+  source refs from a bounded full observation plus profile-specific SoTs.
+- `RealityDelta` records ordered foreground/focus/HUD/entity/log/action/storage
+  changes after that baseline.
+- `RealityAudit` periodically re-reads physical SoTs and compares actual state
+  to the baseline+delta assumption; drift produces explicit rebase guidance.
+
+Until #537-#542 land, these schemas/tools are planned surfaces. Existing live
+FSV must still use the current MCP tools and separate physical SoT readback.
+
 ### 5.2 ObserveParams and slot expansion
 
 `ObserveParams`:
@@ -4118,7 +4140,9 @@ These are doctrine — **NEVER violate**:
 3. **Full-State Verification (FSV) is mandatory and manual.** The agent reads the SoT before, executes the trigger, performs a separate read for "after", exercises ≥3 edge cases (empty/boundary/structurally-invalid), and records actual state. **Scripts, tests, benchmarks, harnesses, GitHub Actions, and CI are supporting evidence only.** They never count as FSV. Do not add `*_fsv` tests, FSV harnesses, or FSV scripts.
 4. **Natural-only motion (OQ-004 DECIDED 2026-05-22).** `Natural` curves + `Natural` keystroke dynamics tuned `FAST` are the resolved default of every tool, profile, and reflex. `Instant`/`Burst` exist for explicit opt-in only.
 5. **Manual FSV on the configured Windows host is the shipping gate, not CI** (operator decision 2026-05-24, issues #246/#247/#350/#351). Do not dispatch, wait on, or block a tag on GitHub Actions/CI. Do not add `*_fsv` tests.
-6. **Missing configured-host prerequisites are agent work, not blockers.** Do not stop at "missing." Synapse gives the agent full local computer-control responsibility for this host and the same practical local ability the operator has at this keyboard. If the operator could download, install, connect, configure, generate, flash, launch, or inspect it from this computer, the agent must use Synapse/local host control to make it happen and then inspect the physical SoT. Missing local state creates the next action for the agent and must be made real, not handed back to the operator or treated as a blocker while reversible host work remains. Nothing is ever `status:blocked` because a configured-host prerequisite is absent; the only blockable item is the exact operator-only hard-to-reverse external action left after every reversible local step is exhausted. Browser downloads, GUI installers, Device Manager checks, package-manager installs, model/file generation, firmware flashing, app launching, USB/COM inspection, and UI inspection are agent-owned work when reversible on this host. Ask only for narrow approval on hard-to-reverse external actions after reversible local work is exhausted.
+6. **Synapse MCP runtime is a required FSV precondition and trigger surface.** For any Synapse behavior with an MCP tool, the agent must read the live `synapse-mcp` process/stdout child or socket, authenticate when HTTP is used, call `health`, initialize an MCP session, verify the tool through `tools/list`, trigger the behavior through real MCP `tools/call`, and then perform a separate physical SoT readback. Return values and `health` prove liveness/attempt only.
+7. **Reality context should be delta-first with periodic drift audits.** Issue #536 changes the target context model: a full snapshot establishes or repairs a baseline; routine context is ordered reality deltas; periodic full physical audits compare the delta-guided assumption against actual UI/log/file/process/storage/device SoTs and force rebase on drift.
+8. **Missing configured-host prerequisites are agent work, not blockers.** Do not stop at "missing." Synapse gives the agent full local computer-control responsibility for this host and the same practical local ability the operator has at this keyboard. If the operator could download, install, connect, configure, generate, flash, launch, or inspect it from this computer, the agent must use Synapse/local host control to make it happen and then inspect the physical SoT. Missing local state creates the next action for the agent and must be made real, not handed back to the operator or treated as a blocker while reversible host work remains. Nothing is ever `status:blocked` because a configured-host prerequisite is absent; the only blockable item is the exact operator-only hard-to-reverse external action left after every reversible local step is exhausted. Browser downloads, GUI installers, Device Manager checks, package-manager installs, model/file generation, firmware flashing, app launching, USB/COM inspection, and UI inspection are agent-owned work when reversible on this host. Ask only for narrow approval on hard-to-reverse external actions after reversible local work is exhausted.
 
 `AGENTS.md` reinforces these and pins **`[skip ci]` on every agent commit**.
 
@@ -4288,6 +4312,20 @@ Source files covered:
 All 72 live tools are registered on `SynapseService` via `#[tool(description=...)]` in `server.rs`. Tool descriptions are taken verbatim from the source. Every tool returns through `Json<T>` so the response shape exactly matches the deserialized response struct.
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
+
+Manual FSV of any tool starts by proving the live runtime: read the
+`synapse-mcp` process/stdout child or loopback socket, authenticate when HTTP
+is used, call `health`, initialize the MCP session, and confirm the target tool
+appears in `tools/list`. The behavior trigger is the real MCP `tools/call`;
+afterward the agent reads the separate physical source of truth the tool should
+have changed or observed. Tool returns and health responses are liveness and
+attempt evidence only.
+
+Issue #536 adds planned delta-first reality tools. `reality_baseline`,
+`observe_delta`, and `reality_audit` are target surfaces for #537-#542 and are
+not counted in the live tool total until implemented. Their contract is:
+baseline establishes epoch/hash/source refs, delta returns ordered changes since
+a cursor, and audit re-reads physical SoTs to detect drift and force rebase.
 
 ## 1. `health`
 

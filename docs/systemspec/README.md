@@ -24,6 +24,12 @@ Comprehensive technical reference for the Synapse MCP server, produced by readin
 
 - `AGENTS.md` and `docs/impplan/00_methodology.md` are the operating doctrine.
   Manual FSV is the shipping gate; this systemspec is descriptive only.
+  Synapse behavior must be verified through a live `synapse-mcp` runtime when a
+  tool exists: process/stdio or socket readback, authenticated `health`,
+  initialized MCP session, `tools/list`, real `tools/call`, then separate
+  physical SoT readback.
+  Issue #536 changes the target context model to delta-first reality: baseline,
+  ordered deltas, and periodic full audits to detect drift and rebase.
   Missing configured-host prerequisites are acquisition/setup work: agents use
   Synapse/local control as the operator-equivalent host control surface with
   full local computer-control responsibility to make reversible local

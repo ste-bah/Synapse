@@ -29,6 +29,20 @@ All 72 live tools are registered on `SynapseService` via `#[tool(description=...
 
 Default error response shape (all tools): `ErrorData { code: rmcp::ErrorCode(-32099), message, data: { "code": <SCREAMING_SNAKE_CASE> } }` via `crates/synapse-mcp/src/m1.rs::mcp_error`.
 
+Manual FSV of any tool starts by proving the live runtime: read the
+`synapse-mcp` process/stdout child or loopback socket, authenticate when HTTP
+is used, call `health`, initialize the MCP session, and confirm the target tool
+appears in `tools/list`. The behavior trigger is the real MCP `tools/call`;
+afterward the agent reads the separate physical source of truth the tool should
+have changed or observed. Tool returns and health responses are liveness and
+attempt evidence only.
+
+Issue #536 adds planned delta-first reality tools. `reality_baseline`,
+`observe_delta`, and `reality_audit` are target surfaces for #537-#542 and are
+not counted in the live tool total until implemented. Their contract is:
+baseline establishes epoch/hash/source refs, delta returns ordered changes since
+a cursor, and audit re-reads physical SoTs to detect drift and force rebase.
+
 ## 1. `health`
 
 **Description:** "Return server health"

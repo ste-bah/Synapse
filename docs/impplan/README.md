@@ -14,6 +14,7 @@ Doctrine: `docs2/compressionprompt.md` §0-13. Keep verbatim: paths, crate names
 4. **Natural-only motion (OQ-004 DECIDED 2026-05-22).** `Natural` curves + `Natural` keystroke dynamics tuned `FAST` (50 ms `Snap` travel, ~190 WPM typing with `mean_iki_ms=32, stddev=10, bigram_bias=true`) are the resolved default of every tool, profile, and reflex. No `Instant` jumps, no `Burst` typing as defaults. `Instant`/`Burst` remain in the enums for explicit caller opt-in only. See `07_cross_cutting.md` §12.
 5. **Manual FSV on the configured Windows host is the shipping gate, not CI** (operator decision 2026-05-24, issues #246/#247/#350/#351). Use local checks for supporting evidence. Do not dispatch, wait on, or block a tag on GitHub Actions/CI. Do not add `*_fsv` tests, FSV harnesses, or FSV scripts.
 6. **Missing configured-host prerequisites are work, not blockers.** Do not stop at "missing." Synapse gives the agent full local computer-control responsibility for this host and the same practical local ability the operator has at this keyboard. If the operator could download, install, connect, configure, generate, flash, launch, or inspect it from this computer, the agent must make it happen through Synapse/local host workflows and then inspect the physical SoT. Missing local state creates the next action for the agent and must be made real, not handed back to the operator or treated as a blocker while reversible host work remains. Nothing is ever `status:blocked` because a configured-host prerequisite is absent; the only blockable item is the exact operator-only hard-to-reverse external action left after every reversible local step is exhausted. Browser downloads, GUI installers, Device Manager checks, package-manager installs, model/file generation, firmware flashing, app launching, USB/COM inspection, and UI inspection are agent-owned work when reversible on this host. Ask only for narrow approval on hard-to-reverse external actions after every reversible local step is complete.
+7. **Reality context is moving delta-first.** Per #536, a full snapshot should establish or repair a baseline; routine agent context should be ordered reality deltas, and Synapse should periodically run full physical reality audits to detect drift and force a rebase. Until the MCP/storage/perception tools exist (#537-#543), existing real MCP tools plus manual SoT readback remain required.
 
 ---
 
@@ -67,6 +68,14 @@ Child issue ledger:
 | #480 | curated Windows Terminal seed package |
 | #481 | curated Chromium-browser seed package |
 | #482 | curated Minecraft Java seed package |
+| #536 | delta-of-reality observation model and periodic drift audit |
+| #537 | core reality baseline/delta/audit schemas |
+| #538 | MCP baseline, observe-delta, and audit tools |
+| #539 | perception/runtime reality delta generation |
+| #540 | storage baseline, delta journal, and audit rows |
+| #541 | EverQuest world model fed by deltas plus drift audits |
+| #542 | manual FSV runbook for reality deltas and drift audits |
+| #543 | registry/profile-quality signals from delta accuracy and drift audits |
 
 Manual FSV for this track always names and reads the physical source of truth:
 profile TOML files, future registry index/package files, RocksDB

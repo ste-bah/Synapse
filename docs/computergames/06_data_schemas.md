@@ -287,6 +287,105 @@ pub enum SensorStatus {
 
 ---
 
+### 2.10 Reality baseline, deltas, and audits (target)
+
+Issue #536 introduces the target delta-first reality contract. These schemas
+are the intended shape for #537; they are not live until implemented in
+`synapse-core` and exposed through `tools/list`.
+
+```rust
+pub struct SourceRef {
+    pub kind: String,                 // "window" | "log" | "file" | "rocksdb" | ...
+    pub path: String,
+    pub offset: Option<u64>,
+    pub hash: Option<String>,
+    pub summary: String,
+}
+
+pub struct RedactionSummary {
+    pub policy: String,
+    pub raw_private_fields_omitted: bool,
+    pub redacted_fields: Vec<String>,
+}
+
+pub struct RealityBaseline {
+    pub epoch_id: String,
+    pub baseline_seq: u64,
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub profile_id: Option<ProfileId>,
+    pub source_refs: Vec<SourceRef>,
+    pub compact_state_hash: String,
+    pub redaction: RedactionSummary,
+    pub size_bytes: u32,
+    pub size_estimate_tokens: u32,
+}
+
+pub struct RealityDelta {
+    pub epoch_id: String,
+    pub seq: u64,
+    pub previous_seq: u64,
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub source: EventSource,
+    pub kind: String,
+    pub path: String,
+    pub before: serde_json::Value,
+    pub after: serde_json::Value,
+    pub confidence: f32,
+    pub expected_previous_hash: Option<String>,
+    pub source_refs: Vec<SourceRef>,
+    pub correlations: Vec<EventRef>,
+    pub redaction: RedactionSummary,
+}
+
+pub struct RealityAudit {
+    pub audit_id: String,
+    pub epoch_id: String,
+    pub compared_seq_start: u64,
+    pub compared_seq_end: u64,
+    pub ran_at: chrono::DateTime<chrono::Utc>,
+    pub assumption_hash: String,
+    pub actual_hash: String,
+    pub drift_status: RealityDriftStatus,
+    pub drift_items: Vec<RealityDriftItem>,
+    pub physical_source_refs: Vec<SourceRef>,
+    pub rebase_required: bool,
+}
+
+pub struct RealityDriftItem {
+    pub path: String,
+    pub assumed: serde_json::Value,
+    pub actual: serde_json::Value,
+    pub severity: RealityDriftStatus,
+    pub source_refs: Vec<SourceRef>,
+}
+
+#[serde(rename_all = "snake_case")]
+pub enum RealityDriftStatus {
+    InSync,
+    MinorDrift,
+    MajorDrift,
+    RebaseRequired,
+    SourceUnavailable,
+}
+```
+
+Deltas are append-only within an epoch. If retention, source loss, invalid
+cursors, or conflicting evidence makes the assumption untrustworthy, the system
+returns `rebase_required` instead of guessing.
+
+Physical storage target:
+
+- `CF_KV/reality/baseline/v1/<profile>/<epoch>`
+- `CF_KV/reality/delta/v1/<profile>/<epoch>/<seq>`
+- `CF_KV/reality/audit/v1/<profile>/<audit_id>`
+- `CF_KV/reality/head/v1/<profile>` for the current epoch/seq/hash pointer
+
+Full observations remain the source for baseline and explicit audit/debug
+expansion. Routine context should prefer `RealityDelta` batches because they
+carry the change in reality plus source refs, not the unchanged surroundings.
+
+---
+
 ## 3. Events
 
 ```rust
