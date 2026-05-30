@@ -35,6 +35,7 @@ impl SynapseService {
         subsystems.insert("reflex".to_owned(), self.reflex_health());
         subsystems.insert("profiles".to_owned(), self.profile_health());
         subsystems.insert("action".to_owned(), self.action_health());
+        subsystems.insert("hid_host".to_owned(), self.hid_host_health());
         subsystems.insert("audio".to_owned(), self.audio_health());
         subsystems.insert("http".to_owned(), self.http_health(active_sessions));
         let ok = subsystems.values().all(|health| health.status != "error");
@@ -248,6 +249,36 @@ impl SynapseService {
             Err(_err) => SubsystemHealth {
                 status: "error".to_owned(),
                 detail: Some("M2 service state lock poisoned".to_owned()),
+                ..SubsystemHealth::default()
+            },
+        }
+    }
+
+    fn hid_host_health(&self) -> SubsystemHealth {
+        match self.m2_state.lock() {
+            Ok(state) => {
+                let Some(target) = state.hardware_hid() else {
+                    return SubsystemHealth {
+                        status: "disabled".to_owned(),
+                        detail: Some(
+                            "hardware HID disabled; start with --hardware-hid <port|auto> or SYNAPSE_HARDWARE_HID".to_owned(),
+                        ),
+                        ..SubsystemHealth::default()
+                    };
+                };
+                let emitter_available = state.emitter_available();
+                SubsystemHealth {
+                    status: if emitter_available { "ok" } else { "error" }.to_owned(),
+                    detail: Some(format!(
+                        "hardware_hid={target} emitter_available={emitter_available}"
+                    )),
+                    device_name: Some(target.to_owned()),
+                    ..SubsystemHealth::default()
+                }
+            }
+            Err(_err) => SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some("M2 service state lock poisoned while reading HID host".to_owned()),
                 ..SubsystemHealth::default()
             },
         }

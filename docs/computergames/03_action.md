@@ -42,6 +42,9 @@ The active table is visible at
 `health.subsystems.action.backend_resolution` with `source`, configured defaults,
 and the resolved `keyboard_auto` / `mouse_auto` / `pad_auto` / `release_all_auto`
 values.
+Hardware HID target state is visible separately at `health.subsystems.hid_host`
+so the action routing table and the physical HID host readiness do not collapse
+into one signal.
 
 ViGEm requires ViGEmBus driver installed (one-time, signed). Hardware requires a flashed RP2040 board and `--hardware-hid <port|auto>` argument or `SYNAPSE_HARDWARE_HID` env.
 

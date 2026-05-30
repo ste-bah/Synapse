@@ -2676,6 +2676,7 @@ Returns:
     "storage": {"status": "ok", "db_path": "...", "schema_version": 7, "cf_sizes": {"CF_REFLEX_AUDIT": 4096}},
     "reflex": {"status": "ok", "active_count": 2, "last_tick_jitter_us": 180, "recursion_clamps_total": 0},
     "profiles": {"status": "ok", "active_profile_id": "notepad", "profile_count": 4, "last_reload_at": "1779723537765"},
+    "hid_host": {"status": "disabled", "detail": "hardware HID disabled; start with --hardware-hid <port|auto> or SYNAPSE_HARDWARE_HID"},
     "audio": {"status": "disabled", "ring_buffer_seconds": 5, "stt_model_loaded": false},
     "http": {"status": "ok", "bind_addr": "127.0.0.1:7700", "active_sessions": 1, "sse_subscribers": 0}
   },
@@ -2683,6 +2684,12 @@ Returns:
   "uptime_s": 1245
 }
 ```
+
+`hid_host` reports the configured hardware HID target separately from the
+generic action subsystem. It is `disabled` when no hardware backend was
+requested, `ok` when a configured hardware target initialized with a live action
+emitter, and `error` if the configured target exists but the action emitter is
+not available.
 
 M3 subsystem status strings are `initializing`, `ok`, `degraded_latency`,
 `disk_pressure_l1`..`disk_pressure_l4`, `disabled`, or `error`.

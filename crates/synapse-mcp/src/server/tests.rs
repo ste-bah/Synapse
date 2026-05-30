@@ -10,6 +10,7 @@ fn health_payload_reports_m3_subsystems_initializing_or_disabled() {
     assert_eq!(payload.subsystems["storage"].status, "initializing");
     assert_eq!(payload.subsystems["reflex"].status, "initializing");
     assert_eq!(payload.subsystems["profiles"].status, "initializing");
+    assert_eq!(payload.subsystems["hid_host"].status, "disabled");
     assert_eq!(payload.subsystems["audio"].status, "disabled");
     assert_eq!(payload.subsystems["http"].status, "disabled");
 }
