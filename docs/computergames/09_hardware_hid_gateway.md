@@ -217,7 +217,7 @@ Binary, framed, with explicit acks. Parseable with no allocations on firmware si
 | 0x30 | `PAD_REPORT` | `[14 bytes raw report]` | apply pad report |
 | 0x40 | `RELEASE_ALL` | empty | all mouse buttons up, all keys up, pad neutral |
 | 0x50 | `WATCHDOG_KICK` | `[u32 timeout_ms]` | reset watchdog with new timeout |
-| 0x60 | `GET_TELEMETRY` | empty | replies with `TELEMETRY_RESP { uptime_ms, frames_received, frames_dropped, link_errors, commands_executed, watchdog_fires, crc_errors }` |
+| 0x60 | `GET_TELEMETRY` | empty | replies with `TELEMETRY_RESP` counters and command-timing telemetry |
 | 0xF0 | `RESET_TO_BOOTLOADER` | empty | enters UF2 bootloader (for re-flashing) |
 
 ### 5.3 Responses (firmware → host)
@@ -236,6 +236,27 @@ Same frame layout, `MAGIC = 0xA5` (mirror byte) to distinguish direction.
 Source note: host and firmware constants are mirrored in
 `firmware/pico-hid/src/protocol.rs` and
 `crates/synapse-hid-host/src/protocol.rs`.
+
+`TELEMETRY_RESP` currently carries an 11-field little-endian `u32` payload
+(44 bytes):
+
+1. `uptime_ms`
+2. `frames_received`
+3. `frames_dropped`
+4. `link_errors`
+5. `commands_executed`
+6. `watchdog_fires`
+7. `crc_errors`
+8. `timed_commands`
+9. `previous_command_delta_us`
+10. `last_command_delta_us`
+11. `last_timed_command_uptime_us`
+
+The host parser also accepts the legacy 7-field base payload
+(`TELEMETRY_BASE_PAYLOAD_LEN = 28`) so old firmware can still be identified
+without corrupting the timing fields; the four timing values are represented as
+`None` when absent. The current firmware writer returns the full
+`TELEMETRY_PAYLOAD_LEN = 44` payload.
 
 ### 5.4 Sequence numbers and ack semantics
 
@@ -343,6 +364,12 @@ provides the bounded sliding window, ACK/NAK parsing, retry budget, and
 connected link in a worker thread for reconnect attempts and exposes the same
 telemetry snapshot read through the active link.
 
+`HidTelemetrySnapshot` stores the seven base counters plus optional timing
+fields (`timed_commands`, `previous_command_delta_us`,
+`last_command_delta_us`, `last_timed_command_uptime_us`) so host benches can
+distinguish firmware that lacks the timing extension from firmware that reports
+zero timing values.
+
 ### 7.1 Auto-detect
 
 `synapse-mcp` at startup with `--hardware-hid auto` enumerates COM ports,
@@ -370,16 +397,21 @@ immediately (no queueing).
 rustup target add thumbv6m-none-eabi
 cargo install elf2uf2-rs
 
-# Build
-cd firmware/pico-hid
-cargo build --release
-elf2uf2-rs target/thumbv6m-none-eabi/release/pico-hid pico-hid.uf2
+# Build versioned release artifacts
+.\scripts\release\firmware\build_pico_hid.ps1 -Version 0.1.0
+.\scripts\release\firmware\build_pico_hid.ps1 -Version 0.1.0-m4
+.\scripts\release\firmware\build_pico_hid.ps1 -Version 0.1.0 -Features loopback
 
 # Flash
 # 1. Hold BOOTSEL on the Pico while plugging USB
 # 2. Pico appears as a USB mass storage device "RPI-RP2"
-# 3. Copy pico-hid.uf2 to it; Pico reboots into Synapse firmware
+# 3. Copy the selected versioned UF2 to it; Pico reboots into Synapse firmware
 ```
+
+The helper writes artifacts under `scripts\release\firmware\` using the naming
+pattern `pico-hid-<version>.uf2` for the default firmware and
+`pico-hid-<feature-list>-<version>.uf2` for feature builds such as
+`pico-hid-loopback-0.1.0.uf2`.
 
 If any build, flash, driver, cable, board, or firmware artifact prerequisite is
 missing, the agent must make the real prerequisite exist on this configured host
@@ -395,7 +427,8 @@ Helper: `synapse-mcp hid flash --port COM7`:
 1. Detect if device is in Synapse firmware mode (sends `IDENTIFY`).
 2. If yes, send `RESET_TO_BOOTLOADER` to reboot into UF2.
 3. Wait for mass storage to appear.
-4. Copy bundled `pico-hid.uf2`.
+4. Copy bundled/versioned `pico-hid-0.1.0-m4.uf2` unless another explicit UF2
+   is selected.
 5. Wait for re-enumeration as Synapse firmware.
 6. Verify with `IDENTIFY`.
 
