@@ -20,7 +20,7 @@ use synapse_storage::cf;
 
 use super::{
     Json, ObserveParams, Parameters, SynapseService, current_input, observe_include,
-    populate_clipboard_summary, tool, tool_router,
+    populate_clipboard_summary, populate_fs_recent, tool, tool_router,
 };
 use crate::{
     m1::{ObserveSlot, mcp_error},
@@ -874,11 +874,14 @@ impl SynapseService {
             max_elements: Some(max_elements),
             since_event_seq: None,
         };
+        let include = observe_include(&params);
         let state = self.m1_state()?;
         let mut input = current_input(&state, depth)?;
+        if include.fs && input.fs_recent.is_empty() {
+            populate_fs_recent(&mut input, &state.fs_recent_tracker);
+        }
         drop(state);
 
-        let include = observe_include(&params);
         if include.clipboard && input.clipboard_summary.is_none() {
             populate_clipboard_summary(&mut input);
         }

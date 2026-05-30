@@ -43,6 +43,11 @@
    populate redacted summary metadata: formats, optional text length, and a
    hash-only excerpt marker. Raw clipboard text must not be stored in reality
    rows.
+10. **Filesystem paths are hash-only.** When an MCP request includes the `fs`
+    slot, live observation/reality tools read only the explicitly configured
+    non-recursive `SYNAPSE_FS_WATCH_ROOT` watcher. Events are capped and store
+    hashed path tokens, event kind, and optional file size metadata; raw watched
+    paths must not be stored in observation or reality rows.
 
 The first 30 tools below are the live M3 baseline. #499 adds `act_keymap` as a
 profile-keymap action alias, #508 adds `everquest_loc_probe` as a literal

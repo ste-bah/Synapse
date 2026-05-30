@@ -1188,6 +1188,7 @@ synapse-mcp --help
 | `SYNAPSE_AUDIO_LOOPBACK` | `crates/synapse-mcp/src/m3.rs::audio_loopback_enabled` | `bool` (`0`/`1`/`true`/`false`) | unset → `true` | When false, the audio runtime spawns without starting the WASAPI loopback. |
 | `SYNAPSE_CAPTURE_FORCE_DXGI` | `crates/synapse-capture/src/lib.rs::capture_backend_from_env` (via `CaptureBackendPreference::from_force_dxgi_value`) | `bool`/preference token | unset → `Auto` | Forces the DXGI duplication backend over the Windows.Graphics.Capture backend. |
 | `SYNAPSE_MCP_SYNTHETIC_FIXTURE` | `crates/synapse-mcp/src/m1.rs::M1State::from_env` | `String` | unset | If equal to `notepad` (case-insensitive), the M1 layer feeds a synthetic Notepad observation source instead of the live OS. |
+| `SYNAPSE_FS_WATCH_ROOT` | `crates/synapse-mcp/src/m1/sources.rs::FsRecentTracker::from_env` | directory path | unset | Enables the bounded live filesystem summary source for the explicit non-recursive watch root. `fs_recent` stores only hashed path tokens plus event kind and size metadata. Missing/unwatchable paths fail closed with no events. |
 | `SYNAPSE_MCP_FORCE_NO_PERCEPTION` | `crates/synapse-mcp/src/m1.rs::M1State::from_env` | `bool` (`1`/`true`) | unset | Force every `observe` call to return `OBSERVE_NO_PERCEPTION_AVAILABLE`. Test knob. |
 | `SYNAPSE_MCP_FORCE_OBSERVE_INTERNAL` | `crates/synapse-mcp/src/m1.rs::M1State::from_env` | `bool` (`1`/`true`) | unset | Force every `observe` call to return `OBSERVE_INTERNAL`. Test knob. |
 | `SYNAPSE_MCP_FORCE_PANIC_DURING_ACT` | `crates/synapse-mcp/src/server.rs::maybe_force_panic_during_act` (debug builds only) | `String` | unset | When equal to `1` in a debug build, `act_press` panics inside `block_in_place`. Used to validate the operator-hotkey + panic-hook path. |
@@ -1877,7 +1878,7 @@ Sub-structs:
 | `AudioEvent` | `at`, `kind: String`, `azimuth_deg: Option<f32>`, `confidence` |
 | `DirectionEstimate` | `azimuth_deg: f32`, `confidence: f32` |
 | `ClipboardSummary` | `formats: Vec<String>`, `text_len: Option<u32>`, `text_excerpt: Option<String>` containing only hash/source metadata, `redacted: bool` |
-| `FsEvent` | `at`, `path`, `kind: FsEventKind` (Created/Modified/Deleted/Renamed), `size_bytes: Option<u64>` |
+| `FsEvent` | `at`, `path` as a hash token for the watched relative path, `kind: FsEventKind` (Created/Modified/Deleted/Renamed), `size_bytes: Option<u64>` |
 | `ObservationDiagnostics` | `assembled_in_ms`, `sensor_latency_ms: BTreeMap<String, f32>`, `a11y_enabled`, `pixel_enabled`, `audio_enabled`, `a11y_status: SensorStatus`, `capture_status`, `detection_status`, `audio_status`, `elements_truncated`, `entities_truncated`, `size_bytes`, `size_estimate_tokens` |
 | `SensorStatus` | `Healthy` \| `DegradedLatency { last_p99_ms: f32 }` \| `DegradedSensorFailed { reason_code: String }` \| `Disabled` \| `Unavailable` (default) |
 
@@ -3145,7 +3146,7 @@ of the HUD crop relative to the selected client-rect anchor. For example, a
 ### 4.2 `ObservationAssembler::assemble` algorithm
 
 1. Compute the effective `PerceptionMode`: if `input.mode_override.is_some()` use it, else `auto_mode(input)`.
-2. For each slot enabled by `ObserveInclude` (defaults: focused, elements, entities, hud, events), include the corresponding fields. Otherwise the slot is left at its default (empty vec / None). When the `clipboard` slot is requested through the live MCP path, the server reads the Win32 clipboard text surface and populates `ClipboardSummary` with formats, text length, a hash-only redacted excerpt marker, and `redacted=true`; raw clipboard text is not persisted into compact reality rows.
+2. For each slot enabled by `ObserveInclude` (defaults: focused, elements, entities, hud, events), include the corresponding fields. Otherwise the slot is left at its default (empty vec / None). When the `clipboard` slot is requested through the live MCP path, the server reads the Win32 clipboard text surface and populates `ClipboardSummary` with formats, text length, a hash-only redacted excerpt marker, and `redacted=true`; raw clipboard text is not persisted into compact reality rows. When the `fs` slot is requested and `SYNAPSE_FS_WATCH_ROOT` names an approved local directory, the server drains the non-recursive OS watcher and populates `fs_recent` with at most five redacted events containing a hashed path token, event kind, and optional file size.
 3. Truncate `elements` to `max_subtree_nodes` (default 60, clamp 1..=500) and apply `max_subtree_depth` (clamp ≤ 6). Set `diagnostics.elements_truncated` when truncated.
 4. Truncate `entities` to `max_entities` (default 60). Set `diagnostics.entities_truncated`.
 5. Compute `diagnostics.assembled_in_ms = started.elapsed().as_secs_f32() * 1000`.
@@ -4396,6 +4397,10 @@ When `include` contains `clipboard`, the live path samples the system clipboard
 into a redacted `ClipboardSummary` containing format names, optional text
 length, and hash-only excerpt metadata. Raw clipboard text must not be persisted
 by `observe`, `reality_baseline`, or `observe_delta`.
+When `include` contains `fs`, the live path drains the bounded non-recursive
+watcher configured by `SYNAPSE_FS_WATCH_ROOT`. `fs_recent` contains at most five
+events with hashed path tokens, event kind, and optional file size; raw watched
+paths must not be persisted by observation or reality rows.
 **Errors:** `OBSERVE_NO_PERCEPTION_AVAILABLE` (forced via `SYNAPSE_MCP_FORCE_NO_PERCEPTION`), `OBSERVE_INTERNAL` (forced or assembler error), `A11Y_NO_FOREGROUND`, `CAPTURE_TARGET_LOST`, perception subsystem errors.
 
 ## 2a. `reality_baseline`

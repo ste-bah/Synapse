@@ -16,7 +16,7 @@ use synapse_perception::{ObservationInput, ObserveInclude, parse_perception_mode
 
 pub use ocr::read_text_in_state;
 use search::{element_match, entity_match};
-pub use sources::populate_clipboard_summary;
+pub use sources::{FsRecentTracker, populate_clipboard_summary, populate_fs_recent};
 use sources::{platform_input, synthetic_notepad_input};
 
 pub type SharedM1State = Arc<Mutex<M1State>>;
@@ -32,6 +32,7 @@ pub struct M1State {
     pub last_observed_foreground: Option<ForegroundContext>,
     pub everquest_log_cursor: Option<EverQuestLogCursorState>,
     pub everquest_event_seq: u64,
+    pub fs_recent_tracker: FsRecentTracker,
 }
 
 impl M1State {
@@ -55,6 +56,7 @@ impl M1State {
             last_observed_foreground: None,
             everquest_log_cursor: None,
             everquest_event_seq: 0,
+            fs_recent_tracker: FsRecentTracker::from_env(),
         }
     }
 }

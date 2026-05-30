@@ -19,6 +19,7 @@ ed25519-dalek.workspace = true
 futures-util.workspace = true
 hyper.workspace = true
 image.workspace = true
+notify.workspace = true
 rmcp = { workspace = true, features = ["transport-streamable-http-server"] }
 regex.workspace = true
 schemars.workspace = true

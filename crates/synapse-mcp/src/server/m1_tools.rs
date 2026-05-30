@@ -2,7 +2,7 @@ use super::{
     ErrorData, FindParams, FindResponse, Health, Json, ObserveParams, Parameters, ReadTextParams,
     SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
     SetPerceptionModeResponse, SynapseService, current_input, empty_input_schema, find_in_state,
-    mcp_error, observe_include, populate_clipboard_summary, read_text_in_state,
+    mcp_error, observe_include, populate_clipboard_summary, populate_fs_recent, read_text_in_state,
     set_capture_target_in_state, set_perception_mode_in_state, tool, tool_router,
 };
 
@@ -46,14 +46,17 @@ impl SynapseService {
             kind = "observe",
             "tool.invocation kind=observe"
         );
+        let include = observe_include(&params.0);
         let state = self.m1_state()?;
         let mut input = current_input(&state, params.0.depth.unwrap_or(2).min(6))?;
+        if include.fs && input.fs_recent.is_empty() {
+            populate_fs_recent(&mut input, &state.fs_recent_tracker);
+        }
         if let Some(since) = params.0.since_event_seq {
             input.recent_events.retain(|event| event.seq > since);
         }
         drop(state);
 
-        let include = observe_include(&params.0);
         if include.clipboard && input.clipboard_summary.is_none() {
             populate_clipboard_summary(&mut input);
         }

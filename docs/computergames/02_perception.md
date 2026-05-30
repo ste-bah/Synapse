@@ -438,7 +438,7 @@ pub struct Observation {
     pub audio: AudioContext,                    // recent events + direction estimate if any
     pub recent_events: Vec<Event>,              // since last observe(), capped
     pub clipboard_summary: Option<ClipboardSummary>, // redacted metadata only
-    pub fs_recent: Vec<FsEvent>,                // last 5 file changes
+    pub fs_recent: Vec<FsEvent>,                // last 5 redacted file changes
     pub diagnostics: ObservationDiagnostics,    // perception health (which sensors active, latencies)
 }
 ```

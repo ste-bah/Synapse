@@ -181,7 +181,7 @@ Sub-structs:
 | `AudioEvent` | `at`, `kind: String`, `azimuth_deg: Option<f32>`, `confidence` |
 | `DirectionEstimate` | `azimuth_deg: f32`, `confidence: f32` |
 | `ClipboardSummary` | `formats: Vec<String>`, `text_len: Option<u32>`, `text_excerpt: Option<String>` containing only hash/source metadata, `redacted: bool` |
-| `FsEvent` | `at`, `path`, `kind: FsEventKind` (Created/Modified/Deleted/Renamed), `size_bytes: Option<u64>` |
+| `FsEvent` | `at`, `path` as a hash token for the watched relative path, `kind: FsEventKind` (Created/Modified/Deleted/Renamed), `size_bytes: Option<u64>` |
 | `ObservationDiagnostics` | `assembled_in_ms`, `sensor_latency_ms: BTreeMap<String, f32>`, `a11y_enabled`, `pixel_enabled`, `audio_enabled`, `a11y_status: SensorStatus`, `capture_status`, `detection_status`, `audio_status`, `elements_truncated`, `entities_truncated`, `size_bytes`, `size_estimate_tokens` |
 | `SensorStatus` | `Healthy` \| `DegradedLatency { last_p99_ms: f32 }` \| `DegradedSensorFailed { reason_code: String }` \| `Disabled` \| `Unavailable` (default) |
 

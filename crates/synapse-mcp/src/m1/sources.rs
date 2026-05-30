@@ -1,15 +1,25 @@
-use std::{collections::BTreeMap, time::Instant};
+use std::{
+    collections::BTreeMap,
+    fmt, fs,
+    path::{Path, PathBuf},
+    sync::mpsc,
+    time::Instant,
+};
 
 use chrono::Utc;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rmcp::ErrorData;
 use sha2::{Digest as _, Sha256};
 use synapse_action::{ClipboardFormat, read_clipboard_text};
 use synapse_core::{
     AccessibleNode, AudioContext, ClipboardSummary, DetectedEntity, FocusedElement,
-    ForegroundContext, HudReading, HudReadings, HudValue, PerceptionMode, Rect, SensorStatus,
-    UiaPattern, element_id, entity_id,
+    ForegroundContext, FsEvent, FsEventKind, HudReading, HudReadings, HudValue, PerceptionMode,
+    Rect, SensorStatus, UiaPattern, element_id, entity_id,
 };
 use synapse_perception::ObservationInput;
+
+const FS_WATCH_ROOT_ENV: &str = "SYNAPSE_FS_WATCH_ROOT";
+const MAX_FS_RECENT_EVENTS: usize = 5;
 
 pub fn synthetic_notepad_input() -> ObservationInput {
     let at = Utc::now();
@@ -180,6 +190,248 @@ mod tests {
         assert_eq!(summary.text_excerpt, None);
         assert_eq!(summary.redacted, true);
     }
+
+    #[test]
+    fn fs_path_token_hashes_without_raw_path() {
+        let root = PathBuf::from(r"C:\synapse-fsv");
+        let path = root.join("nested").join("known.txt");
+
+        let token = redacted_fs_path_token(&root, &path);
+
+        assert!(token.starts_with("sha256:"));
+        assert!(!token.contains("known.txt"));
+        assert!(!token.contains("synapse-fsv"));
+    }
+
+    #[test]
+    fn fs_event_kind_maps_notify_kinds() {
+        assert_eq!(
+            fs_event_kind(notify::EventKind::Create(notify::event::CreateKind::File)),
+            Some(FsEventKind::Created)
+        );
+        assert_eq!(
+            fs_event_kind(notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Any
+            ))),
+            Some(FsEventKind::Modified)
+        );
+        assert_eq!(
+            fs_event_kind(notify::EventKind::Modify(notify::event::ModifyKind::Name(
+                notify::event::RenameMode::Both
+            ))),
+            Some(FsEventKind::Renamed)
+        );
+        assert_eq!(
+            fs_event_kind(notify::EventKind::Remove(notify::event::RemoveKind::File)),
+            Some(FsEventKind::Deleted)
+        );
+    }
+
+    #[test]
+    fn fs_events_coalesce_by_redacted_path() {
+        let path = "sha256:path".to_owned();
+        let at = Utc::now();
+        let events = coalesce_fs_events(vec![
+            FsEvent {
+                at,
+                path: path.clone(),
+                kind: FsEventKind::Created,
+                size_bytes: Some(0),
+            },
+            FsEvent {
+                at,
+                path: path.clone(),
+                kind: FsEventKind::Modified,
+                size_bytes: Some(9),
+            },
+        ]);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, FsEventKind::Created);
+        assert_eq!(events[0].size_bytes, Some(9));
+    }
+}
+
+pub struct FsRecentTracker {
+    root: Option<PathBuf>,
+    rx: Option<mpsc::Receiver<notify::Result<notify::Event>>>,
+    _watcher: Option<RecommendedWatcher>,
+    disabled_reason: Option<String>,
+}
+
+impl fmt::Debug for FsRecentTracker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FsRecentTracker")
+            .field("root", &self.root)
+            .field("enabled", &self.rx.is_some())
+            .field("disabled_reason", &self.disabled_reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FsRecentTracker {
+    #[must_use]
+    pub fn from_env() -> Self {
+        let Some(root) = std::env::var_os(FS_WATCH_ROOT_ENV) else {
+            return Self::disabled(None);
+        };
+        let raw_root = PathBuf::from(root);
+        if raw_root.as_os_str().is_empty() {
+            return Self::disabled(None);
+        }
+        match Self::watch(&raw_root) {
+            Ok(tracker) => tracker,
+            Err(error) => {
+                tracing::debug!(
+                    code = "OBSERVE_FS_WATCH_UNAVAILABLE",
+                    error = %error,
+                    "filesystem summary watcher unavailable"
+                );
+                Self::disabled(Some(error.to_string()))
+            }
+        }
+    }
+
+    fn watch(root: &Path) -> anyhow::Result<Self> {
+        let root = fs::canonicalize(root)?;
+        if !root.is_dir() {
+            anyhow::bail!("{} is not a directory", root.display());
+        }
+        let (tx, rx) = mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = tx.send(event);
+        })?;
+        watcher.watch(&root, RecursiveMode::NonRecursive)?;
+        Ok(Self {
+            root: Some(root),
+            rx: Some(rx),
+            _watcher: Some(watcher),
+            disabled_reason: None,
+        })
+    }
+
+    #[expect(
+        clippy::missing_const_for_fn,
+        reason = "constructor accepts an owned diagnostic string on the disabled path"
+    )]
+    fn disabled(reason: Option<String>) -> Self {
+        Self {
+            root: None,
+            rx: None,
+            _watcher: None,
+            disabled_reason: reason,
+        }
+    }
+
+    pub fn populate(&self, input: &mut ObservationInput) {
+        let started = Instant::now();
+        let events = self.drain_events();
+        input
+            .sensor_latency_ms
+            .insert("fs".to_owned(), started.elapsed().as_secs_f32() * 1000.0);
+        input.fs_recent = events;
+    }
+
+    fn drain_events(&self) -> Vec<FsEvent> {
+        let (Some(root), Some(rx)) = (self.root.as_deref(), self.rx.as_ref()) else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        while let Ok(result) = rx.try_recv() {
+            match result {
+                Ok(event) => events.extend(fs_events_from_notify(root, &event)),
+                Err(error) => tracing::debug!(
+                    code = "OBSERVE_FS_WATCH_EVENT_FAILED",
+                    error = %error,
+                    "filesystem watcher event failed"
+                ),
+            }
+        }
+        let mut events = coalesce_fs_events(events);
+        if events.len() > MAX_FS_RECENT_EVENTS {
+            events.drain(0..events.len() - MAX_FS_RECENT_EVENTS);
+        }
+        events
+    }
+}
+
+pub fn populate_fs_recent(input: &mut ObservationInput, tracker: &FsRecentTracker) {
+    tracker.populate(input);
+}
+
+fn fs_events_from_notify(root: &Path, event: &notify::Event) -> Vec<FsEvent> {
+    let Some(kind) = fs_event_kind(event.kind) else {
+        return Vec::new();
+    };
+    let at = Utc::now();
+    event
+        .paths
+        .iter()
+        .filter(|path| path_stays_under_root(root, path))
+        .map(|path| FsEvent {
+            at,
+            path: redacted_fs_path_token(root, path),
+            kind,
+            size_bytes: fs_event_size(path, kind),
+        })
+        .collect()
+}
+
+fn coalesce_fs_events(events: Vec<FsEvent>) -> Vec<FsEvent> {
+    let mut by_path = BTreeMap::<String, FsEvent>::new();
+    for event in events {
+        by_path
+            .entry(event.path.clone())
+            .and_modify(|existing| {
+                existing.at = event.at;
+                existing.kind = coalesced_fs_kind(existing.kind, event.kind);
+                if event.size_bytes.is_some() || existing.kind == FsEventKind::Deleted {
+                    existing.size_bytes = event.size_bytes;
+                }
+            })
+            .or_insert(event);
+    }
+    by_path.into_values().collect()
+}
+
+const fn coalesced_fs_kind(existing: FsEventKind, next: FsEventKind) -> FsEventKind {
+    match (existing, next) {
+        (_, FsEventKind::Deleted) | (FsEventKind::Deleted, _) => FsEventKind::Deleted,
+        (FsEventKind::Created, FsEventKind::Created | FsEventKind::Modified)
+        | (FsEventKind::Modified, FsEventKind::Created) => FsEventKind::Created,
+        (_, FsEventKind::Renamed) | (FsEventKind::Renamed, _) => FsEventKind::Renamed,
+        (_, FsEventKind::Modified) => FsEventKind::Modified,
+    }
+}
+
+const fn fs_event_kind(kind: notify::EventKind) -> Option<FsEventKind> {
+    match kind {
+        notify::EventKind::Create(_) => Some(FsEventKind::Created),
+        notify::EventKind::Modify(notify::event::ModifyKind::Name(_)) => Some(FsEventKind::Renamed),
+        notify::EventKind::Modify(_) => Some(FsEventKind::Modified),
+        notify::EventKind::Remove(_) => Some(FsEventKind::Deleted),
+        _ => None,
+    }
+}
+
+fn path_stays_under_root(root: &Path, path: &Path) -> bool {
+    path.starts_with(root)
+}
+
+fn redacted_fs_path_token(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let normalized = relative.to_string_lossy().replace('\\', "/");
+    sha256_hex(normalized.as_bytes())
+}
+
+fn fs_event_size(path: &Path, kind: FsEventKind) -> Option<u64> {
+    if kind == FsEventKind::Deleted {
+        return None;
+    }
+    fs::metadata(path)
+        .ok()
+        .filter(std::fs::Metadata::is_file)
+        .map(|metadata| metadata.len())
 }
 
 fn node(sequence: u32, depth: u32, name: &str, role: &str, focused: bool) -> AccessibleNode {

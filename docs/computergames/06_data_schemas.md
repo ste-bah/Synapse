@@ -246,7 +246,7 @@ pub struct ClipboardSummary {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FsEvent {
     pub at: chrono::DateTime<chrono::Utc>,
-    pub path: String,
+    pub path: String,                // hash token for the watched relative path
     pub kind: FsEventKind,
     pub size_bytes: Option<u64>,
 }
