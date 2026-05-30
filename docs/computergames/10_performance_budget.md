@@ -263,6 +263,8 @@ SERVER-SIDE latencies, measured from request parse to response send. Network and
 - `bench_aim_curve_step_calc`: <1 µs per step
 - `bench_action_software_press`: 1 ms p99
 - `bench_action_hardware_press`: 5 ms p99 (requires HW gateway attached)
+- `bench_hid_combo_timing`: ≤0.5 ms scheduled-step deviation (requires HW gateway attached)
+- `bench_hid_high_volume`: 10k moves ≤15 s, zero drops/CRC errors (requires HW gateway attached)
 - `bench_detection_rtdetr_v2_s_coco_640`: 25 ms p99 DirectML / 8 ms p99 CUDA (GPU dependent)
 - `bench_ocr_winrt_120x32`: 8 ms p99
 

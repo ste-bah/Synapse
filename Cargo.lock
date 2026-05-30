@@ -3514,6 +3514,7 @@ dependencies = [
  "insta",
  "proptest",
  "serde",
+ "serde_json",
  "sha2 0.11.0",
  "synapse-a11y",
  "synapse-capture",
@@ -3608,6 +3609,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]

@@ -114,22 +114,27 @@ Source files covered:
 
 `#[test]` + `#[tokio::test]` attributes across `crates/`: **385** (counted via `awk` on the tree; includes both unit `mod tests` blocks and integration test files).
 
-## 4. Bench inventory (13 files)
+## 4. Bench inventory (18 files)
 
 | Crate | Bench | Tests budget |
 |---|---|---|
 | `synapse-a11y` | `uia_snapshot_depth2_60elem.rs` | UIA tree snapshot p99 ≤ 10 ms |
 | `synapse-action` | `action_curve_step_calc_natural.rs` | Curve sampling cost |
 | `synapse-action` | `action_software_press.rs` | Software backend key press latency (`act_press` to electrical signal ≤ 2 ms) |
+| `synapse-action` | `action_hardware_press.rs` | Hardware HID key press p99 ≤ 5 ms with baseline export |
 | `synapse-action` | `action_recording_round_trip.rs` | Recording backend overhead |
 | `synapse-capture` | `capture_loop.rs` | Frame capture p99 ≤ 3 ms |
 | `synapse-perception` | `observe_warm_a11y_only.rs` | `observe()` p99 ≤ 30 ms (a11y_only) |
 | `synapse-perception` | `observe_warm_hybrid.rs` | `observe()` p99 ≤ 30 ms (hybrid; `REFERENCE_OBSERVE_WARM_HYBRID_P99_MS`) |
+| `synapse-perception` | `hud_template_match.rs` | HUD template-counter matching on synthetic 180x16 region |
 | `synapse-perception` | `ocr_read_text.rs` | OCR cost on canonical fixture |
 | `synapse-reflex` | `event_to_subscriber.rs` | Event push p99 ≤ 50 ms (`REFERENCE_EVENT_TO_SUBSCRIBER_P99_MS`) |
 | `synapse-reflex` | `reflex_combo_step_interval.rs` | Combo step accuracy |
 | `synapse-reflex` | `reflex_tick_jitter_idle.rs` | Scheduler tick jitter idle p99 ≤ 200 µs (`REFERENCE_REFLEX_TICK_JITTER_IDLE_P99_US`) |
 | `synapse-reflex` | `reflex_tick_jitter_under_load.rs` | Scheduler tick jitter under load |
+| `synapse-hid-host` | `hid_combo_timing.rs` | 3-step HID combo scheduled interval deviation ≤ 0.5 ms |
+| `synapse-hid-host` | `hid_high_volume.rs` | 10k relative mouse moves ≤ 15 s, zero drops/CRC errors, cursor X +10k |
+| `synapse-hid-host` | `hid_protocol_encode_1mb.rs` | HID protocol encode throughput |
 | `synapse-storage` | `batch_throughput.rs` | put_batch / flush rates |
 
 All benches use `criterion 0.8` with `harness = false`. The `scripts/check-bench-delta.ps1` script compares two `critcmp` JSON outputs and enforces a ≤20% regression on tracked benches.

@@ -21,8 +21,19 @@ pico-hid = { version = "0.1.0", path = "../../firmware/pico-hid", default-featur
 proptest.workspace = true
 synapse-test-utils = { version = "0.1.0", path = "../synapse-test-utils" }
 
+[target.'cfg(windows)'.dev-dependencies]
+windows.workspace = true
+
 [[bench]]
 name = "hid_protocol_encode_1mb"
+harness = false
+
+[[bench]]
+name = "hid_combo_timing"
+harness = false
+
+[[bench]]
+name = "hid_high_volume"
 harness = false
 
 [lints.rust]

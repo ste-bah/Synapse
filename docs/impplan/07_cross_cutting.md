@@ -22,6 +22,8 @@ Tracked benches (local/manual perf-regression gate):
 | `aim_curve_step_calc_natural` | ≤ 1 µs/step | M2 |
 | `action_software_press` | ≤ 3 ms | M2 |
 | `action_hardware_press` | ≤ 5 ms | M4 |
+| `hid_combo_timing` | ≤ 0.5 ms step-interval deviation | M4 |
+| `hid_high_volume` | 10k commands ≤ 15 s, zero drops/CRC errors | M4 |
 | `detection_rtdetr_v2_s_coco_640` | ≤ 25 ms DirectML / ≤ 8 ms CUDA | M4 default per ADR-0010 |
 | `ocr_winrt_120x32` | ≤ 8 ms | M1 |
 | `serialize_observation_typical` | ≤ 5 ms | M1 |
