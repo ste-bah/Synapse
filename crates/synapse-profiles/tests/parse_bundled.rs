@@ -168,6 +168,30 @@ fn bundled_everquest_profile_targets_inventory_panel() -> Result<(), Box<dyn std
             h: 260,
         }
     ));
+    let next_level_percent = profile
+        .hud
+        .iter()
+        .find(|field| field.name == "everquest.next_level_percent")
+        .ok_or("everquest.next_level_percent HUD field missing")?;
+    assert!(matches!(
+        next_level_percent.extractor,
+        HudExtractor::WinrtOcr
+    ));
+    assert!(matches!(
+        next_level_percent.parser,
+        HudParser::Regex { ref pattern, group }
+            if pattern.contains("NEXT") && pattern.contains("%") && group == 1
+    ));
+    assert!(matches!(
+        next_level_percent.region,
+        HudRegion::AnchoredToEdge {
+            edge: WindowEdge::TopLeft,
+            x_offset: 80,
+            y_offset: 180,
+            w: 320,
+            h: 260,
+        }
+    ));
     let map_window = profile
         .hud
         .iter()
@@ -191,6 +215,7 @@ fn bundled_everquest_profile_targets_inventory_panel() -> Result<(), Box<dyn std
         profile.metadata["capability.observe.hud"].contains("visible Inventory character panel")
     );
     assert!(profile.metadata["capability.observe.hud"].contains("everquest.map_window_text"));
+    assert!(profile.metadata["capability.observe.hud"].contains("everquest.next_level_percent"));
     assert_eq!(profile.backends.mouse_default, Backend::Hardware);
     Ok(())
 }

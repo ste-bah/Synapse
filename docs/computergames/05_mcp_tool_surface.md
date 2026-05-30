@@ -833,11 +833,12 @@ back before returning.
 
 The response includes confidence-scored fields for foreground focus,
 character/server, log cursor, zone, zone short name, map-order location,
-nearest landmarks, visible level, target/consider, latest action summaries, and
-hazards. Unknown parameters fail with `TOOL_PARAMS_INVALID`. Missing active EQ
-log state, disabled logging, storage write/read failure, or malformed map/log
-state fail closed or lower confidence with explicit hazards rather than
-inventing coordinates or levels.
+nearest landmarks, visible level, visible next-level XP percent,
+target/consider, latest action summaries, and hazards. Unknown parameters fail
+with `TOOL_PARAMS_INVALID`. Missing active EQ log state, disabled logging,
+storage write/read failure, or malformed map/log/HUD state fail closed or lower
+confidence with explicit hazards rather than inventing coordinates, levels, or
+XP progress.
 
 Manual FSV must read the physical EQ log/config/map files and foreground state
 before the trigger, call the real MCP tool, then separately read the
@@ -1498,9 +1499,9 @@ the physical DB bytes afterward.
 `CF_KV/everquest/world_summary/v1/everquest.live/<summary_id>`. It reads the
 persisted current-state row by default, builds local-map context from the EQ
 install maps, and stores bounded zone/position confidence, nearest exits and
-landmarks, recent transitions, safe next probes, level state, focus state,
-hazards, active blockers, source refs, and compaction recovery links to #501,
-#500, and #505.
+landmarks, recent transitions, safe next probes, level/XP progress, focus
+state, hazards, active blockers, source refs, and compaction recovery links to
+#501, #500, and #505.
 
 The summary executes no input and must not carry raw chat bodies. Missing or
 unknown zone, missing map graph, stale state, non-EQ foreground, and

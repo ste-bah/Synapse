@@ -44,6 +44,7 @@ struct SummarySourceState {
     location: Option<EverQuestWorldSummaryLocation>,
     location_confidence: f32,
     level: Option<u32>,
+    xp_percent: Option<f32>,
     level_confidence: f32,
     focus: EverQuestWorldSummaryFocus,
     hazards: Vec<EverQuestWorldSummaryHazard>,
@@ -120,9 +121,14 @@ impl SynapseService {
                     .as_ref()
                     .map_or(0.0, |_| override_state.confidence),
                 level: override_state.level,
-                level_confidence: override_state
-                    .level
-                    .map_or(0.0, |_| override_state.confidence),
+                xp_percent: override_state.xp_percent,
+                level_confidence: if override_state.level.is_some()
+                    || override_state.xp_percent.is_some()
+                {
+                    override_state.confidence
+                } else {
+                    0.0
+                },
                 focus: EverQuestWorldSummaryFocus {
                     is_everquest_foreground: override_state.everquest_foreground,
                     confidence: override_state.confidence,
@@ -564,7 +570,7 @@ fn build_summary_row(
         location: source.location.clone(),
         level_progress: EverQuestWorldSummaryLevel {
             level: source.level,
-            xp_percent: None,
+            xp_percent: source.xp_percent,
             confidence: source.level_confidence,
         },
         focus: source.focus.clone(),
@@ -614,6 +620,7 @@ fn missing_source_state(params: &NormalizedSummaryParams) -> SummarySourceState 
         location: None,
         location_confidence: 0.0,
         level: None,
+        xp_percent: None,
         level_confidence: 0.0,
         focus: EverQuestWorldSummaryFocus {
             is_everquest_foreground: false,
@@ -670,6 +677,7 @@ fn source_state_from_current_row(
     source_refs.extend(state_source_refs(&state.zone_short_name.sources));
     source_refs.extend(state_source_refs(&state.location.sources));
     source_refs.extend(state_source_refs(&state.level.sources));
+    source_refs.extend(state_source_refs(&state.xp_percent.sources));
     source_refs.truncate(MAX_SOURCE_REFS);
 
     SummarySourceState {
@@ -691,7 +699,8 @@ fn source_state_from_current_row(
             }),
         location_confidence: state.location.confidence,
         level: state.level.value,
-        level_confidence: state.level.confidence,
+        xp_percent: state.xp_percent.value,
+        level_confidence: state.level.confidence.max(state.xp_percent.confidence),
         focus: EverQuestWorldSummaryFocus {
             is_everquest_foreground: state.focus.is_everquest_foreground,
             confidence: state.focus.confidence,
@@ -1203,6 +1212,7 @@ mod tests {
         assert_eq!(row.compact_status, "ready");
         assert_eq!(row.zone.short_name.as_deref(), Some("neriaka"));
         assert_eq!(row.level_progress.level, Some(1));
+        assert_eq!(row.level_progress.xp_percent, Some(0.0));
         assert_eq!(row.nearest_exits[0].label, "to_Nektulos_Forest");
         assert_eq!(row.reality_context.audit_status, "in_sync");
         assert_eq!(row.reality_context.newest_delta_seq, Some(2));
@@ -1351,6 +1361,7 @@ mod tests {
             }),
             location_confidence: 0.95,
             level: Some(1),
+            xp_percent: Some(0.0),
             level_confidence: 0.95,
             focus: EverQuestWorldSummaryFocus {
                 is_everquest_foreground: true,

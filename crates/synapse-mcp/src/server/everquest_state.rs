@@ -51,6 +51,8 @@ pub struct EverQuestCurrentState {
     pub location: EverQuestStateField<EverQuestStateLocation>,
     pub nearest_landmarks: Vec<EverQuestStateLandmark>,
     pub level: EverQuestStateField<u32>,
+    #[serde(default = "default_xp_percent_field")]
+    pub xp_percent: EverQuestStateField<f32>,
     pub target: EverQuestStateField<String>,
     pub consider: EverQuestStateField<String>,
     pub latest_actions: Vec<EverQuestStateActionSummary>,
@@ -193,6 +195,7 @@ impl SynapseService {
             location.value.as_ref(),
         );
         let level = level_field(&input.hud);
+        let xp_percent = xp_percent_field(&input.hud);
         let target = latest_summary_field(
             &batch.events,
             &batch,
@@ -205,8 +208,15 @@ impl SynapseService {
             &[EverQuestLogKind::Consider],
             "no consider log event in sampled log window",
         );
-        let mut hazards =
-            hazards_for_state(&focus, &zone, &zone_short_name, &location, &level, &batch);
+        let mut hazards = hazards_for_state(
+            &focus,
+            &zone,
+            &zone_short_name,
+            &location,
+            &level,
+            &xp_percent,
+            &batch,
+        );
         if let Some(cursor) = self.m1_state()?.everquest_log_cursor.clone()
             && cursor.path == active.log.path
             && cursor.offset > batch.file_len_bytes
@@ -243,6 +253,7 @@ impl SynapseService {
             location,
             nearest_landmarks,
             level,
+            xp_percent,
             target,
             consider,
             latest_actions,
@@ -589,6 +600,48 @@ fn level_from_number(value: f64) -> Option<u32> {
     }
 }
 
+fn xp_percent_field(hud: &synapse_core::HudReadings) -> EverQuestStateField<f32> {
+    let Some(reading) = hud.by_name.get("everquest.next_level_percent") else {
+        return hud.errors.get("everquest.next_level_percent").map_or_else(
+            || field_none("HUD XP percent unavailable"),
+            |error| field_none(format!("HUD XP percent unavailable: {}", error.detail)),
+        );
+    };
+    match &reading.parsed {
+        HudValue::Number(value) => xp_percent_from_number(*value).map_or_else(
+            || field_none(format!("HUD XP percent was outside 0..=100: {value}")),
+            |xp_percent| field_some(xp_percent, reading.confidence, hud_source(reading), None),
+        ),
+        HudValue::Text(text) => text.trim().parse::<f32>().map_or_else(
+            |_| field_none(format!("HUD XP percent text was not numeric: {text:?}")),
+            |value| {
+                xp_percent_from_number(f64::from(value)).map_or_else(
+                    || field_none(format!("HUD XP percent was outside 0..=100: {value}")),
+                    |xp_percent| {
+                        field_some(xp_percent, reading.confidence, hud_source(reading), None)
+                    },
+                )
+            },
+        ),
+        other => field_none(format!(
+            "HUD XP percent parsed to unsupported value: {other:?}"
+        )),
+    }
+}
+
+fn xp_percent_from_number(value: f64) -> Option<f32> {
+    if value.is_finite() && (0.0..=100.0).contains(&value) {
+        #[allow(clippy::cast_possible_truncation)]
+        Some(value as f32)
+    } else {
+        None
+    }
+}
+
+fn default_xp_percent_field() -> EverQuestStateField<f32> {
+    field_none("HUD XP percent unavailable in older current-state row")
+}
+
 fn hud_source(reading: &synapse_core::HudReading) -> EverQuestStateSource {
     EverQuestStateSource {
         kind: "hud".to_owned(),
@@ -622,6 +675,7 @@ fn hazards_for_state(
     zone_short_name: &EverQuestStateField<String>,
     location: &EverQuestStateField<EverQuestStateLocation>,
     level: &EverQuestStateField<u32>,
+    xp_percent: &EverQuestStateField<f32>,
     batch: &synapse_everquest::EverQuestLogTailBatch,
 ) -> Vec<EverQuestStateHazard> {
     let mut hazards = Vec::new();
@@ -646,6 +700,9 @@ fn hazards_for_state(
     }
     if level.value.is_none() {
         hazards.push(field_hazard("level_unknown", level));
+    }
+    if xp_percent.value.is_none() {
+        hazards.push(field_hazard("xp_percent_unknown", xp_percent));
     }
     if batch.truncated_by_bytes || batch.truncated_by_events {
         hazards.push(EverQuestStateHazard {

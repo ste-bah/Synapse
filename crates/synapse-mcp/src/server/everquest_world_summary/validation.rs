@@ -41,6 +41,9 @@ pub(super) fn normalize_params(
             "state_override.zone_short_name",
             override_state.zone_short_name.take(),
         )?;
+        if let Some(xp_percent) = override_state.xp_percent {
+            validate_percent("state_override.xp_percent", xp_percent)?;
+        }
         validate_unit_interval("state_override.confidence", override_state.confidence)?;
         override_state.hazards = normalize_hazards(std::mem::take(&mut override_state.hazards))?;
         override_state.source_refs =
@@ -220,6 +223,15 @@ fn normalize_count(field: &str, value: usize) -> Result<(), ErrorData> {
 fn validate_unit_interval(field: &str, value: f32) -> Result<(), ErrorData> {
     if !value.is_finite() || !(0.0..=1.0).contains(&value) {
         return Err(params_error(format!("{field} must be between 0.0 and 1.0")));
+    }
+    Ok(())
+}
+
+fn validate_percent(field: &str, value: f32) -> Result<(), ErrorData> {
+    if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+        return Err(params_error(format!(
+            "{field} must be between 0.0 and 100.0"
+        )));
     }
     Ok(())
 }

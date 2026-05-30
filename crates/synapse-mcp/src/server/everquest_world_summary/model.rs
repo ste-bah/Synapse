@@ -51,6 +51,8 @@ pub struct EverQuestWorldSummaryStateOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xp_percent: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generated_at: Option<DateTime<Utc>>,
     #[serde(default = "default_full_confidence")]
     pub confidence: f32,

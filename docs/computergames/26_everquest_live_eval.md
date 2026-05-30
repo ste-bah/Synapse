@@ -102,10 +102,13 @@ UIA window title `EverQuest`, which is not character state and must not be used
 as a level claim. The Inventory crop is deliberately broad enough for the
 current windowed placement and the earlier fullscreen placement; the parser
 looks for the name/class line such as `1 Wizard`. `everquest.next_level_label`
-proves the XP panel is visible; the numeric XP percentage must still be read
-from the visible crop/screenshot unless OCR agrees with the crop. If OCR
-returns an ambiguous or contradictory XP percentage, the agent must treat the
-visible crop as the SoT and record the OCR mismatch on #495/#500.
+proves the XP panel is visible. `everquest.next_level_percent` parses the
+numeric `NEXT LEVEL ...%` value from the same visible Inventory crop and feeds
+the persisted `everquest_current_state.xp_percent` and
+`everquest_world_summary.level_progress.xp_percent` fields. If OCR returns an
+ambiguous or contradictory XP percentage, the agent must treat the visible crop
+as the SoT, fail closed for the numeric claim, and record the OCR mismatch on
+#495/#500.
 
 ## Safe Input Aliases
 
