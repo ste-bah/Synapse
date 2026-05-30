@@ -257,10 +257,12 @@ summaries to a baseline plus deltas:
   those physical SoTs against the baseline+delta assumption. Persist drift and
   force a new baseline before continuing movement/combat if reality disagrees.
 
-The level-2 run should use delta context between audits once #537-#542 are
-implemented. Until then, use existing real MCP tools (`observe`,
-`everquest_current_state`, `everquest_world_summary`, `storage_inspect`) plus
-manual before/after SoT readback.
+The level-2 run should use delta context between audits through the real
+`reality_baseline`, `observe_delta`, `reality_audit`, and
+`everquest_world_summary` MCP tools. The concrete manual runbook is
+[`25_mcp_runtime_fsv_path.md`](25_mcp_runtime_fsv_path.md) section 3. Existing
+`observe`, `everquest_current_state`, and `storage_inspect` calls remain
+supporting SoT readbacks; they do not replace the delta/audit triggers.
 
 #541 wires this into `everquest_world_summary`. Every summary row now carries a
 `reality_context` block derived from the persisted `CF_KV` rows:

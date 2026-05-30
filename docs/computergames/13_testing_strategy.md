@@ -28,7 +28,9 @@ benchmark, or direct database write is supporting evidence only.
 For the #536 delta-first reality work, manual FSV must prove both sides of the
 contract: the delta stream contains the known change, and a periodic full audit
 agrees with or corrects the agent's accumulated assumption by reading the
-physical SoT.
+physical SoT. The concrete manual runbook is
+[`25_mcp_runtime_fsv_path.md`](25_mcp_runtime_fsv_path.md) section 3; do not
+replace it with a script or harness.
 
 "Hard to test" is never an excuse for not testing.
 Likewise, a missing local prerequisite is not an excuse to stop. If the
