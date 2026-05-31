@@ -17,6 +17,15 @@ title_regex = ".* - Microsoft Edge$"
 [[matches]]
 exe = "chromium.exe"
 
+# Bare-exe fallbacks so the profile still binds on windows whose title lacks the
+# " - Google Chrome"/" - Microsoft Edge" suffix (e.g. chrome://version, PWAs,
+# the initial blank window). The title-specific matches above rank higher.
+[[matches]]
+exe = "chrome.exe"
+
+[[matches]]
+exe = "msedge.exe"
+
 [capture]
 target = "foreground_window"
 min_update_interval_ms = 50

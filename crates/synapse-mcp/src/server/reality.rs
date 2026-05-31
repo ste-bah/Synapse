@@ -3417,6 +3417,7 @@ mod tests {
             name: "Translate Button".to_owned(),
             role: "Button".to_owned(),
             automation_id: Some("TranslateButton".to_owned()),
+            value: None,
             bbox: Rect {
                 x: 20,
                 y: 30,
@@ -3858,6 +3859,7 @@ max_detections = 8
                 name: format!("Synthetic Item {index}"),
                 role: "MenuItem".to_owned(),
                 automation_id: Some(format!("SyntheticItem{index}")),
+                value: None,
                 bbox: Rect {
                     x: 10,
                     y: 20_i32.saturating_add(offset),
@@ -3891,6 +3893,7 @@ max_detections = 8
             name: element_name.to_owned(),
             role: "Button".to_owned(),
             automation_id: Some("SyntheticButton".to_owned()),
+            value: None,
             bbox: Rect {
                 x: if is_after { 12 } else { 10 },
                 y: 10,

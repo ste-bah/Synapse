@@ -94,6 +94,11 @@ pub struct AccessibleNode {
     pub role: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation_id: Option<String>,
+    /// On-screen value source-of-truth (UIA `ValuePattern` / `RangeValuePattern`),
+    /// e.g. the text in an edit field or a numeric display. `None` when the
+    /// element exposes no value. Distinct from `name` (often a static label).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
     pub bbox: Rect,
     pub enabled: bool,
     pub focused: bool,

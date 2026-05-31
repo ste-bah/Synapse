@@ -47,13 +47,20 @@ const POLL_INTERVAL: Duration = Duration::from_millis(120);
 const INTER_KEY_DELAY: Duration = Duration::from_millis(250);
 const MAX_TARGET_CYCLES: u32 = 3;
 const DEFAULT_HOTBAR_ALIAS: &str = "hotbar4";
+// Roam/chase timing scaffolding. The roam/chase movement loop that consumes
+// these is not yet wired; kept so the policy is ready when it lands. EverQuest
+// is a legacy target (see docs/computergames/08_supported_use_policy.md §7.1.1).
 /// One roam move: hold `forward` for this long after a small turn, then re-scan.
+#[expect(dead_code, reason = "roam/chase movement loop not yet wired")]
 const ROAM_FORWARD_HOLD_MS: u32 = 1200;
 /// One roam turn: hold a turn alias for this long to face a fresh direction.
+#[expect(dead_code, reason = "roam/chase movement loop not yet wired")]
 const ROAM_TURN_HOLD_MS: u32 = 350;
 /// One chase burst: hold `forward` for this long, then re-poll the fight window.
+#[expect(dead_code, reason = "roam/chase movement loop not yet wired")]
 const CHASE_FORWARD_HOLD_MS: u32 = 800;
 /// A chase ends if no combat lines are seen for this many consecutive bursts.
+#[expect(dead_code, reason = "roam/chase movement loop not yet wired")]
 const CHASE_IDLE_BURSTS: u32 = 3;
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -137,6 +144,7 @@ struct Policy {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ActAutocombatIteration {
     pub index: u32,
     pub target_summary: Option<String>,
@@ -156,6 +164,7 @@ pub struct ActAutocombatIteration {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ActAutocombatResponse {
     pub ok: bool,
     pub iterations: u32,
@@ -242,7 +251,10 @@ enum FightSignal {
     /// `<mob> has been slain by ...` — engagement won.
     Slain,
     /// The mob is fleeing at low HP (`flees`, `tries to flee`, `runs away`) and
-    /// is still alive — chase it to stay in melee range and finish it.
+    /// is still alive — chase it to stay in melee range and finish it. The
+    /// detector that produces this is not yet wired; the fight loop handles the
+    /// variant as "continue" until the chase movement loop lands.
+    #[expect(dead_code, reason = "fleeing detector / chase loop not yet wired")]
     Fleeing,
     /// Target lost / no target (auto-attack can no longer reach it).
     TargetLost,
@@ -456,6 +468,10 @@ impl SynapseService {
             melee_started: false,
             casts: 0,
             cast: false,
+            // Roam/chase scaffolding is present but the movement logic is not yet
+            // implemented; report inert values so the iteration shape is stable.
+            roam_steps: 0,
+            chased: false,
             outcome: EngagementOutcome::NoTarget.as_str().to_owned(),
         };
 
@@ -561,8 +577,10 @@ impl SynapseService {
                     }
                     return Ok((EngagementOutcome::NoTarget, tally));
                 }
-                // Resisted/fizzled/miss/hits-exchanged -> keep fighting.
-                FightSignal::Continue | FightSignal::Idle => {}
+                // Resisted/fizzled/miss/hits-exchanged -> keep fighting. Fleeing
+                // is treated as continue for now (chase movement is not yet
+                // implemented): keep auto-attacking while the mob may be in range.
+                FightSignal::Continue | FightSignal::Idle | FightSignal::Fleeing => {}
             }
         }
     }
@@ -1225,6 +1243,8 @@ mod tests {
             cast_mana_cost_percent: 250,
             engagement_timeout_s: 9999,
             hotbar_alias: "  HOTBAR4 ".to_owned(),
+            max_roam_steps: 999,
+            max_chase_s: 9999,
             idempotency_key: Some("run/with:bad chars!".to_owned()),
         });
         assert_eq!(policy.max_iterations, 50);
@@ -1235,6 +1255,8 @@ mod tests {
         assert_eq!(policy.cast_mana_cost, 100);
         assert_eq!(policy.engagement_timeout.as_secs(), 300);
         assert_eq!(policy.hotbar_alias, "hotbar4");
+        assert_eq!(policy.max_roam_steps, 50);
+        assert_eq!(policy.max_chase.as_secs(), 120);
         assert_eq!(policy.run_id, "runwithbadchars");
     }
 
@@ -1250,9 +1272,13 @@ mod tests {
             cast_mana_cost_percent: default_cast_mana_cost(),
             engagement_timeout_s: default_engagement_timeout_s(),
             hotbar_alias: default_hotbar_alias(),
+            max_roam_steps: default_max_roam_steps(),
+            max_chase_s: default_max_chase_s(),
             idempotency_key: None,
         });
         assert_eq!(policy.cast_mana_cost, 70);
         assert_eq!(policy.engagement_timeout.as_secs(), 30);
+        assert_eq!(policy.max_roam_steps, 6);
+        assert_eq!(policy.max_chase.as_secs(), 12);
     }
 }

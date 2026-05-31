@@ -166,6 +166,7 @@ fn sample_observation() -> Observation {
             name: "Text Editor".to_owned(),
             role: "Edit".to_owned(),
             automation_id: Some("15".to_owned()),
+            value: None,
             bbox: Rect {
                 x: 10,
                 y: 20,

@@ -407,6 +407,7 @@ pub fn accessible_node() -> AccessibleNode {
         name: "Editor".to_owned(),
         role: "document".to_owned(),
         automation_id: Some("15".to_owned()),
+        value: None,
         bbox: Rect {
             x: 20,
             y: 30,

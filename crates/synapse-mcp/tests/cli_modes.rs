@@ -232,6 +232,10 @@ async fn http_health_reads_m4_policy_counts_from_repeated_cli_flags() -> anyhow:
         .env("SYNAPSE_LOG_DIR", dir.path())
         .env("APPDATA", dir.path())
         .env("SYNAPSE_BEARER_TOKEN", token)
+        // Opt out of the default-permissive shell/launch posture so health
+        // reports the configured allowlist counts rather than "any".
+        .env("SYNAPSE_ALLOW_SHELL_ANY", "0")
+        .env("SYNAPSE_ALLOW_LAUNCH_ANY", "0")
         .env_remove("SYNAPSE_HARDWARE_HID")
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
@@ -262,6 +266,10 @@ async fn http_health_reads_m4_policy_counts_from_comma_env() -> anyhow::Result<(
         .env("SYNAPSE_BEARER_TOKEN", token)
         .env("SYNAPSE_ALLOW_SHELL", "^echo$,^cargo$")
         .env("SYNAPSE_ALLOW_LAUNCH", "^notepad\\.exe$,^calc\\.exe$")
+        // Opt out of the default-permissive shell/launch posture so health
+        // reports the configured allowlist counts rather than "any".
+        .env("SYNAPSE_ALLOW_SHELL_ANY", "0")
+        .env("SYNAPSE_ALLOW_LAUNCH_ANY", "0")
         .env_remove("SYNAPSE_HARDWARE_HID")
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())

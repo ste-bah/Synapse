@@ -194,25 +194,16 @@ impl M4ServiceConfig {
     }
 }
 
-fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
-}
-
-/// Like [`env_flag`] but defaults to `true` when the variable is unset. Only an
-/// explicit falsey value (`0`/`false`/`no`/`off`) disables the flag.
+/// Returns `true` unless the env var is explicitly set to a falsey value
+/// (`0`/`false`/`no`/`off`). An unset variable means `true`, i.e.
+/// permissive-by-default for shell/launch.
 fn env_flag_default_true(name: &str) -> bool {
-    match std::env::var(name) {
-        Ok(value) => !matches!(
+    std::env::var(name).map_or(true, |value| {
+        !matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off"
-        ),
-        Err(_) => true,
-    }
+        )
+    })
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

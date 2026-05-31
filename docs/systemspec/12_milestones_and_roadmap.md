@@ -134,7 +134,7 @@ delta-first reality tools. Current build:
 | 21 | `reflex_list` | M3 | live | |
 | 22 | `reflex_history` | M3 | live | |
 | 23 | `profile_list` | M3 | live | |
-| 24 | `profile_activate` | M3 | live | use_scope=unknown requires `--allow-unknown-profile` |
+| 24 | `profile_activate` | M3 | live | use_scope=unknown allowed by default; `--restrict-unknown-profile` fails closed |
 | 25 | `replay_record` | M3 | live | JSONL only |
 | 26 | `audio_tail` | M3 | live | |
 | 27 | `audio_transcribe` | M3 | live (en only) | |

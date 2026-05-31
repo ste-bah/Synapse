@@ -94,6 +94,7 @@ pub fn sample_observation() -> Result<Observation, chrono::ParseError> {
             name: "Text Editor".to_owned(),
             role: "Edit".to_owned(),
             automation_id: Some("15".to_owned()),
+            value: None,
             bbox: Rect {
                 x: 10,
                 y: 20,
@@ -222,6 +223,7 @@ pub fn observation_strategy() -> impl Strategy<Value = Observation> {
                     name: "Focused".to_owned(),
                     role,
                     automation_id: None,
+                    value: None,
                     bbox: Rect {
                         x: 1,
                         y: 2,

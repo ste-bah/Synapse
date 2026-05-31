@@ -443,6 +443,7 @@ fn node(sequence: u32, depth: u32, name: &str, role: &str, focused: bool) -> Acc
         name: name.to_owned(),
         role: role.to_owned(),
         automation_id: None,
+        value: None,
         bbox: Rect {
             x: 10 + depth_i32,
             y: 20 + sequence_i32.saturating_mul(10),
@@ -643,6 +644,7 @@ mod linux_x11 {
             name: foreground.window_title.clone(),
             role: "Window".to_owned(),
             automation_id: None,
+            value: None,
             bbox: foreground.window_bounds,
             enabled: true,
             focused: false,

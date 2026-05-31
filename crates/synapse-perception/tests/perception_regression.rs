@@ -124,6 +124,7 @@ fn node(depth: u32, name: &str, role: &str, focused: bool) -> AccessibleNode {
         name: name.to_owned(),
         role: role.to_owned(),
         automation_id: None,
+        value: None,
         bbox: Rect {
             x: 10 + depth_i32,
             y: 20 + depth_i32,

@@ -14,7 +14,16 @@ expression: shape
                   "const": "eq",
                   "type": "string"
                 },
-                "value": true
+                "value": {
+                  "type": [
+                    "object",
+                    "array",
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
               },
               "required": [
                 "op",
@@ -28,7 +37,16 @@ expression: shape
                   "const": "ne",
                   "type": "string"
                 },
-                "value": true
+                "value": {
+                  "type": [
+                    "object",
+                    "array",
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
               },
               "required": [
                 "op",
@@ -42,7 +60,16 @@ expression: shape
                   "const": "lt",
                   "type": "string"
                 },
-                "value": true
+                "value": {
+                  "type": [
+                    "object",
+                    "array",
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
               },
               "required": [
                 "op",
@@ -56,7 +83,16 @@ expression: shape
                   "const": "le",
                   "type": "string"
                 },
-                "value": true
+                "value": {
+                  "type": [
+                    "object",
+                    "array",
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
               },
               "required": [
                 "op",
@@ -70,7 +106,16 @@ expression: shape
                   "const": "gt",
                   "type": "string"
                 },
-                "value": true
+                "value": {
+                  "type": [
+                    "object",
+                    "array",
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
               },
               "required": [
                 "op",
@@ -84,7 +129,16 @@ expression: shape
                   "const": "ge",
                   "type": "string"
                 },
-                "value": true
+                "value": {
+                  "type": [
+                    "object",
+                    "array",
+                    "string",
+                    "number",
+                    "boolean",
+                    "null"
+                  ]
+                }
               },
               "required": [
                 "op",

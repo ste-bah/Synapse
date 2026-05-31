@@ -1275,6 +1275,7 @@ max_detections = 8
                 name: "Notepad".to_owned(),
                 role: "Window".to_owned(),
                 automation_id: None,
+                value: None,
                 bbox: Rect {
                     x: 10,
                     y: 20,
@@ -1293,6 +1294,7 @@ max_detections = 8
                 name: "Document".to_owned(),
                 role: "Edit".to_owned(),
                 automation_id: Some("15".to_owned()),
+                value: None,
                 bbox: Rect {
                     x: 12,
                     y: 80,

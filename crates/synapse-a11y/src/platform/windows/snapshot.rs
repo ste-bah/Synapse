@@ -1,16 +1,10 @@
 use std::time::{Duration, Instant};
-use std::{
-    collections::HashSet,
-    sync::{
-        Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
-};
+use std::{collections::HashSet, sync::Mutex};
 
 use synapse_core::{AccessibleNode, AccessibleSubtree, ElementId, UiaPattern, element_id};
 use uiautomation::{
-    UIAutomation, UIElement, UITreeWalker,
-    core::UICacheRequest,
+    UIAutomation, UIElement,
+    core::{UICacheRequest, UICondition},
     types::{ElementMode, PropertyConditionFlags, TreeScope, UIProperty},
     variants::Variant,
 };
@@ -19,12 +13,22 @@ use crate::{A11yError, A11yResult, ElementSearchScope, ids::runtime_id_hex};
 
 use super::common::{
     TreeView, cached_hwnd, cached_patterns, cached_rect, cached_role, cached_runtime_id,
-    create_cache_request, map_uia_error, non_empty, pattern_property, with_automation,
+    cached_value, create_cache_request, map_uia_error, non_empty, pattern_property, with_automation,
 };
 
 static SNAPSHOT_CACHE: Mutex<Option<SnapshotCache>> = Mutex::new(None);
-static SNAPSHOT_DEPTH1_DEGRADED: AtomicBool = AtomicBool::new(false);
 const RAW_SUPPLEMENT_DEPTH: u32 = 2;
+/// Hard ceiling on nodes collected in one snapshot. Cross-process trees (UWP,
+/// browsers) can be large; this bounds worst-case work while preserving every
+/// node collected up to the cap (the result is flagged `truncated`, never
+/// silently collapsed).
+const SNAPSHOT_NODE_BUDGET: usize = 4000;
+/// Wall-clock budget for one snapshot walk. When exceeded the walk stops
+/// descending further but KEEPS everything collected so far and flags
+/// `truncated`. This replaces the previous behaviour, which discarded a
+/// complete tree and re-ran at depth 1 whenever a walk took >25ms — fatal for
+/// inherently slower cross-process UWP/ApplicationFrameHost trees.
+const SNAPSHOT_DEADLINE: Duration = Duration::from_millis(400);
 const RAW_SUPPLEMENT_NODE_BUDGET: usize = 60;
 // Packaged Notepad exposes these top-level menu items through raw
 // name+ExpandCollapse search even when RawView child walking omits them.
@@ -37,35 +41,41 @@ struct SnapshotCache {
 }
 
 struct SnapshotWalk<'a> {
-    walker: &'a UITreeWalker,
+    /// True condition so every child is enumerated (raw view equivalent).
+    true_condition: &'a UICondition,
     cache: &'a UICacheRequest,
     root_hwnd: i64,
+    /// Stop descending once this many nodes are collected.
+    node_budget: usize,
+    /// Stop descending once this instant is reached.
+    deadline: Instant,
 }
+
 pub fn snapshot(root: &UIElement, depth: u32) -> A11yResult<AccessibleSubtree> {
     if let Some(tree) = cached_snapshot(depth) {
         return Ok(tree);
     }
 
     with_automation(|automation| {
-        let requested_depth = if depth > 1 && SNAPSHOT_DEPTH1_DEGRADED.load(Ordering::Relaxed) {
-            1
-        } else {
-            depth
-        };
-        let start = Instant::now();
-        let mut tree = snapshot_at_depth(automation, root, requested_depth)?;
-        if depth > 1 && requested_depth > 1 && start.elapsed() > Duration::from_millis(25) {
-            SNAPSHOT_DEPTH1_DEGRADED.store(true, Ordering::Relaxed);
-            tree = snapshot_at_depth(automation, root, 1)?;
-            tree.truncated = true;
-        }
-        if requested_depth < depth {
-            tree.truncated = true;
-        }
+        let started = Instant::now();
+        let mut tree = snapshot_at_depth(automation, root, depth)?;
         if depth >= RAW_SUPPLEMENT_DEPTH {
             tree.truncated |= supplement_raw_pattern_nodes(automation, root, &mut tree.nodes)?;
             tree.max_depth = tree.max_depth.max(RAW_SUPPLEMENT_DEPTH);
         }
+        // Observability: `truncated` is also surfaced to callers (observe
+        // diagnostics) so an incomplete tree is never mistaken for a complete
+        // one. A truncated tree means the node budget/deadline was hit or a
+        // subtree errored (the per-subtree error is logged at warn separately).
+        tracing::debug!(
+            code = "A11Y_SNAPSHOT_ASSEMBLED",
+            requested_depth = depth,
+            nodes = tree.nodes.len(),
+            max_depth = tree.max_depth,
+            truncated = tree.truncated,
+            elapsed_ms = started.elapsed().as_millis(),
+            "a11y snapshot assembled"
+        );
         store_snapshot(depth, &tree);
         Ok(tree)
     })
@@ -119,16 +129,19 @@ fn snapshot_at_depth(
     depth: u32,
 ) -> A11yResult<AccessibleSubtree> {
     let cache = create_cache_request(automation, 0, ElementMode::Full, TreeView::Raw)?;
-    let walker = automation.get_raw_view_walker().map_err(map_uia_error)?;
+    let true_condition = automation.create_true_condition().map_err(map_uia_error)?;
     let cached_root = root.build_updated_cache(&cache).map_err(map_uia_error)?;
     let root_hwnd = cached_hwnd(&cached_root).unwrap_or(0);
     let mut nodes = Vec::new();
+    let mut truncated = false;
     let walk = SnapshotWalk {
-        walker: &walker,
+        true_condition: &true_condition,
         cache: &cache,
         root_hwnd,
+        node_budget: SNAPSHOT_NODE_BUDGET,
+        deadline: Instant::now() + SNAPSHOT_DEADLINE,
     };
-    collect_nodes(&walk, &cached_root, None, 0, depth, &mut nodes)?;
+    collect_nodes(&walk, &cached_root, None, 0, depth, &mut nodes, &mut truncated)?;
     let root = nodes
         .first()
         .map(|node| node.element_id.clone())
@@ -139,7 +152,7 @@ fn snapshot_at_depth(
         root,
         nodes,
         max_depth: depth,
-        truncated: false,
+        truncated,
     })
 }
 
@@ -237,13 +250,38 @@ fn collect_nodes(
     depth: u32,
     max_depth: u32,
     nodes: &mut Vec<AccessibleNode>,
+    truncated: &mut bool,
 ) -> A11yResult<ElementId> {
-    let children = if depth < max_depth {
-        walk.walker
-            .get_children_build_cache(element, walk.cache)
-            .unwrap_or_default()
-    } else {
+    let children = if depth >= max_depth {
         Vec::new()
+    } else if nodes.len() >= walk.node_budget || Instant::now() >= walk.deadline {
+        // Budget/deadline hit: keep everything collected, but do not descend
+        // further and flag the result as incomplete (never silently complete).
+        *truncated = true;
+        Vec::new()
+    } else {
+        // `find_all_build_cache(Children, true)` returns a `Result` (unlike the
+        // tree walker's `get_children_build_cache`, which the crate collapses to
+        // `Option`/`None` and hides the error). It also reliably crosses the
+        // cross-process `Windows.UI.Core.CoreWindow` boundary for UWP apps.
+        match element.find_all_build_cache(TreeScope::Children, walk.true_condition, walk.cache) {
+            Ok(children) => children,
+            Err(err) => {
+                *truncated = true;
+                tracing::warn!(
+                    code = "A11Y_CHILD_ENUM_FAILED",
+                    error = %err,
+                    depth,
+                    element_name = %element.get_cached_name().unwrap_or_default(),
+                    element_class = %element.get_cached_classname().unwrap_or_default(),
+                    control_type = ?element.get_cached_control_type().ok(),
+                    automation_id = %element.get_cached_automation_id().unwrap_or_default(),
+                    process_id = element.get_cached_process_id().unwrap_or(-1),
+                    "UIA child enumeration failed; subtree omitted and snapshot flagged truncated"
+                );
+                Vec::new()
+            }
+        }
     };
     let node = node_from_cached_element(element, parent, depth, walk.root_hwnd, children.len())?;
     let node_id = node.element_id.clone();
@@ -256,6 +294,7 @@ fn collect_nodes(
             depth + 1,
             max_depth,
             nodes,
+            truncated,
         )?;
     }
     Ok(node_id)
@@ -279,6 +318,7 @@ fn node_from_cached_element(
         name: element.get_cached_name().unwrap_or_default(),
         role: cached_role(element),
         automation_id: non_empty(element.get_cached_automation_id().unwrap_or_default()),
+        value: cached_value(element),
         bbox: cached_rect(element),
         enabled: element.is_cached_enabled().unwrap_or(false),
         focused: element.has_cached_keyboard_focus().unwrap_or(false),

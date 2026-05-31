@@ -70,7 +70,23 @@ fn find_by_runtime_id_hex(
         return Ok(None);
     }
 
-    for child in root.get_cached_children().unwrap_or_default() {
+    let children = match root.get_cached_children() {
+        Ok(children) => children,
+        Err(err) => {
+            // Do not silently treat a navigation failure as "no children":
+            // log it with context so a failed re-resolve is diagnosable.
+            tracing::warn!(
+                code = "A11Y_CACHED_CHILDREN_FAILED",
+                error = %err,
+                depth,
+                element_name = %root.get_cached_name().unwrap_or_default(),
+                element_class = %root.get_cached_classname().unwrap_or_default(),
+                "cached child navigation failed during re-resolve; subtree skipped"
+            );
+            Vec::new()
+        }
+    };
+    for child in children {
         if let Some(found) =
             find_by_runtime_id_hex(&child, runtime_id_hex_expected, depth + 1, max_depth)?
         {

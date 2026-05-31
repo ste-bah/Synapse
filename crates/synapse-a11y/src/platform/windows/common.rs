@@ -81,6 +81,8 @@ pub(super) fn create_cache_request(
         UIProperty::IsWindowPatternAvailable,
         UIProperty::IsTransformPatternAvailable,
         UIProperty::IsRangeValuePatternAvailable,
+        UIProperty::ValueValue,
+        UIProperty::RangeValueValue,
     ] {
         cache.add_property(property).map_err(map_uia_error)?;
     }
@@ -183,6 +185,34 @@ fn cached_bool(element: &UIElement, property: UIProperty) -> bool {
         .ok()
         .and_then(|variant| <&Variant as TryInto<bool>>::try_into(&variant).ok())
         .unwrap_or(false)
+}
+
+/// On-screen value source-of-truth: prefer the `ValuePattern` string, then the
+/// `RangeValuePattern` number. Returns `None` when neither pattern is exposed or
+/// the value is empty, so `AccessibleNode.value` stays absent rather than blank.
+pub(super) fn cached_value(element: &UIElement) -> Option<String> {
+    if cached_bool(element, UIProperty::IsValuePatternAvailable)
+        && let Ok(variant) = element.get_cached_property_value(UIProperty::ValueValue)
+        && let Ok(text) = variant.get_string()
+        && !text.is_empty()
+    {
+        return Some(text);
+    }
+    if cached_bool(element, UIProperty::IsRangeValuePatternAvailable)
+        && let Ok(variant) = element.get_cached_property_value(UIProperty::RangeValueValue)
+        && let Ok(Value::R8(number)) = variant.get_value()
+    {
+        return Some(format_range_value(number));
+    }
+    None
+}
+
+fn format_range_value(number: f64) -> String {
+    if number.fract() == 0.0 && number.abs() < 1e15 {
+        format!("{number:.0}")
+    } else {
+        format!("{number}")
+    }
 }
 
 pub(super) fn cached_rect(element: &UIElement) -> Rect {

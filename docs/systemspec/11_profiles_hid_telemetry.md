@@ -186,7 +186,7 @@ match does not activate the profile or overwrite a manual `profile_activate`.
 | Tool | Behavior |
 |---|---|
 | `profile_list { include_inactive: bool default true }` | calls `runtime.list(include_inactive)` and `runtime.active_profile_id()`; permission: `READ_PROFILE` |
-| `profile_activate { profile_id }` | look up the profile; if `use_scope = Unknown` and `--allow-unknown-profile` is not set, return `SAFETY_PROFILE_ACTION_DENIED`; activate the profile (or return `changed = false` if already active); then apply `Profile.backends` to M2's `BackendResolutionPolicy`; permission: `WRITE_PROFILE_ACTIVE` |
+| `profile_activate { profile_id }` | look up the profile; if `use_scope = Unknown` and `--restrict-unknown-profile` IS set, return `SAFETY_PROFILE_ACTION_DENIED` (default is permissive — unknown scopes are allowed); activate the profile (or return `changed = false` if already active); then apply `Profile.backends` to M2's `BackendResolutionPolicy`; permission: `WRITE_PROFILE_ACTIVE` |
 
 Activating a profile updates the action emitter's shared backend-resolution
 policy. `[backends] default_backend = "hardware"` is accepted as a TOML alias

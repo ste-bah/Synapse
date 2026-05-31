@@ -148,7 +148,7 @@ submodules (declared via `#[tool_router]`). Grouped by milestone:
 | `reflex_list` | List active reflexes (and optionally terminal ones reconstructed from `CF_REFLEX_AUDIT`) | `server.rs::reflex_list`, `m3/reflex.rs` |
 | `reflex_history` | Return persisted `StoredReflexAudit` rows (newest-first), optionally for one reflex id, capped at 1000 | `server.rs::reflex_history`, `m3/reflex.rs` |
 | `profile_list` | List loaded profiles + active id | `server.rs::profile_list`, `m3/profile.rs` |
-| `profile_activate` | Activate a known profile id (use_scope=unknown profiles require `--allow-unknown-profile`) | `server.rs::profile_activate`, `m3/profile.rs` |
+| `profile_activate` | Activate a profile id (use_scope=unknown allowed by default; `--restrict-unknown-profile` fails closed) | `server.rs::profile_activate`, `m3/profile.rs` |
 | `replay_record` | Stream observations and/or events to a JSONL file under `%LOCALAPPDATA%/synapse/replays` | `server.rs::replay_record`, `m3/replay.rs` |
 | `audio_tail` | Return the most-recent loopback audio tail as PCM s16le bytes (max 5 s; `synapse_audio::MAX_RING_SECONDS`) | `server.rs::audio_tail`, `m3/audio.rs` |
 | `audio_transcribe` | Transcribe the loopback tail via Whisper-tiny (language pinned to `"en"`) | `server.rs::audio_transcribe`, `m3/audio.rs` |
@@ -294,7 +294,7 @@ CLI flags on `synapse-mcp` (parsed in `main.rs::Cli`, full table: [03_configurat
 --log-level <LEVEL>             [env: SYNAPSE_LOG_LEVEL]       default: info
 --reflex-disabled               [env: SYNAPSE_REFLEX_DISABLED]
 --enable-audio                  [env: SYNAPSE_ENABLE_AUDIO]
---allow-unknown-profile         [env: SYNAPSE_ALLOW_UNKNOWN_PROFILE]
+--restrict-unknown-profile      [env: SYNAPSE_RESTRICT_UNKNOWN_PROFILE]
 --allowed-permissions <LIST>    [env: SYNAPSE_MCP_ALLOWED_PERMISSIONS]
 --reflex-force-degraded         [env: SYNAPSE_REFLEX_FORCE_DEGRADED]
 --storage-pressure-free-bytes-sample <BYTES>
@@ -391,7 +391,7 @@ DXGI duplication and Windows.Graphics.Capture backends with a single `CaptureBac
 `AudioRuntime` (`crates/synapse-audio/src/lib.rs`) holds a ring buffer (default 5 s, max 5 s — `DEFAULT_RING_SECONDS = MAX_RING_SECONDS = 5`), a WASAPI loopback handle (started only when `--enable-audio` or `SYNAPSE_AUDIO_LOOPBACK=1`), optional event-emitting detectors (`detectors::DetectorProcessor`), and a Whisper-tiny STT engine (`WhisperTinyStt`). Provides `tail_seconds`, `transcribe_tail`, ring-format negotiation, direction estimate (azimuth + confidence). See [10_audio_and_models.md](10_audio_and_models.md).
 
 ### 9.10 synapse-profiles (TOML loader + live reload)
-`ProfileRuntime::spawn` parses every `.toml` file in the profile directory at startup, registers a `notify` recursive watcher with a 200 ms debounce, and refreshes parsed profiles on filesystem events. Bundled profile dir is auto-discovered (`bundled_profiles_dir`); operator override is `SYNAPSE_PROFILE_DIR`. Resolves the active profile against the current foreground window via `resolve_active_profile`. Profiles with `use_scope=unknown` require explicit `--allow-unknown-profile`. See [11_profiles_hid_telemetry.md](11_profiles_hid_telemetry.md) (or section in subsystem deep-dives).
+`ProfileRuntime::spawn` parses every `.toml` file in the profile directory at startup, registers a `notify` recursive watcher with a 200 ms debounce, and refreshes parsed profiles on filesystem events. Bundled profile dir is auto-discovered (`bundled_profiles_dir`); operator override is `SYNAPSE_PROFILE_DIR`. Resolves the active profile against the current foreground window via `resolve_active_profile`. Profiles with `use_scope=unknown` (and unprofiled foregrounds) are actionable by default; pass `--restrict-unknown-profile` to fail closed. See [11_profiles_hid_telemetry.md](11_profiles_hid_telemetry.md) (or section in subsystem deep-dives).
 
 ### 9.11 synapse-telemetry (logs + metrics registry)
 Owns the process-wide `tracing` subscriber: JSON file appender (daily rolling, lives in `%LOCALAPPDATA%/synapse/logs`), stderr console layer, and a background log-GC thread (default 6-hour interval, 7-day retention, 500 MiB ceiling, all overridable by `SYNAPSE_LOG_GC_INTERVAL_S`). Installs the panic-to-log hook (`install_panic_hook`). The `metrics` module declares 19 M3 metric specs (12 counters, 5 gauges, 2 histograms) with bounded label cardinality (`CARDINALITY_LIMIT = 1000`). Examples: `events_published_total`, `reflex_fires_total`, `reflex_tick_jitter_us`, `storage_disk_pressure_level`, `storage_cf_bytes`, `audio_loopback_underruns_total`, `sse_active_subscribers`. Spawn registers these via `metrics-exporter-prometheus` machinery.

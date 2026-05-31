@@ -40,7 +40,7 @@ All flags are defined in `crates/synapse-mcp/src/main.rs::Cli` (clap derive).
 | `--log-level` | `SYNAPSE_LOG_LEVEL` | `String` (parsed `LevelFilter`) | `info` | `trace`/`debug`/`info`/`warn`/`error`/`off` | Sets both file and console layer filters (`crates/synapse-mcp/src/main.rs::configure_telemetry`) |
 | `--reflex-disabled` | `SYNAPSE_REFLEX_DISABLED` | `bool` | `false` | `0`, `1`, `true`, `false` (case-insensitive); other values reject startup (`parse_bool_env` in `m3.rs`) | Disables the reflex runtime; reflex tool calls return `REFLEX_DISABLED_BY_OPERATOR`. |
 | `--enable-audio` | `SYNAPSE_ENABLE_AUDIO` | `bool` | `false` | same as above | Required to grant `READ_AUDIO` and to spawn the WASAPI loopback. `audio_tail` / `audio_transcribe` require this. |
-| `--allow-unknown-profile` | `SYNAPSE_ALLOW_UNKNOWN_PROFILE` | `bool` | `false` | same as above | Permits activating profiles whose `use_scope = unknown`. |
+| `--restrict-unknown-profile` | `SYNAPSE_RESTRICT_UNKNOWN_PROFILE` | `bool` | `false` | same as above | Fail-closed switch. Off by default (permissive): unknown/unprofiled foreground apps are actionable. Set it to refuse action dispatch on `use_scope = unknown` / no-profile foregrounds. |
 | `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | `Option<String>` | derived default set (see §4.4) | comma/semicolon/whitespace-separated permission names (`READ_EVENTS`, `WRITE_REFLEX`, `READ_REFLEX`, `READ_PROFILE`, `WRITE_PROFILE_ACTIVE`, `WRITE_REPLAY`, `READ_AUDIO`, `INPUT_KEYBOARD`, `INPUT_MOUSE`, `INPUT_PAD`, `INPUT_HARDWARE_HID`; aliases `KEYBOARD`/`MOUSE`/`PAD`/`HARDWARE_HID`; sentinel values `NONE` and `DENY_ALL` produce an empty set) | M3 permission grant list. Invalid permission names refuse startup. |
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | `bool` | `false` | same as bool flags above | Forces the reflex scheduler into degraded-latency mode (test-only knob). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | `Option<u64>` | `None` | unsigned integer | If set, applies one synthetic free-byte sample at startup to validate disk-pressure responder paths (`Db::run_pressure_check_with_free_bytes_sample`). |
@@ -133,7 +133,7 @@ Sentinel values `NONE` / `DENY_ALL` produce an empty grants set (every M3 tool w
 - Default name when `path` is omitted: `replay-<uuid-v7>.jsonl`.
 
 ### 4.6 Profiles
-- Activating a profile whose `use_scope = unknown` without `--allow-unknown-profile` → `SAFETY_PROFILE_ACTION_DENIED`. (`crates/synapse-mcp/src/m3/profile.rs::activate_profile`)
+- Action dispatch on a `use_scope = unknown` / unprofiled foreground is allowed by default (permissive). With `--restrict-unknown-profile` it returns `SAFETY_PROFILE_ACTION_DENIED`. (`crates/synapse-mcp/src/m3/profile.rs::activate_profile`, `server/context.rs::ensure_profile_scope_allows_action`)
 
 ### 4.7 Audio
 - `audio_tail.seconds` ≤ `synapse_audio::MAX_RING_SECONDS = 5`; larger → `TOOL_PARAMS_INVALID`.
