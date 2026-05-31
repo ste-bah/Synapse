@@ -101,8 +101,11 @@ use crate::{
     },
     m4::{
         ActComboParams, ActComboResponse, ActLaunchParams, ActLaunchResponse, ActRunShellParams,
-        ActRunShellResponse, M4ServiceConfig, execute_combo, launch, required_combo_permissions,
-        run_shell,
+        ActRunShellResponse, M4ServiceConfig, RunShellAuthorization, authorize_run_shell,
+        execute_combo, launch, required_combo_permissions, run_authorized_shell,
+        run_shell_idempotency_completed_row, run_shell_idempotency_replay,
+        run_shell_idempotency_reservation_row, run_shell_idempotency_row_key,
+        run_shell_request_details,
     },
 };
 

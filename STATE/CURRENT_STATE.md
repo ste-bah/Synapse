@@ -1,5 +1,54 @@
 # CURRENT STATE - Synapse
 
+## 2026-05-31T14:26:17-05:00
+- Active issue remains #606 `scenario(stress): act_run_shell orchestration - allowlist modes, timeout, 1MB cap, idempotency`.
+- Implementation patch is in the worktree:
+  - `crates/synapse-mcp/src/m4.rs`: split shell authorization from execution, added 600000 ms max timeout validation, idempotency key validation, request hashing, and `CF_KV` idempotency row encode/decode/replay helpers.
+  - `crates/synapse-mcp/src/server/m4_tools.rs`: `act_run_shell` now writes `CF_ACTION_LOG` start/result audit rows, authorizes before execution, reserves/completes idempotency rows, replays exact retries, and rejects conflicting reuse.
+  - `crates/synapse-mcp/src/server.rs`: exports the new M4 helpers into the server tool module.
+- Wired Synapse MCP client/tool surface was checked after compaction:
+  - `mcp__synapse.health` returned `ok=true`, installed stdio runtime PID `45712`, `allow_shell_patterns=any`.
+  - `mcp__synapse.storage_inspect` returned live row counts and samples from `C:\Users\hotra\AppData\Local\synapse\db`.
+- #606 manual FSV evidence captured through repo-built `C:\code\Synapse\target\release\synapse-mcp.exe` and official MCP Inspector strict client:
+  - Permissive daemon run `.runs\606\permissive-20260531T140952`, PID `37100`, bind `127.0.0.1:7799`, isolated DB/logs, strict `tools/list` count `80`, `act_run_shell` present, schema readback `timeout_ms default=30000 min=1 max=600000`. PID stopped; port closed.
+  - Happy permissive shell: before `happy.txt` absent and `CF_ACTION_LOG=2`; trigger wrote `work\happy.txt`; after file bytes `shell-happy-606`, stdout `stdout-606:extra-606`, and storage `CF_ACTION_LOG=4`.
+  - Env containment: child process env readback contained `PATH`, `USERPROFILE`, `TEMP`, `SystemRoot`, explicit `SYNAPSE_EXTRA_ENV`, plus PowerShell-created `PathEXT`/`PSMODULEPATH`; broad parent secrets like `APPDATA`/`EXA_API_KEY` were absent.
+  - Output cap: >1MB stdout trigger returned `stdout.Length=1048576`, first/last char `x`, `stdout_truncated=true`, `timed_out=false`.
+  - Timeout edge: 500 ms trigger returned `timed_out=true`, `duration_ms=529`; after readback `work\timeout-late.txt` absent and `CF_ACTION_LOG` advanced.
+  - Idempotency: exact retry with `idempotency_key=issue-606-idem-1` returned `count=1` both times; file `work\idem.txt` stayed `1`; `CF_KV` advanced `0->1` with key hash `03c48bf3f99f7f005e5d9309b3e624abdbfce5687c29e1a0c9e0d2dd369145d9`, request hash `e2901db689891e7af70c7c028d592d76ec3a57c5c2184d891ab66d9c102a2a34`, status `ok`, stored response `count=1`.
+  - Idempotency conflict: reused same key with different command failed with `idempotency_key was already used for different parameters`; after readback `work\idem-conflict.txt` absent and `CF_KV` stayed `1`.
+  - Empty/structurally invalid command: whitespace command failed with `act_run_shell command must not be empty`; `CF_ACTION_LOG` advanced with `TOOL_PARAMS_INVALID`.
+  - Default and max timeout: omitted `timeout_ms` logged `timeout_ms=30000`; explicit `timeout_ms=600000` ran and logged `timeout_ms=600000`.
+  - Restrictive daemon run `.runs\606\restrictive-20260531T141636`, PID `49920`, bind `127.0.0.1:7800`, `SYNAPSE_ALLOW_SHELL_ANY=0`, `SYNAPSE_ALLOW_SHELL=^cmd\.exe /c "echo allowlisted-606"$`, strict `tools/list` count `80`; PID stopped and port closed.
+  - Restrictive allow/deny: allowed command printed `allowlisted-606`; denied `cmd.exe /c "echo denied-606"` failed with `SAFETY_SHELL_DENIED_BY_POLICY`; `CF_ACTION_LOG` readback `0->2->4`, `CF_KV=0`.
+  - Malformed regex startup edge: run `.runs\606\malformed-20260531T142400`, PID `45164`, bind `127.0.0.1:7801`, pattern `^(cmd\.exe /c echo malformed-606$`; process exited `1`, port never opened, stderr showed `regex parse error` / `unclosed group`.
+  - Above-max timeout boundary: run `.runs\606\above-max-20260531T142425`, PID `7604`, bind `127.0.0.1:7802`, strict `tools/list` ok; `timeout_ms=600001` failed with `act_run_shell timeout_ms must be 1..=600000`, after storage `CF_ACTION_LOG=2`, `CF_KV=0`, action log had started/error rows with `TOOL_PARAMS_INVALID`; PID stopped and port closed.
+- Final #606 supporting checks after the last edit are green:
+  - `cargo fmt --check`
+  - `cargo check -p synapse-mcp`
+  - `cargo test -p synapse-mcp shell_idempotency -- --nocapture`
+  - `cargo test -p synapse-mcp shell_rejects_timeout_above_max -- --nocapture`
+  - `cargo clippy -p synapse-mcp --all-targets -- -D warnings`
+  - `cargo build --release -p synapse-mcp`
+  - `git diff --check` exited 0 with line-ending warnings only.
+- Diff review completed for `m4.rs`, `server.rs`, `server/m4_tools.rs`, and state notes. Next: commit/push with `[skip ci]`, post #606 RESOLVED evidence, close #606, then refresh the live queue.
+
+## 2026-05-31T13:40:46-05:00
+- #605 `scenario(stress): release_all + panic-hook + stuck-key auto-release safety` is closed.
+  - Commit: `e0ea7e1 fix(action): harden release_all input recovery (#605) [skip ci]`
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/605#issuecomment-4587679836
+  - Closure readback: `gh issue close 605` succeeded; refreshed open queue no longer lists #605.
+- Post-#605 cleanup/readback:
+  - `git status --short --branch`: `## main...origin/main`
+  - remaining live `synapse-mcp.exe`: PID `45712`, installed chat runtime at `C:\Users\hotra\.cargo\bin\synapse-mcp.exe`
+  - ports `127.0.0.1:7797` and `127.0.0.1:7798` have no listener
+  - OS input SoT readback: Shift/Ctrl/Alt/P/LBUTTON/RBUTTON/MBUTTON all false.
+- Active issue is now #606 `scenario(stress): act_run_shell orchestration - allowlist modes, timeout, 1MB cap, idempotency`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/606#issuecomment-4587680954
+  - Issue acceptance requires real MCP `tools/call` triggers plus separate physical SoT readbacks for shell output/files/process state, environment exposure, timeout/output-cap behavior, deny-policy logs, idempotency, and storage/action log rows.
+  - Next: inspect existing `act_run_shell` implementation, policy/env/timeout/logging/idempotency code paths, then patch only if the code/FSV exposes gaps.
+- Current live open queue after closing #605: #594 parent plus #595-#604 and #606-#634.
+
 ## 2026-05-31T13:18:00-05:00
 - Active work remains #605 `scenario(stress): release_all + panic-hook + stuck-key auto-release safety`.
 - Required wake-up context was re-read after compaction and reconciled with live GitHub/git state:

@@ -23,3 +23,7 @@
 - 2026-05-31: #605 release-daemon manual FSV now covers empty release_all, active key release_all, active mouse/pad release_all, stuck-key auto-release, operator hotkey release, and invalid act_press params. Remaining #605 runtime edge is debug-only panic-hook recovery.
 - 2026-05-31: #605 debug panic-hook FSV passed on a repo-built debug daemon: forced `act_press` panic after keydown timed out at the client, but panic-hook release_all released Shift, removed the ledger, kept the daemon alive, and logged `reason="panic"` with result ok.
 - 2026-05-31: #605 final supporting checks and diff review passed; ready to commit/push with `[skip ci]` and close the issue with manual FSV evidence.
+- 2026-05-31: Pushed #605 commit `e0ea7e1`, posted RESOLVED evidence, closed #605, refreshed the open queue, and selected #606 `act_run_shell` orchestration next.
+- 2026-05-31: Patched #606 so `act_run_shell` emits start/result action audit rows, enforces a 600000 ms timeout max, records idempotency rows in `CF_KV`, replays exact idempotent retries, and rejects conflicting idempotency-key reuse.
+- 2026-05-31: Completed #606 manual FSV with repo-built daemons and official MCP Inspector: permissive/restrictive shell modes, env containment, default/max timeout, output cap, timeout, denied policy, idempotency replay/conflict, malformed regex startup, empty command, and above-max timeout rejection.
+- 2026-05-31: #606 final supporting checks and diff review passed after two clippy cleanups; ready to commit/push with `[skip ci]` and close the issue with evidence.

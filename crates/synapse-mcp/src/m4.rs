@@ -10,10 +10,12 @@ use anyhow::Context;
 use rmcp::{ErrorData, model::ErrorCode, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use synapse_core::{
     Action, Backend, ComboInput, ComboStep, ForegroundContext, Key, error_codes, new_reflex_id,
 };
 use synapse_reflex::{ComboParams, ReflexRuntime, ScheduledReflex};
+use synapse_storage::{decode_json, encode_json};
 use tokio::{io::AsyncReadExt, process::Command};
 
 use crate::{
@@ -24,7 +26,9 @@ use crate::{
 
 const MAX_COMBO_STEPS: usize = 256;
 const DEFAULT_SHELL_TIMEOUT_MS: u32 = 30_000;
+const MAX_SHELL_TIMEOUT_MS: u32 = 600_000;
 const DEFAULT_LAUNCH_TIMEOUT_MS: u32 = 10_000;
+const MAX_SHELL_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
 const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
 /// Unrestricted shell/launch. **On by default**: Synapse is general local
@@ -41,6 +45,7 @@ const SHELL_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 const ALLOW_PATTERN_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const PROCESS_BASE_ENV_KEYS: [&str; 4] = ["PATH", "USERPROFILE", "TEMP", "SystemRoot"];
 const LAUNCH_WINDOW_POLL_INTERVAL_MS: u64 = 20;
+const RUN_SHELL_IDEMPOTENCY_PREFIX: &str = "m4/act_run_shell/idempotency/v1/";
 pub const SHELL_PATTERN_TOO_BROAD: &str = "SHELL_PATTERN_TOO_BROAD";
 pub const LAUNCH_PATTERN_TOO_BROAD: &str = "LAUNCH_PATTERN_TOO_BROAD";
 
@@ -249,7 +254,7 @@ pub struct ActComboResponse {
     pub started_at_ms: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActRunShellParams {
     pub command: String,
@@ -266,7 +271,7 @@ pub struct ActRunShellParams {
     pub idempotency_key: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActRunShellResponse {
     pub exit_code: Option<i32>,
@@ -276,6 +281,26 @@ pub struct ActRunShellResponse {
     pub timed_out: bool,
     pub stdout_truncated: bool,
     pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct RunShellAuthorization {
+    command_line: String,
+    matched_pattern: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RunShellIdempotencyRow {
+    schema_version: u32,
+    tool: String,
+    idempotency_key_sha256: String,
+    request_sha256: String,
+    status: String,
+    command_line: String,
+    matched_pattern: String,
+    started_at: String,
+    completed_at: Option<String>,
+    response: Option<ActRunShellResponse>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -362,12 +387,24 @@ pub fn required_combo_permissions(
     Ok(required)
 }
 
+#[allow(
+    dead_code,
+    reason = "kept as the direct M4 execution helper for unit tests and non-server callers"
+)]
 pub async fn run_shell(
     config: &M4ServiceConfig,
     params: ActRunShellParams,
 ) -> Result<ActRunShellResponse, ErrorData> {
-    validate_run_shell_params(&params)?;
-    let command_line = shell_command_line(&params);
+    let authorization = authorize_run_shell(config, &params)?;
+    run_authorized_shell(params, &authorization).await
+}
+
+pub fn authorize_run_shell(
+    config: &M4ServiceConfig,
+    params: &ActRunShellParams,
+) -> Result<RunShellAuthorization, ErrorData> {
+    validate_run_shell_params(params)?;
+    let command_line = shell_command_line(params);
     let Some(matched_pattern) = config.shell_match(&command_line) else {
         let reason = if config.allow_shell_count() == 0 {
             "no_allow_shell_policy"
@@ -391,13 +428,22 @@ pub async fn run_shell(
             }),
         ));
     };
-    let matched_pattern = matched_pattern.to_owned();
+    Ok(RunShellAuthorization {
+        command_line,
+        matched_pattern: matched_pattern.to_owned(),
+    })
+}
+
+pub async fn run_authorized_shell(
+    params: ActRunShellParams,
+    authorization: &RunShellAuthorization,
+) -> Result<ActRunShellResponse, ErrorData> {
     let idempotency_present = params.idempotency_key.is_some();
     let result = run_allowlisted_shell(params).await?;
     tracing::info!(
         code = "M4_ACT_RUN_SHELL_EXECUTED",
-        command_line = %command_line,
-        matched_pattern = %matched_pattern,
+        command_line = %authorization.command_line,
+        matched_pattern = %authorization.matched_pattern,
         exit_code = ?result.exit_code,
         duration_ms = result.duration_ms,
         timed_out = result.timed_out,
@@ -407,6 +453,170 @@ pub async fn run_shell(
         "readback=act_run_shell after=process_complete"
     );
     Ok(result)
+}
+
+pub fn run_shell_request_details(params: &ActRunShellParams) -> serde_json::Value {
+    json!({
+        "command": params.command,
+        "args": params.args,
+        "working_dir": params.working_dir,
+        "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
+        "timeout_ms": params.timeout_ms,
+        "idempotency_key_present": params.idempotency_key.is_some(),
+        "request_sha256": run_shell_request_sha256(params).ok(),
+    })
+}
+
+pub fn run_shell_idempotency_row_key(
+    params: &ActRunShellParams,
+) -> Result<Option<Vec<u8>>, ErrorData> {
+    let Some(key) = &params.idempotency_key else {
+        return Ok(None);
+    };
+    validate_run_shell_idempotency_key(key)?;
+    Ok(Some(
+        format!(
+            "{RUN_SHELL_IDEMPOTENCY_PREFIX}{}",
+            sha256_hex(key.as_bytes())
+        )
+        .into_bytes(),
+    ))
+}
+
+pub fn run_shell_idempotency_reservation_row(
+    params: &ActRunShellParams,
+    authorization: &RunShellAuthorization,
+) -> Result<Vec<u8>, ErrorData> {
+    let key_sha256 = params
+        .idempotency_key
+        .as_deref()
+        .map(|key| sha256_hex(key.as_bytes()))
+        .unwrap_or_default();
+    let row = RunShellIdempotencyRow {
+        schema_version: 1,
+        tool: "act_run_shell".to_owned(),
+        idempotency_key_sha256: key_sha256,
+        request_sha256: run_shell_request_sha256(params)?,
+        status: "in_progress".to_owned(),
+        command_line: authorization.command_line.clone(),
+        matched_pattern: authorization.matched_pattern.clone(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        completed_at: None,
+        response: None,
+    };
+    encode_json(&row).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_run_shell idempotency reservation encode failed: {error}"),
+        )
+    })
+}
+
+pub fn run_shell_idempotency_completed_row(
+    params: &ActRunShellParams,
+    authorization: &RunShellAuthorization,
+    response: &ActRunShellResponse,
+) -> Result<Vec<u8>, ErrorData> {
+    let key_sha256 = params
+        .idempotency_key
+        .as_deref()
+        .map(|key| sha256_hex(key.as_bytes()))
+        .unwrap_or_default();
+    let now = chrono::Utc::now().to_rfc3339();
+    let row = RunShellIdempotencyRow {
+        schema_version: 1,
+        tool: "act_run_shell".to_owned(),
+        idempotency_key_sha256: key_sha256,
+        request_sha256: run_shell_request_sha256(params)?,
+        status: "ok".to_owned(),
+        command_line: authorization.command_line.clone(),
+        matched_pattern: authorization.matched_pattern.clone(),
+        started_at: now.clone(),
+        completed_at: Some(now),
+        response: Some(response.clone()),
+    };
+    encode_json(&row).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_run_shell idempotency completion encode failed: {error}"),
+        )
+    })
+}
+
+pub fn run_shell_idempotency_replay(
+    params: &ActRunShellParams,
+    row_bytes: &[u8],
+) -> Result<ActRunShellResponse, ErrorData> {
+    let row = decode_json::<RunShellIdempotencyRow>(row_bytes).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_run_shell idempotency row decode failed: {error}"),
+        )
+    })?;
+    if row.schema_version != 1 || row.tool != "act_run_shell" {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "act_run_shell idempotency row has unexpected schema/tool",
+        ));
+    }
+    let expected_key_sha256 = params
+        .idempotency_key
+        .as_deref()
+        .map(|key| sha256_hex(key.as_bytes()))
+        .unwrap_or_default();
+    if row.idempotency_key_sha256 != expected_key_sha256 {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "act_run_shell idempotency row key hash mismatch",
+        ));
+    }
+    let request_sha256 = run_shell_request_sha256(params)?;
+    if row.request_sha256 != request_sha256 {
+        return Err(idempotency_error(
+            "act_run_shell idempotency_key was already used for different parameters",
+            "idempotency_key_conflict",
+            &json!({
+                "stored_request_sha256": row.request_sha256,
+                "incoming_request_sha256": request_sha256,
+            }),
+        ));
+    }
+    match (row.status.as_str(), row.response) {
+        ("ok", Some(response)) => {
+            tracing::info!(
+                code = "M4_ACT_RUN_SHELL_IDEMPOTENT_REPLAY",
+                request_sha256 = %request_sha256,
+                "readback=act_run_shell after=idempotent_replay"
+            );
+            Ok(response)
+        }
+        ("in_progress", _) => Err(idempotency_error(
+            "act_run_shell idempotency_key is already in progress",
+            "idempotency_in_progress",
+            &json!({ "request_sha256": request_sha256 }),
+        )),
+        (status, _) => Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_run_shell idempotency row has unsupported status {status:?}"),
+        )),
+    }
+}
+
+fn run_shell_request_sha256(params: &ActRunShellParams) -> Result<String, ErrorData> {
+    let payload = json!({
+        "command": params.command,
+        "args": params.args,
+        "working_dir": params.working_dir,
+        "env": params.env,
+        "timeout_ms": params.timeout_ms,
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_run_shell request fingerprint encode failed: {error}"),
+        )
+    })?;
+    Ok(sha256_hex(&bytes))
 }
 
 pub async fn launch(
@@ -648,6 +858,33 @@ fn validate_run_shell_params(params: &ActRunShellParams) -> Result<(), ErrorData
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "act_run_shell command must not be empty",
+        ));
+    }
+    if params.timeout_ms == 0 || params.timeout_ms > MAX_SHELL_TIMEOUT_MS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("act_run_shell timeout_ms must be 1..={MAX_SHELL_TIMEOUT_MS}"),
+        ));
+    }
+    if let Some(key) = &params.idempotency_key {
+        validate_run_shell_idempotency_key(key)?;
+    }
+    Ok(())
+}
+
+fn validate_run_shell_idempotency_key(key: &str) -> Result<(), ErrorData> {
+    if key.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_run_shell idempotency_key must not be empty",
+        ));
+    }
+    if key.len() > MAX_SHELL_IDEMPOTENCY_KEY_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "act_run_shell idempotency_key must be <= {MAX_SHELL_IDEMPOTENCY_KEY_BYTES} bytes"
+            ),
         ));
     }
     Ok(())
@@ -1147,6 +1384,23 @@ fn shell_tool_error(
     ErrorData::new(ErrorCode(-32099), message, Some(data))
 }
 
+fn idempotency_error(
+    message: &'static str,
+    reason: &'static str,
+    details: &serde_json::Value,
+) -> ErrorData {
+    let mut data = json!({
+        "code": error_codes::TOOL_PARAMS_INVALID,
+        "reason": reason,
+    });
+    if let (Some(target), Some(source)) = (data.as_object_mut(), details.as_object()) {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    ErrorData::new(ErrorCode(-32099), message, Some(data))
+}
+
 fn launch_tool_error(
     code: &'static str,
     message: impl Into<String>,
@@ -1155,6 +1409,16 @@ fn launch_tool_error(
     let message = message.into();
     tracing::warn!(code, "M4 launch tool error: {message}");
     ErrorData::new(ErrorCode(-32099), message, Some(data))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 const fn default_backend() -> Backend {
@@ -1794,5 +2058,89 @@ mod tests {
         assert_eq!(response.exit_code, None);
         assert!(response.timed_out);
         assert!(response.duration_ms < 2_000, "{response:?}");
+    }
+
+    #[test]
+    fn shell_rejects_timeout_above_max() {
+        let params = shell_params(
+            "cmd.exe",
+            vec!["/c", "echo too-long"],
+            MAX_SHELL_TIMEOUT_MS + 1,
+        );
+
+        let error = match authorize_run_shell(&shell_config_for(&params), &params) {
+            Ok(_authorization) => panic!("timeout above max should reject"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(|code| code.as_str()),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert!(error.message.contains("timeout_ms must be"));
+    }
+
+    #[test]
+    fn shell_idempotency_replays_matching_completed_row() {
+        let mut params = shell_params("cmd.exe", vec!["/c", "echo replay"], 30_000);
+        params.idempotency_key = Some("issue-606-replay".to_owned());
+        let authorization = authorize_run_shell(&shell_config_for(&params), &params)
+            .unwrap_or_else(|error| panic!("authorized shell params: {error}"));
+        let response = ActRunShellResponse {
+            exit_code: Some(0),
+            stdout: "replay\r\n".to_owned(),
+            stderr: String::new(),
+            duration_ms: 12,
+            timed_out: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let row = run_shell_idempotency_completed_row(&params, &authorization, &response)
+            .unwrap_or_else(|error| panic!("completed idempotency row should encode: {error}"));
+
+        let replay = run_shell_idempotency_replay(&params, &row)
+            .unwrap_or_else(|error| panic!("matching idempotency row should replay: {error}"));
+
+        assert_eq!(replay.stdout, "replay\r\n");
+        assert_eq!(replay.exit_code, Some(0));
+    }
+
+    #[test]
+    fn shell_idempotency_rejects_conflicting_request_reuse() {
+        let mut first = shell_params("cmd.exe", vec!["/c", "echo first"], 30_000);
+        first.idempotency_key = Some("issue-606-conflict".to_owned());
+        let authorization = authorize_run_shell(&shell_config_for(&first), &first)
+            .unwrap_or_else(|error| panic!("first shell params should authorize: {error}"));
+        let response = ActRunShellResponse {
+            exit_code: Some(0),
+            stdout: "first\r\n".to_owned(),
+            stderr: String::new(),
+            duration_ms: 10,
+            timed_out: false,
+            stdout_truncated: false,
+            stderr_truncated: false,
+        };
+        let row = run_shell_idempotency_completed_row(&first, &authorization, &response)
+            .unwrap_or_else(|error| panic!("completed idempotency row should encode: {error}"));
+        let mut second = shell_params("cmd.exe", vec!["/c", "echo second"], 30_000);
+        second.idempotency_key = first.idempotency_key.clone();
+
+        let error = match run_shell_idempotency_replay(&second, &row) {
+            Ok(replay) => panic!("conflicting idempotency reuse should reject, got {replay:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("reason"))
+                .and_then(|reason| reason.as_str()),
+            Some("idempotency_key_conflict")
+        );
     }
 }

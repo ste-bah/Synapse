@@ -23,3 +23,6 @@
 - 2026-05-31T13:18:00-05:00 iteration #605-release-fsv: completed release-daemon manual FSV for empty, active key, active mouse/pad, stuck-key auto-release, operator hotkey, and invalid-param cases; panic-hook debug daemon is next.
 - 2026-05-31T13:24:00-05:00 iteration #605-panic-fsv: completed debug forced-panic manual FSV; panic hook released Shift, cleared ledger, daemon stayed healthy, and debug daemon was stopped.
 - 2026-05-31T13:37:00-05:00 iteration #605-checks: final local supporting checks and diff review passed; preparing #605 commit and issue closure.
+- 2026-05-31T13:40:46-05:00 iteration #605-close-606-start: pushed #605 commit e0ea7e1, posted RESOLVED evidence, closed #605, refreshed open queue, and posted #606 START.
+- 2026-05-31T14:26:17-05:00 iteration #606-fsv: patched act_run_shell audit/idempotency/timeout handling and completed manual FSV across permissive, restrictive, malformed-regex, and above-max daemon runs; supporting checks are next.
+- 2026-05-31T14:45:28-05:00 iteration #606-checks: final fmt/check/focused tests/clippy/release build/diff check passed and the #606 diff was reviewed; commit and closure are next.
