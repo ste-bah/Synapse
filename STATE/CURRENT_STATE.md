@@ -1,5 +1,17 @@
 # CURRENT STATE - Synapse
 
+## 2026-05-31T14:47:21-05:00
+- #606 `scenario(stress): act_run_shell orchestration - allowlist modes, timeout, 1MB cap, idempotency` is closed.
+  - Commit: `6975d14 fix(mcp): audit and dedupe shell orchestration (#606) [skip ci]`
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/606#issuecomment-4587883204
+  - Closure readback: `gh issue close 606` succeeded; refreshed open queue no longer lists #606.
+  - Post-#606 process cleanup readback: only wired chat MCP PID `45712` remains; isolated ports `7799`, `7800`, `7801`, and `7802` were closed before closure.
+- Active issue is now #607 `scenario(stress): act_launch fleet - all 30 profiles, foreground incl. console apps`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/607#issuecomment-4587884557
+  - Issue acceptance requires real MCP `tools/call act_launch` triggers, separate foreground/process/profile/storage SoT readbacks, all 30 bundled-profile apps where locally available/acquirable, explicit cmd/powershell/Windows Terminal console foregrounding, and edges for already-running app, wait-title no-match, restrictive-policy deny, rapid relaunch, and invalid/empty params.
+  - Next: inspect profile launch definitions and existing `act_launch` foreground/window matching/audit behavior before launching a repo-built isolated daemon for #607 manual FSV.
+- Current live open queue after closing #606: #594 parent plus #595-#604 and #607-#634.
+
 ## 2026-05-31T14:26:17-05:00
 - Active issue remains #606 `scenario(stress): act_run_shell orchestration - allowlist modes, timeout, 1MB cap, idempotency`.
 - Implementation patch is in the worktree:

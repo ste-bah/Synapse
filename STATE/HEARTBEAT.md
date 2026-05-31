@@ -26,3 +26,4 @@
 - 2026-05-31T13:40:46-05:00 iteration #605-close-606-start: pushed #605 commit e0ea7e1, posted RESOLVED evidence, closed #605, refreshed open queue, and posted #606 START.
 - 2026-05-31T14:26:17-05:00 iteration #606-fsv: patched act_run_shell audit/idempotency/timeout handling and completed manual FSV across permissive, restrictive, malformed-regex, and above-max daemon runs; supporting checks are next.
 - 2026-05-31T14:45:28-05:00 iteration #606-checks: final fmt/check/focused tests/clippy/release build/diff check passed and the #606 diff was reviewed; commit and closure are next.
+- 2026-05-31T14:47:21-05:00 iteration #606-close-607-start: pushed #606 commit 6975d14, posted evidence, closed #606, refreshed open queue, and posted #607 START.
