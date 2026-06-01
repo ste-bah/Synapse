@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -22,11 +22,15 @@ use super::{
     scheduler_tick::tick,
 };
 use crate::{
-    EventBus, REFLEX_LIFETIME_EXPIRED_KIND, ReflexActionGateHandle, SubscriberHandle,
+    EventBus, REFLEX_LIFETIME_EXPIRED_KIND, REFLEX_TRACK_LOST_KIND, ReflexActionGateHandle,
+    SubscriberHandle,
     error::ReflexResult,
     kinds::{
-        aim_track::AimTrackController, combo::ComboController, hold_button::HoldButtonController,
-        hold_move::HoldMoveController, on_event::OnEventState,
+        aim_track::{AimTrackController, AimTrackTargetSourceHandle},
+        combo::ComboController,
+        hold_button::HoldButtonController,
+        hold_move::HoldMoveController,
+        on_event::OnEventState,
     },
     write_audit,
 };
@@ -54,6 +58,7 @@ pub(super) struct RuntimeState {
     pub(super) combo_states: Vec<Option<ComboController>>,
     pub(super) on_event_states: Vec<OnEventState>,
     pub(super) starvation_states: Vec<crate::conflict::StarvationState>,
+    pub(super) aim_track_target_source: Option<AimTrackTargetSourceHandle>,
     pub(super) subscription: SubscriberHandle,
     pub(super) stop: Arc<AtomicBool>,
     pub(super) samples: Arc<Mutex<VecDeque<TickSample>>>,
@@ -333,6 +338,28 @@ pub(super) fn mark_reflex_error(runtime: &RuntimeState, index: usize, code: &str
     }
 }
 
+pub(super) fn mark_reflex_track_lost(
+    runtime: &RuntimeState,
+    index: usize,
+    lost_for: Duration,
+    target_context: serde_json::Value,
+) {
+    if let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
+        control.active = false;
+    }
+    let lost_status = if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
+        status.state = ReflexState::Expired;
+        status.last_error_code = Some(error_codes::REFLEX_TRACK_LOST.to_owned());
+        Some(status.clone())
+    } else {
+        None
+    };
+    let Some(status) = lost_status else {
+        return;
+    };
+    write_track_lost_audit(runtime, &status, lost_for, target_context);
+}
+
 pub(super) fn mark_reflex_action_denied(runtime: &RuntimeState, index: usize) {
     if let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
         control.active = false;
@@ -374,6 +401,46 @@ fn write_lifetime_expired_audit(runtime: &RuntimeState, status: &ReflexStatus, r
             audit_id = %audit.audit_id,
             detail = %error,
             "reflex lifetime audit write failed"
+        );
+    }
+}
+
+fn write_track_lost_audit(
+    runtime: &RuntimeState,
+    status: &ReflexStatus,
+    lost_for: Duration,
+    target_context: serde_json::Value,
+) {
+    let Some(db) = runtime.audit_db.as_deref() else {
+        return;
+    };
+    let audit = StoredReflexAudit {
+        schema_version: SCHEMA_VERSION,
+        audit_id: Uuid::now_v7().to_string(),
+        reflex_id: status.id.clone(),
+        ts_ns: now_ts_ns(),
+        status: ReflexState::Expired,
+        event_id: None,
+        audit_context: runtime.audit_context.clone(),
+        steps: Vec::new(),
+        error_code: Some(error_codes::REFLEX_TRACK_LOST.to_owned()),
+        details: json!({
+            "kind": REFLEX_TRACK_LOST_KIND,
+            "kind_summary": status.kind_summary,
+            "tick_index": runtime.tick_index,
+            "lost_for_ms": u64::try_from(lost_for.as_millis()).unwrap_or(u64::MAX),
+            "target_context": target_context,
+        }),
+        redacted: false,
+        redactions: Vec::new(),
+    };
+    if let Err(error) = write_audit(db, &audit) {
+        tracing::warn!(
+            component = "reflex_track_lost",
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "reflex track-lost audit write failed"
         );
     }
 }

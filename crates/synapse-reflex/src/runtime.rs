@@ -5,8 +5,8 @@ use synapse_core::{ReflexId, ReflexState, ReflexStatus, StoredAuditContext};
 use synapse_storage::Db;
 
 use crate::{
-    EventBus, ReflexActionGateHandle, ReflexResult, ScheduledReflex, SchedulerConfig,
-    SchedulerHandle,
+    AimTrackTargetSourceHandle, EventBus, ReflexActionGateHandle, ReflexResult, ScheduledReflex,
+    SchedulerConfig, SchedulerHandle,
 };
 
 /// Runtime handle for the M3 reflex subsystem.
@@ -23,6 +23,7 @@ pub struct ReflexRuntime {
     pub(crate) scheduler_config: SchedulerConfig,
     pub(crate) audit_context: Option<StoredAuditContext>,
     pub(crate) action_gate: Option<ReflexActionGateHandle>,
+    pub(crate) aim_track_target_source: Option<AimTrackTargetSourceHandle>,
     pub(crate) reflexes: Vec<ScheduledReflex>,
     pub(crate) disabled_reflex_ids: HashSet<ReflexId>,
     pub(crate) scheduler: Option<SchedulerHandle>,
@@ -76,6 +77,7 @@ impl ReflexRuntime {
             scheduler_config,
             audit_context: None,
             action_gate: None,
+            aim_track_target_source: None,
             reflexes: Vec::new(),
             disabled_reflex_ids: HashSet::new(),
             scheduler: None,
@@ -206,6 +208,14 @@ impl ReflexRuntime {
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
     pub fn set_action_gate(&mut self, action_gate: Option<ReflexActionGateHandle>) {
         self.action_gate = action_gate;
+    }
+
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
+    pub fn set_aim_track_target_source(
+        &mut self,
+        target_source: Option<AimTrackTargetSourceHandle>,
+    ) {
+        self.aim_track_target_source = target_source;
     }
 
     #[must_use]

@@ -29,8 +29,9 @@ pub use dispatch::{
 pub use error::{ReflexError, ReflexResult};
 pub use kinds::aim_track::{
     AimTrackContext, AimTrackController, AimTrackOutput, AimTrackParams, AimTrackTarget,
-    DEFAULT_EMA_ALPHA, DEFAULT_MAX_SPEED_PX_PER_TICK, REFLEX_TRACK_LOST_KIND, ResolvedElementBox,
-    TRACK_LOST_AFTER,
+    AimTrackTargetSnapshot, AimTrackTargetSource, AimTrackTargetSourceHandle, DEFAULT_EMA_ALPHA,
+    DEFAULT_MAX_SPEED_PX_PER_TICK, REFLEX_AIM_TRACK_CORRECTION_KIND, REFLEX_TRACK_LOST_KIND,
+    ResolvedElementBox, TRACK_LOST_AFTER,
 };
 pub use kinds::combo::{
     ComboContext, ComboController, ComboOutput, ComboParams, ComboPhase,

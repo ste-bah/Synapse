@@ -15,7 +15,9 @@ use crate::{
     error::{ReflexError, ReflexResult},
     kinds::on_event::OnEventState,
     kinds::{
-        aim_track::AimTrackParams, combo::ComboParams, hold_button::HoldButtonParams,
+        aim_track::{AimTrackParams, AimTrackTargetSourceHandle},
+        combo::ComboParams,
+        hold_button::HoldButtonParams,
         hold_move::HoldMoveParams,
     },
 };
@@ -24,7 +26,7 @@ use scheduler_loop::{
     ReflexControl, RuntimeReflex, RuntimeState, aim_track_states, combo_states, hold_button_states,
     hold_move_states, lock_controls, mark_reflex_action_denied, mark_reflex_active_if_starved,
     mark_reflex_error, mark_reflex_fired, mark_reflex_lifetime_expired, mark_reflex_starved,
-    run_scheduler_thread, status_for_reflex,
+    mark_reflex_track_lost, run_scheduler_thread, status_for_reflex,
 };
 
 pub const MAX_SCHEDULED_REFLEXES: usize = 32;
@@ -280,7 +282,16 @@ impl ReflexScheduler {
         reflexes: Vec<ScheduledReflex>,
         config: SchedulerConfig,
     ) -> ReflexResult<SchedulerHandle> {
-        Self::spawn_inner(event_bus, action_handle, reflexes, config, None, None, None)
+        Self::spawn_inner(
+            event_bus,
+            action_handle,
+            reflexes,
+            config,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Spawns the scheduler with an action permission gate.
@@ -303,6 +314,7 @@ impl ReflexScheduler {
             None,
             None,
             Some(action_gate),
+            None,
         )
     }
 
@@ -324,6 +336,7 @@ impl ReflexScheduler {
             reflexes,
             config,
             Some(audit_db),
+            None,
             None,
             None,
         )
@@ -350,6 +363,7 @@ impl ReflexScheduler {
             Some(audit_db),
             audit_context,
             None,
+            None,
         )
     }
 
@@ -375,6 +389,62 @@ impl ReflexScheduler {
             Some(audit_db),
             audit_context,
             Some(action_gate),
+            None,
+        )
+    }
+
+    /// Spawns the scheduler with audit persistence, context, and a dynamic
+    /// `aim_track` target source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same setup errors as [`Self::spawn`].
+    pub fn spawn_with_audit_db_context_and_aim_track_source(
+        event_bus: EventBus,
+        action_handle: ActionHandle,
+        reflexes: Vec<ScheduledReflex>,
+        config: SchedulerConfig,
+        audit_db: Arc<Db>,
+        audit_context: Option<StoredAuditContext>,
+        aim_track_target_source: AimTrackTargetSourceHandle,
+    ) -> ReflexResult<SchedulerHandle> {
+        Self::spawn_inner(
+            event_bus,
+            action_handle,
+            reflexes,
+            config,
+            Some(audit_db),
+            audit_context,
+            None,
+            Some(aim_track_target_source),
+        )
+    }
+
+    /// Spawns the scheduler with audit persistence, context, an action gate,
+    /// and a dynamic `aim_track` target source.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same setup errors as [`Self::spawn`].
+    pub fn spawn_with_audit_db_context_action_gate_and_aim_track_source(
+        event_bus: EventBus,
+        action_handle: ActionHandle,
+        reflexes: Vec<ScheduledReflex>,
+        config: SchedulerConfig,
+        audit_db: Arc<Db>,
+        audit_context: Option<StoredAuditContext>,
+        action_gate: ReflexActionGateHandle,
+        aim_track_target_source: AimTrackTargetSourceHandle,
+    ) -> ReflexResult<SchedulerHandle> {
+        Self::spawn_inner(
+            event_bus,
+            action_handle,
+            reflexes,
+            config,
+            Some(audit_db),
+            audit_context,
+            Some(action_gate),
+            Some(aim_track_target_source),
         )
     }
 
@@ -386,6 +456,7 @@ impl ReflexScheduler {
         audit_db: Option<Arc<Db>>,
         audit_context: Option<StoredAuditContext>,
         action_gate: Option<ReflexActionGateHandle>,
+        aim_track_target_source: Option<AimTrackTargetSourceHandle>,
     ) -> ReflexResult<SchedulerHandle> {
         config.validate()?;
         validate_reflexes(&reflexes)?;
@@ -444,6 +515,7 @@ impl ReflexScheduler {
             combo_states,
             on_event_states,
             starvation_states,
+            aim_track_target_source,
             subscription,
             stop: Arc::clone(&stop),
             samples: Arc::clone(&samples),

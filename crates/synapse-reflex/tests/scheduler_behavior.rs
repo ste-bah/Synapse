@@ -1,17 +1,24 @@
-use std::{error::Error, io, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    io,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use serde_json::json;
 use synapse_action::{ACTION_QUEUE_CAPACITY, ActionHandle, ActionMessage};
 use synapse_core::{
-    Action, Backend, ButtonAction, Event, EventFilter, EventSource, Key, KeyCode, MouseButton,
-    Point, ReflexLifetime, ReflexState, SCHEMA_VERSION, StoredReflexAudit, error_codes,
+    Action, Backend, ButtonAction, DetectedEntity, Event, EventFilter, EventSource, Key, KeyCode,
+    MouseButton, Point, Rect, ReflexLifetime, ReflexState, SCHEMA_VERSION, StoredReflexAudit,
+    error_codes,
 };
 use synapse_reflex::{
-    AimTrackParams, AimTrackTarget, DEFAULT_REFLEX_PRIORITY, EventBus, HoldMoveParams,
-    REFLEX_ACTION_DENIED_STEP_STATUS, REFLEX_ACTION_PERMISSION_DENIED_KIND,
+    AimTrackParams, AimTrackTarget, AimTrackTargetSnapshot, AimTrackTargetSource,
+    DEFAULT_REFLEX_PRIORITY, EventBus, HoldMoveParams, REFLEX_ACTION_DENIED_STEP_STATUS,
+    REFLEX_ACTION_PERMISSION_DENIED_KIND, REFLEX_AIM_TRACK_CORRECTION_KIND,
     REFLEX_LIFETIME_EXPIRED_KIND, REFLEX_RECURSION_LIMIT_KIND, REFLEX_STARVED_KIND,
-    REFLEX_TICK_LATE_KIND, ReflexActionGate, ReflexActionPermissionDenied, ReflexScheduler,
-    ScheduledReflex, ScheduledReflexDriver, SchedulerConfig, SchedulerTrigger,
+    REFLEX_TICK_LATE_KIND, REFLEX_TRACK_LOST_KIND, ReflexActionGate, ReflexActionPermissionDenied,
+    ReflexScheduler, ScheduledReflex, ScheduledReflexDriver, SchedulerConfig, SchedulerTrigger,
 };
 use synapse_storage::{Db, cf, decode_json};
 use tempfile::tempdir;
@@ -729,6 +736,100 @@ fn stateful_aim_track_conflicts_by_priority_and_starves_loser() -> Result<(), Bo
 }
 
 #[test]
+fn aim_track_uses_dynamic_target_source_and_audits_corrections_and_loss()
+-> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let db = Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
+    let bus = EventBus::default();
+    let lost_events = bus.subscribe(
+        EventFilter::Kind {
+            kind: REFLEX_TRACK_LOST_KIND.to_owned(),
+        },
+        Vec::new(),
+        false,
+    )?;
+    let (action_handle, mut action_rx) = ActionHandle::channel();
+    let source: Arc<dyn AimTrackTargetSource> = Arc::new(ScriptedMovingTrackSource::new(12));
+    let mut params = AimTrackParams::new(AimTrackTarget::TrackId(42));
+    params.deadzone_px = 0.0;
+    params.max_speed_px_per_tick = 3.0;
+    params.ema_alpha = 1.0;
+    let reflex = ScheduledReflex::aim_track("dynamic-aim-track", params);
+
+    let mut scheduler = ReflexScheduler::spawn_with_audit_db_context_and_aim_track_source(
+        bus,
+        action_handle,
+        vec![reflex],
+        slow_ticks_config(40),
+        Arc::clone(&db),
+        None,
+        source,
+    )?;
+    assert!(wait_for_status(
+        &scheduler,
+        "dynamic-aim-track",
+        ReflexState::Expired,
+        Duration::from_secs(5)
+    ));
+    let samples = scheduler.wait_for_samples(40, Duration::from_secs(5));
+    scheduler.stop()?;
+    db.flush()?;
+
+    let actions = drain_actions(&mut action_rx);
+    let statuses = scheduler.statuses();
+    let dynamic_status = status(&statuses, "dynamic-aim-track")?;
+    let audits = read_audits(&db)?;
+    let correction_audits = audits
+        .iter()
+        .filter(|audit| audit.details["kind"] == REFLEX_AIM_TRACK_CORRECTION_KIND)
+        .collect::<Vec<_>>();
+    let lost_audit = audits
+        .iter()
+        .find(|audit| {
+            audit.reflex_id == "dynamic-aim-track"
+                && audit.error_code.as_deref() == Some(error_codes::REFLEX_TRACK_LOST)
+        })
+        .ok_or_else(|| io::Error::other("missing track-lost audit row"))?;
+
+    assert_eq!(samples.len(), 40);
+    assert!(!actions.is_empty());
+    assert_eq!(correction_audits.len(), actions.len());
+    assert!(actions.iter().all(|action| matches!(
+        action,
+        Action::MouseMoveRelative { dx, dy, .. } if (*dx).hypot(*dy) <= 3.01
+    )));
+    assert_eq!(dynamic_status.state, ReflexState::Expired);
+    assert_eq!(
+        dynamic_status.last_error_code.as_deref(),
+        Some(error_codes::REFLEX_TRACK_LOST)
+    );
+    assert_eq!(lost_events.drain().len(), 1);
+
+    let first_correction = correction_audits
+        .first()
+        .ok_or_else(|| io::Error::other("missing correction audit row"))?;
+    assert_eq!(
+        first_correction.details["target_context"]["source_label"],
+        "scripted_track_source"
+    );
+    assert_eq!(
+        first_correction.details["target_context"]["entity_track_ids"],
+        json!([42])
+    );
+    assert_eq!(first_correction.steps.len(), 1);
+    assert_eq!(first_correction.steps[0].status, "dispatched");
+    assert_eq!(lost_audit.details["kind"], REFLEX_TRACK_LOST_KIND);
+    assert!(
+        lost_audit.details["lost_for_ms"]
+            .as_u64()
+            .unwrap_or_default()
+            >= u64::try_from(synapse_reflex::TRACK_LOST_AFTER.as_millis()).unwrap_or(u64::MAX)
+    );
+    assert_eq!(lost_audit.details["target_context"]["entity_count"], 0);
+    Ok(())
+}
+
+#[test]
 fn priority_change_is_used_on_later_ticks() -> Result<(), Box<dyn Error>> {
     let bus = EventBus::default();
     let (action_handle, mut action_rx) = ActionHandle::channel();
@@ -882,6 +983,67 @@ impl ReflexActionGate for DenyUnknownScopeGate {
             use_scope: Some("unknown".to_owned()),
             detail: "active profile has use_scope=\"unknown\"".to_owned(),
         })
+    }
+}
+
+struct ScriptedMovingTrackSource {
+    calls: Mutex<u64>,
+    present_calls: u64,
+}
+
+impl ScriptedMovingTrackSource {
+    const fn new(present_calls: u64) -> Self {
+        Self {
+            calls: Mutex::new(0),
+            present_calls,
+        }
+    }
+}
+
+impl AimTrackTargetSource for ScriptedMovingTrackSource {
+    fn snapshot(&self) -> AimTrackTargetSnapshot {
+        let call = {
+            let mut calls = lock_source_calls(&self.calls);
+            *calls = calls.saturating_add(1);
+            *calls
+        };
+        if call > self.present_calls {
+            return AimTrackTargetSnapshot {
+                source_label: Some("scripted_track_source".to_owned()),
+                source_seq: Some(call),
+                ..AimTrackTargetSnapshot::default()
+            };
+        }
+        let now = chrono::Utc::now();
+        let offset = i32::try_from(call).unwrap_or(i32::MAX).saturating_mul(4);
+        AimTrackTargetSnapshot {
+            entities: vec![DetectedEntity {
+                entity_id: "moving-target".to_owned(),
+                track_id: 42,
+                class_label: "marker".to_owned(),
+                bbox: Rect {
+                    x: 20_000_i32.saturating_add(offset),
+                    y: 20_000_i32.saturating_add(offset),
+                    w: 20,
+                    h: 20,
+                },
+                confidence: 1.0,
+                first_seen_at: now,
+                last_seen_at: now,
+                velocity_px_per_s: Some((240.0, 240.0)),
+            }],
+            source_label: Some("scripted_track_source".to_owned()),
+            source_seq: Some(call),
+            source_error: None,
+            elements: Vec::new(),
+        }
+    }
+}
+
+fn lock_source_calls(calls: &Mutex<u64>) -> std::sync::MutexGuard<'_, u64> {
+    match calls.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 

@@ -46,8 +46,18 @@ impl ReflexRuntime {
         next.push(reflex.clone());
         scheduler::validate_reflexes(&next)?;
 
-        let new_scheduler = match self.action_gate.clone() {
-            Some(action_gate) => {
+        let new_scheduler = match (self.action_gate.clone(), self.aim_track_target_source.clone()) {
+            (Some(action_gate), Some(target_source)) => scheduler::ReflexScheduler::spawn_with_audit_db_context_action_gate_and_aim_track_source(
+                self.event_bus.clone(),
+                self.action_handle.clone(),
+                next.clone(),
+                self.scheduler_config.clone(),
+                Arc::clone(&self.db),
+                self.audit_context.clone(),
+                action_gate,
+                target_source,
+            )?,
+            (Some(action_gate), None) => {
                 scheduler::ReflexScheduler::spawn_with_audit_db_context_and_action_gate(
                     self.event_bus.clone(),
                     self.action_handle.clone(),
@@ -58,7 +68,18 @@ impl ReflexRuntime {
                     action_gate,
                 )?
             }
-            None => scheduler::ReflexScheduler::spawn_with_audit_db_and_context(
+            (None, Some(target_source)) => {
+                scheduler::ReflexScheduler::spawn_with_audit_db_context_and_aim_track_source(
+                    self.event_bus.clone(),
+                    self.action_handle.clone(),
+                    next.clone(),
+                    self.scheduler_config.clone(),
+                    Arc::clone(&self.db),
+                    self.audit_context.clone(),
+                    target_source,
+                )?
+            }
+            (None, None) => scheduler::ReflexScheduler::spawn_with_audit_db_and_context(
                 self.event_bus.clone(),
                 self.action_handle.clone(),
                 next.clone(),

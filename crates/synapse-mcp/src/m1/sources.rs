@@ -250,6 +250,110 @@ mod tests {
         assert_eq!(events[0].kind, FsEventKind::Created);
         assert_eq!(events[0].size_bytes, Some(9));
     }
+
+    #[test]
+    fn rebase_nodes_to_foreground_shifts_stale_uia_rects_when_root_size_matches() {
+        let mut nodes = vec![
+            accessible_node_with_bbox(
+                0,
+                None,
+                Rect {
+                    x: 100,
+                    y: 200,
+                    w: 800,
+                    h: 600,
+                },
+            ),
+            accessible_node_with_bbox(
+                1,
+                Some(element_id(0x1234, "0000002a00000000")),
+                Rect {
+                    x: 110,
+                    y: 240,
+                    w: 780,
+                    h: 520,
+                },
+            ),
+            accessible_node_with_bbox(
+                2,
+                Some(element_id(0x1234, "0000002a00000001")),
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: 0,
+                    h: 0,
+                },
+            ),
+        ];
+        let foreground = foreground_with_bounds(Rect {
+            x: 300,
+            y: 450,
+            w: 800,
+            h: 600,
+        });
+
+        rebase_nodes_to_foreground(&mut nodes, &foreground);
+
+        assert_eq!(
+            nodes[0].bbox,
+            Rect {
+                x: 300,
+                y: 450,
+                w: 800,
+                h: 600,
+            }
+        );
+        assert_eq!(
+            nodes[1].bbox,
+            Rect {
+                x: 310,
+                y: 490,
+                w: 780,
+                h: 520,
+            }
+        );
+        assert_eq!(
+            nodes[2].bbox,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn rebase_nodes_to_foreground_leaves_different_sized_roots_unchanged() {
+        let mut nodes = vec![accessible_node_with_bbox(
+            0,
+            None,
+            Rect {
+                x: 100,
+                y: 200,
+                w: 800,
+                h: 600,
+            },
+        )];
+        let foreground = foreground_with_bounds(Rect {
+            x: 300,
+            y: 450,
+            w: 801,
+            h: 600,
+        });
+
+        rebase_nodes_to_foreground(&mut nodes, &foreground);
+
+        assert_eq!(
+            nodes[0].bbox,
+            Rect {
+                x: 100,
+                y: 200,
+                w: 800,
+                h: 600,
+            }
+        );
+    }
 }
 
 pub struct FsRecentTracker {
@@ -455,6 +559,46 @@ fn node(sequence: u32, depth: u32, name: &str, role: &str, focused: bool) -> Acc
         patterns: Vec::new(),
         children_count: 0,
         depth,
+    }
+}
+
+#[cfg(test)]
+fn accessible_node_with_bbox(
+    sequence: u32,
+    parent: Option<synapse_core::ElementId>,
+    bbox: Rect,
+) -> AccessibleNode {
+    AccessibleNode {
+        element_id: element_id(0x1234, &format!("0000002a{sequence:08x}")),
+        parent,
+        name: format!("node-{sequence}"),
+        role: "pane".to_owned(),
+        automation_id: None,
+        value: None,
+        bbox,
+        enabled: true,
+        focused: false,
+        patterns: Vec::new(),
+        children_count: 0,
+        depth: sequence,
+    }
+}
+
+#[cfg(test)]
+fn foreground_with_bounds(window_bounds: Rect) -> ForegroundContext {
+    ForegroundContext {
+        hwnd: 0x1234,
+        pid: 44,
+        process_name: "notepad.exe".to_owned(),
+        process_path: "C:\\Windows\\System32\\notepad.exe".to_owned(),
+        window_title: "manual.txt - Notepad".to_owned(),
+        window_bounds,
+        monitor_index: 0,
+        dpi_scale: 1.0,
+        profile_id: None,
+        steam_appid: None,
+        is_fullscreen: false,
+        is_dwm_composed: true,
     }
 }
 
@@ -701,7 +845,7 @@ mod linux_x11 {
 
 #[cfg(windows)]
 pub fn platform_input(depth: u32, mode: PerceptionMode) -> Result<ObservationInput, ErrorData> {
-    let tree = synapse_a11y::snapshot_focused_window(depth).map_err(|err| a11y_error(&err))?;
+    let mut tree = synapse_a11y::snapshot_focused_window(depth).map_err(|err| a11y_error(&err))?;
     let hwnd = tree
         .root
         .parts()
@@ -710,6 +854,7 @@ pub fn platform_input(depth: u32, mode: PerceptionMode) -> Result<ObservationInp
         })?
         .hwnd;
     let foreground = windows_foreground_context(hwnd)?;
+    rebase_nodes_to_foreground(&mut tree.nodes, &foreground);
     let focused = tree
         .nodes
         .iter()
@@ -928,4 +1073,51 @@ fn focused_from_node(node: &AccessibleNode) -> FocusedElement {
 #[cfg(windows)]
 fn windows_foreground_context(hwnd: i64) -> Result<ForegroundContext, ErrorData> {
     synapse_a11y::foreground_context(hwnd).map_err(|err| a11y_error(&err))
+}
+
+fn rebase_nodes_to_foreground(nodes: &mut [AccessibleNode], foreground: &ForegroundContext) {
+    let Some(root) = nodes
+        .iter()
+        .find(|node| node.parent.is_none())
+        .or_else(|| nodes.first())
+    else {
+        return;
+    };
+    let Ok(root_parts) = root.element_id.parts() else {
+        return;
+    };
+    if root_parts.hwnd != foreground.hwnd {
+        return;
+    }
+    let root_bbox = root.bbox;
+    let foreground_bbox = foreground.window_bounds;
+    if root_bbox.w <= 0
+        || root_bbox.h <= 0
+        || root_bbox.w != foreground_bbox.w
+        || root_bbox.h != foreground_bbox.h
+    {
+        return;
+    }
+    let dx = foreground_bbox.x.saturating_sub(root_bbox.x);
+    let dy = foreground_bbox.y.saturating_sub(root_bbox.y);
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    tracing::debug!(
+        code = "M1_A11Y_BBOX_REBASED_TO_FOREGROUND",
+        hwnd = foreground.hwnd,
+        dx,
+        dy,
+        root_x_before = root_bbox.x,
+        root_y_before = root_bbox.y,
+        foreground_x = foreground_bbox.x,
+        foreground_y = foreground_bbox.y,
+        "rebased UIA element rectangles to current foreground window position"
+    );
+    for node in nodes {
+        if node.bbox.w > 0 && node.bbox.h > 0 {
+            node.bbox.x = node.bbox.x.saturating_add(dx);
+            node.bbox.y = node.bbox.y.saturating_add(dy);
+        }
+    }
 }

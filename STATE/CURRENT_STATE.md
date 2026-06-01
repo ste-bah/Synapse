@@ -1,5 +1,108 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T00:12:25-05:00
+- Active issue remains #610 `scenario(stress): aim_track reflex - moving target + track-loss`.
+- Post-compaction wake-up was completed again:
+  - Re-read `docs/AICodingAgentSuperPrompt.md`, `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`, `AGENTS.md`, `STATE/*`, #610, #594, #351, the live open issue queue, and git status/log.
+  - Live queue remains #594 plus #595-#604 and #610-#634.
+  - Configured wired `mcp__synapse` client works through the actual tool surface: `health`, `storage_inspect`, `reflex_list`, `reflex_history`, and `observe` returned without schema-load failure.
+- #610 acceptance FSV run is captured in `.runs\610\aim-track-accept-20260531T2351`:
+  - Repo-built daemon PID `74696`, bind `127.0.0.1:7831`, binary `target\release\synapse-mcp.exe`, SHA256 `0E1DFB375963D808D4DE5A22A926CA4762DD57DC0AF6CB3A3C585E8FDFE349C7`.
+  - Process/socket/auth/health preconditions passed; official MCP Inspector strict `tools/list` loaded 80 tools including `observe`, `reflex_register`, `reflex_list`, `reflex_history`, `storage_inspect`, `reflex_cancel`, and `release_all`.
+  - Happy moving-target run: real Inspector `reflex_register` registered Notepad document element `0x261c94:0000002a00261c94`; physical Win32 move changed the document center to `(1665,1107)`; DPI-aware `GetCursorPos` read `(1665,1107)`; `reflex_history` recorded `aim_track_correction` rows against the rebased target.
+  - Track-loss run: after hiding Notepad and moving foreground to VS Code, `observe` no longer contained the target; `reflex_list` showed the reflex `expired` with `REFLEX_TRACK_LOST`; `reflex_history` recorded `reflex_track_lost` with `lost_for_ms=641`.
+  - Edge matrix completed with real Inspector tool calls and separate SoT readbacks:
+    - X-only: cursor `(1000,1000)` to `(1400,1000)`, correction rows had `y=0`.
+    - Y-only: cursor `(1000,1000)` to `(1000,1300)`, correction rows had `x=0`.
+    - Deadzone larger than error: cursor stayed `(1000,1000)`, reflex `fire_count=0`, and per-reflex history had only `reflex_registered`.
+    - Max-speed clamp: raw delta stayed large, but correction details had `smoothed_delta.x=1` and dispatched `mouse_move_relative dx=1, dy=0`; cursor moved slowly from `(1000,1000)` to `(1135,1000)` instead of jumping to `(1800,1000)`.
+    - Boundary: `priority=1000` accepted, one-pixel target moved cursor `(1200,1200)` to `(1201,1200)` with one `dx=1` correction.
+    - Empty params: `reflex_register kind=aim_track` exited 1 with `aim_track reflex requires target`; total/active reflex counts stayed `6/0`; cursor unchanged.
+    - Structurally invalid target: `target={"kind":"element"}` exited 1 with `missing field element_id`; total/active reflex counts stayed `6/0`; cursor unchanged.
+    - Target teleport: Notepad document jumped from center `(1110,822)` to `(2100,1302)`; history recorded first large raw delta `(990,480)` and cursor converged to `(2100,1302)`.
+  - Cleanup: `release_all` reported zero keys/buttons/pads, `reflex_list` read `total=7 active=0 cancelled=6 expired=1`, storage read `CF_REFLEX_AUDIT=4956`, and PID `74696`/port `7831` are stopped/closed.
+- Next: run final supporting checks, inspect the diff, update state, commit/push `[skip ci]`, post #610 RESOLVED evidence, close #610, refresh the queue, then continue to the next open issue.
+
+## 2026-06-01T00:28:35-05:00
+- Final #610 supporting checks completed after manual evidence:
+  - `cargo fmt --check`
+  - `cargo check -p synapse-reflex`
+  - `cargo check -p synapse-mcp`
+  - `cargo test -p synapse-reflex --test scheduler_behavior -- --nocapture` (21 passed)
+  - `cargo test -p synapse-mcp aim_track_target_source_reads_shallow_observe_child_elements -- --nocapture` passed
+  - First broad `cargo test -p synapse-mcp rebase_nodes_to_foreground -- --nocapture` hit host paging-file/resource error 1455 while compiling test artifacts, not a test assertion. Cleaned the cached `windows` crate artifact with `cargo clean -p windows` and reran the focused bin test with one build job/incremental off.
+  - `cargo test -p synapse-mcp --bin synapse-mcp rebase_nodes_to_foreground -- --nocapture` passed (2 passed)
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture` passed (3 passed)
+  - `cargo build --release -p synapse-mcp`
+  - `git diff --check` exited 0 with only LF/CRLF warnings.
+- Final release binary readback: `C:\code\Synapse\target\release\synapse-mcp.exe`, length `46315008`, SHA256 `478BDD601E6CE5CAD19465FE8D43E01BB1837135340B350A4C3E93FC32290F6A`, timestamp `2026-06-01T05:27:02Z`.
+- Diff review completed for source/state files; changes are scoped to dynamic aim-track target sourcing, correction/track-loss audit persistence, M1 shallow target sourcing, and stale UIA bbox rebasing.
+- Next: commit/push `[skip ci]`, post #610 RESOLVED evidence, close #610, then refresh the queue.
+
+## 2026-05-31T23:38:30-05:00
+- Active issue remains #610 `scenario(stress): aim_track reflex - moving target + track-loss`.
+- Post-compaction wake-up was completed:
+  - Re-read `docs/AICodingAgentSuperPrompt.md`, `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`, `AGENTS.md`, `STATE/*`, #610, #594, #351, decision/context issue list, live open queue, and git status/log/branch.
+  - Live queue is #594 plus #595-#604 and #610-#634.
+  - Configured wired `mcp__synapse` client works: `health`, `storage_inspect`, `reflex_list`, `reflex_history`, and `observe` returned through the actual tool surface.
+- Patched daemon run `.runs\610\aim-track-depth2-20260531T2315` proved:
+  - Repo-built daemon PID `51264`, bind `127.0.0.1:7829`, strict Inspector `tools/list` loaded 80 tools including `observe`, `reflex_register`, `reflex_list`, `reflex_history`, `storage_inspect`, and `release_all`.
+  - Baseline isolated storage was clean and Notepad child target `0x261c94:0000002a00261c94` was visible at depth 2.
+  - Real Inspector `reflex_register` on the child element produced `aim_track_correction` rows and `fire_count>0`, confirming the depth-2 target-source patch fixed the prior immediate track-loss failure.
+  - A serialized moving-window read then exposed a new real #610 defect: Win32 `foreground.window_bounds` moved while UIA root/child element bboxes stayed at the old coordinates, so the reflex chased stale child-element center coordinates after target movement.
+- Patch after this defect:
+  - `crates/synapse-mcp/src/m1/sources.rs`: Windows `platform_input` now rebases UIA element bboxes to current foreground-window position when the root HWND matches and root dimensions match the foreground bounds. This keeps `observe` and `aim_track` target sourcing aligned with the physical window position when UIA returns stale moved-window coordinates.
+  - Added focused regression coverage for rebasing stale UIA rects and leaving dimension-mismatched roots unchanged.
+- Supporting checks after the bbox patch:
+  - `cargo fmt`
+  - `cargo check -p synapse-mcp`
+  - `cargo test -p synapse-mcp rebase_nodes_to_foreground -- --nocapture`
+  - `cargo check -p synapse-reflex`
+  - Release build completed after the first command timeout; final binary `C:\code\Synapse\target\release\synapse-mcp.exe`, length `46315008`, SHA256 `0E1DFB375963D808D4DE5A22A926CA4762DD57DC0AF6CB3A3C585E8FDFE349C7`, timestamp `2026-06-01T04:37:08Z`.
+- Cleanup before rebuild: cancelled active test reflexes and stopped isolated daemon PID `51264`; port `127.0.0.1:7829` is closed.
+- Next: launch a fresh isolated repo-built daemon on a new port, prove process/socket/auth/health/strict Inspector `tools/list`, then rerun #610 manual FSV happy path plus target loss and required edges.
+
+## 2026-05-31T23:05:19-05:00
+- Active issue remains #610 `scenario(stress): aim_track reflex - moving target + track-loss`.
+- Post-compaction wake-up completed again:
+  - Re-read `docs/AICodingAgentSuperPrompt.md`, `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`, `AGENTS.md`, `STATE/*`, #610, #594, #351, decision/context issue list, live open queue, and git status/log/branch.
+  - Live queue is #594 plus #595-#604 and #610-#634.
+  - Configured wired `mcp__synapse` client works: `health`, `storage_inspect`, `reflex_list`, `reflex_history`, and `observe` returned through the actual tool surface.
+- #610 failed FSV attempt readback from `.runs\610\aim-track-final-20260531T2255`:
+  - Daemon PID `60972`, bind `127.0.0.1:7828`, repo-built release binary, strict Inspector `tools/list` and real `tools/call reflex_register` were already proven in that run.
+  - Registered target was Notepad text editor element `0x261c94:0000002a00261c94`.
+  - `reflex_history` / `CF_REFLEX_AUDIT` showed `REFLEX_TRACK_LOST` after `lost_for_ms=508` with target source `m1_current_input` reporting only element `0x325d2:0000002a000325d2`; cursor stayed at `(20,20)`, `fire_count=0`, and there were zero `aim_track_correction` rows.
+  - Root cause: MCP target source sampled M1 at depth `0`, while `observe` default/depth-2 output can select child elements. The live scheduler could not resolve the child element selected by the operator/agent from the prior observation.
+- Patch after failure:
+  - `crates/synapse-mcp/src/server/context.rs`: `AIM_TRACK_TARGET_SOURCE_DEPTH` is now `2`, matching `observe`'s shallow default; added regression `aim_track_target_source_reads_shallow_observe_child_elements`.
+  - `crates/synapse-mcp/src/m1.rs`: synthetic M1 input now respects requested depth, so depth-sensitive target-source bugs are not hidden by synthetic fixtures.
+- Supporting checks after this depth patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-mcp aim_track_target_source_reads_shallow_observe_child_elements -- --nocapture`
+  - `cargo check -p synapse-mcp`
+  - `cargo check -p synapse-reflex`
+- Next: stop stale failed-FSV daemon PID `60972`, rebuild release `synapse-mcp`, launch a fresh isolated daemon on a new port, re-prove process/socket/auth/health/strict Inspector `tools/list`, then manually rerun #610 happy path and required edges with separate cursor/observation/storage/history/log SoT readbacks.
+
+## 2026-05-31T22:50:00-05:00
+- Active issue remains #610 `scenario(stress): aim_track reflex - moving target + track-loss`.
+- Root-cause patch is in the worktree:
+  - `aim_track` now has a dynamic `AimTrackTargetSource` snapshot abstraction.
+  - MCP `SynapseService::reflex_runtime()` installs an M1-backed target source so runtime `aim_track` can resolve current entities/elements from real perception input instead of always seeing empty slices.
+  - Stateful conflict planning now resolves dynamic `track_id` / `element_id` targets before arbitration.
+  - Each dispatched aim correction writes an `aim_track_correction` row to `CF_REFLEX_AUDIT`.
+  - Track loss now expires/deactivates the reflex and writes a `reflex_track_lost` audit row instead of repeatedly blocking ticks.
+  - Supporting regression `aim_track_uses_dynamic_target_source_and_audits_corrections_and_loss` proves dynamic target snapshots drive corrections, audit rows persist, and target loss expires.
+- Supporting checks passed so far:
+  - `cargo fmt`
+  - `cargo check -p synapse-reflex`
+  - `cargo check -p synapse-mcp`
+  - `cargo test -p synapse-reflex --test scheduler_behavior aim_track_uses_dynamic_target_source_and_audits_corrections_and_loss -- --nocapture`
+  - `cargo test -p synapse-reflex --test scheduler_behavior -- --nocapture` (21 passed)
+  - `cargo test -p synapse-mcp schema_sanitize -- --nocapture`
+  - `cargo build --release -p synapse-mcp`
+- Repo-built FSV binary readback: `C:\code\Synapse\target\release\synapse-mcp.exe`, length `46276608`, SHA256 `D96388B08C3E3EBC605C015BEC035912B7B2938FCA363CD7B85790CBADD44EA3`, timestamp `2026-05-31 22:49:47`.
+- Next: launch isolated repo-built daemon for manual #610 FSV, prove process/socket/auth/health/strict Inspector `tools/list`, then trigger real MCP `reflex_register` runs against a scripted moving on-screen marker with separate cursor/observation/storage/log SoT readbacks.
+
 ## 2026-05-31T22:07:00-05:00
 - #609 `scenario(stress): 1ms reflex tick jitter under system load` is closed.
   - Commit: `b7ecd73 fix(reflex): persist tick-late audit rows (#609) [skip ci]`

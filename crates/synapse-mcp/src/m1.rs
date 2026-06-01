@@ -11,7 +11,10 @@ use rmcp::{ErrorData, handler::server::common, model::JsonObject, schemars::Json
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use synapse_capture::{CaptureBackend, CaptureConfig, CaptureTarget, resolve_capture_target};
-use synapse_core::{ElementId, ForegroundContext, OcrBackend, PerceptionMode, Rect, error_codes};
+use synapse_core::{
+    AccessibleNode, ElementId, FocusedElement, ForegroundContext, OcrBackend, PerceptionMode, Rect,
+    error_codes,
+};
 use synapse_perception::{ObservationInput, ObserveInclude, parse_perception_mode};
 
 pub use ocr::read_text_in_state;
@@ -290,13 +293,42 @@ pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, Er
         ));
     }
     if let Some(input) = &state.synthetic {
-        let mut input = input.clone();
+        let mut input = input_limited_to_depth(input.clone(), depth);
         if state.perception_mode != PerceptionMode::Auto {
             input.mode_override = Some(state.perception_mode);
         }
         return Ok(input);
     }
     platform_input(depth, state.perception_mode)
+}
+
+fn input_limited_to_depth(mut input: ObservationInput, depth: u32) -> ObservationInput {
+    input.elements.retain(|node| node.depth <= depth);
+    if let Some(focused) = &input.focused {
+        let focused_present = input
+            .elements
+            .iter()
+            .any(|node| node.element_id == focused.element_id);
+        if focused_present {
+            return input;
+        }
+    }
+    input.focused = input.elements.first().map(focused_from_accessible_node);
+    input
+}
+
+fn focused_from_accessible_node(node: &AccessibleNode) -> FocusedElement {
+    FocusedElement {
+        element_id: node.element_id.clone(),
+        name: node.name.clone(),
+        role: node.role.clone(),
+        automation_id: node.automation_id.clone(),
+        bbox: node.bbox,
+        enabled: node.enabled,
+        patterns: node.patterns.clone(),
+        value: node.value.clone(),
+        selected_text: None,
+    }
 }
 
 /// Depth `find` walks the foreground tree. `observe`'s default is shallow (2),

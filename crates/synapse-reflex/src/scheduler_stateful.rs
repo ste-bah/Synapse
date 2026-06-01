@@ -1,8 +1,12 @@
 use std::{collections::HashSet, time::Duration};
 
+use chrono::Utc;
+use serde_json::{Value, json};
 use synapse_core::{
-    Action, ButtonAction, Event, Point, ReflexAimAxis, ReflexButtonTarget, error_codes,
+    Action, ButtonAction, Event, Point, ReflexAimAxis, ReflexButtonTarget, ReflexState,
+    SCHEMA_VERSION, StoredReflexAudit, StoredReflexStep, error_codes,
 };
+use uuid::Uuid;
 
 use super::RuntimeState;
 use crate::{
@@ -10,13 +14,17 @@ use crate::{
     conflict::{ConflictCandidate, ConflictLoser, resolve_conflicts},
     dispatch::ReflexActionDispatchContext,
     kinds::{
-        aim_track::{AimTrackContext, AimTrackOutput, AimTrackTarget},
+        aim_track::{
+            AimTrackContext, AimTrackOutput, AimTrackParams, AimTrackTargetSnapshot,
+            REFLEX_AIM_TRACK_CORRECTION_KIND,
+        },
         combo::{ComboContext, ComboOutput, ComboPhase},
         hold_button::{HoldButtonOutput, HoldButtonPhase},
         hold_lifetime::HoldLifetimeContext,
         hold_move::{HoldMoveOutput, HoldMovePhase},
     },
     scheduler::ScheduledReflexDriver,
+    write_audit,
 };
 
 pub(super) fn step_stateful_controllers(
@@ -58,6 +66,12 @@ pub(super) fn step_stateful_controllers(
                 StatefulOutcome::Expired { actions, reason } => {
                     *dispatched_actions = dispatched_actions.saturating_add(actions);
                     super::mark_reflex_lifetime_expired(runtime, index, reason);
+                }
+                StatefulOutcome::TrackLost {
+                    lost_for,
+                    target_context,
+                } => {
+                    super::mark_reflex_track_lost(runtime, index, lost_for, target_context);
                 }
                 StatefulOutcome::Idle => {}
                 StatefulOutcome::Blocked { error } => {
@@ -151,10 +165,18 @@ fn aim_track_conflict_actions(runtime: &RuntimeState, index: usize) -> Vec<Actio
         return Vec::new();
     };
     let params = controller.params();
-    let Some(target) = aim_static_target(&params.target) else {
+    let Ok(cursor) = synapse_action::backend::software::cursor_position() else {
         return Vec::new();
     };
-    let Ok(cursor) = synapse_action::backend::software::cursor_position() else {
+    let snapshot = aim_track_target_snapshot(runtime);
+    let context = AimTrackContext {
+        cursor,
+        entities: &snapshot.entities,
+        elements: &snapshot.elements,
+        tick_index: runtime.tick_index,
+        tick_elapsed: runtime.config.target_interval,
+    };
+    let Some(target) = controller.resolved_target(&context) else {
         return Vec::new();
     };
     if !aim_outside_deadzone(cursor, target, params.axis, params.deadzone_px) {
@@ -245,19 +267,6 @@ fn hold_button_action(button: &ReflexButtonTarget, backend: synapse_core::Backen
     }
 }
 
-fn aim_static_target(target: &AimTrackTarget) -> Option<Point> {
-    match target {
-        AimTrackTarget::Point(point) => Some(*point),
-        AimTrackTarget::ElementRect(rect) => Some(Point {
-            x: rect.x.saturating_add(rect.w / 2),
-            y: rect.y.saturating_add(rect.h / 2),
-        }),
-        AimTrackTarget::EntityId(_) | AimTrackTarget::TrackId(_) | AimTrackTarget::ElementId(_) => {
-            None
-        }
-    }
-}
-
 fn aim_outside_deadzone(
     cursor: Point,
     target: Point,
@@ -285,6 +294,10 @@ enum StatefulOutcome {
     Expired {
         actions: usize,
         reason: &'static str,
+    },
+    TrackLost {
+        lost_for: Duration,
+        target_context: Value,
     },
     Idle,
     Blocked {
@@ -337,7 +350,6 @@ fn step_aim_track(
 ) -> Option<StatefulOutcome> {
     let dispatch_context = dispatch_context(runtime);
     let reflex_id = runtime.reflexes[index].reflex.reflex_id.clone();
-    let controller = runtime.aim_track_states.get_mut(index)?.as_mut()?;
     let cursor = match synapse_action::backend::software::cursor_position() {
         Ok(cursor) => cursor,
         Err(error) => {
@@ -348,22 +360,45 @@ fn step_aim_track(
             });
         }
     };
+    let snapshot = aim_track_target_snapshot(runtime);
     let context = AimTrackContext {
         cursor,
-        entities: &[],
-        elements: &[],
+        entities: &snapshot.entities,
+        elements: &snapshot.elements,
         tick_index: runtime.tick_index,
         tick_elapsed: elapsed,
     };
-    match controller.step_dispatch_with(&context, &runtime.event_bus, |action| {
-        dispatch_context.dispatch_action(&reflex_id, action)
-    }) {
-        Ok(AimTrackOutput::Dispatched { .. }) => Some(StatefulOutcome::Fired { actions: 1 }),
+    let (result, lost_for, params) = {
+        let controller = runtime.aim_track_states.get_mut(index)?.as_mut()?;
+        let result = controller.step_dispatch_with(&context, &runtime.event_bus, |action| {
+            dispatch_context.dispatch_action(&reflex_id, action)
+        });
+        (result, controller.lost_for(), controller.params().clone())
+    };
+    match result {
+        Ok(AimTrackOutput::Dispatched {
+            action,
+            target,
+            raw_delta,
+            smoothed_delta,
+        }) => {
+            write_aim_track_correction_audit(
+                runtime,
+                &reflex_id,
+                &params,
+                action,
+                cursor,
+                target,
+                raw_delta,
+                smoothed_delta,
+                &snapshot,
+            );
+            Some(StatefulOutcome::Fired { actions: 1 })
+        }
         Ok(AimTrackOutput::Idle { .. }) => Some(StatefulOutcome::Idle),
-        Err(ReflexError::TrackLost { .. }) => Some(StatefulOutcome::Blocked {
-            error: ReflexError::TrackLost {
-                reflex_id: reflex_id.clone(),
-            },
+        Err(ReflexError::TrackLost { .. }) => Some(StatefulOutcome::TrackLost {
+            lost_for,
+            target_context: aim_track_target_context(&params, &snapshot),
         }),
         Err(error) => Some(StatefulOutcome::Blocked { error }),
     }
@@ -499,4 +534,157 @@ fn warn_stateful_dispatch_blocked(index: usize, error: &ReflexError) {
         code = error_codes::REFLEX_TICK_LATE,
         "reflex stateful controller dispatch blocked"
     );
+}
+
+fn aim_track_target_snapshot(runtime: &RuntimeState) -> AimTrackTargetSnapshot {
+    runtime
+        .aim_track_target_source
+        .as_ref()
+        .map_or_else(AimTrackTargetSnapshot::default, |source| source.snapshot())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_aim_track_correction_audit(
+    runtime: &RuntimeState,
+    reflex_id: &str,
+    params: &AimTrackParams,
+    action: Action,
+    cursor: Point,
+    target: Point,
+    raw_delta: (f64, f64),
+    smoothed_delta: (f64, f64),
+    snapshot: &AimTrackTargetSnapshot,
+) {
+    let Some(db) = runtime.audit_db.as_deref() else {
+        return;
+    };
+    let audit = StoredReflexAudit {
+        schema_version: SCHEMA_VERSION,
+        audit_id: Uuid::now_v7().to_string(),
+        reflex_id: reflex_id.to_owned(),
+        ts_ns: now_ts_ns(),
+        status: ReflexState::Active,
+        event_id: None,
+        audit_context: runtime.audit_context.clone(),
+        steps: vec![StoredReflexStep {
+            index: 0,
+            action,
+            status: "dispatched".to_owned(),
+            error_code: None,
+        }],
+        error_code: None,
+        details: json!({
+            "kind": REFLEX_AIM_TRACK_CORRECTION_KIND,
+            "tick_index": runtime.tick_index,
+            "cursor": point_value(cursor),
+            "target": point_value(target),
+            "raw_delta": delta_value(raw_delta),
+            "smoothed_delta": delta_value(smoothed_delta),
+            "params": aim_track_params_value(params),
+            "target_context": aim_track_target_context(params, snapshot),
+        }),
+        redacted: false,
+        redactions: Vec::new(),
+    };
+    if let Err(error) = write_audit(db, &audit) {
+        tracing::warn!(
+            component = "reflex_aim_track",
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "aim_track correction audit write failed"
+        );
+    }
+}
+
+fn aim_track_params_value(params: &AimTrackParams) -> Value {
+    json!({
+        "target": aim_track_target_value(params),
+        "axis": aim_axis_value(params.axis),
+        "gain": params.gain,
+        "deadzone_px": params.deadzone_px,
+        "max_speed_px_per_tick": params.max_speed_px_per_tick,
+        "ema_alpha": params.ema_alpha,
+        "backend": params.backend,
+    })
+}
+
+fn aim_track_target_context(params: &AimTrackParams, snapshot: &AimTrackTargetSnapshot) -> Value {
+    json!({
+        "target": aim_track_target_value(params),
+        "source_label": snapshot.source_label.as_deref(),
+        "source_seq": snapshot.source_seq,
+        "source_error": snapshot.source_error.as_deref(),
+        "entity_count": snapshot.entities.len(),
+        "element_count": snapshot.elements.len(),
+        "entity_track_ids": snapshot
+            .entities
+            .iter()
+            .map(|entity| entity.track_id)
+            .collect::<Vec<_>>(),
+        "element_ids": snapshot
+            .elements
+            .iter()
+            .map(|element| element.element_id.clone())
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn aim_track_target_value(params: &AimTrackParams) -> Value {
+    match &params.target {
+        crate::AimTrackTarget::Point(point) => json!({
+            "kind": "screen",
+            "point": point_value(*point),
+        }),
+        crate::AimTrackTarget::EntityId(entity_id) => json!({
+            "kind": "entity",
+            "entity_id": entity_id,
+        }),
+        crate::AimTrackTarget::TrackId(track_id) => json!({
+            "kind": "track",
+            "track_id": track_id,
+        }),
+        crate::AimTrackTarget::ElementId(element_id) => json!({
+            "kind": "element",
+            "element_id": element_id,
+        }),
+        crate::AimTrackTarget::ElementRect(rect) => json!({
+            "kind": "element_rect",
+            "rect": {
+                "x": rect.x,
+                "y": rect.y,
+                "w": rect.w,
+                "h": rect.h,
+            },
+        }),
+    }
+}
+
+fn point_value(point: Point) -> Value {
+    json!({
+        "x": point.x,
+        "y": point.y,
+    })
+}
+
+fn delta_value(delta: (f64, f64)) -> Value {
+    json!({
+        "x": delta.0,
+        "y": delta.1,
+    })
+}
+
+fn aim_axis_value(axis: ReflexAimAxis) -> &'static str {
+    match axis {
+        ReflexAimAxis::Xy => "xy",
+        ReflexAimAxis::XOnly => "x_only",
+        ReflexAimAxis::YOnly => "y_only",
+    }
+}
+
+fn now_ts_ns() -> u64 {
+    Utc::now()
+        .timestamp_nanos_opt()
+        .and_then(|value| u64::try_from(value).ok())
+        .unwrap_or_default()
 }

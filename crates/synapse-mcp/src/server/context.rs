@@ -4,15 +4,20 @@ use super::{
     action_preflight::{ActionPreflightReadback, attach_action_preflight_to_error},
     activate_profile, authorization_error, error_codes, mcp_error,
 };
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use rmcp::model::ErrorCode;
 use serde_json::json;
-use synapse_core::{Action, Event, EventSource, ForegroundContext, ProfileUseScope, ReflexId};
+use synapse_core::{
+    AccessibleNode, Action, ElementId, Event, EventSource, FocusedElement, ForegroundContext,
+    ProfileUseScope, ReflexId,
+};
 use synapse_profiles::ForegroundProfileTransition;
 use synapse_reflex::{
-    EventBus, ReflexActionGate, ReflexActionGateHandle, ReflexActionPermissionDenied,
+    AimTrackTargetSnapshot, AimTrackTargetSource, EventBus, ReflexActionGate,
+    ReflexActionGateHandle, ReflexActionPermissionDenied, ResolvedElementBox,
 };
 
 type M2ActionContext = (
@@ -28,6 +33,9 @@ type M2ReleaseAllContext = (
 
 const PROFILE_CHANGED_KIND: &str = "profile-changed";
 const SCOPE_TRANSITIONED_KIND: &str = "scope-transitioned";
+// Match observe's default shallow tree so targets selected from an observation
+// can be resolved on scheduler ticks without requiring a deep UIA walk.
+const AIM_TRACK_TARGET_SOURCE_DEPTH: u32 = 2;
 static NEXT_PROFILE_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 impl SynapseService {
@@ -235,7 +243,27 @@ impl SynapseService {
             .ensure_reflex_runtime(action_handle, event_bus)
             .map_err(|error| m3_state_error(&error))?;
         drop(state);
+        self.install_aim_track_target_source(&runtime)?;
         Ok(runtime)
+    }
+
+    fn install_aim_track_target_source(
+        &self,
+        runtime: &Arc<Mutex<synapse_reflex::ReflexRuntime>>,
+    ) -> Result<(), ErrorData> {
+        let target_source = Arc::new(M1AimTrackTargetSource {
+            m1_state: Arc::clone(&self.m1_state),
+        });
+        runtime
+            .lock()
+            .map_err(|_error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "reflex runtime lock poisoned while setting aim_track target source",
+                )
+            })?
+            .set_aim_track_target_source(Some(target_source));
+        Ok(())
     }
 
     pub(super) fn install_reflex_action_gate(
@@ -533,6 +561,80 @@ impl ReflexActionGate for ReflexScopeActionGate {
             })
         })()
         .map_err(|error| reflex_denial_from_error(&error))
+    }
+}
+
+struct M1AimTrackTargetSource {
+    m1_state: super::SharedM1State,
+}
+
+impl AimTrackTargetSource for M1AimTrackTargetSource {
+    fn snapshot(&self) -> AimTrackTargetSnapshot {
+        let input = {
+            let state = match self.m1_state.lock() {
+                Ok(state) => state,
+                Err(_error) => {
+                    return target_source_error_snapshot(
+                        "M1 service state lock poisoned while resolving aim_track target",
+                    );
+                }
+            };
+            crate::m1::current_input(&state, AIM_TRACK_TARGET_SOURCE_DEPTH)
+        };
+        match input {
+            Ok(input) => AimTrackTargetSnapshot {
+                entities: input.entities,
+                elements: resolved_elements_from_input(&input.focused, &input.elements),
+                source_label: Some("m1_current_input".to_owned()),
+                source_seq: None,
+                source_error: None,
+            },
+            Err(error) => {
+                tracing::warn!(
+                    code = "AIM_TRACK_TARGET_SOURCE_UNAVAILABLE",
+                    detail = %error,
+                    "aim_track target source could not read current M1 input"
+                );
+                target_source_error_snapshot(error.to_string())
+            }
+        }
+    }
+}
+
+fn target_source_error_snapshot(detail: impl Into<String>) -> AimTrackTargetSnapshot {
+    AimTrackTargetSnapshot {
+        source_label: Some("m1_current_input".to_owned()),
+        source_error: Some(detail.into()),
+        ..AimTrackTargetSnapshot::default()
+    }
+}
+
+fn resolved_elements_from_input(
+    focused: &Option<FocusedElement>,
+    elements: &[AccessibleNode],
+) -> Vec<ResolvedElementBox> {
+    let mut seen = HashSet::<ElementId>::new();
+    let mut resolved = Vec::new();
+    if let Some(focused) = focused {
+        push_resolved_element(&mut seen, &mut resolved, &focused.element_id, focused.bbox);
+    }
+    for element in elements {
+        push_resolved_element(&mut seen, &mut resolved, &element.element_id, element.bbox);
+    }
+    resolved
+}
+
+fn push_resolved_element(
+    seen: &mut HashSet<ElementId>,
+    resolved: &mut Vec<ResolvedElementBox>,
+    element_id: &ElementId,
+    bbox: synapse_core::Rect,
+) {
+    if seen.insert(element_id.clone()) {
+        resolved.push(ResolvedElementBox {
+            element_id: element_id.clone(),
+            bbox,
+        });
     }
 }
 
@@ -1153,6 +1255,35 @@ mod scope_gate_tests {
             error.data.as_ref().and_then(|data| data.get("use_scope")),
             Some(&json!("unknown"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn aim_track_target_source_reads_shallow_observe_child_elements() -> anyhow::Result<()> {
+        let profiles = TempDir::new()?;
+        let service = service_with_profiles(profiles.path(), false)?;
+        install_synthetic_notepad_input(&service)?;
+
+        let source = M1AimTrackTargetSource {
+            m1_state: service.m1_state.clone(),
+        };
+        let snapshot = source.snapshot();
+
+        assert_eq!(AIM_TRACK_TARGET_SOURCE_DEPTH, 2);
+        assert!(snapshot.source_error.is_none());
+        assert!(
+            snapshot
+                .elements
+                .iter()
+                .any(|element| { element.element_id == element_id(0x1234, "0000002a00000000") })
+        );
+        assert!(
+            snapshot
+                .elements
+                .iter()
+                .any(|element| { element.element_id == element_id(0x1234, "0000002a00000001") })
+        );
+
         Ok(())
     }
 

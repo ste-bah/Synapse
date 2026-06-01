@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use chrono::Utc;
 use serde_json::json;
@@ -16,6 +16,13 @@ pub const DEFAULT_GAIN: f32 = 1.0;
 pub const DEFAULT_DEADZONE_PX: f32 = 2.0;
 pub const TRACK_LOST_AFTER: Duration = Duration::from_millis(500);
 pub const REFLEX_TRACK_LOST_KIND: &str = "reflex_track_lost";
+pub const REFLEX_AIM_TRACK_CORRECTION_KIND: &str = "aim_track_correction";
+
+pub type AimTrackTargetSourceHandle = Arc<dyn AimTrackTargetSource>;
+
+pub trait AimTrackTargetSource: Send + Sync {
+    fn snapshot(&self) -> AimTrackTargetSnapshot;
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AimTrackParams {
@@ -78,6 +85,15 @@ impl From<AimTarget> for AimTrackTarget {
 pub struct ResolvedElementBox {
     pub element_id: ElementId,
     pub bbox: Rect,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AimTrackTargetSnapshot {
+    pub entities: Vec<DetectedEntity>,
+    pub elements: Vec<ResolvedElementBox>,
+    pub source_label: Option<String>,
+    pub source_seq: Option<u64>,
+    pub source_error: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -272,6 +288,10 @@ impl AimTrackController {
                 .map(|element| rect_center(element.bbox)),
             AimTrackTarget::ElementRect(rect) => Some(rect_center(*rect)),
         }
+    }
+
+    pub(crate) fn resolved_target(&self, context: &AimTrackContext<'_>) -> Option<Point> {
+        self.resolve_target(context)
     }
 
     fn emit_track_lost(&self, event_bus: &EventBus, context: &AimTrackContext<'_>) {
