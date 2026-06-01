@@ -1,30 +1,19 @@
 # RECOVERY NOTES - Synapse
 
 Current resume point:
-- Active issue: #610 `scenario(stress): aim_track reflex - moving target + track-loss`.
-- Acceptance evidence is captured in `.runs\610\aim-track-accept-20260531T2351`.
-- Repo-built isolated daemon PID `74696` on `127.0.0.1:7831` was stopped after cleanup; port is closed. Do not try to reuse the daemon.
-- Manual evidence completed:
-  - MCP preconditions: process/socket/auth/health and official Inspector strict `tools/list` with 80 tools.
-  - Happy path: real Inspector `reflex_register` on Notepad document element, Win32 window move, DPI-aware cursor readback at target center, and `reflex_history` correction rows.
-  - Track loss: Notepad hidden and foreground switched to VS Code; `observe` lost the element; `reflex_list` expired the reflex with `REFLEX_TRACK_LOST`; `reflex_history` contains `reflex_track_lost`.
-  - Edges: X-only, Y-only, deadzone larger than error, max-speed clamp, target teleport, boundary `priority=1000`, empty missing-target params, and structurally invalid element target.
-  - Cleanup: `release_all` zero held state; final list read `total=7 active=0 cancelled=6 expired=1`; final storage read `CF_REFLEX_AUDIT=4956`, `CF_ACTION_LOG=1`, `CF_EVENTS=6`, `CF_OBSERVATIONS=6`.
-- Next exact steps:
-  1. Commit and push with `[skip ci]`.
-  2. Post #610 RESOLVED evidence and close the issue.
-  3. Refresh the open queue and continue.
-- Final supporting checks already completed:
-  - `cargo fmt --check`
-  - `cargo check -p synapse-reflex`
-  - `cargo check -p synapse-mcp`
-  - `cargo test -p synapse-reflex --test scheduler_behavior -- --nocapture` (21 passed)
-  - `cargo test -p synapse-mcp aim_track_target_source_reads_shallow_observe_child_elements -- --nocapture`
-  - `cargo test -p synapse-mcp --bin synapse-mcp rebase_nodes_to_foreground -- --nocapture` after cleaning the stale `windows` artifact from a host paging-file failure
-  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
-  - `cargo build --release -p synapse-mcp`
-  - `git diff --check` (only LF/CRLF warnings)
-- Final release binary: `target\release\synapse-mcp.exe`, SHA256 `478BDD601E6CE5CAD19465FE8D43E01BB1837135340B350A4C3E93FC32290F6A`, length `46315008`, timestamp `2026-06-01T05:27:02Z`.
+- #610 is closed with commit `72581cb` and RESOLVED evidence at https://github.com/ChrisRoyse/Synapse/issues/610#issuecomment-4589812724.
+- Active issue: #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce`.
+- START comment: https://github.com/ChrisRoyse/Synapse/issues/611#issuecomment-4589814953
+- Resume by inspecting on_event filter/debounce/lifetime implementation and MCP event/perception surfaces, then launch a repo-built isolated daemon for #611 with official Inspector strict tools/list and real MCP tools/call triggers.
+- #611 must cover: HUD threshold event -> action, audio transient -> action, entity-appear -> action, debounce coalescing, filter never matches, 8-deep filter, UntilEvent lifetime expiry, plus empty/boundary/structurally invalid params.
+- #611 SoTs: target app/UI state, `reflex_history` / `CF_REFLEX_AUDIT`, `CF_EVENTS` / `CF_OBSERVATIONS`, storage counts, daemon logs, process/socket state, and cleanup state.
+
+Closed #610 reference:
+- Acceptance evidence is in `.runs\610\aim-track-accept-20260531T2351`.
+- Repo-built isolated daemon PID `74696` on `127.0.0.1:7831` was stopped after cleanup; port is closed.
+- Manual evidence completed: MCP preconditions, moving-target convergence, track loss, X-only, Y-only, deadzone no-op, max-speed clamp, target teleport, boundary `priority=1000`, empty missing-target params, structurally invalid element target, and cleanup.
+- Final supporting checks completed: fmt/checks, full scheduler behavior test, focused MCP target-source and bbox tests, schema sanitize, release build, and `git diff --check`.
+- Final #610 release binary: `target\release\synapse-mcp.exe`, SHA256 `478BDD601E6CE5CAD19465FE8D43E01BB1837135340B350A4C3E93FC32290F6A`, length `46315008`, timestamp `2026-06-01T05:27:02Z`.
 
 Resume by:
 1. Re-read `docs/AICodingAgentSuperPrompt.md`, `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`, `AGENTS.md`, #351, the open issue queue, and `STATE/*`.

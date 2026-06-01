@@ -39,6 +39,20 @@
 - Diff review completed for source/state files; changes are scoped to dynamic aim-track target sourcing, correction/track-loss audit persistence, M1 shallow target sourcing, and stale UIA bbox rebasing.
 - Next: commit/push `[skip ci]`, post #610 RESOLVED evidence, close #610, then refresh the queue.
 
+## 2026-06-01T00:30:41-05:00
+- #610 `scenario(stress): aim_track reflex - moving target + track-loss` is closed.
+  - Commit: `72581cb fix(reflex): resolve dynamic aim tracking (#610) [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/610#issuecomment-4589812724
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T05:30:10Z`.
+  - Post-close git readback: `main...origin/main` and clean.
+- Active issue is now #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/611#issuecomment-4589814953
+  - Issue requires proving on_event reflexes fire actions from real perception events with correct debounce.
+  - Required paths: HUD threshold event -> action, audio transient -> action, entity-appear -> action, debounce coalescing, filter never matches, 8-deep filter, UntilEvent lifetime expiry, plus empty/boundary/structurally invalid params.
+  - Required SoTs: target app/UI state, `reflex_history` / `CF_REFLEX_AUDIT`, `CF_EVENTS` / `CF_OBSERVATIONS`, storage counts, daemon logs, process/socket state, and cleanup state.
+  - Next: inspect on_event filter/debounce/lifetime implementation and MCP event/perception surfaces before launching the isolated #611 daemon.
+- Current live open queue after closing #610: #594 plus #595-#604 and #611-#634.
+
 ## 2026-05-31T23:38:30-05:00
 - Active issue remains #610 `scenario(stress): aim_track reflex - moving target + track-loss`.
 - Post-compaction wake-up was completed:

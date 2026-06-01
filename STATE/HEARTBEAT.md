@@ -48,3 +48,4 @@
 - 2026-05-31T23:38:30-05:00 iteration #610-bbox-rebase: real moving-window aim_track readback exposed stale UIA child bboxes after Win32 movement; patched Windows M1 bbox rebasing, passed focused regression/checks, rebuilt release daemon SHA256 0E1DFB375963D808D4DE5A22A926CA4762DD57DC0AF6CB3A3C585E8FDFE349C7.
 - 2026-06-01T00:12:25-05:00 iteration #610-final-fsv: completed manual MCP evidence for happy path, track loss, X/Y axes, deadzone, clamp, teleport, boundary, empty, and invalid inputs; cleanup stopped PID 74696 and closed port 7831.
 - 2026-06-01T00:28:35-05:00 iteration #610-final-checks: final fmt/check/tests/release build/diff check passed after cleaning a stale windows artifact from a paging-file compile failure; diff review completed.
+- 2026-06-01T00:30:41-05:00 iteration #610-close-611-start: pushed #610 commit 72581cb, posted RESOLVED evidence, closed #610, refreshed queue, and posted #611 START.
