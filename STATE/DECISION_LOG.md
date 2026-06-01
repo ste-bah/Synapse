@@ -316,3 +316,16 @@ Outcome:
 - Added storage/reflex pressure-permission read APIs and expanded `storage_put_probe_rows` to all 11 CFs.
 - Non-empty blocked diagnostic writes now return MCP error `STORAGE_WRITE_FAILED`; empty `rows=0` remains a no-op.
 - Manual MCP FSV with repo-built daemon PID `56980` on `127.0.0.1:7846` proved the full Normal/L1/L2/L3/L4/recovery ladder, strict thresholds, compaction counts, L3/L4 write gating, explicit refusal errors, empty/no-op, invalid CF, and recovery write reopen.
+
+# 2026-06-01T11:29:00-05:00 - #619 follows #618 in the storage campaign
+
+Decision: Take #619 next after closing #618 because it is the next open storage child under #594.
+
+Evidence:
+- `gh issue view 618` read back `state=CLOSED`, `closedAt=2026-06-01T16:27:18Z`.
+- Live queue after #618 closure lists #594 plus #595-#604 and #619-#634 open.
+- #619 is open, has no prior comments, and requires storage GC under concurrent writes evidence.
+- Posted #619 START comment at https://github.com/ChrisRoyse/Synapse/issues/619#issuecomment-4594506099.
+
+Outcome:
+- Next action is code/test inspection for `storage_gc_once`, probe rows, audit retention, and row cap behavior before launching a repo-built isolated daemon for manual MCP FSV.

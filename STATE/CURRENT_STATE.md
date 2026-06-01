@@ -1,5 +1,19 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T11:29:00-05:00
+- #618 `scenario(stress): storage pressure ladder - 5 levels + write-gating` is closed.
+  - Commit: `c0b24e3 fix(mcp): expose storage pressure gating (#618) [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/618#issuecomment-4594501572
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T16:27:18Z`.
+  - Manual FSV run directory: `.runs\618\pressure-fsv-20260601T1108-patched`.
+  - Final release binary SHA256: `8BCD4B02A37D85C40D15087C8A3B66A8963804CB8A5877CC5A349CE676EFB12B`.
+  - Post-close git readback: `main...origin/main`, clean, HEAD `c0b24e3`.
+- Active issue is now #619 `scenario(stress): storage_gc_once under concurrent writes`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/619#issuecomment-4594506099
+  - Live queue after #618 closure: #594 plus #595-#604 and #619-#634.
+  - #619 requires real MCP `storage_put_probe_rows`, `storage_gc_once`, and `storage_inspect` triggers proving GC correctness under concurrent writes, counts oscillating around soft cap without corruption, audit retention report consistency, no lost newest rows, max-age eviction, dedupe window, run_id provenance, GC on empty CF, boundary caps, and structurally invalid params.
+  - Next: inspect storage GC/probe-row implementation and tests before launching a repo-built isolated daemon for manual MCP FSV.
+
 ## 2026-06-01T11:18:00-05:00
 - Active issue #618 `scenario(stress): storage pressure ladder - 5 levels + write-gating` has implementation and manual MCP FSV evidence captured; final supporting checks, diff review, commit, RESOLVED comment, close, and queue continuation are next.
 - Patch in worktree:

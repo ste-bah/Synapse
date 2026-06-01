@@ -1,5 +1,16 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T11:29:00-05:00
+- #618 is closed.
+  - Commit: `c0b24e3 fix(mcp): expose storage pressure gating (#618) [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/618#issuecomment-4594501572
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T16:27:18Z`.
+  - Worktree clean after push.
+- Active issue is #619 `scenario(stress): storage_gc_once under concurrent writes`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/619#issuecomment-4594506099
+  - Live queue after #618 closure: #594 plus #595-#604 and #619-#634.
+  - Current next action: inspect storage GC/probe-row/audit-retention implementation and tests, then launch a repo-built isolated daemon for #619 manual MCP FSV.
+
 ## Current Resume Point - 2026-06-01T11:18:00-05:00
 - Active issue #618 `scenario(stress): storage pressure ladder - 5 levels + write-gating` is patched and manual MCP FSV evidence is captured.
 - Worktree patch:
