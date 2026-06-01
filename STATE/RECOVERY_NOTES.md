@@ -1,5 +1,19 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T03:31:50-05:00
+- #611 is closed with commit `5723393` and RESOLVED evidence at https://github.com/ChrisRoyse/Synapse/issues/611#issuecomment-4590866021. Closure readback: state `CLOSED`, closed at `2026-06-01T08:31:17Z`.
+- Live open queue after closing #611: #594 plus #595-#604 and #612-#634.
+- Active issue: #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes`.
+- START comment: https://github.com/ChrisRoyse/Synapse/issues/612#issuecomment-4590869661
+- #612 acceptance requires real MCP `tools/call` triggers plus separate physical SoT readbacks for:
+  - `hold_move` with and without `re_assert`;
+  - `hold_button` mouse/gamepad hold;
+  - one-shot combo auto-cancel;
+  - lifetimes `UntilCancelled`, `OneShot`, `Duration(ms)`, `UntilEvent`, `UntilDeadline`;
+  - edges: focus-loss reassert, minimum duration, already-past deadline, cancel already-expired, empty/boundary/structurally-invalid params.
+- Suggested SoTs: OS key/button state, controller/XInput state or tester UI, target app/game/tester UI, `CF_REFLEX_AUDIT`, `CF_ACTION_LOG`, `reflex_list`, `reflex_history`, daemon process/socket/log state, and cleanup `release_all`.
+- Resume by reading the hold/reflex lifetime/action implementation and current tests, then patch only if gaps are found before launching an isolated repo-built #612 daemon.
+
 ## Current Resume Point - 2026-06-01T03:29:27-05:00
 - Active issue: #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce`.
 - Manual behavior FSV evidence is captured in `.runs\611\on-event-fsv-20260601T012006`; the isolated acceptance daemon PID `47056` / port `7834` and FSV-owned target processes were already cleaned up.

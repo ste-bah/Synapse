@@ -91,3 +91,5 @@ Evidence:
 
 Outcome:
 - Next actions are commit/push `[skip ci]`, post #611 RESOLVED evidence, close #611, and refresh the live queue.
+
+- 2026-06-01: Pushed #611 commit `5723393`, posted RESOLVED evidence, closed #611, refreshed the open queue, and selected #612 `hold_move / hold_button / combo reflex lifetimes` as the next active reflex stress issue.

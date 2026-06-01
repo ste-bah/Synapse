@@ -1,5 +1,19 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T03:31:50-05:00
+- #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce` is closed.
+  - Commit: `5723393 fix(reflex): resolve on-event stress path (#611) [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/611#issuecomment-4590866021
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T08:31:17Z`.
+  - Post-close git readback before state update: `main...origin/main`, clean.
+- Refreshed live open queue now lists #594 plus #595-#604 and #612-#634.
+- Active issue is now #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/612#issuecomment-4590869661
+  - Issue requires proving continuous hold and one-shot combo reflexes across `UntilCancelled`, `OneShot`, `Duration(ms)`, `UntilEvent`, and `UntilDeadline`.
+  - Required paths: `hold_move` with/without `re_assert`, `hold_button` for mouse/gamepad hold, one-shot combo auto-cancel, `reflex_cancel` stopping holds, focus-loss reassert, Duration minimum, already-past deadline, cancel already-expired, and empty/boundary/structurally invalid params.
+  - Required SoTs: OS key/button state, controller/XInput or tester state where applicable, target app/game/tester UI, `CF_REFLEX_AUDIT`, `CF_ACTION_LOG`, `reflex_list`, `reflex_history`, daemon process/socket/log state, and cleanup `release_all`.
+  - Next: inspect hold/reflex lifetime implementation and existing tests before patching or launching an isolated #612 daemon.
+
 ## 2026-06-01T03:29:27-05:00
 - Post-compaction wake-up for #611 was completed again:
   - Re-read `docs/AICodingAgentSuperPrompt.md`, `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`, `AGENTS.md`, `STATE/*`, #611, #594, #351, the live open queue, and git status/log/branch.
