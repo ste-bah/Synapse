@@ -1,5 +1,18 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T14:31:53-05:00
+- #622 `scenario(stress): authoring loop - generate/accept/reject/export + quality_refresh` is closed.
+  - No product-code patch was required.
+  - State/evidence commit: `9c855fc docs(state): record issue 622 evidence [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/622#issuecomment-4595815302
+  - Closure readback: issue state `CLOSED`, closed at `2026-06-01T19:31:05Z`.
+  - Final release binary SHA256 from #622 supporting build: `236992450A49D3177C1FCBF1D06F567C30CC54AA5F217C1F0D59BFDBADF23E01`.
+- Active issue is now #623 `scenario(stress): audit consent + bundle redaction + replay_record`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/623#issuecomment-4595820271
+  - #623 is assigned to `ChrisRoyse` and labeled `status:in-progress`, `agent:codex`.
+  - #623 requires real MCP triggers and separate SoT readbacks for `audit_export_consent_set`, consent `CF_KV` row, refused export without consent, audit activity generation, `audit_export_bundle` output manifest/rows/redaction report files and SHA256 hashes, redaction guarantees/no raw sensitive payloads, max row/byte caps, `replay_record` JSONL counts/records, `duration_ms=0`, `target=both`, and empty/boundary/structurally invalid inputs.
+  - Next: inspect audit consent/export, replay recording, storage row formats, redaction policy enforcement, bundle file layout, cap handling, and existing tests before launching an isolated repo-built daemon.
+
 ## 2026-06-01T14:28:42-05:00
 - Active issue #622 `scenario(stress): authoring loop - generate/accept/reject/export + quality_refresh` has manual MCP FSV and supporting checks complete; no product-code patch was required.
 - Manual FSV run directory: `.runs\622\authoring-fsv-20260601T1350`.

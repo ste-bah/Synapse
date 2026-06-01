@@ -444,3 +444,16 @@ Evidence:
 
 Outcome:
 - #622 is ready for RESOLVED comment and closure.
+
+# 2026-06-01T14:31:53-05:00 - #623 follows #622 in the audit/replay campaign
+
+Decision: Take #623 next after closing #622 because it is the next open H-profile/telemetry child under #594.
+
+Evidence:
+- `gh issue view 622` read back `state=CLOSED`, `closedAt=2026-06-01T19:31:05Z`.
+- Live queue after #622 closure lists #594 plus #595-#604 and #623-#634 open.
+- #623 is open and requires audit consent, redacted bundle export, and replay capture evidence.
+- Posted #623 START comment at https://github.com/ChrisRoyse/Synapse/issues/623#issuecomment-4595820271 and labeled it `status:in-progress`, `agent:codex`.
+
+Outcome:
+- Next action is implementation/test inspection before launching a repo-built isolated daemon for #623 manual MCP FSV.

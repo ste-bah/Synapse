@@ -1,5 +1,15 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T14:31:53-05:00
+- #622 is closed.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/622#issuecomment-4595815302
+  - Closure readback: state `CLOSED`, closed at `2026-06-01T19:31:05Z`.
+  - State/evidence commit: `9c855fc docs(state): record issue 622 evidence [skip ci]`.
+- Active issue is #623 `scenario(stress): audit consent + bundle redaction + replay_record`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/623#issuecomment-4595820271
+  - Claimed with `status:in-progress`, `agent:codex`, assigned to `ChrisRoyse`.
+  - Current exact next action: inspect `audit_export_consent_set`, `audit_export_bundle`, `replay_record`, redaction policy/report generation, bundle file output, storage row formats, caps, and supporting tests. Then launch a repo-built isolated daemon for manual MCP FSV.
+
 ## Current Resume Point - 2026-06-01T14:28:42-05:00
 - Active issue #622 has manual MCP FSV, cleanup, and supporting checks complete; no product-code patch was required.
 - FSV evidence directory: `.runs\622\authoring-fsv-20260601T1350`.
