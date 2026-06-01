@@ -1,5 +1,37 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T07:09:36-05:00
+- Active issue #613 `scenario(stress): subscribe firehose - 4096 ring, EVENTS_DROPPED, one-per-event, deep filters` has implementation and manual FSV evidence complete; commit/issue closure is next.
+- #613 patch in worktree:
+  - `EventFilter::validate` now validates `Data` filters, rejects invalid JSON Pointer paths, and rejects invalid regex patterns instead of silently matching false.
+  - SSE `/events` reconnect now reuses an explicitly requested empty subscription when `Last-Event-ID: 0`, instead of creating a new unfiltered All subscription.
+  - SSE ring overflows now increment `events_dropped_for_subscriber` / `EVENTS_DROPPED_METRIC` when the per-subscription ring drops old buffered events.
+  - Supporting regressions cover data-filter validation, strict `subscribe` validation, empty-subscription reconnect, and 5000-event ring overflow/drop accounting.
+- Final patched manual MCP FSV evidence is under `.runs\613\subscribe-firehose-fsv-20260601T062230-patched`:
+  - Repo-built daemon PID `32356`, binary `C:\code\Synapse\target\release\synapse-mcp.exe`, bind `127.0.0.1:7839`, isolated DB `.runs\613\subscribe-firehose-fsv-20260601T062230-patched\db`, watch root `.runs\613\subscribe-firehose-fsv-20260601T062230-patched\watch`.
+  - Process/socket/auth/client-parity precondition passed: process path readback matched repo release binary; netstat showed `127.0.0.1:7839 LISTENING`; unauth `/health` returned `401`; auth `/health ok=true`; official MCP Inspector strict `tools/list` returned 80 tools including `health`, `subscribe`, `subscribe_cancel`, `observe_delta`, `reality_baseline`, `act_clipboard`, `act_run_shell`, `storage_inspect`, and `replay_record`.
+  - Baseline SoT: `reality_baseline` stored `reality/baseline/v1/notepad/issue613-patched` and `reality/head/v1/notepad` in `CF_KV`.
+  - One-per-event happy path: real MCP `act_clipboard`, `act_run_shell`, and `observe_delta` triggers produced physical clipboard/file SoTs matching marker `issue613-patched-oneper-20260601T062403456`; SSE subscription `019e82ec-ebf5-7943-884e-03590d0a05f2` delivered exactly 3 `synapse/event` frames, stream seq `1,2,3`, event seq `1,2,3`, paths `/focused,/clipboard,/fs`, no loss; stats after read `ring_len=3`, `dropped_total=0`.
+  - 8-deep filter path: subscription `019e82ee-5d56-72f2-92c0-00e3c4a73063` accepted a depth-8 filter using `kind`, `data in_set`, `exists`, and regex behind nested `not`; `observe_delta` published 4 deltas (`/foreground/window_title_sha256,/focused,/clipboard,/fs`), while SSE delivered only the matching `/clipboard` and `/fs` frames.
+  - Slow-consumer/backpressure firehose: subscription `019e82ef-c53f-7e13-ae2c-cfea7dbd3ae8`; manual HTTP event ingress with `SYNAPSE_HTTP_SSE_MANUAL=1` posted 5000 known `issue613.firehose` events. Publish response read `matched=5000 queued=5000 dropped=904`; stats read `ring_len=4096`, `oldest_event_seq=904`, `latest_event_seq=4999`, `dropped_total=904`, `events_dropped_for_subscriber=904`, `lossy_pending=true`; replay read 1 `subscription_started` lossy frame plus 4096 `synapse/event` frames, first event seq `904` lossy true and last event seq `4999`.
+  - Edge cases: depth-9 filter, invalid regex `[`, invalid data path `field`, and `buffer_size=4095` all failed through strict Inspector with MCP error and subscriber count unchanged; empty filter All delivered known event `issue613.empty_filter` seq `613000`; subscribe-then-immediate-cancel returned `cancelled=true`, stats endpoint returned 404 before and after publishing a matching event.
+  - Cleanup: cancelled active subscriptions through real MCP `subscribe_cancel`, `health` read `sse_subscribers=0`, `release_all` returned zero held inputs, daemon PID `32356` stopped, port `7839` no longer listening.
+- Supporting checks passed:
+  - `cargo fmt --check`
+  - `git diff --check` (line-ending warnings only)
+  - `cargo check -p synapse-core -j 2`
+  - `cargo check -p synapse-reflex -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-core event_filter_validation_edges_have_readback --test event_filter_types -- --nocapture`
+  - `cargo test -p synapse-mcp last_event_id_zero_reuses_empty_existing_subscription --bin synapse-mcp -- --nocapture`
+  - `cargo test -p synapse-mcp ring_overflow_reports_drop_metric_and_lossy_frame --bin synapse-mcp -- --nocapture`
+  - `cargo test -p synapse-mcp --test m3_subscribe_tool -- --nocapture`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+  - `cargo test -p synapse-reflex --test bus_behavior -- --nocapture`
+  - `cargo build --release -p synapse-mcp -j 2` (rerun passed after one interrupted attempt)
+- Final release binary readback: `target\release\synapse-mcp.exe`, length `46359552`, SHA256 `426E96F4CA1C07D92433284FEBD39A161722C256133265AD6472B4E1D51DB67C`, `LastWriteTimeUtc=2026-06-01T12:09:18.7698237Z`.
+- Next: commit #613 with `[skip ci]`, post RESOLVED evidence, close #613, refresh live queue, and continue to #614 unless the queue changes.
+
 ## 2026-06-01T05:44:31-05:00
 - #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes` is closed.
   - Commit: `db761fe fix(reflex): resolve hold lifetime stress path (#612) [skip ci]`.

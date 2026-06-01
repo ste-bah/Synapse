@@ -65,3 +65,4 @@
 - 2026-06-01T05:33:52-05:00 iteration #612-cancel-expired-fix: patched reflex_cancel to read persisted terminal audit status, passed focused/schema/build checks, and captured fresh MCP evidence showing expired combo cancel now returns already_expired.
 - 2026-06-01T05:41:10-05:00 iteration #612-final-checks: final fmt/check/reflex/MCP regression set and release build passed; final synapse-mcp SHA256 is 6898E30AE4FAE8519499B0BB91436E3C0B44D218BE03539EA1D60957C1281BF1.
 - 2026-06-01T05:44:31-05:00 iteration #612-close-613-start: pushed #612 commit db761fe, posted RESOLVED evidence, closed #612, refreshed queue to #594 plus #595-#604/#613-#634, and posted #613 START.
+- 2026-06-01T07:09:36-05:00 iteration #613-final-fsv-checks: patched subscribe/SSE filter and ring defects, completed manual MCP FSV for one-per-event/deep-filter/firehose/edges, stopped daemon PID 32356, and passed final supporting checks/release build.

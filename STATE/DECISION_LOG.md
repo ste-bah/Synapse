@@ -139,3 +139,19 @@ Outcome:
 - Fresh repo-built manual MCP rerun under `.runs\612\hold-lifetime-fsv-20260601T0530-cancel-expired` proved the edge: expired combo `019e82be-1a45-7d00-a817-22a9d7248818`, real Inspector `reflex_cancel`, response `already_expired`, OS P false before/after, recovery ledger absent, `reflex_history` lifecycle rows intact, `CF_REFLEX_AUDIT=2`.
 
 - 2026-06-01: Pushed #612 commit `db761fe`, posted RESOLVED evidence, closed #612, refreshed the open queue, and selected #613 `subscribe firehose - 4096 ring, EVENTS_DROPPED, one-per-event, deep filters` as the next event-stream stress issue.
+
+# 2026-06-01T07:09:36-05:00 - #613 harden SSE subscribe firehose behavior
+
+Decision: Treat the #613 runtime findings as real defects and patch the event stream path before closure.
+
+Evidence:
+- Code readback showed `EventFilter::Data` validation did not validate JSON Pointer paths or regex patterns, so invalid filters could be accepted and then silently match false.
+- Manual SSE readback on a fresh subscription with `Last-Event-ID: 0` exposed that `/events?subscription_id=<id>` created a new All subscription if the requested subscription's ring was still empty.
+- Firehose stress needed drop accounting at the SSE ring layer as well as the event-bus queue layer; otherwise ring evictions were visible in stats but did not update the configured dropped-event metric surface.
+
+Outcome:
+- Added fail-closed data-filter validation for invalid paths and regex.
+- Changed SSE reconnect to reuse an explicitly requested empty subscription when `Last-Event-ID: 0`.
+- Added ring-overflow metric/drop accounting for per-subscription SSE ring eviction.
+- Manual patched FSV under `.runs\613\subscribe-firehose-fsv-20260601T062230-patched` proved one-per-event delivery, 8-deep filters, 5000-event firehose drops, invalid edges, empty filter All, cancel behavior, cleanup, and strict Inspector tools-list.
+- Supporting checks and final release build passed; next action is commit and close #613.
