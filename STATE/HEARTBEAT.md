@@ -98,3 +98,4 @@
 - 2026-06-01T14:31:53-05:00 iteration #622-close-623-start: pushed #622 evidence commit 9c855fc, posted RESOLVED evidence, closed #622, refreshed queue, claimed #623, and posted #623 START.
 - 2026-06-01T15:03:43-05:00 iteration #623-manual-fsv: completed isolated repo-built MCP evidence for audit consent/export/redaction/caps and replay JSONL observations+events/zero/invalid edges; stopped both #623 daemons and recorded docs-only runtime API correction.
 - 2026-06-01T15:11:30-05:00 iteration #623-final-checks: final fmt/diff/docs/check/replay/schema/tool-list/release build passed; release synapse-mcp SHA256 498E3164F4B795E0ABD3A9E7E2AE678810D532F84B35E5381456277C13628476.
+- 2026-06-01T15:16:27-05:00 iteration #624-wakeup-start: re-read wake context, verified no live Issue615FanoutTarget fixture remains, confirmed #623 closed, refreshed queue, claimed #624, posted START, and recorded the #624 resume point.

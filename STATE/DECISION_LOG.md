@@ -482,3 +482,29 @@ Evidence:
 
 Outcome:
 - #623 is ready for commit, RESOLVED comment, and closure.
+
+# 2026-06-01T15:16:27-05:00 - #624 follows #623 in the EverQuest full-loop campaign
+
+Decision: Take #624 next after closing #623 because it is the next open EverQuest full-loop child under #594 and follows the completed profile/audit/replay tool chain work.
+
+Evidence:
+- `gh issue view 623` read back `state=CLOSED`, `closedAt=2026-06-01T20:13:12Z`.
+- Live queue after #623 closure lists #594 plus #595-#604 and #624-#634 open.
+- #624 is open and requires live EverQuest perception, chat/log/map, memory, planner, trajectory, episode export, ContextGraph ingest/search, and world-model readback evidence.
+- Posted #624 START comment at https://github.com/ChrisRoyse/Synapse/issues/624#issuecomment-4596141027 and labeled it `status:in-progress`, `agent:codex`.
+
+Outcome:
+- Next action is implementation/test/host-SoT inspection before launching a repo-built isolated daemon for #624 manual MCP FSV.
+
+# 2026-06-01T15:16:27-05:00 - #615 fanout windows were temporary UIA fixtures, not product UI
+
+Decision: Treat the `Issue615FanoutTarget` windows/buttons as closed #615 FSV fixture residue only; no product issue is indicated by their existence.
+
+Evidence:
+- Live process/window readback found no `Issue615` or fanout window.
+- Wired Synapse `find` returned no `Issue615FanoutTarget` or `Show80` elements.
+- Fixture source `.runs\615\target\issue615_target.ps1` shows the buttons only mutate an in-window `ItemPanel` (`Clear`, `Show4/7/8/80`, `Rename8`, `Mixed8`) or close the form (`Exit`).
+- #615 RESOLVED evidence already recorded the real manual SoT readbacks proving those buttons changed item counts/names during FSV and that target PID `79124` was stopped.
+
+Outcome:
+- User can ignore those windows if seen again; the agent should close any leaked fixture window after use and continue the active issue queue.

@@ -1,5 +1,38 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T15:16:27-05:00
+- Required wake-up context was re-read after compaction:
+  - `C:\code\Synapse\docs\AICodingAgentSuperPrompt.md`
+  - `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`
+  - `AGENTS.md`
+  - `STATE/ACTIVE_OBJECTIVE.md`, `STATE/CURRENT_STATE.md`, `STATE/RECOVERY_NOTES.md`, `STATE/DECISION_LOG.md` tail, and `STATE/HEARTBEAT.md` tail.
+  - GitHub open queue, #351 decision/context issue, decision/context issue lists, #623 closure state, and #624 body/comments.
+  - `git status`, `git log -10`, and branch readback.
+- User asked about `Issue615FanoutTarget` windows/buttons (`Clear`, `Show4`, `Show7`, `Show8`, `Rename8`, `Mixed8`, `Show80`, `Exit`) appearing inert.
+  - Live process/window readback found no `Issue615`/fanout windows.
+  - Wired Synapse MCP readback found no `Issue615FanoutTarget` or `Show80` elements; foreground is VS Code.
+  - The fixture source is `.runs\615\target\issue615_target.ps1`: it is a temporary WinForms UIA stress target, not product UI. Button behavior is: `Clear` removes item buttons, `Show4/7/8/80` populate item buttons, `Rename8` renames existing item buttons, `Mixed8` renames up to four and adds new buttons through eight, and `Exit` closes the form.
+- Git state after wake-up:
+  - branch `main`
+  - `git status --short --branch`: `## main...origin/main`
+  - `HEAD`: `c4c3b14 docs(state): record issue 623 evidence [skip ci]`
+- Wired MCP client sanity check passed:
+  - `mcp__synapse.health` returned `ok=true`, active profile `vscode`, storage path `C:\Users\hotra\AppData\Local\synapse\db`, reflex runtime initialized, operator hotkey registered.
+  - `observe` saw VS Code focused and A11Y/capture healthy.
+  - `storage_inspect` and `reflex_list include_expired=true` returned normally.
+- #623 is closed.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/623#issuecomment-4596117663
+  - Closure readback: state `CLOSED`, closed at `2026-06-01T20:13:12Z`.
+  - Evidence/state commit already on `origin/main`: `c4c3b14 docs(state): record issue 623 evidence [skip ci]`.
+- Live open queue after #623 closure contains #594 plus #595-#604 and #624-#634.
+- Active issue is now #624 `scenario(stress): EverQuest full loop - perception->memory->planner->trajectory->ContextGraph`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/624#issuecomment-4596141027
+  - Claimed with `status:in-progress`, `agent:codex`, assigned to `ChrisRoyse`.
+  - #624 requires real MCP triggers and separate SoT readbacks across `everquest_chat_input_state`, `everquest_loc_probe`, `everquest_current_state`, `everquest_map_sensor`, `everquest_outcome_ingest`, `everquest_memory_record`, `everquest_memory_consult`, `everquest_planner_guard`, `everquest_route_plan`, `everquest_domain_normalize`, `everquest_trajectory_record`, `everquest_episode_export`, `everquest_contextgraph_ingest/search`, `everquest_world_model_record/inspect`, and `everquest_world_summary`.
+  - Required physical SoTs: EQ log bytes/offsets, `UI_*.ini` layout, local `maps/*.txt`, episode JSONL bytes/hash, ContextGraph storage/provenance, and persisted `CF_KV/everquest/*` / world-model rows.
+  - Required edges: login/non-EQ foreground denial, visible unsent chat text gate fail, disabled/missing logging, stale state, empty/boundary/structurally invalid params.
+  - Next: inspect EverQuest MCP tool implementations, log/map/layout readers, ContextGraph bridge, supporting tests, and host EverQuest runtime state before launching or configuring an isolated repo-built daemon for #624 manual MCP FSV.
+
 ## 2026-06-01T15:03:43-05:00
 - Active issue #623 `scenario(stress): audit consent + bundle redaction + replay_record` has manual MCP FSV behavior evidence and final supporting checks complete; commit, RESOLVED comment, closure, and queue continuation are next.
 - Worktree changes for #623 are documentation corrections only:

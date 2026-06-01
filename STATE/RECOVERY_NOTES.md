@@ -1,5 +1,28 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T15:16:27-05:00
+- Wake-up after compaction is complete. Required doctrine/state/GitHub/git/MCP context was re-read and reconciled.
+- User's `Issue615FanoutTarget` concern was checked:
+  - no live `Issue615`/fanout window/process exists now;
+  - wired Synapse `find` found no `Issue615FanoutTarget`/`Show80` elements;
+  - fixture source `.runs\615\target\issue615_target.ps1` confirms it was a temporary WinForms UIA stress target; buttons mutate the `ItemPanel` or close the form and are not product UI.
+- #623 is closed:
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/623#issuecomment-4596117663
+  - Closure readback: `state=CLOSED`, `closedAt=2026-06-01T20:13:12Z`.
+  - Evidence/state commit on `origin/main`: `c4c3b14 docs(state): record issue 623 evidence [skip ci]`.
+- Active issue is #624:
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/624#issuecomment-4596141027
+  - Claimed with `status:in-progress`, `agent:codex`, assigned to `ChrisRoyse`.
+  - Live open queue: #594 plus #595-#604 and #624-#634.
+- Git readback: branch `main`, `git status --short --branch` is `## main...origin/main`, HEAD `c4c3b14`.
+- Wired MCP readback: `health ok=true`, active profile `vscode`, operator hotkey registered, storage initialized, `observe`/`storage_inspect`/`reflex_list` returned normally.
+- Exact next actions:
+  1. Commit/push this state update with `[skip ci]`.
+  2. Inspect #624 EverQuest live-integration tool implementations and supporting tests/docs.
+  3. Read current host EverQuest/log/map/layout/ContextGraph SoTs.
+  4. Build/launch repo-built `synapse-mcp` for #624 and perform official Inspector strict `tools/list`.
+  5. Run #624 manual MCP FSV with separate physical SoT readbacks for each tool path and required edge cases.
+
 ## Current Resume Point - 2026-06-01T15:03:43-05:00
 - Active issue #623 has behavior FSV evidence and final supporting checks complete. Commit, RESOLVED comment, closure, and queue continuation remain.
 - Worktree changes are docs only:
