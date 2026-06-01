@@ -15,6 +15,7 @@ use uuid::Uuid;
 use super::{
     REFLEX_TICK_LATE_KIND, RuntimeState, ScheduledReflexDriver, SchedulerTrigger, TickSample,
     scheduler_combo::{dispatch_reflex_action, step_active_combos},
+    scheduler_loop::TickLateSignal,
     scheduler_stateful::step_stateful_controllers,
 };
 use crate::{
@@ -440,7 +441,13 @@ fn record_tick_sample(
         } else {
             "deadline_miss"
         };
-        emit_tick_late(runtime, elapsed_us, jitter_us, reason, degraded);
+        let signal = TickLateSignal { reason, degraded };
+        if runtime.last_tick_late_signal != Some(signal) {
+            emit_tick_late(runtime, elapsed_us, jitter_us, reason, degraded);
+        }
+        runtime.last_tick_late_signal = Some(signal);
+    } else {
+        runtime.last_tick_late_signal = None;
     }
 
     let sample = TickSample {
@@ -453,7 +460,7 @@ fn record_tick_sample(
         late,
         degraded,
     };
-    tracing::info!(
+    tracing::trace!(
         component = "reflex_scheduler",
         tick_index = sample.tick_index,
         elapsed_us = sample.elapsed_us,

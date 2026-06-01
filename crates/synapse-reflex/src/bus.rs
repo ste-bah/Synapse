@@ -77,11 +77,17 @@ struct Subscriber {
 
 #[derive(Clone, Debug)]
 pub struct SubscriberHandle {
-    id: SubscriptionId,
+    registration: Arc<SubscriberRegistration>,
     receiver: Receiver<Event>,
     lossy: Arc<std::sync::atomic::AtomicBool>,
     dropped_since_read: Arc<AtomicU64>,
     snapshot_first: bool,
+}
+
+#[derive(Debug)]
+struct SubscriberRegistration {
+    id: SubscriptionId,
+    inner: Arc<EventBusInner>,
 }
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
@@ -161,7 +167,10 @@ impl EventBus {
         self.inner.subscribers.store(Arc::new(next));
 
         Ok(SubscriberHandle {
-            id,
+            registration: Arc::new(SubscriberRegistration {
+                id,
+                inner: Arc::clone(&self.inner),
+            }),
             receiver,
             lossy,
             dropped_since_read,
@@ -207,18 +216,7 @@ impl EventBus {
     /// Removes a subscriber. Returns `false` if the id was already absent.
     #[tracing::instrument(skip_all, fields(subscription_id = id))]
     pub fn unsubscribe(&self, id: &str) -> bool {
-        let _guard = self.lock_updates();
-        let current = self.inner.subscribers.load_full();
-        let next = current
-            .iter()
-            .filter(|subscriber| subscriber.id != id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let removed = next.len() != current.len();
-        if removed {
-            self.inner.subscribers.store(Arc::new(next));
-        }
-        removed
+        unsubscribe_inner(&self.inner, id)
     }
 
     #[must_use]
@@ -245,7 +243,7 @@ impl SubscriberHandle {
     #[must_use]
     #[tracing::instrument(skip_all)]
     pub fn id(&self) -> &str {
-        &self.id
+        &self.registration.id
     }
 
     #[must_use]
@@ -287,6 +285,30 @@ impl SubscriberHandle {
         }
         events
     }
+}
+
+impl Drop for SubscriberRegistration {
+    fn drop(&mut self) {
+        let _removed = unsubscribe_inner(&self.inner, &self.id);
+    }
+}
+
+fn unsubscribe_inner(inner: &Arc<EventBusInner>, id: &str) -> bool {
+    let _guard = match inner.updates.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let current = inner.subscribers.load_full();
+    let next = current
+        .iter()
+        .filter(|subscriber| subscriber.id != id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let removed = next.len() != current.len();
+    if removed {
+        inner.subscribers.store(Arc::new(next));
+    }
+    removed
 }
 
 fn enqueue_drop_oldest(subscriber: &Subscriber, mut event: Event) -> u64 {

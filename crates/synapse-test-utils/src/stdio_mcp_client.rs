@@ -137,7 +137,9 @@ impl StdioMcpClient {
 
         let response = tokio::time::timeout(REQUEST_TIMEOUT, self.read_response(id))
             .await
-            .context("timed out waiting for JSON-RPC response")??;
+            .with_context(|| {
+                format!("timed out waiting for JSON-RPC response to {method} id {id}")
+            })??;
         if let Some(error) = response.get("error") {
             bail!("JSON-RPC error from {method}: {error}");
         }
@@ -160,7 +162,9 @@ impl StdioMcpClient {
 
         let response = tokio::time::timeout(REQUEST_TIMEOUT, self.read_response(id))
             .await
-            .context("timed out waiting for JSON-RPC error response")??;
+            .with_context(|| {
+                format!("timed out waiting for JSON-RPC error response to {method} id {id}")
+            })??;
         response
             .get("error")
             .cloned()

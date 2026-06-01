@@ -1,7 +1,10 @@
 use std::{
     error::Error,
     io,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -80,6 +83,41 @@ fn on_event_reflex_pulls_bus_event_and_dispatches() -> Result<(), Box<dyn Error>
     assert!(pulled >= 1);
     assert_eq!(dispatched, 1);
     assert_eq!(action_rx.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn on_event_ticks_do_not_sample_aim_track_target_source() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let db = Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
+    let bus = EventBus::default();
+    let (action_handle, _action_rx) = ActionHandle::channel();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let source: Arc<dyn AimTrackTargetSource> = Arc::new(CountingAimTrackSource {
+        calls: Arc::clone(&calls),
+    });
+    let reflex = ScheduledReflex::on_event(
+        "reflex-on-event-no-aim-source",
+        EventFilter::Kind {
+            kind: "wanted".to_owned(),
+        },
+        vec![Action::ReleaseAll],
+    );
+
+    let mut scheduler = ReflexScheduler::spawn_with_audit_db_context_and_aim_track_source(
+        bus,
+        action_handle,
+        vec![reflex],
+        SchedulerConfig::default().with_max_ticks(3),
+        db,
+        None,
+        source,
+    )?;
+    let samples = scheduler.wait_for_samples(3, WAIT_TIMEOUT);
+    scheduler.stop()?;
+
+    assert_eq!(samples.len(), 3);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
     Ok(())
 }
 
@@ -525,6 +563,54 @@ fn blocked_dispatch_path_emits_reflex_tick_late() -> Result<(), Box<dyn Error>> 
     assert_eq!(tick_late_audit.details["degraded"], false);
     assert!(tick_late_audit.details["elapsed_us"].as_u64().is_some());
     assert!(tick_late_audit.details["jitter_us"].as_u64().is_some());
+    Ok(())
+}
+
+#[test]
+fn consecutive_tick_late_signals_are_coalesced() -> Result<(), Box<dyn Error>> {
+    let temp = tempdir()?;
+    let db = std::sync::Arc::new(Db::open(&temp.path().join("db"), SCHEMA_VERSION)?);
+    let bus = EventBus::default();
+    let late_events = bus.subscribe(
+        EventFilter::Kind {
+            kind: REFLEX_TICK_LATE_KIND.to_owned(),
+        },
+        Vec::new(),
+        false,
+    )?;
+    let (action_handle, mut action_rx) = ActionHandle::channel();
+    for _ in 0..ACTION_QUEUE_CAPACITY {
+        action_handle.try_execute(Action::ReleaseAll)?;
+    }
+
+    let reflex = ScheduledReflex::every_tick("reflex-blocked", vec![Action::ReleaseAll]);
+    let mut scheduler = ReflexScheduler::spawn_with_audit_db(
+        bus,
+        action_handle,
+        vec![reflex],
+        SchedulerConfig::default().with_max_ticks(3),
+        std::sync::Arc::clone(&db),
+    )?;
+    let samples = scheduler.wait_for_samples(3, WAIT_TIMEOUT);
+    scheduler.stop()?;
+    db.flush()?;
+
+    let late = late_events.drain();
+    let tick_late_audits = read_audits(&db)?
+        .into_iter()
+        .filter(|audit| audit.error_code.as_deref() == Some(error_codes::REFLEX_TICK_LATE))
+        .collect::<Vec<_>>();
+    let queued_actions = drain_actions(&mut action_rx);
+
+    assert_eq!(samples.len(), 3);
+    assert!(samples.iter().all(|sample| sample.late));
+    assert_eq!(late.len(), 1);
+    assert_eq!(tick_late_audits.len(), 1);
+    assert_eq!(
+        queued_actions.len(),
+        ACTION_QUEUE_CAPACITY,
+        "blocked ticks must not enqueue additional actions"
+    );
     Ok(())
 }
 
@@ -1225,6 +1311,17 @@ impl AimTrackTargetSource for ScriptedMovingTrackSource {
             source_error: None,
             elements: Vec::new(),
         }
+    }
+}
+
+struct CountingAimTrackSource {
+    calls: Arc<AtomicUsize>,
+}
+
+impl AimTrackTargetSource for CountingAimTrackSource {
+    fn snapshot(&self) -> AimTrackTargetSnapshot {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        AimTrackTargetSnapshot::default()
     }
 }
 

@@ -69,6 +69,13 @@ pub(super) struct RuntimeState {
     pub(super) audit_context: Option<StoredAuditContext>,
     pub(super) action_gate: Option<ReflexActionGateHandle>,
     pub(super) tick_index: u64,
+    pub(super) last_tick_late_signal: Option<TickLateSignal>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) struct TickLateSignal {
+    pub(super) reason: &'static str,
+    pub(super) degraded: bool,
 }
 
 pub(super) fn aim_track_states(

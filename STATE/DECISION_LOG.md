@@ -93,3 +93,47 @@ Outcome:
 - Next actions are commit/push `[skip ci]`, post #611 RESOLVED evidence, close #611, and refresh the live queue.
 
 - 2026-06-01: Pushed #611 commit `5723393`, posted RESOLVED evidence, closed #611, refreshed the open queue, and selected #612 `hold_move / hold_button / combo reflex lifetimes` as the next active reflex stress issue.
+- 2026-06-01: #612 code inspection found `hold_move.re_assert` was only schema/docs state and `reflex_cancel` did not release active hold inputs. Patched reassert keydown dispatch and cancel-time hold release action queuing before runtime FSV.
+- 2026-06-01: #612 MCP `reflex_register` supporting test timeout root cause was non-aim reflex ticks sampling the aim-track M1 target source before checking controller presence. Patched `step_aim_track` to return before cursor/M1 reads for non-aim slots and added a regression proving `on_event` ticks do not call the aim target source.
+
+# 2026-06-01T04:39:15-05:00 - #612 reassert must not grow crash-recovery ledger per tick
+
+Decision: Keep physical reassert KeyDown dispatch, but suppress duplicate logical crash-recovery ledger writes.
+
+Evidence:
+- Real isolated #612 manual evidence on daemon PID `47904` showed `hold_move re_assert=true` correctly kept W physically down after an external KeyUp, proving the reassert behavior itself was needed.
+- The separate recovery-ledger SoT read showed many duplicate `key_held` rows for W in `action_recovery.jsonl`, so long-running reassert would create unbounded crash-recovery file growth even though the logical held-input state had not changed.
+
+Outcome:
+- `append_recovery_event_at` now replays the current logical ledger and skips appending an event when it would leave recovered state unchanged and the existing file has no ignored trailing bytes.
+- Added `recovery_log_skips_duplicate_logical_holds`.
+- Supporting checks passed: `cargo fmt`, focused `synapse-action` recovery test, `cargo check -p synapse-action -j 2`, and `cargo build --release -p synapse-mcp -j 2`.
+
+# 2026-06-01T04:51:40-05:00 - #612 reassert dispatch must be periodic, not per-tick
+
+Decision: Rate-limit `hold_move.re_assert` dispatch to a fixed 50 ms interval.
+
+Evidence:
+- Fresh real MCP evidence after the duplicate-ledger fix showed W stayed physically down and the recovery ledger stayed bounded at one row, but `reflex_cancel` returned `cancelled=true` while the after-read still showed W down and the ledger present.
+- A delayed after-read still showed W down. `release_all` then released one key and removed the ledger, proving the backend could release W and the cancel problem was caused by queued reassert KeyDowns.
+- Code readback showed the scheduler dispatched a reassert KeyDown every 1 ms tick while the hold was active.
+
+Outcome:
+- `HoldMoveController` now suppresses reassert until 50 ms have elapsed since the initial hold or last reassert.
+- Focused regression updated to prove a 1 ms tick is only `Holding` with no queued action, while the next interval tick emits `Reasserted`.
+- Supporting checks passed: `cargo fmt`, focused hold_move reassert test, focused recovery-ledger test, `cargo check` for `synapse-reflex` and `synapse-action`, and release build.
+
+# 2026-06-01T05:33:52-05:00 - #612 cancel expired reflexes from persisted terminal audit state
+
+Decision: Make `reflex_cancel` use the same persisted terminal status surface as `reflex_list include_expired=true` before returning `NotFound`.
+
+Evidence:
+- Manual #612 edge evidence showed `reflex_cancel` returned `cancelled=false, reason=not_found` for a one-shot combo while `reflex_list include_expired=true` still reported that same reflex as `expired`.
+- Code readback showed `cancel` checked only `self.statuses()` from the live scheduler, while listing merges terminal statuses from `CF_REFLEX_AUDIT`.
+- A scheduler can drop an already-expired reflex from the live active set while the persisted audit rows remain the user-visible terminal state.
+
+Outcome:
+- Added `terminal_status_from_audit(reflex_id)` and used it in `ReflexRuntime::cancel` when the live scheduler snapshot has no status.
+- Expired/action-denied historical statuses now return `AlreadyExpired`; historical cancelled statuses retain the existing cancelled outcome.
+- Added supporting regression `cancel_expired_reflex_restored_from_audit_reports_already_expired`.
+- Fresh repo-built manual MCP rerun under `.runs\612\hold-lifetime-fsv-20260601T0530-cancel-expired` proved the edge: expired combo `019e82be-1a45-7d00-a817-22a9d7248818`, real Inspector `reflex_cancel`, response `already_expired`, OS P false before/after, recovery ledger absent, `reflex_history` lifecycle rows intact, `CF_REFLEX_AUDIT=2`.

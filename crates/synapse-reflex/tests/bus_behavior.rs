@@ -144,6 +144,29 @@ fn custom_subscription_cap_is_enforced_and_reusable() -> Result<(), Box<dyn Erro
 }
 
 #[test]
+fn dropped_subscription_handle_unregisters_from_bus() -> Result<(), Box<dyn Error>> {
+    let bus = EventBus::default();
+    let first = bus.subscribe(EventFilter::All, Vec::new(), false)?;
+    let first_clone = first.clone();
+    assert_eq!(bus.subscriber_count(), 1);
+
+    drop(first);
+    assert_eq!(
+        bus.subscriber_count(),
+        1,
+        "cloned handles should keep the bus registration alive"
+    );
+
+    drop(first_clone);
+    assert_eq!(bus.subscriber_count(), 0);
+
+    let replacement = bus.subscribe(EventFilter::All, Vec::new(), false)?;
+    assert!(!replacement.id().is_empty());
+    assert_eq!(bus.subscriber_count(), 1);
+    Ok(())
+}
+
+#[test]
 fn invalid_filter_returns_reflex_filter_invalid() {
     let bus = EventBus::default();
     let invalid = EventFilter::And { args: Vec::new() };

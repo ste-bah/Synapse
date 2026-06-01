@@ -527,6 +527,7 @@ impl ReflexScheduler {
             audit_context,
             action_gate,
             tick_index: 0,
+            last_tick_late_signal: None,
         };
 
         let join = thread::Builder::new()

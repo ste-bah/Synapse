@@ -29,7 +29,8 @@ async fn reflex_register_schema_defaults_and_edges() -> anyhow::Result<()> {
 
     let response = client
         .tools_call("reflex_register", valid_register_args("support-reflex"))
-        .await?;
+        .await
+        .context("register initial support-reflex")?;
     let first = structured(&response)?;
     let first_id = first["reflex_id"]
         .as_str()
@@ -41,7 +42,8 @@ async fn reflex_register_schema_defaults_and_edges() -> anyhow::Result<()> {
 
     let duplicate = client
         .tools_call_error("reflex_register", valid_register_args("support-reflex"))
-        .await?;
+        .await
+        .context("register duplicate support-reflex should error")?;
     assert_eq!(duplicate["data"]["code"], "REFLEX_PARAMS_INVALID");
 
     let bad_kind = client
@@ -53,7 +55,8 @@ async fn reflex_register_schema_defaults_and_edges() -> anyhow::Result<()> {
                 "then": {"kind": "action", "action": {"kind": "release_all"}}
             }),
         )
-        .await?;
+        .await
+        .context("register bad kind should error")?;
     assert_eq!(bad_kind["data"]["code"], "REFLEX_KIND_INVALID");
 
     let bad_priority = client
@@ -66,7 +69,8 @@ async fn reflex_register_schema_defaults_and_edges() -> anyhow::Result<()> {
                 "priority": 4_294_967_295_u64
             }),
         )
-        .await?;
+        .await
+        .context("register bad priority should error")?;
     assert_eq!(bad_priority["data"]["code"], "REFLEX_PRIORITY_INVALID");
 
     for index in 1..32 {
@@ -75,7 +79,8 @@ async fn reflex_register_schema_defaults_and_edges() -> anyhow::Result<()> {
                 "reflex_register",
                 valid_register_args(&format!("support-reflex-{index}")),
             )
-            .await?;
+            .await
+            .with_context(|| format!("register support-reflex-{index}"))?;
         let payload = structured(&response)?;
         assert!(
             payload["reflex_id"]
@@ -85,7 +90,8 @@ async fn reflex_register_schema_defaults_and_edges() -> anyhow::Result<()> {
     }
     let capped = client
         .tools_call_error("reflex_register", valid_register_args("support-reflex-cap"))
-        .await?;
+        .await
+        .context("register support-reflex-cap should hit cap")?;
     assert_eq!(capped["data"]["code"], "REFLEX_CAP_REACHED");
 
     let status = client.shutdown().await?;

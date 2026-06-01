@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use synapse_core::{ReflexState, ReflexStatus};
+use synapse_core::{Action, ButtonAction, ReflexState, ReflexStatus};
 
 use crate::{
     MAX_REFLEX_PRIORITY, ReflexCancelOutcome, ReflexError, ReflexResult, ReflexRuntime,
-    ScheduledReflex, scheduler,
+    ScheduledReflex, ScheduledReflexDriver, scheduler,
 };
 
 impl ReflexRuntime {
@@ -121,12 +121,18 @@ impl ReflexRuntime {
     /// persisted.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", reflex_id = %reflex_id))]
     pub fn cancel(&mut self, reflex_id: &str) -> ReflexResult<ReflexCancelOutcome> {
-        let Some(status) = self
+        let status = match self
             .statuses()
             .into_iter()
             .find(|status| status.id == reflex_id)
-        else {
-            return Ok(ReflexCancelOutcome::NotFound);
+        {
+            Some(status) => status,
+            None => {
+                let Some(status) = self.terminal_status_from_audit(reflex_id)? else {
+                    return Ok(ReflexCancelOutcome::NotFound);
+                };
+                return Ok(cancel_outcome_for_terminal_status(status));
+            }
         };
 
         match status.state {
@@ -148,6 +154,7 @@ impl ReflexRuntime {
         if !scheduler.cancel_reflex(reflex_id) {
             return Ok(ReflexCancelOutcome::NotFound);
         }
+        self.dispatch_cancel_release_actions(reflex_id)?;
         self.disabled_reflex_ids.remove(reflex_id);
         self.reflexes
             .retain(|reflex| reflex.reflex_id.as_str() != reflex_id);
@@ -160,6 +167,26 @@ impl ReflexRuntime {
             })?;
         self.write_cancellation_audit(&status)?;
         Ok(ReflexCancelOutcome::Cancelled { status })
+    }
+
+    fn dispatch_cancel_release_actions(&self, reflex_id: &str) -> ReflexResult<()> {
+        let Some(reflex) = self
+            .reflexes
+            .iter()
+            .find(|reflex| reflex.reflex_id.as_str() == reflex_id)
+        else {
+            return Ok(());
+        };
+        for action in cancel_release_actions(reflex) {
+            self.action_handle
+                .try_execute(action)
+                .map_err(|error| ReflexError::ParamsInvalid {
+                    detail: format!(
+                        "cancel release action dispatch failed for reflex {reflex_id}: {error}"
+                    ),
+                })?;
+        }
+        Ok(())
     }
 
     /// Disables every active scheduler reflex for the operator panic hotkey and
@@ -201,6 +228,53 @@ impl ReflexRuntime {
         }
         self.write_disabled_audits_with_reason(&disabled, reason)?;
         Ok(disabled)
+    }
+}
+
+fn cancel_release_actions(reflex: &ScheduledReflex) -> Vec<Action> {
+    match &reflex.driver {
+        ScheduledReflexDriver::HoldMove(params) => params
+            .keys
+            .iter()
+            .rev()
+            .cloned()
+            .map(|key| Action::KeyUp {
+                key,
+                backend: params.backend,
+            })
+            .collect(),
+        ScheduledReflexDriver::HoldButton(params) => match params.button {
+            synapse_core::ReflexButtonTarget::Mouse { button } => vec![Action::MouseButton {
+                button,
+                action: ButtonAction::Up,
+                hold_ms: 0,
+                backend: params.backend,
+            }],
+            synapse_core::ReflexButtonTarget::Pad { pad, button } => {
+                vec![Action::PadButton {
+                    pad,
+                    button,
+                    action: ButtonAction::Up,
+                    hold_ms: 0,
+                }]
+            }
+        },
+        ScheduledReflexDriver::Actions
+        | ScheduledReflexDriver::AimTrack(_)
+        | ScheduledReflexDriver::Combo(_) => Vec::new(),
+    }
+}
+
+fn cancel_outcome_for_terminal_status(status: ReflexStatus) -> ReflexCancelOutcome {
+    match status.state {
+        ReflexState::ActionDenied | ReflexState::Expired => {
+            ReflexCancelOutcome::AlreadyExpired { status }
+        }
+        ReflexState::Cancelled => ReflexCancelOutcome::Cancelled { status },
+        ReflexState::Active
+        | ReflexState::Paused
+        | ReflexState::Disabled
+        | ReflexState::Starved => ReflexCancelOutcome::NotFound,
     }
 }
 

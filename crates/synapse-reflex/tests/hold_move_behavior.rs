@@ -12,8 +12,10 @@ use synapse_core::{
 use synapse_reflex::{
     EventBus, HoldButtonController, HoldButtonOutput, HoldButtonParams, HoldLifetimeContext,
     HoldMoveController, HoldMoveOutput, HoldMoveParams, HoldMovePhase,
-    REFLEX_LIFETIME_EXPIRED_KIND, ReflexError,
+    REFLEX_LIFETIME_EXPIRED_KIND, ReflexError, ReflexRuntime, ScheduledReflex,
 };
+use synapse_storage::Db;
+use tempfile::tempdir;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -131,6 +133,50 @@ fn hold_move_external_cancel_releases_until_cancelled() -> Result<(), Box<dyn st
     assert_eq!(
         after_cancel,
         vec![Action::KeyUp {
+            key,
+            backend: Backend::Software,
+        }]
+    );
+    Ok(())
+}
+
+#[test]
+fn hold_move_reasserts_keydown_while_holding_when_enabled() -> Result<(), Box<dyn std::error::Error>>
+{
+    let key = named_key("w");
+    let mut params = HoldMoveParams::new(key.clone());
+    params.re_assert = true;
+    let mut controller =
+        HoldMoveController::new("hold-reassert", params, ReflexLifetime::UntilCancelled)?;
+    let bus = EventBus::default();
+    let (handle, mut rx) = ActionHandle::channel();
+
+    controller.register_dispatch(&handle)?;
+    let after_register = drain(&mut rx);
+    let early = controller.step_dispatch(&context(1, &[], false), &handle, &bus)?;
+    let after_early = drain(&mut rx);
+    let output = controller.step_dispatch(&context(50, &[], false), &handle, &bus)?;
+    let after_step = drain(&mut rx);
+
+    assert_eq!(
+        after_register,
+        vec![Action::KeyDown {
+            key: key.clone(),
+            backend: Backend::Software,
+        }]
+    );
+    assert_eq!(early, HoldMoveOutput::Holding { elapsed_ms: 1 });
+    assert!(after_early.is_empty());
+    assert_eq!(
+        output,
+        HoldMoveOutput::Reasserted {
+            elapsed_ms: 51,
+            actions: 1
+        }
+    );
+    assert_eq!(
+        after_step,
+        vec![Action::KeyDown {
             key,
             backend: Backend::Software,
         }]
@@ -305,6 +351,52 @@ async fn hold_move_and_external_actions_share_action_emitter_state()
     Ok(())
 }
 
+#[test]
+fn runtime_cancel_hold_move_queues_keyup() -> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempdir()?;
+    let db = Arc::new(Db::open(
+        &temp.path().join("db"),
+        synapse_core::SCHEMA_VERSION,
+    )?);
+    let bus = EventBus::default();
+    let (handle, mut rx) = ActionHandle::channel();
+    let mut runtime = ReflexRuntime::spawn(db, handle, bus)?;
+    let key = named_key("w");
+    let reflex =
+        ScheduledReflex::hold_move("runtime-cancel-hold", HoldMoveParams::new(key.clone()));
+
+    runtime.register(&reflex)?;
+    let down = wait_for_action(
+        &mut rx,
+        |action| matches!(action, Action::KeyDown { key: observed, .. } if observed == &key),
+    )?;
+    let outcome = runtime.cancel("runtime-cancel-hold")?;
+    let up = wait_for_action(
+        &mut rx,
+        |action| matches!(action, Action::KeyUp { key: observed, .. } if observed == &key),
+    )?;
+
+    assert!(matches!(
+        outcome,
+        synapse_reflex::ReflexCancelOutcome::Cancelled { .. }
+    ));
+    assert_eq!(
+        down,
+        Action::KeyDown {
+            key: key.clone(),
+            backend: Backend::Software,
+        }
+    );
+    assert_eq!(
+        up,
+        Action::KeyUp {
+            key,
+            backend: Backend::Software,
+        }
+    );
+    Ok(())
+}
+
 const fn context(elapsed_ms: u64, events: &[Event], cancelled: bool) -> HoldLifetimeContext<'_> {
     HoldLifetimeContext {
         tick_elapsed: Duration::from_millis(elapsed_ms),
@@ -319,6 +411,24 @@ fn drain(rx: &mut mpsc::Receiver<synapse_action::ActionMessage>) -> Vec<Action> 
         actions.push(action);
     }
     actions
+}
+
+fn wait_for_action(
+    rx: &mut mpsc::Receiver<synapse_action::ActionMessage>,
+    predicate: impl Fn(&Action) -> bool,
+) -> Result<Action, Box<dyn std::error::Error>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        while let Ok((action, _ack)) = rx.try_recv() {
+            if predicate(&action) {
+                return Ok(action);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out waiting for action".into());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 async fn wait_for_snapshot(

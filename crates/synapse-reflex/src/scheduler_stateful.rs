@@ -348,6 +348,7 @@ fn step_aim_track(
     index: usize,
     elapsed: Duration,
 ) -> Option<StatefulOutcome> {
+    runtime.aim_track_states.get(index)?.as_ref()?;
     let dispatch_context = dispatch_context(runtime);
     let reflex_id = runtime.reflexes[index].reflex.reflex_id.clone();
     let cursor = match synapse_action::backend::software::cursor_position() {
@@ -427,6 +428,7 @@ fn step_hold_move(
             }
             Ok(
                 HoldMoveOutput::Holding { .. }
+                | HoldMoveOutput::Reasserted { .. }
                 | HoldMoveOutput::Released { .. }
                 | HoldMoveOutput::Idle { .. },
             ) => {}
@@ -442,6 +444,18 @@ fn step_hold_move(
     match controller.step_dispatch_with(&context, &runtime.event_bus, |action| {
         dispatch_context.dispatch_action(&reflex_id, action)
     }) {
+        Ok(HoldMoveOutput::Reasserted {
+            actions: reasserted_actions,
+            ..
+        }) if registered => Some(StatefulOutcome::Fired {
+            actions: actions.saturating_add(reasserted_actions),
+        }),
+        Ok(HoldMoveOutput::Reasserted {
+            actions: reasserted_actions,
+            ..
+        }) => Some(StatefulOutcome::Progressed {
+            actions: reasserted_actions,
+        }),
         Ok(
             HoldMoveOutput::Holding { .. }
             | HoldMoveOutput::Idle { .. }

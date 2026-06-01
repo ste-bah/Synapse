@@ -11,6 +11,7 @@ use super::hold_lifetime::{
 };
 
 const HELD_KEY_REFLEX_SAFETY_GRACE_MS: u64 = 1_000;
+const HOLD_MOVE_REASSERT_INTERVAL_MS: u64 = 50;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HoldMoveParams {
@@ -62,6 +63,10 @@ pub enum HoldMoveOutput {
     Holding {
         elapsed_ms: u128,
     },
+    Reasserted {
+        elapsed_ms: u128,
+        actions: usize,
+    },
     Released {
         reason: HoldReleaseReason,
         actions: usize,
@@ -77,6 +82,7 @@ pub struct HoldMoveController {
     params: HoldMoveParams,
     lifetime: HoldLifetimeTracker,
     phase: HoldMovePhase,
+    last_reassert_at: Option<Duration>,
 }
 
 impl HoldMoveController {
@@ -97,6 +103,7 @@ impl HoldMoveController {
             params,
             lifetime: HoldLifetimeTracker::new(lifetime, Some(held_key_cap()))?,
             phase: HoldMovePhase::Pending,
+            last_reassert_at: None,
         })
     }
 
@@ -144,6 +151,7 @@ impl HoldMoveController {
             HoldMovePhase::Pending => {
                 let actions = self.dispatch_down_with(&mut dispatch_action)?;
                 self.phase = HoldMovePhase::Holding;
+                self.last_reassert_at = Some(self.elapsed());
                 Ok(HoldMoveOutput::Registered { actions })
             }
             HoldMovePhase::Holding => Ok(HoldMoveOutput::Idle {
@@ -187,9 +195,16 @@ impl HoldMoveController {
             });
         }
         let Some(reason) = self.lifetime.step(context) else {
-            return Ok(HoldMoveOutput::Holding {
-                elapsed_ms: self.elapsed().as_millis(),
-            });
+            let elapsed_ms = self.elapsed().as_millis();
+            if self.params.re_assert && self.reassert_due() {
+                let actions = self.dispatch_down_with(&mut dispatch_action)?;
+                self.last_reassert_at = Some(self.elapsed());
+                return Ok(HoldMoveOutput::Reasserted {
+                    elapsed_ms,
+                    actions,
+                });
+            }
+            return Ok(HoldMoveOutput::Holding { elapsed_ms });
         };
         let _output = self.release_with(event_bus, reason, &mut dispatch_action)?;
         Err(lifetime_expired(&self.reflex_id))
@@ -268,6 +283,13 @@ impl HoldMoveController {
         }
         Ok(self.params.keys.len())
     }
+
+    fn reassert_due(&self) -> bool {
+        let Some(last_reassert_at) = self.last_reassert_at else {
+            return true;
+        };
+        self.elapsed().saturating_sub(last_reassert_at) >= reassert_interval()
+    }
 }
 
 fn dispatch(action_handle: &ActionHandle, action: Action) -> ReflexResult<()> {
@@ -280,4 +302,8 @@ fn dispatch(action_handle: &ActionHandle, action: Action) -> ReflexResult<()> {
 
 const fn held_key_cap() -> Duration {
     Duration::from_millis(HELD_KEY_MAX_DURATION_MS + HELD_KEY_REFLEX_SAFETY_GRACE_MS)
+}
+
+const fn reassert_interval() -> Duration {
+    Duration::from_millis(HOLD_MOVE_REASSERT_INTERVAL_MS)
 }

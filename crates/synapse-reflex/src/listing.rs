@@ -137,6 +137,35 @@ impl ReflexRuntime {
             .filter_map(AuditStatusAccumulator::into_terminal_status)
             .collect())
     }
+
+    pub(crate) fn terminal_status_from_audit(
+        &self,
+        reflex_id: &str,
+    ) -> ReflexResult<Option<ReflexStatus>> {
+        let rows = self
+            .db
+            .scan_cf_prefix(cf::CF_REFLEX_AUDIT, audit_key_prefix(reflex_id).as_bytes())
+            .map_err(|error| ReflexError::ParamsInvalid {
+                detail: format!("reflex audit scan failed: {error}"),
+            })?;
+        let mut audits = rows
+            .into_iter()
+            .map(|(_key, value)| {
+                decode_json::<StoredReflexAudit>(&value).map_err(|error| {
+                    ReflexError::ParamsInvalid {
+                        detail: format!("reflex audit decode failed: {error}"),
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        audits.sort_by_key(|audit| (audit.ts_ns, audit.audit_id.clone()));
+
+        let mut accumulator = AuditStatusAccumulator::new(reflex_id.to_owned());
+        for audit in audits {
+            accumulator.record(audit);
+        }
+        Ok(accumulator.into_terminal_status())
+    }
 }
 
 const fn is_non_terminal(state: ReflexState) -> bool {

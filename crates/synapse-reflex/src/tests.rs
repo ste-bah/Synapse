@@ -1,14 +1,17 @@
 use std::{error::Error, sync::Arc};
 
+use serde_json::json;
 use synapse_action::ActionHandle;
-use synapse_core::{Action, EventFilter, ReflexState, StoredReflexAudit, error_codes};
+use synapse_core::{
+    Action, EventFilter, ReflexLifetime, ReflexState, StoredReflexAudit, error_codes,
+};
 use synapse_storage::{Db, cf, decode_json};
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
 use crate::{
-    EventBus, REFLEX_CANCELLED_KIND, REFLEX_DISABLED_KIND, REFLEX_REGISTERED_KIND,
-    ReflexCancelOutcome, ReflexRuntime, ScheduledReflex,
+    EventBus, REFLEX_CANCELLED_KIND, REFLEX_DISABLED_KIND, REFLEX_LIFETIME_EXPIRED_KIND,
+    REFLEX_REGISTERED_KIND, ReflexCancelOutcome, ReflexRuntime, ScheduledReflex, write_audit,
 };
 
 const TEST_SCHEMA_VERSION: u32 = 7;
@@ -95,6 +98,58 @@ fn cancel_registered_reflex_marks_status_and_writes_audit() -> Result<(), Box<dy
 }
 
 #[test]
+fn cancel_expired_reflex_restored_from_audit_reports_already_expired() -> Result<(), Box<dyn Error>>
+{
+    let temp = tempdir()?;
+    let db = Arc::new(Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?);
+    let reflex_id = "reflex-runtime-expired-from-audit";
+    write_audit(
+        &db,
+        &stored_reflex_audit(
+            reflex_id,
+            "audit-registered",
+            100,
+            ReflexState::Active,
+            REFLEX_REGISTERED_KIND,
+        ),
+    )?;
+    write_audit(
+        &db,
+        &stored_reflex_audit(
+            reflex_id,
+            "audit-expired",
+            200,
+            ReflexState::Expired,
+            REFLEX_LIFETIME_EXPIRED_KIND,
+        ),
+    )?;
+    db.flush()?;
+
+    let (action_handle, _action_rx) = ActionHandle::channel();
+    let mut runtime = ReflexRuntime::spawn(Arc::clone(&db), action_handle, EventBus::default())?;
+    assert!(runtime.statuses().is_empty());
+    assert_eq!(
+        runtime
+            .list(true)?
+            .into_iter()
+            .find(|status| status.id == reflex_id)
+            .map(|status| status.state),
+        Some(ReflexState::Expired)
+    );
+
+    let outcome = runtime.cancel(reflex_id)?;
+    let ReflexCancelOutcome::AlreadyExpired { status } = outcome else {
+        panic!("expired audit-only reflex should report already expired");
+    };
+    assert_eq!(status.id, reflex_id);
+    assert_eq!(status.state, ReflexState::Expired);
+
+    let audits = db.scan_cf(cf::CF_REFLEX_AUDIT)?;
+    assert_eq!(audits.len(), 2);
+    Ok(())
+}
+
+#[test]
 fn cancelled_reflex_does_not_resurrect_on_later_registration() -> Result<(), Box<dyn Error>> {
     let temp = tempdir()?;
     let db = Arc::new(Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?);
@@ -145,6 +200,35 @@ fn cancelled_reflex_does_not_resurrect_on_later_registration() -> Result<(), Box
     Ok(())
 }
 
+fn stored_reflex_audit(
+    reflex_id: &str,
+    audit_id: &str,
+    ts_ns: u64,
+    status: ReflexState,
+    kind: &str,
+) -> StoredReflexAudit {
+    StoredReflexAudit {
+        schema_version: TEST_SCHEMA_VERSION,
+        audit_id: audit_id.to_owned(),
+        reflex_id: reflex_id.to_owned(),
+        ts_ns,
+        status,
+        event_id: None,
+        audit_context: None,
+        steps: Vec::new(),
+        error_code: None,
+        details: json!({
+            "kind": kind,
+            "kind_summary": "combo:1 steps",
+            "priority": 100,
+            "lifetime": ReflexLifetime::OneShot,
+            "exclusive": false,
+        }),
+        redacted: false,
+        redactions: Vec::new(),
+    }
+}
+
 #[test]
 fn duplicate_active_reflex_definition_is_rejected() -> Result<(), Box<dyn Error>> {
     let temp = tempdir()?;
@@ -185,6 +269,35 @@ fn duplicate_active_reflex_definition_is_rejected() -> Result<(), Box<dyn Error>
             .count(),
         1
     );
+    Ok(())
+}
+
+#[test]
+fn repeated_on_event_registrations_do_not_leak_scheduler_subscribers() -> Result<(), Box<dyn Error>>
+{
+    let temp = tempdir()?;
+    let db = Arc::new(Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?);
+    let (action_handle, _action_rx) = ActionHandle::channel();
+    let bus = EventBus::default();
+    let mut runtime = ReflexRuntime::spawn(Arc::clone(&db), action_handle, bus.clone())?;
+
+    for index in 0..32 {
+        let reflex = ScheduledReflex::on_event(
+            format!("reflex-runtime-many-{index}"),
+            EventFilter::Kind {
+                kind: format!("support-many-{index}"),
+            },
+            vec![Action::ReleaseAll],
+        );
+        runtime.register(&reflex)?;
+        assert_eq!(
+            bus.subscriber_count(),
+            1,
+            "scheduler restart should leave exactly one live internal subscriber"
+        );
+    }
+
+    assert_eq!(runtime.list(false)?.len(), 32);
     Ok(())
 }
 

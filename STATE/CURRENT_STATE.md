@@ -1,5 +1,133 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T05:33:52-05:00
+- Active issue remains #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes`.
+- Patched the final #612 defect found in manual cancel-expired evidence:
+  - Before patch, `reflex_cancel` returned `cancelled=false, reason=not_found` for an already-expired one-shot combo even though `reflex_list include_expired=true` still read the reflex as `expired`.
+  - Root cause: `reflex_cancel` consulted only the live scheduler status snapshot, while `reflex_list include_expired=true` merges terminal statuses from persisted `CF_REFLEX_AUDIT`.
+  - Patch: `ReflexRuntime::cancel` now checks the same persisted terminal audit status before returning `NotFound`; expired/action-denied terminal statuses return `AlreadyExpired`, and historical cancelled statuses retain the existing cancelled outcome.
+  - Added supporting regression `cancel_expired_reflex_restored_from_audit_reports_already_expired`.
+- Supporting checks passed after the patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-reflex cancel_expired_reflex_restored_from_audit_reports_already_expired --lib -- --nocapture`
+  - `cargo check -p synapse-reflex -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+  - `cargo build --release -p synapse-mcp -j 2`
+- Final broad supporting checks also passed:
+  - `cargo fmt --check`
+  - `git diff --check` (line-ending warnings only)
+  - `cargo check -p synapse-action -j 2`
+  - `cargo check -p synapse-reflex -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-action recovery_log_skips_duplicate_logical_holds --lib -- --nocapture`
+  - `cargo test -p synapse-reflex cancel_expired_reflex_restored_from_audit_reports_already_expired --lib -- --nocapture`
+  - `cargo test -p synapse-reflex --test hold_move_behavior -- --nocapture` (8 passed)
+  - `cargo test -p synapse-reflex --test bus_behavior -- --nocapture` (5 passed)
+  - `cargo test -p synapse-reflex --test scheduler_behavior -- --nocapture` (26 passed)
+  - `cargo test -p synapse-reflex --test combo_behavior -- --nocapture` (7 passed)
+  - `cargo test -p synapse-mcp --test m3_reflex_register_tool -- --nocapture` (1 passed)
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture` (3 passed)
+  - `cargo build --release -p synapse-mcp -j 2`
+- Final release build readback after patch: `target\release\synapse-mcp.exe`, length `46342656`, SHA256 `6898E30AE4FAE8519499B0BB91436E3C0B44D218BE03539EA1D60957C1281BF1`, timestamp `2026-06-01T05:41:10-05:00`.
+- Manual MCP FSV rerun for the cancel already-expired edge is captured under `.runs\612\hold-lifetime-fsv-20260601T0530-cancel-expired`:
+  - Fresh repo-built daemon PID `53088`, bind `127.0.0.1:7838`, isolated DB `.runs\612\hold-lifetime-fsv-20260601T0530-cancel-expired\db`.
+  - Process/socket/auth precondition passed: process path `C:\code\Synapse\target\release\synapse-mcp.exe`; `127.0.0.1:7838 LISTENING`; unauth `/health` returned `401`; auth `/health ok=true`; operator hotkey disabled by env; storage DB path isolated.
+  - Official MCP Inspector strict `tools/list` passed with 80 tools and required `health`, `reflex_register`, `reflex_cancel`, `reflex_list`, `reflex_history`, `storage_inspect`, `release_all`, and `act_combo` present.
+  - SoT before cancel: OS `GetAsyncKeyState(P)=false`, `action_recovery.jsonl` absent, `reflex_list include_expired=true` showed combo `019e82be-1a45-7d00-a817-22a9d7248818` state `expired`, `fire_count=1`, `last_error_code=REFLEX_LIFETIME_EXPIRED`.
+  - Trigger: real MCP Inspector `tools/call reflex_cancel reflex_id=019e82be-1a45-7d00-a817-22a9d7248818`.
+  - SoT after cancel: response `cancelled=false, reason=already_expired`; OS P still false; recovery ledger absent; `reflex_list include_expired=true` still shows the reflex `expired`; `reflex_history` rows are `reflex_lifetime_expired` and `reflex_registered`; `storage_inspect` reads `CF_REFLEX_AUDIT=2`, `CF_ACTION_LOG=1`.
+  - Cleanup `release_all` returned zero releases; daemon PID `53088` stopped; port `7838` has no LISTEN row, only TIME_WAIT.
+- Next: commit/push `[skip ci]`, post #612 RESOLVED evidence, close #612, refresh the open queue, and continue to #613 unless the queue changes.
+
+## 2026-06-01T04:51:40-05:00
+- Active issue remains #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes`.
+- Patched an additional #612 defect found during fresh manual reassert evidence:
+  - `hold_move re_assert=true` kept W down and the recovery ledger bounded, but the cancel-time KeyUp was hidden behind a flood of per-tick reassert KeyDowns.
+  - `reflex_cancel` returned `cancelled=true`; separate physical read after 1s still showed W down and `action_recovery.jsonl` still had one W `key_held` row.
+  - `release_all` then released W and removed the ledger, confirming the defect was in the reassert/cancel interaction rather than the action backend.
+- Root-cause patch:
+  - `HoldMoveController` now rate-limits reassert dispatch to a 50 ms interval instead of every scheduler tick.
+  - Focused controller regression now proves early ticks do not enqueue extra KeyDowns and the interval tick does reassert.
+- Supporting checks passed after the patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-reflex --test hold_move_behavior hold_move_reasserts_keydown_while_holding_when_enabled -- --nocapture`
+  - `cargo test -p synapse-action recovery_log_skips_duplicate_logical_holds --lib -- --nocapture`
+  - `cargo check -p synapse-reflex -j 2`
+  - `cargo check -p synapse-action -j 2`
+  - `cargo build --release -p synapse-mcp -j 2`
+- New release binary readback: `target\release\synapse-mcp.exe`, length `46334976`, SHA256 `8D9AFDC19BD14594C0B42877B6D2DE8F06DB6B7AA354F83709783C4E7701856D`, timestamp `2026-06-01T04:51:32-05:00`.
+- The old patched evidence daemon PID `60632` was stopped; port `7836` has no LISTEN row.
+- Next: launch another fresh #612 daemon with the reassert-throttled binary, rerun strict Inspector tools-list, and redo behavior FSV from a clean baseline.
+
+## 2026-06-01T04:36:30-05:00
+- Active issue remains #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes`.
+- Launched initial isolated #612 daemon PID `47904`, bind `127.0.0.1:7835`, run dir `.runs\612\hold-lifetime-fsv-20260601T042259`, token `synapse-612-token`.
+  - Process/socket/auth readbacks passed via `Get-Process`, `netstat`, unauth `/health=401`, auth `/health ok=true`.
+  - Official MCP Inspector `0.21.2` strict `tools/list` passed with 80 tools including #612 required tools.
+- Manual FSV happy path started:
+  - `hold_move` UntilCancelled registered Shift; OS `GetAsyncKeyState` read Shift down and `action_recovery.jsonl` had one `key_held` row.
+  - `reflex_cancel` then released Shift; OS read Shift up and recovery ledger absent.
+- The `re_assert=true` run exposed a real defect: repeated reassert KeyDowns correctly kept W physically down, but `action_recovery.jsonl` grew with many duplicate `key_held` rows for the same logical key.
+- Patch added in `synapse-action` recovery ledger:
+  - `append_recovery_event_at` now reads the logical ledger before append and skips no-op hold/release events when they would not change recovered state.
+  - Added regression `recovery_log_skips_duplicate_logical_holds`.
+- Supporting checks passed after the patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-action recovery_log_skips_duplicate_logical_holds --lib -- --nocapture`
+  - `cargo check -p synapse-action -j 2`
+  - `cargo build --release -p synapse-mcp -j 2`
+- New release binary readback: `target\release\synapse-mcp.exe`, length `46334976`, SHA256 `1DFD23F3EE49AB5176825096FDFB2D8E59B452454632B65D0C1D5F2D45E2F430`, timestamp `2026-06-01T04:35:53.8023304-05:00`.
+- Old #612 daemon PID `47904` was stopped; port `7835` has no LISTEN row, only TIME_WAIT.
+- Next: launch a fresh #612 daemon on a new port with the patched binary, re-run strict Inspector tools-list, then redo/continue manual FSV including re_assert with bounded ledger readback.
+
+## 2026-06-01T04:11:07-05:00
+- Active issue remains #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes`.
+- Post-compaction wake-up was completed again:
+  - Re-read `docs/AICodingAgentSuperPrompt.md`, `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`, `AGENTS.md`, `STATE/*`, #612, #594, #351, the live open queue, and git status/log/branch.
+  - Live open queue remains #594 plus #595-#604 and #612-#634.
+  - Configured wired `mcp__synapse` client loaded and executed `health`, `storage_inspect`, `reflex_list include_expired=true`, `reflex_history limit=5`, and `observe depth=0`.
+- #612 supporting MCP timeout root cause was found and patched:
+  - `step_aim_track` read cursor position and sampled the M1 aim-track target source before proving the current reflex slot actually had an `aim_track` controller.
+  - With many `on_event` reflexes, every scheduler tick performed a depth-2 UIA snapshot per non-aim reflex; `reflex_register` waits for the old scheduler to stop on each restart, so repeated MCP registrations slowed until the strict client timed out.
+  - Patch now returns from `step_aim_track` before cursor/M1 reads when the slot has no aim-track controller.
+  - Added supporting regression `on_event_ticks_do_not_sample_aim_track_target_source`.
+  - Removed the temporary diagnostic `logs.keep()` / `eprintln!` from `m3_reflex_register_tool.rs`; retained useful timeout context.
+- Supporting checks passed after this patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-reflex --test scheduler_behavior on_event_ticks_do_not_sample_aim_track_target_source -- --nocapture`
+  - `cargo check -p synapse-reflex -j 2`
+  - `cargo test -p synapse-mcp --test m3_reflex_register_tool -- --nocapture`
+  - `cargo fmt --check`
+  - `cargo test -p synapse-reflex --test bus_behavior -- --nocapture` (5 passed)
+  - `cargo test -p synapse-reflex --test scheduler_behavior -- --nocapture` (26 passed)
+  - `cargo test -p synapse-reflex --test hold_move_behavior -- --nocapture` (8 passed)
+  - `cargo test -p synapse-reflex --test combo_behavior -- --nocapture` (7 passed)
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture` (3 passed)
+  - `cargo build --release -p synapse-mcp -j 2`
+  - `git diff --check` exited 0 with line-ending warnings only.
+- Release binary readback: `target\release\synapse-mcp.exe`, length `46333440`, SHA256 `D1029364B92C10FA69690F96AB47DAE9391B1ECE38C0C4FFC0E2CE9C3C86EE20`, timestamp `2026-06-01T09:17:27.5484285Z`.
+- Diff review completed for current #612 source/test/state changes. `STATE/RECOVERY_NOTES.md` was rewritten to a single current #612 resume point to avoid stale compaction instructions.
+- Next: launch an isolated repo-built daemon for manual MCP FSV.
+
+## 2026-06-01T03:37:29-05:00
+- Active issue remains #612 `scenario(stress): hold_move / hold_button / combo reflex lifetimes`.
+- Code inspection found two real #612 gaps before runtime evidence:
+  - `hold_move` accepted and documented `re_assert`, but no runtime code used it.
+  - `reflex_cancel` marked hold reflexes cancelled without queuing the physical key/button release actions, so held inputs could remain down until `release_all` or auto-release.
+- Patch in worktree:
+  - `HoldMoveController` now emits `HoldMoveOutput::Reasserted` and re-dispatches `KeyDown` for configured keys while holding when `re_assert=true`.
+  - Scheduler stateful handling counts reasserted actions as progress without incrementing reflex fire count after the initial hold.
+  - `ReflexRuntime::cancel` now queues physical release actions for active `hold_move` and `hold_button` definitions before removing the reflex and writing the cancellation audit.
+  - Added focused supporting coverage for reasserted keydown and runtime cancel queuing keyup.
+- Supporting checks passed after this patch:
+  - `cargo fmt`
+  - `cargo check -p synapse-reflex -j 2`
+  - `cargo test -p synapse-reflex --test hold_move_behavior -- --nocapture` (8 passed)
+  - `cargo check -p synapse-mcp -j 2`
+- Next: inspect the diff, run broader supporting checks, build release, then launch an isolated #612 daemon for manual MCP FSV.
+
 ## 2026-06-01T03:31:50-05:00
 - #611 `scenario(stress): on_event reflexes - HUD/audio/entity triggers + debounce` is closed.
   - Commit: `5723393 fix(reflex): resolve on-event stress path (#611) [skip ci]`.

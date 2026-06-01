@@ -181,6 +181,14 @@ fn append_recovery_event_at(path: &Path, event: &RecoveryEvent) -> ActionResult<
             detail: "action crash recovery ledger lock poisoned".to_owned(),
         })?;
     ensure_parent_dir(path)?;
+    let before = read_ledger_from_log(path)?;
+    if !before.ignored_trailing_bytes {
+        let mut after = before.clone();
+        after.apply(event.clone());
+        if after == before {
+            return Ok(());
+        }
+    }
     let mut encoded =
         serde_json::to_vec(event).map_err(|error| ActionError::BackendUnavailable {
             detail: format!("encode action crash recovery event failed: {error}"),
@@ -441,6 +449,23 @@ mod tests {
             },
         )?;
 
+        assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_log_skips_duplicate_logical_holds() -> Result<(), Box<dyn Error>> {
+        let dir = TempDir::new()?;
+        let path = dir.path().join("action_recovery.jsonl");
+        let key = named_key("w");
+
+        append_recovery_event_at(&path, &RecoveryEvent::KeyHeld { key: key.clone() })?;
+        append_recovery_event_at(&path, &RecoveryEvent::KeyHeld { key: key.clone() })?;
+        let content = fs::read_to_string(&path)?;
+        assert_eq!(content.lines().count(), 1);
+        assert_eq!(read_ledger_from_log(&path)?.keys, vec![key.clone()]);
+
+        append_recovery_event_at(&path, &RecoveryEvent::KeyReleased { key })?;
         assert!(!path.exists());
         Ok(())
     }
