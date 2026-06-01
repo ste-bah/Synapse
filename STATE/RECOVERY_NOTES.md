@@ -1,12 +1,57 @@
 # RECOVERY NOTES - Synapse
 
-## Current Resume Point - 2026-06-01T07:16:00-05:00
-- #613 is closed and recorded. Implementation commit `e95a656`; evidence/state commit `e792ea0`; RESOLVED evidence https://github.com/ChrisRoyse/Synapse/issues/613#issuecomment-4592454588; closure readback `CLOSED` at `2026-06-01T12:12:21Z`.
-- Active issue is #614 `scenario(stress): reality baseline→delta→audit full loop across all sensors`.
-  - START comment: https://github.com/ChrisRoyse/Synapse/issues/614#issuecomment-4592477025
-  - Live queue after #613 closure: #594 plus #595-#604 and #614-#634.
-  - Post-compaction wired MCP readback succeeded with `health`, `storage_inspect`, `reflex_list include_expired=true`, `reflex_history limit=5`, and `observe depth=0`.
-- Current next action: inspect the reality baseline/delta/audit implementation and existing tests before launching the isolated repo-built #614 daemon.
+## Current Resume Point - 2026-06-01T08:10:00-05:00
+- #614 implementation and manual MCP FSV evidence are captured. Do not relaunch FSV unless final checks or diff review expose a new defect.
+- Current next action: commit with `[skip ci]`, post #614 RESOLVED evidence, close #614, refresh the open issue queue, then continue to the next open issue.
+- Final supporting checks passed after FSV: `cargo fmt --check`; `cargo check -p synapse-mcp -j 2`; `cargo test -p synapse-mcp server::reality::tests --bin synapse-mcp -- --nocapture` (14 passed); `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture` (3 passed); `cargo build --release -p synapse-mcp -j 2`; `git diff --check` with line-ending warnings only.
+- Final release binary readback: `target\release\synapse-mcp.exe`, length `46350848`, SHA256 `18F213F8799AFA64ACCB31F3C3F07F98D40ADF3E081D3C05B256A8FC957BEED4`, `LastWriteTimeUtc=2026-06-01T13:14:38Z`.
+- Main evidence run: `.runs\614\reality-loop-fsv-20260601T0741-patched`.
+  - Repo-built daemon PID `82340`, bind `127.0.0.1:7840`, strict Inspector tools-list 80 tools, baseline/head rows, 18 total SSE `reality_delta` frames, audit row `reality/audit/v1/unprofiled/audit-01780319054227975800-0000000001`, and cursor/error edges captured.
+  - Cleanup stopped PID `82340`, curl PID `82448`, and Luanti PID `36460`; an orphan TCP LISTEN row for `127.0.0.1:7840` still references non-existent PID `82340`, so use a different port if needed.
+- FS-watch evidence run: `.runs\614\fs-watch-fsv-20260601T0805`.
+  - Repo-built daemon PID `77940`, bind `127.0.0.1:7841`, `SYNAPSE_FS_WATCH_ROOT` set to the run `watch` directory, strict Inspector tools-list 80 tools.
+  - Real MCP `act_run_shell` wrote `issue614-fs-watch-marker.txt`; separate file read matched text/hash; `observe_delta` returned `/fs` created-file delta; `storage_inspect` read CF_KV baseline/delta/head rows.
+  - Cleanup stopped PID `77940`; port `7841` has only TIME_WAIT rows.
+
+## #614 Patch Checkpoint
+- Current worktree change: `crates/synapse-mcp/src/server/reality.rs`.
+- Patched:
+  - omitted-profile `reality_baseline` now observes first, selects the active profile, and reuses that profile's existing head/baseline when `epoch_id` is omitted and `force_new_epoch=false`;
+  - `observe_delta.since_epoch` now validates through the same reality key-segment validation used for baseline/audit epochs before stale-epoch comparison;
+  - `capture_reality_observation` now fails closed on `depth=0`, `depth>6`, `max_elements=0`, or `max_elements>500` instead of clamping bypassed invalid values.
+  - `observe_delta` now returns `profile_changed` rebase guidance for a known observed profile switch instead of failing requested-profile validation before the edge can be represented.
+- Focused checks passed:
+  - `cargo fmt`
+  - `cargo test -p synapse-mcp reality_baseline_reuses_observed_profile_when_profile_id_is_omitted --bin synapse-mcp -- --nocapture`
+  - `cargo test -p synapse-mcp observe_delta_edges_return_rebase_or_fail_closed --bin synapse-mcp -- --nocapture`
+  - `cargo test -p synapse-mcp reality_tools_reject_out_of_range_snapshot_params --bin synapse-mcp -- --nocapture`
+  - `cargo test -p synapse-mcp observe_delta_reports_profile_changed_for_requested_head_mismatch --bin synapse-mcp -- --nocapture`
+- Broader supporting checks passed:
+  - `cargo test -p synapse-mcp server::reality::tests --bin synapse-mcp -- --nocapture` (14 passed)
+  - `cargo fmt --check`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+  - `cargo build --release -p synapse-mcp -j 2`
+- Stopped stale pre-patch isolated #614 daemon PID `75352`.
+- Release binary: `target\release\synapse-mcp.exe`, length `46350848`, SHA256 `319FC6F5942ABF272EDCCA7A1EEF7970EE7AE0C7CB6A11A515F681B74F6854A1`, timestamp `2026-06-01T12:39:53Z`.
+- Host-sensor plan: use Luanti (`%LOCALAPPDATA%\synapse\benchmarks\luanti\engine\5.16.1\luanti-5.16.1-win64\bin\luanti.exe`) for real foreground/UIA/HUD/entity/diagnostics deltas, Notepad/clipboard/filesystem tools for additional physical changes, and `--enable-audio` plus a local sound trigger for audio if loopback initializes.
+- Next: launch isolated #614 daemon, strict Inspector `tools/list`, then manual FSV.
+
+## #614 Manual FSV Evidence
+- Main run directory: `.runs\614\reality-loop-fsv-20260601T0741-patched`.
+- FS subrun directory: `.runs\614\fs-watch-fsv-20260601T0805`.
+- Covered feeds:
+  - baseline/head: CF_KV baseline/head rows for `issue614-luanti-20260601T0743` and `issue614-luanti-profiled-20260601T0746`;
+  - foreground/focus/UIA/HUD/entity/audio/clipboard: 12-delta main cursor walk, CF_KV 3->15, SSE stream seq 1..12;
+  - diagnostics: boundary `max_elements=1` changed `elements_truncated=false` to `true`;
+  - filesystem: FS-watch subrun `/fs` created-file delta, CF_KV 2->3, file SHA256 readback;
+  - audit: `reality_audit` persisted audit row and returned drift/rebase guidance.
+- Edge cases:
+  - empty/no-change: `since_seq=12` returned `no_changes`, no CF_KV delta rows;
+  - missing baseline: `profile_id=missing614` returned `missing_baseline`;
+  - stale epoch: old epoch returned `stale_epoch`;
+  - profile change: Notepad foreground returned `profile_changed: head profile unprofiled but observed notepad`;
+  - future/overflow/malformed/structural invalids: future seq, overflow seq, malformed epoch, and `depth=0` all failed closed.
 
 ## #614 Scope
 - Goal: prove the delta-first reality model end to end across every sensor feed.

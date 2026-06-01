@@ -1,5 +1,64 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T08:10:00-05:00
+- Active issue remains #614 `scenario(stress): reality baseline->delta->audit full loop across all sensors`; implementation and manual MCP FSV evidence are captured, final supporting checks/commit/issue closure are next.
+- Patch in worktree remains scoped to `crates/synapse-mcp/src/server/reality.rs`:
+  - omitted-profile `reality_baseline` observes first and reuses the active observed profile head when no epoch is requested;
+  - `observe_delta.since_epoch`, `depth`, and `max_elements` now fail closed server-side;
+  - `observe_delta` returns `profile_changed` rebase guidance for a known observed profile switch instead of failing before the edge is represented.
+- Main #614 manual FSV run: `.runs\614\reality-loop-fsv-20260601T0741-patched`.
+  - Repo-built daemon PID `82340`, binary `C:\code\Synapse\target\release\synapse-mcp.exe`, bind `127.0.0.1:7840`, isolated DB `.runs\614\reality-loop-fsv-20260601T0741-patched\db`, token `synapse-614-token`, audio enabled.
+  - Process/socket/auth/client parity readbacks passed: process path matched repo release binary; socket listened on `127.0.0.1:7840`; unauth `/health=401`; auth `/health ok=true`, storage DB path isolated, audio loopback running; official MCP Inspector `0.21.2` strict `tools/list` returned 80 tools including `reality_baseline`, `observe_delta`, `reality_audit`, `subscribe`, `act_launch`, `act_run_shell`, `act_clipboard`, `audio_tail`, and `storage_inspect`.
+  - Baseline SoT: `reality_baseline` wrote `reality/baseline/v1/unprofiled/issue614-luanti-20260601T0743` and `reality/head/v1/unprofiled`; reuse call returned `created=false`, `reason=existing_baseline_reused`, and CF_KV stayed at 2; forced follow-up baseline `issue614-luanti-profiled-20260601T0746` updated the same unprofiled head because Luanti main-menu title does not match the Luanti gameplay profile regex.
+  - Physical triggers: real MCP `act_launch` started Luanti PID `36460`; real `act_clipboard` wrote marker `issue614-delta-20260601T0748`; real `act_run_shell` moved the window, wrote watched marker files, and played a WAV. Separate OS/file reads confirmed Luanti HWND `0x220eaa`, clipboard marker, file text/hash, and window rect.
+  - Main `observe_delta` from epoch `issue614-luanti-profiled-20260601T0746`, seq 0 returned 12 deltas and published 12 SSE events: foreground/focus/UIA bounds, HUD `luanti.crosshair_contrast` and `luanti.hotbar_contrast`, entity bbox/confidence, `/audio`, and `/clipboard`. Separate `storage_inspect` read CF_KV 3->15 with delta/head sample keys.
+  - SSE SoT: subscription `019e8341-1966-7653-8909-d8d62c6548d0`; `sse-reality-delta-2.out` contains 18 ordered `synapse/event` frames, stream seq 1..18, delta seq 1..18, no lossy frames.
+  - Empty/no-change edge: `observe_delta since_seq=12` with same epoch returned `reason=no_changes`, 0 deltas, 0 published SSE events; separate storage read showed CF_KV unchanged at 15.
+  - Boundary/diagnostics edge: `observe_delta max_elements=1` returned `/diagnostics` changing `elements_truncated=false` to `true` plus a UIA disappearance; CF_KV advanced 15->17 and samples showed delta seq 13/14 plus head.
+  - Cursor/rebase/error edges through strict Inspector:
+    - missing baseline: `profile_id=missing614` returned `baseline_required=true`, `rebase_required=true`, `reason=missing_baseline`;
+    - stale epoch: old epoch `issue614-luanti-20260601T0743` returned `reason=stale_epoch: requested ..., current issue614-luanti-profiled-20260601T0746`;
+    - profile change: real MCP `act_launch notepad.exe` foregrounded Notepad; `observe_delta profile_id=unprofiled since_seq=18` returned `profile_changed: head profile unprofiled but observed notepad`;
+    - future seq `999999`, malformed epoch `bad/epoch`, overflow seq `18446744073709551616`, and `depth=0` all failed closed with MCP errors and CF_KV remained 21.
+  - `reality_audit` with current epoch wrote audit row `reality/audit/v1/unprofiled/audit-01780319054227975800-0000000001`, returned `baseline_status=current`, `drift_status=rebase_required`, compared seq end 18, and separate storage read showed CF_KV advanced 21->22.
+- Filesystem feed subrun: `.runs\614\fs-watch-fsv-20260601T0805`.
+  - Repo-built daemon PID `77940`, bind `127.0.0.1:7841`, isolated DB, token `synapse-614fs-token`, `SYNAPSE_FS_WATCH_ROOT=.runs\614\fs-watch-fsv-20260601T0805\watch`.
+  - Process/socket/auth/tools-list passed: strict Inspector returned 80 tools. Baseline `issue614-fs-watch-20260601T0806` wrote baseline/head rows with FS count 0.
+  - Real MCP `act_run_shell` wrote `issue614-fs-watch-marker.txt`; separate file SoT read confirmed text `issue614-fs-watch-20260601T0806` and SHA256 `F279825DCF260AB5D1B5C3B3F182D95EBE91D677AD3ACFF90612C19842C18053`.
+  - `observe_delta` returned one `/fs` `filesystem_summary_changed` delta from `event_count=0` to created file summary; separate `storage_inspect` read CF_KV 2->3 with baseline, delta, and head sample keys.
+- Cleanup: cancelled main subscriptions, called real `release_all` on both isolated daemons, stopped curl PID `82448`, main daemon PID `82340`, FS daemon PID `77940`, and Luanti PID `36460`. Port `7841` has only TIME_WAIT rows. Windows still reports an orphan `127.0.0.1:7840 LISTENING` row owned by non-existent PID `82340`; `Get-Process`, `tasklist`, and CIM all show no such process, so future isolated runs should use a new port if the kernel row persists.
+- Final supporting checks after FSV passed:
+  - `cargo fmt --check`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp server::reality::tests --bin synapse-mcp -- --nocapture` (14 passed)
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture` (3 passed)
+  - `cargo build --release -p synapse-mcp -j 2`
+  - `git diff --check` exited 0 with line-ending warnings only.
+- Final release binary readback: `target\release\synapse-mcp.exe`, length `46350848`, SHA256 `18F213F8799AFA64ACCB31F3C3F07F98D40ADF3E081D3C05B256A8FC957BEED4`, `LastWriteTimeUtc=2026-06-01T13:14:38Z`.
+- Diff review completed for `crates/synapse-mcp/src/server/reality.rs` and `STATE/*`.
+- Next: commit with `[skip ci]`, post #614 RESOLVED evidence, close #614, refresh the open queue, and continue to the next open issue.
+
+## 2026-06-01T07:40:09-05:00
+- Active issue remains #614 `scenario(stress): reality baseline→delta→audit full loop across all sensors`.
+- Post-compaction wake-up re-read completed: repo doctrine, external wake-up doctrine, `AGENTS.md`, `STATE/*`, #614, #594, #351, live open queue, and git status/log/branch.
+- Live GitHub readback: #614 is still open with only the START comment; parent #594 remains open; #351 is closed and confirms manual FSV/no CI.
+- Git readback before the final #614 patch: `main...origin/main`, HEAD `b66b78e`, modified only `crates/synapse-mcp/src/server/reality.rs` and state files.
+- Wired configured Synapse MCP client readback succeeded: `health ok=true`, `storage_inspect` read CF counts/retention, `reflex_list include_expired=true` and `reflex_history` read the persisted cancelled reflex, and `observe depth=0` read the live VS Code foreground.
+- Additional #614 profile-change edge patch:
+  - `observe_delta` now uses the requested profile only to select the stored head; after observing live state it returns `profile_changed` rebase guidance when the observed profile is known and differs.
+  - If the live observation cannot resolve a profile, it keeps the requested head profile instead of inventing an `unprofiled` profile switch.
+  - Added supporting regression `observe_delta_reports_profile_changed_for_requested_head_mismatch`.
+- Supporting checks passed after the final patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-mcp observe_delta_reports_profile_changed_for_requested_head_mismatch --bin synapse-mcp -- --nocapture`
+  - `cargo test -p synapse-mcp server::reality::tests --bin synapse-mcp -- --nocapture` (14 passed)
+  - `cargo fmt --check`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+- Stopped stale pre-patch isolated #614 daemon PID `75352`; port `127.0.0.1:7840` had no remaining listener afterward.
+- Release build passed after the final patch: `cargo build --release -p synapse-mcp -j 2`; binary `target\release\synapse-mcp.exe`, length `46350848`, SHA256 `319FC6F5942ABF272EDCCA7A1EEF7970EE7AE0C7CB6A11A515F681B74F6854A1`, `LastWriteTimeUtc=2026-06-01T12:39:53Z`.
+- Next: launch a fresh isolated #614 daemon from this rebuilt binary and run manual MCP FSV for baseline, delta, SSE, audit, physical sensor changes, and required edge cases.
+
 ## 2026-06-01T07:13:00-05:00
 - #613 `scenario(stress): subscribe firehose - 4096 ring, EVENTS_DROPPED, one-per-event, deep filters` is closed.
   - Implementation commit: `e95a656 fix(mcp): harden subscribe firehose path (#613) [skip ci]`.
@@ -12,7 +71,16 @@
   - START comment: https://github.com/ChrisRoyse/Synapse/issues/614#issuecomment-4592477025
   - Issue requires proving the delta-first reality model end to end across sensor feeds: baseline rows, foreground/focus/UIA/HUD/entity/audio/clipboard/filesystem/diagnostics changes, ordered `observe_delta` cursor walks, `reality_delta` SSE events, `CF_KV/reality/delta/*` rows, and no-change/missing/stale/future cursor edges.
   - Post-compaction wired Synapse MCP client readback succeeded: `health ok=true`, `storage_inspect` returned CF counts and reality retention prefixes, `reflex_list include_expired=true` returned the prior cancelled reflex, `reflex_history limit=5` read terminal rows, and `observe depth=0` returned the live VS Code foreground/focused SoT.
-  - Next: inspect reality baseline/delta/audit implementation and existing tests, then launch a repo-built isolated daemon for manual MCP FSV.
+  - Code inspection found and patched three #614 reality-tool robustness gaps in `crates/synapse-mcp/src/server/reality.rs`:
+    - `reality_baseline` with omitted `profile_id`, omitted `epoch_id`, and `force_new_epoch=false` checked only `reality/head/v1/unprofiled` before observing, so it could create a fresh epoch for the active observed profile instead of reusing that profile's existing head.
+    - `observe_delta.since_epoch` was compared to the head epoch without validating it as a reality key segment.
+    - `depth` and `max_elements` had JSON-schema ranges but server-side capture silently clamped bypassed out-of-range values instead of failing closed.
+  - Added focused supporting regressions for omitted-profile baseline reuse, invalid `since_epoch`, and out-of-range snapshot params.
+  - Focused checks passed: `cargo fmt`; `cargo test -p synapse-mcp reality_baseline_reuses_observed_profile_when_profile_id_is_omitted --bin synapse-mcp -- --nocapture`; `cargo test -p synapse-mcp observe_delta_edges_return_rebase_or_fail_closed --bin synapse-mcp -- --nocapture`; `cargo test -p synapse-mcp reality_tools_reject_out_of_range_snapshot_params --bin synapse-mcp -- --nocapture`.
+  - Broader supporting checks passed: `cargo test -p synapse-mcp server::reality::tests --bin synapse-mcp -- --nocapture` (13 tests); `cargo fmt --check`; `cargo check -p synapse-mcp -j 2`; `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`.
+  - Release build passed: `cargo build --release -p synapse-mcp -j 2`; binary `target\release\synapse-mcp.exe`, length `46350336`, SHA256 `2C3D7E51AADF23F54B90CE32607813E848CD699327F95BDD4E69F4B6F7164229`, `LastWriteTimeUtc=2026-06-01T12:25:35Z`.
+  - Host-sensor setup readback: Luanti binary exists at `%LOCALAPPDATA%\synapse\benchmarks\luanti\engine\5.16.1\luanti-5.16.1-win64\bin\luanti.exe`, EverQuest and Minecraft launcher binaries also exist, but no game process is currently running; Notepad PID `60556` is currently available. Luanti profile has real capture-derived HUD/entity baseline hooks.
+  - Next: launch a repo-built isolated #614 daemon with audio enabled and run strict Inspector plus manual MCP FSV.
 
 ## 2026-06-01T07:09:36-05:00
 - Active issue #613 `scenario(stress): subscribe firehose - 4096 ring, EVENTS_DROPPED, one-per-event, deep filters` has implementation and manual FSV evidence complete; commit/issue closure is next.

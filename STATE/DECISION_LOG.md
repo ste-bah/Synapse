@@ -168,3 +168,44 @@ Evidence:
 
 Outcome:
 - Next action is implementation/test inspection for reality baseline/delta/audit, followed by a repo-built isolated daemon and manual MCP FSV.
+
+# 2026-06-01T07:36:00-05:00 - #614 fail closed and reuse the observed-profile baseline
+
+Decision: Patch reality-tool server semantics before runtime FSV so omitted-profile baselines reuse the active profile head and invalid cursor/snapshot params fail closed.
+
+Evidence:
+- Code readback showed `reality_baseline` used `UNPROFILED_PROFILE_KEY` for the pre-observe reuse check when `profile_id` was omitted. That misses an existing `reality/head/v1/<observed-profile>` row and can create a new epoch for the active profile.
+- Code readback showed `observe_delta.since_epoch` was not passed through `validate_key_segment` before comparison.
+- Code readback showed `capture_reality_observation` clamped `depth`/`max_elements`, so a schema-bypassing caller could get accepted behavior for invalid params.
+
+Outcome:
+- Added an observed-profile reuse path for omitted-profile `reality_baseline`.
+- Added `since_epoch` validation and server-side `depth`/`max_elements` bounds checks.
+- Added focused regressions for baseline reuse, malformed epoch rejection, and out-of-range snapshot params; all focused checks passed.
+
+# 2026-06-01T07:40:09-05:00 - #614 profile-change must be rebase guidance
+
+Decision: Treat a known observed-profile switch during `observe_delta` as a rebase response, not a request parameter error.
+
+Evidence:
+- #614 explicitly requires a profile-change mid-walk edge.
+- Code readback showed the stored head was selected from the requested `profile_id`, but the subsequent live observation used `select_profile(requested, observation)`, which rejects a known observed mismatch before the `profile_changed` response branch can run.
+- The first narrow patch made the new edge pass, but the broader reality suite showed synthetic observations with no resolved profile were incorrectly treated as `unprofiled` switches.
+
+Outcome:
+- `observe_delta` now compares the stored requested head to the live observed profile only when the observation resolves a profile; unresolved observations retain the requested head profile.
+- Added `observe_delta_reports_profile_changed_for_requested_head_mismatch`.
+- Supporting checks passed: focused profile-change regression, all 14 reality tests, fmt check, `cargo check -p synapse-mcp -j 2`, schema sanitize tests, and release build.
+
+# 2026-06-01T08:10:00-05:00 - #614 filesystem feed required an FS-watch subrun
+
+Decision: Treat the missing `/fs` delta from the main #614 daemon as setup state, not acceptance failure, and prove the filesystem sensor with a second isolated repo-built daemon configured with `SYNAPSE_FS_WATCH_ROOT`.
+
+Evidence:
+- The main daemon was launched without `SYNAPSE_FS_WATCH_ROOT`, so `populate_fs_recent` had no watcher and the main `observe_delta` correctly produced foreground/focus/UIA/HUD/entity/audio/clipboard/diagnostics deltas but no `/fs` delta.
+- Code readback showed the filesystem sensor is enabled only from the `SYNAPSE_FS_WATCH_ROOT` environment variable.
+- D4 says a missing configured-host prerequisite is acquisition/setup work, not a blocker.
+
+Outcome:
+- Launched `.runs\614\fs-watch-fsv-20260601T0805` on `127.0.0.1:7841` with `SYNAPSE_FS_WATCH_ROOT` set to the run watch directory.
+- Strict Inspector tools-list returned 80 tools; baseline/head rows were written; real MCP `act_run_shell` created a known file; separate file text/hash readback matched; `observe_delta` returned `/fs` `filesystem_summary_changed`; `storage_inspect` read CF_KV baseline/delta/head rows.

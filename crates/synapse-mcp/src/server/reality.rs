@@ -512,41 +512,44 @@ impl SynapseService {
         &self,
         params: &RealityBaselineParams,
     ) -> Result<RealityBaselineResponse, ErrorData> {
-        let existing_profile_key = params
+        let requested_profile_key = params
             .profile_id
             .as_deref()
             .map(validate_key_segment)
-            .transpose()?
-            .unwrap_or_else(|| UNPROFILED_PROFILE_KEY.to_owned());
-        if !params.force_new_epoch
-            && params.epoch_id.is_none()
-            && let Some(head) = self.read_reality_head(&existing_profile_key)?
-        {
-            let baseline = self.read_baseline_row(&head.baseline_row_key)?;
-            let head_readback = self.readback_kv_row(&head_key(&head.profile_key))?;
-            let baseline_readback = self.readback_kv_row(&head.baseline_row_key)?;
-            return Ok(RealityBaselineResponse {
-                ok: true,
-                created: false,
-                profile_key: head.profile_key.clone(),
-                baseline,
-                baseline_required: false,
-                rebase_required: false,
-                reason: Some("existing_baseline_reused".to_owned()),
-                size_bytes: head.size_bytes,
-                size_estimate_tokens: head.size_estimate_tokens,
-                head,
-                readback_rows: vec![baseline_readback, head_readback],
-            });
+            .transpose()?;
+        let mut captured_for_new_baseline = None;
+        if !params.force_new_epoch && params.epoch_id.is_none() {
+            if let Some(profile_key) = requested_profile_key.as_deref() {
+                if let Some(head) = self.read_reality_head(profile_key)? {
+                    return self.existing_baseline_response(head);
+                }
+            } else {
+                let captured = self.capture_reality_observation(
+                    &params.include,
+                    params.depth,
+                    params.max_elements,
+                    "reality_baseline",
+                )?;
+                let profile = select_profile(None, &captured.observation)?;
+                if let Some(head) = self.read_reality_head(&profile.profile_key)? {
+                    return self.existing_baseline_response(head);
+                }
+                captured_for_new_baseline = Some((captured, profile));
+            }
         }
 
-        let captured = self.capture_reality_observation(
-            &params.include,
-            params.depth,
-            params.max_elements,
-            "reality_baseline",
-        )?;
-        let profile = select_profile(params.profile_id.as_deref(), &captured.observation)?;
+        let (captured, profile) = if let Some(captured) = captured_for_new_baseline {
+            captured
+        } else {
+            let captured = self.capture_reality_observation(
+                &params.include,
+                params.depth,
+                params.max_elements,
+                "reality_baseline",
+            )?;
+            let profile = select_profile(params.profile_id.as_deref(), &captured.observation)?;
+            (captured, profile)
+        };
         let profile_id = profile.profile_id;
         let profile_key = profile.profile_key;
         let epoch_id = params
@@ -602,6 +605,28 @@ impl SynapseService {
         })
     }
 
+    fn existing_baseline_response(
+        &self,
+        head: RealityHeadRow,
+    ) -> Result<RealityBaselineResponse, ErrorData> {
+        let baseline = self.read_baseline_row(&head.baseline_row_key)?;
+        let head_readback = self.readback_kv_row(&head_key(&head.profile_key))?;
+        let baseline_readback = self.readback_kv_row(&head.baseline_row_key)?;
+        Ok(RealityBaselineResponse {
+            ok: true,
+            created: false,
+            profile_key: head.profile_key.clone(),
+            baseline,
+            baseline_required: false,
+            rebase_required: false,
+            reason: Some("existing_baseline_reused".to_owned()),
+            size_bytes: head.size_bytes,
+            size_estimate_tokens: head.size_estimate_tokens,
+            head,
+            readback_rows: vec![baseline_readback, head_readback],
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn observe_reality_delta(
         &self,
@@ -609,6 +634,11 @@ impl SynapseService {
     ) -> Result<ObserveDeltaResponse, ErrorData> {
         let requested_profile_key = params
             .profile_id
+            .as_deref()
+            .map(validate_key_segment)
+            .transpose()?;
+        let requested_since_epoch = params
+            .since_epoch
             .as_deref()
             .map(validate_key_segment)
             .transpose()?;
@@ -630,11 +660,11 @@ impl SynapseService {
         let Some(mut head) = self.read_reality_head(&head_profile_key)? else {
             return Ok(missing_baseline_response(
                 head_profile_key,
-                params.since_epoch,
+                requested_since_epoch,
                 params.since_seq,
             ));
         };
-        if let Some(epoch) = params.since_epoch.as_deref()
+        if let Some(epoch) = requested_since_epoch.as_deref()
             && epoch != head.epoch_id
         {
             return Ok(stale_epoch_response(&head, epoch, params.since_seq));
@@ -659,7 +689,16 @@ impl SynapseService {
                 params.max_elements,
                 "observe_delta",
             )?;
-            let profile = select_profile(params.profile_id.as_deref(), &captured.observation)?;
+            // The requested profile selected the stored head. Compare the live
+            // observation to it so known profile switches become rebase
+            // guidance. If the observation cannot resolve a profile, keep the
+            // requested head profile instead of inventing an unprofiled switch.
+            let observed_profile = select_profile(None, &captured.observation)?;
+            let profile = if params.profile_id.is_some() && observed_profile.profile_id.is_none() {
+                select_profile(params.profile_id.as_deref(), &captured.observation)?
+            } else {
+                observed_profile
+            };
             (captured, profile)
         };
         if profile.profile_key != head.profile_key {
@@ -911,8 +950,8 @@ impl SynapseService {
         max_elements: usize,
         reason: &'static str,
     ) -> Result<CapturedReality, ErrorData> {
-        let depth = depth.clamp(1, MAX_DEPTH);
-        let max_elements = max_elements.clamp(1, MAX_ELEMENTS);
+        let depth = bounded_depth(depth)?;
+        let max_elements = bounded_max_elements(max_elements)?;
         let params = ObserveParams {
             include: include.to_vec(),
             depth: Some(depth),
@@ -2847,6 +2886,24 @@ fn bounded_max_deltas(value: u32) -> Result<usize, ErrorData> {
     usize::try_from(value).map_err(|_| params_error("max_deltas does not fit usize"))
 }
 
+fn bounded_depth(value: u32) -> Result<u32, ErrorData> {
+    if value == 0 || value > MAX_DEPTH {
+        return Err(params_error(format!(
+            "depth must be between 1 and {MAX_DEPTH}"
+        )));
+    }
+    Ok(value)
+}
+
+fn bounded_max_elements(value: usize) -> Result<usize, ErrorData> {
+    if value == 0 || value > MAX_ELEMENTS {
+        return Err(params_error(format!(
+            "max_elements must be between 1 and {MAX_ELEMENTS}"
+        )));
+    }
+    Ok(value)
+}
+
 fn source_surfaces(source_refs: &[SourceRef]) -> Vec<RealitySourceSurface> {
     let mut surfaces = Vec::new();
     for source in source_refs {
@@ -3310,6 +3367,19 @@ mod tests {
                 .is_some_and(|value| value.starts_with("stale_epoch"))
         );
 
+        let invalid_epoch = service
+            .observe_delta(Parameters(ObserveDeltaParams {
+                profile_id: Some("synthetic".to_owned()),
+                since_epoch: Some("bad/epoch".to_owned()),
+                since_seq: Some(0),
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+                max_deltas: DEFAULT_MAX_DELTAS,
+            }))
+            .await;
+        assert!(invalid_epoch.is_err());
+
         let invalid = service
             .observe_delta(Parameters(ObserveDeltaParams {
                 profile_id: Some("synthetic".to_owned()),
@@ -3322,6 +3392,38 @@ mod tests {
             }))
             .await;
         assert!(invalid.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reality_tools_reject_out_of_range_snapshot_params() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        install_synthetic_input(&service, synthetic_input("Window A"))?;
+
+        let invalid_depth = service
+            .reality_baseline(Parameters(RealityBaselineParams {
+                profile_id: Some("synthetic".to_owned()),
+                epoch_id: Some("invalid-depth-epoch".to_owned()),
+                force_new_epoch: true,
+                include: Vec::new(),
+                depth: 0,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+            }))
+            .await;
+        assert!(invalid_depth.is_err());
+
+        let invalid_max_elements = service
+            .reality_baseline(Parameters(RealityBaselineParams {
+                profile_id: Some("synthetic".to_owned()),
+                epoch_id: Some("invalid-max-elements-epoch".to_owned()),
+                force_new_epoch: true,
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: MAX_ELEMENTS + 1,
+            }))
+            .await;
+        assert!(invalid_max_elements.is_err());
         Ok(())
     }
 
@@ -3372,6 +3474,100 @@ mod tests {
                 .iter()
                 .any(|delta| delta.kind == "foreground_changed")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn observe_delta_reports_profile_changed_for_requested_head_mismatch()
+    -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let profile_dir = temp.path().join("profiles");
+        fs::create_dir_all(&profile_dir)?;
+        write_profile(
+            &profile_dir.join("synthetic.toml"),
+            "synthetic",
+            "single_player",
+        )?;
+        write_profile(&profile_dir.join("other.toml"), "other", "single_player")?;
+        let service = service_with_profile_dir(temp.path(), &profile_dir)?;
+        install_synthetic_input(&service, synthetic_input("Synthetic Window"))?;
+        service
+            .reality_baseline(Parameters(RealityBaselineParams {
+                profile_id: Some("synthetic".to_owned()),
+                epoch_id: Some("profile-change-epoch".to_owned()),
+                force_new_epoch: true,
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+            }))
+            .await?;
+
+        let mut other = synthetic_input("Other Window");
+        other.foreground.process_name = "other.exe".to_owned();
+        other.foreground.process_path = "C:\\Synthetic\\other.exe".to_owned();
+        install_synthetic_input(&service, other)?;
+        let response = service
+            .observe_delta(Parameters(ObserveDeltaParams {
+                profile_id: Some("synthetic".to_owned()),
+                since_epoch: Some("profile-change-epoch".to_owned()),
+                since_seq: Some(0),
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+                max_deltas: DEFAULT_MAX_DELTAS,
+            }))
+            .await?;
+        assert!(response.0.rebase_required);
+        assert_eq!(response.0.profile_key.as_deref(), Some("synthetic"));
+        assert!(response.0.reason.as_deref().is_some_and(
+            |value| value == "profile_changed: head profile synthetic but observed other"
+        ));
+        assert!(response.0.deltas.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reality_baseline_reuses_observed_profile_when_profile_id_is_omitted()
+    -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let profile_dir = temp.path().join("profiles");
+        fs::create_dir_all(&profile_dir)?;
+        write_profile(
+            &profile_dir.join("synthetic.toml"),
+            "synthetic",
+            "single_player",
+        )?;
+        let service = service_with_profile_dir(temp.path(), &profile_dir)?;
+        install_synthetic_input(&service, synthetic_input("Window A"))?;
+        let baseline = service
+            .reality_baseline(Parameters(RealityBaselineParams {
+                profile_id: None,
+                epoch_id: Some("reuse-observed-profile-epoch".to_owned()),
+                force_new_epoch: true,
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+            }))
+            .await?;
+        assert!(baseline.0.created);
+        assert_eq!(baseline.0.profile_key, "synthetic");
+
+        install_synthetic_input(&service, synthetic_input("Window B"))?;
+        let reused = service
+            .reality_baseline(Parameters(RealityBaselineParams {
+                profile_id: None,
+                epoch_id: None,
+                force_new_epoch: false,
+                include: Vec::new(),
+                depth: DEFAULT_DEPTH,
+                max_elements: DEFAULT_MAX_ELEMENTS,
+            }))
+            .await?;
+        assert!(!reused.0.created);
+        assert_eq!(reused.0.profile_key, "synthetic");
+        assert_eq!(reused.0.baseline.epoch_id, "reuse-observed-profile-epoch");
+        assert_eq!(reused.0.reason.as_deref(), Some("existing_baseline_reused"));
+        assert_eq!(reused.0.head.head_seq, 0);
         Ok(())
     }
 
