@@ -457,3 +457,28 @@ Evidence:
 
 Outcome:
 - Next action is implementation/test inspection before launching a repo-built isolated daemon for #623 manual MCP FSV.
+
+# 2026-06-01T15:03:43-05:00 - #623 audit/replay evidence passes; docs corrected
+
+Decision: Resolve #623 after final supporting checks with documentation corrections only.
+
+Evidence:
+- The audit/export runtime behavior matched the existing implementation: consent is a `CF_KV` row, strict redaction is fail-closed, and exported bundle SoTs are physical files with response/file hash parity.
+- The docs were stale for `replay_record`: `docs/computergames/05_mcp_tool_surface.md` still described a `verb=start/stop/status` API and `docs/systemspec/13_mcp_tool_reference.md` omitted `observations_skipped`. The runtime and tests use `duration_ms`, `target`, `format`, and `path`, so the docs were corrected.
+- Manual MCP FSV captured audit consent/export, redaction marker removal, max row/byte caps, replay `target=both` with both observation and event JSONL records, zero-duration replay, and invalid replay path/target/format edges.
+- A second isolated daemon with `SYNAPSE_HTTP_SSE_MANUAL=1` was necessary to publish deterministic known events into the same EventBus used by `replay_record`; the replay trigger itself remained real Inspector MCP `tools/call`, and JSONL file bytes were the verdict.
+
+Outcome:
+- Product code did not require a patch. Final supporting checks, state commit, RESOLVED comment, and closure are next.
+
+# 2026-06-01T15:11:30-05:00 - #623 final checks passed
+
+Decision: Commit #623 docs/state after successful supporting checks.
+
+Evidence:
+- `cargo fmt --check`, `git diff --check`, `scripts\check_docs.ps1`, `cargo check -p synapse-mcp -j 2`, focused replay-record test, schema-sanitize test, tools-list test, and release build all passed.
+- The docs checker initially exposed a real missing `REFLEX_DEBOUNCED` entry in `docs/computergames/06_data_schemas.md`; the docs entry was added and the checker then passed.
+- Final release binary readback SHA256 is `498E3164F4B795E0ABD3A9E7E2AE678810D532F84B35E5381456277C13628476`.
+
+Outcome:
+- #623 is ready for commit, RESOLVED comment, and closure.

@@ -1,5 +1,32 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T15:03:43-05:00
+- Active issue #623 has behavior FSV evidence and final supporting checks complete. Commit, RESOLVED comment, closure, and queue continuation remain.
+- Worktree changes are docs only:
+  - `docs/computergames/05_mcp_tool_surface.md`
+  - `docs/computergames/06_data_schemas.md`
+  - `docs/systemspec/13_mcp_tool_reference.md`
+- Evidence directories:
+  - Audit/export: `.runs\623\audit-replay-fsv-20260601T1445`
+  - Replay/events: `.runs\623\replay-events-fsv-20260601T1457`
+- Audit/export evidence:
+  - daemon PID `38756`, bind `127.0.0.1:7851`, repo release binary, strict Inspector tools-list 80.
+  - consent row `CF_KV/audit_export/v1/consent/vscode` enabled strict local-only.
+  - happy export hashes: manifest `329FD52280770C941008A26E6C44C8352FB89C3108ABEA62090A568142D30CAC`, rows `1099D371C32B72CE2326BA751D06BD973F50A1001140232F787199D561F5950C`, report `716D862AC76FE5FE30C3273202AD905063A4B4E7B99717D705C8F52417CCAF6B`.
+  - redaction report: 7 rows, 90 fields, zero raw sensitive marker hits.
+  - edges: no consent, redaction override, `max_rows=1`, `max_row_bytes=100`, empty output path.
+- Replay evidence:
+  - daemon PID `11076`, bind `127.0.0.1:7852`, repo release binary, `SYNAPSE_HTTP_SSE_MANUAL=1`, strict Inspector tools-list 80.
+  - `replay_record target=both` happy file `issue623-both-manual-event-3.jsonl`: 23295 bytes, SHA256 `1AE400B7A81EAF3BA99FDA510299EFD8A7CB4A11778F624FC64A24FAF5FE9F31`, 7 lines = 4 observations + 3 events, event seqs `6231457005..6231457007`, marker values present.
+  - `duration_ms=0` file `issue623-empty.jsonl`: 0 bytes, empty SHA256 `E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855`.
+  - invalid target, invalid format, empty path, and traversal path failed closed and wrote no extra files.
+  - both isolated daemons were released/stopped; ports `7851` and `7852` are closed.
+- Final supporting checks passed: `cargo fmt --check`; `git diff --check`; `scripts\check_docs.ps1`; `cargo check -p synapse-mcp -j 2`; `cargo test -p synapse-mcp --test m3_replay_record_tool -- --nocapture`; `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`; `cargo test -p synapse-mcp --test m3_tools_list -- --nocapture`; `cargo build --release -p synapse-mcp -j 2`.
+- Final release binary SHA256 `498E3164F4B795E0ABD3A9E7E2AE678810D532F84B35E5381456277C13628476`, length `46406144`, `LastWriteTimeUtc=2026-06-01T20:11:10.6731953Z`.
+- Exact next actions:
+  1. Commit docs/state with `[skip ci]`.
+  2. Post #623 RESOLVED evidence, close #623, refresh queue, and continue.
+
 ## Current Resume Point - 2026-06-01T14:31:53-05:00
 - #622 is closed.
   - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/622#issuecomment-4595815302

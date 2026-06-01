@@ -96,3 +96,5 @@
 - 2026-06-01T13:43:30-05:00 iteration #621-close-622-start: pushed #621 evidence commit f9ab56e, posted RESOLVED evidence, closed #621, refreshed queue, claimed #622, and posted #622 START.
 - 2026-06-01T14:28:42-05:00 iteration #622-manual-fsv-checks: completed isolated repo-built MCP evidence for authoring generate/list/inspect/accept/reject/export, zero/invalid/boundary edges, 10k-row max, quality refresh/stale/invalid edges, cleanup, and final supporting checks/release build.
 - 2026-06-01T14:31:53-05:00 iteration #622-close-623-start: pushed #622 evidence commit 9c855fc, posted RESOLVED evidence, closed #622, refreshed queue, claimed #623, and posted #623 START.
+- 2026-06-01T15:03:43-05:00 iteration #623-manual-fsv: completed isolated repo-built MCP evidence for audit consent/export/redaction/caps and replay JSONL observations+events/zero/invalid edges; stopped both #623 daemons and recorded docs-only runtime API correction.
+- 2026-06-01T15:11:30-05:00 iteration #623-final-checks: final fmt/diff/docs/check/replay/schema/tool-list/release build passed; release synapse-mcp SHA256 498E3164F4B795E0ABD3A9E7E2AE678810D532F84B35E5381456277C13628476.

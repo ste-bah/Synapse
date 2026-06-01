@@ -2710,20 +2710,40 @@ M3 subsystem status strings are `initializing`, `ok`, `degraded_latency`,
 
 ### 3.30 `replay_record`
 
+Records observations, events, or both to a local JSONL file under the replay
+root. Relative paths are resolved under `%LOCALAPPDATA%/synapse/replays`; an
+absolute path is accepted only when it remains under that same root after
+normalization.
+
 ```json
 {
   "name": "replay_record",
   "input_schema": {
     "type": "object",
     "additionalProperties": false,
-    "required": ["verb"],
+    "required": ["duration_ms"],
     "properties": {
-      "verb": {"enum": ["start","stop","status"]},
-      "session_id": {"type": "string"}
+      "target": {
+        "type": "string",
+        "enum": ["observations", "events", "both"],
+        "default": "observations"
+      },
+      "format": {
+        "type": "string",
+        "enum": ["jsonl"],
+        "default": "jsonl"
+      },
+      "duration_ms": {"type": "integer", "minimum": 0},
+      "path": {"type": "string"}
     }
   }
 }
 ```
+
+The response includes the physical path, `records_written`,
+`observations_skipped`, and byte length. `duration_ms=0` creates/flushed an
+empty JSONL file with zero records. Invalid target, invalid format, empty path,
+and path traversal outside the replay root fail closed.
 
 ### 3.31 `storage_inspect`
 

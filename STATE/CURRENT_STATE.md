@@ -1,5 +1,44 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T15:03:43-05:00
+- Active issue #623 `scenario(stress): audit consent + bundle redaction + replay_record` has manual MCP FSV behavior evidence and final supporting checks complete; commit, RESOLVED comment, closure, and queue continuation are next.
+- Worktree changes for #623 are documentation corrections only:
+  - `docs/computergames/05_mcp_tool_surface.md`: `replay_record` now documents the actual `duration_ms`/`target`/`format`/`path` schema, replay root path rules, response fields, and fail-closed inputs.
+  - `docs/systemspec/13_mcp_tool_reference.md`: `ReplayRecordResponse` now includes `observations_skipped`.
+  - `docs/computergames/06_data_schemas.md`: supporting docs-check fix adds the missing `REFLEX_DEBOUNCED` error-code entry.
+- Audit/export FSV run directory: `.runs\623\audit-replay-fsv-20260601T1445`.
+  - Repo-built daemon PID `38756`, binary `C:\code\Synapse\target\release\synapse-mcp.exe`, bind `127.0.0.1:7851`, isolated DB `.runs\623\audit-replay-fsv-20260601T1445\db`, isolated token `synapse-623-token`.
+  - MCP precondition passed: process/socket/auth readback; unauth `/health=401`; auth `/health=200`; official MCP Inspector strict `tools/list` exited 0 with 80 tools and #623 tools present. Inspector stderr had only `unknown format "uint*"` warnings.
+  - Export without consent failed closed with `audit export requires an enabled local consent row`; storage stayed empty and output dir absent.
+  - `audit_export_consent_set profile_id=vscode enabled=true redaction_policy=strict` wrote consent row `CF_KV/audit_export/v1/consent/vscode`; separate `storage_inspect` read `CF_KV=1` and row fields `enabled=true`, allowed `["strict"]`, `external_sharing_allowed=false`, note `issue623 manual consent strict local-only`.
+  - Real audit activity came from real MCP `observe` and `act_press keys=["shift"] hold_ms=20`; separate storage readback moved `CF_ACTION_LOG=0 -> 2`, `CF_EVENTS=1`, `CF_OBSERVATIONS=1`, `CF_SESSIONS=1`.
+  - Synthetic sensitive audit rows were inserted through real MCP `storage_put_probe_rows` into `CF_ACTION_LOG` to make redaction verdicts deterministic. Raw SoT before export contained known markers `ISSUE623_SECRET_TEXT_MARKER`, `ISSUE623_TOKEN_MARKER`, `ISSUE623_SECRET_WINDOW_MARKER`, `ISSUE623_CONTEXT_TITLE_MARKER`, `issue623-user@example.invalid`, and `C:\Users\hotra\secret\issue623`.
+  - Happy `audit_export_bundle` wrote `.runs\623\audit-replay-fsv-20260601T1445\exports\happy` with 7 rows scanned/exported and 90 fields redacted.
+    - `manifest.json` length 2169, SHA256 `329FD52280770C941008A26E6C44C8352FB89C3108ABEA62090A568142D30CAC`.
+    - `rows.json` length 10600, SHA256 `1099D371C32B72CE2326BA751D06BD973F50A1001140232F787199D561F5950C`.
+    - `redaction_report.json` length 927, SHA256 `716D862AC76FE5FE30C3273202AD905063A4B4E7B99717D705C8F52417CCAF6B`.
+    - Direct file scan found zero raw marker hits. Redaction report read `rows_redacted=7`, `fields_redacted=90`, classes `high_cardinality_id=31`, `path=26`, `text=5`, `timing=7`, `user_identifier=5`, `window_title=16`.
+  - Audit/export edges passed: redaction policy `none` failed closed; `max_rows=1` exported exactly one row and response/file hash matched `sha256:35a00c1926d9055460c55bb1d4a05b0eebcfeced918cd80ec673284f22d2723b`; small `max_row_bytes=100` failed closed before writing; empty `output_path` failed closed.
+- Replay/event FSV run directory: `.runs\623\replay-events-fsv-20260601T1457`.
+  - Repo-built daemon PID `11076`, binary `C:\code\Synapse\target\release\synapse-mcp.exe`, bind `127.0.0.1:7852`, isolated DB `.runs\623\replay-events-fsv-20260601T1457\db`, isolated token `synapse-623-events-token`, and `SYNAPSE_HTTP_SSE_MANUAL=1` for manual event publication into the daemon's EventBus.
+  - MCP precondition passed: process/socket/auth readback; unauth `/health=401`; auth `/health=200`; official MCP Inspector strict `tools/list` exited 0 with 80 tools including `replay_record`, `storage_inspect`, and `subscribe`.
+  - `replay_record target=both format=jsonl duration_ms=3500 path=issue623-both-manual-event-3.jsonl` ran through real Inspector `tools/call` while five known events were POSTed to `/events`. Publish readback showed seq `6231457005..6231457007` matched and queued.
+  - Direct replay JSONL SoT readback: `issue623-both-manual-event-3.jsonl`, 23295 bytes, SHA256 `1AE400B7A81EAF3BA99FDA510299EFD8A7CB4A11778F624FC64A24FAF5FE9F31`, 7 lines: 4 `observation` records and 3 `event` records. Event seqs `6231457005`, `6231457006`, `6231457007`, kind `issue623.replay_event`, markers `issue623-event-marker-6231457005..7007`.
+  - Replay `duration_ms=0` edge wrote `issue623-empty.jsonl`, 0 bytes, SHA256 `E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855`, response `records_written=0`, `observations_skipped=0`.
+  - Replay invalid edges failed closed and wrote no files: `target=bogus`, `format=csv`, empty `path`, and traversal `path=..\issue623-outside.jsonl`. Final replay dir contained only the happy and empty JSONL files; final isolated storage counts stayed all zero.
+  - Cleanup: real Inspector `release_all` returned zero held keys/buttons/pads on both #623 daemons; PIDs `38756` and `11076` stopped; ports `7851` and `7852` closed. Log scan found no panic/internal-error matches; only expected operator-hotkey unavailable messages from running isolated daemons alongside the active chat runtime.
+- Final supporting checks passed:
+  - `cargo fmt --check`
+  - `git diff --check` (line-ending warnings only)
+  - `scripts\check_docs.ps1`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp --test m3_replay_record_tool -- --nocapture`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+  - `cargo test -p synapse-mcp --test m3_tools_list -- --nocapture`
+  - `cargo build --release -p synapse-mcp -j 2`
+- Final release binary readback: `target\release\synapse-mcp.exe`, length `46406144`, SHA256 `498E3164F4B795E0ABD3A9E7E2AE678810D532F84B35E5381456277C13628476`, `LastWriteTimeUtc=2026-06-01T20:11:10.6731953Z`.
+- Current next actions: commit with `[skip ci]`, post #623 RESOLVED evidence, close #623, refresh the queue, and claim the next issue.
+
 ## 2026-06-01T14:31:53-05:00
 - #622 `scenario(stress): authoring loop - generate/accept/reject/export + quality_refresh` is closed.
   - No product-code patch was required.

@@ -1403,7 +1403,7 @@ signals.
 | `duration_ms` | `u32` | yes | — | `>= 0`; how long to record |
 | `path` | `Option<String>` | no | — | Relative paths joined to `replay_root()`; lexical-normalized; must stay under root |
 
-**Returns:** `ReplayRecordResponse { path: String, records_written: u64, bytes: u64 }`.
+**Returns:** `ReplayRecordResponse { path: String, records_written: u64, observations_skipped: u64, bytes: u64 }`.
 
 Recording cadence: observations sampled every `OBSERVATION_SAMPLE_INTERVAL = 250 ms`; events drained every `EVENT_DRAIN_INTERVAL = 20 ms`.
 

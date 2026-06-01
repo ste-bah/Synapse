@@ -1316,6 +1316,7 @@ REFLEX_DISABLED_BY_OPERATOR
 REFLEX_LIFETIME_EXPIRED
 REFLEX_RECURSION_LIMIT
 REFLEX_ACTION_PERMISSION_DENIED
+REFLEX_DEBOUNCED
 ```
 
 M4 reflex-path codes:
@@ -1323,6 +1324,7 @@ M4 reflex-path codes:
 | Code | Trigger path |
 |---|---|
 | `REFLEX_ACTION_PERMISSION_DENIED` | Combo or event-triggered reflex suppresses an action because the active profile or session policy denies it. |
+| `REFLEX_DEBOUNCED` | Event-triggered reflex suppresses a duplicate or same-tick trigger under the debounce policy. |
 
 ### 8.4 Profile & config
 
