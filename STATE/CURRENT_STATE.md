@@ -1,5 +1,66 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T12:55:00-05:00
+- Active issue remains #603 `scenario(stress): ViGEm gamepad full sweep - X360 + DS4 buttons/sticks/triggers`.
+- Implementation patch remains scoped to `crates/synapse-mcp/src/m2/pad.rs`:
+  - exposes `guide` in `ActPadButton`;
+  - maps it to core/backend `PadButton::Guide`;
+  - focused tests cover schema exposure, JSON mapping, and full X360/DS4 recording-backend readbacks.
+- Manual MCP/SoT evidence is captured under `.runs\603\pad-fsv-20260602T1205`.
+  - Repo-built daemon PID `35556`, bind `127.0.0.1:7884`, auth health OK, unauth health `401`, strict Inspector `tools/list=80`; `act_pad` schema included `guide`.
+  - ViGEmBus SoT was running via service/PnP/registry readback.
+  - X360 full sweep accepted: strict Inspector `act_pad` full report with `a,b,x,y,lb,rb,ls,rs,back,start,up,down,left,right,guide`, sticks/triggers, `hold_ms=30000`; XInput during read `buttons=0xf3ff`, `lt=255`, `rt=128`, `lx=-32768`, `ly=32767`, `rx=32767`, `ry=-32768`; browser Gamepad API showed Xbox buttons including guide pressed; after read neutral.
+  - DS4 full sweep accepted: strict Inspector `act_pad` full report, browser Gamepad API showed DS4 face/shoulder/stick/system buttons and guide; PnP DS4 device present; DS4 trigger-only supplement showed buttons 6/7 trigger values `1` and `0.5019608`.
+  - Dpad individual sweep accepted for X360 and DS4: each direction had the expected XInput/browser button readback because all-at-once contradictory dpad directions cancel.
+  - Concurrent controllers accepted: overlapping X360 A and DS4 B strict calls read back simultaneously on XInput/browser surfaces and returned neutral.
+  - Rapid lifecycle accepted: pad_id 2 x360->ds4->x360 sequence succeeded and final browser/PnP readback was neutral.
+  - Edge cases accepted: empty/neutral report; max `hold_ms=30000`; over-max `hold_ms=60000` failed closed with `ACTION_HOLD_EXCEEDED_MAX`; structurally invalid `buttons="a"` failed closed and left `CF_ACTION_LOG=48`, XInput neutral.
+  - Storage/action audit moved from `CF_ACTION_LOG=6` before the main sweep to `48`, then to `65` after Luanti attempts and cleanup.
+  - Luanti real-game attempt was exercised and documented as an explained gap: copied run-local world, enabled joystick settings, added run-local probe mod, and tried X360 left stick/A/dpad/right stick plus DS4 left stick. XInput readbacks proved the virtual reports during holds, Luanti probe logged `enable_joysticks=true` with the requested joystick ids/types, but `get_player_control()` never logged inputs and `players.sqlite` position/yaw stayed unchanged.
+  - Public strict Inspector/manual MCP path cannot physically generate 1000 `act_pad` calls/sec without an automated harness; supporting `rate_limit_overshoot` regression remains the rate-limit evidence and the gap will be documented on #603.
+  - Cleanup complete: strict Inspector `release_all` returned zero held keys/buttons/pads; XInput slots 0/1 neutral; final `storage_inspect` read `CF_ACTION_LOG=65`; daemon PID `35556` stopped; port `7884` closed; no Luanti process remains.
+- Final supporting checks passed:
+  - `cargo fmt --check`;
+  - `git diff --check` (CRLF warnings only);
+  - `cargo test -p synapse-mcp --bin synapse-mcp act_pad_ -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp recording_backend_readback_carries_full_x360_and_ds4_reports -- --nocapture`;
+  - `cargo test -p synapse-action backend::vigem::tests --lib -- --nocapture`;
+  - `cargo test -p synapse-core gamepad_report_schema_has_closed_object_and_axis_bounds --test action_types -- --nocapture`;
+  - `cargo test -p synapse-action --test rate_limit_overshoot vigem_1100_events_limits_exactly_100 -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m3_tools_list -- --nocapture`;
+  - `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`;
+  - `cargo check -p synapse-action -p synapse-mcp -j 2`;
+  - `cargo build --release -p synapse-mcp -j 2`.
+- Final release binary readback: `target\release\synapse-mcp.exe`, length `46800896`, SHA256 `68F9285C1860CF55FA291861D94C31E122EF80CF32303B1A73F425011B47ADD6`, `LastWriteTimeUtc=2026-06-02T18:03:05.1344129Z`.
+- Tracked diff token scan found no matches for bearer/auth/token markers; diff review completed.
+- Current next:
+  1. Commit with `[skip ci]`, push, post #603 RESOLVED evidence, close #603, remove stale labels.
+  2. Refresh queue and continue #604.
+
+## 2026-06-02T11:48:40-05:00
+- Active issue remains #603 `scenario(stress): ViGEm gamepad full sweep - X360 + DS4 buttons/sticks/triggers`.
+- Code inspection found one real public-surface gap:
+  - core `PadButton` and ViGEm report conversion already supported `Guide`;
+  - X360 maps `Guide` to raw `0x0400`; DS4 maps `Guide` to `special=0x01`;
+  - MCP `ActPadButton` did not expose `guide`, so `act_pad` could not drive every controller button from the real tool surface.
+- Patch applied in `crates/synapse-mcp/src/m2/pad.rs`:
+  - adds `ActPadButton::Guide`;
+  - maps it to `PadButton::Guide`;
+  - adds support checks for schema exposure, JSON mapping to core `Guide`, and recording-backend full X360/DS4 reports carrying `Guide`, all face/shoulder/stick/dpad buttons, stick extremes, and triggers before returning to neutral.
+- Focused supporting checks passed:
+  - `cargo fmt`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp act_pad_ -- --nocapture` (schema + JSON guide mapping);
+  - `cargo test -p synapse-mcp --bin synapse-mcp recording_backend_readback_carries_full_x360_and_ds4_reports -- --nocapture`;
+  - `cargo test -p synapse-action backend::vigem::tests --lib -- --nocapture`;
+  - `cargo test -p synapse-core gamepad_report_schema_has_closed_object_and_axis_bounds --test action_types -- --nocapture`;
+  - `cargo test -p synapse-action --test rate_limit_overshoot vigem_1100_events_limits_exactly_100 -- --nocapture`;
+  - `git diff --check` (CRLF warning only).
+- Current next:
+  1. Run broader schema/tool-list/touched-crate checks and release build.
+  2. Launch isolated repo-built daemon and perform #603 manual MCP/SoT FSV through strict Inspector against physical controller readback.
+  3. Update state again with daemon/run directory and accepted/rejected evidence.
+
 ## 2026-06-02T11:42:49-05:00
 - Required wake-up context was re-read after compaction:
   - `C:\code\Synapse\docs\AICodingAgentSuperPrompt.md`;

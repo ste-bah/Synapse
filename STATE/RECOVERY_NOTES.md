@@ -1,5 +1,58 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T12:55:00-05:00
+- Active issue #603 has implementation, manual MCP/SoT evidence, Luanti gap documentation, cleanup, daemon shutdown, final supporting checks, release build, and diff/token review complete. Commit/push and GitHub closeout remain.
+- Patch in `crates/synapse-mcp/src/m2/pad.rs`:
+  - exposes `guide` in public `ActPadButton`;
+  - maps `guide` to core `PadButton::Guide`;
+  - adds focused tests for schema exposure, JSON mapping, and recording-backend full X360/DS4 reports with guide/sticks/triggers/neutral return.
+- Accepted run directory: `.runs\603\pad-fsv-20260602T1205`.
+  - Isolated daemon PID `35556`, bind `127.0.0.1:7884`, release binary SHA256 `66A99E8954A5D428B9E81C822CE95B0D25DE66E2FAC57CE5D6C33219B9E57F9D`, auth health OK, unauth health `401`, strict Inspector `tools/list=80`, `act_pad` schema includes `guide`.
+  - X360 full sweep accepted from artifacts `39`-`42`: strict MCP call held all buttons including `guide`, both sticks and triggers; XInput during read showed full non-guide public mask plus stick/trigger values; browser Gamepad API showed guide/button state; after read neutral.
+  - DS4 full sweep accepted from artifacts `44`-`49`: strict MCP call plus browser/PnP readbacks; trigger-only supplement proved DS4 L2/R2 values.
+  - Dpad individual accepted at artifact `50`; concurrent controllers at `51`; rapid lifecycle at `52`; storage readback at `53`/`100`.
+  - Edge cases accepted: neutral empty report (`29`), max hold success (`39`), over-max hold fail-closed (`38`), structurally invalid buttons string with unchanged storage and neutral XInput (`54`-`57`).
+  - Luanti game attempt artifacts `62`-`95`: run-local copied world + probe mod; joystick settings read true for X360 id0 and DS4 id1; XInput proved held virtual reports, but Luanti `get_player_control()` and `players.sqlite` position/yaw did not change. Treat as an explained external-game gap, not accepted game-response success.
+  - Cleanup artifacts `96`-`101`: `release_all` zero, XInput neutral, final `storage_inspect CF_ACTION_LOG=65`, daemon stopped, port `7884` closed, no Luanti process.
+- Supporting rate-limit note: public strict Inspector calls cannot manually reach 1000/s without creating an automated harness; keep `cargo test -p synapse-action --test rate_limit_overshoot vigem_1100_events_limits_exactly_100 -- --nocapture` as supporting evidence only and document the manual-path gap on #603.
+- Final supporting checks passed:
+  - `cargo fmt --check`;
+  - `git diff --check` (CRLF warnings only);
+  - focused `act_pad` schema/mapping/full-report tests;
+  - ViGEm backend tests;
+  - core gamepad schema test;
+  - supporting ViGEm rate-limit overshoot test;
+  - MCP schema sanitize, M3 tool-list, and M4 tool-list tests;
+  - `cargo check -p synapse-action -p synapse-mcp -j 2`;
+  - `cargo build --release -p synapse-mcp -j 2`.
+- Final release binary readback: `target\release\synapse-mcp.exe`, length `46800896`, SHA256 `68F9285C1860CF55FA291861D94C31E122EF80CF32303B1A73F425011B47ADD6`, `LastWriteTimeUtc=2026-06-02T18:03:05.1344129Z`.
+- Tracked diff token scan found no bearer/auth/token marker matches; diff review completed.
+- Exact next actions:
+  1. Commit with `[skip ci]`, push, post #603 RESOLVED evidence, close #603, remove `status:in-progress`/`agent:codex`.
+  2. Refresh queue and continue #604.
+
+## Current Resume Point - 2026-06-02T11:48:40-05:00
+- Active issue #603 is patched locally but not yet runtime-FSV accepted or committed.
+- Patch in `crates/synapse-mcp/src/m2/pad.rs`:
+  - exposes `guide` in the public `ActPadButton` enum;
+  - maps `guide` to core `PadButton::Guide`;
+  - adds focused support checks proving schema exposure, JSON deserialization/mapping, and recording-backend full X360/DS4 reports with `Guide`, all ordinary buttons, stick extremes, triggers, and neutral return.
+- Rationale:
+  - core/backend already supported `Guide` (`x360` raw `0x0400`, DS4 special `0x01`);
+  - without this patch the real `act_pad` tool could not drive every controller button required by #603.
+- Focused supporting checks passed:
+  - `cargo fmt`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp act_pad_ -- --nocapture`;
+  - `cargo test -p synapse-mcp --bin synapse-mcp recording_backend_readback_carries_full_x360_and_ds4_reports -- --nocapture`;
+  - `cargo test -p synapse-action backend::vigem::tests --lib -- --nocapture`;
+  - `cargo test -p synapse-core gamepad_report_schema_has_closed_object_and_axis_bounds --test action_types -- --nocapture`;
+  - `cargo test -p synapse-action --test rate_limit_overshoot vigem_1100_events_limits_exactly_100 -- --nocapture`;
+  - `git diff --check` (CRLF warning only).
+- Exact next actions:
+  1. Run broader schema/tool-list/touched-crate checks and release build.
+  2. Launch isolated repo-built daemon and verify process/socket/auth/health/strict Inspector `tools/list` shows `act_pad` button enum includes `guide`.
+  3. Run #603 manual MCP/SoT FSV: X360 + DS4 full button/stick/trigger sweep, neutral, concurrent pads, lifecycle/rate-limit/fail-closed edges, storage/action rows, device/process/readback SoTs, cleanup.
+
 ## Current Resume Point - 2026-06-02T11:42:49-05:00
 - Required wake-up context was re-read and reconciled with live GitHub/git state.
 - #602 is closed.

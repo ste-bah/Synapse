@@ -1188,3 +1188,32 @@ Evidence:
 Outcome:
 - Posted #603 START comment and labeled/assigned the issue.
 - Inspect `act_pad`/ViGEm implementation next.
+
+# 2026-06-02T11:48:40-05:00 - #603 patch exposes gamepad guide button
+
+Decision: Patch the MCP `act_pad` public surface before runtime FSV because it could not drive the full button set.
+
+Evidence:
+- Core `PadButton` includes `Guide`, and `synapse-action` ViGEm conversion already maps it for both controllers (`x360` raw `0x0400`, DS4 `special=0x01`).
+- `ActPadButton` exposed only face/shoulder/stick/dpad/start/back buttons, so strict `tools/list` clients could not call `act_pad` with `guide`.
+- Focused checks now show the `ActPadButton` schema includes `guide`, JSON `"guide"` maps to core `PadButton::Guide`, and recording-backend X360/DS4 full reports carry `Guide` plus sticks/triggers and return to neutral.
+
+Outcome:
+- `crates/synapse-mcp/src/m2/pad.rs` patched.
+- Broader checks and real MCP/SoT FSV remain next.
+
+# 2026-06-02T12:55:00-05:00 - #603 runtime FSV accepted with Luanti gap
+
+Decision: Accept #603 controller-surface FSV for X360/DS4 through strict Inspector and document Luanti as an explained external-game gap rather than a Synapse pad failure.
+
+Evidence:
+- Isolated repo-built daemon PID `35556` on `127.0.0.1:7884` passed auth health and strict Inspector `tools/list=80`; `act_pad` schema included `guide`.
+- Real MCP `act_pad` calls drove X360 and DS4 full sweeps. Separate XInput/browser/PnP readbacks proved buttons, guide, sticks, triggers, dpad directions, concurrent controllers, lifecycle churn, and neutral return.
+- Edge readbacks covered empty/neutral, max hold, over-max fail-closed, structurally invalid params, storage unchanged on invalid, and final cleanup neutral state.
+- Luanti was launched from the installed runtime against a run-local copied world with joystick settings enabled and a probe mod reading `get_player_control()` plus `players.sqlite`. XInput showed held virtual reports, but Luanti logged no controls and persisted no position/yaw delta for X360 id0 or DS4 id1.
+- Public manual strict-Inspector path cannot produce 1000 calls/sec without an automated harness; supporting rate-limit regression remains non-FSV evidence and the limitation will be stated on the issue.
+
+Outcome:
+- Cleanup completed: `release_all` zero, XInput neutral, `CF_ACTION_LOG=65`, daemon stopped, port `7884` closed, no Luanti process remains.
+- Final supporting checks passed, release binary SHA256 is `68F9285C1860CF55FA291861D94C31E122EF80CF32303B1A73F425011B47ADD6`, and tracked diff token scan found no matches.
+- Commit and GitHub closeout are next.
