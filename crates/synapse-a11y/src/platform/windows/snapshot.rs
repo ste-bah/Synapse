@@ -4,7 +4,7 @@ use std::{collections::HashSet, sync::Mutex};
 use synapse_core::{AccessibleNode, AccessibleSubtree, ElementId, Point, UiaPattern, element_id};
 use uiautomation::{
     UIAutomation, UIElement,
-    core::{UICacheRequest, UICondition},
+    core::{UICacheRequest, UICondition, UITreeWalker},
     types::{
         ElementMode, Handle, Point as UiaPoint, PropertyConditionFlags, TreeScope, UIProperty,
     },
@@ -48,8 +48,9 @@ struct SnapshotWalk<'a> {
     /// True condition so every child is enumerated (raw view equivalent).
     true_condition: &'a UICondition,
     cache: &'a UICacheRequest,
+    raw_walker: &'a UITreeWalker,
     root_hwnd: i64,
-    /// Stop descending once this many nodes are collected.
+    /// Stop collecting once this many nodes are collected.
     node_budget: usize,
     /// Stop descending once this instant is reached.
     deadline: Instant,
@@ -226,6 +227,7 @@ fn snapshot_at_depth(
 ) -> A11yResult<AccessibleSubtree> {
     let cache = create_cache_request(automation, 0, ElementMode::Full, TreeView::Raw)?;
     let true_condition = automation.create_true_condition().map_err(map_uia_error)?;
+    let raw_walker = automation.get_raw_view_walker().map_err(map_uia_error)?;
     let cached_root = root.build_updated_cache(&cache).map_err(map_uia_error)?;
     let root_hwnd = cached_hwnd(&cached_root).unwrap_or(0);
     let root_id = element_id_from_cached_element(&cached_root, root_hwnd)?;
@@ -237,6 +239,7 @@ fn snapshot_at_depth(
     let walk = SnapshotWalk {
         true_condition: &true_condition,
         cache: &cache,
+        raw_walker: &raw_walker,
         root_hwnd,
         node_budget: SNAPSHOT_NODE_BUDGET,
         deadline: Instant::now() + SNAPSHOT_DEADLINE,
@@ -272,6 +275,9 @@ fn supplement_raw_pattern_nodes(
     let Some(root_id) = nodes.first().map(|node| node.element_id.clone()) else {
         return Ok(false);
     };
+    if !should_supplement_raw_pattern_nodes(nodes.first().map(|node| node.name.as_str())) {
+        return Ok(false);
+    }
     let root_hwnd = root_id
         .parts()
         .map_err(|err| A11yError::InvalidElementId {
@@ -378,18 +384,126 @@ fn collect_nodes(
     nodes: &mut Vec<AccessibleNode>,
     truncated: &mut bool,
 ) -> A11yResult<ElementId> {
-    let children = if depth >= max_depth {
-        Vec::new()
-    } else if nodes.len() >= walk.node_budget || Instant::now() >= walk.deadline {
-        // Budget/deadline hit: keep everything collected, but do not descend
-        // further and flag the result as incomplete (never silently complete).
+    if let Some(reason) =
+        collection_limit_reason(nodes.len(), walk.node_budget, Instant::now(), walk.deadline)
+    {
         *truncated = true;
-        Vec::new()
-    } else {
-        // `find_all_build_cache(Children, true)` returns a `Result` (unlike the
-        // tree walker's `get_children_build_cache`, which the crate collapses to
-        // `Option`/`None` and hides the error). It also reliably crosses the
-        // cross-process `Windows.UI.Core.CoreWindow` boundary for UWP apps.
+        return Err(A11yError::internal(format!(
+            "UIA snapshot {reason} reached before collecting node"
+        )));
+    }
+    let node = node_from_cached_element(element, parent, depth, walk.root_hwnd, 0)?;
+    let node_id = node.element_id.clone();
+    let node_index = nodes.len();
+    nodes.push(node);
+    if depth >= max_depth {
+        return Ok(node_id);
+    }
+    if collection_limit_reason(nodes.len(), walk.node_budget, Instant::now(), walk.deadline)
+        .is_some()
+    {
+        *truncated = true;
+        return Ok(node_id);
+    }
+    collect_child_nodes(
+        walk, element, &node_id, node_index, depth, max_depth, nodes, truncated,
+    );
+    Ok(node_id)
+}
+
+fn collect_child_nodes(
+    walk: &SnapshotWalk<'_>,
+    element: &UIElement,
+    node_id: &ElementId,
+    node_index: usize,
+    depth: u32,
+    max_depth: u32,
+    nodes: &mut Vec<AccessibleNode>,
+    truncated: &mut bool,
+) {
+    if should_use_bulk_child_fallback(element) {
+        collect_child_nodes_from_bulk(
+            walk, element, node_id, node_index, depth, max_depth, nodes, truncated,
+        );
+        return;
+    }
+
+    let Ok(mut child) = walk
+        .raw_walker
+        .get_first_child_build_cache(element, walk.cache)
+    else {
+        return;
+    };
+    loop {
+        if let Some(reason) =
+            collection_limit_reason(nodes.len(), walk.node_budget, Instant::now(), walk.deadline)
+        {
+            *truncated = true;
+            tracing::debug!(
+                code = "A11Y_SNAPSHOT_WALK_TRUNCATED",
+                reason,
+                nodes = nodes.len(),
+                node_budget = walk.node_budget,
+                depth,
+                "UIA snapshot collection stopped before remaining siblings"
+            );
+            break;
+        }
+        let child_name = child.get_cached_name().unwrap_or_default();
+        let child_class = child.get_cached_classname().unwrap_or_default();
+        let child_control_type = child.get_cached_control_type().ok();
+        let child_automation_id = child.get_cached_automation_id().unwrap_or_default();
+        let child_process_id = child.get_cached_process_id().unwrap_or(-1);
+        if let Err(error) = collect_nodes(
+            walk,
+            &child,
+            Some(node_id.clone()),
+            depth + 1,
+            max_depth,
+            nodes,
+            truncated,
+        ) {
+            *truncated = true;
+            tracing::warn!(
+                code = "A11Y_CHILD_NODE_FAILED",
+                error = %error,
+                depth = depth + 1,
+                element_name = %child_name,
+                element_class = %child_class,
+                control_type = ?child_control_type,
+                automation_id = %child_automation_id,
+                process_id = child_process_id,
+                "UIA child node read failed; node omitted and snapshot flagged truncated"
+            );
+        } else if let Some(parent) = nodes.get_mut(node_index) {
+            parent.children_count = parent.children_count.saturating_add(1);
+        }
+        match walk
+            .raw_walker
+            .get_next_sibling_build_cache(&child, walk.cache)
+        {
+            Ok(next) => child = next,
+            Err(_) => break,
+        }
+    }
+}
+
+fn collect_child_nodes_from_bulk(
+    walk: &SnapshotWalk<'_>,
+    element: &UIElement,
+    node_id: &ElementId,
+    node_index: usize,
+    depth: u32,
+    max_depth: u32,
+    nodes: &mut Vec<AccessibleNode>,
+    truncated: &mut bool,
+) {
+    // `find_all_build_cache(Children, true)` reliably crosses the
+    // cross-process `Windows.UI.Core.CoreWindow` boundary for UWP apps. Keep it
+    // only for those known app-frame nodes; normal high-fanout trees use the
+    // streaming walker above so a single child enumeration cannot monopolize
+    // the snapshot deadline.
+    let children =
         match element.find_all_build_cache(TreeScope::Children, walk.true_condition, walk.cache) {
             Ok(children) => children,
             Err(err) => {
@@ -405,14 +519,29 @@ fn collect_nodes(
                     process_id = element.get_cached_process_id().unwrap_or(-1),
                     "UIA child enumeration failed; subtree omitted and snapshot flagged truncated"
                 );
-                Vec::new()
+                return;
             }
-        }
-    };
-    let node = node_from_cached_element(element, parent, depth, walk.root_hwnd, children.len())?;
-    let node_id = node.element_id.clone();
-    nodes.push(node);
+        };
     for child in children {
+        if let Some(reason) =
+            collection_limit_reason(nodes.len(), walk.node_budget, Instant::now(), walk.deadline)
+        {
+            *truncated = true;
+            tracing::debug!(
+                code = "A11Y_SNAPSHOT_WALK_TRUNCATED",
+                reason,
+                nodes = nodes.len(),
+                node_budget = walk.node_budget,
+                depth,
+                "UIA snapshot collection stopped before remaining siblings"
+            );
+            break;
+        }
+        let child_name = child.get_cached_name().unwrap_or_default();
+        let child_class = child.get_cached_classname().unwrap_or_default();
+        let child_control_type = child.get_cached_control_type().ok();
+        let child_automation_id = child.get_cached_automation_id().unwrap_or_default();
+        let child_process_id = child.get_cached_process_id().unwrap_or(-1);
         if let Err(error) = collect_nodes(
             walk,
             &child,
@@ -427,16 +556,47 @@ fn collect_nodes(
                 code = "A11Y_CHILD_NODE_FAILED",
                 error = %error,
                 depth = depth + 1,
-                element_name = %child.get_cached_name().unwrap_or_default(),
-                element_class = %child.get_cached_classname().unwrap_or_default(),
-                control_type = ?child.get_cached_control_type().ok(),
-                automation_id = %child.get_cached_automation_id().unwrap_or_default(),
-                process_id = child.get_cached_process_id().unwrap_or(-1),
+                element_name = %child_name,
+                element_class = %child_class,
+                control_type = ?child_control_type,
+                automation_id = %child_automation_id,
+                process_id = child_process_id,
                 "UIA child node read failed; node omitted and snapshot flagged truncated"
             );
+        } else if let Some(parent) = nodes.get_mut(node_index) {
+            parent.children_count = parent.children_count.saturating_add(1);
         }
     }
-    Ok(node_id)
+}
+
+fn collection_limit_reason(
+    nodes_len: usize,
+    node_budget: usize,
+    now: Instant,
+    deadline: Instant,
+) -> Option<&'static str> {
+    if nodes_len >= node_budget {
+        Some("node_budget")
+    } else if now >= deadline {
+        Some("deadline")
+    } else {
+        None
+    }
+}
+
+fn should_use_bulk_child_fallback(element: &UIElement) -> bool {
+    let class_name = element.get_cached_classname().unwrap_or_default();
+    let class_name = class_name.as_str();
+    class_name == "ApplicationFrameWindow"
+        || class_name == "Windows.UI.Core.CoreWindow"
+        || class_name == "ApplicationFrameInputSinkWindow"
+}
+
+fn should_supplement_raw_pattern_nodes(root_name: Option<&str>) -> bool {
+    let Some(root_name) = root_name else {
+        return false;
+    };
+    root_name == "Notepad" || root_name.ends_with(" - Notepad")
 }
 
 fn node_from_cached_element(
@@ -481,4 +641,48 @@ fn element_id_from_cached_element(element: &UIElement, hwnd: i64) -> A11yResult<
         );
     }
     Ok(element_id(hwnd, &readback.hex))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::{collection_limit_reason, should_supplement_raw_pattern_nodes};
+
+    #[test]
+    fn collection_limit_reason_reports_budget_boundary() {
+        let now = Instant::now();
+        let future = now + Duration::from_secs(1);
+
+        assert_eq!(collection_limit_reason(3_999, 4_000, now, future), None);
+        assert_eq!(
+            collection_limit_reason(4_000, 4_000, now, future),
+            Some("node_budget")
+        );
+        assert_eq!(
+            collection_limit_reason(4_001, 4_000, now, future),
+            Some("node_budget")
+        );
+    }
+
+    #[test]
+    fn collection_limit_reason_reports_deadline() {
+        let now = Instant::now();
+        let elapsed = now - Duration::from_millis(1);
+
+        assert_eq!(
+            collection_limit_reason(10, 4_000, now, elapsed),
+            Some("deadline")
+        );
+    }
+
+    #[test]
+    fn raw_pattern_supplement_is_limited_to_notepad_roots() {
+        assert!(should_supplement_raw_pattern_nodes(Some("Notepad")));
+        assert!(should_supplement_raw_pattern_nodes(Some("notes - Notepad")));
+        assert!(!should_supplement_raw_pattern_nodes(Some(
+            "Issue595FanoutTarget"
+        )));
+        assert!(!should_supplement_raw_pattern_nodes(None));
+    }
 }

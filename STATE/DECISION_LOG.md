@@ -743,3 +743,47 @@ Evidence:
 
 Outcome:
 - Begin #595 implementation/investigation with code inspection and deterministic high-fanout local target setup.
+
+# 2026-06-02T00:18:00-05:00 - #595 enforces internal UIA snapshot collection budget
+
+Decision: Fix the #595 boundedness bug at the Windows UIA snapshot collection boundary, not only at the final observe/find response truncation.
+
+Evidence:
+- Code inspection showed observe/find/reality response caps already clamp output, but Windows collect_nodes could still collect every sibling from a large flat child enumeration because the old guard only stopped descent.
+- Microsoft UIA documentation warns broad descendant searches can traverse thousands of items, so Synapse must enforce its own node/deadline budget.
+- Patch in crates/synapse-a11y/src/platform/windows/snapshot.rs adds collection_limit_reason and checks budget/deadline before node collection, before child enumeration, and before recursing into remaining siblings.
+- Focused helper tests, synapse-a11y check, synapse-mcp check, and release build passed before this state entry.
+
+Outcome:
+- Continue with real MCP manual FSV against an issue-local 10k-item WinForms target and isolated repo-built daemon.
+
+# 2026-06-02T00:36:51-05:00 - #595 must bound UIA child enumeration before bulk materialization
+
+Decision: Replace normal Windows UIA snapshot child collection with streaming raw-tree-walker enumeration, while preserving bulk child enumeration only for known UWP app-frame/CoreWindow nodes.
+
+Evidence:
+- Manual #595 run against a 10k WPF UIA target proved the first budget patch was insufficient: real MCP `observe` and `find` took ~26-27s, and daemon logs showed truncation only after `FindAllBuildCache(TreeScope::Children)` had bulk-materialized the large child array.
+- Microsoft UIA docs warn broad tree searches can traverse thousands of elements; caching APIs prefetch in bulk, so Synapse must enforce the budget before each sibling, not after a bulk return.
+- The patch streams normal child enumeration through `UITreeWalker` sibling calls, checks budget/deadline before each child, and restricts the old bulk path to `ApplicationFrameWindow`, `Windows.UI.Core.CoreWindow`, and `ApplicationFrameInputSinkWindow` to preserve #582.
+- The Notepad raw menu supplement is now gated to Notepad roots so it cannot scan arbitrary high-fanout trees.
+- Focused helper tests, a11y check, mcp check, and release build passed; release SHA256 is `9F7663082D2A417E44B053AD95C79B590B50B0409BFCCE421FF1C616196757E7`.
+
+Outcome:
+- Redo #595 manual MCP FSV on a fresh isolated daemon; reject any result that still shows bulk 10k enumeration latency or misses the known target SoT without an explicit, understood reason.
+
+# 2026-06-02T01:05:39-05:00 - #595 fanout fix accepted on isolated repo-built MCP runtime
+
+Decision: Accept the #595 Windows UIA fanout fix for commit/RESOLVED posting based on the repo-built isolated daemon, strict Inspector client parity, and separate target/storage/log/UIA readbacks.
+
+Evidence:
+- Isolated daemon PID `64060`, bind `127.0.0.1:7864`, unauth/auth health, and strict Inspector `tools/list` with 80 tools proved the repo-built runtime and required tools were present before behavior acceptance.
+- Deterministic target PID `62812` exposed 10,000 UIA text children with known names/automation ids/bboxes from its state file and independent UIA reads.
+- Real Inspector `tools/call observe depth=6 max_elements=500` returned 184 elements, advanced isolated `CF_EVENTS/CF_OBSERVATIONS` from 0 to 1, and daemon logs showed `A11Y_SNAPSHOT_WALK_TRUNCATED reason="deadline"` with ~403ms snapshot elapsed rather than the prior 26s bulk enumeration.
+- Real Inspector `tools/call find query="Issue595 Item 00042"` returned the exact visible item name/automation id/bbox matching independent UIA.
+- `reality_baseline` persisted baseline/head rows; after target rename, `observe_delta profile_id=powershell` persisted eight `CF_KV/reality/delta/*` rows.
+- Edges passed or were explicitly characterized: `max_elements=1`, no-result find, depth-0 and max-elements-0 boundaries, unknown-param structural invalid with storage unchanged, minimized-window find by HWND, and Calculator/UWP CoreWindow fallback smoke.
+- Supporting checks passed after the final helper-test edit; release binary SHA256 is `C5415C7A2153613FC5C9BC654C3ADB99A939F83D7BC2A6FA9F7CF206A41DC57A`.
+- Cleanup released inputs, stopped target/CalculatorApp/isolated daemon, and verified port `7864` closed.
+
+Outcome:
+- Commit the scoped code/state changes with `[skip ci]`, post #595 RESOLVED evidence, close #595, then continue with the next unblocked issue.

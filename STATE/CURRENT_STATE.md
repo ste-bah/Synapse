@@ -1,5 +1,119 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T01:05:39-05:00
+- Active issue remains #595, but implementation/checks/manual evidence are ready for commit and RESOLVED posting.
+- Required wake-up was re-run after compaction:
+  - read both AICodingAgentSuperPrompt files, `AGENTS.md`, `STATE/*`, #351, #595, the live open queue, and git status/log/branch.
+  - wired Synapse MCP `health`, `storage_inspect`, `observe`, and `find` loaded through the configured client; the configured long-lived daemon still took ~28s on `find` against the 10k target, so it was not used as #595 acceptance evidence.
+- #595 product patch in `crates/synapse-a11y/src/platform/windows/snapshot.rs`:
+  - normal Windows UIA snapshot child collection streams through `UITreeWalker` sibling calls with budget/deadline checks before each child.
+  - `find_all_build_cache(TreeScope::Children)` is restricted to known UWP app-frame/CoreWindow classes so #582 remains covered.
+  - collection now hard-stops on the internal node budget/deadline before collecting more nodes, and logs truncation instead of silently completing.
+  - the raw `File`/`Edit`/`View` supplement is limited to Notepad roots so arbitrary high-fanout windows are not scanned by that workaround.
+  - added focused helper regressions for budget/deadline classification and Notepad-only raw supplement gating.
+- Manual #595 MCP/SoT evidence accepted under `.runs\595\fanout-fsv-20260602T0037`:
+  - repo-built isolated daemon PID `64060`, bind `127.0.0.1:7864`, binary `target\release\synapse-mcp.exe`, isolated DB/logs; socket and auth health readbacks passed, unauth `/health` returned 401, strict MCP Inspector `tools/list` succeeded with 80 tools and #595 tools present.
+  - target SoT: deterministic WPF/PowerShell `Issue595FanoutTarget` PID `62812`, 10,000 UIA text descendants, state file and independent UIA readbacks for names/automation ids/bboxes.
+  - happy `observe depth=6 max_elements=500` through real Inspector `tools/call` returned bounded element count 184 instead of materializing the 10k tree; separate storage readback moved `CF_EVENTS/CF_OBSERVATIONS` 0->1 and daemon log recorded `A11Y_SNAPSHOT_WALK_TRUNCATED reason="deadline"` with snapshot elapsed ~403ms.
+  - happy `find query="Issue595 Item 00042"` through real Inspector returned the exact visible item name/automation id/bbox matching independent UIA readback.
+  - `reality_baseline` persisted `CF_KV` baseline/head rows for epoch `issue595-fanout-0037`; after physical target rename to `Issue595 Renamed`, `observe_delta profile_id=powershell` returned 8 deltas and persisted `CF_KV/reality/delta/*` rows.
+  - edges covered with before/after SoT reads: `max_elements=1`, no-result `find`, depth-0 boundary, max-elements-0 clamp boundary, structurally invalid unknown param rejection with storage unchanged, minimized-window `find window_hwnd`, and Calculator/UWP `ApplicationFrameWindow` smoke for `CalculatorResults`.
+  - CLI empty-query encoding was recorded as an Inspector argument-format caveat, not accepted as server empty-query verdict.
+- Final supporting checks after the last edit:
+  - `cargo fmt --check`
+  - `git diff --check` (line-ending warnings only)
+  - `cargo test -p synapse-a11y collection_limit_reason -- --nocapture`
+  - `cargo test -p synapse-a11y raw_pattern_supplement -- --nocapture`
+  - `cargo check -p synapse-a11y -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+  - `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`
+  - `cargo build --release -p synapse-mcp -j 2`
+  - final release binary `target\release\synapse-mcp.exe`: length `46485504`, SHA256 `C5415C7A2153613FC5C9BC654C3ADB99A939F83D7BC2A6FA9F7CF206A41DC57A`, `LastWriteTimeUtc=2026-06-02T06:05:23Z`.
+- Cleanup:
+  - real Inspector `release_all` against isolated daemon returned zero held keys/buttons/pads.
+  - stopped #595 target PID `62812`, CalculatorApp PID `29856`, and isolated daemon PID `64060`.
+  - readback shows target absent, daemon absent, `127.0.0.1:7864` closed, CalculatorApp absent; `ApplicationFrameHost` PID `18732` remains as Windows Settings and was preserved.
+  - `README.md` remains unrelated/user-owned and must not be staged.
+- Next:
+  1. Review/stage only `crates/synapse-a11y/src/platform/windows/snapshot.rs` and `STATE/*`, excluding `README.md`.
+  2. Commit with `[skip ci]`, push, post #595 RESOLVED evidence, close #595, remove stale in-progress label if needed.
+  3. Refresh open queue and continue with the next unblocked issue (#596 unless GitHub changed).
+
+## 2026-06-02T00:36:51-05:00
+- Required wake-up was re-run after compaction:
+  - read `docs/AICodingAgentSuperPrompt.md`, `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`, `AGENTS.md`, `STATE/*`, #351, #595, live open queue, and git status/log/branch.
+  - wired Synapse MCP `health`, `storage_inspect`, `observe`, and `find` returned through the configured client.
+  - live queue still has #595 active/in-progress, #594 parent open, #624/#625 blocked on the operator-only Daybreak boundary, and #596-#604/#629-#634 open/unblocked.
+- #595 manual run after the first patch exposed a second root cause:
+  - target `Issue595FanoutTarget` PID `62812` is a deterministic WPF 10k-child target with sentinel `Issue595 Item 03500`.
+  - independent UIA readback found `text_descendant_count=10009`, sentinel present, and parent path `Window -> Issue595 Fanout Scroll -> TextBlock`.
+  - real MCP `observe depth=6 max_elements=500` and `find query=Issue595 Item 03500` against isolated daemon PID `79940` were not accepted as FSV because they took ~26-27s and returned only shallow nodes/no sentinel.
+  - daemon logs showed `A11Y_SNAPSHOT_WALK_TRUNCATED reason="deadline" nodes=25` after `FindAllBuildCache(TreeScope::Children)` had already materialized the 10k-child list.
+- #595 patch now goes beyond the first budget guard:
+  - `crates/synapse-a11y/src/platform/windows/snapshot.rs` normal child traversal now uses `UITreeWalker::get_first_child_build_cache` / `get_next_sibling_build_cache` and checks budget/deadline before each sibling.
+  - bulk `find_all_build_cache(TreeScope::Children)` remains only for known UWP app-frame classes (`ApplicationFrameWindow`, `Windows.UI.Core.CoreWindow`, `ApplicationFrameInputSinkWindow`) to preserve the #582 CoreWindow boundary path.
+  - the raw menu supplement is now limited to Notepad root windows, so arbitrary high-fanout foreground trees are not scanned three times for `File`/`Edit`/`View`.
+- Supporting checks after the streaming-walker patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-a11y collection_limit_reason -- --nocapture`
+  - `cargo check -p synapse-a11y -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo build --release -p synapse-mcp -j 2`
+  - release binary readback: `target\release\synapse-mcp.exe`, length `46485504`, SHA256 `9F7663082D2A417E44B053AD95C79B590B50B0409BFCCE421FF1C616196757E7`, `LastWriteTimeUtc=2026-06-02T05:36:42.1557686Z`.
+- Cleanup/setup:
+  - stale isolated daemon PID `79940` on `127.0.0.1:7863` was stopped and the socket is closed.
+  - live `Issue595FanoutTarget` PID `62812` remains available for patched manual FSV; close it during #595 cleanup.
+  - `README.md` remains unrelated/user-owned and must not be staged.
+- Next:
+  1. Launch a fresh isolated repo-built `synapse-mcp` HTTP daemon for #595.
+  2. Verify process/socket/auth/health and strict Inspector `tools/list`.
+  3. Redo #595 manual MCP FSV through real `observe`, `find`, `reality_baseline`, `observe_delta`, and `storage_inspect`, with separate target UIA/window/state-file/storage/log readbacks.
+  4. Cover happy path plus `max_elements=1`, `depth=6`, empty/no-result, structurally invalid, minimized target, and UWP/CoreWindow smoke.
+
+## 2026-06-02T00:18:00-05:00
+- Required post-compaction wake-up was re-run:
+  - read `docs/AICodingAgentSuperPrompt.md`, `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`, `AGENTS.md`, `STATE/*`, #351, #595, live open queue, and git status/log/branch.
+  - wired Synapse MCP client returned through real tools: `health`, `storage_inspect`, `observe`, and `find`.
+  - live queue still has #595 active/in-progress, #594 parent open, #624/#625 blocked on the Daybreak operator-only boundary, and #596-#604/#629-#634 open/unblocked.
+- #595 implementation finding:
+  - `observe` clamps response elements through `observe_include` to `max_elements` 1..500 and `depth` <=6.
+  - `find` uses `FIND_SNAPSHOT_DEPTH=16` and returns max 20 hits.
+  - `observe_delta` uses stricter `bounded_depth`/`bounded_max_elements` for 1..6 and 1..500.
+  - Windows UIA snapshots use an internal `SNAPSHOT_NODE_BUDGET=4000` plus `SNAPSHOT_DEADLINE=400ms`.
+  - The real boundedness bug was in `collect_nodes`: after enumerating a large flat child list, it only stopped descending and could still collect every sibling, so a 10k-child UIA list could exceed the internal 4000-node budget before response truncation.
+- #595 patch currently dirty in `crates/synapse-a11y/src/platform/windows/snapshot.rs`:
+  - added `collection_limit_reason`;
+  - stop/flag before collecting any node after budget/deadline;
+  - skip child enumeration when the current node will exhaust the budget/deadline;
+  - break before remaining siblings once budget/deadline is reached, logging `A11Y_SNAPSHOT_WALK_TRUNCATED`;
+  - added focused helper tests for budget and deadline boundaries.
+- Supporting checks already run after the patch before this state write:
+  - `cargo fmt`
+  - `cargo test -p synapse-a11y collection_limit_reason -- --nocapture`
+  - `cargo check -p synapse-a11y -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo build --release -p synapse-mcp -j 2`
+  - release binary readback from that build: `target\release\synapse-mcp.exe`, length `46479360`, SHA256 `291051081606485F341561FABB67AA44A80E4A179DC2D911B42EB4C90B421B0D`, `LastWriteTimeUtc=2026-06-02T05:10:43.48732Z`.
+- Web/source research:
+  - Microsoft Learn `IUIAutomationElement::FindAll` warns that broad desktop descendant searches can iterate thousands of items and stack overflow; Microsoft UIA caching docs describe caching as bulk prefetching and advise scoping/cache filtering.
+  - This supports keeping Synapse snapshots bounded by explicit budgets and shallow child enumeration.
+- Issue-local target artifact created for manual #595 FSV:
+  - `.runs\595\fanout-fsv-20260602T0018\target\issue595_target.ps1`
+  - WinForms target title `Issue595FanoutTarget`;
+  - `ListBox` item counts `0/500/4000/10000`, deterministic item names like `Issue595 Item 03500`, rename to `Issue595 Renamed 03500`, state file readback, selection/minimize controls.
+  - This is a deterministic physical UIA target, not product code.
+- Current dirty state:
+  - `README.md` remains unrelated/user-owned; do not stage.
+  - `crates/synapse-a11y/src/platform/windows/snapshot.rs` is #595 product patch.
+  - `.runs\595\fanout-fsv-20260602T0018\target\issue595_target.ps1` is an untracked/ignored run artifact for manual evidence.
+- Next:
+  1. Launch `Issue595FanoutTarget` and read target state/window/UIA SoTs.
+  2. Launch isolated repo-built `synapse-mcp` HTTP daemon with issue-local DB/logs.
+  3. Verify process/socket/auth/health and strict Inspector `tools/list`.
+  4. Run manual MCP FSV through real `observe`, `find`, `reality_baseline`, `observe_delta`, and `storage_inspect` calls with separate target state/UIA/storage/log readbacks.
+  5. Cover happy path plus `max_elements=1`, `depth=6`, no-result/empty query, minimized window, structurally invalid params, and a UWP/CoreWindow smoke edge where available.
+
 ## 2026-06-02T00:03:13-05:00
 - #628 is closed:
   - commit `4991efe fix(mcp): harden browser element actions (#628) [skip ci]` pushed to `origin/main`.

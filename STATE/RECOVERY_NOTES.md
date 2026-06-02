@@ -1,5 +1,120 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T01:05:39-05:00
+- #595 is ready for closeout.
+- Product patch:
+  - file `crates/synapse-a11y/src/platform/windows/snapshot.rs`;
+  - normal UIA child traversal now streams through raw `UITreeWalker` sibling calls with node/deadline checks before each child;
+  - bulk `find_all_build_cache(TreeScope::Children)` remains only for UWP app-frame/CoreWindow fallback classes;
+  - raw pattern supplement is gated to Notepad root windows;
+  - tests cover budget/deadline helper and Notepad-only supplement gating.
+- Accepted manual MCP/SoT evidence directory: `.runs\595\fanout-fsv-20260602T0037`.
+  - isolated repo-built daemon PID `64060`, bind `127.0.0.1:7864`, strict Inspector `tools/list` 80 tools, and `tools/call` triggers for `health`, `observe`, `find`, `reality_baseline`, `observe_delta`, `storage_inspect`, and `release_all`;
+  - deterministic target PID `62812`, title `Issue595FanoutTarget`, 10k item/state/UIA SoT readbacks;
+  - happy `observe depth=6 max_elements=500`: element count 184, `CF_EVENTS/CF_OBSERVATIONS` 0->1, daemon elapsed ~403ms with `A11Y_SNAPSHOT_WALK_TRUNCATED reason="deadline"`;
+  - happy `find Issue595 Item 00042`: exact name/automation id/bbox matched independent UIA;
+  - baseline/rename/delta: `CF_KV` baseline/head rows, target renamed to `Issue595 Renamed`, then 8 reality deltas persisted;
+  - edges: `max_elements=1`, no-result `find`, depth-0 boundary, max-elements-0 clamp boundary, structurally invalid unknown param with storage unchanged, minimized-window `find window_hwnd`, and Calculator/UWP `CalculatorResults` smoke.
+- Cleanup completed:
+  - Inspector `release_all` returned zero held inputs;
+  - target PID `62812`, CalculatorApp PID `29856`, daemon PID `64060`, and port `7864` are absent;
+  - `ApplicationFrameHost` PID `18732` is now Windows Settings and was preserved.
+- Final supporting checks passed:
+  - `cargo fmt --check`
+  - `git diff --check` with line-ending warnings only
+  - `cargo test -p synapse-a11y collection_limit_reason -- --nocapture`
+  - `cargo test -p synapse-a11y raw_pattern_supplement -- --nocapture`
+  - `cargo check -p synapse-a11y -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`
+  - `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`
+  - `cargo build --release -p synapse-mcp -j 2`
+  - final release SHA256 `C5415C7A2153613FC5C9BC654C3ADB99A939F83D7BC2A6FA9F7CF206A41DC57A`, length `46485504`, timestamp `2026-06-02T06:05:23Z`.
+- Important caveats:
+  - configured chat MCP loaded but is a long-lived stale daemon and still took ~28s on a wired `find` against the 10k target; do not use that stale daemon as #595 acceptance evidence.
+  - Inspector empty-query CLI encoding did not produce a clean empty-string server trigger, so no empty-query verdict is claimed; no-result `find` covers the empty/no-match behavior expected by the issue.
+  - `README.md` is unrelated/user-owned; do not stage.
+- Exact next actions:
+  1. Stage only `crates/synapse-a11y/src/platform/windows/snapshot.rs` plus `STATE/CURRENT_STATE.md`, `STATE/DECISION_LOG.md`, `STATE/HEARTBEAT.md`, and `STATE/RECOVERY_NOTES.md`.
+  2. Confirm `README.md` is excluded from the index.
+  3. Commit `fix(a11y): stream UIA fanout snapshots (#595) [skip ci]`, push, post RESOLVED evidence to #595, close #595, and remove stale `status:in-progress` if present.
+  4. Refresh the live queue and take #596 unless GitHub changed.
+
+## Current Resume Point - 2026-06-02T00:36:51-05:00
+- Active issue remains #595:
+  - title `scenario(stress): UIA fanout storm - observe/find under 10k+ element trees`;
+  - START comment https://github.com/ChrisRoyse/Synapse/issues/595#issuecomment-4598866903;
+  - assigned to `ChrisRoyse`, labeled `status:in-progress`, `agent:codex`.
+- Wake-up after compaction was completed again:
+  - doctrine files, `STATE/*`, #351, #595, live queue, git status/log/branch all read;
+  - wired Synapse MCP `health`, `storage_inspect`, `observe`, and `find` returned successfully.
+- Important reconciliation:
+  - disk state at `00:18` described the first budget guard patch, but the later manual run found a second real defect.
+  - real MCP `observe`/`find` against the 10k WPF target took ~26-27s because `FindAllBuildCache(TreeScope::Children)` bulk-materialized 10k children before Synapse could enforce its node/deadline budget. Those results were rejected as FSV evidence.
+- Current #595 patch in `crates/synapse-a11y/src/platform/windows/snapshot.rs`:
+  - keeps the original `collection_limit_reason` budget/deadline guards;
+  - adds a `UITreeWalker` to `SnapshotWalk`;
+  - streams normal child enumeration one sibling at a time with budget/deadline checks before each child;
+  - limits bulk child enumeration to UWP app-frame/CoreWindow classes to preserve the #582 boundary behavior;
+  - limits the raw `File`/`Edit`/`View` supplement to Notepad roots so high-fanout targets are not scanned by that workaround.
+- Supporting checks passed after this patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-a11y collection_limit_reason -- --nocapture`
+  - `cargo check -p synapse-a11y -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo build --release -p synapse-mcp -j 2`
+  - release binary: length `46485504`, SHA256 `9F7663082D2A417E44B053AD95C79B590B50B0409BFCCE421FF1C616196757E7`, `LastWriteTimeUtc=2026-06-02T05:36:42.1557686Z`.
+- Runtime state:
+  - stale isolated daemon PID `79940` / port `7863` was stopped.
+  - WPF target PID `62812`, title `Issue595FanoutTarget`, remains live and should be reused or replaced for the patched run.
+  - `README.md` is unrelated/user-owned; do not stage it.
+- Exact next actions:
+  1. Start fresh isolated repo-built daemon on a new #595 port (for example `127.0.0.1:7864`) with issue-local DB/log paths and token from `%APPDATA%\synapse\token.txt` without printing the token.
+  2. Verify process/socket/binary, unauth/auth health, and strict MCP Inspector `tools/list` for `observe`, `find`, `reality_baseline`, `observe_delta`, `storage_inspect`, and `release_all`.
+  3. Read target state/window/UIA SoTs before the trigger.
+  4. Trigger real MCP `observe depth=6 max_elements=500`; accept only if the separate after-read shows bounded storage/log state and daemon elapsed time no longer reflects bulk 10k enumeration.
+  5. Run `find`, `reality_baseline` + mutate + `observe_delta`, and edges: `max_elements=1`, no-result/empty query, invalid params, minimized target, and UWP/CoreWindow smoke.
+  6. Finish with final supporting checks, cleanup target/daemon, diff review, commit `[skip ci]`, RESOLVED comment, close #595, then continue the queue.
+
+## Current Resume Point - 2026-06-02T00:18:00-05:00
+- Active issue remains #595:
+  - title `scenario(stress): UIA fanout storm - observe/find under 10k+ element trees`;
+  - START comment https://github.com/ChrisRoyse/Synapse/issues/595#issuecomment-4598866903;
+  - assigned to `ChrisRoyse`, labeled `status:in-progress`, `agent:codex`.
+- Required wake-up was re-run after compaction and reconciled:
+  - #351 confirms manual FSV only and no GitHub Actions/CI.
+  - live queue still has #594 parent, active #595, #624/#625 blocked on the Daybreak operator-only boundary, and #596-#604/#629-#634 open.
+  - wired Synapse MCP `health`, `storage_inspect`, `observe`, and `find` loaded through the real configured client.
+- Current #595 patch:
+  - file: `crates/synapse-a11y/src/platform/windows/snapshot.rs`;
+  - root cause: `collect_nodes` could collect all siblings from a large flat `find_all_build_cache(TreeScope::Children)` result even after `SNAPSHOT_NODE_BUDGET=4000`, because the prior guard only stopped descent;
+  - fix: `collection_limit_reason` checks budget/deadline before collection, before child enumeration, and before recursing into remaining siblings; sibling collection now breaks at the budget/deadline and logs `A11Y_SNAPSHOT_WALK_TRUNCATED`.
+- Supporting checks already passed after patch:
+  - `cargo fmt`
+  - `cargo test -p synapse-a11y collection_limit_reason -- --nocapture`
+  - `cargo check -p synapse-a11y -j 2`
+  - `cargo check -p synapse-mcp -j 2`
+  - `cargo build --release -p synapse-mcp -j 2`
+  - latest release binary readback from that build: length `46479360`, SHA256 `291051081606485F341561FABB67AA44A80E4A179DC2D911B42EB4C90B421B0D`, `LastWriteTimeUtc=2026-06-02T05:10:43.48732Z`.
+- Issue-local manual target:
+  - `.runs\595\fanout-fsv-20260602T0018\target\issue595_target.ps1`;
+  - launches visible WinForms `Issue595FanoutTarget`;
+  - deterministic `ListBox` counts/prefixes/state file: 0/500/4000/10000 items, sentinel `Issue595 Item 03500`, renamed sentinel `Issue595 Renamed 03500`, `Select3500`, `Minimize`, `Exit`.
+- Current worktree:
+  - `README.md` dirty and unrelated/user-owned; do not stage.
+  - `crates/synapse-a11y/src/platform/windows/snapshot.rs` dirty for #595.
+  - state files dirty for #595 resume context.
+- Exact next actions:
+  1. Launch target with `powershell.exe -STA -File .runs\595\fanout-fsv-20260602T0018\target\issue595_target.ps1 -StatePath .runs\595\fanout-fsv-20260602T0018\target-state.json`; hide only the console helper, leave target window visible.
+  2. Read target process/window/state-file SoTs and do a separate UIA/visible read to confirm 10k count/sentinel.
+  3. Launch isolated repo-built `synapse-mcp.exe --mode http` on a fresh port with DB `.runs\595\fanout-fsv-20260602T0018\db` and logs `.runs\595\fanout-fsv-20260602T0018\logs`.
+  4. Verify daemon process/socket/binary hash, unauth `/health=401`, auth `/health ok=true`, strict Inspector `tools/list` with `observe`, `find`, `observe_delta`, `reality_baseline`, `storage_inspect`, and `release_all`.
+  5. Run manual MCP FSV:
+     - happy observe depth 6/max 500 against the 10k tree; after-read target state, isolated storage row counts, daemon log `A11Y_SNAPSHOT_WALK_TRUNCATED`, and bounded node counts.
+     - `find` sentinel query such as `Issue595 Item 03500` or visible selected sentinel; separate target/UIA readback.
+     - baseline then rename target and call `observe_delta`; read CF_KV/head/delta rows plus target state file.
+     - edges: empty/no-result find, `max_elements=1`, minimized target, invalid params, UWP/CoreWindow smoke where available.
+
 ## Current Resume Point - 2026-06-02T00:03:13-05:00
 - #628 is closed:
   - commit `4991efe fix(mcp): harden browser element actions (#628) [skip ci]`;
