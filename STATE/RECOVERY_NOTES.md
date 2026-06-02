@@ -1,5 +1,23 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T13:07:00-05:00
+- #603 is closed.
+  - Commit: `6d3c148 fix(mcp): expose gamepad guide button (#603) [skip ci]`.
+  - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/603#issuecomment-4605620033.
+  - Closure readback: `state=CLOSED`, `closedAt=2026-06-02T18:06:13Z`.
+  - Worktree readback after push: `## main...origin/main`.
+- Active issue is #604 `scenario(stress): act_clipboard round-trip - Text/Unicode, large, non-ASCII reject, contention`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/604#issuecomment-4605626077.
+  - GitHub labels/assignee updated with `status:in-progress`, `agent:codex`, and `ChrisRoyse`.
+- #604 acceptance target:
+  - real MCP `tools/call act_clipboard` through strict client-parity `tools/list`;
+  - separate SoT reads from Windows clipboard, Notepad paste/file bytes, action/storage rows, contention process/window state, and cleanup state;
+  - Unicode/ASCII round trips, large payload integrity, clear/empty behavior, CF_TEXT non-ASCII rejection, contention/retry, and empty/boundary/structurally invalid params.
+- Exact next actions:
+  1. Inspect `act_clipboard` implementation/tests and existing Windows clipboard constraints.
+  2. Patch only if code or FSV exposes a real gap.
+  3. Run supporting checks, build release `synapse-mcp`, launch isolated daemon, verify process/socket/auth/health/strict Inspector tools-list, then run #604 manual FSV.
+
 ## Current Resume Point - 2026-06-02T12:55:00-05:00
 - Active issue #603 has implementation, manual MCP/SoT evidence, Luanti gap documentation, cleanup, daemon shutdown, final supporting checks, release build, and diff/token review complete. Commit/push and GitHub closeout remain.
 - Patch in `crates/synapse-mcp/src/m2/pad.rs`:

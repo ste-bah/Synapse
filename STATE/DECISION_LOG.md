@@ -1217,3 +1217,17 @@ Outcome:
 - Cleanup completed: `release_all` zero, XInput neutral, `CF_ACTION_LOG=65`, daemon stopped, port `7884` closed, no Luanti process remains.
 - Final supporting checks passed, release binary SHA256 is `68F9285C1860CF55FA291861D94C31E122EF80CF32303B1A73F425011B47ADD6`, and tracked diff token scan found no matches.
 - Commit and GitHub closeout are next.
+
+# 2026-06-02T13:07:00-05:00 - #604 starts after #603 closure
+
+Decision: Claim #604 as the next unblocked #594 child after verifying #603 closed and `main` is clean.
+
+Evidence:
+- #603 GitHub readback showed `state=CLOSED`, `closedAt=2026-06-02T18:06:13Z`, RESOLVED evidence comment, and stale claim labels removed.
+- `git status --short --branch` read `## main...origin/main`; `HEAD` and `origin/main` are `6d3c148`.
+- Live open queue shows #604 as the next unblocked child before #629-#634; #624/#625 remain blocked.
+- #604 requires real MCP `act_clipboard` FSV for text/Unicode/large/non-ASCII/contention/clear behavior through separate Windows clipboard and Notepad/file SoT reads.
+
+Outcome:
+- Posted #604 START comment and labeled/assigned the issue.
+- Inspect `act_clipboard` implementation next.

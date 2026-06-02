@@ -1,5 +1,29 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T13:07:00-05:00
+- #603 is closed:
+  - commit `6d3c148 fix(mcp): expose gamepad guide button (#603) [skip ci]`;
+  - RESOLVED evidence https://github.com/ChrisRoyse/Synapse/issues/603#issuecomment-4605620033;
+  - closure readback `state=CLOSED`, `closedAt=2026-06-02T18:06:13Z`;
+  - stale `status:in-progress` and `agent:codex` labels removed.
+- Git state after #603 close:
+  - branch `main`;
+  - `git status --short --branch` read `## main...origin/main`;
+  - latest commit `6d3c148`.
+- Live open queue after #603:
+  - #594 parent remains open;
+  - #624/#625 remain `status:blocked` on the Daybreak/operator boundary;
+  - unblocked children currently open include #604 and #629-#634.
+- Active issue is #604 `scenario(stress): act_clipboard round-trip - Text/Unicode, large, non-ASCII reject, contention`.
+  - START comment: https://github.com/ChrisRoyse/Synapse/issues/604#issuecomment-4605626077.
+  - Labels/assignee updated with `status:in-progress`, `agent:codex`, and `ChrisRoyse`.
+  - Issue goal: prove `act_clipboard` read/write round trips for CF_TEXT and CF_UNICODETEXT, large payload integrity, clear/empty behavior, non-ASCII rejection for CF_TEXT, and contention retry behavior.
+  - Planned SoTs: repo-built daemon process/socket/auth/health/strict Inspector `tools/list`; real `act_clipboard` calls; separate Windows clipboard reads; Notepad paste/file-byte readbacks; action/storage audit rows; contention holder process/window state; cleanup clipboard/release state.
+- Current next:
+  1. Inspect `act_clipboard` MCP params, schema, action backend, Windows clipboard code, size/encoding limits, contention retry, audit logging, and tests.
+  2. Patch only if code or FSV exposes a real gap.
+  3. Build/launch isolated repo-built daemon and perform manual MCP/SoT FSV for #604.
+
 ## 2026-06-02T12:55:00-05:00
 - Active issue remains #603 `scenario(stress): ViGEm gamepad full sweep - X360 + DS4 buttons/sticks/triggers`.
 - Implementation patch remains scoped to `crates/synapse-mcp/src/m2/pad.rs`:
