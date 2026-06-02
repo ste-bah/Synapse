@@ -11,12 +11,12 @@ use uiautomation::{
     variants::Variant,
 };
 
-use crate::{A11yError, A11yResult, ElementSearchScope, ids::runtime_id_hex};
+use crate::{A11yError, A11yResult, ElementSearchScope};
 
 use super::common::{
-    TreeView, cached_hwnd, cached_patterns, cached_rect, cached_role, cached_runtime_id,
-    cached_value, create_cache_request, map_uia_error, non_empty, pattern_property,
-    with_automation,
+    TreeView, cached_hwnd, cached_patterns, cached_rect, cached_role,
+    cached_runtime_id_hex_or_fallback, cached_value, create_cache_request, map_uia_error,
+    non_empty, pattern_property, with_automation,
 };
 
 static SNAPSHOT_CACHE: Mutex<Option<SnapshotCache>> = Mutex::new(None);
@@ -33,9 +33,6 @@ const SNAPSHOT_NODE_BUDGET: usize = 4000;
 /// inherently slower cross-process UWP/ApplicationFrameHost trees.
 const SNAPSHOT_DEADLINE: Duration = Duration::from_millis(400);
 const RAW_SUPPLEMENT_NODE_BUDGET: usize = 60;
-const FALLBACK_RUNTIME_ID_PREFIX: &str = "ffffffff";
-const FNV64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV64_PRIME: u64 = 0x0100_0000_01b3;
 // Packaged Notepad exposes these top-level menu items through raw
 // name+ExpandCollapse search even when RawView child walking omits them.
 const RAW_MENU_SUPPLEMENT_NAMES: [&str; 3] = ["File", "Edit", "View"];
@@ -469,75 +466,19 @@ fn node_from_cached_element(
 }
 
 fn element_id_from_cached_element(element: &UIElement, hwnd: i64) -> A11yResult<ElementId> {
-    match cached_runtime_id(element) {
-        Ok(runtime_id) => Ok(element_id(hwnd, &runtime_id_hex(&runtime_id))),
-        Err(error) if runtime_id_is_unavailable(&error) => {
-            let fallback_hex = fallback_runtime_id_hex(element, hwnd);
-            tracing::warn!(
-                code = "A11Y_RUNTIME_ID_UNAVAILABLE",
-                error = %error,
-                hwnd,
-                fallback_runtime_id_hex = %fallback_hex,
-                element_name = %element.get_cached_name().unwrap_or_default(),
-                element_class = %element.get_cached_classname().unwrap_or_default(),
-                control_type = ?element.get_cached_control_type().ok(),
-                automation_id = %element.get_cached_automation_id().unwrap_or_default(),
-                process_id = element.get_cached_process_id().unwrap_or(-1),
-                "UIA RuntimeId was unavailable; generated a process-local fallback element id"
-            );
-            Ok(element_id(hwnd, &fallback_hex))
-        }
-        Err(error) => Err(error),
+    let readback = cached_runtime_id_hex_or_fallback(element, hwnd)?;
+    if readback.used_fallback {
+        tracing::warn!(
+            code = "A11Y_RUNTIME_ID_UNAVAILABLE",
+            hwnd,
+            fallback_runtime_id_hex = %readback.hex,
+            element_name = %element.get_cached_name().unwrap_or_default(),
+            element_class = %element.get_cached_classname().unwrap_or_default(),
+            control_type = ?element.get_cached_control_type().ok(),
+            automation_id = %element.get_cached_automation_id().unwrap_or_default(),
+            process_id = element.get_cached_process_id().unwrap_or(-1),
+            "UIA RuntimeId was unavailable; generated a process-local fallback element id"
+        );
     }
-}
-
-fn runtime_id_is_unavailable(error: &A11yError) -> bool {
-    matches!(
-        error,
-        A11yError::Internal { detail } if detail.contains("cached RuntimeId had unexpected type EMPTY")
-    )
-}
-
-fn fallback_runtime_id_hex(element: &UIElement, hwnd: i64) -> String {
-    let rect = cached_rect(element);
-    let mut hash = FNV64_OFFSET_BASIS;
-    hash_bytes(&mut hash, &hwnd.to_le_bytes());
-    hash_bytes(
-        &mut hash,
-        &element.get_cached_process_id().unwrap_or(-1).to_le_bytes(),
-    );
-    hash_bytes(
-        &mut hash,
-        format!("{:?}", element.get_cached_control_type().ok()).as_bytes(),
-    );
-    hash_bytes(
-        &mut hash,
-        element
-            .get_cached_classname()
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    hash_bytes(
-        &mut hash,
-        element
-            .get_cached_automation_id()
-            .unwrap_or_default()
-            .as_bytes(),
-    );
-    hash_bytes(
-        &mut hash,
-        element.get_cached_name().unwrap_or_default().as_bytes(),
-    );
-    hash_bytes(&mut hash, &rect.x.to_le_bytes());
-    hash_bytes(&mut hash, &rect.y.to_le_bytes());
-    hash_bytes(&mut hash, &rect.w.to_le_bytes());
-    hash_bytes(&mut hash, &rect.h.to_le_bytes());
-    format!("{FALLBACK_RUNTIME_ID_PREFIX}{hash:016x}")
-}
-
-fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
-    for byte in bytes {
-        *hash ^= u64::from(*byte);
-        *hash = hash.wrapping_mul(FNV64_PRIME);
-    }
+    Ok(element_id(hwnd, &readback.hex))
 }

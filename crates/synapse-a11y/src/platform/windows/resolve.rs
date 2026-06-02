@@ -1,16 +1,19 @@
 use synapse_core::{ElementId, Rect};
 use uiautomation::{
-    UIElement,
+    UIAutomation, UIElement,
     patterns::UIExpandCollapsePattern,
     patterns::UIInvokePattern,
-    types::{ElementMode, ExpandCollapseState, Handle, Rect as UiaRect},
+    types::{ElementMode, ExpandCollapseState, Handle, Rect as UiaRect, TreeScope},
 };
 
-use crate::{A11yError, A11yResult, ElementClickAction, ExpandState, ids::runtime_id_hex};
+use crate::{A11yError, A11yResult, ElementClickAction, ExpandState};
 
 use super::common::{
-    TreeView, cached_runtime_id, create_cache_request, map_uia_error, with_automation,
+    TreeView, cached_hwnd, cached_runtime_id_hex_or_fallback, create_cache_request, map_uia_error,
+    with_automation,
 };
+
+const RE_RESOLVE_NODE_BUDGET: usize = 20_000;
 
 pub fn re_resolve(id: &ElementId) -> A11yResult<UIElement> {
     let _ = id;
@@ -26,28 +29,31 @@ pub(super) fn re_resolve_on_worker(
     let parts = id.parts().map_err(|err| A11yError::InvalidElementId {
         detail: err.to_string(),
     })?;
-    let control_cache = create_cache_request(automation, 8, ElementMode::Full, TreeView::Control)?;
     let hwnd = isize::try_from(parts.hwnd).map_err(|err| A11yError::InvalidElementId {
         detail: err.to_string(),
     })?;
-    let root = automation
-        .element_from_handle_build_cache(Handle::from(hwnd), &control_cache)
-        .map_err(map_uia_error)?;
-    if let Some(found) = find_by_runtime_id_hex(&root, &parts.runtime_id_hex, 0, 8)? {
+    if let Some(found) = find_by_runtime_id_hex(
+        automation,
+        hwnd,
+        &parts.runtime_id_hex,
+        parts.hwnd,
+        TreeView::Control,
+    )? {
         return Ok(found);
     }
 
-    let raw_cache = create_cache_request(automation, 8, ElementMode::Full, TreeView::Raw)?;
-    let raw_root = automation
-        .element_from_handle_build_cache(Handle::from(hwnd), &raw_cache)
-        .map_err(map_uia_error)?;
-    find_by_runtime_id_hex(&raw_root, &parts.runtime_id_hex, 0, 8)?.ok_or_else(|| {
-        A11yError::ElementStale {
-            detail: format!(
-                "element id {id} was not found under hwnd 0x{:x} in control or raw view",
-                parts.hwnd
-            ),
-        }
+    find_by_runtime_id_hex(
+        automation,
+        hwnd,
+        &parts.runtime_id_hex,
+        parts.hwnd,
+        TreeView::Raw,
+    )?
+    .ok_or_else(|| A11yError::ElementStale {
+        detail: format!(
+            "element id {id} was not found under hwnd 0x{:x} in control or raw view",
+            parts.hwnd
+        ),
     })
 }
 
@@ -132,42 +138,66 @@ fn rect_from_uia(rect: UiaRect) -> Rect {
         h: rect.get_bottom().saturating_sub(rect.get_top()),
     }
 }
+
 fn find_by_runtime_id_hex(
-    root: &UIElement,
+    automation: &UIAutomation,
+    hwnd: isize,
     runtime_id_hex_expected: &str,
-    depth: u32,
-    max_depth: u32,
+    root_hwnd: i64,
+    tree_view: TreeView,
 ) -> A11yResult<Option<UIElement>> {
-    let runtime_id = cached_runtime_id(root)?;
-    if runtime_id_hex(&runtime_id).eq_ignore_ascii_case(runtime_id_hex_expected) {
-        return Ok(Some(root.clone()));
-    }
-    if depth >= max_depth {
-        return Ok(None);
+    let cache = create_cache_request(automation, 0, ElementMode::Full, tree_view)?;
+    let root = automation
+        .element_from_handle_build_cache(Handle::from(hwnd), &cache)
+        .map_err(map_uia_error)?;
+    if runtime_id_matches(&root, runtime_id_hex_expected, root_hwnd)? {
+        return Ok(Some(root));
     }
 
-    let children = match root.get_cached_children() {
-        Ok(children) => children,
-        Err(err) => {
-            // Do not silently treat a navigation failure as "no children":
-            // log it with context so a failed re-resolve is diagnosable.
+    let true_condition = automation.create_true_condition().map_err(map_uia_error)?;
+    let elements = root
+        .find_all_build_cache(TreeScope::Descendants, &true_condition, &cache)
+        .map_err(map_uia_error)?;
+    for (visited, element) in elements.into_iter().enumerate() {
+        if visited >= RE_RESOLVE_NODE_BUDGET {
             tracing::warn!(
-                code = "A11Y_CACHED_CHILDREN_FAILED",
-                error = %err,
-                depth,
-                element_name = %root.get_cached_name().unwrap_or_default(),
-                element_class = %root.get_cached_classname().unwrap_or_default(),
-                "cached child navigation failed during re-resolve; subtree skipped"
+                code = "A11Y_RE_RESOLVE_NODE_BUDGET_EXCEEDED",
+                root_hwnd,
+                budget = RE_RESOLVE_NODE_BUDGET,
+                runtime_id_hex_expected,
+                "UIA element re-resolve stopped before scanning the full subtree"
             );
-            Vec::new()
+            return Ok(None);
         }
-    };
-    for child in children {
-        if let Some(found) =
-            find_by_runtime_id_hex(&child, runtime_id_hex_expected, depth + 1, max_depth)?
-        {
-            return Ok(Some(found));
+        if runtime_id_matches(&element, runtime_id_hex_expected, root_hwnd)? {
+            return Ok(Some(element));
         }
     }
     Ok(None)
+}
+
+fn runtime_id_matches(
+    element: &UIElement,
+    runtime_id_hex_expected: &str,
+    root_hwnd: i64,
+) -> A11yResult<bool> {
+    let hwnd = cached_hwnd(element)
+        .filter(|value| *value != 0)
+        .unwrap_or(root_hwnd);
+    match cached_runtime_id_hex_or_fallback(element, hwnd) {
+        Ok(readback) => Ok(readback.hex.eq_ignore_ascii_case(runtime_id_hex_expected)),
+        Err(error) => {
+            tracing::warn!(
+                code = "A11Y_RE_RESOLVE_RUNTIME_ID_FAILED",
+                error = %error,
+                element_name = %element.get_cached_name().unwrap_or_default(),
+                element_class = %element.get_cached_classname().unwrap_or_default(),
+                control_type = ?element.get_cached_control_type().ok(),
+                automation_id = %element.get_cached_automation_id().unwrap_or_default(),
+                process_id = element.get_cached_process_id().unwrap_or(-1),
+                "cached RuntimeId read failed during re-resolve; current element skipped"
+            );
+            Ok(false)
+        }
+    }
 }

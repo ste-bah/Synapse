@@ -1,5 +1,45 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-01T18:59:20-05:00
+- #627 Excel workbook FSV evidence has reached the saved-file SoT readback.
+- Evidence directory: `.runs\627\excel-runtime-check-20260601T1810`.
+- Isolated repo-built daemon:
+  - PID `34556`, bind `127.0.0.1:7855`.
+  - Post-compaction process/socket/binary readback: `119_resume_process_socket_readback.json`.
+  - Strict Inspector `tools/list`: `120_tools_list_post_compaction.txt`.
+  - Health: `121_health_post_compaction.txt`.
+- Saved workbook:
+  - path `.runs\627\excel-runtime-check-20260601T1810\issue627-self-driving-spreadsheet.xlsx`
+  - file after save: `132_file_sot_after_classic_save.json`
+  - `.xlsx` package SoT: `133_xlsx_sot_readback.json`
+  - chart relationship SoT: `134_chart_sot_readback.json`
+  - SHA256 `D3F696164FE3835A1E7C12C9E7F58821CBC08D52FDB64D7C9553340108AD567E`, length `22526`, sheet dimension `A1:M257`.
+- Accepted #627 facts:
+  - Real MCP Save As sequence used `find`, `act_click`, `act_press`, `act_clipboard`, and `observe`.
+  - File SoT before save was absent; after save exists.
+  - Workbook values/formulas match expected table, `G2` records `#DIV/0!`, 256 large-paste rows are present, undo/redo restored/reapplied them earlier, invalid empty `act_press` failed closed with workbook unchanged, and chart XML/relationships are present.
+- Cleanup and final supporting checks are complete:
+  - `135_release_all_before_cleanup.txt`: zero held keys/buttons/pads.
+  - `136_act_press_alt_f4_close_excel.txt`: real MCP Alt+F4 close action succeeded.
+  - `138_cleanup_process_port_readback.json`: Excel PID `78020` absent, daemon PID `34556` absent, port `7855` closed.
+  - Passed: `cargo fmt --check`, `cargo check -p synapse-a11y -j 2`, `cargo check -p synapse-mcp -j 2`, schema sanitize test, M4 tools-list test, release build, and `git diff --check` with line-ending warnings only.
+  - final release binary `target\release\synapse-mcp.exe`: length `46396416`, SHA256 `3FF17F523F900368D486863AA5EED573F8D3616DF2FE87E998330026D5557462`, LastWriteTimeUtc `2026-06-02T00:09:15.8502522Z`.
+- Exact next actions:
+  1. Post #627 RESOLVED evidence and close #627.
+  2. Commit/push code + state with `[skip ci]`.
+  3. Refresh the open issue queue and continue.
+
+## Current Resume Point - 2026-06-01T18:35:41-05:00
+- Required wake-up context has been re-read after compaction.
+- User-visible `Issue615FanoutTarget` concern was checked:
+  - no visible/live `Issue615` or fanout top-level window is present by OS window enumeration;
+  - wired `find` is currently blocked by the Excel `RuntimeId EMPTY` defect being fixed under #627;
+  - fixture source shows the #615 buttons only mutate the old WinForms fixture item panel or close the form.
+- Continue active #627:
+  - keep the current isolated repo-built daemon/Excel run if still alive;
+  - finish remaining spreadsheet edges: large paste, undo/redo, structurally invalid input, save-dialog handling;
+  - save the workbook, independently parse `.xlsx` bytes/worksheet/formula/chart SoT, run final supporting checks, post #627 evidence, close #627, commit with `[skip ci]`, and continue the open issue queue.
+
 ## Current Resume Point - 2026-06-01T17:50:00-05:00
 - #626 is closed with RESOLVED evidence:
   - evidence comment: https://github.com/ChrisRoyse/Synapse/issues/626#issuecomment-4597095341

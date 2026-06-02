@@ -616,3 +616,42 @@ Evidence:
 
 Outcome:
 - Inspect Excel/action/file verification surfaces and run #627 manual FSV through real Synapse MCP tools.
+
+# 2026-06-01T18:35:41-05:00 - #615 fanout fixture concern rechecked during #627
+
+Decision: Treat any `Issue615FanoutTarget` window as stale closed-issue fixture residue, not a product UI or active blocker, unless a new live process/window readback proves otherwise.
+
+Evidence:
+- OS top-level-window enumeration found no visible `Issue615`, `Fanout`, `Show80`, `Rename8`, or `Mixed8` windows alive.
+- `.runs\615\target\issue615_target.ps1` directly defines the button handlers: `Show4/7/8/80` repopulate `ItemPanel`, `Clear` clears it, `Rename8` renames current items, `Mixed8` renames/adds items, and `Exit` closes the form.
+- Wired Synapse `find` currently fails on Excel with `cached RuntimeId had unexpected type EMPTY`, which is the active #627 defect already patched locally and still under manual verification.
+
+Outcome:
+- User was told the windows are old #615 WinForms UIA stress fixtures; if one appears again, close the leaked fixture and continue #627.
+
+# 2026-06-01T18:59:20-05:00 - #627 saved workbook SoT readback completed
+
+Decision: Accept the #627 Excel workbook behavior as manually verified through the saved `.xlsx` file SoT, after using real MCP tools to complete the save dialog and then independently reading workbook package bytes.
+
+Evidence:
+- Post-compaction isolated daemon readback: PID `34556`, bind `127.0.0.1:7855`, repo release binary SHA256 `24757F067CBDBE4E5871BDCAB44DF735A47C1788CD53E126D4680B358032B245`.
+- Strict Inspector `tools/list` and `health` succeeded after compaction with all #627 tools present.
+- Classic `Save As` field and Save button were discovered through real MCP `find`, filled through `act_click`/`act_press`/`act_clipboard`, and accepted through `act_click`.
+- File SoT before save was absent; after save the `.xlsx` exists at `.runs\627\excel-runtime-check-20260601T1810\issue627-self-driving-spreadsheet.xlsx`, length `22526`, SHA256 `D3F696164FE3835A1E7C12C9E7F58821CBC08D52FDB64D7C9553340108AD567E`.
+- Workbook package readback shows sheet dimension `A1:M257`, expected formula cached values `36/27/16/20/26/33/79`, `G2` formula `1/0` with `#DIV/0!`, 256 bulk rows through `J257:M257`, and chart/drawing relationships to `xl/charts/chart1.xml`.
+
+Outcome:
+- Run final supporting checks and cleanup, then post #627 RESOLVED evidence and close the issue.
+
+# 2026-06-01T19:10:00-05:00 - #627 final checks and cleanup passed
+
+Decision: #627 is ready for RESOLVED posting; the RuntimeId/re-resolution patch, Excel manual FSV, cleanup, and local supporting checks are complete.
+
+Evidence:
+- Real Inspector `release_all` returned zero held keys/buttons/pads, real Inspector Alt+F4 closed the saved Excel workbook, and process readback found Excel PID `78020` absent.
+- Isolated daemon PID `34556` was stopped and port `127.0.0.1:7855` read back closed.
+- Supporting checks passed: `cargo fmt --check`, `cargo check -p synapse-a11y -j 2`, `cargo check -p synapse-mcp -j 2`, schema sanitize test, M4 tools-list test, release build, and `git diff --check` with line-ending warnings only.
+- Final release binary SHA256 is `3FF17F523F900368D486863AA5EED573F8D3616DF2FE87E998330026D5557462`, length `46396416`.
+
+Outcome:
+- Post #627 RESOLVED evidence, close #627, commit/push with `[skip ci]`, then continue the open queue.

@@ -25,12 +25,24 @@ use windows::Win32::{
 };
 use windows::core::BOOL;
 
-use crate::{A11yError, A11yResult, ComApartmentKind, ElementSearchScope, UiaWorkerReadback};
+use crate::{
+    A11yError, A11yResult, ComApartmentKind, ElementSearchScope, UiaWorkerReadback,
+    ids::runtime_id_hex,
+};
 
 type UiaJob = Box<dyn FnOnce(&UIAutomation) + Send + 'static>;
 
 static UIA_WORKER: OnceLock<ProcessUiaWorker> = OnceLock::new();
 static UIA_WORKER_INIT_LOCK: Mutex<()> = Mutex::new(());
+const FALLBACK_RUNTIME_ID_PREFIX: &str = "ffffffff";
+const FNV64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV64_PRIME: u64 = 0x0100_0000_01b3;
+
+#[derive(Debug)]
+pub(super) struct RuntimeIdHexReadback {
+    pub hex: String,
+    pub used_fallback: bool,
+}
 
 struct ProcessUiaWorker {
     tx: mpsc::Sender<UiaJob>,
@@ -423,6 +435,75 @@ pub(super) fn cached_runtime_id(element: &UIElement) -> A11yResult<Vec<i32>> {
         ))),
     }
 }
+
+pub(super) fn cached_runtime_id_hex_or_fallback(
+    element: &UIElement,
+    hwnd: i64,
+) -> A11yResult<RuntimeIdHexReadback> {
+    match cached_runtime_id(element) {
+        Ok(runtime_id) => Ok(RuntimeIdHexReadback {
+            hex: runtime_id_hex(&runtime_id),
+            used_fallback: false,
+        }),
+        Err(error) if runtime_id_is_unavailable(&error) => Ok(RuntimeIdHexReadback {
+            hex: fallback_runtime_id_hex(element, hwnd),
+            used_fallback: true,
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+pub(super) fn runtime_id_is_unavailable(error: &A11yError) -> bool {
+    matches!(
+        error,
+        A11yError::Internal { detail } if detail.contains("cached RuntimeId had unexpected type EMPTY")
+    )
+}
+
+pub(super) fn fallback_runtime_id_hex(element: &UIElement, hwnd: i64) -> String {
+    let rect = cached_rect(element);
+    let mut hash = FNV64_OFFSET_BASIS;
+    hash_bytes(&mut hash, &hwnd.to_le_bytes());
+    hash_bytes(
+        &mut hash,
+        &element.get_cached_process_id().unwrap_or(-1).to_le_bytes(),
+    );
+    hash_bytes(
+        &mut hash,
+        format!("{:?}", element.get_cached_control_type().ok()).as_bytes(),
+    );
+    hash_bytes(
+        &mut hash,
+        element
+            .get_cached_classname()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hash_bytes(
+        &mut hash,
+        element
+            .get_cached_automation_id()
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hash_bytes(
+        &mut hash,
+        element.get_cached_name().unwrap_or_default().as_bytes(),
+    );
+    hash_bytes(&mut hash, &rect.x.to_le_bytes());
+    hash_bytes(&mut hash, &rect.y.to_le_bytes());
+    hash_bytes(&mut hash, &rect.w.to_le_bytes());
+    hash_bytes(&mut hash, &rect.h.to_le_bytes());
+    format!("{FALLBACK_RUNTIME_ID_PREFIX}{hash:016x}")
+}
+
+fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV64_PRIME);
+    }
+}
+
 #[allow(clippy::missing_const_for_fn)]
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn map_uia_error(err: uiautomation::Error) -> A11yError {

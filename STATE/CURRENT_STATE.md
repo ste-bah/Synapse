@@ -1,5 +1,40 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-01T18:59:20-05:00
+- #627 manual Excel workbook evidence is now complete through the save/readback step.
+  - Isolated repo-built MCP daemon remains PID `34556`, bind `127.0.0.1:7855`, binary `target\release\synapse-mcp.exe`, SHA256 `24757F067CBDBE4E5871BDCAB44DF735A47C1788CD53E126D4680B358032B245`.
+  - Strict MCP Inspector post-compaction `tools/list` and `health` succeeded; required tools `health`, `observe`, `find`, `act_click`, `act_press`, `act_type`, `act_clipboard`, `read_text`, `storage_inspect`, and `release_all` are present.
+  - Classic Excel `Save As` was handled through real MCP `find`/`act_click`/`act_press`/`act_clipboard`; workbook saved to `.runs\627\excel-runtime-check-20260601T1810\issue627-self-driving-spreadsheet.xlsx`.
+  - Physical file SoT before save: target absent. After save: target exists, length `22526`, LastWriteTimeUtc `2026-06-01T23:55:42.9399586Z`.
+  - Independent shared-read `.xlsx` byte/package readback:
+    - SHA256 `D3F696164FE3835A1E7C12C9E7F58821CBC08D52FDB64D7C9553340108AD567E`
+    - sheet dimension `A1:M257`
+    - expected formula values present: `E2=36`, `E3=27`, `E4=16`, `B5=20`, `C5=26`, `D5=33`, `E5=79`
+    - formula error edge present: `G2` formula `1/0`, value `#DIV/0!`
+    - large paste edge present: 256 `Bulk*` rows from `J2:J257`, with `J257=Bulk256`, `K257=256`, `L257=512`, `M257=768`
+    - chart SoT present: `xl/charts/chart1.xml`, drawing relationship `xl/drawings/drawing1.xml`, chart relationships target `../charts/chart1.xml`, chart formulas reference `Sheet1!$A$2:$A$5` and `Sheet1!$B$2:$E$5`.
+- #627 cleanup and supporting checks are complete:
+  - real Inspector `release_all` returned zero held keys/buttons/pads.
+  - real Inspector `act_press alt+f4` closed Excel; process readback found Excel PID `78020` absent.
+  - isolated daemon PID `34556` was stopped; port `127.0.0.1:7855` readback returned no listener.
+  - supporting checks passed: `cargo fmt --check`, `cargo check -p synapse-a11y -j 2`, `cargo check -p synapse-mcp -j 2`, `cargo test -p synapse-mcp --bin synapse-mcp schema_sanitize -- --nocapture`, `cargo test -p synapse-mcp --test m4_tools_list -- --nocapture`, `cargo build --release -p synapse-mcp -j 2`, and `git diff --check` with line-ending warnings only.
+  - final release binary `target\release\synapse-mcp.exe` length `46396416`, LastWriteTimeUtc `2026-06-02T00:09:15.8502522Z`, SHA256 `3FF17F523F900368D486863AA5EED573F8D3616DF2FE87E998330026D5557462`.
+- #627 remaining work: post RESOLVED evidence to #627, close it, commit/push with `[skip ci]`, then continue the open queue.
+
+## 2026-06-01T18:35:41-05:00
+- Post-compaction wake-up was re-run:
+  - read `docs/AICodingAgentSuperPrompt.md`, `C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md`, `AGENTS.md`, `STATE/*`, live GitHub queue, #351 decision/context, #627 issue/comments, and git status/log/branch.
+  - Wired Synapse MCP `health`, `storage_inspect`, and `reflex_list` succeeded; wired `find` still fails on Excel with `cached RuntimeId had unexpected type EMPTY`, matching the active #627 Windows UIA defect being fixed in the local patch.
+  - Open queue readback: #627 active/in-progress; #624/#625 blocked on Daybreak operator-only boundary; #594/#595-#604 and #628-#634 remain open.
+- User asked about `Issue615FanoutTarget` windows with `Clear`, `Show4`, `Show7`, `Show8`, `Rename8`, `Mixed8`, `Show80`, and `Exit` buttons.
+  - OS process/window readback found no visible `Issue615`/fanout top-level windows alive now.
+  - `.runs\615\target\issue615_target.ps1` confirms those buttons are temporary #615 WinForms UIA fanout stress-fixture controls: `Show*` populates the item panel, `Clear` empties it, `Rename8` renames existing item buttons, `Mixed8` renames/adds item buttons, and `Exit` closes the fixture.
+  - If seen again, treat as stale #615 fixture residue and close it; it is not product UI.
+- Active implementation remains #627. Local worktree has the Windows UIA RuntimeId/re-resolution patch in:
+  - `crates/synapse-a11y/src/platform/windows/common.rs`
+  - `crates/synapse-a11y/src/platform/windows/resolve.rs`
+  - `crates/synapse-a11y/src/platform/windows/snapshot.rs`
+
 ## 2026-06-01T17:50:00-05:00
 - #626 is closed:
   - RESOLVED evidence: https://github.com/ChrisRoyse/Synapse/issues/626#issuecomment-4597095341
