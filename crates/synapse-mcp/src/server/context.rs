@@ -877,7 +877,7 @@ mod scope_gate_tests {
     use super::*;
     use crate::{
         m1::{FindParams, FindScope, ObserveParams, ReadTextParams},
-        m2::M2ServiceConfig,
+        m2::{ActClipboardFormat, ActClipboardParams, ActClipboardVerb, M2ServiceConfig},
         m3::{M3ServiceConfig, subscribe::SubscribeParams},
         m4::M4ServiceConfig,
     };
@@ -1061,6 +1061,69 @@ mod scope_gate_tests {
         );
         assert_eq!(stored_session["active_profile"], "notepad");
         drop(runtime);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn act_clipboard_records_redacted_action_audit_rows() -> anyhow::Result<()> {
+        let profiles = TempDir::new()?;
+        write_profile(
+            &profiles.path().join("notepad.toml"),
+            "notepad",
+            "productivity",
+        )?;
+        let service = service_with_profiles(profiles.path(), false)?;
+        install_synthetic_notepad_input(&service)?;
+
+        let before_count = {
+            let runtime = service.reflex_runtime()?;
+            let runtime = runtime
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("reflex runtime lock poisoned"))?;
+            let before_counts = runtime.storage_cf_row_counts()?;
+            cf_count(&before_counts, cf::CF_ACTION_LOG)
+        };
+
+        let result = service
+            .act_clipboard(Parameters(ActClipboardParams {
+                verb: ActClipboardVerb::Read,
+                text: None,
+                format: ActClipboardFormat::Unicode,
+            }))
+            .await;
+
+        let (after_count, rows) = {
+            let runtime = service.reflex_runtime()?;
+            let runtime = runtime
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("reflex runtime lock poisoned"))?;
+            let after_counts = runtime.storage_cf_row_counts()?;
+            (
+                cf_count(&after_counts, cf::CF_ACTION_LOG),
+                runtime.storage_cf_tail_rows(cf::CF_ACTION_LOG, 2)?,
+            )
+        };
+
+        assert_eq!(after_count, before_count + 2);
+        let started: Value = serde_json::from_slice(&rows[0].1)?;
+        let finished: Value = serde_json::from_slice(&rows[1].1)?;
+        assert_eq!(started["tool"], "act_clipboard");
+        assert_eq!(started["status"], "started");
+        assert_eq!(started["details"]["verb"], "read");
+        assert_eq!(started["details"]["format"], "unicode");
+        assert!(started["details"].get("text").is_none());
+
+        assert_eq!(finished["tool"], "act_clipboard");
+        assert_eq!(
+            finished["status"],
+            if result.is_ok() { "ok" } else { "error" }
+        );
+        assert!(finished["details"]["response"].get("text").is_none());
+        if result.is_ok() {
+            assert_eq!(finished["details"]["response"]["text_present"], true);
+        } else {
+            assert!(finished["details"].get("request").is_some());
+        }
         Ok(())
     }
 

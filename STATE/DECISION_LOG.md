@@ -1231,3 +1231,31 @@ Evidence:
 Outcome:
 - Posted #604 START comment and labeled/assigned the issue.
 - Inspect `act_clipboard` implementation next.
+
+# 2026-06-02T13:19:31-05:00 - #604 clipboard audit/backend patch
+
+Decision: Patch `act_clipboard` before runtime FSV because code inspection exposed storage-audit and error-classification gaps.
+
+Evidence:
+- `server/m2_tools.rs` called `act_clipboard(params)` directly after preflight, unlike sibling action tools, so successful reads/writes/clears did not persist normal `CF_ACTION_LOG` start/result rows.
+- The generic action-result audit would have stored raw clipboard read text if used directly, so #604 needs a redacted result detail path.
+- `m2/clipboard.rs` rejected non-ASCII `format=text` as `TOOL_PARAMS_INVALID`, but the issue requires the backend limitation to surface as `BackendUnavailable` / `ACTION_BACKEND_UNAVAILABLE`.
+
+Outcome:
+- `act_clipboard` now writes redacted action audit rows with verb/format/text length/text-present metadata only.
+- Non-ASCII CF_TEXT reaches `synapse-action` and fails as `ACTION_BACKEND_UNAVAILABLE`.
+- Focused supporting checks passed; release build and manual MCP/SoT FSV remain next.
+
+# 2026-06-02T13:48:15-05:00 - #604 rejects CF_TEXT false success and patches owner HWND
+
+Decision: Reject the first CF_TEXT FSV attempt and patch the Windows clipboard backend.
+
+Evidence:
+- Strict Inspector `act_clipboard format=text` returned `ok=true` for the ASCII payload, but separate Win32 `GetClipboardData(CF_TEXT)` returned bytes that did not match the expected ASCII string and a following MCP `read format=text` returned empty.
+- The Unicode path and redacted audit rows were accepted, so the failure was isolated to the Windows CF_TEXT write/owner path.
+- Microsoft documentation for `EmptyClipboard`/`SetClipboardData` says a NULL clipboard owner leaves no valid owner for subsequent `SetClipboardData`; the existing backend used `OpenClipboard(None)` for writes.
+
+Outcome:
+- Patched `synapse-action` Windows clipboard write/clear to create a temporary hidden owner HWND, pass it to `OpenClipboard`, keep it through `CloseClipboard`, and verify the requested format is available after `SetClipboardData`.
+- Stopped pre-fix daemon PID `9388`; patched release build SHA256 `3BB80539A49DF75CF6B17DD89D574778DEEE295AC7EB8C005E65D234302F63C5`.
+- Redo clean manual FSV next.

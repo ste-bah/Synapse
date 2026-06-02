@@ -81,6 +81,32 @@ impl SynapseService {
         }
     }
 
+    pub(super) fn audit_action_ok_with_details(
+        &self,
+        tool: &'static str,
+        details: &Value,
+    ) -> Result<(), ErrorData> {
+        self.write_action_audit_row(tool, "ok", None, details)
+    }
+
+    pub(super) fn audit_action_error_with_details(
+        &self,
+        tool: &'static str,
+        error: &ErrorData,
+        details: &Value,
+    ) -> Result<(), ErrorData> {
+        self.write_action_audit_row(
+            tool,
+            "error",
+            error_data_code(error),
+            &json!({
+                "message": error.message.to_string(),
+                "data": error.data.clone(),
+                "request": details,
+            }),
+        )
+    }
+
     pub(super) fn audit_action_result_best_effort<T: Serialize>(
         &self,
         tool: &'static str,

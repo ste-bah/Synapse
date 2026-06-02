@@ -147,15 +147,21 @@ mod platform {
         time::{Duration, Instant},
     };
 
-    use windows::Win32::{
-        Foundation::{GlobalFree, HANDLE, HGLOBAL},
-        System::{
-            DataExchange::{
-                CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
-                OpenClipboard, SetClipboardData,
+    use windows::{
+        Win32::{
+            Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND},
+            System::{
+                DataExchange::{
+                    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable,
+                    OpenClipboard, SetClipboardData,
+                },
+                Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
             },
-            Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WINDOW_STYLE,
+            },
         },
+        core::w,
     };
 
     use super::{ActionError, ActionResult, ClipboardFormat};
@@ -166,7 +172,7 @@ mod platform {
     const OPEN_CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(10);
 
     pub fn read_text(format: ClipboardFormat) -> ActionResult<String> {
-        let _clipboard = ClipboardGuard::open("read")?;
+        let _clipboard = ClipboardGuard::open("read", false)?;
         if !format_available(format) {
             return Ok(String::new());
         }
@@ -190,7 +196,7 @@ mod platform {
     }
 
     pub fn write_text(format: ClipboardFormat, text: &str) -> ActionResult<()> {
-        let _clipboard = ClipboardGuard::open("write")?;
+        let _clipboard = ClipboardGuard::open("write", true)?;
         let memory = match format {
             ClipboardFormat::Unicode => GlobalMemory::from_bytes(&unicode_clipboard_bytes(text))?,
             ClipboardFormat::Text => GlobalMemory::from_bytes(&text_clipboard_bytes(text))?,
@@ -200,11 +206,20 @@ mod platform {
             EmptyClipboard()
         }
         .map_err(|err| windows_error("EmptyClipboard", &err))?;
-        memory.give_to_clipboard(format)
+        memory.give_to_clipboard(format)?;
+        if !format_available(format) {
+            return Err(ActionError::BackendUnavailable {
+                detail: format!(
+                    "SetClipboardData reported success but {} was not available after write",
+                    format_name(format)
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub fn clear() -> ActionResult<()> {
-        let _clipboard = ClipboardGuard::open("clear")?;
+        let _clipboard = ClipboardGuard::open("clear", true)?;
         unsafe {
             // SAFETY: The clipboard is open for this thread.
             EmptyClipboard()
@@ -212,21 +227,25 @@ mod platform {
         .map_err(|err| windows_error("EmptyClipboard", &err))
     }
 
-    struct ClipboardGuard;
+    struct ClipboardGuard {
+        _owner: Option<ClipboardOwner>,
+    }
 
     impl ClipboardGuard {
-        fn open(context: &'static str) -> ActionResult<Self> {
+        fn open(context: &'static str, require_owner: bool) -> ActionResult<Self> {
+            let owner = require_owner.then(ClipboardOwner::create).transpose()?;
+            let hwnd = owner.as_ref().map(|owner| owner.hwnd);
             let started = Instant::now();
             let mut attempts = 0_u32;
             loop {
                 attempts += 1;
                 let result = unsafe {
-                    // SAFETY: Passing None preserves the existing M2 clipboard-owner
-                    // behavior; the guard closes the clipboard exactly once on success.
-                    OpenClipboard(None)
+                    // SAFETY: The optional owner HWND, when present, is kept alive by
+                    // the guard until after CloseClipboard runs.
+                    OpenClipboard(hwnd)
                 };
                 match result {
-                    Ok(()) => return Ok(Self),
+                    Ok(()) => return Ok(Self { _owner: owner }),
                     Err(err) if started.elapsed() < OPEN_CLIPBOARD_RETRY_TIMEOUT => {
                         tracing::debug!(
                             code = "ACTION_CLIPBOARD_OPEN_RETRY",
@@ -250,6 +269,50 @@ mod platform {
             unsafe {
                 // SAFETY: This guard is created only after OpenClipboard succeeds.
                 let _ = CloseClipboard();
+            }
+        }
+    }
+
+    struct ClipboardOwner {
+        hwnd: HWND,
+    }
+
+    impl ClipboardOwner {
+        fn create() -> ActionResult<Self> {
+            let hwnd = unsafe {
+                // SAFETY: The built-in STATIC class is registered by the system. The
+                // message-only parent keeps the temporary owner hidden and local to this
+                // process while the clipboard is open.
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!("SynapseClipboardOwner"),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .map_err(|err| windows_error("CreateWindowExW clipboard owner", &err))?;
+            if hwnd.is_invalid() {
+                return Err(ActionError::BackendUnavailable {
+                    detail: "CreateWindowExW returned an invalid clipboard owner HWND".to_owned(),
+                });
+            }
+            Ok(Self { hwnd })
+        }
+    }
+
+    impl Drop for ClipboardOwner {
+        fn drop(&mut self) {
+            unsafe {
+                // SAFETY: hwnd was returned by CreateWindowExW and is owned by this guard.
+                let _ = DestroyWindow(self.hwnd);
             }
         }
     }
@@ -353,6 +416,13 @@ mod platform {
         }
     }
 
+    const fn format_name(format: ClipboardFormat) -> &'static str {
+        match format {
+            ClipboardFormat::Text => "CF_TEXT",
+            ClipboardFormat::Unicode => "CF_UNICODETEXT",
+        }
+    }
+
     fn unicode_clipboard_bytes(text: &str) -> Vec<u8> {
         text.encode_utf16()
             .chain(std::iter::once(0))
@@ -405,5 +475,22 @@ mod platform {
                 started.elapsed().as_millis()
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use synapse_core::error_codes;
+
+    use super::*;
+
+    #[test]
+    fn cf_text_non_ascii_fails_as_backend_unavailable_before_platform_open() {
+        let error = write_text(ClipboardFormat::Text, "unicode-clipboard-edge-雪")
+            .expect_err("non-ASCII CF_TEXT writes must fail closed");
+
+        assert_eq!(error.code(), error_codes::ACTION_BACKEND_UNAVAILABLE);
+        assert!(matches!(error, ActionError::BackendUnavailable { .. }));
+        assert!(error.detail().contains("CF_TEXT"));
     }
 }

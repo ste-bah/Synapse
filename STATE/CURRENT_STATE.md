@@ -1,5 +1,53 @@
 # CURRENT STATE - Synapse
 
+## 2026-06-02T13:48:15-05:00
+- Active issue remains #604.
+- First isolated FSV daemon/run:
+  - run dir `.runs\604\clipboard-fsv-20260602T1328`;
+  - daemon PID `9388`, bind `127.0.0.1:7885`, release SHA256 before owner-window fix `007518B8CC722C9E610CADD3CB5B000DEED37E8815E9FA5138A799AAE055700A`;
+  - auth health OK, unauth `/health=401`, strict Inspector `tools/list=80` with `act_clipboard`.
+- Accepted in the first run:
+  - Unicode `act_clipboard write/read` matched separate `Get-Clipboard` UTF-8 hash `AA146817EBD41E7D1325E8C946521DD2A112837FB6F2E3C02542720973F33C3C`;
+  - `CF_ACTION_LOG` moved to `4`; storage samples showed `act_clipboard` start/ok rows and redacted response metadata (`text_present`, no raw `text` field).
+- Rejected in the first run:
+  - CF_TEXT ASCII write returned `ok=true`, but separate Win32 `GetClipboardData(CF_TEXT)` did not match the expected ASCII bytes and MCP `act_clipboard read format=text` returned empty.
+  - Root cause: Windows write path used `OpenClipboard(None)` before `EmptyClipboard`; Microsoft documents that if the clipboard owner is `NULL`, `EmptyClipboard` sets owner to `NULL` and later `SetClipboardData` fails/notifies no valid owner. Return value alone was therefore not accepted.
+- Additional patch:
+  - `crates/synapse-action/src/clipboard.rs` now creates a temporary hidden message-only owner window for write/clear, passes that HWND to `OpenClipboard`, keeps it alive through `CloseClipboard`, destroys it afterward, and verifies `IsClipboardFormatAvailable(format)` immediately after `SetClipboardData`.
+- Supporting checks passed after owner-window patch:
+  - `cargo fmt`;
+  - `cargo check -p synapse-action -j 2`;
+  - focused action/MCP clipboard tests.
+- New patched release build:
+  - `target\release\synapse-mcp.exe`, length `46848512`, SHA256 `3BB80539A49DF75CF6B17DD89D574778DEEE295AC7EB8C005E65D234302F63C5`, `LastWriteTimeUtc=2026-06-02T18:48:07.5196515Z`.
+- Cleanup/readback:
+  - pre-fix PID `9388` stopped;
+  - port `7885` closed.
+- Current next:
+  1. Launch a clean post-fix isolated daemon, strict Inspector `tools/list`.
+  2. Redo #604 manual FSV from clean SoTs, especially CF_TEXT raw bytes and Notepad paste/file bytes.
+
+## 2026-06-02T13:19:31-05:00
+- Active issue remains #604 `scenario(stress): act_clipboard round-trip - Text/Unicode, large, non-ASCII reject, contention`.
+- Code inspection found two real gaps before runtime FSV:
+  - `act_clipboard` success bypassed normal action start/result audit rows, so `CF_ACTION_LOG` could miss successful clipboard side effects.
+  - MCP prevalidation rejected non-ASCII `format=text` as `TOOL_PARAMS_INVALID`, while #604 expects the backend limitation to surface as `ACTION_BACKEND_UNAVAILABLE`.
+- Patch applied:
+  - `crates/synapse-mcp/src/server/m2_tools.rs`: `act_clipboard` now records redacted action audit start/result rows for all calls and includes only verb/format/text length/text-present metadata, never raw clipboard text.
+  - `crates/synapse-mcp/src/server/action_audit.rs`: added explicit ok/error audit helpers for redacted/custom details.
+  - `crates/synapse-mcp/src/m2/clipboard.rs`: removed non-ASCII CF_TEXT MCP prevalidation so the action backend owns the backend-unavailable failure.
+  - `crates/synapse-action/src/clipboard.rs`: supporting regression asserts non-ASCII CF_TEXT fails as `ACTION_BACKEND_UNAVAILABLE`.
+  - `crates/synapse-mcp/src/server/context.rs`: supporting regression asserts `act_clipboard` writes two redacted `CF_ACTION_LOG` rows.
+- Focused supporting checks passed:
+  - `cargo fmt`;
+  - `cargo test -p synapse-action cf_text_non_ascii_fails_as_backend_unavailable_before_platform_open -- --nocapture`;
+  - `cargo test -p synapse-mcp text_format_non_ascii_reaches_backend_validation -- --nocapture`;
+  - `cargo test -p synapse-mcp act_clipboard_records_redacted_action_audit_rows -- --nocapture`.
+- Current next:
+  1. Run broader supporting checks and release build.
+  2. Launch an isolated repo-built daemon for #604.
+  3. Perform manual MCP/SoT FSV for Unicode, CF_TEXT ASCII, large payload, clear/empty, CF_TEXT non-ASCII rejection, contention retry, boundary and structurally invalid params, Notepad paste/file bytes, `CF_ACTION_LOG` rows, and cleanup.
+
 ## 2026-06-02T13:07:00-05:00
 - #603 is closed:
   - commit `6d3c148 fix(mcp): expose gamepad guide button (#603) [skip ci]`;

@@ -1,5 +1,49 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T13:48:15-05:00
+- Active issue remains #604.
+- First #604 run `.runs\604\clipboard-fsv-20260602T1328` found and rejected a real CF_TEXT false-success:
+  - PID `9388` on `127.0.0.1:7885` passed auth/unauth health and strict Inspector `tools/list=80`.
+  - Unicode write/read accepted with separate `Get-Clipboard` hash match and redacted `CF_ACTION_LOG` rows.
+  - CF_TEXT ASCII write returned success but Win32 `GetClipboardData(CF_TEXT)` did not match and MCP `read format=text` returned empty, so the run was not accepted for CF_TEXT.
+- Root-cause patch after the rejected CF_TEXT run:
+  - Windows clipboard write/clear now creates a temporary hidden owner HWND and passes it to `OpenClipboard` so `EmptyClipboard`/`SetClipboardData` has a valid owner.
+  - After `SetClipboardData`, the backend verifies the requested format is available before returning success.
+- Checks passed after patch:
+  - `cargo fmt`;
+  - `cargo check -p synapse-action -j 2`;
+  - `cargo test -p synapse-action cf_text_non_ascii_fails_as_backend_unavailable_before_platform_open -- --nocapture`;
+  - `cargo test -p synapse-mcp text_format_non_ascii_reaches_backend_validation -- --nocapture`;
+  - `cargo test -p synapse-mcp act_clipboard_records_redacted_action_audit_rows -- --nocapture`;
+  - `cargo build --release -p synapse-mcp -j 2`.
+- New patched release binary:
+  - SHA256 `3BB80539A49DF75CF6B17DD89D574778DEEE295AC7EB8C005E65D234302F63C5`;
+  - length `46848512`;
+  - `LastWriteTimeUtc=2026-06-02T18:48:07.5196515Z`.
+- Pre-fix daemon PID `9388` stopped; port `7885` closed.
+- Exact next actions:
+  1. Launch a clean post-fix daemon, preferably on a new port/run dir.
+  2. Repeat process/socket/auth/health/strict Inspector `tools/list`.
+  3. Run full #604 manual FSV: Unicode, CF_TEXT ASCII with raw Win32 bytes, Notepad paste/file readback, large payload, clear/empty, non-ASCII CF_TEXT backend rejection, contention retry/fail-closed, structurally invalid params, storage audit rows, cleanup.
+
+## Current Resume Point - 2026-06-02T13:19:31-05:00
+- Active issue remains #604 `scenario(stress): act_clipboard round-trip - Text/Unicode, large, non-ASCII reject, contention`.
+- Patch in progress:
+  - `crates/synapse-mcp/src/server/m2_tools.rs` now audits `act_clipboard` start/result rows with redacted clipboard metadata only.
+  - `crates/synapse-mcp/src/server/action_audit.rs` has ok/error helpers for custom redacted action details.
+  - `crates/synapse-mcp/src/m2/clipboard.rs` lets non-ASCII `format=text` reach the action backend.
+  - `crates/synapse-action/src/clipboard.rs` has a supporting backend-unavailable regression.
+  - `crates/synapse-mcp/src/server/context.rs` has a supporting redacted action-log regression.
+- Focused checks passed:
+  - `cargo fmt`;
+  - `cargo test -p synapse-action cf_text_non_ascii_fails_as_backend_unavailable_before_platform_open -- --nocapture`;
+  - `cargo test -p synapse-mcp text_format_non_ascii_reaches_backend_validation -- --nocapture`;
+  - `cargo test -p synapse-mcp act_clipboard_records_redacted_action_audit_rows -- --nocapture`.
+- Exact next actions:
+  1. Run final/broader supporting checks and `cargo build --release -p synapse-mcp`.
+  2. Launch isolated repo-built daemon for #604 and verify process/socket/auth/health/strict Inspector `tools/list`.
+  3. Run manual FSV through real MCP `tools/call act_clipboard` with separate Windows clipboard, Notepad/file bytes, storage/action-log, contention-holder, and cleanup SoTs.
+
 ## Current Resume Point - 2026-06-02T13:07:00-05:00
 - #603 is closed.
   - Commit: `6d3c148 fix(mcp): expose gamepad guide button (#603) [skip ci]`.

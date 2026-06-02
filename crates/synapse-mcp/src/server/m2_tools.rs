@@ -279,15 +279,33 @@ impl SynapseService {
             kind = "act_clipboard",
             "tool.invocation kind=act_clipboard"
         );
+        let request_details = json!({
+            "verb": params.verb,
+            "format": params.format,
+            "text_len": params.text.as_ref().map(|text| text.chars().count()),
+        });
         if matches!(
             params.verb,
             ActClipboardVerb::Write | ActClipboardVerb::Clear
         ) && let Err(error) = self.ensure_supported_use_allows_action("act_clipboard")
         {
-            self.audit_action_denied("act_clipboard", &error);
+            self.audit_action_denied_with_details("act_clipboard", &error, &request_details);
             return Err(error);
         }
-        act_clipboard(params).await.map(Json)
+        self.audit_action_started_with_details("act_clipboard", &request_details)?;
+        let result = act_clipboard(params).await;
+        match &result {
+            Ok(response) => {
+                self.audit_action_ok_with_details(
+                    "act_clipboard",
+                    &clipboard_response_audit_details(response),
+                )?;
+            }
+            Err(error) => {
+                self.audit_action_error_with_details("act_clipboard", error, &request_details)?;
+            }
+        }
+        result.map(Json)
     }
 
     #[tool(description = "Release all held keyboard, mouse, and gamepad input state")]
@@ -311,6 +329,21 @@ impl SynapseService {
 fn action_preflight_details(preflight: &ActionPreflightReadback) -> Value {
     json!({
         "preflight": preflight,
+    })
+}
+
+fn clipboard_response_audit_details(response: &ActClipboardResponse) -> Value {
+    json!({
+        "response": {
+            "ok": response.ok,
+            "verb": response.verb,
+            "format": response.format,
+            "written": response.written,
+            "cleared": response.cleared,
+            "text_len": response.text_len,
+            "text_present": response.text.is_some(),
+            "elapsed_ms": response.elapsed_ms,
+        },
     })
 }
 

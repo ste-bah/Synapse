@@ -154,14 +154,6 @@ fn validate_params(params: &ActClipboardParams) -> Result<(), ErrorData> {
             }
         }
     }
-    if params.format == ActClipboardFormat::Text
-        && params.text.as_deref().is_some_and(|text| !text.is_ascii())
-    {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "act_clipboard format=text accepts ASCII text only; use format=unicode",
-        ));
-    }
     Ok(())
 }
 
@@ -182,4 +174,20 @@ const fn default_clipboard_format() -> ActClipboardFormat {
 
 fn elapsed_ms(started: Instant) -> u32 {
     u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_format_non_ascii_reaches_backend_validation() {
+        let params = ActClipboardParams {
+            verb: ActClipboardVerb::Write,
+            text: Some("unicode-clipboard-edge-雪".to_owned()),
+            format: ActClipboardFormat::Text,
+        };
+
+        assert!(validate_params(&params).is_ok());
+    }
 }
