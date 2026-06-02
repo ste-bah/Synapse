@@ -1,5 +1,72 @@
 # RECOVERY NOTES - Synapse
 
+## Current Resume Point - 2026-06-02T09:40:00-05:00
+- Active issue #600 has implementation, accepted manual MCP/SoT FSV, cleanup, final supporting checks, release build/readback, and diff review complete.
+- Patch:
+  - `crates/synapse-action/src/handle.rs`: normal `execute` fails closed with `ACTION_QUEUE_FULL`; emitter-backed handles include a safety lane; `ReleaseAll` requests the release interrupt before enqueue.
+  - `crates/synapse-action/src/emitter.rs` and `src/emitter/lifecycle.rs`: actor owns/polls the safety lane before normal queue work and rejects pending normal actions after `ReleaseAll` with `SAFETY_RELEASE_ALL_FIRED`.
+  - `crates/synapse-action/src/hotkey.rs` and `src/lib.rs`: expose `request_release_interrupt()`.
+  - `crates/synapse-mcp/src/m2/release_all.rs`: MCP release_all advances the interrupt epoch before snapshot/readback.
+  - Regression tests updated in `synapse-action` handle/emitter/rate-limit coverage and MCP release/press tests.
+- Accepted FSV evidence directory: `.runs\600\action-flood-fsv-20260602T0904-final`.
+  - Daemon PID `40028`, bind `127.0.0.1:7880`, release SHA256 `786FF6F6B62AC564F8F0C7A1DC20E8226A6720AB44A6EB6B75064EC8E88081C2`, strict Inspector `tools/list=80`.
+  - Happy path Notepad file SoT after real `act_press` calls was exactly `def`, SHA256 `CB8379AC2098AA165029E3938A51DA0BCECFC008FD6795F401178647F96C5B34`; storage `CF_ACTION_LOG=10`.
+  - Over-queue flood produced `ACTION_QUEUE_FULL=317` and `SAFETY_RELEASE_ALL_FIRED=256`; in-flight middle-button hold elapsed `1549 ms` instead of `30000 ms`; OS input after/final all false; storage grew to `CF_ACTION_LOG=1813`.
+  - Empty, structurally invalid, exact 256, just-under 255, ViGEm happy, and Shift/KeyUp safety edges were accepted with before/after file, storage, OS-input, and process/log readbacks.
+  - Documented rate-limit gap: strict real public MCP paths could not exceed the software/ViGEm token buckets on this host before queue/backend/RPC throughput dominated; supporting bucket tests prove exact bucket behavior.
+  - Cleanup: release_all zero; daemon PID `40028` stopped and port closed; Notepad PID `60556` closed; file still `def`.
+- Rejected/partial runs to avoid citing as final:
+  - `.runs\600\action-flood-fsv-20260602T0804-patched` predates final release_all interrupt patch.
+  - `.runs\600\action-flood-fsv-20260602T0904-final\edge_manual_20260602T091529` had malformed PowerShell header invocation.
+  - `.runs\600\action-flood-fsv-20260602T0904-final\boundary_exact_256_20260602T092002` and `boundary_just_under_255_20260602T092016` failed setup due header/import splitting.
+- Final supporting checks passed: fmt check, diff check, action handle/emitter/rate-limit tests, MCP release_all/act_press/schema/tool-list tests, touched-crate check, and release build.
+- Final release build after cleanup: length `46730752`, SHA256 `8338D75A74663970FE2239119158082D3D03F8F156F7E9B05276813E10BEFEFB`, timestamp `2026-06-02T14:34:15.8470672Z`.
+- Exact next actions:
+  1. Run tracked diff/token scan.
+  2. Commit with `[skip ci]`, push.
+  3. Post #600 RESOLVED evidence with the documented rate-limit gap, close #600, remove stale `status:in-progress`/`agent:codex`.
+  4. Refresh queue and take #601 unless GitHub changed.
+
+## Current Resume Point - 2026-06-02T07:55:36-05:00
+- Active issue remains #600.
+- Root-cause patch stack now includes:
+  - normal MCP action enqueue via `ActionHandle::execute` fails closed with `ACTION_QUEUE_FULL` instead of awaiting bounded-channel capacity;
+  - emitter-backed handles carry a priority safety lane for `ReleaseAll` and `KeyUp`;
+  - the actor polls safety/auto-release/snapshot/shutdown before normal actions and rejects pending normal actions after `ReleaseAll` with `SAFETY_RELEASE_ALL_FIRED`;
+  - MCP `ReleaseAll` now also calls `request_release_interrupt()` before enqueue so in-flight software holds that poll the release epoch stop early instead of delaying safety until the requested hold duration expires.
+- Supporting checks passed after the interrupt patch:
+  - `cargo fmt`;
+  - `cargo test -p synapse-action --test handle_queue -- --nocapture`;
+  - `cargo test -p synapse-action --test emitter_state release_all_safety_lane_preempts_saturated_normal_queue -- --nocapture`;
+  - `cargo check -p synapse-action`.
+- Existing #600 isolated daemon PID `75412` on `127.0.0.1:7879` is still alive but predates the interrupt patch; use it only for cleanup, then stop it and launch a fresh repo-built daemon.
+- Exact next actions:
+  1. Run broader `synapse-action`/`synapse-reflex`/`synapse-mcp` checks and release build.
+  2. Call real Inspector `release_all` on old PID `75412`, stop it, and verify port `7879` closed.
+  3. Launch a fresh isolated repo-built #600 daemon and repeat process/socket/auth/health/strict Inspector `tools/list`.
+  4. Manual FSV: Notepad happy path, queue overflow with long `act_click` hold + concurrent click flood, interleaved release_all during that flood, software/ViGEm rate-limit evidence or documented strict-client throughput gap, refill recovery, empty/boundary/invalid params, storage/log/OS/file readbacks, and cleanup.
+
+## Current Resume Point - 2026-06-02T07:30:35-05:00
+- Active issue remains #600.
+- Confirmed root cause:
+  - real MCP action tools used `ActionHandle::execute`, whose old bounded `send().await` could wait for capacity rather than surfacing `ACTION_QUEUE_FULL`;
+  - `ReleaseAll`/panic/operator safety release and `KeyUp` could be delayed by the same normal queue even though the rate limiter exempted them.
+- Patch applied:
+  - `crates/synapse-action/src/handle.rs`: normal `execute` now fails closed with `ACTION_QUEUE_FULL`; emitter-backed handles have an unbounded safety lane for `ReleaseAll`/`KeyUp`; panic/operator release uses that lane when available.
+  - `crates/synapse-action/src/emitter.rs` and `src/emitter/lifecycle.rs`: emitter owns the safety receiver, biases safety/auto-release/snapshot/shutdown before normal actions, and rejects pending normal actions after `ReleaseAll` with `SAFETY_RELEASE_ALL_FIRED`.
+  - `crates/synapse-action/tests/handle_queue.rs`: supporting regression for `execute` queue-full at 256.
+  - `crates/synapse-action/tests/emitter_state.rs`: supporting regression that release_all preempts a saturated normal queue and queued keydowns do not dispatch afterward.
+- Supporting checks passed so far:
+  - `cargo fmt`
+  - `cargo check -p synapse-action`
+  - `cargo test -p synapse-action --test handle_queue -- --nocapture`
+  - `cargo test -p synapse-action --test emitter_state release_all_safety_lane_preempts_saturated_normal_queue -- --nocapture`
+- Exact next actions:
+  1. Run `cargo check -p synapse-reflex -p synapse-mcp -j 2` plus focused MCP action/schema/tool-list checks.
+  2. Run final format/diff checks and release build.
+  3. Launch a fresh isolated repo-built #600 daemon, verify process/socket/auth/health/strict Inspector `tools/list`.
+  4. Manual FSV: Notepad happy path, exact capacity boundary, over-rate `ACTION_RATE_LIMITED`, recovery after refill, queue overflow `ACTION_QUEUE_FULL`, interleaved `release_all` during flood, KeyUp/release safety, ViGEm bucket if available, empty/invalid params, cleanup.
+
 ## Current Resume Point - 2026-06-02T07:20:00-05:00
 - #599 is closed with commit `9252e93` and RESOLVED evidence at https://github.com/ChrisRoyse/Synapse/issues/599#issuecomment-4602291835.
 - Worktree was clean after pushing #599: `## main...origin/main`.

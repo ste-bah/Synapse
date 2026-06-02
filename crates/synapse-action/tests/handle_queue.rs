@@ -1,7 +1,10 @@
 use std::time::Duration;
 
-use synapse_action::{ACTION_QUEUE_CAPACITY, ActionError, ActionHandle};
-use synapse_core::Action;
+use synapse_action::{
+    ACTION_QUEUE_CAPACITY, ActionError, ActionHandle, operator_release_epoch,
+    operator_release_requested_since,
+};
+use synapse_core::{Action, Backend, Key, KeyCode};
 
 #[test]
 fn try_execute_reports_queue_full_at_capacity_boundary() {
@@ -99,4 +102,76 @@ async fn execute_waits_for_actor_ack_happy_path() {
         .unwrap_or_else(|err| panic!("actor task should complete: {err}"));
     assert_eq!(final_len, 0);
     println!("readback=action_queue edge=execute_ack after=queued:{final_len}");
+}
+
+#[tokio::test]
+async fn execute_reports_queue_full_when_normal_queue_is_saturated() {
+    let (handle, rx) = ActionHandle::channel();
+    for index in 0..ACTION_QUEUE_CAPACITY {
+        handle
+            .try_execute(Action::KeyDown {
+                key: key_named(&format!("held-{index}")),
+                backend: Backend::Software,
+            })
+            .unwrap_or_else(|err| panic!("queue should accept capacity-sized burst: {err}"));
+    }
+    let before_len = rx.len();
+    println!("readback=action_queue edge=execute_full before=queued:{before_len}");
+
+    let error = match handle
+        .execute(Action::KeyDown {
+            key: key_named("overflow"),
+            backend: Backend::Software,
+        })
+        .await
+    {
+        Ok(()) => panic!("execute must fail closed when the bounded action queue is full"),
+        Err(error) => error,
+    };
+
+    assert_eq!(before_len, ACTION_QUEUE_CAPACITY);
+    assert_eq!(rx.len(), ACTION_QUEUE_CAPACITY);
+    assert_eq!(error.code(), synapse_core::error_codes::ACTION_QUEUE_FULL);
+    println!(
+        "readback=action_queue edge=execute_full after=queued:{} result_value={} detail={}",
+        rx.len(),
+        error.code(),
+        error.detail()
+    );
+}
+
+#[tokio::test]
+async fn execute_release_all_requests_hold_interrupt_before_actor_ack() {
+    let (handle, mut rx) = ActionHandle::channel();
+    let before_epoch = operator_release_epoch();
+    println!("readback=release_interrupt edge=execute_release_all before_epoch={before_epoch}");
+
+    let pending = tokio::spawn(async move { handle.execute(Action::ReleaseAll).await });
+    let Some((action, ack)) = rx.recv().await else {
+        panic!("release_all action should be enqueued");
+    };
+
+    assert!(matches!(action, Action::ReleaseAll));
+    assert!(operator_release_requested_since(before_epoch));
+    let after_epoch = operator_release_epoch();
+    println!(
+        "readback=release_interrupt edge=execute_release_all after_epoch={after_epoch} requested_since_before={}",
+        operator_release_requested_since(before_epoch)
+    );
+
+    ack.send(Ok(()))
+        .unwrap_or_else(|_error| panic!("release_all ack receiver should still be alive"));
+    pending
+        .await
+        .unwrap_or_else(|error| panic!("release_all task should join: {error}"))
+        .unwrap_or_else(|error| panic!("release_all should observe actor ack: {error}"));
+}
+
+fn key_named(value: &str) -> Key {
+    Key {
+        code: KeyCode::Named {
+            value: value.to_owned(),
+        },
+        use_scancode: false,
+    }
 }

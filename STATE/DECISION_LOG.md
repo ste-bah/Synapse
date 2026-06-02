@@ -1040,3 +1040,51 @@ Evidence:
 Outcome:
 - Posted #600 START comment and labeled/assigned the issue.
 - Inspect action limiter/queue code next.
+
+# 2026-06-02T07:30:35-05:00 - #600 requires real MCP execute-path queue hardening
+
+Decision: Patch the action handle/emitter before runtime FSV because the low-level queue tests did not cover the real MCP enqueue path.
+
+Evidence:
+- #600 requires real `act_press`/`act_click` MCP floods to surface `ACTION_QUEUE_FULL` once the 256-deep action queue is saturated.
+- `ActionHandle::try_execute` already returned `ACTION_QUEUE_FULL`, but MCP tools call `ActionHandle::execute`.
+- The old `execute` used async `mpsc::Sender::send`, which waits for bounded-channel capacity instead of failing closed.
+- `ReleaseAll` and panic/operator safety release used the same saturated normal queue; `KeyUp` was rate-limit exempt but not queue-priority exempt.
+- Tokio docs confirm bounded `send` waits for channel capacity while `try_send` returns immediately when the buffer is full; `select!` with `biased` polling can enforce an explicit priority order.
+
+Outcome:
+- Normal `execute` now uses non-blocking queue insertion and returns `ACTION_QUEUE_FULL`.
+- Emitter-backed handles carry a priority safety lane for `ReleaseAll`/`KeyUp`.
+- The actor polls safety/auto-release/snapshot/shutdown before normal actions and rejects pending normal actions after `ReleaseAll`.
+- Focused `synapse-action` compile and queue/preemption regressions passed; broader MCP/runtime FSV remains next.
+
+# 2026-06-02T07:55:36-05:00 - #600 release_all must interrupt active software holds
+
+Decision: Have `ReleaseAll` enqueue request the release-interrupt epoch before it waits for actor execution.
+
+Evidence:
+- The #600 queue fix made `ReleaseAll` bypass the saturated normal queue, but the actor can still be inside a blocking backend call.
+- Software key/mouse hold sleeps poll `operator_release_requested_since(epoch)`, but only the operator hotkey advanced that epoch.
+- MCP `release_all` and panic-hook `fire_release_all_blocking_with_timeout` therefore had a priority lane but did not wake the current long hold.
+- Focused handle test readback showed `execute(Action::ReleaseAll)` now changes the epoch before actor ack, and the safety-lane preemption regression still passes.
+
+Outcome:
+- Added `synapse_action::request_release_interrupt()`.
+- `ActionHandle::execute(Action::ReleaseAll)` and blocking release fire now call it before enqueueing.
+- Rebuild and fresh isolated MCP FSV are required because the old #600 daemon predates this patch.
+
+# 2026-06-02T09:40:00-05:00 - #600 accepted with queue-flood fix and documented rate-limit gap
+
+Decision: Accept the #600 implementation after the final isolated repo-built daemon run, with the token-bucket runtime evidence recorded as a documented host-throughput gap rather than a forced claim.
+
+Evidence:
+- Final daemon `.runs\600\action-flood-fsv-20260602T0904-final`: PID `40028`, bind `127.0.0.1:7880`, release SHA256 `786FF6F6B62AC564F8F0C7A1DC20E8226A6720AB44A6EB6B75064EC8E88081C2`, strict Inspector `tools/list=80`.
+- Real MCP happy path wrote exactly `def` to the Notepad file SoT and separately read `CF_ACTION_LOG=10`.
+- Queue flood produced `ACTION_QUEUE_FULL=317`, `SAFETY_RELEASE_ALL_FIRED=256`, log readbacks for both codes, and no stuck OS input after release/cleanup.
+- MCP release_all interrupted active software holds: middle-button hold elapsed `1549 ms` and Shift hold elapsed `1766 ms` rather than the requested `30000 ms`.
+- Empty, invalid-structure, exact 256, just-under 255, ViGEm happy, and KeyUp/release safety edges all had before/after file/storage/OS/process readbacks.
+- The real public MCP paths on this host did not reach `ACTION_RATE_LIMITED`: software flood attempts hit `ACTION_QUEUE_FULL`/backend validation first, while ViGEm calls completed below `1000/s`; supporting token-bucket tests passed exact software/ViGEm overshoot cases.
+- Cleanup readbacks showed release_all zero, daemon stopped, port closed, Notepad closed, and file unchanged.
+
+Outcome:
+- Proceed to tracked diff/token scan, `[skip ci]` commit, push, #600 RESOLVED comment/closeout, then refresh queue for #601.

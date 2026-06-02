@@ -30,6 +30,7 @@ pub const HELD_KEY_MAX_DURATION_MS: u64 = 30_000;
 
 pub struct ActionEmitter {
     rx: mpsc::Receiver<ActionMessage>,
+    safety_rx: mpsc::UnboundedReceiver<ActionMessage>,
     snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
     auto_release_tx: mpsc::Sender<HeldKeyAutoRelease>,
     auto_release_rx: mpsc::Receiver<HeldKeyAutoRelease>,

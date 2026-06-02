@@ -42,7 +42,8 @@ pub use handle::{
 };
 pub use hotkey::{
     OperatorHotkeyGuard, OperatorHotkeyStatus, install_operator_hotkey, operator_hotkey_status,
-    operator_release_epoch, operator_release_requested_since, set_operator_hotkey_status,
+    operator_release_epoch, operator_release_requested_since, request_release_interrupt,
+    set_operator_hotkey_status,
 };
 pub use invoke::{
     CoordinateFallbackPlan, ElementClickOutcome, click_element_or_fallback, invoke_element,

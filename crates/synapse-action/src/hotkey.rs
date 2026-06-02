@@ -63,8 +63,7 @@ pub fn operator_release_requested_since(epoch: u64) -> bool {
     OPERATOR_RELEASE_EPOCH.load(Ordering::Acquire) != epoch
 }
 
-#[cfg(windows)]
-fn request_operator_release_interrupt() {
+pub fn request_release_interrupt() {
     OPERATOR_RELEASE_EPOCH.fetch_add(1, Ordering::AcqRel);
 }
 
@@ -176,7 +175,7 @@ mod platform {
             }
 
             if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_WPARAM {
-                super::request_operator_release_interrupt();
+                super::request_release_interrupt();
                 let result = catch_unwind(AssertUnwindSafe(&handler));
                 if result.is_err() {
                     tracing::error!(

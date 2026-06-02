@@ -116,20 +116,13 @@ async fn live_press_sequence_leaves_actor_available_for_release_all_mid_hold() {
     let recording = Arc::new(RecordingBackend::new());
     let (handle, snapshot_handle, join) =
         ActionEmitter::spawn_with_backend(cancel.clone(), recording.clone());
-    let keys = vec![key("a")];
     let started_events = recording.events();
     println!(
         "readback=act_press_live_sequence edge=mid_hold_release before_events={started_events:?}"
     );
 
-    let press = tokio::spawn(execute_live_press_sequence(
-        handle.clone(),
-        keys,
-        50,
-        Backend::Software,
-        None,
-    ));
-    let before_release = wait_for_held_key(&snapshot_handle, "a").await;
+    let (press, before_release) =
+        spawn_press_and_wait_for_held_key(handle.clone(), &snapshot_handle).await;
     println!(
         "readback=act_press_live_sequence edge=mid_hold_release before_release={before_release:?}"
     );
@@ -166,6 +159,39 @@ async fn live_press_sequence_leaves_actor_available_for_release_all_mid_hold() {
         .await
         .unwrap_or_else(|error| panic!("emitter should join: {error}"));
     assert!(final_snapshot.held_keys.is_empty());
+}
+
+async fn spawn_press_and_wait_for_held_key(
+    handle: synapse_action::ActionHandle,
+    snapshot_handle: &synapse_action::ActionEmitterSnapshotHandle,
+) -> (
+    tokio::task::JoinHandle<Result<(), rmcp::ErrorData>>,
+    synapse_action::ActionStateSnapshot,
+) {
+    for attempt in 0..5 {
+        let press = tokio::spawn(execute_live_press_sequence(
+            handle.clone(),
+            vec![key("a")],
+            500,
+            Backend::Software,
+            None,
+        ));
+        if let Some(snapshot) = wait_for_held_key_or_press_done(snapshot_handle, "a", &press).await
+        {
+            return (press, snapshot);
+        }
+        press
+            .await
+            .unwrap_or_else(|error| panic!("interrupted press attempt should join: {error}"))
+            .unwrap_or_else(|error| {
+                panic!("interrupted press attempt should still release cleanly: {error}")
+            });
+        println!(
+            "readback=act_press_live_sequence edge=mid_hold_release attempt={attempt} observed_external_release_before_held=true"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for held key a without external release interference");
 }
 
 fn profile_with_keymap<const N: usize>(entries: [(&str, &str); N]) -> Profile {
@@ -278,11 +304,12 @@ fn event_sequence_reads_recording_events() {
     assert_eq!(after, "down:ctrl>delay:33>up:ctrl");
 }
 
-async fn wait_for_held_key(
+async fn wait_for_held_key_or_press_done(
     snapshot_handle: &synapse_action::ActionEmitterSnapshotHandle,
     key_name: &str,
-) -> synapse_action::ActionStateSnapshot {
-    for _ in 0..50 {
+    press: &tokio::task::JoinHandle<Result<(), rmcp::ErrorData>>,
+) -> Option<synapse_action::ActionStateSnapshot> {
+    for _ in 0..100 {
         let snapshot = snapshot_handle
             .snapshot()
             .await
@@ -291,9 +318,12 @@ async fn wait_for_held_key(
             synapse_core::KeyCode::Named { value } => value == key_name,
             _ => false,
         }) {
-            return snapshot;
+            return Some(snapshot);
+        }
+        if press.is_finished() {
+            return None;
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
-    panic!("timed out waiting for held key {key_name}");
+    None
 }

@@ -11,8 +11,10 @@ use super::{
     BackendRateLimits, Backends, EmitState,
 };
 use crate::{
-    ACTION_QUEUE_CAPACITY, ActionBackend, ActionHandle, ActionMessage, BackendResolutionPolicy,
+    ACTION_QUEUE_CAPACITY, ActionBackend, ActionError, ActionHandle, ActionMessage, ActionResult,
+    BackendResolutionPolicy,
 };
+use synapse_core::{Action, error_codes};
 
 impl ActionEmitter {
     #[must_use]
@@ -45,9 +47,26 @@ impl ActionEmitter {
         backends: Backends,
         backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
     ) -> Self {
+        Self::new_with_backends_and_policy_with_safety(
+            rx,
+            empty_safety_rx(),
+            snapshot_rx,
+            backends,
+            backend_resolution,
+        )
+    }
+
+    fn new_with_backends_and_policy_with_safety(
+        rx: mpsc::Receiver<ActionMessage>,
+        safety_rx: mpsc::UnboundedReceiver<ActionMessage>,
+        snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
+        backends: Backends,
+        backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
+    ) -> Self {
         let (auto_release_tx, auto_release_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         Self {
             rx,
+            safety_rx,
             snapshot_rx,
             auto_release_tx,
             auto_release_rx,
@@ -64,12 +83,14 @@ impl ActionEmitter {
     #[cfg(test)]
     pub(super) fn with_rate_limits(
         rx: mpsc::Receiver<ActionMessage>,
+        safety_rx: mpsc::UnboundedReceiver<ActionMessage>,
         snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
         backends: Backends,
         rate_limits: BackendRateLimits,
     ) -> Self {
         Self::with_rate_limits_and_policy(
             rx,
+            safety_rx,
             snapshot_rx,
             backends,
             rate_limits,
@@ -80,6 +101,7 @@ impl ActionEmitter {
     #[cfg(test)]
     pub(super) fn with_rate_limits_and_policy(
         rx: mpsc::Receiver<ActionMessage>,
+        safety_rx: mpsc::UnboundedReceiver<ActionMessage>,
         snapshot_rx: mpsc::Receiver<ActionSnapshotMessage>,
         backends: Backends,
         rate_limits: BackendRateLimits,
@@ -88,6 +110,7 @@ impl ActionEmitter {
         let (auto_release_tx, auto_release_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         Self {
             rx,
+            safety_rx,
             snapshot_rx,
             auto_release_tx,
             auto_release_rx,
@@ -106,12 +129,12 @@ impl ActionEmitter {
         rate_limits: BackendRateLimits,
     ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
         let backends = Backends::all_routed_to(Arc::new(crate::RecordingBackend::new()));
-        let (handle, rx) = ActionHandle::channel();
+        let (handle, rx, safety_rx) = ActionHandle::channel_with_safety_lane();
         let (snapshot_tx, snapshot_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         (
             handle,
             ActionEmitterSnapshotHandle::new(snapshot_tx),
-            Self::with_rate_limits(rx, snapshot_rx, backends, rate_limits),
+            Self::with_rate_limits(rx, safety_rx, snapshot_rx, backends, rate_limits),
         )
     }
 
@@ -136,12 +159,18 @@ impl ActionEmitter {
         backends: Backends,
         backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
     ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
-        let (handle, rx) = ActionHandle::channel();
+        let (handle, rx, safety_rx) = ActionHandle::channel_with_safety_lane();
         let (snapshot_tx, snapshot_rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         (
             handle,
             ActionEmitterSnapshotHandle::new(snapshot_tx),
-            Self::new_with_backends_and_policy(rx, snapshot_rx, backends, backend_resolution),
+            Self::new_with_backends_and_policy_with_safety(
+                rx,
+                safety_rx,
+                snapshot_rx,
+                backends,
+                backend_resolution,
+            ),
         )
     }
 
@@ -217,17 +246,17 @@ impl ActionEmitter {
     ) -> ActionStateSnapshot {
         loop {
             tokio::select! {
-                Some((action, ack)) = self.rx.recv() => {
-                    let result = self.execute(action).await;
-                    let _send_result = ack.send(result);
-                },
-                Some(snapshot_ack) = self.snapshot_rx.recv() => {
-                    let _send_result = snapshot_ack.send(self.snapshot());
+                biased;
+                Some((action, ack)) = self.safety_rx.recv() => {
+                    self.execute_actor_message(action, ack).await;
                 },
                 Some(auto_release) = self.auto_release_rx.recv() => {
                     if let Some(emitted_action) = self.auto_release_held_key(&auto_release) {
                         let _release_result = self.execute(emitted_action).await;
                     }
+                },
+                Some(snapshot_ack) = self.snapshot_rx.recv() => {
+                    let _send_result = snapshot_ack.send(self.snapshot());
                 },
                 () = shutdown_cancel.cancelled() => {
                     self.release_all(shutdown_reason).await;
@@ -236,6 +265,9 @@ impl ActionEmitter {
                 () = connection_closed_cancelled(connection_closed_cancel.as_ref()), if connection_closed_cancel.is_some() => {
                     self.release_all("connection_closed").await;
                     return self.snapshot();
+                },
+                Some((action, ack)) = self.rx.recv() => {
+                    self.execute_actor_message(action, ack).await;
                 },
                 else => {
                     self.release_all("connection_closed").await;
@@ -253,11 +285,55 @@ impl ActionEmitter {
         snapshot.held_key_timer_count = self.held_key_timers.len();
         snapshot
     }
+
+    async fn execute_actor_message(
+        &mut self,
+        action: Action,
+        ack: tokio::sync::oneshot::Sender<ActionResult<()>>,
+    ) {
+        let is_release_all = matches!(action, Action::ReleaseAll);
+        let result = self.execute(action).await;
+        let _send_result = ack.send(result);
+        if is_release_all {
+            self.reject_pending_normal_actions_after_release_all();
+        }
+    }
+
+    fn reject_pending_normal_actions_after_release_all(&mut self) {
+        let mut rejected = 0_u32;
+        loop {
+            match self.rx.try_recv() {
+                Ok((action, ack)) => {
+                    rejected = rejected.saturating_add(1);
+                    let kind = super::routing::action_kind(&action);
+                    let _send_result = ack.send(Err(ActionError::SafetyReleaseAllFired {
+                        detail: format!(
+                            "pending {kind} action discarded because release_all preempted the action queue"
+                        ),
+                    }));
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+        if rejected > 0 {
+            tracing::warn!(
+                code = error_codes::SAFETY_RELEASE_ALL_FIRED,
+                rejected_pending_actions = rejected,
+                "release_all preempted and rejected pending normal action queue items"
+            );
+        }
+    }
 }
 impl Drop for ActionEmitter {
     fn drop(&mut self) {
         self.abort_all_held_key_timers();
     }
+}
+
+fn empty_safety_rx() -> mpsc::UnboundedReceiver<ActionMessage> {
+    let (_tx, rx) = mpsc::unbounded_channel();
+    rx
 }
 
 async fn connection_closed_cancelled(cancel: Option<&CancellationToken>) {

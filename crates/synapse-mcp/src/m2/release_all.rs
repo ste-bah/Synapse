@@ -6,7 +6,10 @@ use std::{
 use rmcp::ErrorData;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use synapse_action::{ActionEmitterSnapshotHandle, ActionError, ActionHandle, ActionStateSnapshot};
+use synapse_action::{
+    ActionEmitterSnapshotHandle, ActionError, ActionHandle, ActionStateSnapshot,
+    request_release_interrupt,
+};
 use synapse_core::{Action, error_codes};
 use synapse_reflex::ReflexRuntime;
 
@@ -31,6 +34,9 @@ pub async fn release_all_with_handles(
     _params: ReleaseAllParams,
 ) -> Result<ReleaseAllResponse, ErrorData> {
     let started = Instant::now();
+    // Wake interrupt-aware in-flight software holds before awaiting an actor
+    // snapshot; otherwise the snapshot request itself can wait behind the hold.
+    request_release_interrupt();
     let reflex_report = disable_reflexes_for_release_all(reflex_runtime.as_ref());
     let before = snapshot_handle
         .snapshot()
@@ -168,17 +174,24 @@ fn action_error_to_mcp(error: &ActionError) -> ErrorData {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::{Duration, Instant},
+    };
 
     use tokio_util::sync::CancellationToken;
 
     use serde_json::Value;
     use synapse_action::{
-        ActionBackend, ActionEmitter, ActionEmitterSnapshotHandle, ActionStateSnapshot,
-        RecordingBackend,
+        ActionBackend, ActionEmitter, ActionEmitterSnapshotHandle, ActionError,
+        ActionStateSnapshot, EmitState, RecordingBackend, operator_release_epoch,
+        operator_release_requested_since,
     };
     use synapse_core::{
-        Backend, ButtonAction, GamepadController, GamepadReport, Key, KeyCode, MouseButton,
+        Action, Backend, ButtonAction, GamepadController, GamepadReport, Key, KeyCode, MouseButton,
         PadButton, ReflexButtonTarget, ReflexState, StoredReflexAudit,
     };
     use synapse_reflex::{EventBus, HoldButtonParams, ReflexRuntime, ScheduledReflex};
@@ -360,6 +373,72 @@ mod tests {
         assert!(final_snapshot.held_buttons.is_empty());
     }
 
+    #[tokio::test]
+    async fn release_all_interrupts_in_flight_hold_before_snapshot_read() {
+        let cancel = CancellationToken::new();
+        let backend = Arc::new(InterruptibleHoldBackend::default());
+        let (handle, snapshot_handle, join) =
+            ActionEmitter::spawn_with_backend(cancel.clone(), backend.clone());
+
+        let press = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                handle
+                    .execute(Action::KeyPress {
+                        key: key("a"),
+                        hold_ms: 1_000,
+                        backend: Backend::Software,
+                    })
+                    .await
+            }
+        });
+        for _attempt in 0..100 {
+            if backend.hold_started.load(Ordering::Acquire) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(backend.hold_started.load(Ordering::Acquire));
+
+        let started = Instant::now();
+        let response = release_all_with_handles(
+            handle.clone(),
+            snapshot_handle.clone(),
+            None,
+            ReleaseAllParams {},
+        )
+        .await
+        .unwrap_or_else(|error| panic!("release_all should interrupt the in-flight hold: {error}"));
+        let elapsed = started.elapsed();
+        press
+            .await
+            .unwrap_or_else(|error| panic!("press task should join: {error}"))
+            .unwrap_or_else(|error| panic!("interrupted press should release cleanly: {error}"));
+        let after = snapshot_handle
+            .snapshot()
+            .await
+            .unwrap_or_else(|error| panic!("snapshot after interrupt should succeed: {error}"));
+
+        println!(
+            "readback=action_emitter_state tool=release_all edge=in_flight_hold_interrupt elapsed_ms={} response={response:?} after={after:?}",
+            elapsed.as_millis()
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "release_all waited behind the in-flight hold instead of interrupting it: {elapsed:?}"
+        );
+        assert!(backend.release_observed.load(Ordering::Acquire));
+        assert!(after.held_keys.is_empty());
+        assert!(after.held_buttons.is_empty());
+        assert!(after.pad_state.is_empty());
+
+        cancel.cancel();
+        let final_snapshot = join
+            .await
+            .unwrap_or_else(|error| panic!("emitter task should join: {error}"));
+        assert!(final_snapshot.held_keys.is_empty());
+    }
+
     fn key(value: &str) -> Key {
         Key {
             code: KeyCode::Named {
@@ -391,5 +470,33 @@ mod tests {
             .get("reason")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
+    }
+
+    #[derive(Default)]
+    struct InterruptibleHoldBackend {
+        hold_started: AtomicBool,
+        release_observed: AtomicBool,
+    }
+
+    impl ActionBackend for InterruptibleHoldBackend {
+        fn execute(&self, action: &Action, _state: &mut EmitState) -> Result<(), ActionError> {
+            match action {
+                Action::KeyPress { hold_ms, .. } => {
+                    self.hold_started.store(true, Ordering::Release);
+                    let epoch = operator_release_epoch();
+                    let deadline = Instant::now() + Duration::from_millis(u64::from(*hold_ms));
+                    while Instant::now() < deadline {
+                        if operator_release_requested_since(epoch) {
+                            self.release_observed.store(true, Ordering::Release);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(())
+                }
+                Action::ReleaseAll => Ok(()),
+                _ => Ok(()),
+            }
+        }
     }
 }

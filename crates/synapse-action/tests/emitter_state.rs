@@ -129,6 +129,58 @@ fn emitter_channel_preserves_bounded_queue_capacity() {
 }
 
 #[tokio::test]
+async fn release_all_safety_lane_preempts_saturated_normal_queue() -> Result<(), Box<dyn Error>> {
+    let cancel = CancellationToken::new();
+    let recording = Arc::new(RecordingBackend::new());
+    let (handle, snapshot_handle, emitter) = ActionEmitter::channel_with_backend(recording.clone());
+    let queued_key = key_named("shift");
+
+    for _index in 0..ACTION_QUEUE_CAPACITY {
+        handle.try_execute(Action::KeyDown {
+            key: queued_key.clone(),
+            backend: Backend::Software,
+        })?;
+    }
+    assert_eq!(emitter.pending_len(), ACTION_QUEUE_CAPACITY);
+    println!(
+        "readback=action_emitter_queue edge=release_preempt before=queued:{} events={:?}",
+        emitter.pending_len(),
+        recording.events()
+    );
+
+    let join = tokio::spawn(emitter.run(cancel.clone()));
+    let release_result = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        handle.execute(Action::ReleaseAll),
+    )
+    .await?;
+    release_result?;
+    let after = snapshot_handle.snapshot().await?;
+    let events = recording.events();
+
+    assert_empty(&after);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, synapse_action::RecordedInput::ReleaseAll { .. }))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, synapse_action::RecordedInput::KeyDown { .. })),
+        "queued normal actions must be rejected after release_all preemption: {events:?}"
+    );
+    println!(
+        "readback=action_emitter_queue edge=release_preempt after={after:?} events={events:?}"
+    );
+
+    cancel.cancel();
+    let final_snapshot = join.await?;
+    assert_empty(&final_snapshot);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_drains_held_state_before_actor_returns() -> Result<(), Box<dyn Error>> {
     let cancel = CancellationToken::new();
     let (handle, snapshot_handle, join) =

@@ -27,6 +27,7 @@ pub trait ActionComboScheduler: Send + Sync {
 #[derive(Clone)]
 pub struct ActionHandle {
     tx: mpsc::Sender<ActionMessage>,
+    safety_tx: Option<mpsc::UnboundedSender<ActionMessage>>,
     combo_scheduler: Arc<Mutex<Option<Arc<dyn ActionComboScheduler>>>>,
 }
 
@@ -43,6 +44,7 @@ impl ActionHandle {
     pub fn new(tx: mpsc::Sender<ActionMessage>) -> Self {
         Self {
             tx,
+            safety_tx: None,
             combo_scheduler: Arc::new(Mutex::new(None)),
         }
     }
@@ -51,6 +53,25 @@ impl ActionHandle {
     pub fn channel() -> (Self, mpsc::Receiver<ActionMessage>) {
         let (tx, rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
         (Self::new(tx), rx)
+    }
+
+    #[must_use]
+    pub(crate) fn channel_with_safety_lane() -> (
+        Self,
+        mpsc::Receiver<ActionMessage>,
+        mpsc::UnboundedReceiver<ActionMessage>,
+    ) {
+        let (tx, rx) = mpsc::channel(ACTION_QUEUE_CAPACITY);
+        let (safety_tx, safety_rx) = mpsc::unbounded_channel();
+        (
+            Self {
+                tx,
+                safety_tx: Some(safety_tx),
+                combo_scheduler: Arc::new(Mutex::new(None)),
+            },
+            rx,
+            safety_rx,
+        )
     }
 
     /// Installs the scheduler used to route [`Action::Combo`] through the
@@ -78,7 +99,8 @@ impl ActionHandle {
     ///
     /// # Errors
     ///
-    /// Returns `ACTION_BACKEND_UNAVAILABLE` when the emitter channel or
+    /// Returns `ACTION_QUEUE_FULL` when the bounded normal action queue is
+    /// saturated, `ACTION_BACKEND_UNAVAILABLE` when the emitter channel or
     /// acknowledgement path is closed, or the emitter's own `ActionError`.
     pub async fn execute(&self, action: Action) -> ActionResult<()> {
         validate_action(&action)?;
@@ -88,12 +110,7 @@ impl ActionHandle {
             return scheduler.schedule_combo(steps.clone(), *backend);
         }
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.tx
-            .send((action, ack_tx))
-            .await
-            .map_err(|_err| ActionError::BackendUnavailable {
-                detail: "action emitter channel is closed".to_owned(),
-            })?;
+        self.send_for_execution(action, ack_tx)?;
         ack_rx
             .await
             .map_err(|_err| ActionError::BackendUnavailable {
@@ -123,13 +140,12 @@ impl ActionHandle {
     ///
     /// # Errors
     ///
-    /// Returns `ACTION_QUEUE_FULL` if the bounded queue is saturated, or
-    /// `ACTION_BACKEND_UNAVAILABLE` if the acknowledgement closes or times out.
+    /// Returns `ACTION_QUEUE_FULL` if the fallback bounded queue is saturated,
+    /// or `ACTION_BACKEND_UNAVAILABLE` if the acknowledgement closes or times
+    /// out.
     pub fn fire_release_all_blocking_with_timeout(&self, timeout: Duration) -> ActionResult<()> {
         let (ack_tx, mut ack_rx) = oneshot::channel();
-        self.tx
-            .try_send((Action::ReleaseAll, ack_tx))
-            .map_err(map_try_send)?;
+        self.send_release_all(Action::ReleaseAll, ack_tx)?;
 
         let deadline = Instant::now() + timeout;
         loop {
@@ -160,6 +176,34 @@ impl ActionHandle {
                 detail: "action combo scheduler bridge is poisoned".to_owned(),
             })
     }
+
+    fn send_for_execution(
+        &self,
+        action: Action,
+        ack_tx: oneshot::Sender<ActionResult<()>>,
+    ) -> ActionResult<()> {
+        if matches!(action, Action::ReleaseAll) {
+            crate::request_release_interrupt();
+        }
+        if is_safety_action(&action)
+            && let Some(safety_tx) = &self.safety_tx
+        {
+            return safety_tx.send((action, ack_tx)).map_err(map_unbounded_send);
+        }
+        self.tx.try_send((action, ack_tx)).map_err(map_try_send)
+    }
+
+    fn send_release_all(
+        &self,
+        action: Action,
+        ack_tx: oneshot::Sender<ActionResult<()>>,
+    ) -> ActionResult<()> {
+        crate::request_release_interrupt();
+        if let Some(safety_tx) = &self.safety_tx {
+            return safety_tx.send((action, ack_tx)).map_err(map_unbounded_send);
+        }
+        self.tx.try_send((action, ack_tx)).map_err(map_try_send)
+    }
 }
 
 fn map_try_send(error: mpsc::error::TrySendError<ActionMessage>) -> ActionError {
@@ -171,4 +215,15 @@ fn map_try_send(error: mpsc::error::TrySendError<ActionMessage>) -> ActionError 
             detail: "action emitter channel is closed".to_owned(),
         },
     }
+}
+
+fn map_unbounded_send(error: mpsc::error::SendError<ActionMessage>) -> ActionError {
+    let _message = error.0;
+    ActionError::BackendUnavailable {
+        detail: "action emitter safety channel is closed".to_owned(),
+    }
+}
+
+const fn is_safety_action(action: &Action) -> bool {
+    matches!(action, Action::ReleaseAll | Action::KeyUp { .. })
 }
