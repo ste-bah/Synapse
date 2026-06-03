@@ -22,6 +22,10 @@ use crate::{
         hold_button::{HoldButtonOutput, HoldButtonPhase},
         hold_lifetime::HoldLifetimeContext,
         hold_move::{HoldMoveOutput, HoldMovePhase},
+        path_follow::{
+            PathFollowContext, PathFollowDispatchRecord, PathFollowOutput, PathFollowPhase,
+            REFLEX_PATH_FOLLOW_TICK_KIND,
+        },
     },
     scheduler::ScheduledReflexDriver,
     write_audit,
@@ -51,6 +55,7 @@ pub(super) fn step_stateful_controllers(
             step_hold_move(runtime, index, events, elapsed),
             step_hold_button(runtime, index, events, elapsed),
             step_combo(runtime, index, elapsed),
+            step_path_follow(runtime, index, elapsed),
         ]
         .into_iter()
         .flatten()
@@ -70,6 +75,10 @@ pub(super) fn step_stateful_controllers(
                 StatefulOutcome::ComboCompleted { actions, details } => {
                     *dispatched_actions = dispatched_actions.saturating_add(actions);
                     super::mark_reflex_combo_completed(runtime, index, details);
+                }
+                StatefulOutcome::PathFollowCompleted { actions, details } => {
+                    *dispatched_actions = dispatched_actions.saturating_add(actions);
+                    super::mark_reflex_path_follow_completed(runtime, index, details);
                 }
                 StatefulOutcome::TrackLost {
                     lost_for,
@@ -161,6 +170,7 @@ fn stateful_conflict_actions(runtime: &RuntimeState, index: usize) -> Vec<Action
         ScheduledReflexDriver::HoldMove(_) => hold_move_conflict_actions(runtime, index),
         ScheduledReflexDriver::HoldButton(_) => hold_button_conflict_actions(runtime, index),
         ScheduledReflexDriver::Combo(_) => combo_conflict_actions(runtime, index),
+        ScheduledReflexDriver::PathFollow(_) => path_follow_conflict_actions(runtime, index),
     }
 }
 
@@ -254,6 +264,31 @@ fn combo_conflict_actions(runtime: &RuntimeState, index: usize) -> Vec<Action> {
     }]
 }
 
+fn path_follow_conflict_actions(runtime: &RuntimeState, index: usize) -> Vec<Action> {
+    let Some(controller) = runtime
+        .path_follow_states
+        .get(index)
+        .and_then(Option::as_ref)
+    else {
+        return Vec::new();
+    };
+    if !matches!(
+        controller.phase(),
+        PathFollowPhase::Pending | PathFollowPhase::Running
+    ) {
+        return Vec::new();
+    }
+    let params = controller.params();
+    vec![Action::MouseStroke {
+        path: params.path.clone(),
+        button: params.button,
+        profile: params.profile,
+        timing: params.timing.clone(),
+        humanize: params.humanize,
+        backend: params.backend,
+    }]
+}
+
 fn hold_button_action(button: &ReflexButtonTarget, backend: synapse_core::Backend) -> Action {
     match button {
         ReflexButtonTarget::Mouse { button } => Action::MouseButton {
@@ -303,6 +338,10 @@ enum StatefulOutcome {
         actions: usize,
         details: Value,
     },
+    PathFollowCompleted {
+        actions: usize,
+        details: Value,
+    },
     TrackLost {
         lost_for: Duration,
         target_context: Value,
@@ -336,6 +375,53 @@ fn step_combo(
         }),
         Ok(
             ComboOutput::Idle { .. } | ComboOutput::Started { .. } | ComboOutput::Dispatched { .. },
+        ) => Some(StatefulOutcome::Idle),
+        Err(error) => Some(StatefulOutcome::Blocked { error }),
+    }
+}
+
+fn step_path_follow(
+    runtime: &mut RuntimeState,
+    index: usize,
+    elapsed: Duration,
+) -> Option<StatefulOutcome> {
+    let dispatch_context = dispatch_context(runtime);
+    let reflex_id = runtime.reflexes[index].reflex.reflex_id.clone();
+    let context = PathFollowContext {
+        tick_elapsed: elapsed,
+    };
+    let (result, completion_details) = {
+        let controller = runtime.path_follow_states.get_mut(index)?.as_mut()?;
+        let result = controller.step_dispatch_with(&context, &runtime.event_bus, |action| {
+            dispatch_context.dispatch_action(&reflex_id, action)
+        });
+        let completion_details = if matches!(result, Ok(PathFollowOutput::Completed { .. })) {
+            Some(controller.completion_audit_details())
+        } else {
+            None
+        };
+        (result, completion_details)
+    };
+    match result {
+        Ok(PathFollowOutput::Completed {
+            actions, records, ..
+        }) => {
+            write_path_follow_tick_audit(runtime, &reflex_id, &records);
+            Some(StatefulOutcome::PathFollowCompleted {
+                actions,
+                details: completion_details.unwrap_or_else(|| json!({})),
+            })
+        }
+        Ok(output) if output.action_count() > 0 => {
+            write_path_follow_tick_audit(runtime, &reflex_id, output.records());
+            Some(StatefulOutcome::Progressed {
+                actions: output.action_count(),
+            })
+        }
+        Ok(
+            PathFollowOutput::Idle { .. }
+            | PathFollowOutput::Started { .. }
+            | PathFollowOutput::Dispatched { .. },
         ) => Some(StatefulOutcome::Idle),
         Err(error) => Some(StatefulOutcome::Blocked { error }),
     }
@@ -544,6 +630,61 @@ fn step_hold_button(
             reason: "lifetime",
         }),
         Err(error) => Some(StatefulOutcome::Blocked { error }),
+    }
+}
+
+fn write_path_follow_tick_audit(
+    runtime: &RuntimeState,
+    reflex_id: &str,
+    records: &[PathFollowDispatchRecord],
+) {
+    if records.is_empty() {
+        return;
+    }
+    let Some(db) = runtime.audit_db.as_deref() else {
+        return;
+    };
+    let steps = records
+        .iter()
+        .enumerate()
+        .map(|(index, record)| StoredReflexStep {
+            index: u32::try_from(index).unwrap_or(u32::MAX),
+            action: record.action.clone(),
+            status: "dispatched".to_owned(),
+            error_code: None,
+        })
+        .collect::<Vec<_>>();
+    let dispatches = records
+        .iter()
+        .map(PathFollowDispatchRecord::audit_value)
+        .collect::<Vec<_>>();
+    let audit = StoredReflexAudit {
+        schema_version: SCHEMA_VERSION,
+        audit_id: Uuid::now_v7().to_string(),
+        reflex_id: reflex_id.to_owned(),
+        ts_ns: now_ts_ns(),
+        status: ReflexState::Active,
+        event_id: None,
+        audit_context: runtime.audit_context.clone(),
+        steps,
+        error_code: None,
+        details: json!({
+            "kind": REFLEX_PATH_FOLLOW_TICK_KIND,
+            "tick_index": runtime.tick_index,
+            "dispatch_count": records.len(),
+            "dispatches": dispatches,
+        }),
+        redacted: false,
+        redactions: Vec::new(),
+    };
+    if let Err(error) = write_audit(db, &audit) {
+        tracing::warn!(
+            component = "reflex_path_follow",
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
+            detail = %error,
+            "path_follow dispatch audit write failed"
+        );
     }
 }
 

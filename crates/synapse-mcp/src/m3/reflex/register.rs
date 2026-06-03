@@ -8,12 +8,13 @@ use rmcp::ErrorData;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use synapse_core::{
-    Action, AimTarget, Backend, Key, KeyCode, ReflexAimAxis, ReflexButtonTarget, ReflexLifetime,
-    ReflexStatus, error_codes, new_reflex_id,
+    Action, AimTarget, Backend, HumanizeParams, Key, KeyCode, MouseButton, PathSpec, ReflexAimAxis,
+    ReflexButtonTarget, ReflexLifetime, ReflexStatus, StrokeTiming, VelocityProfile, error_codes,
+    new_reflex_id,
 };
 use synapse_reflex::{
-    AimTrackParams, AimTrackTarget, ComboParams, HoldButtonParams, HoldMoveParams, ReflexError,
-    ReflexRuntime, ScheduledReflex,
+    AimTrackParams, AimTrackTarget, ComboParams, HoldButtonParams, HoldMoveParams,
+    PathFollowParams, ReflexError, ReflexRuntime, ScheduledReflex,
 };
 
 use crate::m1::mcp_error;
@@ -57,9 +58,18 @@ pub struct ReflexRegisterParams {
     #[serde(default)]
     pub re_assert: bool,
     #[serde(default)]
-    pub button: Option<ReflexButtonTarget>,
+    pub button: Option<ReflexButtonParam>,
     #[serde(default)]
     pub steps: Option<Vec<ReflexComboStepParam>>,
+    #[serde(default)]
+    pub path: Option<PathSpec>,
+    #[serde(default = "default_path_follow_velocity_profile")]
+    #[schemars(default = "default_path_follow_velocity_profile")]
+    pub velocity_profile: VelocityProfile,
+    #[serde(default)]
+    pub duration_or_speed: Option<StrokeTiming>,
+    #[serde(default)]
+    pub humanize: Option<HumanizeParams>,
     #[serde(default = "default_reflex_priority")]
     #[schemars(default = "default_reflex_priority", range(min = 0, max = 1000))]
     pub priority: u32,
@@ -78,6 +88,31 @@ pub struct ReflexRegisterParams {
 pub struct ReflexRegisterResponse {
     pub reflex_id: String,
     pub state: ReflexStatus,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum ReflexButtonParam {
+    Target(ReflexButtonTarget),
+    Mouse(MouseButton),
+}
+
+impl ReflexButtonParam {
+    fn into_target(self) -> ReflexButtonTarget {
+        match self {
+            Self::Target(target) => target,
+            Self::Mouse(button) => ReflexButtonTarget::Mouse { button },
+        }
+    }
+
+    fn into_mouse_button(self, kind: &'static str) -> Result<MouseButton, ReflexError> {
+        match self {
+            Self::Mouse(button) | Self::Target(ReflexButtonTarget::Mouse { button }) => Ok(button),
+            Self::Target(ReflexButtonTarget::Pad { .. }) => Err(ReflexError::ParamsInvalid {
+                detail: format!("{kind} reflex requires a mouse button when button is provided"),
+            }),
+        }
+    }
 }
 
 pub fn required_permissions_register(
@@ -166,9 +201,12 @@ pub(super) fn scheduled_reflex_from_params(
                 .with_exclusive(params.exclusive))
         }
         "hold_button" => {
-            let button = params.button.ok_or_else(|| ReflexError::ParamsInvalid {
-                detail: "hold_button reflex requires button".to_owned(),
-            })?;
+            let button = params
+                .button
+                .map(ReflexButtonParam::into_target)
+                .ok_or_else(|| ReflexError::ParamsInvalid {
+                    detail: "hold_button reflex requires button".to_owned(),
+                })?;
             let hold_params = HoldButtonParams {
                 button,
                 backend: params.backend,
@@ -186,6 +224,13 @@ pub(super) fn scheduled_reflex_from_params(
                     .with_lifetime(ReflexLifetime::OneShot)
                     .with_exclusive(params.exclusive),
             )
+        }
+        "path_follow" => {
+            let path_follow = path_follow_params(&params)?;
+            Ok(ScheduledReflex::path_follow(reflex_id, path_follow)
+                .with_priority(params.priority)
+                .with_lifetime(ReflexLifetime::OneShot)
+                .with_exclusive(params.exclusive))
         }
         other => Err(ReflexError::KindInvalid {
             detail: format!("unknown reflex kind: {other}"),
@@ -216,6 +261,7 @@ fn actions_for_permissions(params: &ReflexRegisterParams) -> Result<Vec<Action>,
             let button = params
                 .button
                 .clone()
+                .map(ReflexButtonParam::into_target)
                 .ok_or_else(|| ReflexError::ParamsInvalid {
                     detail: "hold_button reflex requires button".to_owned(),
                 })?;
@@ -225,6 +271,17 @@ fn actions_for_permissions(params: &ReflexRegisterParams) -> Result<Vec<Action>,
             steps: combo_steps_from_params(params.steps.clone(), params.then.clone())?,
             backend: params.backend,
         }]),
+        "path_follow" => {
+            let path_follow = path_follow_params(params)?;
+            Ok(vec![Action::MouseStroke {
+                path: path_follow.path,
+                button: path_follow.button,
+                profile: path_follow.profile,
+                timing: path_follow.timing,
+                humanize: path_follow.humanize,
+                backend: path_follow.backend,
+            }])
+        }
         _other => Ok(Vec::new()),
     }
 }
@@ -253,6 +310,34 @@ fn aim_track_params(params: &ReflexRegisterParams) -> Result<AimTrackParams, Ref
         aim_params.ema_alpha = ema_alpha;
     }
     Ok(aim_params)
+}
+
+fn path_follow_params(params: &ReflexRegisterParams) -> Result<PathFollowParams, ReflexError> {
+    let path = params
+        .path
+        .clone()
+        .ok_or_else(|| ReflexError::ParamsInvalid {
+            detail: "path_follow reflex requires path".to_owned(),
+        })?;
+    let timing = params
+        .duration_or_speed
+        .clone()
+        .ok_or_else(|| ReflexError::ParamsInvalid {
+            detail: "path_follow reflex requires duration_or_speed".to_owned(),
+        })?;
+    let button = params
+        .button
+        .clone()
+        .map(|button| button.into_mouse_button("path_follow"))
+        .transpose()?;
+    Ok(PathFollowParams::new(
+        path,
+        button,
+        params.velocity_profile,
+        timing,
+        params.humanize,
+        params.backend,
+    ))
 }
 
 fn hold_move_keys(params: &ReflexRegisterParams) -> Result<Vec<Key>, ReflexError> {
@@ -353,4 +438,8 @@ fn named_key(value: &str) -> Key {
         },
         use_scancode: false,
     }
+}
+
+const fn default_path_follow_velocity_profile() -> VelocityProfile {
+    VelocityProfile::Constant
 }

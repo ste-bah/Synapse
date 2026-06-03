@@ -14,7 +14,7 @@ use crate::{
 pub(super) fn reflex_kind_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({
         "type": "string",
-        "enum": ["aim_track", "hold_move", "hold_button", "combo", "on_event"]
+        "enum": ["aim_track", "hold_move", "hold_button", "combo", "on_event", "path_follow"]
     })
 }
 

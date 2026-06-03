@@ -2,9 +2,9 @@ use chrono::{DateTime, Utc};
 use proptest::prelude::*;
 use synapse_core::{
     Action, AimCurve, AimNaturalParams, AimTarget, Backend, ButtonAction, ComboInput, ComboStep,
-    DataPredicate, EventFilter, EventSource, Key, KeyCode, MouseButton, PadButton, Point,
-    ReflexAimAxis, ReflexButtonTarget, ReflexKind, ReflexLifetime, ReflexRegistration, ReflexState,
-    ReflexStatus, ReflexThen,
+    DataPredicate, EventFilter, EventSource, HumanizeParams, Key, KeyCode, MouseButton, PadButton,
+    PathPoint, PathSpec, Point, ReflexAimAxis, ReflexButtonTarget, ReflexKind, ReflexLifetime,
+    ReflexRegistration, ReflexState, ReflexStatus, ReflexThen, StrokeTiming, VelocityProfile,
 };
 
 use super::fixtures::fixed_time;
@@ -39,6 +39,25 @@ pub fn point_strategy() -> impl Strategy<Value = Point> {
     (-10_000_i32..10_000, -10_000_i32..10_000).prop_map(|(x, y)| Point { x, y })
 }
 
+pub fn path_point_strategy() -> impl Strategy<Value = PathPoint> {
+    (-10_000.0_f64..10_000.0, -10_000.0_f64..10_000.0).prop_map(|(x, y)| PathPoint { x, y })
+}
+
+pub fn path_spec_strategy() -> impl Strategy<Value = PathSpec> {
+    prop_oneof![
+        (path_point_strategy(), path_point_strategy())
+            .prop_map(|(from, to)| PathSpec::Line { from, to }),
+        (path_point_strategy(), 1.0_f64..500.0)
+            .prop_map(|(center, radius)| { PathSpec::Circle { center, radius } }),
+        prop::collection::vec(path_point_strategy(), 2..6).prop_map(|points| {
+            PathSpec::Polyline {
+                points,
+                closed: false,
+            }
+        }),
+    ]
+}
+
 pub fn aim_target_strategy() -> impl Strategy<Value = AimTarget> {
     prop_oneof![
         point_strategy().prop_map(|point| AimTarget::Screen { point }),
@@ -70,6 +89,55 @@ pub fn mouse_button_strategy() -> impl Strategy<Value = MouseButton> {
         Just(MouseButton::X1),
         Just(MouseButton::X2),
     ]
+}
+
+pub fn velocity_profile_strategy() -> impl Strategy<Value = VelocityProfile> {
+    prop_oneof![
+        Just(VelocityProfile::Constant),
+        Just(VelocityProfile::Linear),
+        Just(VelocityProfile::EaseInOut),
+        Just(VelocityProfile::MinimumJerk),
+    ]
+}
+
+pub fn stroke_timing_strategy() -> impl Strategy<Value = StrokeTiming> {
+    prop_oneof![
+        (1_u32..5_000).prop_map(|duration_ms| StrokeTiming::DurationMs { duration_ms }),
+        (1.0_f64..10_000.0).prop_map(|px_per_sec| StrokeTiming::SpeedPxPerSec { px_per_sec }),
+    ]
+}
+
+pub fn humanize_params_strategy() -> impl Strategy<Value = HumanizeParams> {
+    (
+        0.0_f32..3.0,
+        0.0_f32..3.0,
+        0.0_f32..1.0,
+        1.0_f32..1.5,
+        1.5_f32..2.0,
+        0.0_f32..1.0,
+        0_u32..20,
+        20_u32..80,
+    )
+        .prop_map(
+            |(
+                tremor_base_stddev_px,
+                tremor_velocity_scale,
+                overshoot_prob,
+                overshoot_min,
+                overshoot_max,
+                micro_pause_prob,
+                pause_min,
+                pause_max,
+            )| HumanizeParams {
+                tremor_base_stddev_px,
+                tremor_velocity_scale,
+                overshoot_prob,
+                overshoot_factor_range: (overshoot_min, overshoot_max),
+                micro_pause_prob,
+                micro_pause_ms_range: (pause_min, pause_max),
+                seed: Some(42),
+            },
+        )
 }
 
 pub fn button_action_strategy() -> impl Strategy<Value = ButtonAction> {
@@ -242,6 +310,24 @@ pub fn reflex_kind_strategy() -> impl Strategy<Value = ReflexKind> {
             backend_strategy(),
         )
             .prop_map(|(steps, backend)| ReflexKind::Combo { steps, backend }),
+        (
+            path_spec_strategy(),
+            prop::option::of(mouse_button_strategy()),
+            velocity_profile_strategy(),
+            stroke_timing_strategy(),
+            prop::option::of(humanize_params_strategy()),
+            backend_strategy(),
+        )
+            .prop_map(|(path, button, profile, timing, humanize, backend)| {
+                ReflexKind::PathFollow {
+                    path,
+                    button,
+                    profile,
+                    timing,
+                    humanize,
+                    backend,
+                }
+            },),
         (
             event_filter_strategy(),
             reflex_then_strategy(),

@@ -7,7 +7,8 @@
 use serde_json::json;
 use synapse_core::{
     Action, Backend, ComboInput, DataPredicate, EventFilter, KeyCode, KeystrokeDynamics,
-    KeystrokeNaturalParams, ReflexAimAxis, ReflexLifetime,
+    KeystrokeNaturalParams, MouseButton, ReflexAimAxis, ReflexLifetime, StrokeTiming,
+    VelocityProfile,
 };
 use synapse_reflex::{AimTrackTarget, ScheduledReflexDriver, SchedulerTrigger};
 
@@ -220,6 +221,38 @@ fn combo_timed_act_press_steps_map_to_one_shot_combo_driver() {
         ComboInput::KeyPress { ref key, hold_ms: 33 }
             if key.code == KeyCode::Named { value: "space".to_owned() }
     ));
+}
+
+#[test]
+fn path_follow_shape_maps_to_one_shot_stateful_driver() {
+    let params: ReflexRegisterParams = serde_json::from_value(json!({
+        "kind": "path_follow",
+        "path": {
+            "kind": "circle",
+            "center": { "x": 100.0, "y": 120.0 },
+            "radius": 10.0
+        },
+        "button": "left",
+        "velocity_profile": "minimum_jerk",
+        "duration_or_speed": { "kind": "duration_ms", "duration_ms": 12 },
+        "backend": "software"
+    }))
+    .expect("path_follow reflex shape should deserialize");
+
+    let reflex = scheduled_reflex_from_params(params).expect("path_follow should build a reflex");
+
+    let ScheduledReflexDriver::PathFollow(path_follow) = reflex.driver else {
+        panic!("path_follow should map to stateful path_follow driver");
+    };
+    assert_eq!(reflex.lifetime, ReflexLifetime::OneShot);
+    assert!(reflex.then.is_empty());
+    assert_eq!(path_follow.button, Some(MouseButton::Left));
+    assert_eq!(path_follow.profile, VelocityProfile::MinimumJerk);
+    assert_eq!(
+        path_follow.timing,
+        StrokeTiming::DurationMs { duration_ms: 12 }
+    );
+    assert_eq!(path_follow.backend, Backend::Software);
 }
 
 #[test]

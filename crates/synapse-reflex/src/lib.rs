@@ -48,6 +48,11 @@ pub use kinds::on_event::{
     MAX_ON_EVENT_FIRINGS_PER_TICK, REFLEX_DEBOUNCED_KIND, REFLEX_FIRED_KIND,
     REFLEX_RECURSION_LIMIT_KIND,
 };
+pub use kinds::path_follow::{
+    MAX_PATH_FOLLOW_SAMPLES, PathFollowContext, PathFollowController, PathFollowOutput,
+    PathFollowParams, PathFollowPhase, REFLEX_PATH_FOLLOW_COMPLETED_KIND,
+    REFLEX_PATH_FOLLOW_TICK_KIND,
+};
 pub use runtime::ReflexRuntime;
 pub use scheduler::{
     DEFAULT_REFLEX_PRIORITY, MAX_REFLEX_PRIORITY, MAX_SCHEDULED_REFLEXES, REFLEX_TICK_LATE_KIND,

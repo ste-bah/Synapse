@@ -262,6 +262,16 @@ fn cancel_release_actions(reflex: &ScheduledReflex) -> Vec<Action> {
         ScheduledReflexDriver::Actions
         | ScheduledReflexDriver::AimTrack(_)
         | ScheduledReflexDriver::Combo(_) => Vec::new(),
+        ScheduledReflexDriver::PathFollow(params) => {
+            params.button.map_or_else(Vec::new, |button| {
+                vec![Action::MouseButton {
+                    button,
+                    action: ButtonAction::Up,
+                    hold_ms: 0,
+                    backend: params.backend,
+                }]
+            })
+        }
     }
 }
 

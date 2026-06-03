@@ -1,5 +1,6 @@
 ---
 source: crates/synapse-mcp/tests/m3_reflex_register_tool.rs
+assertion_line: 160
 expression: shape
 ---
 {
@@ -255,6 +256,55 @@ expression: shape
               "button",
               "curve",
               "duration_ms",
+              "backend"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "backend": {
+                "$ref": "#/$defs/Backend"
+              },
+              "button": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/MouseButton"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "humanize": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/HumanizeParams"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "kind": {
+                "const": "mouse_stroke",
+                "type": "string"
+              },
+              "path": {
+                "$ref": "#/$defs/PathSpec"
+              },
+              "profile": {
+                "$ref": "#/$defs/VelocityProfile"
+              },
+              "timing": {
+                "$ref": "#/$defs/StrokeTiming"
+              }
+            },
+            "required": [
+              "kind",
+              "path",
+              "profile",
+              "timing",
               "backend"
             ],
             "type": "object"
@@ -1339,6 +1389,76 @@ expression: shape
         ],
         "type": "object"
       },
+      "HumanizeParams": {
+        "additionalProperties": false,
+        "properties": {
+          "micro_pause_ms_range": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "micro_pause_prob": {
+            "format": "float",
+            "type": "number"
+          },
+          "overshoot_factor_range": {
+            "maxItems": 2,
+            "minItems": 2,
+            "prefixItems": [
+              {
+                "format": "float",
+                "type": "number"
+              },
+              {
+                "format": "float",
+                "type": "number"
+              }
+            ],
+            "type": "array"
+          },
+          "overshoot_prob": {
+            "format": "float",
+            "type": "number"
+          },
+          "seed": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "tremor_base_stddev_px": {
+            "format": "float",
+            "type": "number"
+          },
+          "tremor_velocity_scale": {
+            "format": "float",
+            "type": "number"
+          }
+        },
+        "required": [
+          "tremor_base_stddev_px",
+          "tremor_velocity_scale",
+          "overshoot_prob",
+          "overshoot_factor_range",
+          "micro_pause_prob",
+          "micro_pause_ms_range"
+        ],
+        "type": "object"
+      },
       "Key": {
         "additionalProperties": false,
         "properties": {
@@ -1558,6 +1678,190 @@ expression: shape
         ],
         "type": "string"
       },
+      "PathPoint": {
+        "additionalProperties": false,
+        "properties": {
+          "x": {
+            "format": "double",
+            "type": "number"
+          },
+          "y": {
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "x",
+          "y"
+        ],
+        "type": "object"
+      },
+      "PathSpec": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "from": {
+                "$ref": "#/$defs/PathPoint"
+              },
+              "kind": {
+                "const": "line",
+                "type": "string"
+              },
+              "to": {
+                "$ref": "#/$defs/PathPoint"
+              }
+            },
+            "required": [
+              "kind",
+              "from",
+              "to"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "center": {
+                "$ref": "#/$defs/PathPoint"
+              },
+              "kind": {
+                "const": "arc",
+                "type": "string"
+              },
+              "radius": {
+                "format": "double",
+                "type": "number"
+              },
+              "start_angle_rad": {
+                "format": "double",
+                "type": "number"
+              },
+              "sweep_angle_rad": {
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "kind",
+              "center",
+              "radius",
+              "start_angle_rad",
+              "sweep_angle_rad"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "center": {
+                "$ref": "#/$defs/PathPoint"
+              },
+              "kind": {
+                "const": "circle",
+                "type": "string"
+              },
+              "radius": {
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "kind",
+              "center",
+              "radius"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "cubic_bezier",
+                "type": "string"
+              },
+              "p0": {
+                "$ref": "#/$defs/PathPoint"
+              },
+              "p1": {
+                "$ref": "#/$defs/PathPoint"
+              },
+              "p2": {
+                "$ref": "#/$defs/PathPoint"
+              },
+              "p3": {
+                "$ref": "#/$defs/PathPoint"
+              }
+            },
+            "required": [
+              "kind",
+              "p0",
+              "p1",
+              "p2",
+              "p3"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "closed": {
+                "default": false,
+                "type": "boolean"
+              },
+              "kind": {
+                "const": "polyline",
+                "type": "string"
+              },
+              "points": {
+                "items": {
+                  "$ref": "#/$defs/PathPoint"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "points"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "alpha": {
+                "default": 0.5,
+                "format": "double",
+                "type": "number"
+              },
+              "closed": {
+                "default": false,
+                "type": "boolean"
+              },
+              "kind": {
+                "const": "catmull_rom",
+                "type": "string"
+              },
+              "tension": {
+                "default": 0.0,
+                "format": "double",
+                "type": "number"
+              },
+              "waypoints": {
+                "items": {
+                  "$ref": "#/$defs/PathPoint"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "kind",
+              "waypoints"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "Point": {
         "additionalProperties": false,
         "properties": {
@@ -1583,6 +1887,16 @@ expression: shape
           "y_only"
         ],
         "type": "string"
+      },
+      "ReflexButtonParam": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ReflexButtonTarget"
+          },
+          {
+            "$ref": "#/$defs/MouseButton"
+          }
+        ]
       },
       "ReflexButtonTarget": {
         "oneOf": [
@@ -1863,10 +2177,60 @@ expression: shape
         ],
         "type": "string"
       },
+      "StrokeTiming": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "duration_ms": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "const": "duration_ms",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "duration_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "speed_px_per_sec",
+                "type": "string"
+              },
+              "px_per_sec": {
+                "format": "double",
+                "type": "number"
+              }
+            },
+            "required": [
+              "kind",
+              "px_per_sec"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "Trigger": {
         "enum": [
           "left",
           "right"
+        ],
+        "type": "string"
+      },
+      "VelocityProfile": {
+        "enum": [
+          "constant",
+          "linear",
+          "ease_in_out",
+          "minimum_jerk"
         ],
         "type": "string"
       },
@@ -1920,13 +2284,12 @@ expression: shape
       "button": {
         "anyOf": [
           {
-            "$ref": "#/$defs/ReflexButtonTarget"
+            "$ref": "#/$defs/ReflexButtonParam"
           },
           {
             "type": "null"
           }
-        ],
-        "default": null
+        ]
       },
       "deadzone_px": {
         "default": null,
@@ -1941,6 +2304,17 @@ expression: shape
         "format": "uint32",
         "minimum": 0,
         "type": "integer"
+      },
+      "duration_or_speed": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/StrokeTiming"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
       },
       "ema_alpha": {
         "default": null,
@@ -1961,6 +2335,17 @@ expression: shape
           "number",
           "null"
         ]
+      },
+      "humanize": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/HumanizeParams"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
       },
       "key": {
         "default": null,
@@ -1985,7 +2370,8 @@ expression: shape
           "hold_move",
           "hold_button",
           "combo",
-          "on_event"
+          "on_event",
+          "path_follow"
         ],
         "type": "string"
       },
@@ -2002,6 +2388,17 @@ expression: shape
           "number",
           "null"
         ]
+      },
+      "path": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/PathSpec"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null
       },
       "priority": {
         "default": 100,
@@ -2043,6 +2440,10 @@ expression: shape
             "type": "null"
           }
         ]
+      },
+      "velocity_profile": {
+        "$ref": "#/$defs/VelocityProfile",
+        "default": "constant"
       },
       "when": {
         "anyOf": [

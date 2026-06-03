@@ -20,6 +20,7 @@ use crate::{
         combo::ComboParams,
         hold_button::HoldButtonParams,
         hold_move::HoldMoveParams,
+        path_follow::PathFollowParams,
     },
 };
 pub use scheduler_handle::SchedulerHandle;
@@ -27,8 +28,8 @@ use scheduler_loop::{
     ReflexControl, RuntimeReflex, RuntimeState, aim_track_states, combo_states, hold_button_states,
     hold_move_states, lock_controls, mark_reflex_action_denied, mark_reflex_active_if_starved,
     mark_reflex_combo_completed, mark_reflex_error, mark_reflex_fired,
-    mark_reflex_lifetime_expired, mark_reflex_starved, mark_reflex_track_lost,
-    run_scheduler_thread, status_for_reflex,
+    mark_reflex_lifetime_expired, mark_reflex_path_follow_completed, mark_reflex_starved,
+    mark_reflex_track_lost, path_follow_states, run_scheduler_thread, status_for_reflex,
 };
 
 pub const MAX_SCHEDULED_REFLEXES: usize = 32;
@@ -209,6 +210,20 @@ impl ScheduledReflex {
     }
 
     #[must_use]
+    pub fn path_follow(reflex_id: impl Into<ReflexId>, params: PathFollowParams) -> Self {
+        Self {
+            reflex_id: reflex_id.into(),
+            trigger: SchedulerTrigger::EveryTick,
+            then: Vec::new(),
+            driver: ScheduledReflexDriver::PathFollow(params),
+            priority: DEFAULT_REFLEX_PRIORITY,
+            lifetime: ReflexLifetime::OneShot,
+            exclusive: false,
+            debounce: Duration::ZERO,
+        }
+    }
+
+    #[must_use]
     pub const fn with_priority(mut self, priority: u32) -> Self {
         self.priority = priority;
         self
@@ -234,6 +249,7 @@ pub enum ScheduledReflexDriver {
     HoldMove(HoldMoveParams),
     HoldButton(HoldButtonParams),
     Combo(ComboParams),
+    PathFollow(PathFollowParams),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -491,6 +507,7 @@ impl ReflexScheduler {
         let hold_move_states = hold_move_states(&reflexes)?;
         let hold_button_states = hold_button_states(&reflexes)?;
         let combo_states = combo_states(&reflexes);
+        let path_follow_states = path_follow_states(&reflexes)?;
         let reflexes = reflexes
             .into_iter()
             .enumerate()
@@ -517,6 +534,7 @@ impl ReflexScheduler {
             hold_move_states,
             hold_button_states,
             combo_states,
+            path_follow_states,
             on_event_states,
             starvation_states,
             aim_track_target_source,

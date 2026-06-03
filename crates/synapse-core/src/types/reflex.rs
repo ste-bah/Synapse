@@ -3,8 +3,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Action, AimCurve, AimTarget, Backend, ComboStep, EventFilter, Key, MouseButton, PadButton,
-    PadId, ReflexId,
+    Action, AimCurve, AimTarget, Backend, ComboStep, EventFilter, HumanizeParams, Key, MouseButton,
+    PadButton, PadId, PathSpec, ReflexId, StrokeTiming, VelocityProfile,
 };
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -49,6 +49,16 @@ pub enum ReflexKind {
     },
     Combo {
         steps: Vec<ComboStep>,
+        backend: Backend,
+    },
+    PathFollow {
+        path: PathSpec,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        button: Option<MouseButton>,
+        profile: VelocityProfile,
+        timing: StrokeTiming,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        humanize: Option<HumanizeParams>,
         backend: Backend,
     },
     OnEvent {

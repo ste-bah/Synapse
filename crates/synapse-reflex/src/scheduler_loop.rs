@@ -31,6 +31,7 @@ use crate::{
         hold_button::HoldButtonController,
         hold_move::HoldMoveController,
         on_event::OnEventState,
+        path_follow::PathFollowController,
     },
     write_audit,
 };
@@ -56,6 +57,7 @@ pub(super) struct RuntimeState {
     pub(super) hold_move_states: Vec<Option<HoldMoveController>>,
     pub(super) hold_button_states: Vec<Option<HoldButtonController>>,
     pub(super) combo_states: Vec<Option<ComboController>>,
+    pub(super) path_follow_states: Vec<Option<PathFollowController>>,
     pub(super) on_event_states: Vec<OnEventState>,
     pub(super) starvation_states: Vec<crate::conflict::StarvationState>,
     pub(super) aim_track_target_source: Option<AimTrackTargetSourceHandle>,
@@ -90,7 +92,8 @@ pub(super) fn aim_track_states(
             ScheduledReflexDriver::Actions
             | ScheduledReflexDriver::HoldMove(_)
             | ScheduledReflexDriver::HoldButton(_)
-            | ScheduledReflexDriver::Combo(_) => Ok(None),
+            | ScheduledReflexDriver::Combo(_)
+            | ScheduledReflexDriver::PathFollow(_) => Ok(None),
         })
         .collect()
 }
@@ -110,7 +113,8 @@ pub(super) fn hold_move_states(
             ScheduledReflexDriver::Actions
             | ScheduledReflexDriver::AimTrack(_)
             | ScheduledReflexDriver::HoldButton(_)
-            | ScheduledReflexDriver::Combo(_) => Ok(None),
+            | ScheduledReflexDriver::Combo(_)
+            | ScheduledReflexDriver::PathFollow(_) => Ok(None),
         })
         .collect()
 }
@@ -130,7 +134,8 @@ pub(super) fn hold_button_states(
             ScheduledReflexDriver::Actions
             | ScheduledReflexDriver::AimTrack(_)
             | ScheduledReflexDriver::HoldMove(_)
-            | ScheduledReflexDriver::Combo(_) => Ok(None),
+            | ScheduledReflexDriver::Combo(_)
+            | ScheduledReflexDriver::PathFollow(_) => Ok(None),
         })
         .collect()
 }
@@ -146,7 +151,26 @@ pub(super) fn combo_states(reflexes: &[ScheduledReflex]) -> Vec<Option<ComboCont
             ScheduledReflexDriver::Actions
             | ScheduledReflexDriver::AimTrack(_)
             | ScheduledReflexDriver::HoldMove(_)
-            | ScheduledReflexDriver::HoldButton(_) => None,
+            | ScheduledReflexDriver::HoldButton(_)
+            | ScheduledReflexDriver::PathFollow(_) => None,
+        })
+        .collect()
+}
+
+pub(super) fn path_follow_states(
+    reflexes: &[ScheduledReflex],
+) -> ReflexResult<Vec<Option<PathFollowController>>> {
+    reflexes
+        .iter()
+        .map(|reflex| match &reflex.driver {
+            ScheduledReflexDriver::PathFollow(params) => {
+                PathFollowController::new(reflex.reflex_id.clone(), params.clone()).map(Some)
+            }
+            ScheduledReflexDriver::Actions
+            | ScheduledReflexDriver::AimTrack(_)
+            | ScheduledReflexDriver::HoldMove(_)
+            | ScheduledReflexDriver::HoldButton(_)
+            | ScheduledReflexDriver::Combo(_) => Ok(None),
         })
         .collect()
 }
@@ -291,6 +315,9 @@ fn kind_summary(reflex: &ScheduledReflex) -> String {
         ScheduledReflexDriver::HoldMove(params) => format!("hold_move:{} keys", params.keys.len()),
         ScheduledReflexDriver::HoldButton(_params) => "hold_button".to_owned(),
         ScheduledReflexDriver::Combo(params) => format!("combo:{} steps", params.steps.len()),
+        ScheduledReflexDriver::PathFollow(params) => {
+            format!("path_follow:{}", path_kind(&params.path))
+        }
     }
 }
 
@@ -361,6 +388,33 @@ pub(super) fn mark_reflex_combo_completed(
     }
 }
 
+pub(super) fn mark_reflex_path_follow_completed(
+    runtime: &RuntimeState,
+    index: usize,
+    path_follow_completion: Value,
+) {
+    if let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
+        control.active = false;
+    }
+    let expired_status = if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
+        status.state = ReflexState::Expired;
+        status.last_fired_at = Some(Utc::now());
+        status.fire_count = status.fire_count.saturating_add(1);
+        status.last_error_code = Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned());
+        Some(status.clone())
+    } else {
+        None
+    };
+    if let Some(status) = expired_status {
+        write_lifetime_expired_audit_with_path_follow(
+            runtime,
+            &status,
+            "completed",
+            path_follow_completion,
+        );
+    }
+}
+
 pub(super) fn mark_reflex_error(runtime: &RuntimeState, index: usize, code: &str) {
     if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
         status.last_error_code = Some(code.to_owned());
@@ -410,14 +464,33 @@ fn write_lifetime_expired_audit_with_combo(
     reason: &str,
     combo_completion: Value,
 ) {
-    write_lifetime_expired_audit_inner(runtime, status, reason, Some(combo_completion));
+    write_lifetime_expired_audit_inner(
+        runtime,
+        status,
+        reason,
+        Some(("combo_completion", combo_completion)),
+    );
+}
+
+fn write_lifetime_expired_audit_with_path_follow(
+    runtime: &RuntimeState,
+    status: &ReflexStatus,
+    reason: &str,
+    path_follow_completion: Value,
+) {
+    write_lifetime_expired_audit_inner(
+        runtime,
+        status,
+        reason,
+        Some(("path_follow_completion", path_follow_completion)),
+    );
 }
 
 fn write_lifetime_expired_audit_inner(
     runtime: &RuntimeState,
     status: &ReflexStatus,
     reason: &str,
-    combo_completion: Option<Value>,
+    completion: Option<(&'static str, Value)>,
 ) {
     let Some(db) = runtime.audit_db.as_deref() else {
         return;
@@ -428,8 +501,8 @@ fn write_lifetime_expired_audit_inner(
         "tick_index": runtime.tick_index,
         "fire_count": status.fire_count,
     });
-    if let Some(combo_completion) = combo_completion {
-        details["combo_completion"] = combo_completion;
+    if let Some((field, value)) = completion {
+        details[field] = value;
     }
     let audit = StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
@@ -501,6 +574,17 @@ fn now_ts_ns() -> u64 {
         .timestamp_nanos_opt()
         .and_then(|value| u64::try_from(value).ok())
         .unwrap_or_default()
+}
+
+fn path_kind(path: &synapse_core::PathSpec) -> &'static str {
+    match path {
+        synapse_core::PathSpec::Line { .. } => "line",
+        synapse_core::PathSpec::Arc { .. } => "arc",
+        synapse_core::PathSpec::Circle { .. } => "circle",
+        synapse_core::PathSpec::CubicBezier { .. } => "cubic_bezier",
+        synapse_core::PathSpec::Polyline { .. } => "polyline",
+        synapse_core::PathSpec::CatmullRom { .. } => "catmull_rom",
+    }
 }
 
 pub(super) fn mark_reflex_starved(runtime: &RuntimeState, index: usize) {
