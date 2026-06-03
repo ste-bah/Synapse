@@ -92,8 +92,11 @@ const EXPECTED_TOOLS: [&str; 81] = [
 async fn m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<()> {
     // Run with debug tools enabled so the asserted surface + snapshot covers the
     // full tool set, including the SYNAPSE_DEBUG_TOOLS-gated storage probes.
-    let mut client =
-        StdioMcpClient::launch_and_init_with_env(None, &[("SYNAPSE_DEBUG_TOOLS", "1")]).await?;
+    let mut client = StdioMcpClient::launch_and_init_with_env(
+        None,
+        &[("SYNAPSE_DEBUG_TOOLS", "1"), ("SYNAPSE_ENABLE_EVERQUEST", "1")],
+    )
+    .await?;
     let response = client.tools_list().await?;
     let tools = response
         .get("tools")

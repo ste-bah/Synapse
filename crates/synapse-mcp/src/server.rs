@@ -250,26 +250,34 @@ impl SynapseService {
     fn tool_router() -> ToolRouter<Self> {
         let mut router = Self::m1_tool_router()
             + Self::m2_tool_router()
-            + Self::everquest_tool_router()
-            + Self::everquest_autocombat_tool_router()
-            + Self::everquest_contextgraph_tool_router()
-            + Self::everquest_domain_tool_router()
-            + Self::everquest_episode_export_tool_router()
-            + Self::everquest_guard_tool_router()
-            + Self::everquest_state_tool_router()
-            + Self::everquest_map_sensor_tool_router()
-            + Self::everquest_memory_tool_router()
-            + Self::everquest_outcome_tool_router()
-            + Self::everquest_predictive_model_tool_router()
-            + Self::everquest_route_tool_router()
-            + Self::everquest_scorecard_tool_router()
-            + Self::everquest_surprise_tool_router()
-            + Self::everquest_trajectory_tool_router()
-            + Self::everquest_world_model_tool_router()
-            + Self::everquest_world_summary_tool_router()
             + Self::reality_tool_router()
             + Self::m3_tool_router()
             + Self::m4_tool_router();
+        // The EverQuest domain pack (25 tools) is off the general-agent surface
+        // unless the operator opts in (SYNAPSE_ENABLE_EVERQUEST). No capability
+        // is lost — visibility is gated. rmcp builds the tool list once per
+        // service, so a startup opt-in flag is the gating mechanism (dynamic
+        // per-profile re-listing would require tools/list_changed plumbing).
+        if everquest_enabled() {
+            router = router
+                + Self::everquest_tool_router()
+                + Self::everquest_autocombat_tool_router()
+                + Self::everquest_contextgraph_tool_router()
+                + Self::everquest_domain_tool_router()
+                + Self::everquest_episode_export_tool_router()
+                + Self::everquest_guard_tool_router()
+                + Self::everquest_state_tool_router()
+                + Self::everquest_map_sensor_tool_router()
+                + Self::everquest_memory_tool_router()
+                + Self::everquest_outcome_tool_router()
+                + Self::everquest_predictive_model_tool_router()
+                + Self::everquest_route_tool_router()
+                + Self::everquest_scorecard_tool_router()
+                + Self::everquest_surprise_tool_router()
+                + Self::everquest_trajectory_tool_router()
+                + Self::everquest_world_model_tool_router()
+                + Self::everquest_world_summary_tool_router();
+        }
         // Gate test-only storage probes off the default agent surface; they
         // remain available (and callable) only when SYNAPSE_DEBUG_TOOLS is set.
         if !debug_tools_enabled() {
@@ -283,6 +291,12 @@ impl SynapseService {
 /// Whether test-only/debug MCP tools should be exposed on the surface.
 fn debug_tools_enabled() -> bool {
     std::env::var("SYNAPSE_DEBUG_TOOLS")
+        .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// Whether the EverQuest domain tool pack should be advertised.
+fn everquest_enabled() -> bool {
+    std::env::var("SYNAPSE_ENABLE_EVERQUEST")
         .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
 
