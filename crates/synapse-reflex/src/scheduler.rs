@@ -428,6 +428,7 @@ impl ReflexScheduler {
     /// # Errors
     ///
     /// Returns the same setup errors as [`Self::spawn`].
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn_with_audit_db_context_action_gate_and_aim_track_source(
         event_bus: EventBus,
         action_handle: ActionHandle,
@@ -450,6 +451,7 @@ impl ReflexScheduler {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn spawn_inner(
         event_bus: EventBus,
         action_handle: ActionHandle,

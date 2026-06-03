@@ -185,7 +185,7 @@ fn decode_rtdetr_outputs(
             descriptor.id
         )));
     }
-    if logits.len() % classes != 0 {
+    if !logits.len().is_multiple_of(classes) {
         return Err(detection_infer_failed(format!(
             "`logits` length {} is not divisible by class count {classes}",
             logits.len()

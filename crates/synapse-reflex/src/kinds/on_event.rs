@@ -104,6 +104,7 @@ pub(crate) fn publish_fired(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_debounced(
     event_bus: &EventBus,
     audit_db: Option<&Db>,
