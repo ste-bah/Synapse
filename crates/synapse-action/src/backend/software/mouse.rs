@@ -1,7 +1,10 @@
-use std::sync::Once;
+use std::{fmt::Write as _, sync::Once};
 
 use enigo::Enigo;
-use synapse_core::{AimCurve, AimStyle, AimTarget, ButtonAction, MouseButton, MouseTarget, Point};
+use synapse_core::{
+    AimCurve, AimStyle, AimTarget, ButtonAction, HumanizeParams, MouseButton, MouseTarget,
+    PathSpec, Point, StrokeTiming, VelocityProfile,
+};
 use windows::Win32::{
     Foundation::{E_ACCESSDENIED, POINT as WinPoint},
     Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromPoint},
@@ -28,7 +31,10 @@ use super::{
     utils::sleep_ms,
 };
 use crate::backend::mouse_coordinates::{VirtualDesktop, normalize_absolute_mouse_point};
-use crate::{ActionError, EmitState, recovery, sample_curve};
+use crate::{
+    ActionError, EmitState, StrokeError, TimedPathPoint, plan_timed_stroke, recovery, sample_curve,
+    screen_point_from_path_point,
+};
 
 const WHEEL_DELTA: i32 = 120;
 const XBUTTON1_DATA: u32 = 0x0001;
@@ -131,6 +137,65 @@ pub(super) fn mouse_drag(
     mouse_button(button, ButtonAction::Up, 0, state)
 }
 
+#[tracing::instrument(skip_all, fields(action_kind = "software_mouse_stroke"))]
+pub(super) fn mouse_stroke(
+    path: &PathSpec,
+    button: Option<MouseButton>,
+    profile: VelocityProfile,
+    timing: &StrokeTiming,
+    humanize: Option<HumanizeParams>,
+    state: &mut EmitState,
+) -> Result<(), ActionError> {
+    let plan =
+        plan_timed_stroke(path, profile, timing, humanize).map_err(|error| stroke_error(&error))?;
+    let first = plan
+        .samples
+        .first()
+        .ok_or_else(|| ActionError::TargetInvalid {
+            detail: "mouse_stroke planner returned an empty point stream".to_owned(),
+        })?;
+    send_absolute_mouse_move(
+        screen_point_from_path_point(first.point, 0).map_err(|error| stroke_error(&error))?,
+        "mouse stroke origin absolute mouse move",
+    )?;
+
+    if let Some(button) = button {
+        mouse_button(button, ButtonAction::Down, 0, state)?;
+    }
+
+    let stream_result = emit_stroke_stream(&plan.samples);
+    if let Err(error) = stream_result {
+        log_stroke_emit_error(None, &error);
+        if let Some(button) = button
+            && let Err(release_error) = mouse_button(button, ButtonAction::Up, 0, state)
+        {
+            tracing::error!(
+                code = release_error.code(),
+                detail = release_error.detail(),
+                original_code = error.code(),
+                original_detail = error.detail(),
+                action_kind = "software_mouse_stroke",
+                "mouse_stroke failed and button cleanup also failed"
+            );
+            return Err(ActionError::BackendUnavailable {
+                detail: format!(
+                    "mouse_stroke failed with code={} detail={}; cleanup release failed with code={} detail={}",
+                    error.code(),
+                    error.detail(),
+                    release_error.code(),
+                    release_error.detail()
+                ),
+            });
+        }
+        return Err(error);
+    }
+
+    if let Some(button) = button {
+        mouse_button(button, ButtonAction::Up, 0, state)?;
+    }
+    Ok(())
+}
+
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_scroll"))]
 pub(super) fn mouse_scroll(dy: i32, dx: i32, at: Option<Point>) -> Result<(), ActionError> {
     if let Some(point) = at {
@@ -198,6 +263,81 @@ fn mouse_move_curve(
         inputs.push(absolute_mouse_input_for_desktop(point, desktop));
     }
     send_input_batch(&inputs, "drag curve absolute mouse move")
+}
+
+fn emit_stroke_stream(samples: &[TimedPathPoint]) -> Result<(), ActionError> {
+    let desktop = virtual_desktop()?;
+    let mut previous_elapsed = samples.first().map_or(0.0, |sample| sample.elapsed_ms);
+    for (index, sample) in samples.iter().enumerate().skip(1) {
+        let delay_ms = stroke_delay_ms(previous_elapsed, sample.elapsed_ms, index)?;
+        if sleep_ms(delay_ms) {
+            return Err(ActionError::SafetyOperatorHotkeyFired {
+                detail: format!(
+                    "operator release requested during mouse_stroke at sample_index={index}"
+                ),
+            });
+        }
+        previous_elapsed = sample.elapsed_ms;
+        let point = screen_point_from_path_point(sample.point, index)
+            .map_err(|error| stroke_error(&error))?;
+        let result = send_input_batch(
+            &[absolute_mouse_input_for_desktop(point, desktop)],
+            "mouse stroke absolute move",
+        );
+        if let Err(error) = result {
+            log_stroke_emit_error(Some(index), &error);
+            return Err(error);
+        }
+    }
+
+    if let Some((index, final_sample)) = samples
+        .len()
+        .checked_sub(1)
+        .map(|index| (index, samples[index]))
+    {
+        let requested = screen_point_from_path_point(final_sample.point, index)
+            .map_err(|error| stroke_error(&error))?;
+        let actual = read_physical_cursor_position("mouse stroke final cursor readback")?;
+        if !cursor_readback_matches(requested, actual) {
+            return Err(ActionError::BackendUnavailable {
+                detail: format!(
+                    "mouse stroke final cursor readback mismatch: requested={requested:?} actual=({},{}) tolerance_px={CURSOR_READBACK_TOLERANCE_PX}",
+                    actual.x, actual.y
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn stroke_delay_ms(
+    previous_elapsed: f64,
+    current_elapsed: f64,
+    index: usize,
+) -> Result<u32, ActionError> {
+    if !previous_elapsed.is_finite()
+        || !current_elapsed.is_finite()
+        || current_elapsed + 1.0e-9 < previous_elapsed
+    {
+        return Err(ActionError::TargetInvalid {
+            detail: format!(
+                "mouse_stroke sample_index={index} has non-monotonic elapsed_ms previous={previous_elapsed} current={current_elapsed}"
+            ),
+        });
+    }
+    let delay = (current_elapsed - previous_elapsed).max(0.0);
+    if delay > f64::from(u32::MAX) {
+        return Err(ActionError::TargetInvalid {
+            detail: format!("mouse_stroke sample_index={index} delay_ms={delay} exceeds u32 range"),
+        });
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "validated finite u32-range delay is rounded to backend millisecond sleep"
+    )]
+    Ok(delay.round() as u32)
 }
 
 fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), ActionError> {
@@ -305,6 +445,22 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
     }
 }
 
+fn stroke_error(error: &StrokeError) -> ActionError {
+    ActionError::TargetInvalid {
+        detail: format!("mouse_stroke planning failed: {error}"),
+    }
+}
+
+fn log_stroke_emit_error(sample_index: Option<usize>, error: &ActionError) {
+    tracing::error!(
+        code = error.code(),
+        detail = error.detail(),
+        sample_index,
+        action_kind = "software_mouse_stroke",
+        "mouse_stroke emit failed without fallback"
+    );
+}
+
 fn set_physical_cursor_pos(point: Point, detail: &'static str) -> bool {
     match unsafe { SetPhysicalCursorPos(point.x, point.y) } {
         Ok(()) => true,
@@ -410,14 +566,15 @@ fn cursor_readback_mismatch_error(
         first_actual.x, first_actual.y
     );
     if let Some((compensation, compensated_actual)) = compensated {
-        message.push_str(&format!(
+        let _ = write!(
+            message,
             " compensated_request={:?} dpi=({}, {}) compensated_actual=({}, {})",
             compensation.adjusted,
             compensation.dpi_x,
             compensation.dpi_y,
             compensated_actual.x,
             compensated_actual.y
-        ));
+        );
     }
     ActionError::BackendUnavailable { detail: message }
 }

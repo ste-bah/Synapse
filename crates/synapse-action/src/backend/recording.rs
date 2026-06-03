@@ -4,9 +4,8 @@ use std::{
 };
 
 use synapse_core::{
-    Action, AimCurve, AimStyle, AimTarget, GamepadReport, HumanizeParams, Key, KeyCode,
-    MouseButton, MouseTarget, PadButton, PadId, PathSpec, Point, Stick, StrokeTiming, Trigger,
-    VelocityProfile,
+    Action, AimCurve, AimStyle, AimTarget, GamepadReport, Key, KeyCode, MouseButton, MouseTarget,
+    PadButton, PadId, Point, Stick, Trigger,
 };
 
 use crate::{ActionBackend, ActionError, EmitState};
@@ -51,12 +50,9 @@ pub enum RecordedInput {
     MouseButtonUp {
         button: MouseButton,
     },
-    MouseStroke {
-        path: PathSpec,
-        button: Option<MouseButton>,
-        profile: VelocityProfile,
-        timing: StrokeTiming,
-        humanize: Option<HumanizeParams>,
+    MouseStrokePoint {
+        elapsed_ms: f64,
+        point: Point,
     },
     MouseScroll {
         dy: i32,
@@ -158,7 +154,6 @@ impl ActionBackend for RecordingBackend {
     #[tracing::instrument(skip_all, fields(backend = "recording"))]
     fn execute(&self, action: &Action, state: &mut EmitState) -> Result<(), ActionError> {
         crate::validate_action(action)?;
-        self.state().apply_action(action, state);
-        Ok(())
+        self.state().apply_action(action, state)
     }
 }

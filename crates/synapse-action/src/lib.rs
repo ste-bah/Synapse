@@ -9,11 +9,13 @@ pub mod emitter;
 pub mod error;
 pub mod handle;
 pub mod hotkey;
+pub mod humanize;
 pub mod invoke;
 pub mod path;
 pub mod rate_limit;
 pub mod recovery;
 pub mod safety;
+pub mod stroke;
 pub mod validation;
 pub mod velocity;
 
@@ -47,6 +49,7 @@ pub use hotkey::{
     operator_release_epoch, operator_release_requested_since, request_release_interrupt,
     set_operator_hotkey_status,
 };
+pub use humanize::{HumanizeError, HumanizeResult, humanize_timed_path};
 pub use invoke::{
     CoordinateFallbackPlan, ElementClickOutcome, click_element_or_fallback, invoke_element,
 };
@@ -62,6 +65,10 @@ pub use recovery::{
     recover_stale_inputs_from_configured_path,
 };
 pub use safety::install_panic_hook;
+pub use stroke::{
+    STROKE_TICK_MS, StrokeError, StrokePlan, StrokeResult, plan_timed_stroke,
+    screen_point_from_path_point,
+};
 pub use validation::{MAX_DRAG_DISTANCE_PX, validate_action};
 pub use velocity::{
     TimedPathPoint, VelocityError, VelocityResult, fitts_law_duration_ms,

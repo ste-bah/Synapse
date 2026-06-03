@@ -1,12 +1,16 @@
 use std::collections::{BTreeSet, HashMap};
 
 use synapse_core::{
-    Action, AimCurve, ButtonAction, ComboInput, GamepadReport, Key, KeyCode, KeystrokeDynamics,
-    MouseButton, MouseTarget, PadButton, PadId, Point, Stick, Trigger,
+    Action, AimCurve, ButtonAction, ComboInput, GamepadReport, HumanizeParams, Key, KeyCode,
+    KeystrokeDynamics, MouseButton, MouseTarget, PadButton, PadId, PathSpec, Point, Stick,
+    StrokeTiming, Trigger, VelocityProfile,
 };
 
 use super::RecordedInput;
-use crate::{EmitState, ModifierMask, sample_typing_schedule};
+use crate::{
+    ActionError, EmitState, ModifierMask, StrokeError, plan_timed_stroke, sample_typing_schedule,
+    screen_point_from_path_point,
+};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RecordingState {
@@ -17,7 +21,11 @@ pub(super) struct RecordingState {
 }
 
 impl RecordingState {
-    pub(super) fn apply_action(&mut self, action: &Action, state: &mut EmitState) {
+    pub(super) fn apply_action(
+        &mut self,
+        action: &Action,
+        state: &mut EmitState,
+    ) -> Result<(), ActionError> {
         match action {
             Action::KeyPress { key, hold_ms, .. } => self.key_press(key, *hold_ms, state),
             Action::KeyDown { key, .. } => self.key_down(key, state),
@@ -57,13 +65,7 @@ impl RecordingState {
                 timing,
                 humanize,
                 ..
-            } => self.events.push(RecordedInput::MouseStroke {
-                path: path.clone(),
-                button: *button,
-                profile: *profile,
-                timing: timing.clone(),
-                humanize: *humanize,
-            }),
+            } => self.mouse_stroke(path, *button, *profile, timing, *humanize, state)?,
             Action::MouseScroll { dy, dx, at, .. } => {
                 self.events.push(RecordedInput::MouseScroll {
                     dy: *dy,
@@ -103,6 +105,7 @@ impl RecordingState {
             }
             Action::ReleaseAll => self.release_all(state),
         }
+        Ok(())
     }
 
     fn key_press(&mut self, key: &Key, hold_ms: u32, state: &mut EmitState) {
@@ -214,6 +217,33 @@ impl RecordingState {
             duration_ms,
         });
         self.mouse_button_up(button, state);
+    }
+
+    fn mouse_stroke(
+        &mut self,
+        path: &PathSpec,
+        button: Option<MouseButton>,
+        profile: VelocityProfile,
+        timing: &StrokeTiming,
+        humanize: Option<HumanizeParams>,
+        state: &mut EmitState,
+    ) -> Result<(), ActionError> {
+        let plan = plan_timed_stroke(path, profile, timing, humanize)
+            .map_err(|error| stroke_error(&error))?;
+        if let Some(button) = button {
+            self.mouse_button_down(button, state);
+        }
+        for (index, sample) in plan.samples.iter().enumerate() {
+            self.events.push(RecordedInput::MouseStrokePoint {
+                elapsed_ms: sample.elapsed_ms,
+                point: screen_point_from_path_point(sample.point, index)
+                    .map_err(|error| stroke_error(&error))?,
+            });
+        }
+        if let Some(button) = button {
+            self.mouse_button_up(button, state);
+        }
+        Ok(())
     }
 
     fn mouse_move_relative(&mut self, dx: f64, dy: f64) {
@@ -485,5 +515,11 @@ fn is_neutral_report(report: &GamepadReport) -> bool {
 fn push_unique(buttons: &mut Vec<PadButton>, button: PadButton) {
     if !buttons.contains(&button) {
         buttons.push(button);
+    }
+}
+
+fn stroke_error(error: &StrokeError) -> ActionError {
+    ActionError::TargetInvalid {
+        detail: format!("recording mouse_stroke planning failed: {error}"),
     }
 }

@@ -6,7 +6,8 @@ use synapse_action::{
 use synapse_core::{
     Action, AimCurve, AimNaturalParams, AimStyle, AimTarget, Backend, ButtonAction, ComboInput,
     ComboStep, GamepadReport, Key, KeyCode, KeystrokeDynamics, KeystrokeNaturalParams, MouseButton,
-    MouseTarget, PadButton, Point, Stick, Trigger,
+    MouseTarget, PadButton, PathPoint, PathSpec, Point, Stick, StrokeTiming, Trigger,
+    VelocityProfile,
 };
 
 #[test]
@@ -239,6 +240,7 @@ fn action_cases() -> Vec<RecordingCase> {
         mouse_move_relative_case(),
         mouse_button_case(),
         mouse_drag_case(),
+        mouse_stroke_case(),
         mouse_scroll_case(),
         pad_button_case(),
         pad_stick_case(),
@@ -438,6 +440,52 @@ fn mouse_drag_case() -> RecordingCase {
                 },
                 curve,
                 duration_ms: 200,
+            },
+            RecordedInput::MouseButtonUp {
+                button: MouseButton::Left,
+            },
+        ],
+        ..empty_expectations()
+    }
+}
+
+fn mouse_stroke_case() -> RecordingCase {
+    RecordingCase {
+        edge: "mouse_stroke",
+        action: Action::MouseStroke {
+            path: PathSpec::Line {
+                from: PathPoint::new(0.0, 0.0),
+                to: PathPoint::new(4.0, 0.0),
+            },
+            button: Some(MouseButton::Left),
+            profile: VelocityProfile::Constant,
+            timing: StrokeTiming::DurationMs { duration_ms: 4 },
+            humanize: None,
+            backend: Backend::Software,
+        },
+        expected_events: vec![
+            RecordedInput::MouseButtonDown {
+                button: MouseButton::Left,
+            },
+            RecordedInput::MouseStrokePoint {
+                elapsed_ms: 0.0,
+                point: Point { x: 0, y: 0 },
+            },
+            RecordedInput::MouseStrokePoint {
+                elapsed_ms: 1.0,
+                point: Point { x: 1, y: 0 },
+            },
+            RecordedInput::MouseStrokePoint {
+                elapsed_ms: 2.0,
+                point: Point { x: 2, y: 0 },
+            },
+            RecordedInput::MouseStrokePoint {
+                elapsed_ms: 3.0,
+                point: Point { x: 3, y: 0 },
+            },
+            RecordedInput::MouseStrokePoint {
+                elapsed_ms: 4.0,
+                point: Point { x: 4, y: 0 },
             },
             RecordedInput::MouseButtonUp {
                 button: MouseButton::Left,

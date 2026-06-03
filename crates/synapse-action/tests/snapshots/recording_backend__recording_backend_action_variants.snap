@@ -1,6 +1,6 @@
 ---
 source: crates/synapse-action/tests/recording_backend.rs
-assertion_line: 63
+assertion_line: 64
 expression: snapshot
 ---
 {
@@ -236,6 +236,56 @@ expression: snapshot
         "x": 5,
         "y": 6
       }
+    }
+  ],
+  "mouse_stroke": [
+    {
+      "kind": "mouse_button_down",
+      "button": "left"
+    },
+    {
+      "kind": "mouse_stroke_point",
+      "elapsed_ms": 0.0,
+      "point": {
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "kind": "mouse_stroke_point",
+      "elapsed_ms": 1.0,
+      "point": {
+        "x": 1,
+        "y": 0
+      }
+    },
+    {
+      "kind": "mouse_stroke_point",
+      "elapsed_ms": 2.0,
+      "point": {
+        "x": 2,
+        "y": 0
+      }
+    },
+    {
+      "kind": "mouse_stroke_point",
+      "elapsed_ms": 3.0,
+      "point": {
+        "x": 3,
+        "y": 0
+      }
+    },
+    {
+      "kind": "mouse_stroke_point",
+      "elapsed_ms": 4.0,
+      "point": {
+        "x": 4,
+        "y": 0
+      }
+    },
+    {
+      "kind": "mouse_button_up",
+      "button": "left"
     }
   ],
   "pad_button": [

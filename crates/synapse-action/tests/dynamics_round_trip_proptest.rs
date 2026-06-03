@@ -192,7 +192,7 @@ fn reconstruct_typed_text(events: &[RecordedInput]) -> Result<String, Box<dyn st
             | RecordedInput::MouseMoveRelative { .. }
             | RecordedInput::MouseButtonDown { .. }
             | RecordedInput::MouseButtonUp { .. }
-            | RecordedInput::MouseStroke { .. }
+            | RecordedInput::MouseStrokePoint { .. }
             | RecordedInput::MouseScroll { .. }
             | RecordedInput::AimAt { .. }
             | RecordedInput::ComboAt { .. }

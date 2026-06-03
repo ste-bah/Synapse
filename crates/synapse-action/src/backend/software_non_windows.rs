@@ -75,6 +75,9 @@ mod linux {
                     duration_ms,
                     ..
                 } => mouse_drag(*from, *to, *button, curve, *duration_ms, state),
+                Action::MouseStroke { .. } => Err(ActionError::BackendUnavailable {
+                    detail: "software Linux/X11 backend cannot emit mouse_stroke yet".to_owned(),
+                }),
                 Action::MouseScroll { dy, dx, at, .. } => mouse_scroll(*dy, *dx, *at),
                 Action::AimAt {
                     target,
@@ -558,6 +561,7 @@ mod unsupported {
             Action::MouseMoveRelative { .. } => "mouse_move_relative",
             Action::MouseButton { .. } => "mouse_button",
             Action::MouseDrag { .. } => "mouse_drag",
+            Action::MouseStroke { .. } => "mouse_stroke",
             Action::MouseScroll { .. } => "mouse_scroll",
             Action::PadButton { .. } => "pad_button",
             Action::PadStick { .. } => "pad_stick",
