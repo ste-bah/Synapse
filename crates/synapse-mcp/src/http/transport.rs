@@ -1,4 +1,6 @@
-use std::{io, net::SocketAddr, process::ExitCode, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeSet, io, net::SocketAddr, process::ExitCode, sync::Arc, time::Duration,
+};
 
 use anyhow::Context;
 use axum::{
@@ -13,9 +15,10 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
     session::{SessionState, SessionStore, SessionStoreError, local::LocalSessionManager},
 };
+use synapse_action::ActionHandle;
 use synapse_core::Health;
 use synapse_storage::{Db, cf};
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, task::JoinHandle, time};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -30,6 +33,7 @@ use crate::{
 
 type McpHttpService = StreamableHttpService<SynapseService, LocalSessionManager>;
 const MCP_SESSION_STORE_PREFIX: &str = "mcp/session/v1/";
+const STALE_SESSION_INPUT_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 struct HttpState {
@@ -209,13 +213,17 @@ fn router(
         "HTTP bearer token configured"
     );
     let health_service = Arc::new(service.clone());
-    let session_cleanup = session::SessionCleanupState::new(
-        service
-            .unscoped_action_handle()
-            .context("read action handle for HTTP session cleanup")?,
-    );
+    let action_cleanup_handle = service
+        .unscoped_action_handle()
+        .context("read action handle for HTTP session cleanup")?;
+    let session_cleanup = session::SessionCleanupState::new(action_cleanup_handle.clone());
     let (mcp_service, session_manager) = streamable_service(shutdown_cancel, service)
         .context("initialize HTTP MCP session state")?;
+    let _stale_cleanup_task = spawn_stale_session_input_cleanup(
+        action_cleanup_handle,
+        Arc::clone(&session_manager),
+        shutdown_cancel.child_token(),
+    );
     let state = HttpState {
         health_service,
         session_manager,
@@ -256,6 +264,100 @@ fn streamable_service(
         config,
     );
     Ok((service, session_manager))
+}
+
+fn spawn_stale_session_input_cleanup(
+    action_handle: ActionHandle,
+    session_manager: Arc<LocalSessionManager>,
+    shutdown_cancel: CancellationToken,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = time::interval(STALE_SESSION_INPUT_CLEANUP_INTERVAL);
+        interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown_cancel.cancelled() => {
+                    tracing::debug!(
+                        code = "MCP_HTTP_SESSION_INPUT_STALE_CLEANUP_STOPPED",
+                        "stopping stale HTTP session held-input cleanup"
+                    );
+                    break;
+                }
+                _ = interval.tick() => {
+                    cleanup_stale_session_inputs_once(&action_handle, &session_manager).await;
+                }
+            }
+        }
+    })
+}
+
+async fn cleanup_stale_session_inputs_once(
+    action_handle: &ActionHandle,
+    session_manager: &LocalSessionManager,
+) {
+    let snapshot = match action_handle.session_inputs_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::error!(
+                code = error.code(),
+                detail = %error.detail(),
+                "HTTP MCP stale-session cleanup could not read held-input ownership"
+            );
+            return;
+        }
+    };
+    if snapshot.sessions.is_empty() {
+        return;
+    }
+
+    let active_sessions = active_http_session_ids(session_manager).await;
+    for session in snapshot.sessions {
+        if active_sessions.contains(&session.session_id) {
+            continue;
+        }
+        release_stale_session_inputs(action_handle, &session.session_id).await;
+    }
+}
+
+async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTreeSet<String> {
+    session_manager
+        .sessions
+        .read()
+        .await
+        .keys()
+        .map(|session_id| session_id.as_ref().to_owned())
+        .collect()
+}
+
+async fn release_stale_session_inputs(action_handle: &ActionHandle, session_id: &str) {
+    let before = action_handle.session_inputs_snapshot();
+    let result = action_handle.release_session_inputs(session_id).await;
+    let after = action_handle.session_inputs_snapshot();
+    match result {
+        Ok(summary) => {
+            tracing::info!(
+                code = "MCP_HTTP_SESSION_INPUT_STALE_CLEANUP",
+                session_id,
+                released_keys = summary.released_keys,
+                released_buttons = summary.released_buttons,
+                neutralized_pads = summary.neutralized_pads,
+                retained_shared_inputs = summary.retained_shared_inputs,
+                before = ?before,
+                after = ?after,
+                "readback=session_input_ownership edge=http_session_gone after_cleanup"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                code = error.code(),
+                session_id,
+                detail = %error.detail(),
+                before = ?before,
+                after = ?after,
+                "HTTP MCP stale-session cleanup failed while releasing owned inputs"
+            );
+        }
+    }
 }
 
 fn session_store_db(service: &SynapseService) -> anyhow::Result<Arc<Db>> {
@@ -451,7 +553,9 @@ mod tests {
 
     use anyhow::Context as _;
     use rmcp::model::{ClientCapabilities, Implementation, InitializeRequestParams};
-    use synapse_core::SCHEMA_VERSION;
+    use rmcp::transport::streamable_http_server::session::SessionManager as _;
+    use synapse_action::{ActionBackend, ActionEmitter, RecordingBackend};
+    use synapse_core::{Action, Backend, Key, KeyCode, SCHEMA_VERSION};
 
     use super::*;
 
@@ -521,5 +625,85 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_session_cleanup_releases_absent_inputs_only() -> anyhow::Result<()> {
+        let cancel = CancellationToken::new();
+        let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
+        let (handle, snapshot_handle, join) =
+            ActionEmitter::spawn_with_backend(cancel.clone(), backend);
+        let session_manager = Arc::new(LocalSessionManager::default());
+        let (active_session_id, _active_transport) = session_manager
+            .create_session()
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let active_session_text = active_session_id.as_ref().to_owned();
+        let stale_session_id = "stale-session".to_owned();
+
+        handle
+            .with_session_id(Some(stale_session_id.clone()))
+            .execute(Action::KeyDown {
+                key: test_key("ctrl"),
+                backend: Backend::Software,
+            })
+            .await?;
+        handle
+            .with_session_id(Some(active_session_text.clone()))
+            .execute(Action::KeyDown {
+                key: test_key("shift"),
+                backend: Backend::Software,
+            })
+            .await?;
+
+        let before_state = snapshot_handle.snapshot().await?;
+        let before_ownership = handle.session_inputs_snapshot()?;
+        println!(
+            "readback=http_session_cleanup edge=stale_owner before_state={before_state:?} before_ownership={before_ownership:?} active_session_id={active_session_text}"
+        );
+
+        cleanup_stale_session_inputs_once(&handle, &session_manager).await;
+
+        let after_state = snapshot_handle.snapshot().await?;
+        let after_ownership = handle.session_inputs_snapshot()?;
+        println!(
+            "readback=http_session_cleanup edge=stale_owner after_state={after_state:?} after_ownership={after_ownership:?}"
+        );
+
+        assert_eq!(after_state.held_keys, vec![test_key("shift")]);
+        assert!(
+            after_ownership
+                .sessions
+                .iter()
+                .any(|session| session.session_id == active_session_text),
+            "active session ownership should be retained"
+        );
+        assert!(
+            !after_ownership
+                .sessions
+                .iter()
+                .any(|session| session.session_id == stale_session_id),
+            "stale session ownership should be removed"
+        );
+
+        session_manager
+            .close_session(&active_session_id)
+            .await
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        handle.execute(Action::ReleaseAll).await?;
+        cancel.cancel();
+        let final_snapshot = join.await?;
+        assert!(final_snapshot.held_keys.is_empty());
+
+        Ok(())
+    }
+
+    fn test_key(value: &str) -> Key {
+        Key {
+            code: KeyCode::Named {
+                value: value.to_owned(),
+            },
+            use_scancode: false,
+        }
     }
 }
