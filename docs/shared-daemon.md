@@ -24,12 +24,19 @@ A bearer token is read from `%APPDATA%\synapse\token.txt` (or the
 
 ## How each client connects
 
-- **Claude Code** speaks Streamable HTTP natively — point its `synapse` MCP
-  entry at `http://127.0.0.1:7700/mcp` with the bearer token (transport `http`).
-- **Codex, Claude Desktop, WSL agents** are stdio-only — launch
-  `synapse-mcp --mode connect --bind 127.0.0.1:7700`. The bridge forwards
-  JSON-RPC to the daemon and streams notifications back; it auto-spawns the
-  daemon on first use and forwards its `--db` to the spawned daemon.
+- **Claude Code and Codex** speak Streamable HTTP natively — point the
+  `synapse` MCP entry at `http://127.0.0.1:7700/mcp` with the bearer token
+  (transport `http` / `streamable_http`).
+- **Claude Desktop on Windows** is a stdio client — launch `synapse-mcp --mode
+  connect --bind 127.0.0.1:7700`. The bridge forwards JSON-RPC to the daemon
+  and streams notifications back; it auto-spawns the daemon on first use and
+  forwards its `--db` to the spawned daemon.
+- **WSL agents must not launch the Windows `.exe` bridge directly.** Direct
+  WSL interop makes the Windows parent look like long-lived `wsl.exe`, not the
+  real Linux-side MCP client, so the bridge cannot prove client lifetime. WSL
+  Codex/Claude clients should use native Streamable HTTP
+  `http://127.0.0.1:7700/mcp` with the local bearer token. A direct WSL
+  `--mode connect` launch fails closed with `MCP_CONNECT_UNSUPPORTED_PARENT`.
 
 All clients share one daemon, so they observe the same live world state and
 receive the same `subscribe` events.
@@ -52,6 +59,10 @@ both exit **4** instead of failing later inside a tool call.
 - The `connect` bridge exits when its stdin closes (client disconnect) and also
   arms a **parent-death watchdog** (`WaitForSingleObject` on the parent) so it
   can never outlive the client even on an abrupt Windows kill.
+- The `connect` bridge refuses direct WSL interop parents (`wsl.exe` /
+  `wslhost.exe`) because that parent belongs to the WSL host, not the real
+  Linux MCP client. This is a hard failure with structured log code
+  `MCP_CONNECT_UNSUPPORTED_PARENT`; use HTTP transport from WSL instead.
 - The spawned daemon is created with `bInheritHandles=FALSE`, so it never holds
   a client's stdio pipe open.
 - The daemon stays resident across individual client disconnects and does **not**
@@ -83,6 +94,11 @@ clients are connected.
   When none exists, start a fresh Codex session so MCP initializes again; do not
   claim the current chat's direct `mcp__synapse` FSV is available until the live
   namespace itself succeeds.
+- **WSL Codex/Claude leaves `synapse-mcp --mode connect` children under
+  `wsl.exe`** — this is a configuration error. Reconfigure the WSL client to
+  HTTP transport with bearer auth. The bridge now refuses direct WSL interop
+  with `MCP_CONNECT_UNSUPPORTED_PARENT` so this stale-child class cannot recur
+  silently.
 - **`RegisterHotKey ... Hot key is already registered` / "leaked or duplicate
   synapse-mcp instance"** — more than one synapse-mcp is running. Run
   `synapse-mcp --mode doctor` to list them; `--mode doctor --kill-stray` removes

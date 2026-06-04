@@ -22,6 +22,9 @@ use rmcp::{
         },
     },
 };
+use tokio_util::sync::CancellationToken;
+
+use crate::stdio_eof::CancelOnEofRead;
 
 /// How long to wait for a freshly spawned daemon to become healthy.
 const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -34,16 +37,36 @@ const DAEMON_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// failure mode). This watchdog waits on the parent process handle and force
 /// exits when it dies, so a bridge can never outlive its client. The shared
 /// daemon is intentionally NOT subject to this — it must survive client churn.
-fn install_parent_watchdog() {
+fn install_parent_watchdog() -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        let Some(parent_pid) = parent_process_id() else {
-            tracing::warn!(
+        let Some(parent) = parent_process_info() else {
+            tracing::error!(
                 code = "MCP_CONNECT_PARENT_UNKNOWN",
-                "could not determine parent pid; parent-death watchdog disabled"
+                "could not determine parent process; refusing bridge without lifecycle owner"
             );
-            return;
+            anyhow::bail!(
+                "MCP_CONNECT_PARENT_UNKNOWN: could not determine parent process; refusing bridge without lifecycle owner"
+            );
         };
+        if parent.is_unsupported_wsl_interop_host() {
+            tracing::error!(
+                code = "MCP_CONNECT_UNSUPPORTED_PARENT",
+                parent_pid = parent.pid,
+                parent_name = %parent.name,
+                parent_command_line_len = parent.command_line.len(),
+                parent_command_line_mentions_wsl = parent.command_line.to_ascii_lowercase().contains("\\wsl.exe"),
+                remediation = "configure WSL clients for HTTP MCP transport or launch through a supported wrapper; direct WSL interop cannot prove client lifetime",
+                "refusing direct WSL interop bridge parent"
+            );
+            anyhow::bail!(
+                "MCP_CONNECT_UNSUPPORTED_PARENT: parent_pid={} parent_name={} direct WSL interop cannot prove client lifetime; configure WSL clients for HTTP MCP transport or a supported launcher",
+                parent.pid,
+                parent.name
+            );
+        };
+        verify_parent_watchdog_handle(parent.pid)?;
+        let parent_pid = parent.pid;
         std::thread::spawn(move || {
             use windows::Win32::Foundation::CloseHandle;
             use windows::Win32::System::Threading::{
@@ -57,13 +80,13 @@ fn install_parent_watchdog() {
                         let _ = CloseHandle(handle);
                     }
                     Err(error) => {
-                        tracing::warn!(
+                        tracing::error!(
                             code = "MCP_CONNECT_PARENT_OPEN_FAILED",
                             parent_pid,
                             error = %error,
-                            "could not open parent process; watchdog inactive"
+                            "could not open parent process inside watchdog; bridge shutting down"
                         );
-                        return;
+                        std::process::exit(1);
                     }
                 }
             }
@@ -80,15 +103,72 @@ fn install_parent_watchdog() {
             "parent-death watchdog armed"
         );
     }
+    Ok(())
 }
 
 #[cfg(windows)]
-fn parent_process_id() -> Option<u32> {
+#[derive(Debug)]
+struct ParentProcessInfo {
+    pid: u32,
+    name: String,
+    command_line: String,
+}
+
+#[cfg(windows)]
+impl ParentProcessInfo {
+    fn is_unsupported_wsl_interop_host(&self) -> bool {
+        self.name.eq_ignore_ascii_case("wsl.exe")
+            || self.name.eq_ignore_ascii_case("wslhost.exe")
+            || self.command_line.to_ascii_lowercase().contains("\\wsl.exe")
+    }
+}
+
+#[cfg(windows)]
+fn parent_process_info() -> Option<ParentProcessInfo> {
     use sysinfo::{ProcessesToUpdate, System, get_current_pid};
     let current = get_current_pid().ok()?;
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
-    Some(system.process(current)?.parent()?.as_u32())
+    let parent_pid = system.process(current)?.parent()?;
+    let parent = system.process(parent_pid)?;
+    Some(ParentProcessInfo {
+        pid: parent_pid.as_u32(),
+        name: parent.name().to_string_lossy().into_owned(),
+        command_line: parent
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+    })
+}
+
+#[cfg(windows)]
+fn verify_parent_watchdog_handle(parent_pid: u32) -> anyhow::Result<()> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE};
+
+    // SAFETY: OpenProcess is called with synchronize-only access. The handle is
+    // closed immediately; the watchdog thread opens its own handle after spawn.
+    unsafe {
+        match OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                Ok(())
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = "MCP_CONNECT_PARENT_OPEN_FAILED",
+                    parent_pid,
+                    error = %error,
+                    "could not open parent process; refusing bridge without watchdog"
+                );
+                anyhow::bail!(
+                    "MCP_CONNECT_PARENT_OPEN_FAILED: could not open parent pid {parent_pid}: {error}"
+                );
+            }
+        }
+    }
 }
 
 /// Probe the daemon `/health` endpoint. Returns true only on a 2xx response.
@@ -297,12 +377,20 @@ pub async fn run_connect(bind: &str, db: Option<&Path>) -> anyhow::Result<ExitCo
 
     // Arm the parent-death watchdog before anything else so the bridge can
     // never outlive the client that launched it.
-    install_parent_watchdog();
+    install_parent_watchdog()?;
 
     // Ensure exactly one shared daemon is up (spawn it if needed) before bridging.
     let mut daemon = open_daemon_transport(bind, &uri, db, &token).await?;
 
+    let client_closed_token = CancellationToken::new();
     let (stdin, stdout) = rmcp::transport::stdio();
+    let stdin = CancelOnEofRead::new(
+        stdin,
+        client_closed_token.clone(),
+        client_closed_token.clone(),
+        "MCP_CONNECT_EOF_CONNECTION_CLOSED",
+        "connect",
+    );
     let mut client = AsyncRwTransport::new_server(stdin, stdout);
     let mut client_message_count = 0usize;
     let mut saved_initialize: Option<ClientJsonRpcMessage> = None;
@@ -310,6 +398,13 @@ pub async fn run_connect(bind: &str, db: Option<&Path>) -> anyhow::Result<ExitCo
 
     loop {
         tokio::select! {
+            _ = client_closed_token.cancelled() => {
+                tracing::info!(
+                    code = "MCP_CONNECT_STDIN_EOF",
+                    "client stdin EOF guard cancelled bridge; shutting down bridge"
+                );
+                break;
+            }
             from_client = client.receive() => {
                 match from_client {
                     Some(message) => {

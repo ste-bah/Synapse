@@ -116,6 +116,19 @@ fn kill_synapse_processes_for_db(db: &str) {
     }
 }
 
+fn windows_path_to_wsl(path: &str) -> anyhow::Result<String> {
+    let mut chars = path.chars();
+    let drive = chars
+        .next()
+        .context("Windows path missing drive letter")?
+        .to_ascii_lowercase();
+    if chars.next() != Some(':') {
+        bail!("Windows path should start with drive colon: {path}");
+    }
+    let rest = chars.as_str().replace('\\', "/");
+    Ok(format!("/mnt/{drive}{rest}"))
+}
+
 fn lifecycle_test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -229,6 +242,70 @@ fn connect_bridge_exits_when_parent_process_dies() -> anyhow::Result<()> {
     exit_result
 }
 
+/// The connect bridge must also exit when stdin reaches EOF before the client
+/// sends a complete MCP initialize frame. This is the empty-input boundary that
+/// can otherwise leave a bridge waiting forever under a still-alive parent.
+#[test]
+fn connect_bridge_exits_on_stdin_eof_before_init() -> anyhow::Result<()> {
+    let _guard = lifecycle_test_lock()
+        .lock()
+        .map_err(|err| anyhow::anyhow!("lifecycle test lock poisoned: {err}"))?;
+    let tmp = tempfile::tempdir()?;
+    let db = db_arg(tmp.path())?;
+    let bind = free_loopback_bind()?;
+    let appdata = write_test_token_appdata(tmp.path())?;
+    let mut child = Command::new(bin())
+        .args([
+            "--mode",
+            "connect",
+            "--bind",
+            &bind,
+            "--db",
+            &db,
+            "--log-level",
+            "info",
+        ])
+        .env("APPDATA", &appdata)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn connect bridge")?;
+
+    std::thread::sleep(Duration::from_millis(800));
+    drop(child.stdin.take());
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().context("poll connect bridge")? {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            kill_synapse_processes_for_db(&db);
+            bail!("connect bridge did not exit within 20s after stdin EOF");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let output = child
+        .wait_with_output()
+        .context("collect connect bridge output")?;
+    kill_synapse_processes_for_db(&db);
+
+    assert!(status.success(), "connect bridge exit status: {status}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP_CONNECT_EOF_CONNECTION_CLOSED"),
+        "stderr should contain EOF guard log; stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("MCP_CONNECT_STDIN_EOF"),
+        "stderr should contain bridge EOF shutdown log; stderr={stderr}"
+    );
+    Ok(())
+}
+
 /// A second daemon for the same DB must be refused by the single-instance guard
 /// (exit code 3) while the first keeps running.
 #[test]
@@ -305,6 +382,52 @@ fn duplicate_daemon_is_refused() -> anyhow::Result<()> {
     assert!(
         first_still_alive,
         "first daemon should survive the duplicate launch"
+    );
+    Ok(())
+}
+
+/// Direct WSL interop starts Windows children under the long-lived `wsl.exe`
+/// host, so a Windows parent-death watchdog cannot prove the real Linux client
+/// lifetime. This is ignored by default because it requires the operator's WSL
+/// distro; run it on configured Windows hosts before accepting bridge lifecycle
+/// changes.
+#[test]
+#[ignore = "requires configured Ubuntu-24.04 WSL distro"]
+fn direct_wsl_interop_connect_parent_is_refused() -> anyhow::Result<()> {
+    let _guard = lifecycle_test_lock()
+        .lock()
+        .map_err(|err| anyhow::anyhow!("lifecycle test lock poisoned: {err}"))?;
+    let bind = free_loopback_bind()?;
+    let wsl_bin = windows_path_to_wsl(bin())?;
+    let output = Command::new("wsl.exe")
+        .args([
+            "-d",
+            "Ubuntu-24.04",
+            "-e",
+            "env",
+            "SYNAPSE_BEARER_TOKEN=lifecycle-wsl-parent-token",
+            &wsl_bin,
+            "--mode",
+            "connect",
+            "--bind",
+            &bind,
+            "--log-level",
+            "info",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("spawn direct WSL interop connect bridge")?;
+
+    assert!(
+        !output.status.success(),
+        "direct WSL interop bridge should be refused"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("MCP_CONNECT_UNSUPPORTED_PARENT"),
+        "stderr should name unsupported parent; stderr={stderr}"
     );
     Ok(())
 }

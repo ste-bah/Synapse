@@ -51,26 +51,19 @@ mod m4;
 mod safety;
 mod server;
 mod single_instance;
+mod stdio_eof;
 
-use std::{
-    io,
-    num::NonZeroUsize,
-    path::PathBuf,
-    pin::Pin,
-    process::ExitCode,
-    task::{Context as TaskContext, Poll},
-    time::Duration,
-};
+use std::{num::NonZeroUsize, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::Context;
 use clap::{ArgAction, Parser, ValueEnum};
 use rmcp::ServiceExt;
 use synapse_telemetry::{TelemetryConfig, TelemetryGuard, init_tracing};
-use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::filter::LevelFilter;
 
 use crate::server::SynapseService;
+use crate::stdio_eof::CancelOnEofRead;
 
 const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
 const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
@@ -323,6 +316,8 @@ async fn run_stdio(
         stdin,
         emitter_connection_closed_token.clone(),
         rmcp_token.clone(),
+        "MCP_STDIO_EOF_CONNECTION_CLOSED",
+        "stdio",
     );
     let start = service.serve_with_ct((stdin, stdout), rmcp_token.clone());
     tokio::pin!(start);
@@ -369,52 +364,6 @@ async fn run_stdio(
 
     drop(telemetry_guard);
     Ok(code)
-}
-
-struct CancelOnEofRead<R> {
-    inner: R,
-    connection_closed_cancel: CancellationToken,
-    service_cancel: CancellationToken,
-    eof_seen: bool,
-}
-
-impl<R> CancelOnEofRead<R> {
-    const fn new(
-        inner: R,
-        connection_closed_cancel: CancellationToken,
-        service_cancel: CancellationToken,
-    ) -> Self {
-        Self {
-            inner,
-            connection_closed_cancel,
-            service_cancel,
-            eof_seen: false,
-        }
-    }
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for CancelOnEofRead<R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut TaskContext<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let before_len = buf.filled().len();
-        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if matches!(&result, Poll::Ready(Ok(())))
-            && buf.filled().len() == before_len
-            && !self.eof_seen
-        {
-            self.eof_seen = true;
-            self.connection_closed_cancel.cancel();
-            self.service_cancel.cancel();
-            tracing::info!(
-                code = "MCP_STDIO_EOF_CONNECTION_CLOSED",
-                "readback=stdio edge=connection_closed after=eof"
-            );
-        }
-        result
-    }
 }
 
 #[cfg(windows)]
