@@ -76,7 +76,13 @@ clients are connected.
   `C:\Users\hotra\.cargo\bin\synapse-mcp.exe --mode connect --bind 127.0.0.1:7700`
   against the repo-built daemon, re-read health and tool discovery, and retry
   the real wired `mcp__synapse` tools. Direct HTTP or standalone stdio probes
-  are diagnostics only; do not use them as FSV substitutes.
+  are diagnostics only; do not use them as FSV substitutes. If those host SoTs
+  are healthy but the already-running Codex process still has no
+  `synapse-mcp --mode connect` child and the live tool remains closed, check
+  the installed Codex command surface for a real MCP reload/reconnect action.
+  When none exists, start a fresh Codex session so MCP initializes again; do not
+  claim the current chat's direct `mcp__synapse` FSV is available until the live
+  namespace itself succeeds.
 - **`RegisterHotKey ... Hot key is already registered` / "leaked or duplicate
   synapse-mcp instance"** — more than one synapse-mcp is running. Run
   `synapse-mcp --mode doctor` to list them; `--mode doctor --kill-stray` removes
