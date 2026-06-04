@@ -78,9 +78,9 @@ giant screenshot it has to squint at:
 
 Real input, synthesized through Win32 — not brittle macros:
 
-- **`act_click`, `act_aim`, `act_drag`, `act_stroke`, `act_scroll`** — mouse
-  control with timing profiles for point-to-point moves and explicit paths for
-  shaped strokes; see [Motion Semantics](docs/motion-semantics.md).
+- **`act_click`, `act_stroke`, `act_scroll`** — mouse control with timing
+  profiles for point/element moves, optional-button drags, and explicit shaped
+  paths; see [Motion Semantics](docs/motion-semantics.md).
 - **`act_type`, `act_press`, `act_keymap`** — type Unicode text with *human-like*
   keystroke dynamics, press chords, or fire profile-defined key aliases.
 - **`act_pad`** — a full **virtual Xbox / DualShock controller** via ViGEmBus.
@@ -341,7 +341,7 @@ Once it's connected, just ask your agent in plain English. For example:
 > *"Register a reflex that reacts the instant a window-focus event fires, show me
 > it firing, then disarm it."*
 
-Behind the scenes the agent calls `act_launch`, `act_type`, `act_drag`,
+Behind the scenes the agent calls `act_launch`, `act_type`, `act_stroke`,
 `observe`, `read_text`, `reality_baseline`, `reflex_register`, and friends — and
 every action is captured to the local audit trail.
 
@@ -356,7 +356,7 @@ At a glance:
 |---|---|
 | **Perception** | `observe` · `find` · `read_text` · `audio_tail` · `audio_transcribe` · `subscribe` · `set_capture_target` · `set_perception_mode` |
 | **Delta-first reality** | `reality_baseline` · `observe_delta` · `reality_audit` |
-| **Action** | `act_click` · `act_type` · `act_press` · `act_keymap` · `act_aim` · `act_drag` · `act_stroke` · `act_scroll` · `act_pad` · `act_clipboard` · `act_combo` · `act_run_shell` · `act_launch` · `release_all` |
+| **Action** | `act_click` · `act_type` · `act_press` · `act_keymap` · `act_stroke` · `act_scroll` · `act_pad` · `act_clipboard` · `act_combo` · `act_run_shell` · `act_launch` · `release_all` |
 | **Reflexes** | `reflex_register` · `reflex_cancel` · `reflex_list` · `reflex_history` |
 | **Profiles, registry & audit** | `profile_list` · `profile_activate` · `profile_quality_refresh` · `profile_authoring_*` · `profile_registry_*` · `audit_intelligence_query` · `audit_export_bundle` |
 | **Storage & health** | `health` · `storage_inspect` · `storage_gc_once` · `storage_pressure_sample` · `replay_record` |

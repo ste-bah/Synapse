@@ -1,6 +1,5 @@
 ---
 source: crates/synapse-mcp/tests/m3_audio_tail_tool.rs
-assertion_line: 138
 expression: shape
 ---
 {
@@ -29,14 +28,12 @@ expression: shape
             "type": "string"
           },
           "azimuth_deg": {
-            "format": "float",
             "type": [
               "number",
               "null"
             ]
           },
           "confidence": {
-            "format": "float",
             "type": "number"
           },
           "kind": {
@@ -54,11 +51,9 @@ expression: shape
         "additionalProperties": false,
         "properties": {
           "azimuth_deg": {
-            "format": "float",
             "type": "number"
           },
           "confidence": {
-            "format": "float",
             "type": "number"
           }
         },
@@ -73,11 +68,9 @@ expression: shape
     "additionalProperties": false,
     "properties": {
       "captured_seconds": {
-        "format": "double",
         "type": "number"
       },
       "channels": {
-        "format": "uint16",
         "maximum": 65535,
         "minimum": 0,
         "type": "integer"
@@ -96,13 +89,11 @@ expression: shape
         "type": "string"
       },
       "frames": {
-        "format": "uint",
         "minimum": 0,
         "type": "integer"
       },
       "pcm": {
         "items": {
-          "format": "uint8",
           "maximum": 255,
           "minimum": 0,
           "type": "integer"
@@ -116,20 +107,16 @@ expression: shape
         "type": "array"
       },
       "requested_seconds": {
-        "format": "double",
         "type": "number"
       },
       "rms_db": {
-        "format": "float",
         "type": "number"
       },
       "sample_rate": {
-        "format": "uint32",
         "minimum": 0,
         "type": "integer"
       },
       "vad_speech_pct": {
-        "format": "float",
         "type": "number"
       }
     },

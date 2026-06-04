@@ -4,11 +4,9 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 46] = [
-    "act_aim",
+const EXPECTED_TOOLS: [&str; 44] = [
     "act_click",
     "act_clipboard",
-    "act_drag",
     "act_keymap",
     "act_pad",
     "act_press",
@@ -152,33 +150,9 @@ fn assert_schema_roots_closed(tools: &[Value]) -> anyhow::Result<()> {
 }
 
 fn assert_motion_semantics_are_advertised(tools: &[Value]) -> anyhow::Result<()> {
-    let drag = tool_by_name(tools, "act_drag")?;
-    let drag_description = drag
-        .get("description")
-        .and_then(Value::as_str)
-        .context("act_drag description missing")?;
     ensure!(
-        drag_description.contains("velocity_profile controls timing only"),
-        "act_drag description must describe velocity_profile as timing-only: {drag_description}"
-    );
-    ensure!(
-        drag_description.contains("act_stroke.path"),
-        "act_drag description must direct spatial paths to act_stroke.path: {drag_description}"
-    );
-    ensure!(
-        value_at(drag, "inputSchema.properties.curve").is_err(),
-        "act_drag schema must not advertise deprecated curve"
-    );
-    value_at(drag, "inputSchema.properties.velocity_profile")
-        .context("act_drag schema must advertise velocity_profile")?;
-
-    let aim_description = tool_by_name(tools, "act_aim")?
-        .get("description")
-        .and_then(Value::as_str)
-        .context("act_aim description missing")?;
-    ensure!(
-        aim_description.contains("not spatial path shape"),
-        "act_aim description must not imply spatial path shaping: {aim_description}"
+        tool_by_name(tools, "act_aim").is_err() && tool_by_name(tools, "act_drag").is_err(),
+        "act_aim and act_drag must be removed from tools/list after act_stroke unification"
     );
 
     let stroke_description = tool_by_name(tools, "act_stroke")?
@@ -188,6 +162,14 @@ fn assert_motion_semantics_are_advertised(tools: &[Value]) -> anyhow::Result<()>
     ensure!(
         stroke_description.contains("explicit spatial path"),
         "act_stroke description must advertise explicit spatial path ownership: {stroke_description}"
+    );
+    ensure!(
+        stroke_description.contains("point/element target"),
+        "act_stroke description must advertise point/element target ownership: {stroke_description}"
+    );
+    ensure!(
+        stroke_description.contains("button set drags"),
+        "act_stroke description must advertise optional-button drag semantics: {stroke_description}"
     );
     ensure!(
         stroke_description.contains("motion_model"),
@@ -229,13 +211,6 @@ fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
         "act_click",
         "inputSchema.properties.hold_ms.default",
         &json!(120),
-    )?;
-    read_default(
-        readbacks,
-        tools,
-        "act_drag",
-        "inputSchema.properties.velocity_profile.default",
-        &json!("natural"),
     )?;
     read_default(
         readbacks,
@@ -487,7 +462,10 @@ fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
 
 fn read_required_fields(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::Result<()> {
     read_required(readbacks, tools, "act_keymap", "alias")?;
-    read_required(readbacks, tools, "act_stroke", "path")?;
+    read_property(readbacks, tools, "act_stroke", "path")?;
+    read_property(readbacks, tools, "act_stroke", "target")?;
+    read_property(readbacks, tools, "act_stroke", "from")?;
+    read_property(readbacks, tools, "act_stroke", "to")?;
     read_required(readbacks, tools, "act_stroke", "duration_or_speed")?;
     read_required(readbacks, tools, "subscribe_cancel", "subscription_id")?;
     read_required(readbacks, tools, "reflex_cancel", "reflex_id")?;
@@ -563,6 +541,24 @@ fn read_required(
     readbacks.push(json!({
         "tool": tool_name,
         "path": "inputSchema.required",
+        "actual_contains": field,
+    }));
+    Ok(())
+}
+
+fn read_property(
+    readbacks: &mut Vec<Value>,
+    tools: &[Value],
+    tool_name: &str,
+    field: &str,
+) -> anyhow::Result<()> {
+    value_at(
+        tool_by_name(tools, tool_name)?,
+        &format!("inputSchema.properties.{field}"),
+    )?;
+    readbacks.push(json!({
+        "tool": tool_name,
+        "path": "inputSchema.properties",
         "actual_contains": field,
     }));
     Ok(())

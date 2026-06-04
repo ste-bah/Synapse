@@ -13,7 +13,10 @@ async fn storage_tools_are_default_granted_and_persist_probe_rows() -> anyhow::R
     let db_path_string = db_path.to_string_lossy().into_owned();
     let mut client = StdioMcpClient::launch_and_init_with_env(
         Some(logs.path()),
-        &[("SYNAPSE_DB", db_path_string.as_str())],
+        &[
+            ("SYNAPSE_DEBUG_TOOLS", "1"),
+            ("SYNAPSE_DB", db_path_string.as_str()),
+        ],
     )
     .await?;
 
@@ -67,7 +70,10 @@ async fn storage_probe_rows_cover_pressure_gated_column_families() -> anyhow::Re
     let db_path_string = db_path.to_string_lossy().into_owned();
     let mut client = StdioMcpClient::launch_and_init_with_env(
         Some(logs.path()),
-        &[("SYNAPSE_DB", db_path_string.as_str())],
+        &[
+            ("SYNAPSE_DEBUG_TOOLS", "1"),
+            ("SYNAPSE_DB", db_path_string.as_str()),
+        ],
     )
     .await?;
 

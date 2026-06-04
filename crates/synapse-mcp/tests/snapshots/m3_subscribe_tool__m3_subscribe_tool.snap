@@ -1,5 +1,6 @@
 ---
 source: crates/synapse-mcp/tests/m3_subscribe_tool.rs
+assertion_line: 211
 expression: shape
 ---
 {
@@ -351,7 +352,6 @@ expression: shape
       "properties": {
         "buffer_size": {
           "default": 4096,
-          "format": "uint32",
           "minimum": 0,
           "type": "integer"
         },

@@ -18,7 +18,7 @@ The probe checks, in order:
 When the probe finds a reachable endpoint, the async browser path attaches CDP,
 pulls the accessibility tree, resolves DOM bounds, and merges the resulting web
 nodes into the normal element list. Those nodes are queryable through `find` and
-actionable by `act_click`, `act_type`, and `act_aim`.
+actionable by `act_click`, `act_type`, and `act_stroke`.
 
 When no endpoint is reachable, Synapse does not silently pretend the DOM was
 observed. The UIA tree is still returned, but it is the browser shell, not the
@@ -96,7 +96,7 @@ For browser work, prefer this loop:
 5. Call `find` with a role/name query, such as `role = "button"` and
    `name_substring = "Apply"`.
 6. Use the returned CDP-backed `element_id` with `act_click`, `act_type`, or
-   `act_aim`.
+   `act_stroke`.
 7. Read the separate source of truth after the action: page text/DOM state,
    visible UI state, downloaded file bytes, server-side record, or the Synapse
    audit row that should have changed.

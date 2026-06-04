@@ -897,13 +897,11 @@ mod scope_gate_tests {
         m4::M4ServiceConfig,
     };
 
-    const ACTION_WRITE_TOOLS: [&str; 14] = [
+    const ACTION_WRITE_TOOLS: [&str; 12] = [
         "act_click",
         "act_type",
         "act_press",
         "act_keymap",
-        "act_aim",
-        "act_drag",
         "act_stroke",
         "act_scroll",
         "act_pad",
@@ -919,7 +917,7 @@ mod scope_gate_tests {
         let profiles = TempDir::new()?;
         let service = service_with_profiles(profiles.path(), false)?;
 
-        assert_eq!(crate::m3::m3_tool_stubs().len(), 33);
+        assert_eq!(crate::m3::m3_tool_stubs().len(), 29);
         assert!(service.instructions().contains("M3 scaffold"));
 
         Ok(())

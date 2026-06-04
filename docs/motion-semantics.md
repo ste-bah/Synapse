@@ -13,20 +13,19 @@ Use separate names for timing and spatial shape:
   seeded gravity/wind/damping point-to-point line strokes with variable step
   lengths.
 
-`act_aim` and `act_drag` are point-to-point tools. Their style or
-`velocity_profile` changes how quickly the pointer progresses between endpoints;
-callers that need a curved, closed, or multi-waypoint spatial path should use
-`act_stroke`.
+`act_stroke` owns the public motion surface. Use `path` for an explicit spatial
+shape, or use `target`/`to` with an optional `from` for point-to-point motion.
+Leave `button` unset to move/aim; set `button` to drag along the resolved line or
+path.
 
 Migration:
 
-- New `act_drag` calls should send `velocity_profile`.
-- The old `act_drag.curve` field remains a compatibility alias for `natural`,
-  `instant`, `linear`, and `ease_in_out`.
-- The old `act_drag.curve = "bezier"` value is rejected with an explicit
-  parameter error. Use `act_stroke.path.kind = "cubic_bezier"` for spatial
-  Bezier movement, or `velocity_profile = "ease_in_out"` for point-to-point
-  timing.
+- Former `act_aim` move-to-point calls map to `act_stroke` with `target` or
+  `to` and no `button`.
+- Former `act_drag` calls map to `act_stroke` with `from`, `to`, and `button`.
+- The old `curve` field is not part of the public motion schema. Use
+  `velocity_profile` for timing and `path.kind = "cubic_bezier"` for spatial
+  Bezier movement.
 
 WindMouse:
 

@@ -84,11 +84,6 @@ expression: snapshot
       "tool": "act_click"
     },
     {
-      "actual": "natural",
-      "path": "act_drag.inputSchema.properties.velocity_profile.default",
-      "tool": "act_drag"
-    },
-    {
       "actual": "constant",
       "path": "act_stroke.inputSchema.properties.velocity_profile.default",
       "tool": "act_stroke"

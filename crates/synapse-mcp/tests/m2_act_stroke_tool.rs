@@ -29,6 +29,8 @@ async fn act_stroke_tools_call_recording_backend_and_path_edges() -> anyhow::Res
         .and_then(Value::as_array)
         .context("tools array missing")?;
     assert!(tools.iter().any(|tool| tool["name"] == "act_stroke"));
+    assert!(!tools.iter().any(|tool| tool["name"] == "act_aim"));
+    assert!(!tools.iter().any(|tool| tool["name"] == "act_drag"));
 
     let response = client
         .tools_call(
@@ -63,6 +65,34 @@ async fn act_stroke_tools_call_recording_backend_and_path_edges() -> anyhow::Res
     assert_eq!(stroke.duration_ms, 4.0);
     assert_eq!(stroke.motion_model_used, json!({"kind": "path"}));
     assert_eq!(stroke.backend_used, "software");
+
+    let target_line_response = client
+        .tools_call(
+            "act_stroke",
+            json!({
+                "from": {"x": 10.0, "y": 20.0},
+                "to": {"x": 70.0, "y": 80.0},
+                "button": "left",
+                "velocity_profile": "linear",
+                "duration_or_speed": {"kind": "duration_ms", "duration_ms": 80},
+                "backend": "software"
+            }),
+        )
+        .await?;
+    let target_line: ActStrokeWireResponse = structured(&target_line_response)?;
+    println!(
+        "readback=mcp_act_stroke edge=target_line after=ok:{} path_kind:{} button:{:?} points:{} duration_ms:{}",
+        target_line.ok,
+        target_line.path_kind,
+        target_line.button_used,
+        target_line.point_stream_count,
+        target_line.duration_ms
+    );
+    assert!(target_line.ok);
+    assert_eq!(target_line.path_kind, "line");
+    assert_eq!(target_line.button_used.as_deref(), Some("left"));
+    assert!(target_line.point_stream_count > 1);
+    assert_eq!(target_line.duration_ms, 80.0);
 
     let wind_response = client
         .tools_call(
@@ -221,6 +251,7 @@ fn read_logs(path: &Path) -> anyhow::Result<String> {
 struct ActStrokeWireResponse {
     ok: bool,
     path_kind: String,
+    button_used: Option<String>,
     point_stream_count: u32,
     path_length_px: f64,
     duration_ms: f64,

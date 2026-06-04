@@ -1,12 +1,11 @@
 use super::{
-    ActAimParams, ActAimResponse, ActClickParams, ActClickResponse, ActClipboardParams,
-    ActClipboardResponse, ActClipboardVerb, ActDragParams, ActDragResponse, ActKeymapParams,
-    ActKeymapResponse, ActPadParams, ActPadResponse, ActPressParams, ActPressResponse,
-    ActScrollParams, ActScrollResponse, ActStrokeParams, ActStrokeResponse, ActTypeParams,
-    ActTypeResponse, ErrorData, Json, Parameters, ReleaseAllParams, ReleaseAllResponse,
-    SynapseService, act_aim_with_handle, act_click_with_handle, act_clipboard,
-    act_drag_with_handle, act_keymap_with_handle, act_pad_with_handle, act_press_with_handle,
-    act_scroll_with_handle, act_stroke_with_handle, act_type_with_handle,
+    ActClickParams, ActClickResponse, ActClipboardParams, ActClipboardResponse, ActClipboardVerb,
+    ActKeymapParams, ActKeymapResponse, ActPadParams, ActPadResponse, ActPressParams,
+    ActPressResponse, ActScrollParams, ActScrollResponse, ActStrokeParams, ActStrokeResponse,
+    ActTypeParams, ActTypeResponse, ErrorData, Json, Parameters, ReleaseAllParams,
+    ReleaseAllResponse, SynapseService, act_click_with_handle, act_clipboard,
+    act_keymap_with_handle, act_pad_with_handle, act_press_with_handle, act_scroll_with_handle,
+    act_stroke_with_handle, act_type_with_handle,
     action_preflight::{ActionPreflightReadback, ForegroundProof},
     release_all_with_handles, tool, tool_router, validate_act_stroke_params,
 };
@@ -175,59 +174,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Move the pointer to a screen, element, or track target; style controls point-to-point timing, not spatial path shape"
-    )]
-    pub async fn act_aim(
-        &self,
-        params: Parameters<ActAimParams>,
-    ) -> Result<Json<ActAimResponse>, ErrorData> {
-        tracing::info!(
-            code = "MCP_TOOL_INVOCATION",
-            kind = "act_aim",
-            "tool.invocation kind=act_aim"
-        );
-        let preflight = match self.ensure_supported_use_allows_action("act_aim") {
-            Ok(preflight) => preflight,
-            Err(error) => {
-                self.audit_action_denied("act_aim", &error);
-                return Err(error);
-            }
-        };
-        self.audit_action_started_with_details("act_aim", &action_preflight_details(&preflight))?;
-        let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
-        let result = act_aim_with_handle(handle, recording, params.0).await;
-        self.audit_action_result("act_aim", &result)?;
-        result.map(Json)
-    }
-
-    #[tool(
-        description = "Drag in a point-to-point line between screen coordinates or element centers; velocity_profile controls timing only, use act_stroke.path for arcs, Beziers, polylines, and other spatial paths"
-    )]
-    pub async fn act_drag(
-        &self,
-        params: Parameters<ActDragParams>,
-    ) -> Result<Json<ActDragResponse>, ErrorData> {
-        tracing::info!(
-            code = "MCP_TOOL_INVOCATION",
-            kind = "act_drag",
-            "tool.invocation kind=act_drag"
-        );
-        let preflight = match self.ensure_supported_use_allows_action("act_drag") {
-            Ok(preflight) => preflight,
-            Err(error) => {
-                self.audit_action_denied("act_drag", &error);
-                return Err(error);
-            }
-        };
-        self.audit_action_started_with_details("act_drag", &action_preflight_details(&preflight))?;
-        let (handle, recording, _connection_closed_cancel) = self.m2_action_context()?;
-        let result = act_drag_with_handle(handle, recording, params.0).await;
-        self.audit_action_result("act_drag", &result)?;
-        result.map(Json)
-    }
-
-    #[tool(
-        description = "Move or draw along an explicit spatial path using timed continuous mouse samples; motion_model defaults to path and can use wind_mouse for point-to-point humanized line strokes"
+        description = "Move, aim, or drag to a point/element target or along an explicit spatial path using timed continuous mouse samples; button unset moves/aims and button set drags; motion_model defaults to path and can use wind_mouse for point-to-point line strokes"
     )]
     pub async fn act_stroke(
         &self,

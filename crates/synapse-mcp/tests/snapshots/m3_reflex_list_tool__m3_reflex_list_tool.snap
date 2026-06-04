@@ -393,7 +393,6 @@ expression: shape
                 "type": "string"
               },
               "ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               }
@@ -429,7 +428,6 @@ expression: shape
                 "type": "string"
               },
               "ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               }
@@ -461,7 +459,6 @@ expression: shape
             "type": "boolean"
           },
           "fire_count": {
-            "format": "uint64",
             "minimum": 0,
             "type": "integer"
           },
@@ -488,7 +485,6 @@ expression: shape
             "$ref": "#/$defs/ReflexLifetime"
           },
           "priority": {
-            "format": "uint32",
             "minimum": 0,
             "type": "integer"
           },

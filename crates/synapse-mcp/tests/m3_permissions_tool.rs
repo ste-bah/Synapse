@@ -9,7 +9,10 @@ async fn m3_permissions_refuse_ungranted_tool_calls_and_replay_path_escape() -> 
     let logs = TempDir::new()?;
     let mut client = StdioMcpClient::launch_and_init_with_env(
         Some(logs.path()),
-        &[("SYNAPSE_MCP_ALLOWED_PERMISSIONS", "none")],
+        &[
+            ("SYNAPSE_DEBUG_TOOLS", "1"),
+            ("SYNAPSE_MCP_ALLOWED_PERMISSIONS", "none"),
+        ],
     )
     .await?;
 

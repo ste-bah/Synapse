@@ -1,10 +1,9 @@
 ---
 source: crates/synapse-mcp/tests/m3_tools_list.rs
-assertion_line: 92
 expression: snapshot
 ---
 {
-  "count": 46,
+  "count": 44,
   "m3_defaults": [
     {
       "actual": 33,
@@ -20,11 +19,6 @@ expression: snapshot
       "actual": 120,
       "path": "inputSchema.properties.hold_ms.default",
       "tool": "act_click"
-    },
-    {
-      "actual": "natural",
-      "path": "inputSchema.properties.velocity_profile.default",
-      "tool": "act_drag"
     },
     {
       "actual": "constant",
@@ -212,7 +206,22 @@ expression: snapshot
     },
     {
       "actual_contains": "path",
-      "path": "inputSchema.required",
+      "path": "inputSchema.properties",
+      "tool": "act_stroke"
+    },
+    {
+      "actual_contains": "target",
+      "path": "inputSchema.properties",
+      "tool": "act_stroke"
+    },
+    {
+      "actual_contains": "from",
+      "path": "inputSchema.properties",
+      "tool": "act_stroke"
+    },
+    {
+      "actual_contains": "to",
+      "path": "inputSchema.properties",
       "tool": "act_stroke"
     },
     {
@@ -357,10 +366,8 @@ expression: snapshot
     }
   ],
   "tools": [
-    "act_aim",
     "act_click",
     "act_clipboard",
-    "act_drag",
     "act_keymap",
     "act_pad",
     "act_press",

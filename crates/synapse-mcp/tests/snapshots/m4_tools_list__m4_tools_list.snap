@@ -1,10 +1,9 @@
 ---
 source: crates/synapse-mcp/tests/m4_tools_list.rs
-assertion_line: 123
 expression: snapshot
 ---
 {
-  "count": 77,
+  "count": 75,
   "m4_defaults": [
     {
       "actual": 33,
@@ -85,7 +84,22 @@ expression: snapshot
     },
     {
       "actual_contains": "path",
-      "path": "inputSchema.required",
+      "path": "inputSchema.properties",
+      "tool": "act_stroke"
+    },
+    {
+      "actual_contains": "target",
+      "path": "inputSchema.properties",
+      "tool": "act_stroke"
+    },
+    {
+      "actual_contains": "from",
+      "path": "inputSchema.properties",
+      "tool": "act_stroke"
+    },
+    {
+      "actual_contains": "to",
+      "path": "inputSchema.properties",
       "tool": "act_stroke"
     },
     {
@@ -145,11 +159,9 @@ expression: snapshot
     }
   ],
   "tools": [
-    "act_aim",
     "act_click",
     "act_clipboard",
     "act_combo",
-    "act_drag",
     "act_keymap",
     "act_launch",
     "act_pad",

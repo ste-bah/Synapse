@@ -14,7 +14,7 @@ use synapse_action::{
     RecordingBackend, StrokeError, StrokePlan, plan_timed_stroke, screen_point_from_path_point,
 };
 use synapse_core::{
-    Action, Backend, HumanizeParams, MouseButton, PathPoint, PathSpec, Point, Rect,
+    Action, Backend, ElementId, HumanizeParams, MouseButton, PathPoint, PathSpec, Point, Rect,
     StrokeMotionModel, StrokeTiming, VelocityProfile, error_codes,
 };
 
@@ -37,11 +37,25 @@ const STROKE_DETAIL_PATH_PARAMETER_INVALID: &str = "STROKE_PATH_PARAMETER_INVALI
 const STROKE_DETAIL_VELOCITY_INVALID: &str = "STROKE_VELOCITY_INVALID";
 const STROKE_DETAIL_HUMANIZE_INVALID: &str = "STROKE_HUMANIZE_INVALID";
 const STROKE_DETAIL_MOTION_MODEL_INVALID: &str = "STROKE_MOTION_MODEL_INVALID";
+const STROKE_DETAIL_TARGET_MISSING: &str = "STROKE_TARGET_MISSING";
+const STROKE_DETAIL_TARGET_CONFLICT: &str = "STROKE_TARGET_CONFLICT";
+const STROKE_DETAIL_TARGET_UNRESOLVED: &str = "STROKE_TARGET_UNRESOLVED";
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActStrokeParams {
-    pub path: PathSpec,
+    #[serde(default)]
+    #[schemars(default)]
+    pub path: Option<PathSpec>,
+    #[serde(default)]
+    #[schemars(default)]
+    pub target: Option<ActStrokeTarget>,
+    #[serde(default)]
+    #[schemars(default)]
+    pub from: Option<ActStrokeTarget>,
+    #[serde(default)]
+    #[schemars(default)]
+    pub to: Option<ActStrokeTarget>,
     #[serde(default)]
     #[schemars(default)]
     pub button: Option<MouseButton>,
@@ -61,6 +75,27 @@ pub struct ActStrokeParams {
     #[serde(default)]
     #[schemars(default)]
     pub modifiers: Vec<StrokeModifier>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(untagged)]
+#[schemars(untagged)]
+pub enum ActStrokeTarget {
+    Point(ActStrokePointTarget),
+    Element(ActStrokeElementTarget),
+}
+
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActStrokePointTarget {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActStrokeElementTarget {
+    pub element_id: ElementId,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -99,16 +134,52 @@ pub struct ActStrokeResponse {
     pub elapsed_ms: u32,
 }
 
+#[derive(Clone, Debug)]
+pub struct ActStrokePlan {
+    input_kind: ActStrokeInputKind,
+    path: Option<PathSpec>,
+    plan: Option<StrokePlan>,
+    cdp_aim: Option<CdpAimTarget>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ActStrokeInputKind {
+    Path,
+    TargetLine,
+    CdpElementAim,
+}
+
+#[derive(Clone, Debug)]
+struct CdpAimTarget {
+    element_id: ElementId,
+    backend_node_id: i64,
+}
+
 pub async fn act_stroke_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActStrokeParams,
-    plan: StrokePlan,
+    plan: ActStrokePlan,
 ) -> Result<ActStrokeResponse, ErrorData> {
     let started = Instant::now();
+    if let Some(cdp_aim) = &plan.cdp_aim {
+        return execute_cdp_aim(&params, cdp_aim, started).await;
+    }
+    let path = plan.path.clone().ok_or_else(|| {
+        params_invalid_detail(
+            STROKE_DETAIL_TARGET_UNRESOLVED,
+            "act_stroke internal error: validated stroke had no executable path",
+        )
+    })?;
+    let stroke_plan = plan.plan.clone().ok_or_else(|| {
+        params_invalid_detail(
+            STROKE_DETAIL_TARGET_UNRESOLVED,
+            "act_stroke internal error: validated stroke had no sample plan",
+        )
+    })?;
     let backend = params.backend.to_backend();
     let action = Action::MouseStroke {
-        path: params.path.clone(),
+        path: path.clone(),
         button: params.button,
         profile: params.velocity_profile,
         timing: params.duration_or_speed.clone(),
@@ -128,18 +199,24 @@ pub async fn act_stroke_with_handle(
         execute_with_modifiers(&handle, &modifier_keys, action, backend).await?;
     }
 
-    Ok(response(&params, &plan, started, backend))
+    Ok(response(&params, &path, &stroke_plan, started, backend))
 }
 
-pub fn validate_act_stroke_params(params: &ActStrokeParams) -> Result<StrokePlan, ErrorData> {
+pub fn validate_act_stroke_params(params: &ActStrokeParams) -> Result<ActStrokePlan, ErrorData> {
     validate_and_plan(params)
 }
 
-pub fn act_stroke_request_details(params: &ActStrokeParams, plan: &StrokePlan) -> Value {
+pub fn act_stroke_request_details(params: &ActStrokeParams, plan: &ActStrokePlan) -> Value {
+    let resolved_path = plan.path.as_ref();
+    let planned = plan.plan.as_ref();
     json!({
         "path_id": act_stroke_path_id(params, plan),
-        "path_kind": path_kind(&params.path),
-        "control_point_count": control_point_count(&params.path),
+        "input_kind": plan.input_kind.as_str(),
+        "path_kind": resolved_path.map_or("cdp_element", path_kind),
+        "control_point_count": resolved_path.map_or(1, control_point_count),
+        "target": &params.target,
+        "from": &params.from,
+        "to": &params.to,
         "button": params.button,
         "velocity_profile": params.velocity_profile,
         "duration_or_speed": &params.duration_or_speed,
@@ -150,11 +227,11 @@ pub fn act_stroke_request_details(params: &ActStrokeParams, plan: &StrokePlan) -
         "backend_resolved": backend_used_name(params.backend.to_backend()),
         "modifiers": &params.modifiers,
         "plan": {
-            "point_stream_count": plan.samples.len(),
-            "path_length_px": plan.path_length_px,
-            "duration_ms": plan.duration_ms,
-            "first_sample": plan.samples.first().map(stroke_sample_details),
-            "last_sample": plan.samples.last().map(stroke_sample_details),
+            "point_stream_count": planned.map_or(1, |plan| plan.samples.len()),
+            "path_length_px": planned.map_or(0.0, |plan| plan.path_length_px),
+            "duration_ms": planned.map_or(0.0, |plan| plan.duration_ms),
+            "first_sample": planned.and_then(|plan| plan.samples.first().map(stroke_sample_details)),
+            "last_sample": planned.and_then(|plan| plan.samples.last().map(stroke_sample_details)),
         },
         "fallback_path_executed": false,
     })
@@ -207,19 +284,41 @@ impl StrokeModifier {
     }
 }
 
-fn validate_and_plan(params: &ActStrokeParams) -> Result<StrokePlan, ErrorData> {
+impl ActStrokeInputKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Path => "path",
+            Self::TargetLine => "target_line",
+            Self::CdpElementAim => "cdp_element_aim",
+        }
+    }
+}
+
+fn validate_and_plan(params: &ActStrokeParams) -> Result<ActStrokePlan, ErrorData> {
     validate_and_plan_with_screen_bounds(params, current_virtual_screen_bounds()?)
 }
 
 fn validate_and_plan_with_screen_bounds(
     params: &ActStrokeParams,
     screen_bounds: Option<StrokeScreenBounds>,
-) -> Result<StrokePlan, ErrorData> {
-    validate_control_point_cap(&params.path)?;
-    validate_path_points(&params.path, screen_bounds)?;
-    validate_duration_cap(params)?;
+) -> Result<ActStrokePlan, ErrorData> {
+    let resolved = resolve_stroke_execution(params)?;
+    let (path, input_kind) = match resolved {
+        ResolvedStrokeExecution::Path { path, input_kind } => (path, input_kind),
+        ResolvedStrokeExecution::CdpAim(cdp_aim) => {
+            return Ok(ActStrokePlan {
+                input_kind: ActStrokeInputKind::CdpElementAim,
+                path: None,
+                plan: None,
+                cdp_aim: Some(cdp_aim),
+            });
+        }
+    };
+    validate_control_point_cap(&path)?;
+    validate_path_points(&path, screen_bounds)?;
+    validate_duration_cap(&path, &params.duration_or_speed)?;
     let plan = plan_timed_stroke(
-        &params.path,
+        &path,
         params.velocity_profile,
         &params.duration_or_speed,
         params.motion_model,
@@ -236,7 +335,142 @@ fn validate_and_plan_with_screen_bounds(
         ));
     }
     validate_plan_points(&plan, screen_bounds)?;
-    Ok(plan)
+    Ok(ActStrokePlan {
+        input_kind,
+        path: Some(path),
+        plan: Some(plan),
+        cdp_aim: None,
+    })
+}
+
+enum ResolvedStrokeExecution {
+    Path {
+        path: PathSpec,
+        input_kind: ActStrokeInputKind,
+    },
+    CdpAim(CdpAimTarget),
+}
+
+fn resolve_stroke_execution(
+    params: &ActStrokeParams,
+) -> Result<ResolvedStrokeExecution, ErrorData> {
+    if let Some(path) = &params.path {
+        if params.from.is_some() || params.to.is_some() || params.target.is_some() {
+            return Err(params_invalid_detail(
+                STROKE_DETAIL_TARGET_CONFLICT,
+                "act_stroke path requests must not also set from, to, or target",
+            ));
+        }
+        return Ok(ResolvedStrokeExecution::Path {
+            path: path.clone(),
+            input_kind: ActStrokeInputKind::Path,
+        });
+    }
+
+    let to = match (&params.to, &params.target) {
+        (Some(_), Some(_)) => {
+            return Err(params_invalid_detail(
+                STROKE_DETAIL_TARGET_CONFLICT,
+                "act_stroke accepts either to or target, not both",
+            ));
+        }
+        (Some(to), None) | (None, Some(to)) => to,
+        (None, None) => {
+            return Err(params_invalid_detail(
+                STROKE_DETAIL_TARGET_MISSING,
+                "act_stroke requires path, to, or target",
+            ));
+        }
+    };
+
+    if params.button.is_none()
+        && params.from.is_none()
+        && let ActStrokeTarget::Element(element) = to
+        && let Some(backend_node_id) =
+            synapse_a11y::cdp_backend_from_element_id(&element.element_id)
+    {
+        return Ok(ResolvedStrokeExecution::CdpAim(CdpAimTarget {
+            element_id: element.element_id.clone(),
+            backend_node_id,
+        }));
+    }
+
+    let from = match &params.from {
+        Some(from) => target_to_path_point(from, "from")?,
+        None => current_cursor_path_point()?,
+    };
+    let to = target_to_path_point(to, "to")?;
+    Ok(ResolvedStrokeExecution::Path {
+        path: PathSpec::Line { from, to },
+        input_kind: ActStrokeInputKind::TargetLine,
+    })
+}
+
+fn target_to_path_point(
+    target: &ActStrokeTarget,
+    role: &'static str,
+) -> Result<PathPoint, ErrorData> {
+    match target {
+        ActStrokeTarget::Point(point) => Ok(PathPoint::new(point.x, point.y)),
+        ActStrokeTarget::Element(element) => {
+            if synapse_a11y::cdp_backend_from_element_id(&element.element_id).is_some() {
+                return Err(params_invalid_detail(
+                    STROKE_DETAIL_TARGET_UNRESOLVED,
+                    format!(
+                        "act_stroke {role} CDP element {} can only be used as a pointer aim target with no button and no from point",
+                        element.element_id
+                    ),
+                ));
+            }
+            let center = element_center(&element.element_id, role)?;
+            Ok(PathPoint::new(f64::from(center.x), f64::from(center.y)))
+        }
+    }
+}
+
+fn current_cursor_path_point() -> Result<PathPoint, ErrorData> {
+    let point = synapse_action::backend::software::cursor_position()
+        .map_err(|error| action_error_to_mcp(&error))?;
+    Ok(PathPoint::new(f64::from(point.x), f64::from(point.y)))
+}
+
+#[cfg(windows)]
+fn element_center(element_id: &ElementId, role: &'static str) -> Result<Point, ErrorData> {
+    let rect = synapse_a11y::element_bounding_rect(element_id).map_err(|err| {
+        action_error_to_mcp(&ActionError::ElementNotResolved {
+            detail: format!("act_stroke {role} element {element_id} could not be resolved: {err}"),
+        })
+    })?;
+    center_from_rect(rect).map_err(|error| action_error_to_mcp(&error))
+}
+
+#[cfg(not(windows))]
+fn element_center(element_id: &ElementId, role: &'static str) -> Result<Point, ErrorData> {
+    Err(action_error_to_mcp(&ActionError::BackendUnavailable {
+        detail: format!(
+            "act_stroke {role} element target {element_id} requires Windows UI Automation bbox resolution"
+        ),
+    }))
+}
+
+fn center_from_rect(rect: Rect) -> Result<Point, ActionError> {
+    if rect.w <= 0 || rect.h <= 0 {
+        return Err(ActionError::TargetInvalid {
+            detail: format!("act_stroke element bbox is empty or inverted: {rect:?}"),
+        });
+    }
+
+    let x = i64::from(rect.x) + i64::from(rect.w) / 2;
+    let y = i64::from(rect.y) + i64::from(rect.h) / 2;
+
+    Ok(Point {
+        x: i32::try_from(x).map_err(|err| ActionError::TargetInvalid {
+            detail: format!("act_stroke element bbox center x overflowed i32: {err}"),
+        })?,
+        y: i32::try_from(y).map_err(|err| ActionError::TargetInvalid {
+            detail: format!("act_stroke element bbox center y overflowed i32: {err}"),
+        })?,
+    })
 }
 
 fn validate_control_point_cap(path: &PathSpec) -> Result<(), ErrorData> {
@@ -252,11 +486,11 @@ fn validate_control_point_cap(path: &PathSpec) -> Result<(), ErrorData> {
     Ok(())
 }
 
-fn validate_duration_cap(params: &ActStrokeParams) -> Result<(), ErrorData> {
-    let path_length_px = ArcLengthPath::new(&params.path)
+fn validate_duration_cap(path: &PathSpec, timing: &StrokeTiming) -> Result<(), ErrorData> {
+    let path_length_px = ArcLengthPath::new(path)
         .map_err(|error| path_error_to_mcp(&error))?
         .length();
-    let duration_ms = match &params.duration_or_speed {
+    let duration_ms = match timing {
         StrokeTiming::DurationMs { duration_ms } => f64::from(*duration_ms),
         StrokeTiming::SpeedPxPerSec { px_per_sec } => {
             if !px_per_sec.is_finite() || *px_per_sec <= 0.0 {
@@ -472,6 +706,57 @@ async fn execute_with_modifiers(
     Ok(())
 }
 
+async fn execute_cdp_aim(
+    params: &ActStrokeParams,
+    cdp_aim: &CdpAimTarget,
+    started: Instant,
+) -> Result<ActStrokeResponse, ErrorData> {
+    #[cfg(windows)]
+    {
+        let hwnd = cdp_aim
+            .element_id
+            .parts()
+            .map_err(|err| {
+                mcp_error(
+                    error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+                    format!("web element id is malformed: {err}"),
+                )
+            })?
+            .hwnd;
+        let endpoint = synapse_a11y::endpoint_for_window(hwnd).ok_or_else(|| {
+            mcp_error(
+                error_codes::A11Y_CDP_UNREACHABLE,
+                format!(
+                    "no reachable CDP endpoint for web element {} (browser closed or debug port gone)",
+                    cdp_aim.element_id
+                ),
+            )
+        })?;
+        let title_hint = synapse_a11y::foreground_context(hwnd)
+            .map(|context| context.window_title)
+            .unwrap_or_default();
+        let landed = synapse_a11y::cdp_aim_node(&endpoint, &title_hint, cdp_aim.backend_node_id)
+            .await
+            .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+        tracing::info!(
+            code = "M2_ACT_STROKE_CDP_AIM_MOVED",
+            element_id = %cdp_aim.element_id,
+            x = landed.x,
+            y = landed.y,
+            "readback=act_stroke element method=cdp_mouse_moved"
+        );
+        return Ok(cdp_aim_response(params, started));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = (params, cdp_aim, started);
+        Err(action_error_to_mcp(&ActionError::BackendUnavailable {
+            detail: "act_stroke CDP element aim requires Windows CDP action support".to_owned(),
+        }))
+    }
+}
+
 async fn release_pressed_modifiers(
     handle: &ActionHandle,
     pressed: &[synapse_core::Key],
@@ -545,24 +830,44 @@ fn execute_recording(
 
 fn response(
     params: &ActStrokeParams,
-    plan: &StrokePlan,
+    path: &PathSpec,
+    stroke_plan: &StrokePlan,
     started: Instant,
     backend: Backend,
 ) -> ActStrokeResponse {
     ActStrokeResponse {
         ok: true,
-        path_kind: path_kind(&params.path).to_owned(),
-        control_point_count: u32::try_from(control_point_count(&params.path)).unwrap_or(u32::MAX),
+        path_kind: path_kind(path).to_owned(),
+        control_point_count: u32::try_from(control_point_count(path)).unwrap_or(u32::MAX),
         button_used: params.button,
         velocity_profile_used: params.velocity_profile,
         duration_or_speed_used: params.duration_or_speed.clone(),
         motion_model_used: params.motion_model,
         humanized: params.humanize.is_some(),
-        point_stream_count: u32::try_from(plan.samples.len()).unwrap_or(u32::MAX),
-        path_length_px: plan.path_length_px,
-        duration_ms: plan.duration_ms,
+        point_stream_count: u32::try_from(stroke_plan.samples.len()).unwrap_or(u32::MAX),
+        path_length_px: stroke_plan.path_length_px,
+        duration_ms: stroke_plan.duration_ms,
         modifiers_used: params.modifiers.clone(),
         backend_used: backend_used_name(backend).to_owned(),
+        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+    }
+}
+
+fn cdp_aim_response(params: &ActStrokeParams, started: Instant) -> ActStrokeResponse {
+    ActStrokeResponse {
+        ok: true,
+        path_kind: "cdp_element".to_owned(),
+        control_point_count: 1,
+        button_used: None,
+        velocity_profile_used: params.velocity_profile,
+        duration_or_speed_used: params.duration_or_speed.clone(),
+        motion_model_used: params.motion_model,
+        humanized: params.humanize.is_some(),
+        point_stream_count: 1,
+        path_length_px: 0.0,
+        duration_ms: 0.0,
+        modifiers_used: params.modifiers.clone(),
+        backend_used: "cdp".to_owned(),
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     }
 }
@@ -752,22 +1057,32 @@ const fn backend_used_name(backend: Backend) -> &'static str {
     }
 }
 
-fn act_stroke_path_id(params: &ActStrokeParams, plan: &StrokePlan) -> String {
+fn act_stroke_path_id(params: &ActStrokeParams, plan: &ActStrokePlan) -> String {
     let payload = serde_json::to_vec(&json!({
-        "path": &params.path,
+        "input_kind": plan.input_kind.as_str(),
+        "path": &plan.path,
+        "target": &params.target,
+        "from": &params.from,
+        "to": &params.to,
         "velocity_profile": params.velocity_profile,
         "duration_or_speed": &params.duration_or_speed,
         "humanize": params.humanize,
         "plan": {
-            "point_stream_count": plan.samples.len(),
-            "duration_ms": plan.duration_ms,
-            "path_length_px": plan.path_length_px,
+            "point_stream_count": plan.plan.as_ref().map_or(1, |plan| plan.samples.len()),
+            "duration_ms": plan.plan.as_ref().map_or(0.0, |plan| plan.duration_ms),
+            "path_length_px": plan.plan.as_ref().map_or(0.0, |plan| plan.path_length_px),
         },
     }))
     .unwrap_or_else(|_error| {
         format!(
-            "{:?}:{:?}:{:?}:{:?}",
-            params.path, params.velocity_profile, params.duration_or_speed, params.humanize
+            "{:?}:{:?}:{:?}:{:?}:{:?}:{:?}:{:?}",
+            plan.input_kind,
+            plan.path,
+            params.target,
+            params.from,
+            params.to,
+            params.velocity_profile,
+            params.duration_or_speed
         )
         .into_bytes()
     });
@@ -844,10 +1159,30 @@ mod tests {
             Ok(plan) => plan,
             Err(error) => panic!("valid stroke rejected: {error:?}"),
         };
+        let stroke_plan = stroke_plan(&plan);
 
-        assert_eq!(plan.samples.len(), 5);
-        assert_eq!(plan.path_length_px, 4.0);
-        assert_eq!(plan.duration_ms, 4.0);
+        assert_eq!(stroke_plan.samples.len(), 5);
+        assert_eq!(stroke_plan.path_length_px, 4.0);
+        assert_eq!(stroke_plan.duration_ms, 4.0);
+    }
+
+    #[test]
+    fn stroke_validation_accepts_target_line_shape() {
+        let params = target_line_params(
+            ActStrokeTarget::Point(ActStrokePointTarget { x: 1.0, y: 1.0 }),
+            ActStrokeTarget::Point(ActStrokePointTarget { x: 5.0, y: 1.0 }),
+        );
+
+        let plan = match validate_and_plan_with_screen_bounds(&params, test_bounds()) {
+            Ok(plan) => plan,
+            Err(error) => panic!("valid target line rejected: {error:?}"),
+        };
+
+        assert_eq!(plan.input_kind, ActStrokeInputKind::TargetLine);
+        assert_eq!(plan.path.as_ref().map(path_kind), Some("line"));
+        let stroke_plan = stroke_plan(&plan);
+        assert_eq!(stroke_plan.samples.len(), 5);
+        assert_eq!(stroke_plan.path_length_px, 4.0);
     }
 
     #[test]
@@ -1023,7 +1358,10 @@ mod tests {
 
     fn params_for_path_with_timing(path: PathSpec, timing: StrokeTiming) -> ActStrokeParams {
         ActStrokeParams {
-            path,
+            path: Some(path),
+            target: None,
+            from: None,
+            to: None,
             button: None,
             velocity_profile: VelocityProfile::Constant,
             duration_or_speed: timing,
@@ -1031,6 +1369,29 @@ mod tests {
             humanize: None,
             backend: StrokeBackend::Software,
             modifiers: Vec::new(),
+        }
+    }
+
+    fn target_line_params(from: ActStrokeTarget, to: ActStrokeTarget) -> ActStrokeParams {
+        ActStrokeParams {
+            path: None,
+            target: None,
+            from: Some(from),
+            to: Some(to),
+            button: None,
+            velocity_profile: VelocityProfile::Constant,
+            duration_or_speed: StrokeTiming::DurationMs { duration_ms: 4 },
+            motion_model: StrokeMotionModel::Path,
+            humanize: None,
+            backend: StrokeBackend::Software,
+            modifiers: Vec::new(),
+        }
+    }
+
+    fn stroke_plan(plan: &ActStrokePlan) -> &StrokePlan {
+        match plan.plan.as_ref() {
+            Some(plan) => plan,
+            None => panic!("expected stroke sample plan"),
         }
     }
 

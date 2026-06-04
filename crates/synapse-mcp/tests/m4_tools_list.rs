@@ -4,12 +4,10 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 77] = [
-    "act_aim",
+const EXPECTED_TOOLS: [&str; 75] = [
     "act_click",
     "act_clipboard",
     "act_combo",
-    "act_drag",
     "act_keymap",
     "act_launch",
     "act_pad",
@@ -109,7 +107,7 @@ async fn m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<
         .map(str::to_owned)
         .collect::<Vec<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 77);
+    assert_eq!(names.len(), 75);
     assert_no_duplicate_names(&names)?;
 
     assert_schema_roots_closed(tools)?;
@@ -271,7 +269,10 @@ fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
     )?;
     read_required(&mut readbacks, tools, "act_combo", "steps")?;
     read_required(&mut readbacks, tools, "act_keymap", "alias")?;
-    read_required(&mut readbacks, tools, "act_stroke", "path")?;
+    read_property(&mut readbacks, tools, "act_stroke", "path")?;
+    read_property(&mut readbacks, tools, "act_stroke", "target")?;
+    read_property(&mut readbacks, tools, "act_stroke", "from")?;
+    read_property(&mut readbacks, tools, "act_stroke", "to")?;
     read_required(&mut readbacks, tools, "act_stroke", "duration_or_speed")?;
     read_required(&mut readbacks, tools, "act_run_shell", "command")?;
     read_required(&mut readbacks, tools, "act_launch", "target")?;
@@ -367,6 +368,24 @@ fn read_required(
     readbacks.push(json!({
         "tool": tool_name,
         "path": "inputSchema.required",
+        "actual_contains": field,
+    }));
+    Ok(())
+}
+
+fn read_property(
+    readbacks: &mut Vec<Value>,
+    tools: &[Value],
+    tool_name: &str,
+    field: &str,
+) -> anyhow::Result<()> {
+    value_at(
+        tool_by_name(tools, tool_name)?,
+        &format!("inputSchema.properties.{field}"),
+    )?;
+    readbacks.push(json!({
+        "tool": tool_name,
+        "path": "inputSchema.properties",
         "actual_contains": field,
     }));
     Ok(())

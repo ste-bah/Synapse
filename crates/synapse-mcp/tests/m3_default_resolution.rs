@@ -170,12 +170,6 @@ fn assert_no_instant_or_burst_motion_defaults(tools: &[Value]) -> anyhow::Result
             && row["actual"] == "natural"),
         "act_click curve default must be natural"
     );
-    ensure!(
-        observed.iter().any(|row| row["tool"] == "act_drag"
-            && row["path"] == "act_drag.inputSchema.properties.velocity_profile.default"
-            && row["actual"] == "natural"),
-        "act_drag velocity_profile default must be natural"
-    );
     Ok(observed)
 }
 

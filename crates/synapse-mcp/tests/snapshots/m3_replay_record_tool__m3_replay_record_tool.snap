@@ -1,5 +1,6 @@
 ---
 source: crates/synapse-mcp/tests/m3_replay_record_tool.rs
+assertion_line: 139
 expression: shape
 ---
 {
@@ -8,7 +9,6 @@ expression: shape
     "additionalProperties": false,
     "properties": {
       "duration_ms": {
-        "format": "uint32",
         "minimum": 0,
         "type": "integer"
       },
@@ -48,12 +48,10 @@ expression: shape
     "additionalProperties": false,
     "properties": {
       "bytes": {
-        "format": "uint64",
         "minimum": 0,
         "type": "integer"
       },
       "observations_skipped": {
-        "format": "uint64",
         "minimum": 0,
         "type": "integer"
       },
@@ -61,7 +59,6 @@ expression: shape
         "type": "string"
       },
       "records_written": {
-        "format": "uint64",
         "minimum": 0,
         "type": "integer"
       }

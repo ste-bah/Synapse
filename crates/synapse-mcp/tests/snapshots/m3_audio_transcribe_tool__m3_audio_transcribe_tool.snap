@@ -1,6 +1,5 @@
 ---
 source: crates/synapse-mcp/tests/m3_audio_transcribe_tool.rs
-assertion_line: 97
 expression: shape
 ---
 {
@@ -28,11 +27,9 @@ expression: shape
     "additionalProperties": false,
     "properties": {
       "confidence": {
-        "format": "float",
         "type": "number"
       },
       "latency_ms": {
-        "format": "uint64",
         "minimum": 0,
         "type": "integer"
       },

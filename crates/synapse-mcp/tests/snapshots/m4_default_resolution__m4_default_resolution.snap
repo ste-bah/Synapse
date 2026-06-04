@@ -30,8 +30,18 @@ expression: snapshot
       "tool": "act_launch"
     },
     {
+      "actual": null,
+      "path": "inputSchema.properties.cdp_debug.default",
+      "tool": "act_launch"
+    },
+    {
       "actual": {},
       "path": "inputSchema.properties.env.default",
+      "tool": "act_launch"
+    },
+    {
+      "actual": null,
+      "path": "inputSchema.properties.force_renderer_accessibility.default",
       "tool": "act_launch"
     },
     {
@@ -100,7 +110,9 @@ expression: snapshot
   "observed_default_paths": [
     "act_combo.inputSchema.properties.backend.default",
     "act_launch.inputSchema.properties.args.default",
+    "act_launch.inputSchema.properties.cdp_debug.default",
     "act_launch.inputSchema.properties.env.default",
+    "act_launch.inputSchema.properties.force_renderer_accessibility.default",
     "act_launch.inputSchema.properties.timeout_ms.default",
     "act_run_shell.inputSchema.properties.args.default",
     "act_run_shell.inputSchema.properties.env.default",
