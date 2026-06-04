@@ -2,8 +2,8 @@ use synapse_action::{
     ActionBackend, EmitState, RecordedInput, RecordingBackend, StrokeError, plan_timed_stroke,
 };
 use synapse_core::{
-    Action, Backend, HumanizeParams, MouseButton, PathPoint, PathSpec, StrokeTiming,
-    VelocityProfile, error_codes,
+    Action, Backend, HumanizeParams, MouseButton, PathPoint, PathSpec, StrokeMotionModel,
+    StrokeTiming, VelocityProfile, error_codes,
 };
 
 #[test]
@@ -13,6 +13,7 @@ fn stroke_planner_duration_and_speed_keep_tick_count_and_monotonic_time() {
         &path,
         VelocityProfile::Constant,
         &StrokeTiming::DurationMs { duration_ms: 4 },
+        StrokeMotionModel::Path,
         None,
     )
     .expect("duration stroke should plan");
@@ -20,6 +21,7 @@ fn stroke_planner_duration_and_speed_keep_tick_count_and_monotonic_time() {
         &path,
         VelocityProfile::Constant,
         &StrokeTiming::SpeedPxPerSec { px_per_sec: 1000.0 },
+        StrokeMotionModel::Path,
         None,
     )
     .expect("speed stroke should plan");
@@ -43,6 +45,7 @@ fn stroke_planner_rejects_invalid_speed_and_humanize() {
         &path,
         VelocityProfile::Linear,
         &StrokeTiming::SpeedPxPerSec { px_per_sec: 0.0 },
+        StrokeMotionModel::Path,
         None,
     )
     .expect_err("zero speed must fail closed");
@@ -50,6 +53,7 @@ fn stroke_planner_rejects_invalid_speed_and_humanize() {
         &path,
         VelocityProfile::Linear,
         &StrokeTiming::DurationMs { duration_ms: 4 },
+        StrokeMotionModel::Path,
         Some(HumanizeParams {
             tremor_base_stddev_px: 0.0,
             tremor_velocity_scale: 0.0,
@@ -70,6 +74,128 @@ fn stroke_planner_rejects_invalid_speed_and_humanize() {
 }
 
 #[test]
+fn wind_mouse_motion_model_is_seeded_curved_variable_and_converges() {
+    let path = line_path(0.0, 0.0, 120.0, 0.0);
+    let model = StrokeMotionModel::WindMouse {
+        gravity: 9.0,
+        wind: 3.0,
+        max_step: 10.0,
+        damped_distance: 12.0,
+        seed: Some(42),
+    };
+    let first = plan_timed_stroke(
+        &path,
+        VelocityProfile::Constant,
+        &StrokeTiming::DurationMs { duration_ms: 120 },
+        model,
+        None,
+    )
+    .expect("seeded wind_mouse stroke should plan");
+    let second = plan_timed_stroke(
+        &path,
+        VelocityProfile::Constant,
+        &StrokeTiming::DurationMs { duration_ms: 120 },
+        model,
+        None,
+    )
+    .expect("same seeded wind_mouse stroke should plan");
+    let different_seed = plan_timed_stroke(
+        &path,
+        VelocityProfile::Constant,
+        &StrokeTiming::DurationMs { duration_ms: 120 },
+        StrokeMotionModel::WindMouse {
+            gravity: 9.0,
+            wind: 3.0,
+            max_step: 10.0,
+            damped_distance: 12.0,
+            seed: Some(43),
+        },
+        None,
+    )
+    .expect("different seeded wind_mouse stroke should plan");
+
+    let step_lengths = segment_lengths(&first.samples);
+    let min_step = step_lengths.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_step = step_lengths.iter().copied().fold(0.0_f64, f64::max);
+    let max_abs_y = first
+        .samples
+        .iter()
+        .map(|sample| sample.point.y.abs())
+        .fold(0.0_f64, f64::max);
+    println!(
+        "readback=mouse_stroke_plan edge=wind_mouse before=line:(0,0)->(120,0),seed:42 after_points={} after_min_step={min_step:.3} after_max_step={max_step:.3} after_max_abs_y={max_abs_y:.3} result_value=final:{:?}",
+        first.samples.len(),
+        first.samples.last().map(|sample| sample.point)
+    );
+
+    assert_eq!(first.samples, second.samples);
+    assert_ne!(first.samples, different_seed.samples);
+    assert_eq!(
+        first.samples.last().map(|sample| sample.point),
+        Some(PathPoint::new(120.0, 0.0))
+    );
+    assert!(max_abs_y > 1.0, "wind_mouse path should not stay straight");
+    assert!(
+        max_step - min_step > 1.0,
+        "wind_mouse consecutive step lengths should vary: {step_lengths:?}"
+    );
+    assert!(monotonic_elapsed(&first.samples));
+}
+
+#[test]
+fn wind_mouse_motion_model_rejects_invalid_edges() {
+    let line = line_path(0.0, 0.0, 120.0, 0.0);
+    let bad_param = plan_timed_stroke(
+        &line,
+        VelocityProfile::Constant,
+        &StrokeTiming::DurationMs { duration_ms: 120 },
+        StrokeMotionModel::WindMouse {
+            gravity: 9.0,
+            wind: 3.0,
+            max_step: 0.0,
+            damped_distance: 12.0,
+            seed: Some(42),
+        },
+        None,
+    )
+    .expect_err("wind_mouse max_step=0 should fail closed");
+    let bad_path = plan_timed_stroke(
+        &PathSpec::Circle {
+            center: PathPoint::new(0.0, 0.0),
+            radius: 10.0,
+        },
+        VelocityProfile::Constant,
+        &StrokeTiming::DurationMs { duration_ms: 120 },
+        StrokeMotionModel::WindMouse {
+            gravity: 9.0,
+            wind: 3.0,
+            max_step: 10.0,
+            damped_distance: 12.0,
+            seed: Some(42),
+        },
+        None,
+    )
+    .expect_err("wind_mouse on non-line path should fail closed");
+    println!(
+        "readback=mouse_stroke_plan edge=wind_mouse_invalid after_bad_param={bad_param:?} after_bad_path={bad_path:?}"
+    );
+
+    assert!(matches!(
+        bad_param,
+        StrokeError::InvalidWindMouseParameter {
+            field: "max_step",
+            ..
+        }
+    ));
+    assert!(matches!(
+        bad_path,
+        StrokeError::WindMouseRequiresLine {
+            path_kind: "circle"
+        }
+    ));
+}
+
+#[test]
 fn recording_backend_expands_stroke_to_single_down_stream_up() {
     let backend = RecordingBackend::new();
     let mut emit_state = EmitState::new();
@@ -78,6 +204,7 @@ fn recording_backend_expands_stroke_to_single_down_stream_up() {
         button: Some(MouseButton::Left),
         profile: VelocityProfile::Constant,
         timing: StrokeTiming::DurationMs { duration_ms: 4 },
+        motion_model: StrokeMotionModel::Path,
         humanize: None,
         backend: Backend::Software,
     };
@@ -128,6 +255,7 @@ fn recording_backend_hover_stroke_has_no_button_events() {
         button: None,
         profile: VelocityProfile::Constant,
         timing: StrokeTiming::DurationMs { duration_ms: 2 },
+        motion_model: StrokeMotionModel::Path,
         humanize: None,
         backend: Backend::Software,
     };
@@ -156,6 +284,7 @@ fn recording_backend_invalid_stroke_does_not_mutate_events() {
         button: Some(MouseButton::Left),
         profile: VelocityProfile::Constant,
         timing: StrokeTiming::DurationMs { duration_ms: 4 },
+        motion_model: StrokeMotionModel::Path,
         humanize: None,
         backend: Backend::Software,
     };
@@ -189,4 +318,11 @@ fn monotonic_elapsed(samples: &[synapse_action::TimedPathPoint]) -> bool {
     samples
         .windows(2)
         .all(|pair| pair[0].elapsed_ms <= pair[1].elapsed_ms)
+}
+
+fn segment_lengths(samples: &[synapse_action::TimedPathPoint]) -> Vec<f64> {
+    samples
+        .windows(2)
+        .map(|pair| pair[0].point.distance_to(pair[1].point))
+        .collect()
 }

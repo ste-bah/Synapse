@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use synapse_action::{ActionHandle, StrokePlan, plan_timed_stroke, screen_point_from_path_point};
 use synapse_core::{
     Action, AimCurve, Backend, ButtonAction, Event, EventSource, HumanizeParams, MouseButton,
-    MouseTarget, PathSpec, ReflexId, StrokeTiming, VelocityProfile,
+    MouseTarget, PathSpec, ReflexId, StrokeMotionModel, StrokeTiming, VelocityProfile,
 };
 
 use crate::{EventBus, ReflexError, ReflexResult};
@@ -162,6 +162,7 @@ impl PathFollowController {
             &params.path,
             params.profile,
             &params.timing,
+            StrokeMotionModel::Path,
             params.humanize,
         )
         .map_err(|error| ReflexError::ParamsInvalid {

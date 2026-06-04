@@ -1,5 +1,6 @@
 ---
 source: crates/synapse-mcp/tests/m3_tools_list.rs
+assertion_line: 92
 expression: snapshot
 ---
 {
@@ -28,6 +29,13 @@ expression: snapshot
     {
       "actual": "constant",
       "path": "inputSchema.properties.velocity_profile.default",
+      "tool": "act_stroke"
+    },
+    {
+      "actual": {
+        "kind": "path"
+      },
+      "path": "inputSchema.properties.motion_model.default",
       "tool": "act_stroke"
     },
     {

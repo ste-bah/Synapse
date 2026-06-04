@@ -4,7 +4,7 @@ use synapse_core::{
     Action, AimCurve, AimNaturalParams, AimStyle, AimTarget, Backend, ButtonAction, ComboInput,
     ComboStep, ElementId, GamepadReport, HumanizeParams, Key, KeyCode, KeystrokeDynamics,
     KeystrokeNaturalParams, MouseButton, MouseTarget, PadButton, PathPoint, PathSpec, Point, Stick,
-    StrokeTiming, Trigger, VelocityProfile,
+    StrokeMotionModel, StrokeTiming, Trigger, VelocityProfile,
 };
 
 #[test]
@@ -141,6 +141,7 @@ fn mouse_actions() -> BTreeMap<&'static str, Action> {
                 button: Some(MouseButton::Left),
                 profile: VelocityProfile::MinimumJerk,
                 timing: StrokeTiming::DurationMs { duration_ms: 750 },
+                motion_model: StrokeMotionModel::Path,
                 humanize: Some(HumanizeParams {
                     tremor_base_stddev_px: 0.2,
                     tremor_velocity_scale: 0.5,

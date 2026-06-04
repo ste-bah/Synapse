@@ -5,7 +5,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use synapse_core::{
     AimCurve, AimStyle, AimTarget, ButtonAction, HumanizeParams, MouseButton, MouseTarget,
-    PathSpec, Point, StrokeTiming, VelocityProfile,
+    PathSpec, Point, StrokeMotionModel, StrokeTiming, VelocityProfile,
 };
 use windows::Win32::{
     Foundation::{E_ACCESSDENIED, POINT as WinPoint},
@@ -145,12 +145,14 @@ pub(super) fn mouse_stroke(
     button: Option<MouseButton>,
     profile: VelocityProfile,
     timing: &StrokeTiming,
+    motion_model: StrokeMotionModel,
     humanize: Option<HumanizeParams>,
     state: &mut EmitState,
 ) -> Result<(), ActionError> {
-    let plan =
-        plan_timed_stroke(path, profile, timing, humanize).map_err(|error| stroke_error(&error))?;
-    let context = StrokeEmitLogContext::new(path, button, profile, timing, humanize, &plan);
+    let plan = plan_timed_stroke(path, profile, timing, motion_model, humanize)
+        .map_err(|error| stroke_error(&error))?;
+    let context =
+        StrokeEmitLogContext::new(path, button, profile, timing, motion_model, humanize, &plan);
     let first = match plan.samples.first() {
         Some(first) => first,
         None => {
@@ -590,11 +592,12 @@ impl StrokeEmitLogContext {
         button: Option<MouseButton>,
         profile: VelocityProfile,
         timing: &StrokeTiming,
+        motion_model: StrokeMotionModel,
         humanize: Option<HumanizeParams>,
         plan: &crate::StrokePlan,
     ) -> Self {
         Self {
-            path_id: stroke_path_id(path, profile, timing, humanize, plan),
+            path_id: stroke_path_id(path, profile, timing, motion_model, humanize, plan),
             path_kind: path_kind(path),
             backend: "software",
             button,
@@ -609,6 +612,7 @@ fn stroke_path_id(
     path: &PathSpec,
     profile: VelocityProfile,
     timing: &StrokeTiming,
+    motion_model: StrokeMotionModel,
     humanize: Option<HumanizeParams>,
     plan: &crate::StrokePlan,
 ) -> String {
@@ -616,6 +620,7 @@ fn stroke_path_id(
         "path": path,
         "velocity_profile": profile,
         "duration_or_speed": timing,
+        "motion_model": motion_model,
         "humanize": humanize,
         "plan": {
             "point_stream_count": plan.samples.len(),
@@ -623,7 +628,9 @@ fn stroke_path_id(
             "path_length_px": plan.path_length_px,
         },
     }))
-    .unwrap_or_else(|_error| format!("{path:?}:{profile:?}:{timing:?}:{humanize:?}").into_bytes());
+    .unwrap_or_else(|_error| {
+        format!("{path:?}:{profile:?}:{timing:?}:{motion_model:?}:{humanize:?}").into_bytes()
+    });
     format!("stroke:{}", sha256_hex(payload))
 }
 

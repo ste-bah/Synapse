@@ -59,6 +59,8 @@ pub enum Action {
         button: Option<MouseButton>,
         profile: VelocityProfile,
         timing: StrokeTiming,
+        #[serde(default = "default_stroke_motion_model")]
+        motion_model: StrokeMotionModel,
         humanize: Option<HumanizeParams>,
         backend: Backend,
     },
@@ -126,6 +128,24 @@ pub enum VelocityProfile {
 pub enum StrokeTiming {
     DurationMs { duration_ms: u32 },
     SpeedPxPerSec { px_per_sec: f64 },
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StrokeMotionModel {
+    Path,
+    WindMouse {
+        gravity: f64,
+        wind: f64,
+        max_step: f64,
+        damped_distance: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seed: Option<u64>,
+    },
+}
+
+const fn default_stroke_motion_model() -> StrokeMotionModel {
+    StrokeMotionModel::Path
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]

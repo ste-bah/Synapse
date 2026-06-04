@@ -9,8 +9,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use synapse_core::{
     Action, AimTarget, Backend, HumanizeParams, Key, KeyCode, MouseButton, PathSpec, ReflexAimAxis,
-    ReflexButtonTarget, ReflexLifetime, ReflexStatus, StrokeTiming, VelocityProfile, error_codes,
-    new_reflex_id,
+    ReflexButtonTarget, ReflexLifetime, ReflexStatus, StrokeMotionModel, StrokeTiming,
+    VelocityProfile, error_codes, new_reflex_id,
 };
 use synapse_reflex::{
     AimTrackParams, AimTrackTarget, ComboParams, HoldButtonParams, HoldMoveParams,
@@ -278,6 +278,7 @@ fn actions_for_permissions(params: &ReflexRegisterParams) -> Result<Vec<Action>,
                 button: path_follow.button,
                 profile: path_follow.profile,
                 timing: path_follow.timing,
+                motion_model: StrokeMotionModel::Path,
                 humanize: path_follow.humanize,
                 backend: path_follow.backend,
             }])

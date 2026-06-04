@@ -15,7 +15,6 @@ expression: shape
                 "$ref": "#/$defs/Backend"
               },
               "hold_ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               },
@@ -84,7 +83,6 @@ expression: shape
                 "$ref": "#/$defs/Backend"
               },
               "hold_ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               },
@@ -142,7 +140,6 @@ expression: shape
                 "$ref": "#/$defs/AimCurve"
               },
               "duration_ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               },
@@ -170,11 +167,9 @@ expression: shape
                 "$ref": "#/$defs/Backend"
               },
               "dx": {
-                "format": "float",
                 "type": "number"
               },
               "dy": {
-                "format": "float",
                 "type": "number"
               },
               "kind": {
@@ -203,7 +198,6 @@ expression: shape
                 "$ref": "#/$defs/MouseButton"
               },
               "hold_ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               },
@@ -234,7 +228,6 @@ expression: shape
                 "$ref": "#/$defs/AimCurve"
               },
               "duration_ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               },
@@ -290,6 +283,12 @@ expression: shape
                 "const": "mouse_stroke",
                 "type": "string"
               },
+              "motion_model": {
+                "$ref": "#/$defs/StrokeMotionModel",
+                "default": {
+                  "kind": "path"
+                }
+              },
               "path": {
                 "$ref": "#/$defs/PathSpec"
               },
@@ -326,11 +325,9 @@ expression: shape
                 "$ref": "#/$defs/Backend"
               },
               "dx": {
-                "format": "int32",
                 "type": "integer"
               },
               "dy": {
-                "format": "int32",
                 "type": "integer"
               },
               "kind": {
@@ -356,7 +353,6 @@ expression: shape
                 "$ref": "#/$defs/PadButton"
               },
               "hold_ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               },
@@ -365,7 +361,6 @@ expression: shape
                 "type": "string"
               },
               "pad": {
-                "format": "uint8",
                 "maximum": 255,
                 "minimum": 0,
                 "type": "integer"
@@ -388,7 +383,6 @@ expression: shape
                 "type": "string"
               },
               "pad": {
-                "format": "uint8",
                 "maximum": 255,
                 "minimum": 0,
                 "type": "integer"
@@ -397,11 +391,9 @@ expression: shape
                 "$ref": "#/$defs/Stick"
               },
               "x": {
-                "format": "float",
                 "type": "number"
               },
               "y": {
-                "format": "float",
                 "type": "number"
               }
             },
@@ -422,7 +414,6 @@ expression: shape
                 "type": "string"
               },
               "pad": {
-                "format": "uint8",
                 "maximum": 255,
                 "minimum": 0,
                 "type": "integer"
@@ -431,7 +422,6 @@ expression: shape
                 "$ref": "#/$defs/Trigger"
               },
               "value": {
-                "format": "float",
                 "type": "number"
               }
             },
@@ -451,7 +441,6 @@ expression: shape
                 "type": "string"
               },
               "pad": {
-                "format": "uint8",
                 "maximum": 255,
                 "minimum": 0,
                 "type": "integer"
@@ -474,7 +463,6 @@ expression: shape
                 "$ref": "#/$defs/Backend"
               },
               "deadline_ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               },
@@ -590,11 +578,9 @@ expression: shape
                 "minItems": 2,
                 "prefixItems": [
                   {
-                    "format": "float",
                     "type": "number"
                   },
                   {
-                    "format": "float",
                     "type": "number"
                   }
                 ],
@@ -605,11 +591,9 @@ expression: shape
                 "minItems": 2,
                 "prefixItems": [
                   {
-                    "format": "float",
                     "type": "number"
                   },
                   {
-                    "format": "float",
                     "type": "number"
                   }
                 ],
@@ -646,11 +630,9 @@ expression: shape
         "additionalProperties": false,
         "properties": {
           "control_point_jitter": {
-            "format": "float",
             "type": "number"
           },
           "micro_correct_steps": {
-            "format": "uint8",
             "maximum": 255,
             "minimum": 0,
             "type": "integer"
@@ -660,22 +642,18 @@ expression: shape
             "minItems": 2,
             "prefixItems": [
               {
-                "format": "float",
                 "type": "number"
               },
               {
-                "format": "float",
                 "type": "number"
               }
             ],
             "type": "array"
           },
           "overshoot_prob": {
-            "format": "float",
             "type": "number"
           },
           "seed": {
-            "format": "uint64",
             "minimum": 0,
             "type": [
               "integer",
@@ -683,11 +661,9 @@ expression: shape
             ]
           },
           "timing_stddev_ms": {
-            "format": "float",
             "type": "number"
           },
           "tremor_stddev_px": {
-            "format": "float",
             "type": "number"
           }
         },
@@ -754,7 +730,6 @@ expression: shape
                 "type": "string"
               },
               "track_id": {
-                "format": "uint64",
                 "minimum": 0,
                 "type": "integer"
               }
@@ -824,7 +799,6 @@ expression: shape
             "additionalProperties": false,
             "properties": {
               "hold_ms": {
-                "format": "uint16",
                 "maximum": 65535,
                 "minimum": 0,
                 "type": "integer"
@@ -869,11 +843,9 @@ expression: shape
             "additionalProperties": false,
             "properties": {
               "dx": {
-                "format": "float",
                 "type": "number"
               },
               "dy": {
-                "format": "float",
                 "type": "number"
               },
               "kind": {
@@ -902,7 +874,6 @@ expression: shape
                 "type": "string"
               },
               "pad": {
-                "format": "uint8",
                 "maximum": 255,
                 "minimum": 0,
                 "type": "integer"
@@ -924,7 +895,6 @@ expression: shape
                 "type": "string"
               },
               "pad": {
-                "format": "uint8",
                 "maximum": 255,
                 "minimum": 0,
                 "type": "integer"
@@ -933,11 +903,9 @@ expression: shape
                 "$ref": "#/$defs/Stick"
               },
               "x": {
-                "format": "float",
                 "type": "number"
               },
               "y": {
-                "format": "float",
                 "type": "number"
               }
             },
@@ -956,7 +924,6 @@ expression: shape
         "additionalProperties": false,
         "properties": {
           "at_ms": {
-            "format": "uint32",
             "minimum": 0,
             "type": "integer"
           },
@@ -1335,13 +1302,11 @@ expression: shape
             "default": "x360"
           },
           "lt": {
-            "format": "float",
             "maximum": 1.0,
             "minimum": 0.0,
             "type": "number"
           },
           "rt": {
-            "format": "float",
             "maximum": 1.0,
             "minimum": 0.0,
             "type": "number"
@@ -1397,12 +1362,10 @@ expression: shape
             "minItems": 2,
             "prefixItems": [
               {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               },
               {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               }
@@ -1410,7 +1373,6 @@ expression: shape
             "type": "array"
           },
           "micro_pause_prob": {
-            "format": "float",
             "type": "number"
           },
           "overshoot_factor_range": {
@@ -1418,22 +1380,18 @@ expression: shape
             "minItems": 2,
             "prefixItems": [
               {
-                "format": "float",
                 "type": "number"
               },
               {
-                "format": "float",
                 "type": "number"
               }
             ],
             "type": "array"
           },
           "overshoot_prob": {
-            "format": "float",
             "type": "number"
           },
           "seed": {
-            "format": "uint64",
             "minimum": 0,
             "type": [
               "integer",
@@ -1441,11 +1399,9 @@ expression: shape
             ]
           },
           "tremor_base_stddev_px": {
-            "format": "float",
             "type": "number"
           },
           "tremor_velocity_scale": {
-            "format": "float",
             "type": "number"
           }
         },
@@ -1521,7 +1477,6 @@ expression: shape
                 "type": "string"
               },
               "value": {
-                "format": "uint8",
                 "maximum": 255,
                 "minimum": 0,
                 "type": "integer"
@@ -1558,7 +1513,6 @@ expression: shape
                 "type": "string"
               },
               "ms_per_char": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               }
@@ -1595,11 +1549,9 @@ expression: shape
             "type": "boolean"
           },
           "mean_iki_ms": {
-            "format": "float",
             "type": "number"
           },
           "stddev_ms": {
-            "format": "float",
             "type": "number"
           }
         },
@@ -1682,11 +1634,9 @@ expression: shape
         "additionalProperties": false,
         "properties": {
           "x": {
-            "format": "double",
             "type": "number"
           },
           "y": {
-            "format": "double",
             "type": "number"
           }
         },
@@ -1730,15 +1680,12 @@ expression: shape
                 "type": "string"
               },
               "radius": {
-                "format": "double",
                 "type": "number"
               },
               "start_angle_rad": {
-                "format": "double",
                 "type": "number"
               },
               "sweep_angle_rad": {
-                "format": "double",
                 "type": "number"
               }
             },
@@ -1762,7 +1709,6 @@ expression: shape
                 "type": "string"
               },
               "radius": {
-                "format": "double",
                 "type": "number"
               }
             },
@@ -1831,7 +1777,6 @@ expression: shape
             "properties": {
               "alpha": {
                 "default": 0.5,
-                "format": "double",
                 "type": "number"
               },
               "closed": {
@@ -1844,7 +1789,6 @@ expression: shape
               },
               "tension": {
                 "default": 0.0,
-                "format": "double",
                 "type": "number"
               },
               "waypoints": {
@@ -1866,11 +1810,9 @@ expression: shape
         "additionalProperties": false,
         "properties": {
           "x": {
-            "format": "int32",
             "type": "integer"
           },
           "y": {
-            "format": "int32",
             "type": "integer"
           }
         },
@@ -1928,7 +1870,6 @@ expression: shape
                 "type": "string"
               },
               "pad": {
-                "format": "uint8",
                 "maximum": 255,
                 "minimum": 0,
                 "type": "integer"
@@ -1989,7 +1930,6 @@ expression: shape
                 "type": "string"
               },
               "ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               }
@@ -2025,7 +1965,6 @@ expression: shape
                 "type": "string"
               },
               "ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               }
@@ -2147,7 +2086,6 @@ expression: shape
           },
           "at_ms": {
             "default": 0,
-            "format": "uint32",
             "minimum": 0,
             "type": "integer"
           },
@@ -2177,13 +2115,65 @@ expression: shape
         ],
         "type": "string"
       },
+      "StrokeMotionModel": {
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "const": "path",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "damped_distance": {
+                "type": "number"
+              },
+              "gravity": {
+                "type": "number"
+              },
+              "kind": {
+                "const": "wind_mouse",
+                "type": "string"
+              },
+              "max_step": {
+                "type": "number"
+              },
+              "seed": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "wind": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "kind",
+              "gravity",
+              "wind",
+              "max_step",
+              "damped_distance"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "StrokeTiming": {
         "oneOf": [
           {
             "additionalProperties": false,
             "properties": {
               "duration_ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               },
@@ -2206,7 +2196,6 @@ expression: shape
                 "type": "string"
               },
               "px_per_sec": {
-                "format": "double",
                 "type": "number"
               }
             },
@@ -2293,7 +2282,6 @@ expression: shape
       },
       "deadzone_px": {
         "default": null,
-        "format": "float",
         "type": [
           "number",
           "null"
@@ -2301,7 +2289,6 @@ expression: shape
       },
       "debounce_ms": {
         "default": 0,
-        "format": "uint32",
         "minimum": 0,
         "type": "integer"
       },
@@ -2318,7 +2305,6 @@ expression: shape
       },
       "ema_alpha": {
         "default": null,
-        "format": "float",
         "type": [
           "number",
           "null"
@@ -2330,7 +2316,6 @@ expression: shape
       },
       "gain": {
         "default": null,
-        "format": "float",
         "type": [
           "number",
           "null"
@@ -2383,7 +2368,6 @@ expression: shape
       },
       "max_speed_px_per_tick": {
         "default": null,
-        "format": "float",
         "type": [
           "number",
           "null"
@@ -2402,7 +2386,6 @@ expression: shape
       },
       "priority": {
         "default": 100,
-        "format": "uint32",
         "maximum": 1000,
         "minimum": 0,
         "type": "integer"
@@ -2840,7 +2823,6 @@ expression: shape
                 "type": "string"
               },
               "ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               }
@@ -2876,7 +2858,6 @@ expression: shape
                 "type": "string"
               },
               "ms": {
-                "format": "uint32",
                 "minimum": 0,
                 "type": "integer"
               }
@@ -2908,7 +2889,6 @@ expression: shape
             "type": "boolean"
           },
           "fire_count": {
-            "format": "uint64",
             "minimum": 0,
             "type": "integer"
           },
@@ -2935,7 +2915,6 @@ expression: shape
             "$ref": "#/$defs/ReflexLifetime"
           },
           "priority": {
-            "format": "uint32",
             "minimum": 0,
             "type": "integer"
           },

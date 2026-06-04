@@ -3,7 +3,7 @@ use synapse_core::{
     AimCurve, AimNaturalParams, AimStyle, AimTarget, Backend, ButtonAction, ComboInput, ComboStep,
     ElementId, GamepadReport, HumanizeParams, Key, KeyCode, KeystrokeDynamics,
     KeystrokeNaturalParams, MouseButton, MouseTarget, PadButton, PathPoint, PathSpec, Point, Stick,
-    StrokeTiming, Trigger, VelocityProfile,
+    StrokeMotionModel, StrokeTiming, Trigger, VelocityProfile,
 };
 
 pub fn backend_strategy() -> impl Strategy<Value = Backend> {
@@ -199,6 +199,28 @@ pub fn stroke_timing_strategy() -> impl Strategy<Value = StrokeTiming> {
         (1u32..=10_000).prop_map(|px_per_sec| StrokeTiming::SpeedPxPerSec {
             px_per_sec: f64::from(px_per_sec),
         }),
+    ]
+}
+
+pub fn stroke_motion_model_strategy() -> impl Strategy<Value = StrokeMotionModel> {
+    prop_oneof![
+        Just(StrokeMotionModel::Path),
+        (
+            1u32..=20,
+            1u32..=20,
+            1u32..=30,
+            1u32..=128,
+            prop::option::of(any::<u64>()),
+        )
+            .prop_map(|(gravity, wind, max_step, damped_distance, seed)| {
+                StrokeMotionModel::WindMouse {
+                    gravity: f64::from(gravity),
+                    wind: f64::from(wind),
+                    max_step: f64::from(max_step),
+                    damped_distance: f64::from(damped_distance),
+                    seed,
+                }
+            }),
     ]
 }
 

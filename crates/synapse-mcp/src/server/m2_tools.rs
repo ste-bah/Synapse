@@ -227,7 +227,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Move or draw along an explicit spatial path using timed continuous mouse samples"
+        description = "Move or draw along an explicit spatial path using timed continuous mouse samples; motion_model defaults to path and can use wind_mouse for point-to-point humanized line strokes"
     )]
     pub async fn act_stroke(
         &self,

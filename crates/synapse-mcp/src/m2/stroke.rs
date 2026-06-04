@@ -14,8 +14,8 @@ use synapse_action::{
     RecordingBackend, StrokeError, StrokePlan, plan_timed_stroke, screen_point_from_path_point,
 };
 use synapse_core::{
-    Action, Backend, HumanizeParams, MouseButton, PathPoint, PathSpec, Point, Rect, StrokeTiming,
-    VelocityProfile, error_codes,
+    Action, Backend, HumanizeParams, MouseButton, PathPoint, PathSpec, Point, Rect,
+    StrokeMotionModel, StrokeTiming, VelocityProfile, error_codes,
 };
 
 use crate::m1::mcp_error;
@@ -36,6 +36,7 @@ const STROKE_DETAIL_SPEED_INVALID: &str = "STROKE_SPEED_INVALID";
 const STROKE_DETAIL_PATH_PARAMETER_INVALID: &str = "STROKE_PATH_PARAMETER_INVALID";
 const STROKE_DETAIL_VELOCITY_INVALID: &str = "STROKE_VELOCITY_INVALID";
 const STROKE_DETAIL_HUMANIZE_INVALID: &str = "STROKE_HUMANIZE_INVALID";
+const STROKE_DETAIL_MOTION_MODEL_INVALID: &str = "STROKE_MOTION_MODEL_INVALID";
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +49,9 @@ pub struct ActStrokeParams {
     #[schemars(default = "default_stroke_velocity_profile")]
     pub velocity_profile: VelocityProfile,
     pub duration_or_speed: StrokeTiming,
+    #[serde(default = "default_stroke_motion_model")]
+    #[schemars(default = "default_stroke_motion_model")]
+    pub motion_model: StrokeMotionModel,
     #[serde(default)]
     #[schemars(default)]
     pub humanize: Option<HumanizeParams>,
@@ -85,6 +89,7 @@ pub struct ActStrokeResponse {
     pub button_used: Option<MouseButton>,
     pub velocity_profile_used: VelocityProfile,
     pub duration_or_speed_used: StrokeTiming,
+    pub motion_model_used: StrokeMotionModel,
     pub humanized: bool,
     pub point_stream_count: u32,
     pub path_length_px: f64,
@@ -107,6 +112,7 @@ pub async fn act_stroke_with_handle(
         button: params.button,
         profile: params.velocity_profile,
         timing: params.duration_or_speed.clone(),
+        motion_model: params.motion_model,
         humanize: params.humanize,
         backend,
     };
@@ -137,6 +143,7 @@ pub fn act_stroke_request_details(params: &ActStrokeParams, plan: &StrokePlan) -
         "button": params.button,
         "velocity_profile": params.velocity_profile,
         "duration_or_speed": &params.duration_or_speed,
+        "motion_model": params.motion_model,
         "humanized": params.humanize.is_some(),
         "humanize": params.humanize,
         "backend_requested": params.backend,
@@ -215,6 +222,7 @@ fn validate_and_plan_with_screen_bounds(
         &params.path,
         params.velocity_profile,
         &params.duration_or_speed,
+        params.motion_model,
         params.humanize,
     )
     .map_err(|error| stroke_error_to_mcp(&error))?;
@@ -548,6 +556,7 @@ fn response(
         button_used: params.button,
         velocity_profile_used: params.velocity_profile,
         duration_or_speed_used: params.duration_or_speed.clone(),
+        motion_model_used: params.motion_model,
         humanized: params.humanize.is_some(),
         point_stream_count: u32::try_from(plan.samples.len()).unwrap_or(u32::MAX),
         path_length_px: plan.path_length_px,
@@ -650,6 +659,31 @@ fn stroke_error_to_mcp(error: &StrokeError) -> ErrorData {
                 "act_stroke planned point {index} is outside i32 screen coordinate range: x={x} y={y}"
             ),
         ),
+        StrokeError::WindMouseRequiresLine { path_kind } => params_invalid_detail(
+            STROKE_DETAIL_MOTION_MODEL_INVALID,
+            format!("act_stroke motion_model wind_mouse requires path.kind=line, got {path_kind}"),
+        ),
+        StrokeError::InvalidWindMouseParameter { field, value } => params_invalid_detail(
+            STROKE_DETAIL_MOTION_MODEL_INVALID,
+            format!(
+                "act_stroke motion_model wind_mouse parameter {field} must be finite and greater than zero, got {value}"
+            ),
+        ),
+        StrokeError::WindMouseNonFinitePoint { index, x, y } => params_invalid_detail(
+            STROKE_DETAIL_MOTION_MODEL_INVALID,
+            format!(
+                "act_stroke motion_model wind_mouse generated non-finite point {index}: x={x} y={y}"
+            ),
+        ),
+        StrokeError::WindMouseDidNotConverge {
+            max_points,
+            remaining_distance_px,
+        } => params_invalid_detail(
+            STROKE_DETAIL_SAMPLE_CAP_EXCEEDED,
+            format!(
+                "act_stroke motion_model wind_mouse did not converge within {max_points} points; remaining distance {remaining_distance_px:.3}px"
+            ),
+        ),
     }
 }
 
@@ -700,6 +734,10 @@ fn params_invalid_detail(detail_code: &'static str, message: impl Into<String>) 
 
 const fn default_stroke_velocity_profile() -> VelocityProfile {
     VelocityProfile::Constant
+}
+
+const fn default_stroke_motion_model() -> StrokeMotionModel {
+    StrokeMotionModel::Path
 }
 
 const fn default_stroke_backend() -> StrokeBackend {
@@ -989,6 +1027,7 @@ mod tests {
             button: None,
             velocity_profile: VelocityProfile::Constant,
             duration_or_speed: timing,
+            motion_model: StrokeMotionModel::Path,
             humanize: None,
             backend: StrokeBackend::Software,
             modifiers: Vec::new(),

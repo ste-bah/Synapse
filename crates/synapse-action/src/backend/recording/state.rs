@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap};
 use synapse_core::{
     Action, AimCurve, ButtonAction, ComboInput, GamepadReport, HumanizeParams, Key, KeyCode,
     KeystrokeDynamics, MouseButton, MouseTarget, PadButton, PadId, PathSpec, Point, Stick,
-    StrokeTiming, Trigger, VelocityProfile,
+    StrokeMotionModel, StrokeTiming, Trigger, VelocityProfile,
 };
 
 use super::RecordedInput;
@@ -63,9 +63,18 @@ impl RecordingState {
                 button,
                 profile,
                 timing,
+                motion_model,
                 humanize,
                 ..
-            } => self.mouse_stroke(path, *button, *profile, timing, *humanize, state)?,
+            } => self.mouse_stroke(
+                path,
+                *button,
+                *profile,
+                timing,
+                *motion_model,
+                *humanize,
+                state,
+            )?,
             Action::MouseScroll { dy, dx, at, .. } => {
                 self.events.push(RecordedInput::MouseScroll {
                     dy: *dy,
@@ -225,10 +234,11 @@ impl RecordingState {
         button: Option<MouseButton>,
         profile: VelocityProfile,
         timing: &StrokeTiming,
+        motion_model: StrokeMotionModel,
         humanize: Option<HumanizeParams>,
         state: &mut EmitState,
     ) -> Result<(), ActionError> {
-        let plan = plan_timed_stroke(path, profile, timing, humanize)
+        let plan = plan_timed_stroke(path, profile, timing, motion_model, humanize)
             .map_err(|error| stroke_error(&error))?;
         if let Some(button) = button {
             self.mouse_button_down(button, state);

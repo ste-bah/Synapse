@@ -10,9 +10,12 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn act_stroke_tools_call_recording_backend_and_path_edges() -> anyhow::Result<()> {
     let log_dir = TempDir::new()?;
+    let db_dir = TempDir::new()?;
+    let db_path_string = db_dir.path().to_string_lossy().into_owned();
     let mut client = StdioMcpClient::launch_and_init_with_env(
         Some(log_dir.path()),
         &[
+            ("SYNAPSE_DB", db_path_string.as_str()),
             ("SYNAPSE_MCP_SYNTHETIC_FIXTURE", "notepad"),
             ("SYNAPSE_MCP_RECORDING_BACKEND", "1"),
         ],
@@ -58,7 +61,80 @@ async fn act_stroke_tools_call_recording_backend_and_path_edges() -> anyhow::Res
     assert_eq!(stroke.point_stream_count, 5);
     assert_eq!(stroke.path_length_px, 4.0);
     assert_eq!(stroke.duration_ms, 4.0);
+    assert_eq!(stroke.motion_model_used, json!({"kind": "path"}));
     assert_eq!(stroke.backend_used, "software");
+
+    let wind_response = client
+        .tools_call(
+            "act_stroke",
+            json!({
+                "path": {
+                    "kind": "line",
+                    "from": {"x": 0.0, "y": 0.0},
+                    "to": {"x": 120.0, "y": 0.0}
+                },
+                "velocity_profile": "constant",
+                "duration_or_speed": {"kind": "duration_ms", "duration_ms": 120},
+                "motion_model": {
+                    "kind": "wind_mouse",
+                    "gravity": 9.0,
+                    "wind": 3.0,
+                    "max_step": 10.0,
+                    "damped_distance": 12.0,
+                    "seed": 42
+                },
+                "backend": "software"
+            }),
+        )
+        .await?;
+    let wind_stroke: ActStrokeWireResponse = structured(&wind_response)?;
+    println!(
+        "readback=mcp_act_stroke edge=wind_mouse after=ok:{} path_kind:{} points:{} motion_model:{}",
+        wind_stroke.ok,
+        wind_stroke.path_kind,
+        wind_stroke.point_stream_count,
+        wind_stroke.motion_model_used
+    );
+    assert!(wind_stroke.ok);
+    assert_eq!(wind_stroke.path_kind, "line");
+    assert!(wind_stroke.point_stream_count > 2);
+    assert_eq!(
+        wind_stroke.motion_model_used,
+        json!({
+            "kind": "wind_mouse",
+            "gravity": 9.0,
+            "wind": 3.0,
+            "max_step": 10.0,
+            "damped_distance": 12.0,
+            "seed": 42
+        })
+    );
+
+    let wind_circle = client
+        .tools_call_error(
+            "act_stroke",
+            json!({
+                "path": {
+                    "kind": "circle",
+                    "center": {"x": 0.0, "y": 0.0},
+                    "radius": 10.0
+                },
+                "duration_or_speed": {"kind": "duration_ms", "duration_ms": 120},
+                "motion_model": {
+                    "kind": "wind_mouse",
+                    "gravity": 9.0,
+                    "wind": 3.0,
+                    "max_step": 10.0,
+                    "damped_distance": 12.0
+                }
+            }),
+        )
+        .await?;
+    println!("readback=mcp_act_stroke edge=wind_mouse_circle after_error={wind_circle}");
+    assert_eq!(
+        error_code(&wind_circle),
+        Some(error_codes::TOOL_PARAMS_INVALID)
+    );
 
     let one_point = client
         .tools_call_error(
@@ -148,5 +224,6 @@ struct ActStrokeWireResponse {
     point_stream_count: u32,
     path_length_px: f64,
     duration_ms: f64,
+    motion_model_used: Value,
     backend_used: String,
 }

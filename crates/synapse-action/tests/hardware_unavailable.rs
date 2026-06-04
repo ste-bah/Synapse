@@ -5,8 +5,8 @@ use synapse_action::{
 use synapse_core::{
     Action, AimCurve, AimStyle, AimTarget, Backend, ButtonAction, ComboInput, ComboStep,
     GamepadReport, Key, KeyCode, KeystrokeDynamics, KeystrokeNaturalParams, MouseButton,
-    MouseTarget, PadButton, PathPoint, PathSpec, Point, Stick, StrokeTiming, Trigger,
-    VelocityProfile, error_codes,
+    MouseTarget, PadButton, PathPoint, PathSpec, Point, Stick, StrokeMotionModel, StrokeTiming,
+    Trigger, VelocityProfile, error_codes,
 };
 
 #[test]
@@ -161,6 +161,7 @@ fn mouse_actions() -> Vec<(&'static str, Action)> {
                 button: Some(MouseButton::Left),
                 profile: VelocityProfile::Linear,
                 timing: StrokeTiming::DurationMs { duration_ms: 1 },
+                motion_model: StrokeMotionModel::Path,
                 humanize: None,
                 backend: Backend::Hardware,
             },

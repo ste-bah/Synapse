@@ -183,6 +183,9 @@ expression: canonical_actions()
       "kind": "duration_ms",
       "duration_ms": 750
     },
+    "motion_model": {
+      "kind": "path"
+    },
     "humanize": {
       "tremor_base_stddev_px": 0.2,
       "tremor_velocity_scale": 0.5,

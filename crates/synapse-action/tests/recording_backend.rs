@@ -6,8 +6,8 @@ use synapse_action::{
 use synapse_core::{
     Action, AimCurve, AimNaturalParams, AimStyle, AimTarget, Backend, ButtonAction, ComboInput,
     ComboStep, GamepadReport, Key, KeyCode, KeystrokeDynamics, KeystrokeNaturalParams, MouseButton,
-    MouseTarget, PadButton, PathPoint, PathSpec, Point, Stick, StrokeTiming, Trigger,
-    VelocityProfile,
+    MouseTarget, PadButton, PathPoint, PathSpec, Point, Stick, StrokeMotionModel, StrokeTiming,
+    Trigger, VelocityProfile,
 };
 
 #[test]
@@ -460,6 +460,7 @@ fn mouse_stroke_case() -> RecordingCase {
             button: Some(MouseButton::Left),
             profile: VelocityProfile::Constant,
             timing: StrokeTiming::DurationMs { duration_ms: 4 },
+            motion_model: StrokeMotionModel::Path,
             humanize: None,
             backend: Backend::Software,
         },

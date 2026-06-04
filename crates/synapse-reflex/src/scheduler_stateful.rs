@@ -4,7 +4,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use synapse_core::{
     Action, ButtonAction, Event, Point, ReflexAimAxis, ReflexButtonTarget, ReflexState,
-    SCHEMA_VERSION, StoredReflexAudit, StoredReflexStep, error_codes,
+    SCHEMA_VERSION, StoredReflexAudit, StoredReflexStep, StrokeMotionModel, error_codes,
 };
 use uuid::Uuid;
 
@@ -284,6 +284,7 @@ fn path_follow_conflict_actions(runtime: &RuntimeState, index: usize) -> Vec<Act
         button: params.button,
         profile: params.profile,
         timing: params.timing.clone(),
+        motion_model: StrokeMotionModel::Path,
         humanize: params.humanize,
         backend: params.backend,
     }]

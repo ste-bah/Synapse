@@ -210,6 +210,13 @@ fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
         &mut readbacks,
         tools,
         "act_stroke",
+        "inputSchema.properties.motion_model.default",
+        &json!({"kind": "path"}),
+    )?;
+    read_default(
+        &mut readbacks,
+        tools,
+        "act_stroke",
         "inputSchema.properties.backend.default",
         &json!("auto"),
     )?;

@@ -189,6 +189,14 @@ fn assert_motion_semantics_are_advertised(tools: &[Value]) -> anyhow::Result<()>
         stroke_description.contains("explicit spatial path"),
         "act_stroke description must advertise explicit spatial path ownership: {stroke_description}"
     );
+    ensure!(
+        stroke_description.contains("motion_model"),
+        "act_stroke description must advertise motion_model ownership: {stroke_description}"
+    );
+    ensure!(
+        stroke_description.contains("wind_mouse"),
+        "act_stroke description must advertise wind_mouse availability: {stroke_description}"
+    );
     Ok(())
 }
 
@@ -235,6 +243,13 @@ fn read_schema_defaults(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
         "act_stroke",
         "inputSchema.properties.velocity_profile.default",
         &json!("constant"),
+    )?;
+    read_default(
+        readbacks,
+        tools,
+        "act_stroke",
+        "inputSchema.properties.motion_model.default",
+        &json!({"kind": "path"}),
     )?;
     read_default(
         readbacks,
