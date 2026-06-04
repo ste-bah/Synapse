@@ -480,7 +480,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 32] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 31] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -493,8 +493,7 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 32] {
         profile_authoring::profile_authoring_generate(),
         profile_authoring::profile_authoring_list(),
         profile_authoring::profile_authoring_inspect(),
-        profile_authoring::profile_authoring_accept(),
-        profile_authoring::profile_authoring_reject(),
+        profile_authoring::profile_authoring_decide(),
         profile_authoring::profile_authoring_export(),
         profile_quality::profile_quality_refresh(),
         profile_registry::profile_registry_search(),

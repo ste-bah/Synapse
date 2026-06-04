@@ -2,33 +2,32 @@ use super::{
     AudioTailParams, AudioTailResponse, AudioTranscribeParams, AudioTranscribeResponse,
     AuditExportBundleParams, AuditExportBundleResponse, AuditIntelligenceQueryParams,
     AuditIntelligenceQueryResponse, ErrorData, Json, Parameters, ProfileActivateParams,
-    ProfileActivateResponse, ProfileAuthoringAcceptParams, ProfileAuthoringAcceptResponse,
+    ProfileActivateResponse, ProfileAuthoringDecideParams, ProfileAuthoringDecideResponse,
     ProfileAuthoringExportParams, ProfileAuthoringExportResponse, ProfileAuthoringGenerateParams,
     ProfileAuthoringGenerateResponse, ProfileAuthoringInspectParams,
     ProfileAuthoringInspectResponse, ProfileAuthoringListParams, ProfileAuthoringListResponse,
-    ProfileAuthoringRejectParams, ProfileAuthoringRejectResponse, ProfileListParams,
-    ProfileListResponse, ProfileQualityRefreshParams, ProfileQualityRefreshResponse,
-    ProfileRegistryDisableParams, ProfileRegistryDisableResponse, ProfileRegistryExportParams,
-    ProfileRegistryExportResponse, ProfileRegistryImportParams, ProfileRegistryImportResponse,
-    ProfileRegistryInspectParams, ProfileRegistryInspectResponse, ProfileRegistryInstallParams,
-    ProfileRegistryInstallResponse, ProfileRegistryReportParams, ProfileRegistryReportResponse,
-    ProfileRegistryRollbackParams, ProfileRegistryRollbackResponse, ProfileRegistrySearchParams,
-    ProfileRegistrySearchResponse, ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams,
-    ReflexHistoryResponse, ReflexListParams, ReflexListResponse, ReflexRegisterParams,
-    ReflexRegisterResponse, ReplayRecordParams, ReplayRecordResponse, StorageGcOnceParams,
-    StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
-    StoragePressureSampleParams, StoragePressureSampleResponse, StoragePutProbeRowsParams,
-    StoragePutProbeRowsResponse, SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams,
-    SubscribeResponse, SynapseService, accept_profile_authoring_candidate,
-    apply_storage_pressure_sample, cancel_reflex, cancel_subscription, disable_registry_profile,
-    export_audit_bundle, export_profile_authoring_candidate, export_registry,
-    generate_profile_authoring_candidate, history_reflexes, import_registry,
-    inspect_profile_authoring_candidate, inspect_registry, inspect_storage,
-    install_registry_package, list_profile_authoring_candidates, list_profiles, list_reflexes,
-    put_probe_rows, query_audit_intelligence, record_replay, refresh_profile_quality,
-    register_reflex, reject_profile_authoring_candidate, report_profile_registry,
-    rollback_registry_profile, run_storage_gc_once, search_registry, subscribe_to_events,
-    tail_audio, tool, tool_router, transcribe_audio,
+    ProfileListParams, ProfileListResponse, ProfileQualityRefreshParams,
+    ProfileQualityRefreshResponse, ProfileRegistryDisableParams, ProfileRegistryDisableResponse,
+    ProfileRegistryExportParams, ProfileRegistryExportResponse, ProfileRegistryImportParams,
+    ProfileRegistryImportResponse, ProfileRegistryInspectParams, ProfileRegistryInspectResponse,
+    ProfileRegistryInstallParams, ProfileRegistryInstallResponse, ProfileRegistryReportParams,
+    ProfileRegistryReportResponse, ProfileRegistryRollbackParams, ProfileRegistryRollbackResponse,
+    ProfileRegistrySearchParams, ProfileRegistrySearchResponse, ReflexCancelParams,
+    ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse, ReflexListParams,
+    ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse, ReplayRecordParams,
+    ReplayRecordResponse, StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams,
+    StorageInspectResponse, StoragePressureSampleParams, StoragePressureSampleResponse,
+    StoragePutProbeRowsParams, StoragePutProbeRowsResponse, SubscribeCancelParams,
+    SubscribeCancelResponse, SubscribeParams, SubscribeResponse, SynapseService,
+    apply_storage_pressure_sample, cancel_reflex, cancel_subscription,
+    decide_profile_authoring_candidate, disable_registry_profile, export_audit_bundle,
+    export_profile_authoring_candidate, export_registry, generate_profile_authoring_candidate,
+    history_reflexes, import_registry, inspect_profile_authoring_candidate, inspect_registry,
+    inspect_storage, install_registry_package, list_profile_authoring_candidates, list_profiles,
+    list_reflexes, put_probe_rows, query_audit_intelligence, record_replay,
+    refresh_profile_quality, register_reflex, report_profile_registry, rollback_registry_profile,
+    run_storage_gc_once, search_registry, subscribe_to_events, tail_audio, tool, tool_router,
+    transcribe_audio,
 };
 
 #[tool_router(router = m3_tool_router, vis = "pub(super)")]
@@ -270,43 +269,25 @@ impl SynapseService {
         inspect_profile_authoring_candidate(&reflex_runtime, &params.0).map(Json)
     }
 
-    #[tool(description = "Accept a local profile authoring candidate without activating it")]
-    pub async fn profile_authoring_accept(
+    #[tool(description = "Accept or reject one local profile authoring candidate")]
+    pub async fn profile_authoring_decide(
         &self,
-        params: Parameters<ProfileAuthoringAcceptParams>,
-    ) -> Result<Json<ProfileAuthoringAcceptResponse>, ErrorData> {
+        params: Parameters<ProfileAuthoringDecideParams>,
+    ) -> Result<Json<ProfileAuthoringDecideResponse>, ErrorData> {
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
-            kind = "profile_authoring_accept",
+            kind = "profile_authoring_decide",
             candidate_id = %params.0.candidate_id,
-            "tool.invocation kind=profile_authoring_accept"
+            decision = ?params.0.decision,
+            "tool.invocation kind=profile_authoring_decide"
         );
         self.require_m3_permissions(
-            "profile_authoring_accept",
-            &crate::m3::profile_authoring::required_permissions_accept(&params.0),
+            "profile_authoring_decide",
+            &crate::m3::profile_authoring::required_permissions_decide(&params.0),
         )?;
         let profile_runtime = self.profile_runtime()?;
         let reflex_runtime = self.reflex_runtime()?;
-        accept_profile_authoring_candidate(&profile_runtime, &reflex_runtime, &params.0).map(Json)
-    }
-
-    #[tool(description = "Reject a local profile authoring candidate")]
-    pub async fn profile_authoring_reject(
-        &self,
-        params: Parameters<ProfileAuthoringRejectParams>,
-    ) -> Result<Json<ProfileAuthoringRejectResponse>, ErrorData> {
-        tracing::info!(
-            code = "MCP_TOOL_INVOCATION",
-            kind = "profile_authoring_reject",
-            candidate_id = %params.0.candidate_id,
-            "tool.invocation kind=profile_authoring_reject"
-        );
-        self.require_m3_permissions(
-            "profile_authoring_reject",
-            &crate::m3::profile_authoring::required_permissions_reject(&params.0),
-        )?;
-        let reflex_runtime = self.reflex_runtime()?;
-        reject_profile_authoring_candidate(&reflex_runtime, &params.0).map(Json)
+        decide_profile_authoring_candidate(&profile_runtime, &reflex_runtime, &params.0).map(Json)
     }
 
     #[tool(description = "Export a local profile authoring candidate bundle")]

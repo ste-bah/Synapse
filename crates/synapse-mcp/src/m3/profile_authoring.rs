@@ -68,18 +68,21 @@ pub struct ProfileAuthoringInspectParams {
     pub candidate_id: String,
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ProfileAuthoringAcceptParams {
-    pub candidate_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub operator_note: Option<String>,
+#[serde(rename_all = "snake_case")]
+pub enum ProfileAuthoringDecision {
+    Accept,
+    Reject,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ProfileAuthoringRejectParams {
+pub struct ProfileAuthoringDecideParams {
     pub candidate_id: String,
+    pub decision: ProfileAuthoringDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -200,29 +203,17 @@ pub struct ProfileAuthoringInspectResponse {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct ProfileAuthoringAcceptResponse {
+pub struct ProfileAuthoringDecideResponse {
     pub cf_name: String,
     pub row_key: String,
     pub candidate_id: String,
     pub profile_id: ProfileId,
     pub previous_state: String,
     pub state: String,
+    pub decision: ProfileAuthoringDecision,
     pub wrote_row: bool,
     pub activated: bool,
     pub active_profile_id: Option<ProfileId>,
-    pub candidate: ProfileAuthoringCandidate,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ProfileAuthoringRejectResponse {
-    pub cf_name: String,
-    pub row_key: String,
-    pub candidate_id: String,
-    pub profile_id: ProfileId,
-    pub previous_state: String,
-    pub state: String,
-    pub wrote_row: bool,
     pub candidate: ProfileAuthoringCandidate,
 }
 
@@ -254,13 +245,8 @@ pub const fn profile_authoring_inspect() -> M3ToolStub {
 }
 
 #[must_use]
-pub const fn profile_authoring_accept() -> M3ToolStub {
-    M3ToolStub::new("profile_authoring_accept")
-}
-
-#[must_use]
-pub const fn profile_authoring_reject() -> M3ToolStub {
-    M3ToolStub::new("profile_authoring_reject")
+pub const fn profile_authoring_decide() -> M3ToolStub {
+    M3ToolStub::new("profile_authoring_decide")
 }
 
 #[must_use]
@@ -292,17 +278,17 @@ pub fn required_permissions_inspect(
 }
 
 #[must_use]
-pub fn required_permissions_accept(_params: &ProfileAuthoringAcceptParams) -> RequiredPermissions {
-    required([
-        Permission::ReadProfile,
-        Permission::ReadStorage,
-        Permission::WriteStorage,
-    ])
-}
-
-#[must_use]
-pub fn required_permissions_reject(_params: &ProfileAuthoringRejectParams) -> RequiredPermissions {
-    required([Permission::ReadStorage, Permission::WriteStorage])
+pub fn required_permissions_decide(params: &ProfileAuthoringDecideParams) -> RequiredPermissions {
+    match params.decision {
+        ProfileAuthoringDecision::Accept => required([
+            Permission::ReadProfile,
+            Permission::ReadStorage,
+            Permission::WriteStorage,
+        ]),
+        ProfileAuthoringDecision::Reject => {
+            required([Permission::ReadStorage, Permission::WriteStorage])
+        }
+    }
 }
 
 #[must_use]
@@ -476,11 +462,49 @@ pub fn inspect_profile_authoring_candidate(
     })
 }
 
-pub fn accept_profile_authoring_candidate(
+pub fn decide_profile_authoring_candidate(
     profile_runtime: &ProfileRuntime,
     reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
-    params: &ProfileAuthoringAcceptParams,
-) -> Result<ProfileAuthoringAcceptResponse, ErrorData> {
+    params: &ProfileAuthoringDecideParams,
+) -> Result<ProfileAuthoringDecideResponse, ErrorData> {
+    validate_decide_fields(params)?;
+    match params.decision {
+        ProfileAuthoringDecision::Accept => {
+            decide_accept_candidate(profile_runtime, reflex_runtime, params)
+        }
+        ProfileAuthoringDecision::Reject => decide_reject_candidate(reflex_runtime, params),
+    }
+}
+
+fn validate_decide_fields(params: &ProfileAuthoringDecideParams) -> Result<(), ErrorData> {
+    match params.decision {
+        ProfileAuthoringDecision::Accept if params.reason.is_some() => Err(authoring_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "profile_authoring_decide reason is only valid for decision=reject",
+            json!({
+                "candidate_id": &params.candidate_id,
+                "decision": "accept",
+                "invalid_field": "reason",
+            }),
+        )),
+        ProfileAuthoringDecision::Reject if params.operator_note.is_some() => Err(authoring_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "profile_authoring_decide operator_note is only valid for decision=accept",
+            json!({
+                "candidate_id": &params.candidate_id,
+                "decision": "reject",
+                "invalid_field": "operator_note",
+            }),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn decide_accept_candidate(
+    profile_runtime: &ProfileRuntime,
+    reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
+    params: &ProfileAuthoringDecideParams,
+) -> Result<ProfileAuthoringDecideResponse, ErrorData> {
     let candidate_id = normalized_candidate_id(&params.candidate_id)?;
     let row_key = candidate_key(&candidate_id);
     let (mut candidate, previous_state) = read_candidate_required(reflex_runtime, &row_key)?;
@@ -510,13 +534,14 @@ pub fn accept_profile_authoring_candidate(
     let active_profile_id = profile_runtime
         .active_profile_id()
         .map_err(|error| profile_error(&error))?;
-    Ok(ProfileAuthoringAcceptResponse {
+    Ok(ProfileAuthoringDecideResponse {
         cf_name: cf::CF_PROFILES.to_owned(),
         row_key,
         candidate_id: candidate.candidate_id.clone(),
         profile_id: candidate.profile_id.clone(),
         previous_state,
         state: candidate.state.clone(),
+        decision: ProfileAuthoringDecision::Accept,
         wrote_row,
         activated: false,
         active_profile_id,
@@ -524,10 +549,10 @@ pub fn accept_profile_authoring_candidate(
     })
 }
 
-pub fn reject_profile_authoring_candidate(
+fn decide_reject_candidate(
     reflex_runtime: &Arc<Mutex<ReflexRuntime>>,
-    params: &ProfileAuthoringRejectParams,
-) -> Result<ProfileAuthoringRejectResponse, ErrorData> {
+    params: &ProfileAuthoringDecideParams,
+) -> Result<ProfileAuthoringDecideResponse, ErrorData> {
     let candidate_id = normalized_candidate_id(&params.candidate_id)?;
     let row_key = candidate_key(&candidate_id);
     let (mut candidate, previous_state) = read_candidate_required(reflex_runtime, &row_key)?;
@@ -554,14 +579,17 @@ pub fn reject_profile_authoring_candidate(
         ));
     };
     let candidate = read_candidate_required(reflex_runtime, &row_key)?.0;
-    Ok(ProfileAuthoringRejectResponse {
+    Ok(ProfileAuthoringDecideResponse {
         cf_name: cf::CF_PROFILES.to_owned(),
         row_key,
         candidate_id: candidate.candidate_id.clone(),
         profile_id: candidate.profile_id.clone(),
         previous_state,
         state: candidate.state.clone(),
+        decision: ProfileAuthoringDecision::Reject,
         wrote_row,
+        activated: false,
+        active_profile_id: None,
         candidate,
     })
 }
@@ -1650,4 +1678,59 @@ fn hex_encode(bytes: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(decision: ProfileAuthoringDecision) -> ProfileAuthoringDecideParams {
+        ProfileAuthoringDecideParams {
+            candidate_id: "candidate.alpha".to_owned(),
+            decision,
+            operator_note: None,
+            reason: None,
+        }
+    }
+
+    fn error_code(error: &ErrorData) -> Option<&str> {
+        error.data.as_ref()?.get("code")?.as_str()
+    }
+
+    fn invalid_field(error: &ErrorData) -> Option<&str> {
+        error
+            .data
+            .as_ref()?
+            .get("details")?
+            .get("invalid_field")?
+            .as_str()
+    }
+
+    #[test]
+    fn decide_accept_allows_operator_note_only() {
+        let mut params = params(ProfileAuthoringDecision::Accept);
+        params.operator_note = Some("reviewed by operator".to_owned());
+
+        validate_decide_fields(&params).expect("operator note is valid for accept");
+
+        params.reason = Some("not relevant".to_owned());
+        let error = validate_decide_fields(&params)
+            .expect_err("reason must not be accepted with decision=accept");
+        assert_eq!(error_code(&error), Some(error_codes::TOOL_PARAMS_INVALID));
+        assert_eq!(invalid_field(&error), Some("reason"));
+    }
+
+    #[test]
+    fn decide_reject_allows_reason_only() {
+        let mut params = params(ProfileAuthoringDecision::Reject);
+        params.reason = Some("insufficient evidence".to_owned());
+
+        validate_decide_fields(&params).expect("reason is valid for reject");
+
+        params.operator_note = Some("reviewed by operator".to_owned());
+        let error = validate_decide_fields(&params)
+            .expect_err("operator_note must not be accepted with decision=reject");
+        assert_eq!(error_code(&error), Some(error_codes::TOOL_PARAMS_INVALID));
+        assert_eq!(invalid_field(&error), Some("operator_note"));
+    }
 }

@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 49] = [
+const EXPECTED_TOOLS: [&str; 48] = [
     "act_aim",
     "act_click",
     "act_clipboard",
@@ -23,12 +23,11 @@ const EXPECTED_TOOLS: [&str; 49] = [
     "health",
     "observe",
     "profile_activate",
-    "profile_authoring_accept",
+    "profile_authoring_decide",
     "profile_authoring_export",
     "profile_authoring_generate",
     "profile_authoring_inspect",
     "profile_authoring_list",
-    "profile_authoring_reject",
     "profile_list",
     "profile_quality_refresh",
     "profile_registry_disable",
@@ -438,8 +437,8 @@ fn read_required_fields(readbacks: &mut Vec<Value>, tools: &[Value]) -> anyhow::
         "profile_authoring_inspect",
         "candidate_id",
     )?;
-    read_required(readbacks, tools, "profile_authoring_accept", "candidate_id")?;
-    read_required(readbacks, tools, "profile_authoring_reject", "candidate_id")?;
+    read_required(readbacks, tools, "profile_authoring_decide", "candidate_id")?;
+    read_required(readbacks, tools, "profile_authoring_decide", "decision")?;
     read_required(readbacks, tools, "profile_authoring_export", "candidate_id")?;
     read_required(readbacks, tools, "profile_authoring_export", "output_path")?;
     read_required(readbacks, tools, "profile_quality_refresh", "profile_id")?;
