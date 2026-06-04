@@ -61,6 +61,8 @@ giant screenshot it has to squint at:
 - **`observe`** — the focused window, the full UI Automation element tree (every
   button, field, and menu with its on-screen box), detected entities, and HUD.
 - **`find`** — locate any element or on-screen entity by name, role, or free text.
+- **Browser DOM mode** — Synapse-launched Chromium browsers can expose page
+  nodes through CDP; see [Browser and Web Perception](docs/browser-perception.md).
 - **`read_text`** — OCR any region or element. Reads pixels directly, so it works
   even where the accessibility API can't reach (games, canvases, custom UIs).
 - **`audio_tail` / `audio_transcribe`** — capture and transcribe system audio
