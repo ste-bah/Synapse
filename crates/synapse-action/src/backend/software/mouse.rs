@@ -189,36 +189,39 @@ pub(super) fn mouse_stroke(
         if let Some(button) = button
             && let Err(release_error) = mouse_button(button, ButtonAction::Up, 0, state)
         {
-            tracing::error!(
-                code = release_error.code(),
-                detail = release_error.detail(),
-                original_code = error.code(),
-                original_detail = error.detail(),
-                path_id = %context.path_id,
-                path_kind = context.path_kind,
-                backend = context.backend,
-                point_stream_count = context.point_stream_count,
-                duration_ms = context.duration_ms,
-                path_length_px = context.path_length_px,
-                button = ?context.button,
-                action_kind = "software_mouse_stroke",
-                "mouse_stroke failed and button cleanup also failed"
+            let sample_index =
+                extract_sample_index(error.detail()).or_else(|| plan.samples.len().checked_sub(1));
+            let requested_path_point =
+                sample_index.and_then(|index| plan.samples.get(index).map(|sample| sample.point));
+            let release_error = annotate_cleanup_release_error(release_error, &error, sample_index);
+            log_stroke_cleanup_release_error(
+                &context,
+                sample_index,
+                requested_path_point,
+                "button_cleanup_after_stream_error",
+                &error,
+                &release_error,
             );
-            return Err(ActionError::BackendUnavailable {
-                detail: format!(
-                    "mouse_stroke failed with code={} detail={}; cleanup release failed with code={} detail={}",
-                    error.code(),
-                    error.detail(),
-                    release_error.code(),
-                    release_error.detail()
-                ),
-            });
+            return Err(release_error);
         }
         return Err(error);
     }
 
     if let Some(button) = button {
-        mouse_button(button, ButtonAction::Up, 0, state)?;
+        if let Err(error) = mouse_button(button, ButtonAction::Up, 0, state) {
+            let sample_index = plan.samples.len().checked_sub(1);
+            let requested_path_point =
+                sample_index.and_then(|index| plan.samples.get(index).map(|sample| sample.point));
+            let error = annotate_stroke_emit_error(error, "button_up", sample_index);
+            log_stroke_emit_error(
+                &context,
+                sample_index,
+                requested_path_point,
+                "button_up",
+                &error,
+            );
+            return Err(error);
+        }
     }
     Ok(())
 }
@@ -673,6 +676,23 @@ fn annotate_stroke_emit_error(
     error.with_detail(detail)
 }
 
+fn annotate_cleanup_release_error(
+    release_error: ActionError,
+    original_error: &ActionError,
+    sample_index: Option<usize>,
+) -> ActionError {
+    let index = sample_index
+        .map(|index| format!(" sample_index={index}"))
+        .unwrap_or_default();
+    let detail = format!(
+        "mouse_stroke button_cleanup_after_stream_error{index}: original_code={} original_detail={}; cleanup_detail={}",
+        original_error.code(),
+        original_error.detail(),
+        release_error.detail()
+    );
+    release_error.with_detail(detail)
+}
+
 fn log_stroke_emit_error(
     context: &StrokeEmitLogContext,
     sample_index: Option<usize>,
@@ -694,11 +714,76 @@ fn log_stroke_emit_error(
         button = ?context.button,
         requested_x = requested_path_point.map(|point| point.x),
         requested_y = requested_path_point.map(|point| point.y),
-        queue_rate_state = "backend_dispatch",
+        retry_after_ms = error.retry_after_ms(),
+        queue_rate_state = %queue_rate_state(error),
         fallback_path_executed = false,
         action_kind = "software_mouse_stroke",
         "mouse_stroke emit failed without fallback"
     );
+}
+
+fn log_stroke_cleanup_release_error(
+    context: &StrokeEmitLogContext,
+    sample_index: Option<usize>,
+    requested_path_point: Option<synapse_core::PathPoint>,
+    failure_stage: &'static str,
+    original_error: &ActionError,
+    release_error: &ActionError,
+) {
+    tracing::error!(
+        code = release_error.code(),
+        detail = release_error.detail(),
+        original_code = original_error.code(),
+        original_detail = original_error.detail(),
+        sample_index,
+        failure_stage,
+        path_id = %context.path_id,
+        path_kind = context.path_kind,
+        backend = context.backend,
+        point_stream_count = context.point_stream_count,
+        duration_ms = context.duration_ms,
+        path_length_px = context.path_length_px,
+        button = ?context.button,
+        requested_x = requested_path_point.map(|point| point.x),
+        requested_y = requested_path_point.map(|point| point.y),
+        retry_after_ms = release_error.retry_after_ms(),
+        queue_rate_state = %queue_rate_state(release_error),
+        fallback_path_executed = false,
+        action_kind = "software_mouse_stroke",
+        "mouse_stroke cleanup release failed without fallback"
+    );
+}
+
+fn queue_rate_state(error: &ActionError) -> serde_json::Value {
+    match error {
+        ActionError::RateLimited {
+            retry_after_ms,
+            detail,
+        } => json!({
+            "kind": "rate_limited",
+            "retry_after_ms": retry_after_ms,
+            "detail": detail,
+        }),
+        ActionError::QueueFull { detail } => json!({
+            "kind": "queue_full",
+            "detail": detail,
+        }),
+        _ => json!({
+            "kind": "not_rate_or_queue",
+        }),
+    }
+}
+
+fn extract_sample_index(detail: &str) -> Option<usize> {
+    let marker = "sample_index=";
+    let start = detail.find(marker)? + marker.len();
+    let digits = detail[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>();
+    (!digits.is_empty())
+        .then(|| digits.parse::<usize>().ok())
+        .flatten()
 }
 
 fn set_physical_cursor_pos(point: Point, detail: &'static str) -> bool {
@@ -1032,5 +1117,57 @@ mod tests {
         assert!(annotated.detail().contains("mouse_stroke send_input"));
         assert!(annotated.detail().contains("sample_index=7"));
         assert!(annotated.detail().contains("SendInput returned 0"));
+    }
+
+    #[test]
+    fn stroke_cleanup_release_error_preserves_specific_cleanup_code() {
+        let original = ActionError::BackendUnavailable {
+            detail: "mouse_stroke send_input sample_index=4: SendInput returned 0".to_owned(),
+        };
+        let cleanup = ActionError::RateLimited {
+            detail: "backend=software retry_after_ms=25 requested_tokens=1 available_tokens=0"
+                .to_owned(),
+            retry_after_ms: 25,
+        };
+
+        let annotated = annotate_cleanup_release_error(cleanup, &original, Some(4));
+
+        assert_eq!(
+            annotated.code(),
+            synapse_core::error_codes::ACTION_RATE_LIMITED
+        );
+        assert_eq!(annotated.retry_after_ms(), Some(25));
+        assert!(annotated.detail().contains("sample_index=4"));
+        assert!(
+            annotated
+                .detail()
+                .contains("original_code=ACTION_BACKEND_UNAVAILABLE")
+        );
+        assert!(annotated.detail().contains("cleanup_detail="));
+    }
+
+    #[test]
+    fn stroke_emit_queue_rate_state_is_structured_for_rate_and_queue() {
+        let rate = ActionError::RateLimited {
+            detail: "rate detail".to_owned(),
+            retry_after_ms: 13,
+        };
+        let queue = ActionError::QueueFull {
+            detail: "queue detail".to_owned(),
+        };
+        let other = ActionError::BackendUnavailable {
+            detail: "backend detail".to_owned(),
+        };
+
+        println!(
+            "readback=stroke_emit_queue_rate_state before=rate,queue,other after_rate={} after_queue={} after_other={}",
+            queue_rate_state(&rate),
+            queue_rate_state(&queue),
+            queue_rate_state(&other)
+        );
+        assert_eq!(queue_rate_state(&rate)["kind"], "rate_limited");
+        assert_eq!(queue_rate_state(&rate)["retry_after_ms"], 13);
+        assert_eq!(queue_rate_state(&queue)["kind"], "queue_full");
+        assert_eq!(queue_rate_state(&other)["kind"], "not_rate_or_queue");
     }
 }
