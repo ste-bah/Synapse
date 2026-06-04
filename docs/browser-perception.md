@@ -32,15 +32,17 @@ Browser observations carry diagnostics so agents can tell the difference between
 - `diagnostics.cdp.status = "ok"`: a CDP endpoint is reachable. After the DOM
   attach succeeds, `diagnostics.web_path = "cdp"` and page nodes should appear in
   `elements`.
-- `diagnostics.cdp.status = "unreachable"` with
+- `diagnostics.cdp.status = "A11Y_CDP_UNREACHABLE"` with matching
   `reason_code = "A11Y_CDP_UNREACHABLE"`: the foreground process is Chromium
   family, but no probed debug port accepted a connection. Synapse then attempts
   OCR over tiled browser content. If readable text is found,
   `diagnostics.web_path = "ocr"` and OCR text nodes appear in `elements`; if OCR
   has no usable text or capture is unavailable, `web_path` remains `uia_only`.
-- CDP attach errors use the same diagnostics object with a non-`ok` status and
-  detail. Synapse may still recover readable text through OCR, but the CDP
-  failure remains visible in diagnostics.
+- CDP attach errors use the same diagnostics object with
+  `diagnostics.cdp.status = "A11Y_CDP_ATTACH_FAILED"`, matching
+  `reason_code = "A11Y_CDP_ATTACH_FAILED"`, and a detail string. Synapse may
+  still recover readable text through OCR, but the CDP failure remains visible
+  in diagnostics.
 - Non-browser foreground windows leave `diagnostics.cdp` and `web_path` unset.
 
 The intended strategy ladder is:
