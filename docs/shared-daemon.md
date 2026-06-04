@@ -56,6 +56,10 @@ both exit **4** instead of failing later inside a tool call.
   a client's stdio pipe open.
 - The daemon stays resident across individual client disconnects and does **not**
   `release_all` global input when one client leaves (only on full daemon shutdown).
+- Diagnostic bridge, Codex app-server, browser, Cargo/rustc, and test helper
+  processes are temporary. Close them after the check and reread the
+  process/socket table so only the intended daemon and requested user-facing
+  apps remain.
 
 ## Health
 
@@ -66,6 +70,13 @@ clients are connected.
 
 ## Troubleshooting
 
+- **Codex `mcp__synapse` says `Transport closed`** — treat this as configured
+  host setup work. Confirm the daemon process and `127.0.0.1:7700` socket, run
+  the configured bridge command
+  `C:\Users\hotra\.cargo\bin\synapse-mcp.exe --mode connect --bind 127.0.0.1:7700`
+  against the repo-built daemon, re-read health and tool discovery, and retry
+  the real wired `mcp__synapse` tools. Direct HTTP or standalone stdio probes
+  are diagnostics only; do not use them as FSV substitutes.
 - **`RegisterHotKey ... Hot key is already registered` / "leaked or duplicate
   synapse-mcp instance"** — more than one synapse-mcp is running. Run
   `synapse-mcp --mode doctor` to list them; `--mode doctor --kill-stray` removes
