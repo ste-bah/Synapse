@@ -225,6 +225,20 @@ impl SynapseService {
         Ok((handle, snapshot_handle, reflex_runtime))
     }
 
+    pub(super) fn m2_rate_limit_control(
+        &self,
+    ) -> Result<synapse_action::BackendRateLimitControl, ErrorData> {
+        self.m2_state
+            .lock()
+            .map(|state| state.rate_limit_control.clone())
+            .map_err(|_err| {
+                mcp_error(
+                    synapse_core::error_codes::OBSERVE_INTERNAL,
+                    "M2 service state lock poisoned",
+                )
+            })
+    }
+
     pub(super) fn profile_runtime(
         &self,
     ) -> Result<Arc<synapse_profiles::ProfileRuntime>, ErrorData> {

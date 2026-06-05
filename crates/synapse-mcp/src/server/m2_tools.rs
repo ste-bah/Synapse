@@ -12,11 +12,90 @@ use super::{
 use crate::m1::mcp_error;
 use crate::m2::{act_stroke_error_details, act_stroke_request_details};
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_core::{Backend, ForegroundContext, error_codes};
+use std::time::Duration;
+use synapse_action::{ACTION_QUEUE_CAPACITY, ActionError, ResolvedBackend, TokenBucketSnapshot};
+use synapse_core::{
+    Action, Backend, ForegroundContext, PathPoint, PathSpec, Point, StrokeMotionModel,
+    StrokeTiming, VelocityProfile, error_codes,
+};
 use tokio_util::sync::CancellationToken;
 
 const ACT_STROKE_FOREGROUND_MONITOR_INTERVAL_MS: u64 = 10;
+const ACTION_DIAGNOSTIC_RATE_LIMIT_CONFIRM: &str = "force-real-rate-limit-for-fsv";
+const ACTION_DIAGNOSTIC_QUEUE_FULL_CONFIRM: &str = "saturate-real-action-queue-for-fsv";
+const ACTION_DIAGNOSTIC_MAX_TTL_MS: u64 = 10_000;
+const ACTION_DIAGNOSTIC_MIN_TTL_MS: u64 = 100;
+const ACTION_DIAGNOSTIC_MAX_QUEUE_BLOCKER_MS: u32 = 10_000;
+const ACTION_DIAGNOSTIC_MIN_QUEUE_BLOCKER_MS: u32 = 250;
+const ACTION_DIAGNOSTIC_QUEUE_SETTLE_MS: u64 = 50;
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionDiagnosticRateLimitOverrideParams {
+    #[serde(default)]
+    pub confirm: String,
+    #[serde(default = "default_diagnostic_ttl_ms")]
+    #[schemars(default = "default_diagnostic_ttl_ms", range(min = 100, max = 10000))]
+    pub ttl_ms: u64,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionDiagnosticRateLimitOverrideResponse {
+    pub backend: String,
+    pub ttl_ms: u64,
+    pub before: TokenBucketReadback,
+    pub after: TokenBucketReadback,
+    pub reset_scheduled: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionDiagnosticQueueFullSetupParams {
+    #[serde(default)]
+    pub confirm: String,
+    #[serde(default = "default_queue_blocker_duration_ms")]
+    #[schemars(
+        default = "default_queue_blocker_duration_ms",
+        range(min = 250, max = 10000)
+    )]
+    pub blocker_duration_ms: u32,
+}
+
+#[derive(Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActionDiagnosticQueueFullSetupResponse {
+    pub backend: String,
+    pub expected_queue_capacity: u32,
+    pub blocker_duration_ms: u32,
+    pub blocker_from: Point,
+    pub blocker_to: Point,
+    pub blocker_queued: bool,
+    pub filler_attempts: u32,
+    pub queued_fillers: u32,
+    pub queue_full_observed: bool,
+    pub next_act_stroke_expected_error: String,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TokenBucketReadback {
+    pub capacity: u32,
+    pub tokens: u32,
+    pub refill_rate_per_s: u32,
+    pub last_refill_ns: u64,
+}
+
+const fn default_diagnostic_ttl_ms() -> u64 {
+    5_000
+}
+
+const fn default_queue_blocker_duration_ms() -> u32 {
+    5_000
+}
 
 #[tool_router(router = m2_tool_router, vis = "pub(super)")]
 impl SynapseService {
@@ -346,6 +425,168 @@ impl SynapseService {
         result.map(Json)
     }
 
+    #[tool(
+        description = "FSV diagnostic: temporarily force the real software action rate limiter empty so the next real act_stroke proves ACTION_RATE_LIMITED through the normal MCP action path"
+    )]
+    pub async fn action_diagnostic_rate_limit_override(
+        &self,
+        params: Parameters<ActionDiagnosticRateLimitOverrideParams>,
+    ) -> Result<Json<ActionDiagnosticRateLimitOverrideResponse>, ErrorData> {
+        let params = params.0;
+        const TOOL: &str = "action_diagnostic_rate_limit_override";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=action_diagnostic_rate_limit_override"
+        );
+        let request_details = json!({
+            "backend": ResolvedBackend::Software.as_str(),
+            "ttl_ms": params.ttl_ms,
+        });
+        if let Err(error) =
+            require_diagnostic_confirm(&params.confirm, ACTION_DIAGNOSTIC_RATE_LIMIT_CONFIRM, TOOL)
+        {
+            self.audit_action_denied_with_details(TOOL, &error, &request_details);
+            return Err(error);
+        }
+        if let Err(error) = validate_diagnostic_ttl_ms(params.ttl_ms) {
+            self.audit_action_denied_with_details(TOOL, &error, &request_details);
+            return Err(error);
+        }
+        let preflight = match self.ensure_supported_use_allows_action("act_stroke") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied_with_details(TOOL, &error, &request_details);
+                return Err(error);
+            }
+        };
+        self.audit_action_started_with_details(
+            TOOL,
+            &json!({
+                "request": request_details,
+                "preflight": preflight,
+            }),
+        )?;
+        let control = self.m2_rate_limit_control()?;
+        let override_readback = control
+            .override_backend(ResolvedBackend::Software, 0, 0)
+            .map_err(diagnostic_action_error_to_mcp)?;
+        let response = ActionDiagnosticRateLimitOverrideResponse {
+            backend: override_readback.backend.as_str().to_owned(),
+            ttl_ms: params.ttl_ms,
+            before: token_bucket_readback(override_readback.before),
+            after: token_bucket_readback(override_readback.after),
+            reset_scheduled: true,
+        };
+        schedule_rate_limit_reset(control, ResolvedBackend::Software, params.ttl_ms);
+        self.audit_action_ok_with_details(
+            TOOL,
+            &json!({
+                "response": response,
+                "preflight": preflight,
+            }),
+        )?;
+        Ok(Json(response))
+    }
+
+    #[tool(
+        description = "FSV diagnostic: saturate the real bounded action queue behind a long software blocker so the next real act_stroke proves ACTION_QUEUE_FULL through the normal MCP action path"
+    )]
+    pub async fn action_diagnostic_queue_full_setup(
+        &self,
+        params: Parameters<ActionDiagnosticQueueFullSetupParams>,
+    ) -> Result<Json<ActionDiagnosticQueueFullSetupResponse>, ErrorData> {
+        let params = params.0;
+        const TOOL: &str = "action_diagnostic_queue_full_setup";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=action_diagnostic_queue_full_setup"
+        );
+        let request_details = json!({
+            "backend": ResolvedBackend::Software.as_str(),
+            "expected_queue_capacity": ACTION_QUEUE_CAPACITY,
+            "blocker_duration_ms": params.blocker_duration_ms,
+        });
+        if let Err(error) =
+            require_diagnostic_confirm(&params.confirm, ACTION_DIAGNOSTIC_QUEUE_FULL_CONFIRM, TOOL)
+        {
+            self.audit_action_denied_with_details(TOOL, &error, &request_details);
+            return Err(error);
+        }
+        if let Err(error) = validate_queue_blocker_duration_ms(params.blocker_duration_ms) {
+            self.audit_action_denied_with_details(TOOL, &error, &request_details);
+            return Err(error);
+        }
+        let preflight = match self.ensure_supported_use_allows_action("act_stroke") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied_with_details(TOOL, &error, &request_details);
+                return Err(error);
+            }
+        };
+        self.audit_action_started_with_details(
+            TOOL,
+            &json!({
+                "request": request_details,
+                "preflight": preflight,
+            }),
+        )?;
+        let (handle, recording, _connection_closed_cancel) =
+            self.m2_action_context_for_session_id(None)?;
+        if recording.is_some() {
+            let error = mcp_error(
+                error_codes::ACTION_BACKEND_UNAVAILABLE,
+                "action_diagnostic_queue_full_setup requires the real action emitter, not the recording backend",
+            );
+            self.audit_action_error_with_details(TOOL, &error, &request_details)?;
+            return Err(error);
+        }
+        let from = synapse_action::backend::software::cursor_position()
+            .map_err(diagnostic_action_error_to_mcp)?;
+        let to = diagnostic_adjacent_point(from);
+        handle
+            .try_execute(diagnostic_queue_blocker_action(
+                from,
+                to,
+                params.blocker_duration_ms,
+            ))
+            .map_err(diagnostic_action_error_to_mcp)?;
+        tokio::time::sleep(Duration::from_millis(ACTION_DIAGNOSTIC_QUEUE_SETTLE_MS)).await;
+        let (filler_attempts, queued_fillers, queue_full_observed) =
+            saturate_action_queue(&handle)?;
+        if !queue_full_observed {
+            let error = mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "action_diagnostic_queue_full_setup failed to observe ACTION_QUEUE_FULL after {filler_attempts} attempts and {queued_fillers} queued fillers"
+                ),
+            );
+            self.audit_action_error_with_details(TOOL, &error, &request_details)?;
+            return Err(error);
+        }
+        let response = ActionDiagnosticQueueFullSetupResponse {
+            backend: ResolvedBackend::Software.as_str().to_owned(),
+            expected_queue_capacity: u32::try_from(ACTION_QUEUE_CAPACITY).unwrap_or(u32::MAX),
+            blocker_duration_ms: params.blocker_duration_ms,
+            blocker_from: from,
+            blocker_to: to,
+            blocker_queued: true,
+            filler_attempts,
+            queued_fillers,
+            queue_full_observed,
+            next_act_stroke_expected_error: error_codes::ACTION_QUEUE_FULL.to_owned(),
+        };
+        self.audit_action_ok_with_details(
+            TOOL,
+            &json!({
+                "response": response,
+                "preflight": preflight,
+            }),
+        )?;
+        Ok(Json(response))
+    }
+
     #[tool(description = "Release all held keyboard, mouse, and gamepad input state")]
     pub async fn release_all(
         &self,
@@ -438,6 +679,192 @@ fn log_act_stroke_failure(details: &Value, error: &ErrorData) {
         action_kind = "act_stroke",
         "act_stroke failed without fallback"
     );
+}
+
+fn require_diagnostic_confirm(
+    actual: &str,
+    expected: &'static str,
+    tool: &'static str,
+) -> Result<(), ErrorData> {
+    if actual == expected {
+        return Ok(());
+    }
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!("{tool} requires confirm=\"{expected}\""),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "detail_code": "ACTION_DIAGNOSTIC_CONFIRM_MISMATCH",
+            "expected_confirm": expected,
+            "actual_confirm_present": !actual.is_empty(),
+        })),
+    ))
+}
+
+fn validate_diagnostic_ttl_ms(ttl_ms: u64) -> Result<(), ErrorData> {
+    if (ACTION_DIAGNOSTIC_MIN_TTL_MS..=ACTION_DIAGNOSTIC_MAX_TTL_MS).contains(&ttl_ms) {
+        return Ok(());
+    }
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "diagnostic ttl_ms must be between {ACTION_DIAGNOSTIC_MIN_TTL_MS} and {ACTION_DIAGNOSTIC_MAX_TTL_MS}; got {ttl_ms}"
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "detail_code": "ACTION_DIAGNOSTIC_TTL_OUT_OF_RANGE",
+            "min_ttl_ms": ACTION_DIAGNOSTIC_MIN_TTL_MS,
+            "max_ttl_ms": ACTION_DIAGNOSTIC_MAX_TTL_MS,
+            "ttl_ms": ttl_ms,
+        })),
+    ))
+}
+
+fn validate_queue_blocker_duration_ms(duration_ms: u32) -> Result<(), ErrorData> {
+    if (ACTION_DIAGNOSTIC_MIN_QUEUE_BLOCKER_MS..=ACTION_DIAGNOSTIC_MAX_QUEUE_BLOCKER_MS)
+        .contains(&duration_ms)
+    {
+        return Ok(());
+    }
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "diagnostic blocker_duration_ms must be between {ACTION_DIAGNOSTIC_MIN_QUEUE_BLOCKER_MS} and {ACTION_DIAGNOSTIC_MAX_QUEUE_BLOCKER_MS}; got {duration_ms}"
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "detail_code": "ACTION_DIAGNOSTIC_QUEUE_BLOCKER_DURATION_OUT_OF_RANGE",
+            "min_blocker_duration_ms": ACTION_DIAGNOSTIC_MIN_QUEUE_BLOCKER_MS,
+            "max_blocker_duration_ms": ACTION_DIAGNOSTIC_MAX_QUEUE_BLOCKER_MS,
+            "blocker_duration_ms": duration_ms,
+        })),
+    ))
+}
+
+fn token_bucket_readback(snapshot: TokenBucketSnapshot) -> TokenBucketReadback {
+    TokenBucketReadback {
+        capacity: snapshot.capacity,
+        tokens: snapshot.tokens,
+        refill_rate_per_s: snapshot.refill_rate_per_s,
+        last_refill_ns: snapshot.last_refill_ns,
+    }
+}
+
+fn schedule_rate_limit_reset(
+    control: synapse_action::BackendRateLimitControl,
+    backend: ResolvedBackend,
+    ttl_ms: u64,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(ttl_ms)).await;
+        match control.reset_backend(backend) {
+            Ok(readback) => {
+                tracing::info!(
+                    code = "ACTION_DIAGNOSTIC_RATE_LIMIT_RESET",
+                    backend = readback.backend.as_str(),
+                    before_capacity = readback.before.capacity,
+                    before_tokens = readback.before.tokens,
+                    before_refill_rate_per_s = readback.before.refill_rate_per_s,
+                    after_capacity = readback.after.capacity,
+                    after_tokens = readback.after.tokens,
+                    after_refill_rate_per_s = readback.after.refill_rate_per_s,
+                    "action diagnostic rate limit reset completed"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = error.code(),
+                    backend = backend.as_str(),
+                    detail = error.detail(),
+                    "action diagnostic rate limit reset failed"
+                );
+            }
+        }
+    });
+}
+
+fn diagnostic_adjacent_point(from: Point) -> Point {
+    let x = if from.x == i32::MAX {
+        from.x - 1
+    } else {
+        from.x + 1
+    };
+    Point { x, y: from.y }
+}
+
+fn diagnostic_queue_blocker_action(from: Point, to: Point, duration_ms: u32) -> Action {
+    Action::MouseStroke {
+        path: PathSpec::Line {
+            from: PathPoint::from(from),
+            to: PathPoint::from(to),
+        },
+        button: None,
+        profile: VelocityProfile::Constant,
+        timing: StrokeTiming::DurationMs { duration_ms },
+        motion_model: StrokeMotionModel::Path,
+        humanize: None,
+        backend: Backend::Software,
+    }
+}
+
+fn saturate_action_queue(
+    handle: &synapse_action::ActionHandle,
+) -> Result<(u32, u32, bool), ErrorData> {
+    let mut filler_attempts = 0_u32;
+    let mut queued_fillers = 0_u32;
+    for _ in 0..=ACTION_QUEUE_CAPACITY {
+        filler_attempts = filler_attempts.saturating_add(1);
+        let action = Action::MouseMoveRelative {
+            dx: 0.0,
+            dy: 0.0,
+            backend: Backend::Software,
+        };
+        match handle.try_execute(action) {
+            Ok(()) => {
+                queued_fillers = queued_fillers.saturating_add(1);
+            }
+            Err(ActionError::QueueFull { .. }) => {
+                return Ok((filler_attempts, queued_fillers, true));
+            }
+            Err(error) => {
+                return Err(diagnostic_action_error_to_mcp(error));
+            }
+        }
+    }
+    Ok((filler_attempts, queued_fillers, false))
+}
+
+fn diagnostic_action_error_to_mcp(error: ActionError) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        error.to_string(),
+        Some(json!({
+            "code": error.code(),
+            "detail": error.detail(),
+            "retry_after_ms": error.retry_after_ms(),
+            "queue_rate_state": diagnostic_queue_rate_state(&error),
+        })),
+    )
+}
+
+fn diagnostic_queue_rate_state(error: &ActionError) -> Value {
+    match error {
+        ActionError::RateLimited {
+            retry_after_ms,
+            detail,
+        } => json!({
+            "kind": "rate_limited",
+            "retry_after_ms": retry_after_ms,
+            "detail": detail,
+        }),
+        ActionError::QueueFull { detail } => json!({
+            "kind": "queue_full",
+            "detail": detail,
+        }),
+        _ => json!({
+            "kind": "not_rate_or_queue",
+        }),
+    }
 }
 
 impl SynapseService {

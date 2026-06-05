@@ -19,12 +19,14 @@ mod state;
 mod tests;
 
 pub use backends::Backends;
+pub use rate_limits::{
+    BackendRateLimitControl, BackendRateLimitOverrideReadback, BackendRateLimitSnapshot,
+};
 pub use state::{
     ActionEmitterSnapshotHandle, ActionSnapshotMessage, ActionStateSnapshot, EmitState,
 };
 
 use keyboard::{HeldKeyAutoRelease, HeldKeyTimerKey};
-use rate_limits::BackendRateLimits;
 
 pub const HELD_KEY_MAX_DURATION_MS: u64 = 30_000;
 
@@ -37,7 +39,7 @@ pub struct ActionEmitter {
     state: EmitState,
     backends: Backends,
     backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
-    rate_limits: BackendRateLimits,
+    pub(super) rate_limits: BackendRateLimitControl,
     held_key_timers: HashMap<HeldKeyTimerKey, JoinHandle<()>>,
     held_key_timer_ids: HashMap<HeldKeyTimerKey, u64>,
     next_held_key_timer_id: u64,

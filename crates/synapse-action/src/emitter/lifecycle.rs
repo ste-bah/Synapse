@@ -6,9 +6,10 @@ use std::{
 use tokio::{sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
+use super::rate_limits::{BackendRateLimitControl, BackendRateLimits};
 use super::{
     ActionEmitter, ActionEmitterSnapshotHandle, ActionSnapshotMessage, ActionStateSnapshot,
-    BackendRateLimits, Backends, EmitState,
+    Backends, EmitState,
 };
 use crate::{
     ACTION_QUEUE_CAPACITY, ActionBackend, ActionError, ActionHandle, ActionMessage, ActionResult,
@@ -73,7 +74,7 @@ impl ActionEmitter {
             state: EmitState::new(),
             backends,
             backend_resolution,
-            rate_limits: BackendRateLimits::new(),
+            rate_limits: BackendRateLimitControl::new(BackendRateLimits::new()),
             held_key_timers: HashMap::new(),
             held_key_timer_ids: HashMap::new(),
             next_held_key_timer_id: 0,
@@ -117,7 +118,7 @@ impl ActionEmitter {
             state: EmitState::new(),
             backends,
             backend_resolution,
-            rate_limits,
+            rate_limits: BackendRateLimitControl::new(rate_limits),
             held_key_timers: HashMap::new(),
             held_key_timer_ids: HashMap::new(),
             next_held_key_timer_id: 0,
@@ -179,6 +180,11 @@ impl ActionEmitter {
         backend: Arc<dyn ActionBackend>,
     ) -> (ActionHandle, ActionEmitterSnapshotHandle, Self) {
         Self::channel_with_backends(Backends::all_routed_to(backend))
+    }
+
+    #[must_use]
+    pub fn rate_limit_control(&self) -> BackendRateLimitControl {
+        self.rate_limits.clone()
     }
 
     /// Spawns the action serialization actor on the current Tokio runtime.

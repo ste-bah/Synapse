@@ -4,10 +4,7 @@ use synapse_core::{Action, ComboInput, error_codes};
 
 use super::routing::{action_consumes_rate_limit, action_kind, resolved_backend_for_action};
 use super::{ActionEmitter, EmitState, HeldKeyTimerKey};
-use crate::{
-    ActionBackend, ActionError, ActionResult, ResolvedBackend,
-    rate_limit::retry_after_ms_for_snapshot,
-};
+use crate::{ActionBackend, ActionError, ActionResult, ResolvedBackend};
 
 impl ActionEmitter {
     #[tracing::instrument(skip_all, fields(action_kind = %action_kind(&action)))]
@@ -123,23 +120,7 @@ impl ActionEmitter {
     }
 
     fn consume_rate_limit(&self, backend: ResolvedBackend) -> ActionResult<()> {
-        let bucket = self.rate_limits.bucket(backend);
-        if bucket.try_consume(1) {
-            return Ok(());
-        }
-
-        let snapshot = bucket.snapshot();
-        let retry_after_ms = retry_after_ms_for_snapshot(snapshot, 1);
-        Err(ActionError::RateLimited {
-            detail: format!(
-                "backend={} retry_after_ms={} requested_tokens=1 available_tokens={} refill_rate_per_s={}",
-                backend.as_str(),
-                retry_after_ms,
-                snapshot.tokens,
-                snapshot.refill_rate_per_s
-            ),
-            retry_after_ms,
-        })
+        self.rate_limits.consume(backend)
     }
 
     #[tracing::instrument(skip_all, fields(action_kind = "release_all"))]

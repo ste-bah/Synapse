@@ -15,7 +15,7 @@ use std::{
 
 use synapse_action::{
     ActionBackend, ActionEmitter, ActionEmitterSnapshotHandle, ActionHandle, ActionStateSnapshot,
-    BackendResolutionPolicy, RELEASE_ALL_HANDLE, RecordingBackend,
+    BackendRateLimitControl, BackendResolutionPolicy, RELEASE_ALL_HANDLE, RecordingBackend,
     initialize_double_click_timing_cache,
 };
 use tokio::{sync::watch, task::JoinHandle};
@@ -48,6 +48,7 @@ pub type SharedM2State = Arc<Mutex<M2State>>;
 pub struct M2State {
     pub emitter_handle: ActionHandle,
     pub snapshot_handle: ActionEmitterSnapshotHandle,
+    pub rate_limit_control: BackendRateLimitControl,
     pub recording: Option<Arc<RecordingBackend>>,
     pub connection_closed_cancel: Option<CancellationToken>,
     backend_resolution: Arc<RwLock<BackendResolutionPolicy>>,
@@ -205,6 +206,7 @@ impl M2State {
                 )
             },
         );
+        let rate_limit_control = emitter.rate_limit_control();
         if tokio::runtime::Handle::try_current().is_ok() {
             let _release_handle_result = RELEASE_ALL_HANDLE.set(emitter_handle.clone());
             let (done_tx, done_rx) = watch::channel(None);
@@ -222,6 +224,7 @@ impl M2State {
             return Self {
                 emitter_handle,
                 snapshot_handle,
+                rate_limit_control,
                 recording,
                 connection_closed_cancel: tool_connection_closed_cancel,
                 backend_resolution,
@@ -236,6 +239,7 @@ impl M2State {
         Self {
             emitter_handle,
             snapshot_handle,
+            rate_limit_control,
             recording,
             connection_closed_cancel: tool_connection_closed_cancel,
             backend_resolution,
@@ -315,6 +319,10 @@ impl fmt::Debug for M2State {
             .debug_struct("M2State")
             .field("emitter_handle", &self.emitter_handle)
             .field("snapshot_handle", &self.snapshot_handle)
+            .field(
+                "rate_limit_control",
+                &self.rate_limit_control.try_snapshot().ok(),
+            )
             .field("recording", &self.recording_enabled())
             .field(
                 "connection_closed_cancel",

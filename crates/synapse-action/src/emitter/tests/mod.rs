@@ -14,6 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tracing_subscriber::fmt::writer::MakeWriter;
 
 use super::keyboard::key_log_label;
+use super::rate_limits::BackendRateLimits;
 use super::*;
 
 mod auto_release;
