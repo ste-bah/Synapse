@@ -264,6 +264,11 @@ fn wind_mouse_points(
         if distance <= WIND_MOUSE_TARGET_TOLERANCE_PX {
             break;
         }
+        if distance <= params.max_step {
+            current = to;
+            points.push(current);
+            break;
+        }
 
         if distance >= params.damped_distance {
             let wind_limit = params.wind.min(distance);
@@ -300,7 +305,7 @@ fn wind_mouse_points(
     }
 
     let remaining = current.distance_to(to);
-    if remaining > params.max_step.max(WIND_MOUSE_TARGET_TOLERANCE_PX) {
+    if remaining > WIND_MOUSE_TARGET_TOLERANCE_PX {
         return Err(StrokeError::WindMouseDidNotConverge {
             max_points: WIND_MOUSE_MAX_POINTS,
             remaining_distance_px: remaining,

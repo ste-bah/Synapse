@@ -143,6 +143,44 @@ fn wind_mouse_motion_model_is_seeded_curved_variable_and_converges() {
 }
 
 #[test]
+fn wind_mouse_screen_space_diagonal_stops_at_target_zone() {
+    let path = line_path(2200.0, 320.0, 2320.0, 340.0);
+    let model = StrokeMotionModel::WindMouse {
+        gravity: 9.0,
+        wind: 3.0,
+        max_step: 12.0,
+        damped_distance: 50.0,
+        seed: Some(42),
+    };
+
+    let plan = plan_timed_stroke(
+        &path,
+        VelocityProfile::Constant,
+        &StrokeTiming::DurationMs { duration_ms: 120 },
+        model,
+        None,
+    )
+    .expect("screen-space wind_mouse stroke should converge without exhausting the point cap");
+
+    let arclen = plan.samples.last().map_or(f64::NAN, |sample| sample.arclen);
+    println!(
+        "readback=mouse_stroke_plan edge=wind_mouse_screen_diagonal before=line:(2200,320)->(2320,340),seed:42,damped:50 after_points={} after_last_arclen={arclen:.3} result_value=final:{:?}",
+        plan.samples.len(),
+        plan.samples.last().map(|sample| sample.point)
+    );
+
+    assert!(
+        plan.samples.len() < 256,
+        "wind_mouse must not exhaust the point cap for bounded screen-space strokes"
+    );
+    assert_eq!(
+        plan.samples.last().map(|sample| sample.point),
+        Some(PathPoint::new(2320.0, 340.0))
+    );
+    assert!(monotonic_elapsed(&plan.samples));
+}
+
+#[test]
 fn wind_mouse_motion_model_rejects_invalid_edges() {
     let line = line_path(0.0, 0.0, 120.0, 0.0);
     let bad_param = plan_timed_stroke(
