@@ -15,6 +15,7 @@ mod tests;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ElementClickOutcome {
     Invoked,
+    Toggled,
     CoordinateFallback(CoordinateFallbackPlan),
 }
 
@@ -24,19 +25,21 @@ pub struct CoordinateFallbackPlan {
     pub window_point: Point,
 }
 
-/// Re-resolves a Synapse accessibility element and invokes its UIA
-/// `InvokePattern` without moving the cursor.
+/// Re-resolves a Synapse accessibility element and dispatches a semantic UIA
+/// click (`InvokePattern` or `TogglePattern`) without moving the cursor.
 ///
 /// # Errors
 ///
 /// On Windows, `synapse_a11y::re_resolve` failures are mapped to
-/// `ACTION_ELEMENT_NOT_RESOLVED`. Missing or failing `InvokePattern` calls are
-/// reported as `ACTION_TARGET_INVALID` so the higher-level click path can fall
-/// through to coordinate click handling.
+/// `ACTION_ELEMENT_NOT_RESOLVED`. Missing semantic patterns are reported as
+/// `ACTION_TARGET_INVALID` so the higher-level click path can fall through to
+/// coordinate click handling.
 #[cfg(windows)]
 pub fn invoke_element(element_id: &ElementId) -> ActionResult<()> {
     match synapse_a11y::click_element_action(element_id).map_err(a11y_error_to_action)? {
-        synapse_a11y::ElementClickAction::Invoked => Ok(()),
+        synapse_a11y::ElementClickAction::Invoked | synapse_a11y::ElementClickAction::Toggled => {
+            Ok(())
+        }
         synapse_a11y::ElementClickAction::CoordinateFallback { .. } => Err(
             resolver::invoke_pattern_unavailable(element_id, "pattern not available"),
         ),
@@ -57,9 +60,9 @@ pub fn invoke_element(element_id: &ElementId) -> ActionResult<()> {
     })
 }
 
-/// Attempts semantic UIA invoke first, then falls back to a coordinate click at
-/// the resolved element's bounding-rectangle center when `InvokePattern` is not
-/// available.
+/// Attempts a semantic UIA click first, then falls back to a coordinate click at
+/// the resolved element's bounding-rectangle center when no supported semantic
+/// pattern is available.
 ///
 /// # Errors
 ///
@@ -79,6 +82,7 @@ where
 {
     match synapse_a11y::click_element_action(element_id).map_err(a11y_error_to_action)? {
         synapse_a11y::ElementClickAction::Invoked => Ok(ElementClickOutcome::Invoked),
+        synapse_a11y::ElementClickAction::Toggled => Ok(ElementClickOutcome::Toggled),
         synapse_a11y::ElementClickAction::CoordinateFallback { bbox } => {
             let plan = resolver::coordinate_fallback_plan(element_id, bbox)?;
             dispatch::emit_coordinate_fallback_click(backend, state, button, plan)?;

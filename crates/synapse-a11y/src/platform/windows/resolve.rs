@@ -1,7 +1,7 @@
 use synapse_core::{ElementId, Rect};
 use uiautomation::{
     UIAutomation, UIElement,
-    patterns::{UIExpandCollapsePattern, UIInvokePattern, UIValuePattern},
+    patterns::{UIExpandCollapsePattern, UIInvokePattern, UITogglePattern, UIValuePattern},
     types::{ElementMode, ExpandCollapseState, Handle, Rect as UiaRect, TreeScope},
 };
 
@@ -68,19 +68,32 @@ pub fn click_element_action(id: &ElementId) -> A11yResult<ElementClickAction> {
     let id = id.clone();
     with_automation(move |automation| {
         let element = re_resolve_on_worker(automation, &id)?;
-        let pattern: Result<UIInvokePattern, _> = element.get_pattern();
-        match pattern {
-            Ok(pattern) => {
-                pattern.invoke().map_err(|err| {
+        let invoke_pattern: Result<UIInvokePattern, _> = element.get_pattern();
+        match invoke_pattern {
+            Ok(invoke_pattern) => {
+                invoke_pattern.invoke().map_err(|err| {
                     A11yError::internal(format!(
                         "InvokePattern.invoke failed for element {id}: {err}"
                     ))
                 })?;
                 Ok(ElementClickAction::Invoked)
             }
-            Err(_missing_pattern) => Ok(ElementClickAction::CoordinateFallback {
-                bbox: element_rect(&element)?,
-            }),
+            Err(_missing_invoke_pattern) => {
+                let toggle_pattern: Result<UITogglePattern, _> = element.get_pattern();
+                match toggle_pattern {
+                    Ok(toggle_pattern) => {
+                        toggle_pattern.toggle().map_err(|err| {
+                            A11yError::internal(format!(
+                                "TogglePattern.toggle failed for element {id}: {err}"
+                            ))
+                        })?;
+                        Ok(ElementClickAction::Toggled)
+                    }
+                    Err(_missing_toggle_pattern) => Ok(ElementClickAction::CoordinateFallback {
+                        bbox: element_rect(&element)?,
+                    }),
+                }
+            }
         }
     })
 }

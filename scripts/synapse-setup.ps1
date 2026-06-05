@@ -1053,14 +1053,14 @@ function Assert-SynapseProcessStopTarget {
 
     $exeLeaf = if ($current.ExecutablePath) { Split-Path -Leaf $current.ExecutablePath } else { '' }
     if ($current.Name -ine 'synapse-mcp.exe' -and $exeLeaf -ine 'synapse-mcp.exe') {
-        Die ("SYNAPSE_PROCESS_STOP_TARGET_MISMATCH pid={0} expected=synapse-mcp.exe actual_name={1} actual_path={2} command_line={3} remediation=PID was reused or snapshot was not a Synapse process; refusing taskkill /T" -f `
+        Die ("SYNAPSE_PROCESS_STOP_TARGET_MISMATCH pid={0} expected=synapse-mcp.exe actual_name={1} actual_path={2} command_line={3} remediation=PID was reused or snapshot was not a Synapse process; refusing exact-PID stop" -f `
             $pidValue,
             $current.Name,
             $current.ExecutablePath,
             $current.CommandLine)
     }
     if ($current.CommandLine -notmatch '(?i)synapse-mcp(\.exe)?') {
-        Die ("SYNAPSE_PROCESS_STOP_TARGET_UNVERIFIED pid={0} name={1} command_line={2} remediation=command line does not prove a Synapse MCP target; refusing taskkill /T" -f `
+        Die ("SYNAPSE_PROCESS_STOP_TARGET_UNVERIFIED pid={0} name={1} command_line={2} remediation=command line does not prove a Synapse MCP target; refusing exact-PID stop" -f `
             $pidValue,
             $current.Name,
             $current.CommandLine)
@@ -1082,21 +1082,18 @@ function Stop-SynapseMcpProcesses {
         return
     }
 
-    $taskkillPath = Join-Path $env:SystemRoot 'System32\taskkill.exe'
-    if (-not (Test-Path $taskkillPath)) {
-        Die "SYNAPSE_TASKKILL_MISSING path=$taskkillPath remediation=repair Windows SystemRoot or run setup from a normal Windows environment"
-    }
-
     foreach ($proc in $before) {
         $verified = Assert-SynapseProcessStopTarget -SnapshotProcess $proc
         if (-not $verified) { continue }
         $pidValue = [int]$verified.ProcessId
-        $taskkillOutput = & $taskkillPath /pid $pidValue /t /f 2>&1
-        $taskkillExit = $LASTEXITCODE
-        if ($taskkillOutput) {
-            Info ("taskkill pid={0} exit={1}: {2}" -f $pidValue, $taskkillExit, (($taskkillOutput | Out-String).Trim()))
-        } else {
-            Info "taskkill pid=$pidValue exit=$taskkillExit"
+        try {
+            Stop-Process -Id $pidValue -Force -ErrorAction Stop
+            Info "Synapse process exact-PID stop issued pid=$pidValue reason=$Reason"
+        } catch {
+            Die ("SYNAPSE_PROCESS_STOP_FAILED pid={0} reason={1} error={2} remediation=setup only stops verified synapse-mcp.exe PIDs; inspect process ownership and retry after the daemon exits" -f `
+                $pidValue,
+                $Reason,
+                $_.Exception.Message)
         }
     }
 

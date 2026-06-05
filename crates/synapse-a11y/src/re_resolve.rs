@@ -19,6 +19,7 @@ pub fn re_resolve(id: &ElementId) -> A11yResult<UIElement> {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ElementClickAction {
     Invoked,
+    Toggled,
     CoordinateFallback { bbox: Rect },
 }
 
@@ -42,8 +43,8 @@ pub fn element_bounding_rect(id: &ElementId) -> A11yResult<Rect> {
     platform::element_bounding_rect(id)
 }
 
-/// Attempts UIA `InvokePattern` for an element, otherwise returns its bbox for
-/// caller-owned coordinate fallback.
+/// Attempts a semantic UIA click (`InvokePattern`, then `TogglePattern`) for an
+/// element, otherwise returns its bbox for caller-owned coordinate fallback.
 ///
 /// # Errors
 ///

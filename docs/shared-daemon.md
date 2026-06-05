@@ -86,6 +86,12 @@ both exit **4** instead of failing later inside a tool call.
   are printed as `stale_tcp_connections`. Use `-ForceRestart` only after a
   deliberate maintenance decision; setup must not silently interrupt another
   agent.
+- When setup does restart the daemon, it stops only the verified
+  `synapse-mcp.exe` daemon PID. It must not use process-tree termination such
+  as `taskkill /T`, because apps launched through `act_launch` can be daemon
+  children and may contain user state. Child app cleanup is separate
+  owner-known work: close only exact PIDs that the current verification spawned
+  and recorded, and leave uncertain user-facing windows running.
 - `scripts/synapse-setup.ps1` also takes an exclusive
   `%LOCALAPPDATA%\synapse\setup-maintenance.lock.json` file handle before
   setup/remove. This serializes multi-agent install/restart work. The lock file
@@ -168,6 +174,11 @@ not accepted as live session proof.
   prove an attached client. If a restart is truly required while clients are
   attached, rerun with `-ForceRestart` only after coordinating a maintenance
   window; this flag exists to make interruption explicit.
+- **Setup killed a launched app/window** — this is a setup bug. Setup is only
+  allowed to stop verified `synapse-mcp.exe` daemon PIDs, never their child
+  process tree. Inspect the process stop log, patch setup before rerunning it,
+  and verify that an exact-PID daemon restart leaves a synthetic daemon child
+  process alive.
 - **Setup/update says `SYNAPSE_SETUP_MAINTENANCE_LOCK_HELD`** — another setup
   or remove operation is already running. Read the lock file owner fields, wait
   for that process to exit, or inspect that exact PID. Do not close terminal

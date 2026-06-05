@@ -69,6 +69,26 @@ By default the automation profile is temporary and per launch. Set
 example to keep a login session across runs. Do not point it at the user's
 primary browser profile.
 
+## Already-Running User Browsers
+
+Synapse cannot turn CDP on inside an already-running Chrome/Edge process that
+was launched without a remote-debugging port. For an existing authenticated
+browser session, the supported attach path is:
+
+1. Read `observe.diagnostics.cdp`.
+2. If it is `A11Y_CDP_UNREACHABLE`, verify whether that browser was already
+   launched with a debug port.
+3. If it was, set `SYNAPSE_CDP_PORTS` to that port before starting the daemon
+   or launch the daemon with that environment so `observe`/`find` can probe it.
+4. If it was not, relaunch the browser with an explicit debug port and a
+   non-default `--user-data-dir`, or use Synapse `act_launch` so the automation
+   profile and debug port are created together.
+
+Do not treat a fresh automation profile as equivalent to the user's primary
+profile when cookies/session state matter. Also do not silently fall back to
+coordinate-only web automation and claim DOM access; `web_path = uia_only` means
+the DOM was not read.
+
 ## Optional UIA Renderer Accessibility
 
 CDP is the preferred browser DOM path. When you specifically need the Chromium
@@ -136,6 +156,11 @@ find(role="button", name_substring="Apply", limit=5)
 act_click(target={ element_id="<cdp-backed element id from find>" })
 observe(include=["focused","elements","diagnostics"], max_elements=200)
 ```
+
+For UIA-only browser content, `act_click` element targets prefer semantic UIA
+patterns (`InvokePattern`, then `TogglePattern`) before coordinate fallback.
+Only set `use_invoke_pattern = false` when the operator explicitly wants a raw
+coordinate click and the post-click foreground/readback will be verified.
 
 The final `observe` is not the verdict by itself. Full State Verification still
 requires a separate read of the real outcome produced by the web action.

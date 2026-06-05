@@ -82,6 +82,11 @@ pub(super) async fn execute_element_click(
                 used_invoke_pattern = true;
                 backend_used = "uia";
             }
+            ElementClickOutcome::Toggled => {
+                trace_element_click_outcome(element, click_index, "toggled", None);
+                used_invoke_pattern = true;
+                backend_used = "uia";
+            }
             ElementClickOutcome::CoordinateFallback(plan) => {
                 trace_element_click_outcome(
                     element,
