@@ -41,7 +41,15 @@ pub(super) async fn execute_element_click(
 ) -> Result<ActClickResponse, ErrorData> {
     if element_is_coordinate_only(&element.element_id) || !params.use_invoke_pattern {
         let screen_point = element_center(&element.element_id)?;
-        trace_element_click_outcome(element, 0, "coordinate_direct", Some(screen_point));
+        trace_element_click_outcome(
+            element,
+            0,
+            "coordinate_direct",
+            ElementClickTraceReadback {
+                fallback_screen_point: Some(screen_point),
+                ..ElementClickTraceReadback::default()
+            },
+        );
         let actions = coordinate_click_actions(params, screen_point);
         let backend_used = if let Some(recording) = recording {
             record::execute_recording(recording, &actions, params.clicks, timing).await?;
@@ -81,23 +89,117 @@ pub(super) async fn execute_element_click(
 
         match outcome {
             ElementClickOutcome::Invoked => {
-                trace_element_click_outcome(element, click_index, "invoked", None);
+                trace_element_click_outcome(
+                    element,
+                    click_index,
+                    "invoked",
+                    ElementClickTraceReadback::default(),
+                );
                 used_invoke_pattern = true;
                 backend_used = "uia";
             }
-            ElementClickOutcome::Toggled => {
-                trace_element_click_outcome(element, click_index, "toggled", None);
+            ElementClickOutcome::Toggled {
+                before_state,
+                after_state,
+            } => {
+                trace_element_click_outcome(
+                    element,
+                    click_index,
+                    "toggled",
+                    ElementClickTraceReadback {
+                        state_before: Some(before_state.as_str()),
+                        state_after: Some(after_state.as_str()),
+                        ..ElementClickTraceReadback::default()
+                    },
+                );
+                used_invoke_pattern = true;
+                backend_used = "uia";
+            }
+            ElementClickOutcome::Selected {
+                was_selected,
+                is_selected,
+            } => {
+                trace_element_click_outcome(
+                    element,
+                    click_index,
+                    "selected",
+                    ElementClickTraceReadback {
+                        selected_before: Some(was_selected),
+                        selected_after: Some(is_selected),
+                        ..ElementClickTraceReadback::default()
+                    },
+                );
+                used_invoke_pattern = true;
+                backend_used = "uia";
+            }
+            ElementClickOutcome::Expanded {
+                before_state,
+                after_state,
+            } => {
+                let before_state = format!("{before_state:?}");
+                let after_state = format!("{after_state:?}");
+                trace_element_click_outcome(
+                    element,
+                    click_index,
+                    "expanded",
+                    ElementClickTraceReadback {
+                        state_before: Some(before_state.as_str()),
+                        state_after: Some(after_state.as_str()),
+                        ..ElementClickTraceReadback::default()
+                    },
+                );
+                used_invoke_pattern = true;
+                backend_used = "uia";
+            }
+            ElementClickOutcome::Collapsed {
+                before_state,
+                after_state,
+            } => {
+                let before_state = format!("{before_state:?}");
+                let after_state = format!("{after_state:?}");
+                trace_element_click_outcome(
+                    element,
+                    click_index,
+                    "collapsed",
+                    ElementClickTraceReadback {
+                        state_before: Some(before_state.as_str()),
+                        state_after: Some(after_state.as_str()),
+                        ..ElementClickTraceReadback::default()
+                    },
+                );
+                used_invoke_pattern = true;
+                backend_used = "uia";
+            }
+            ElementClickOutcome::LegacyDefaultAction { default_action } => {
+                trace_element_click_outcome(
+                    element,
+                    click_index,
+                    "legacy_default_action",
+                    ElementClickTraceReadback {
+                        legacy_default_action: default_action.as_deref(),
+                        ..ElementClickTraceReadback::default()
+                    },
+                );
                 used_invoke_pattern = true;
                 backend_used = "uia";
             }
             ElementClickOutcome::CoordinateFallback(plan) => {
-                trace_element_click_outcome(
-                    element,
-                    click_index,
-                    "coordinate_fallback",
-                    Some(plan.screen_point),
+                tracing::error!(
+                    code = "M2_ACT_CLICK_UNEXPECTED_COORDINATE_FALLBACK",
+                    kind = "act_click",
+                    element_id = %element.element_id,
+                    screen_x = plan.screen_point.x,
+                    screen_y = plan.screen_point.y,
+                    "semantic UIA element click returned a coordinate fallback plan; no fallback delivery attempted"
                 );
-                backend_used = "software";
+                return Err(action_error_to_mcp(
+                    &ActionError::ElementPatternUnsupported {
+                        element_id: element.element_id.clone(),
+                        detail: format!(
+                            "semantic UIA click path unexpectedly produced coordinate fallback plan {plan:?}; no fallback delivery was attempted"
+                        ),
+                    },
+                ));
             }
         }
 
@@ -296,11 +398,21 @@ fn element_is_coordinate_only(element_id: &synapse_core::ElementId) -> bool {
     crate::m1::is_browser_ocr_element_id(element_id)
 }
 
+#[derive(Default)]
+struct ElementClickTraceReadback<'a> {
+    fallback_screen_point: Option<Point>,
+    state_before: Option<&'a str>,
+    state_after: Option<&'a str>,
+    selected_before: Option<bool>,
+    selected_after: Option<bool>,
+    legacy_default_action: Option<&'a str>,
+}
+
 fn trace_element_click_outcome(
     element: &ActClickElementTarget,
     click_index: u8,
     outcome: &'static str,
-    fallback_screen_point: Option<Point>,
+    readback: ElementClickTraceReadback<'_>,
 ) {
     tracing::info!(
         code = "M2_ACT_CLICK_ELEMENT_READBACK",
@@ -308,8 +420,13 @@ fn trace_element_click_outcome(
         element_id = %element.element_id,
         click_number = u32::from(click_index) + 1,
         outcome,
-        fallback_screen_x = fallback_screen_point.map(|point| point.x),
-        fallback_screen_y = fallback_screen_point.map(|point| point.y),
+        state_before = readback.state_before,
+        state_after = readback.state_after,
+        selected_before = readback.selected_before,
+        selected_after = readback.selected_after,
+        legacy_default_action = readback.legacy_default_action,
+        fallback_screen_x = readback.fallback_screen_point.map(|point| point.x),
+        fallback_screen_y = readback.fallback_screen_point.map(|point| point.y),
         "readback=action_backend tool=act_click element_click_after"
     );
 }

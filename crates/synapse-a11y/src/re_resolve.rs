@@ -19,8 +19,25 @@ pub fn re_resolve(id: &ElementId) -> A11yResult<UIElement> {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ElementClickAction {
     Invoked,
-    Toggled,
-    CoordinateFallback { bbox: Rect },
+    Toggled {
+        before_state: String,
+        after_state: String,
+    },
+    Selected {
+        was_selected: bool,
+        is_selected: bool,
+    },
+    Expanded {
+        before_state: ExpandState,
+        after_state: ExpandState,
+    },
+    Collapsed {
+        before_state: ExpandState,
+        after_state: ExpandState,
+    },
+    LegacyDefaultAction {
+        default_action: Option<String>,
+    },
 }
 
 /// Readback from setting an element's native text/value on the UIA worker.
@@ -43,13 +60,18 @@ pub fn element_bounding_rect(id: &ElementId) -> A11yResult<Rect> {
     platform::element_bounding_rect(id)
 }
 
-/// Attempts a semantic UIA click (`InvokePattern`, then `TogglePattern`) for an
-/// element, otherwise returns its bbox for caller-owned coordinate fallback.
+/// Attempts a semantic UIA click for an element using supported UIA control
+/// patterns.
+///
+/// No coordinate fallback is synthesized here; unsupported elements return
+/// `ACTION_ELEMENT_PATTERN_UNSUPPORTED` so the caller can decide the next
+/// explicit delivery tier.
 ///
 /// # Errors
 ///
 /// Returns `A11Y_ELEMENT_STALE` when the element id cannot be re-resolved, a
-/// structured UIA error for invoke/bbox failures, or `A11Y_NOT_AVAILABLE` on
+/// typed unsupported-pattern error when no click-like UIA pattern is exposed, a
+/// structured UIA error for pattern method failures, or `A11Y_NOT_AVAILABLE` on
 /// non-Windows platforms.
 pub fn click_element_action(id: &ElementId) -> A11yResult<ElementClickAction> {
     platform::click_element_action(id)

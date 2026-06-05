@@ -211,7 +211,9 @@ pub(super) fn create_cache_request(
         UIProperty::IsTogglePatternAvailable,
         UIProperty::IsValuePatternAvailable,
         UIProperty::IsSelectionPatternAvailable,
+        UIProperty::IsSelectionItemPatternAvailable,
         UIProperty::IsExpandCollapsePatternAvailable,
+        UIProperty::IsLegacyIAccessiblePatternAvailable,
         UIProperty::IsScrollPatternAvailable,
         UIProperty::IsTextPatternAvailable,
         UIProperty::IsWindowPatternAvailable,
@@ -268,8 +270,20 @@ pub(super) fn cached_patterns(element: &UIElement) -> Vec<UiaPattern> {
     push_pattern(
         element,
         &mut patterns,
+        UIProperty::IsSelectionItemPatternAvailable,
+        UiaPattern::SelectionItem,
+    );
+    push_pattern(
+        element,
+        &mut patterns,
         UIProperty::IsExpandCollapsePatternAvailable,
         UiaPattern::ExpandCollapse,
+    );
+    push_pattern(
+        element,
+        &mut patterns,
+        UIProperty::IsLegacyIAccessiblePatternAvailable,
+        UiaPattern::LegacyIAccessible,
     );
     push_pattern(
         element,
@@ -401,7 +415,9 @@ pub(super) const fn pattern_property(pattern: UiaPattern) -> UIProperty {
         UiaPattern::Toggle => UIProperty::IsTogglePatternAvailable,
         UiaPattern::Value => UIProperty::IsValuePatternAvailable,
         UiaPattern::Selection => UIProperty::IsSelectionPatternAvailable,
+        UiaPattern::SelectionItem => UIProperty::IsSelectionItemPatternAvailable,
         UiaPattern::ExpandCollapse => UIProperty::IsExpandCollapsePatternAvailable,
+        UiaPattern::LegacyIAccessible => UIProperty::IsLegacyIAccessiblePatternAvailable,
         UiaPattern::Scroll => UIProperty::IsScrollPatternAvailable,
         UiaPattern::Text => UIProperty::IsTextPatternAvailable,
         UiaPattern::Window => UIProperty::IsWindowPatternAvailable,

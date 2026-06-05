@@ -11,6 +11,8 @@ pub enum A11yError {
     NoForeground { detail: String },
     #[error("UI Automation element is stale: {detail}")]
     ElementStale { detail: String },
+    #[error("UI Automation element has no supported click control pattern: {detail}")]
+    ElementPatternUnsupported { detail: String },
     #[error("Chromium DevTools Protocol is unreachable: {detail}")]
     CdpUnreachable { detail: String },
     #[error("Chromium DevTools Protocol attach failed: {detail}")]
@@ -30,6 +32,9 @@ impl A11yError {
             Self::NotAvailable { .. } => error_codes::A11Y_NOT_AVAILABLE,
             Self::NoForeground { .. } => error_codes::A11Y_NO_FOREGROUND,
             Self::ElementStale { .. } => error_codes::A11Y_ELEMENT_STALE,
+            Self::ElementPatternUnsupported { .. } => {
+                error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
+            }
             Self::CdpUnreachable { .. } => error_codes::A11Y_CDP_UNREACHABLE,
             Self::CdpAttachFailed { .. } => error_codes::A11Y_CDP_ATTACH_FAILED,
             Self::CdpAxtreeFailed { .. } => error_codes::A11Y_CDP_AXTREE_FAILED,

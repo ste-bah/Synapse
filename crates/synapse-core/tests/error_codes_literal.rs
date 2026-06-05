@@ -39,6 +39,7 @@ fn error_codes_match_literal_names() {
     assert_literal!(ACTION_VIGEM_NOT_INSTALLED);
     assert_literal!(ACTION_VIGEM_PLUGIN_FAILED);
     assert_literal!(ACTION_ELEMENT_NOT_RESOLVED);
+    assert_literal!(ACTION_ELEMENT_PATTERN_UNSUPPORTED);
     assert_literal!(TRANSIENT_ELEMENT_EXPIRED);
     assert_literal!(ACTION_FOREGROUND_LOST);
     assert_literal!(ACTION_UNSUPPORTED_KEY);

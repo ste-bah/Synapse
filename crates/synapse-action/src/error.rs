@@ -20,6 +20,11 @@ pub enum ActionError {
     VigemPluginFailed { detail: String },
     #[error("action element not resolved: {detail}")]
     ElementNotResolved { detail: String },
+    #[error("action element pattern unsupported: {detail}")]
+    ElementPatternUnsupported {
+        element_id: ElementId,
+        detail: String,
+    },
     #[error("transient element expired: {detail}")]
     TransientElementExpired {
         element_id: ElementId,
@@ -51,6 +56,9 @@ impl ActionError {
             Self::VigemNotInstalled { .. } => error_codes::ACTION_VIGEM_NOT_INSTALLED,
             Self::VigemPluginFailed { .. } => error_codes::ACTION_VIGEM_PLUGIN_FAILED,
             Self::ElementNotResolved { .. } => error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+            Self::ElementPatternUnsupported { .. } => {
+                error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
+            }
             Self::TransientElementExpired { .. } => error_codes::TRANSIENT_ELEMENT_EXPIRED,
             Self::ForegroundLost { .. } => error_codes::ACTION_FOREGROUND_LOST,
             Self::UnsupportedKey { .. } => error_codes::ACTION_UNSUPPORTED_KEY,
@@ -74,6 +82,7 @@ impl ActionError {
             | Self::VigemNotInstalled { detail }
             | Self::VigemPluginFailed { detail }
             | Self::ElementNotResolved { detail }
+            | Self::ElementPatternUnsupported { detail, .. }
             | Self::TransientElementExpired { detail, .. }
             | Self::ForegroundLost { detail }
             | Self::UnsupportedKey { detail }
@@ -99,6 +108,9 @@ impl ActionError {
             Self::VigemNotInstalled { .. } => Self::VigemNotInstalled { detail },
             Self::VigemPluginFailed { .. } => Self::VigemPluginFailed { detail },
             Self::ElementNotResolved { .. } => Self::ElementNotResolved { detail },
+            Self::ElementPatternUnsupported { element_id, .. } => {
+                Self::ElementPatternUnsupported { element_id, detail }
+            }
             Self::TransientElementExpired { element_id, .. } => {
                 Self::TransientElementExpired { element_id, detail }
             }
@@ -122,6 +134,7 @@ impl ActionError {
             | Self::VigemNotInstalled { .. }
             | Self::VigemPluginFailed { .. }
             | Self::ElementNotResolved { .. }
+            | Self::ElementPatternUnsupported { .. }
             | Self::TransientElementExpired { .. }
             | Self::ForegroundLost { .. }
             | Self::UnsupportedKey { .. }

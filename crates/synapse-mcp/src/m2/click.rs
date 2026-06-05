@@ -17,6 +17,13 @@ use schema::ActClickTarget;
 pub use schema::{ActClickParams, ActClickPostcondition, ActClickResponse};
 
 const MAX_CLICK_HOLD_MS: u32 = 30_000;
+const SUPPORTED_UIA_CLICK_PATTERNS: [&str; 5] = [
+    "InvokePattern",
+    "TogglePattern",
+    "SelectionItemPattern",
+    "ExpandCollapsePattern",
+    "LegacyIAccessiblePattern.DoDefaultAction",
+];
 
 pub async fn act_click_with_handle(
     handle: ActionHandle,
@@ -245,6 +252,9 @@ fn action_error_to_mcp(error: &ActionError) -> ErrorData {
         ActionError::TransientElementExpired { element_id, detail } => {
             transient_element_expired_error(element_id, detail)
         }
+        ActionError::ElementPatternUnsupported { element_id, detail } => {
+            element_pattern_unsupported_error(element_id, detail)
+        }
         _ => mcp_error(error.code(), error.to_string()),
     }
 }
@@ -273,6 +283,36 @@ fn transient_element_expired_error(element_id: &ElementId, detail: &str) -> Erro
             "source_of_truth": "live UI Automation re-resolution under the element_id root HWND",
             "recommended_next_tools": ["observe", "find", "act_click"],
             "recommended_pattern": recommended_pattern,
+            "detail": detail,
+        })),
+    )
+}
+
+fn element_pattern_unsupported_error(element_id: &ElementId, detail: &str) -> ErrorData {
+    let root_hwnd = element_id.parts().ok().map(|parts| parts.hwnd);
+    tracing::warn!(
+        code = error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED,
+        element_id = %element_id,
+        root_hwnd,
+        attempted_patterns = ?SUPPORTED_UIA_CLICK_PATTERNS,
+        detail,
+        fallback_attempted = false,
+        "act_click element target exposes no supported UIA click control pattern; no fallback delivery attempted"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("element target exposes no supported UIA click control pattern: {detail}"),
+        Some(json!({
+            "code": error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED,
+            "detail_code": "UIA_CONTROL_PATTERN_UNSUPPORTED",
+            "transient": false,
+            "fallback_attempted": false,
+            "element_id": element_id.to_string(),
+            "root_hwnd": root_hwnd,
+            "attempted_patterns": SUPPORTED_UIA_CLICK_PATTERNS,
+            "source_of_truth": "live UI Automation control-pattern availability on the re-resolved element",
+            "router_escalation_required": true,
+            "router_next_tier": "postmessage",
             "detail": detail,
         })),
     )

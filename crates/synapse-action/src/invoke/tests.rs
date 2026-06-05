@@ -3,14 +3,11 @@ use synapse_core::{
 };
 
 use super::{
-    CoordinateFallbackPlan, ElementClickOutcome,
-    dispatch::{
-        FALLBACK_MOVE_DURATION_MS, InvokeAttemptError, complete_click_attempt,
-        emit_coordinate_fallback_click,
-    },
+    CoordinateFallbackPlan,
+    dispatch::{FALLBACK_MOVE_DURATION_MS, emit_coordinate_fallback_click},
     resolver::{
-        RectEdges, center_from_rect_edges, element_not_resolved, invoke_pattern_failed,
-        invoke_pattern_unavailable, transient_element_expired,
+        RectEdges, center_from_rect_edges, element_not_resolved, element_pattern_unsupported,
+        invoke_pattern_failed, transient_element_expired,
     },
 };
 #[cfg(not(windows))]
@@ -55,17 +52,31 @@ fn stale_uia_elements_map_to_transient_expired() {
 }
 
 #[test]
-fn missing_invoke_pattern_maps_to_target_invalid_for_coordinate_fallback() {
+fn unsupported_click_patterns_map_to_element_pattern_unsupported() {
     let element_id = synthetic_element_id();
-    let before = "pattern not available";
-    let after = invoke_pattern_unavailable(&element_id, before);
-    assert_eq!(after.code(), error_codes::ACTION_TARGET_INVALID);
-    assert!(after.detail().contains(element_id.as_str()));
-    assert!(after.detail().contains("InvokePattern"));
-    println!(
-        "readback=invoke_error_mapping edge=missing_invoke_pattern before={before:?} after_code={} after_detail={:?}",
+    let before = format!(
+        "element {element_id} does not expose a supported click control pattern; attempted_patterns=[InvokePattern, TogglePattern, SelectionItemPattern, ExpandCollapsePattern, LegacyIAccessiblePattern.DoDefaultAction]"
+    );
+    let after = element_pattern_unsupported(&element_id, &before);
+    assert_eq!(
         after.code(),
-        after.detail()
+        error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
+    );
+    assert_eq!(after.detail(), before);
+    match after {
+        ActionError::ElementPatternUnsupported {
+            element_id: actual,
+            detail,
+        } => {
+            assert_eq!(actual, element_id);
+            assert!(detail.contains("SelectionItemPattern"));
+            assert!(detail.contains("LegacyIAccessiblePattern.DoDefaultAction"));
+        }
+        other => panic!("expected unsupported pattern error, got {other:?}"),
+    }
+    println!(
+        "readback=invoke_error_mapping edge=unsupported_click_patterns before={before:?} after_code={} after_element_id={element_id}",
+        error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
     );
 }
 
@@ -178,103 +189,21 @@ fn coordinate_fallback_emits_move_down_up_at_bbox_center() {
 }
 
 #[test]
-fn missing_invoke_pattern_branch_emits_coordinate_fallback() {
+fn unsupported_click_pattern_error_does_not_emit_coordinate_fallback() {
     let backend = RecordingBackend::default();
-    let mut state = EmitState::default();
-    let plan = CoordinateFallbackPlan {
-        screen_point: Point { x: 42, y: 84 },
-        window_point: Point { x: 2, y: 4 },
-    };
+    let element_id = synthetic_element_id();
     let before = backend.events();
 
-    let after = complete_click_attempt(
-        Err(InvokeAttemptError::MissingPattern),
-        || Ok(plan),
-        &backend,
-        &mut state,
-        MouseButton::Right,
-    );
+    let after = element_pattern_unsupported(&element_id, "no supported UIA click pattern");
 
-    assert_eq!(after, Ok(ElementClickOutcome::CoordinateFallback(plan)));
-    let events = backend.events();
     assert_eq!(
-        events,
-        vec![
-            RecordedInput::MouseMove {
-                to: MouseTarget::Screen {
-                    point: plan.screen_point,
-                },
-                curve: AimCurve::Natural {
-                    params: AimNaturalParams::FAST,
-                },
-                duration_ms: FALLBACK_MOVE_DURATION_MS,
-            },
-            RecordedInput::MouseButtonDown {
-                button: MouseButton::Right,
-            },
-            RecordedInput::MouseButtonUp {
-                button: MouseButton::Right,
-            },
-        ]
+        after.code(),
+        error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
     );
-    println!(
-        "readback=invoke_coordinate_fallback edge=missing_invoke_pattern before={before:?} after_outcome={after:?} after_events={events:?}"
-    );
-}
-
-#[test]
-fn successful_invoke_branch_does_not_emit_coordinate_fallback() {
-    let backend = RecordingBackend::default();
-    let mut state = EmitState::default();
-    let before = backend.events();
-
-    let after = complete_click_attempt(
-        Ok(()),
-        || {
-            Ok(CoordinateFallbackPlan {
-                screen_point: Point { x: 1, y: 1 },
-                window_point: Point { x: 1, y: 1 },
-            })
-        },
-        &backend,
-        &mut state,
-        MouseButton::Left,
-    );
-
-    assert_eq!(after, Ok(ElementClickOutcome::Invoked));
     assert!(backend.events().is_empty());
     println!(
-        "readback=invoke_coordinate_fallback edge=invoke_success before={before:?} after_outcome={after:?} after_events={:?}",
-        backend.events()
-    );
-}
-
-#[test]
-fn failed_invoke_branch_does_not_emit_coordinate_fallback() {
-    let backend = RecordingBackend::default();
-    let mut state = EmitState::default();
-    let expected_error = ActionError::TargetInvalid {
-        detail: "synthetic invoke failure".to_owned(),
-    };
-    let before = backend.events();
-
-    let after = complete_click_attempt(
-        Err(InvokeAttemptError::InvokeFailed(expected_error.clone())),
-        || {
-            Ok(CoordinateFallbackPlan {
-                screen_point: Point { x: 99, y: 99 },
-                window_point: Point { x: 9, y: 9 },
-            })
-        },
-        &backend,
-        &mut state,
-        MouseButton::Left,
-    );
-
-    assert_eq!(after, Err(expected_error));
-    assert!(backend.events().is_empty());
-    println!(
-        "readback=invoke_coordinate_fallback edge=invoke_failure before={before:?} after_outcome={after:?} after_events={:?}",
+        "readback=invoke_coordinate_fallback edge=unsupported_pattern before={before:?} after_code={} after_events={:?}",
+        after.code(),
         backend.events()
     );
 }

@@ -101,7 +101,7 @@ const fn default_queue_blocker_duration_ms() -> u32 {
 #[tool_router(router = m2_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Click a screen coordinate or UI Automation element; velocity_profile controls coordinate-move timing only, while explicit spatial paths belong to act_stroke. If a previously observed transient element expired before dispatch, returns TRANSIENT_ELEMENT_EXPIRED with re-observe/find guidance."
+        description = "Click a screen coordinate or UI Automation element. Default element delivery uses background UIA control patterns (Invoke, Toggle, SelectionItem, ExpandCollapse, LegacyIAccessible.DoDefaultAction) and returns ACTION_ELEMENT_PATTERN_UNSUPPORTED when none is exposed; no implicit coordinate fallback is attempted. velocity_profile controls coordinate-move timing only, while explicit spatial paths belong to act_stroke. If a previously observed transient element expired before dispatch, returns TRANSIENT_ELEMENT_EXPIRED with re-observe/find guidance."
     )]
     pub async fn act_click(
         &self,

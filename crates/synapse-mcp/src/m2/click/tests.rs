@@ -170,6 +170,71 @@ fn transient_element_expired_error_carries_reobserve_guidance() {
     );
 }
 
+#[test]
+fn element_pattern_unsupported_error_carries_attempted_patterns_without_fallback() {
+    let element_id =
+        ElementId::parse("0x1000:0000002a00000001").expect("synthetic element id must be valid");
+    let detail = format!(
+        "element {element_id} does not expose a supported click control pattern; attempted_patterns=[InvokePattern, TogglePattern, SelectionItemPattern, ExpandCollapsePattern, LegacyIAccessiblePattern.DoDefaultAction]"
+    );
+    let before = ActionError::ElementPatternUnsupported {
+        element_id: element_id.clone(),
+        detail,
+    };
+
+    let after = super::action_error_to_mcp(&before);
+    let data = after
+        .data
+        .as_ref()
+        .expect("unsupported pattern error should carry structured data");
+    println!(
+        "readback=act_click_pattern_unsupported edge=no_pattern before_code={} after_data={data}",
+        before.code()
+    );
+
+    assert_eq!(
+        data.get("code").and_then(serde_json::Value::as_str),
+        Some(error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED)
+    );
+    assert_eq!(
+        data.get("detail_code").and_then(serde_json::Value::as_str),
+        Some("UIA_CONTROL_PATTERN_UNSUPPORTED")
+    );
+    assert_eq!(
+        data.get("fallback_attempted")
+            .and_then(serde_json::Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        data.get("element_id").and_then(serde_json::Value::as_str),
+        Some(element_id.as_str())
+    );
+    assert_eq!(
+        data.get("root_hwnd").and_then(serde_json::Value::as_i64),
+        Some(0x1000)
+    );
+    let attempted_patterns = data
+        .get("attempted_patterns")
+        .and_then(serde_json::Value::as_array)
+        .expect("attempted_patterns should be an array");
+    assert_eq!(attempted_patterns.len(), 5);
+    assert!(attempted_patterns.iter().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|pattern| pattern == "SelectionItemPattern")
+    }));
+    assert!(attempted_patterns.iter().any(|value| {
+        value
+            .as_str()
+            .is_some_and(|pattern| pattern == "LegacyIAccessiblePattern.DoDefaultAction")
+    }));
+    assert_eq!(
+        data.get("router_escalation_required")
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+}
+
 #[tokio::test]
 async fn browser_ocr_element_click_uses_coordinate_route_even_when_invoke_default_is_enabled() {
     let cancel = CancellationToken::new();

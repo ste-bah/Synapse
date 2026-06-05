@@ -51,12 +51,13 @@ pub(super) fn transient_element_expired(
 
 #[must_use]
 #[cfg(any(test, windows))]
-pub(super) fn invoke_pattern_unavailable(
+pub(super) fn element_pattern_unsupported(
     element_id: &ElementId,
     error: impl Display,
 ) -> ActionError {
-    ActionError::TargetInvalid {
-        detail: format!("element {element_id} does not expose InvokePattern: {error}"),
+    ActionError::ElementPatternUnsupported {
+        element_id: element_id.clone(),
+        detail: error.to_string(),
     }
 }
 
