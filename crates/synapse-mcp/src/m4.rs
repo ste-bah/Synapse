@@ -54,6 +54,9 @@ const SHELL_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 const ALLOW_PATTERN_SIZE_LIMIT_BYTES: usize = 256 * 1024;
 const PROCESS_BASE_ENV_KEYS: [&str; 4] = ["PATH", "USERPROFILE", "TEMP", "SystemRoot"];
 const LAUNCH_WINDOW_POLL_INTERVAL_MS: u64 = 20;
+const LAUNCH_FOREGROUND_STABLE_MS: u64 = 750;
+const LAUNCH_FOREGROUND_POLL_MS: u64 = 75;
+const LAUNCH_FOREGROUND_MAX_MS: u64 = 3_000;
 const RUN_SHELL_IDEMPOTENCY_PREFIX: &str = "m4/act_run_shell/idempotency/v1/";
 pub const SHELL_PATTERN_TOO_BROAD: &str = "SHELL_PATTERN_TOO_BROAD";
 pub const LAUNCH_PATTERN_TOO_BROAD: &str = "LAUNCH_PATTERN_TOO_BROAD";
@@ -385,6 +388,13 @@ pub struct ActLaunchResponse {
     /// 136+ refuses remote debugging on the default profile).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp_user_data_dir: Option<String>,
+    /// URL observed in the launched browser's CDP target list when Synapse
+    /// opened the debug port and the caller supplied a URL argument.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_verified_url: Option<String>,
+    /// Title observed for the verified CDP target URL, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_verified_title: Option<String>,
 }
 
 pub fn launch_request_details(params: &ActLaunchParams) -> serde_json::Value {
@@ -441,6 +451,8 @@ pub fn launch_process_history_row(
         "cdp_debug_port": response.cdp_debug_port,
         "cdp_endpoint": response.cdp_endpoint,
         "cdp_user_data_dir": response.cdp_user_data_dir,
+        "cdp_verified_url": response.cdp_verified_url,
+        "cdp_verified_title": response.cdp_verified_title,
     });
     encode_json(&row).map_err(|error| {
         mcp_error(
@@ -823,6 +835,8 @@ pub async fn launch(
     };
     let launch_target_name = launch_target_file_name(&params.target);
 
+    let cdp_target =
+        verify_launched_chromium_url(&params, cdp_launch.as_ref(), &cdp, params.timeout_ms).await?;
     let window = if let Some(regex) = wait_regex {
         wait_for_launch_window(
             pid,
@@ -832,7 +846,7 @@ pub async fn launch(
             &launch_target_name,
             &params.args,
         )
-        .await
+        .await?
     } else {
         WindowWaitResult::not_requested()
     };
@@ -848,6 +862,7 @@ pub async fn launch(
         wait_requested = params.wait_for_window_title_regex.is_some(),
         idempotency_present = params.idempotency_key.is_some(),
         cdp_debug_port = ?cdp.port,
+        cdp_verified_url = ?cdp_target.as_ref().map(|target| target.url.as_str()),
         "readback=act_launch after=process_spawn"
     );
     Ok(ActLaunchResponse {
@@ -859,6 +874,8 @@ pub async fn launch(
         cdp_debug_port: cdp.port,
         cdp_endpoint: cdp.endpoint,
         cdp_user_data_dir: cdp.user_data_dir,
+        cdp_verified_url: cdp_target.as_ref().map(|target| target.url.clone()),
+        cdp_verified_title: cdp_target.and_then(|target| target.title),
     })
 }
 
@@ -1061,6 +1078,202 @@ async fn resolve_launched_cdp_port(pid: u32, launch: &ChromiumCdpLaunch) -> Laun
 fn read_devtools_active_port(path: &Path) -> Option<u16> {
     let contents = std::fs::read_to_string(path).ok()?;
     contents.lines().next()?.trim().parse::<u16>().ok()
+}
+
+#[derive(Clone, Debug)]
+struct VerifiedCdpTarget {
+    url: String,
+    title: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct CdpTargetListEntry {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, rename = "type")]
+    target_type: Option<String>,
+}
+
+async fn verify_launched_chromium_url(
+    params: &ActLaunchParams,
+    cdp_launch: Option<&ChromiumCdpLaunch>,
+    cdp: &LaunchedCdp,
+    timeout_ms: u32,
+) -> Result<Option<VerifiedCdpTarget>, ErrorData> {
+    let Some(expected_url) = launch_requested_url(&params.args) else {
+        return Ok(None);
+    };
+    if cdp_launch.is_none() {
+        return Ok(None);
+    }
+    let Some(endpoint) = cdp.endpoint.as_deref() else {
+        return Err(launch_url_verification_error(
+            "cdp_endpoint_missing",
+            &expected_url,
+            None,
+            timeout_ms,
+            None,
+            &[],
+        ));
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(750))
+        .build()
+        .map_err(|error| {
+            launch_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("act_launch failed to build CDP verification client: {error}"),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "reason": "cdp_verification_client_build_failed",
+                    "expected_url": expected_url,
+                    "endpoint": endpoint,
+                }),
+            )
+        })?;
+    let started = Instant::now();
+    let timeout = Duration::from_millis(u64::from(timeout_ms));
+    let mut last_error: Option<String>;
+    let mut last_targets = Vec::new();
+    loop {
+        match fetch_cdp_target_list(&client, endpoint).await {
+            Ok(targets) => {
+                last_targets = target_summaries(&targets);
+                if let Some(target) = targets.iter().find(|target| {
+                    target
+                        .target_type
+                        .as_deref()
+                        .is_none_or(|kind| kind == "page")
+                        && url_matches(&expected_url, &target.url)
+                }) {
+                    tracing::info!(
+                        code = "M4_ACT_LAUNCH_CDP_URL_VERIFIED",
+                        endpoint,
+                        expected_url,
+                        actual_url = %target.url,
+                        title = ?target.title,
+                        "act_launch verified requested browser URL in CDP target list"
+                    );
+                    return Ok(Some(VerifiedCdpTarget {
+                        url: target.url.clone(),
+                        title: target.title.clone().filter(|title| !title.is_empty()),
+                    }));
+                }
+                last_error = None;
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+
+        if started.elapsed() >= timeout {
+            return Err(launch_url_verification_error(
+                "url_not_observed_within_timeout",
+                &expected_url,
+                Some(endpoint),
+                timeout_ms,
+                last_error,
+                &last_targets,
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn fetch_cdp_target_list(
+    client: &reqwest::Client,
+    endpoint: &str,
+) -> Result<Vec<CdpTargetListEntry>, String> {
+    let url = format!("{}/json/list", endpoint.trim_end_matches('/'));
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|error| format!("GET {url}: {error}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("GET {url}: HTTP {status}"));
+    }
+    response
+        .json::<Vec<CdpTargetListEntry>>()
+        .await
+        .map_err(|error| format!("decode {url}: {error}"))
+}
+
+fn launch_requested_url(args: &[String]) -> Option<String> {
+    args.iter().find_map(|arg| {
+        if let Some(value) = arg.strip_prefix("--app=")
+            && supported_launch_url(value)
+        {
+            return Some(value.to_owned());
+        }
+        if arg.starts_with("--") {
+            return None;
+        }
+        supported_launch_url(arg).then(|| arg.to_owned())
+    })
+}
+
+fn supported_launch_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "http" | "https" | "file"))
+}
+
+fn url_matches(expected: &str, actual: &str) -> bool {
+    canonical_launch_url(expected)
+        .zip(canonical_launch_url(actual))
+        .is_some_and(|(expected, actual)| expected == actual)
+}
+
+fn canonical_launch_url(value: &str) -> Option<String> {
+    let url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https" | "file") {
+        return None;
+    }
+    let mut canonical = url.to_string();
+    if url.path() == "/" && url.query().is_none() && url.fragment().is_none() {
+        canonical = canonical.trim_end_matches('/').to_owned();
+    }
+    Some(canonical)
+}
+
+fn target_summaries(targets: &[CdpTargetListEntry]) -> Vec<serde_json::Value> {
+    targets
+        .iter()
+        .take(5)
+        .map(|target| {
+            json!({
+                "type": target.target_type.as_deref(),
+                "title": target.title.as_deref(),
+                "url": target.url.as_str(),
+            })
+        })
+        .collect()
+}
+
+fn launch_url_verification_error(
+    reason: &'static str,
+    expected_url: &str,
+    endpoint: Option<&str>,
+    timeout_ms: u32,
+    last_error: Option<String>,
+    observed_targets: &[serde_json::Value],
+) -> ErrorData {
+    launch_tool_error(
+        error_codes::ACTION_LAUNCH_URL_NOT_REACHED,
+        format!("act_launch did not verify requested browser URL: {reason}"),
+        json!({
+            "code": error_codes::ACTION_LAUNCH_URL_NOT_REACHED,
+            "reason": reason,
+            "expected_url": expected_url,
+            "endpoint": endpoint,
+            "timeout_ms": timeout_ms,
+            "last_error": last_error,
+            "observed_targets": observed_targets,
+        }),
+    )
 }
 
 fn validate_combo_params(params: &ActComboParams) -> Result<(), ErrorData> {
@@ -1489,22 +1702,6 @@ impl WindowWaitResult {
             reason: None,
         }
     }
-
-    fn no_match() -> Self {
-        Self {
-            hwnd: None,
-            matched_title: None,
-            reason: Some("no_match_within_timeout".to_owned()),
-        }
-    }
-
-    fn unavailable() -> Self {
-        Self {
-            hwnd: None,
-            matched_title: None,
-            reason: Some("window_readback_unavailable".to_owned()),
-        }
-    }
 }
 
 async fn wait_for_launch_window(
@@ -1514,13 +1711,15 @@ async fn wait_for_launch_window(
     excluded_hwnds: &HashSet<i64>,
     launch_target_name: &str,
     launch_args: &[String],
-) -> WindowWaitResult {
+) -> Result<WindowWaitResult, ErrorData> {
     let started = Instant::now();
     let timeout = Duration::from_millis(u64::from(timeout_ms));
     let mut last_error: Option<String>;
+    let mut last_windows = Vec::new();
     loop {
         match synapse_a11y::visible_top_level_window_contexts() {
             Ok(contexts) => {
+                last_windows = window_context_summaries(&contexts);
                 if let Some(context) = select_launch_window(
                     &contexts,
                     pid,
@@ -1529,18 +1728,25 @@ async fn wait_for_launch_window(
                     launch_target_name,
                     launch_args,
                 ) {
-                    focus_launch_window(context.hwnd).await;
-                    return WindowWaitResult::matched(context.clone());
+                    let foreground = focus_launch_window(context.hwnd).await?;
+                    return Ok(WindowWaitResult::matched(foreground));
                 }
                 last_error = None;
             }
             Err(error) if error.code() == error_codes::A11Y_NOT_AVAILABLE => {
-                tracing::warn!(
+                tracing::error!(
                     code = error.code(),
                     error = %error,
                     "act_launch window readback unavailable"
                 );
-                return WindowWaitResult::unavailable();
+                return Err(launch_window_error(
+                    "window_readback_unavailable",
+                    pid,
+                    title_regex.as_str(),
+                    timeout_ms,
+                    Some(error.to_string()),
+                    &last_windows,
+                ));
             }
             Err(error) => {
                 last_error = Some(error.to_string());
@@ -1556,37 +1762,137 @@ async fn wait_for_launch_window(
                 last_error,
                 "act_launch window title wait timed out"
             );
-            return WindowWaitResult::no_match();
+            return Err(launch_window_error(
+                "no_match_within_timeout",
+                pid,
+                title_regex.as_str(),
+                timeout_ms,
+                last_error,
+                &last_windows,
+            ));
         }
         tokio::time::sleep(Duration::from_millis(LAUNCH_WINDOW_POLL_INTERVAL_MS)).await;
     }
 }
 
-async fn focus_launch_window(hwnd: i64) {
+async fn focus_launch_window(hwnd: i64) -> Result<ForegroundContext, ErrorData> {
     let mut last_error = None;
-    for attempt in 1..=10 {
-        match synapse_a11y::focus_window(hwnd) {
-            Ok(()) => {
-                tracing::info!(
-                    code = "M4_ACT_LAUNCH_FOCUSED",
-                    hwnd,
-                    attempt,
-                    "act_launch foregrounded the matched window"
-                );
-                return;
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(LAUNCH_FOREGROUND_MAX_MS);
+    let stable_for = Duration::from_millis(LAUNCH_FOREGROUND_STABLE_MS);
+    let mut stable_since: Option<Instant> = None;
+    let mut focus_attempts = 0usize;
+    let mut last_matching_context: Option<ForegroundContext> = None;
+
+    loop {
+        match synapse_a11y::current_foreground_context() {
+            Ok(context) if context.hwnd == hwnd => {
+                let now = Instant::now();
+                let stable_since = *stable_since.get_or_insert(now);
+                last_matching_context = Some(context.clone());
+                if now.duration_since(stable_since) >= stable_for {
+                    tracing::info!(
+                        code = "M4_ACT_LAUNCH_FOCUSED",
+                        hwnd,
+                        attempts = focus_attempts,
+                        stable_ms = LAUNCH_FOREGROUND_STABLE_MS,
+                        pid = context.pid,
+                        title = %context.window_title,
+                        "act_launch foregrounded the matched window and verified it stayed foreground"
+                    );
+                    return Ok(context);
+                }
+            }
+            Ok(context) => {
+                stable_since = None;
+                last_error = Some(format!(
+                    "foreground readback hwnd 0x{:x} pid {} title {:?}, expected hwnd 0x{hwnd:x}",
+                    context.hwnd, context.pid, context.window_title
+                ));
             }
             Err(error) => {
-                last_error = Some(error.to_string());
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                stable_since = None;
+                last_error = Some(format!("foreground readback failed: {error}"));
             }
         }
+
+        if Instant::now() >= deadline {
+            break;
+        }
+
+        focus_attempts += 1;
+        if let Err(error) = synapse_a11y::focus_window(hwnd) {
+            stable_since = None;
+            last_error = Some(error.to_string());
+        }
+        tokio::time::sleep(Duration::from_millis(LAUNCH_FOREGROUND_POLL_MS)).await;
     }
-    tracing::warn!(
+    tracing::error!(
         code = "M4_ACT_LAUNCH_FOCUS_FAILED",
         hwnd,
         error = ?last_error,
-        "act_launch matched the launched window but could not foreground it after retries"
+        attempts = focus_attempts,
+        stable_ms = LAUNCH_FOREGROUND_STABLE_MS,
+        last_matching_title = ?last_matching_context.as_ref().map(|context| context.window_title.as_str()),
+        "act_launch matched the launched window but could not keep it foreground after retries"
     );
+    Err(launch_tool_error(
+        error_codes::ACTION_LAUNCH_FOREGROUND_FAILED,
+        "act_launch matched the launched window but could not keep it foreground after retries",
+        json!({
+            "code": error_codes::ACTION_LAUNCH_FOREGROUND_FAILED,
+            "reason": "foreground_not_stable",
+            "hwnd": hwnd,
+            "attempts": focus_attempts,
+            "required_stable_ms": LAUNCH_FOREGROUND_STABLE_MS,
+            "max_wait_ms": LAUNCH_FOREGROUND_MAX_MS,
+            "last_error": last_error,
+            "last_matching_context": last_matching_context.map(|context| json!({
+                "hwnd": context.hwnd,
+                "pid": context.pid,
+                "process_name": context.process_name,
+                "title": context.window_title,
+            })),
+        }),
+    ))
+}
+
+fn window_context_summaries(contexts: &[ForegroundContext]) -> Vec<serde_json::Value> {
+    contexts
+        .iter()
+        .take(12)
+        .map(|context| {
+            json!({
+                "hwnd": context.hwnd,
+                "pid": context.pid,
+                "process_name": context.process_name,
+                "title": context.window_title,
+            })
+        })
+        .collect()
+}
+
+fn launch_window_error(
+    reason: &'static str,
+    pid: u32,
+    title_regex: &str,
+    timeout_ms: u32,
+    last_error: Option<String>,
+    observed_windows: &[serde_json::Value],
+) -> ErrorData {
+    launch_tool_error(
+        error_codes::ACTION_LAUNCH_WINDOW_NOT_FOUND,
+        format!("act_launch did not verify requested launch window: {reason}"),
+        json!({
+            "code": error_codes::ACTION_LAUNCH_WINDOW_NOT_FOUND,
+            "reason": reason,
+            "pid": pid,
+            "title_regex": title_regex,
+            "timeout_ms": timeout_ms,
+            "last_error": last_error,
+            "observed_windows": observed_windows,
+        }),
+    )
 }
 
 fn select_launch_window<'a>(
@@ -2491,6 +2797,64 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn launch_requested_url_detects_browser_page_args() {
+        let args = vec![
+            "--new-window".to_owned(),
+            "http://localhost:5173/polis".to_owned(),
+        ];
+        let url = launch_requested_url(&args);
+        println!(
+            "readback=act_launch_url edge=wsl_localhost_arg before=args:{args:?} after={url:?}"
+        );
+        assert_eq!(url.as_deref(), Some("http://localhost:5173/polis"));
+
+        let app_args = vec!["--app=https://example.test/app".to_owned()];
+        assert_eq!(
+            launch_requested_url(&app_args).as_deref(),
+            Some("https://example.test/app")
+        );
+
+        let non_url_args = vec!["--new-window".to_owned(), "not-a-url".to_owned()];
+        assert!(launch_requested_url(&non_url_args).is_none());
+    }
+
+    #[tokio::test]
+    async fn launch_url_verification_skips_when_synapse_did_not_open_cdp() {
+        let mut opted_out = launch_params("chrome.exe", vec!["http://localhost:5173"], 10);
+        opted_out.cdp_debug = Some(false);
+        let result =
+            verify_launched_chromium_url(&opted_out, None, &LaunchedCdp::default(), 10).await;
+        println!(
+            "readback=act_launch_url edge=cdp_opt_out before=cdp_launch:None after={result:?}"
+        );
+        assert!(matches!(result, Ok(None)));
+
+        let non_chromium = launch_params("notepad.exe", vec!["http://localhost:5173"], 10);
+        let result =
+            verify_launched_chromium_url(&non_chromium, None, &LaunchedCdp::default(), 10).await;
+        println!(
+            "readback=act_launch_url edge=non_chromium before=cdp_launch:None after={result:?}"
+        );
+        assert!(matches!(result, Ok(None)));
+    }
+
+    #[test]
+    fn launch_url_matching_normalizes_root_trailing_slash() {
+        assert!(url_matches(
+            "http://localhost:5173",
+            "http://localhost:5173/"
+        ));
+        assert!(url_matches(
+            "https://example.test/path?q=1",
+            "https://example.test/path?q=1"
+        ));
+        assert!(!url_matches(
+            "http://localhost:5173/expected",
+            "http://localhost:5173/other"
+        ));
+    }
+
     fn combo_press_step(at_ms: u32, key: &str) -> ActComboStep {
         ActComboStep {
             at_ms,
@@ -2923,20 +3287,35 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn launch_wait_returns_reason_when_window_does_not_match() {
+    async fn launch_wait_fails_when_window_does_not_match() {
         let mut params = launch_params("cmd.exe", vec!["/c", "exit 0"], 50);
         params.wait_for_window_title_regex = Some("^SynapseLaunchNoSuchWindow$".to_owned());
         let config = launch_config_for(&params);
 
-        let response = match launch(&config, params).await {
-            Ok(response) => response,
-            Err(error) => panic!("allowlisted cmd launch should spawn: {error}"),
+        let error = match launch(&config, params).await {
+            Ok(response) => panic!("window verification should fail closed: {response:?}"),
+            Err(error) => error,
         };
 
-        assert!(response.pid > 0);
-        assert_eq!(response.hwnd, None);
-        assert_eq!(response.matched_title, None);
-        assert_eq!(response.reason.as_deref(), Some("no_match_within_timeout"));
+        println!(
+            "readback=act_launch_window_wait edge=no_match before=regex:^SynapseLaunchNoSuchWindow$ after=error:{error}"
+        );
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(|code| code.as_str()),
+            Some(error_codes::ACTION_LAUNCH_WINDOW_NOT_FOUND)
+        );
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("reason"))
+                .and_then(|reason| reason.as_str()),
+            Some("no_match_within_timeout")
+        );
     }
 
     #[cfg(windows)]
@@ -3084,6 +3463,8 @@ mod tests {
             cdp_debug_port: None,
             cdp_endpoint: None,
             cdp_user_data_dir: None,
+            cdp_verified_url: None,
+            cdp_verified_title: None,
         };
 
         let row = launch_process_history_row(&params, &response)
@@ -3100,6 +3481,8 @@ mod tests {
         assert_eq!(value["cdp_debug_port"], serde_json::Value::Null);
         assert_eq!(value["cdp_endpoint"], serde_json::Value::Null);
         assert_eq!(value["cdp_user_data_dir"], serde_json::Value::Null);
+        assert_eq!(value["cdp_verified_url"], serde_json::Value::Null);
+        assert_eq!(value["cdp_verified_title"], serde_json::Value::Null);
         assert!(!String::from_utf8_lossy(&row).contains("do-not-store"));
         assert!(
             String::from_utf8_lossy(&launch_process_history_row_key(&response)).contains("1234")
@@ -3119,6 +3502,8 @@ mod tests {
             cdp_debug_port: Some(45678),
             cdp_endpoint: Some("http://127.0.0.1:45678".to_owned()),
             cdp_user_data_dir: Some("C:\\Temp\\synapse-cdp-profiles\\synthetic".to_owned()),
+            cdp_verified_url: Some("https://example.test/".to_owned()),
+            cdp_verified_title: Some("Synthetic CDP Page".to_owned()),
         };
 
         let row = launch_process_history_row(&params, &response)
@@ -3137,6 +3522,8 @@ mod tests {
             value["cdp_user_data_dir"],
             "C:\\Temp\\synapse-cdp-profiles\\synthetic"
         );
+        assert_eq!(value["cdp_verified_url"], "https://example.test/");
+        assert_eq!(value["cdp_verified_title"], "Synthetic CDP Page");
     }
 
     #[test]
