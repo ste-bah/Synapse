@@ -12,12 +12,14 @@ use super::{
 use crate::m1::mcp_error;
 use crate::m2::postcondition::{
     ActPostcondition, hash_json as verify_hash_json,
-    no_observed_delta_error as source_no_observed_delta_error, postcondition_observed_delta,
+    no_observed_delta_error as source_no_observed_delta_error, postcondition_failed_error,
+    postcondition_observed_delta,
 };
 use crate::m2::{
     ActClickPostcondition, ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA,
     act_click_postmessage_with_params, act_stroke_error_details, act_stroke_request_details,
     attach_click_tier_attempts, click_params_can_route_background_first, click_tier_failed,
+    emitted_text,
 };
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
@@ -30,8 +32,8 @@ use synapse_action::{
     ActionStateSnapshot, RecordingBackend, ResolvedBackend, TokenBucketSnapshot,
 };
 use synapse_core::{
-    AccessibleNode, Action, Backend, ForegroundContext, PathPoint, PathSpec, Point, Rect,
-    StrokeMotionModel, StrokeTiming, VelocityProfile, error_codes,
+    AccessibleNode, Action, Backend, FocusedElement, ForegroundContext, PathPoint, PathSpec, Point,
+    Rect, StrokeMotionModel, StrokeTiming, UiaPattern, VelocityProfile, error_codes,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -192,14 +194,16 @@ impl SynapseService {
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         if params.into_element.is_none()
-            && let Err(error) = self.ensure_act_type_foreground(recording.as_ref())
+            && let Err(error) = self.ensure_act_type_foreground(&preflight, recording.as_ref())
         {
             let result: Result<ActTypeResponse, ErrorData> = Err(error);
             self.audit_action_result("act_type", &result)?;
             return result.map(Json);
         }
-        let before_delta_signature = if params.verify_delta && params.into_element.is_none() {
-            match self.capture_action_delta_signature(160, None, false).await {
+        let verify_timeout_ms = params.verify_timeout_ms;
+        let emitted = emitted_text(&params);
+        let before_text_signature = if params.into_element.is_none() {
+            match self.capture_act_type_text_signature(160).await {
                 Ok(signature) => Some(signature),
                 Err(error) => {
                     let result: Result<ActTypeResponse, ErrorData> = Err(error);
@@ -210,11 +214,10 @@ impl SynapseService {
         } else {
             None
         };
-        let verify_timeout_ms = params.verify_timeout_ms;
         let result = act_type_with_handle(handle, recording, params).await;
-        let result = match (result, before_delta_signature) {
+        let result = match (result, before_text_signature) {
             (Ok(response), Some(before)) => {
-                self.verify_act_type_response(response, before, verify_timeout_ms)
+                self.verify_act_type_response(response, before, verify_timeout_ms, &emitted)
                     .await
             }
             (other, _) => other,
@@ -787,6 +790,41 @@ struct ClickDeltaSignature {
     point_pixel: Option<ClickPixelSignature>,
 }
 
+#[derive(Clone, Debug)]
+struct ActTypeTextReadback {
+    signature: ActTypeTextSignature,
+    value: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ActTypeTextSignature {
+    foreground_hwnd: i64,
+    foreground_pid: u32,
+    foreground_process: String,
+    foreground_title_sha256: Option<String>,
+    focused_element_id: Option<String>,
+    focused_role: Option<String>,
+    focused_name_sha256: Option<String>,
+    focused_value_len: Option<usize>,
+    focused_value_sha256: Option<String>,
+    focused_selected_text_sha256: Option<String>,
+    focused_bbox: Option<Rect>,
+    readback_source: Option<String>,
+    has_text_readback: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ActTypeFocusedTextCandidate {
+    element_id: String,
+    role: String,
+    name: String,
+    selected_text: Option<String>,
+    bbox: Rect,
+    value: Option<String>,
+    patterns: Vec<UiaPattern>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ClickPixelSignature {
@@ -973,6 +1011,56 @@ impl SynapseService {
             .await
     }
 
+    async fn capture_act_type_text_signature(
+        &self,
+        max_elements: usize,
+    ) -> Result<ActTypeTextReadback, ErrorData> {
+        let mut input = {
+            let state = self.m1_state()?;
+            crate::m1::current_input(&state, 6)?
+        };
+        crate::m1::enrich_input_with_cdp(&mut input, 6, max_elements).await;
+        crate::m1::enrich_input_with_browser_ocr(&mut input, max_elements);
+
+        let focused = focused_text_candidate(input.focused.as_ref(), &input.elements);
+        let (value, readback_source) = focused_text_readback(focused.as_ref());
+        let signature = ActTypeTextSignature {
+            foreground_hwnd: input.foreground.hwnd,
+            foreground_pid: input.foreground.pid,
+            foreground_process: input.foreground.process_name,
+            foreground_title_sha256: non_empty_sha256(&input.foreground.window_title),
+            focused_element_id: focused.as_ref().map(|item| item.element_id.clone()),
+            focused_role: focused.as_ref().map(|item| item.role.clone()),
+            focused_name_sha256: focused
+                .as_ref()
+                .and_then(|item| non_empty_sha256(&item.name)),
+            focused_value_len: value.as_ref().map(|value| value.chars().count()),
+            focused_value_sha256: value.as_deref().and_then(non_empty_sha256),
+            focused_selected_text_sha256: focused
+                .as_ref()
+                .and_then(|item| item.selected_text.as_deref())
+                .and_then(non_empty_sha256),
+            focused_bbox: focused.as_ref().map(|item| item.bbox),
+            readback_source: readback_source.map(str::to_owned),
+            has_text_readback: value.is_some(),
+        };
+        if value.is_none() {
+            let signature_hash = verify_hash_json(&signature)?;
+            return Err(postcondition_failed_error(
+                "act_type",
+                "foreground_focused_text_value",
+                "focused element does not expose a UIA Value/Text readback for fail-closed text verification",
+                signature_hash.clone(),
+                signature_hash,
+                json!({
+                    "readback": signature,
+                }),
+            ));
+        }
+
+        Ok(ActTypeTextReadback { signature, value })
+    }
+
     async fn capture_action_delta_signature(
         &self,
         max_elements: usize,
@@ -1064,18 +1152,74 @@ impl SynapseService {
     async fn verify_act_type_response(
         &self,
         mut response: ActTypeResponse,
-        before: ClickDeltaSignature,
+        before: ActTypeTextReadback,
         verify_timeout_ms: u32,
+        emitted: &str,
     ) -> Result<ActTypeResponse, ErrorData> {
-        response.postcondition = self
-            .verify_action_delta(
-                "act_type",
-                "foreground_focused_ui_or_pixels",
-                before,
+        tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
+        let after = self.capture_act_type_text_signature(160).await?;
+        let before_hash = verify_hash_json(&before.signature)?;
+        let after_hash = verify_hash_json(&after.signature)?;
+        if act_type_foreground_identity_changed(&before.signature, &after.signature) {
+            return Err(act_type_text_foreground_lost_error(
                 verify_timeout_ms,
-                None,
-            )
-            .await?;
+                &before_hash,
+                &after_hash,
+                &before.signature,
+                &after.signature,
+            ));
+        }
+        if before.signature.focused_element_id != after.signature.focused_element_id {
+            return Err(postcondition_failed_error(
+                "act_type",
+                "foreground_focused_text_value",
+                "focused text target changed before postcondition readback",
+                before_hash,
+                after_hash,
+                json!({
+                    "before": before.signature,
+                    "after": after.signature,
+                }),
+            ));
+        }
+        if before.value == after.value {
+            return Err(source_no_observed_delta_error(
+                "act_type",
+                "foreground_focused_text_value",
+                verify_timeout_ms,
+                before_hash,
+                after_hash,
+                json!({
+                    "before": before.signature,
+                    "after": after.signature,
+                }),
+            ));
+        }
+        let after_value = after.value.as_deref().unwrap_or_default();
+        if !normalized_text_contains(after_value, emitted) {
+            return Err(postcondition_failed_error(
+                "act_type",
+                "foreground_focused_text_value",
+                "focused text value changed but did not contain the emitted text",
+                before_hash,
+                after_hash,
+                json!({
+                    "expected_emitted_len": emitted.chars().count(),
+                    "expected_emitted_sha256": text_sha256(emitted),
+                    "before": before.signature,
+                    "after": after.signature,
+                }),
+            ));
+        }
+        response.postcondition = postcondition_observed_delta(
+            "act_type",
+            "foreground_focused_text_value",
+            before_hash,
+            after_hash,
+            "observed focused text value changed and containing emitted text after delivery",
+        );
+        response.target_readback_required = false;
+        response.target_text_integrity = "foreground_focused_text_value_readback".to_owned();
         Ok(response)
     }
 
@@ -1364,6 +1508,71 @@ fn signature_hash(signature: &ClickDeltaSignature) -> Result<String, ErrorData> 
     hash_json(signature)
 }
 
+fn focused_text_candidate(
+    focused: Option<&FocusedElement>,
+    elements: &[AccessibleNode],
+) -> Option<ActTypeFocusedTextCandidate> {
+    if let Some(node) = elements
+        .iter()
+        .find(|node| node.focused && has_text_readback_pattern(&node.patterns))
+    {
+        return Some(ActTypeFocusedTextCandidate {
+            element_id: node.element_id.to_string(),
+            role: node.role.clone(),
+            name: node.name.clone(),
+            selected_text: None,
+            bbox: node.bbox,
+            value: node.value.clone(),
+            patterns: node.patterns.clone(),
+        });
+    }
+    focused.map(|focused| ActTypeFocusedTextCandidate {
+        element_id: focused.element_id.to_string(),
+        role: focused.role.clone(),
+        name: focused.name.clone(),
+        selected_text: focused.selected_text.clone(),
+        bbox: focused.bbox,
+        value: focused.value.clone(),
+        patterns: focused.patterns.clone(),
+    })
+}
+
+fn focused_text_readback(
+    focused: Option<&ActTypeFocusedTextCandidate>,
+) -> (Option<String>, Option<&'static str>) {
+    let Some(focused) = focused else {
+        return (None, None);
+    };
+    if let Some(value) = &focused.value {
+        return (Some(value.clone()), Some("uia_focused_value"));
+    }
+    if has_text_readback_pattern(&focused.patterns) {
+        return (Some(String::new()), Some("uia_focused_empty_value_or_text"));
+    }
+    (None, None)
+}
+
+fn has_text_readback_pattern(patterns: &[UiaPattern]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| matches!(pattern, UiaPattern::Value | UiaPattern::Text))
+}
+
+fn normalized_text_contains(value: &str, emitted: &str) -> bool {
+    if emitted.is_empty() {
+        return false;
+    }
+    normalize_newlines(value).contains(&normalize_newlines(emitted))
+}
+
+fn normalize_newlines(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn text_sha256(value: &str) -> String {
+    hex_encode(&Sha256::digest(value.as_bytes()))
+}
+
 fn hash_json<T: Serialize>(value: &T) -> Result<String, ErrorData> {
     let bytes = serde_json::to_vec(value).map_err(|error| {
         mcp_error(
@@ -1393,6 +1602,57 @@ fn foreground_identity_changed(before: &ClickDeltaSignature, after: &ClickDeltaS
     before.foreground_hwnd != after.foreground_hwnd
         || before.foreground_pid != after.foreground_pid
         || before.foreground_process != after.foreground_process
+}
+
+fn act_type_foreground_identity_changed(
+    before: &ActTypeTextSignature,
+    after: &ActTypeTextSignature,
+) -> bool {
+    before.foreground_hwnd != after.foreground_hwnd
+        || before.foreground_pid != after.foreground_pid
+        || before.foreground_process != after.foreground_process
+}
+
+fn act_type_text_foreground_lost_error(
+    timeout_ms: u32,
+    before_hash: &str,
+    after_hash: &str,
+    before: &ActTypeTextSignature,
+    after: &ActTypeTextSignature,
+) -> ErrorData {
+    tracing::warn!(
+        code = error_codes::ACTION_FOREGROUND_LOST,
+        tool = "act_type",
+        source_of_truth = "foreground_focused_text_value",
+        timeout_ms,
+        before_hwnd = before.foreground_hwnd,
+        after_hwnd = after.foreground_hwnd,
+        before_pid = before.foreground_pid,
+        after_pid = after.foreground_pid,
+        before_process = %before.foreground_process,
+        after_process = %after.foreground_process,
+        before_signature = before_hash,
+        after_signature = after_hash,
+        "act_type text readback foreground target identity changed before postcondition readback"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "act_type text readback cannot accept observed delta because foreground target changed within {timeout_ms} ms"
+        ),
+        Some(json!({
+            "code": error_codes::ACTION_FOREGROUND_LOST,
+            "tool": "act_type",
+            "source_of_truth": "foreground_focused_text_value",
+            "verify_delta": {
+                "timeout_ms": timeout_ms,
+                "before_signature": before_hash,
+                "after_signature": after_hash,
+                "before": before,
+                "after": after,
+            }
+        })),
+    )
 }
 
 fn foreground_lost_delta_error(

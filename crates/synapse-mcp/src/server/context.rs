@@ -1,7 +1,9 @@
 use super::{
     Arc, CancellationToken, ErrorData, M1State, Mutex, MutexGuard, ProfileActivateParams,
     ProfileActivateResponse, RecordingBackend, RequiredPermissions, SseState, SynapseService,
-    action_preflight::{ActionPreflightReadback, attach_action_preflight_to_error},
+    action_preflight::{
+        ActionPreflightReadback, ForegroundProof, attach_action_preflight_to_error,
+    },
     activate_profile, apply_profile_runtime_config_in_state, authorization_error, error_codes,
     mcp_error,
 };
@@ -470,57 +472,123 @@ impl SynapseService {
 
     pub(super) fn ensure_act_type_foreground(
         &self,
+        preflight: &ActionPreflightReadback,
         recording: Option<&Arc<RecordingBackend>>,
     ) -> Result<(), ErrorData> {
-        let (expected, actual) = {
-            let state = self.m1_state()?;
-            let Some(expected) = state.last_observed_foreground.clone() else {
-                return Ok(());
-            };
-            let actual = crate::m1::current_input(&state, 1).map(|input| input.foreground);
-            drop(state);
-            (expected, actual)
-        };
-        let actual = actual.map_err(|error| {
-            mcp_error(
-                error_codes::ACTION_FOREGROUND_LOST,
-                format!(
-                    "act_type could not read current foreground for expected hwnd 0x{:x}: {error}",
-                    expected.hwnd
-                ),
-            )
+        let expected = preflight.after.as_ref().unwrap_or(&preflight.before);
+        let actual = self.current_audit_foreground().map_err(|error| {
+            act_type_foreground_lost_error(expected, None, Some(&error), recording)
         })?;
         if actual.hwnd == expected.hwnd {
             return Ok(());
         }
 
-        let recording_event_count_before =
-            recording.map_or(0, |recording| recording.events().len());
-        let recording_event_count_after = recording.map_or(0, |recording| recording.events().len());
-        tracing::warn!(
-            code = "M2_ACT_TYPE_FOREGROUND_LOST",
-            expected_hwnd = expected.hwnd,
-            actual_hwnd = actual.hwnd,
-            expected_pid = expected.pid,
-            actual_pid = actual.pid,
-            expected_title = %expected.window_title,
-            actual_title = %actual.window_title,
-            recording_event_count_before,
-            recording_event_count_after,
-            "readback=foreground edge=lost before_hwnd=0x{:x} after_hwnd=0x{:x} code=ACTION_FOREGROUND_LOST recording_events_before={} recording_events_after={}",
-            expected.hwnd,
-            actual.hwnd,
-            recording_event_count_before,
-            recording_event_count_after
-        );
-        Err(mcp_error(
-            error_codes::ACTION_FOREGROUND_LOST,
-            format!(
-                "act_type expected foreground hwnd 0x{:x} ({}) but current foreground is hwnd 0x{:x} ({})",
-                expected.hwnd, expected.window_title, actual.hwnd, actual.window_title
-            ),
+        Err(act_type_foreground_lost_error(
+            expected,
+            Some(&actual),
+            None,
+            recording,
         ))
     }
+}
+
+fn act_type_foreground_lost_error(
+    expected: &ForegroundProof,
+    actual: Option<&ForegroundContext>,
+    read_error: Option<&ErrorData>,
+    recording: Option<&Arc<RecordingBackend>>,
+) -> ErrorData {
+    let recording_event_count_before = recording.map_or(0, |recording| recording.events().len());
+    let recording_event_count_after = recording.map_or(0, |recording| recording.events().len());
+    match actual {
+        Some(actual) => {
+            tracing::warn!(
+                code = "M2_ACT_TYPE_FOREGROUND_LOST",
+                expected_hwnd = expected.hwnd,
+                actual_hwnd = actual.hwnd,
+                expected_pid = expected.pid,
+                actual_pid = actual.pid,
+                expected_title = %expected.window_title,
+                actual_title = %actual.window_title,
+                recording_event_count_before,
+                recording_event_count_after,
+                "readback=foreground edge=lost before_hwnd=0x{:x} after_hwnd=0x{:x} code=ACTION_FOREGROUND_LOST recording_events_before={} recording_events_after={}",
+                expected.hwnd,
+                actual.hwnd,
+                recording_event_count_before,
+                recording_event_count_after
+            );
+            ErrorData::new(
+                ErrorCode(-32099),
+                format!(
+                    "act_type expected preflight foreground hwnd 0x{:x} ({}) but current foreground is hwnd 0x{:x} ({})",
+                    expected.hwnd, expected.window_title, actual.hwnd, actual.window_title
+                ),
+                Some(json!({
+                    "code": error_codes::ACTION_FOREGROUND_LOST,
+                    "reason": "act_type_foreground_changed_after_preflight",
+                    "foreground_expected": expected,
+                    "foreground_actual": foreground_context_details(actual),
+                    "recording_event_count_before": recording_event_count_before,
+                    "recording_event_count_after": recording_event_count_after,
+                })),
+            )
+        }
+        None => {
+            let read_error_message = read_error
+                .map(|error| error.message.to_string())
+                .unwrap_or_else(|| "unknown foreground read error".to_owned());
+            tracing::warn!(
+                code = "M2_ACT_TYPE_FOREGROUND_LOST",
+                expected_hwnd = expected.hwnd,
+                expected_pid = expected.pid,
+                expected_title = %expected.window_title,
+                read_error = %read_error_message,
+                recording_event_count_before,
+                recording_event_count_after,
+                "readback=foreground edge=read_failed before_hwnd=0x{:x} code=ACTION_FOREGROUND_LOST recording_events_before={} recording_events_after={}",
+                expected.hwnd,
+                recording_event_count_before,
+                recording_event_count_after
+            );
+            ErrorData::new(
+                ErrorCode(-32099),
+                format!(
+                    "act_type could not read current foreground for preflight hwnd 0x{:x} ({}): {}",
+                    expected.hwnd, expected.window_title, read_error_message
+                ),
+                Some(json!({
+                    "code": error_codes::ACTION_FOREGROUND_LOST,
+                    "reason": "act_type_foreground_read_failed_after_preflight",
+                    "foreground_expected": expected,
+                    "foreground_actual": serde_json::Value::Null,
+                    "foreground_read_error": read_error.map(|error| json!({
+                        "message": error.message.to_string(),
+                        "data": error.data.clone(),
+                    })),
+                    "recording_event_count_before": recording_event_count_before,
+                    "recording_event_count_after": recording_event_count_after,
+                })),
+            )
+        }
+    }
+}
+
+fn foreground_context_details(foreground: &ForegroundContext) -> serde_json::Value {
+    json!({
+        "hwnd": foreground.hwnd,
+        "pid": foreground.pid,
+        "process_name": &foreground.process_name,
+        "process_path": &foreground.process_path,
+        "window_title": &foreground.window_title,
+        "window_bounds": &foreground.window_bounds,
+        "monitor_index": foreground.monitor_index,
+        "dpi_scale": foreground.dpi_scale,
+        "profile_id": &foreground.profile_id,
+        "steam_appid": foreground.steam_appid,
+        "is_fullscreen": foreground.is_fullscreen,
+        "is_dwm_composed": foreground.is_dwm_composed,
+    })
 }
 
 fn profile_action_scope_denied_error(
@@ -1151,6 +1219,83 @@ mod scope_gate_tests {
         Ok(())
     }
 
+    #[test]
+    fn act_type_foreground_uses_preflight_instead_of_stale_observed_foreground()
+    -> anyhow::Result<()> {
+        let profiles = TempDir::new()?;
+        let service = service_with_profiles(profiles.path(), true)?;
+        let current = synthetic_process_input("obs64.exe", "YouTube Broadcast Setup", 0x691390);
+        let expected_foreground = current.foreground.clone();
+        install_synthetic_input(&service, current)?;
+        {
+            let mut state = service.m1_state.lock().map_err(|_err| {
+                anyhow::anyhow!("M1 service state lock poisoned while installing stale foreground")
+            })?;
+            state.last_observed_foreground = Some(
+                synthetic_process_input(
+                    "chrome.exe",
+                    "Synapse 751 CDP FSV - Google Chrome",
+                    0x373137a,
+                )
+                .foreground,
+            );
+        }
+        let preflight = act_type_preflight_for(&expected_foreground);
+
+        service.ensure_act_type_foreground(&preflight, None)?;
+
+        println!(
+            "readback=act_type_foreground edge=stale_observed_ignored stale_hwnd=0x373137a preflight_hwnd=0x{:x}",
+            expected_foreground.hwnd
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn act_type_foreground_still_fails_closed_when_focus_changes_after_preflight()
+    -> anyhow::Result<()> {
+        let profiles = TempDir::new()?;
+        let service = service_with_profiles(profiles.path(), true)?;
+        let expected = synthetic_process_input("obs64.exe", "YouTube Broadcast Setup", 0x691390);
+        let actual = synthetic_process_input("notepad.exe", "manual.txt - Notepad", 0x1234);
+        let preflight = act_type_preflight_for(&expected.foreground);
+        install_synthetic_input(&service, actual)?;
+
+        let error = match service.ensure_act_type_foreground(&preflight, None) {
+            Ok(()) => anyhow::bail!("act_type foreground check accepted changed foreground"),
+            Err(error) => error,
+        };
+        let data = error
+            .data
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("foreground error should carry structured data"))?;
+
+        assert_eq!(
+            data.get("code").and_then(serde_json::Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LOST)
+        );
+        assert_eq!(
+            data.get("reason").and_then(serde_json::Value::as_str),
+            Some("act_type_foreground_changed_after_preflight")
+        );
+        assert_eq!(
+            data.pointer("/foreground_expected/hwnd")
+                .and_then(serde_json::Value::as_i64),
+            Some(0x691390)
+        );
+        assert_eq!(
+            data.pointer("/foreground_actual/hwnd")
+                .and_then(serde_json::Value::as_i64),
+            Some(0x1234)
+        );
+        println!(
+            "readback=act_type_foreground edge=changed_after_preflight before_hwnd=0x691390 after_hwnd=0x1234 code={:?} reason={:?}",
+            data.get("code"),
+            data.get("reason")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn observe_persists_audit_session_observation_and_event_rows() -> anyhow::Result<()> {
         let profiles = TempDir::new()?;
@@ -1632,6 +1777,39 @@ max_detections = 8
         state.synthetic = Some(input);
         drop(state);
         Ok(())
+    }
+
+    fn act_type_preflight_for(foreground: &ForegroundContext) -> ActionPreflightReadback {
+        let proof = foreground_proof_for(foreground);
+        ActionPreflightReadback {
+            tool: "act_type",
+            target_profile_id: None,
+            active_profile_id_before: None,
+            applied: false,
+            status: "not_applicable",
+            target: None,
+            before: proof.clone(),
+            candidate_count: None,
+            focus_attempted: false,
+            focus_hwnd: None,
+            focus_error: None,
+            after: Some(proof),
+            readback_error: None,
+            everquest_ui_context: None,
+        }
+    }
+
+    fn foreground_proof_for(foreground: &ForegroundContext) -> ForegroundProof {
+        ForegroundProof {
+            hwnd: foreground.hwnd,
+            pid: foreground.pid,
+            process_name: foreground.process_name.clone(),
+            process_path: foreground.process_path.clone(),
+            window_title: foreground.window_title.clone(),
+            is_minimized: Some(false),
+            minimized_readback_error: None,
+            observed_profile_id: foreground.profile_id.clone(),
+        }
     }
 
     fn synthetic_process_input(

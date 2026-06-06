@@ -50,8 +50,8 @@ pub struct ActTypeParams {
     #[serde(default = "default_type_backend")]
     #[schemars(default = "default_type_backend")]
     pub backend: TypeBackend,
-    #[serde(default)]
-    #[schemars(default)]
+    #[serde(default = "default_verify_delta")]
+    #[schemars(default = "default_verify_delta")]
     pub verify_delta: bool,
     #[serde(default = "default_verify_timeout_ms")]
     #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
@@ -482,7 +482,7 @@ fn validate_type_params(params: &ActTypeParams) -> Result<(), ErrorData> {
     Ok(())
 }
 
-fn emitted_text(params: &ActTypeParams) -> String {
+pub(crate) fn emitted_text(params: &ActTypeParams) -> String {
     if params.press_enter_after {
         let mut text = params.text.clone();
         text.push('\n');
@@ -569,6 +569,10 @@ const fn default_type_backend() -> TypeBackend {
     TypeBackend::Auto
 }
 
+const fn default_verify_delta() -> bool {
+    true
+}
+
 const fn default_use_scancodes() -> bool {
     false
 }
@@ -588,7 +592,7 @@ mod tests {
         ActTypeParams, MIN_SAFE_LINEAR_MS_PER_CHAR, TEXT_INTEGRITY_DISPATCH_ONLY, TypeBackend,
         TypeDynamics, act_type_with_handle, action_from_type_params, default_linear_ms_per_char,
         default_press_enter_after, default_type_backend, default_type_dynamics,
-        default_use_scancodes, default_verify_timeout_ms, recorded_ikis,
+        default_use_scancodes, default_verify_delta, default_verify_timeout_ms, recorded_ikis,
     };
 
     #[tokio::test]
@@ -650,6 +654,7 @@ mod tests {
         assert_eq!(default_type_dynamics(), TypeDynamics::Natural);
         assert_eq!(default_linear_ms_per_char(), 30);
         assert_eq!(default_type_backend(), TypeBackend::Auto);
+        assert!(default_verify_delta());
         assert!(!default_use_scancodes());
         assert!(!default_press_enter_after());
     }

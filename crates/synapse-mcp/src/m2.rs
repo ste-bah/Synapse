@@ -45,6 +45,7 @@ pub use stroke::{
     act_stroke_validation_failure_details, act_stroke_with_handle, validate_act_stroke_params,
 };
 pub use type_text::action_from_type_params;
+pub(crate) use type_text::emitted_text;
 pub use type_text::{ActTypeParams, ActTypeResponse, act_type_with_handle};
 
 use config::RECORDING_BACKEND_ENV;
