@@ -52,7 +52,22 @@ const ALLOW_LAUNCH_ANY_ENV: &str = "SYNAPSE_ALLOW_LAUNCH_ANY";
 const ANY_PERMITTED_SENTINEL: &str = "__any_permitted__";
 const SHELL_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 const ALLOW_PATTERN_SIZE_LIMIT_BYTES: usize = 256 * 1024;
-const PROCESS_BASE_ENV_KEYS: [&str; 4] = ["PATH", "USERPROFILE", "TEMP", "SystemRoot"];
+const PROCESS_BASE_ENV_KEYS: [&str; 14] = [
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "SystemDrive",
+    "SystemRoot",
+    "WINDIR",
+    "TEMP",
+    "TMP",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramData",
+];
 const LAUNCH_WINDOW_POLL_INTERVAL_MS: u64 = 20;
 const LAUNCH_FOREGROUND_STABLE_MS: u64 = 750;
 const LAUNCH_FOREGROUND_POLL_MS: u64 = 75;
@@ -1503,7 +1518,7 @@ fn spawn_launch_child(params: &ActLaunchParams) -> Result<u32, ErrorData> {
     if let Some(working_dir) = &params.working_dir {
         command.current_dir(working_dir);
     }
-    apply_launch_environment(&mut command, params);
+    apply_launch_environment(&mut command, params)?;
     if needs_new_console {
         apply_new_console_creation_flags(&mut command);
     } else {
@@ -1529,14 +1544,19 @@ fn spawn_launch_child(params: &ActLaunchParams) -> Result<u32, ErrorData> {
     Ok(child.id())
 }
 
-fn apply_launch_environment(command: &mut StdCommand, params: &ActLaunchParams) {
+fn apply_launch_environment(
+    command: &mut StdCommand,
+    params: &ActLaunchParams,
+) -> Result<(), ErrorData> {
     command.env_clear();
-    for key in PROCESS_BASE_ENV_KEYS {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
+    let mut env = child_base_environment();
+    ensure_child_temp_environment(&mut env);
+    validate_child_base_environment(&env, "act_launch")?;
+    for (_sort_key, (key, value)) in env {
+        command.env(key, value);
     }
     command.envs(&params.env);
+    Ok(())
 }
 
 fn launch_target_needs_new_console(target: &str) -> bool {
@@ -1631,15 +1651,9 @@ fn spawn_windows_console_child(params: &ActLaunchParams) -> Result<u32, ErrorDat
 
 #[cfg(windows)]
 fn launch_environment_block(params: &ActLaunchParams) -> Result<Vec<u16>, ErrorData> {
-    let mut env: BTreeMap<String, (String, String)> = BTreeMap::new();
-    for key in PROCESS_BASE_ENV_KEYS {
-        if let Some(value) = std::env::var_os(key) {
-            env.insert(
-                key.to_ascii_uppercase(),
-                (key.to_owned(), value.to_string_lossy().into_owned()),
-            );
-        }
-    }
+    let mut env = child_base_environment();
+    ensure_child_temp_environment(&mut env);
+    validate_child_base_environment(&env, "act_launch")?;
     for (key, value) in &params.env {
         validate_launch_environment_entry(key, value)?;
         env.insert(key.to_ascii_uppercase(), (key.clone(), value.clone()));
@@ -1656,6 +1670,149 @@ fn launch_environment_block(params: &ActLaunchParams) -> Result<Vec<u16>, ErrorD
     block.push(0);
     Ok(block)
 }
+
+fn child_base_environment() -> BTreeMap<String, (String, String)> {
+    let mut env: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for key in PROCESS_BASE_ENV_KEYS {
+        if let Some(value) = std::env::var_os(key) {
+            env.insert(
+                key.to_ascii_uppercase(),
+                (key.to_owned(), value.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    add_windows_profile_environment(&mut env);
+    env
+}
+
+fn insert_env_if_absent(env: &mut BTreeMap<String, (String, String)>, key: &str, value: String) {
+    if value.trim().is_empty() || value.contains('\0') {
+        tracing::warn!(
+            code = "M4_CHILD_ENV_DERIVE_INVALID",
+            key,
+            "child process environment derivation produced an invalid value"
+        );
+        return;
+    }
+    env.entry(key.to_ascii_uppercase())
+        .or_insert_with(|| (key.to_owned(), value));
+}
+
+fn ensure_child_temp_environment(env: &mut BTreeMap<String, (String, String)>) {
+    if env.contains_key("TEMP") && env.contains_key("TMP") {
+        return;
+    }
+    let Some(local_appdata) = env.get("LOCALAPPDATA").map(|(_key, value)| value.clone()) else {
+        tracing::warn!(
+            code = "M4_CHILD_ENV_TEMP_UNAVAILABLE",
+            "child process environment is missing TEMP/TMP and LOCALAPPDATA"
+        );
+        return;
+    };
+    let candidate = Path::new(&local_appdata).join("Temp");
+    let temp = candidate.to_string_lossy().into_owned();
+    insert_env_if_absent(env, "TEMP", temp.clone());
+    insert_env_if_absent(env, "TMP", temp);
+}
+
+#[cfg(windows)]
+fn validate_child_base_environment(
+    env: &BTreeMap<String, (String, String)>,
+    surface: &'static str,
+) -> Result<(), ErrorData> {
+    let required = ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP", "TMP"];
+    let missing: Vec<&str> = required
+        .into_iter()
+        .filter(|key| {
+            env.get(*key)
+                .map(|(_name, value)| value.trim().is_empty())
+                .unwrap_or(true)
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    tracing::error!(
+        code = "M4_CHILD_ENV_INCOMPLETE",
+        surface,
+        missing = ?missing,
+        "child process environment is missing required Windows user-profile variables"
+    );
+    let message = format!(
+        "{surface} cannot spawn a reliable Windows child process because Synapse could not construct required user-profile environment variables: {}",
+        missing.join(", ")
+    );
+    let data = json!({
+        "code": error_codes::ACTION_TARGET_INVALID,
+        "reason": "child_environment_incomplete",
+        "surface": surface,
+        "missing": missing,
+        "required": required,
+    });
+    if surface == "act_run_shell" {
+        return Err(shell_tool_error(
+            error_codes::ACTION_TARGET_INVALID,
+            message,
+            data,
+        ));
+    }
+    Err(launch_tool_error(
+        error_codes::ACTION_TARGET_INVALID,
+        message,
+        data,
+    ))
+}
+
+#[cfg(not(windows))]
+fn validate_child_base_environment(
+    _env: &BTreeMap<String, (String, String)>,
+    _surface: &'static str,
+) -> Result<(), ErrorData> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn add_windows_profile_environment(env: &mut BTreeMap<String, (String, String)>) {
+    let Some(userprofile) = env
+        .get("USERPROFILE")
+        .map(|(_key, value)| value.clone())
+        .filter(|value| !value.trim().is_empty())
+    else {
+        tracing::warn!(
+            code = "M4_CHILD_ENV_PROFILE_UNAVAILABLE",
+            "child process environment is missing USERPROFILE; APPDATA and LOCALAPPDATA cannot be derived"
+        );
+        return;
+    };
+    let profile = Path::new(&userprofile);
+    insert_env_if_absent(
+        env,
+        "APPDATA",
+        profile
+            .join("AppData")
+            .join("Roaming")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    insert_env_if_absent(
+        env,
+        "LOCALAPPDATA",
+        profile
+            .join("AppData")
+            .join("Local")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let system_drive = env
+        .get("SYSTEMDRIVE")
+        .map(|(_key, value)| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("C:");
+    insert_env_if_absent(env, "ProgramData", format!("{system_drive}\\ProgramData"));
+}
+
+#[cfg(not(windows))]
+fn add_windows_profile_environment(_env: &mut BTreeMap<String, (String, String)>) {}
 
 #[cfg(windows)]
 fn validate_launch_environment_entry(key: &str, value: &str) -> Result<(), ErrorData> {
@@ -2023,10 +2180,11 @@ fn spawn_shell_child(params: &ActRunShellParams) -> Result<tokio::process::Child
         command.current_dir(working_dir);
     }
     command.env_clear();
-    for key in PROCESS_BASE_ENV_KEYS {
-        if let Some(value) = std::env::var_os(key) {
-            command.env(key, value);
-        }
+    let mut env = child_base_environment();
+    ensure_child_temp_environment(&mut env);
+    validate_child_base_environment(&env, "act_run_shell")?;
+    for (_sort_key, (key, value)) in env {
+        command.env(key, value);
     }
     command.envs(&params.env);
     command
@@ -2623,6 +2781,64 @@ mod tests {
             is_fullscreen: false,
             is_dwm_composed: true,
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_environment_derives_windows_profile_paths_from_slim_daemon_env() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "USERPROFILE".to_owned(),
+            ("USERPROFILE".to_owned(), r"C:\Users\hotra".to_owned()),
+        );
+        env.insert(
+            "SYSTEMDRIVE".to_owned(),
+            ("SystemDrive".to_owned(), "D:".to_owned()),
+        );
+
+        add_windows_profile_environment(&mut env);
+
+        assert_eq!(
+            env.get("APPDATA").map(|(_key, value)| value.as_str()),
+            Some(r"C:\Users\hotra\AppData\Roaming")
+        );
+        assert_eq!(
+            env.get("LOCALAPPDATA").map(|(_key, value)| value.as_str()),
+            Some(r"C:\Users\hotra\AppData\Local")
+        );
+        assert_eq!(
+            env.get("PROGRAMDATA").map(|(_key, value)| value.as_str()),
+            Some(r"D:\ProgramData")
+        );
+        println!(
+            "readback=child_env edge=slim_daemon after_appdata={} after_localappdata={} after_programdata={}",
+            env["APPDATA"].1, env["LOCALAPPDATA"].1, env["PROGRAMDATA"].1
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn child_environment_preserves_explicit_appdata_from_daemon_env() {
+        let mut env = BTreeMap::new();
+        env.insert(
+            "USERPROFILE".to_owned(),
+            ("USERPROFILE".to_owned(), r"C:\Users\hotra".to_owned()),
+        );
+        env.insert(
+            "APPDATA".to_owned(),
+            ("APPDATA".to_owned(), r"E:\Roaming".to_owned()),
+        );
+
+        add_windows_profile_environment(&mut env);
+
+        assert_eq!(
+            env.get("APPDATA").map(|(_key, value)| value.as_str()),
+            Some(r"E:\Roaming")
+        );
+        println!(
+            "readback=child_env edge=explicit_appdata after_appdata={}",
+            env["APPDATA"].1
+        );
     }
 
     fn launch_config_for(params: &ActLaunchParams) -> M4ServiceConfig {
