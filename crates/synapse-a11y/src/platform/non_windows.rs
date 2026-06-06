@@ -49,6 +49,18 @@ pub fn is_window_minimized(_hwnd: i64) -> A11yResult<bool> {
     ))
 }
 
+pub fn is_window_visible(_hwnd: i64) -> A11yResult<bool> {
+    Err(A11yError::not_available(
+        "visible window readback requires Windows",
+    ))
+}
+
+pub fn is_top_level_window(_hwnd: i64) -> A11yResult<bool> {
+    Err(A11yError::not_available(
+        "top-level window readback requires Windows",
+    ))
+}
+
 pub fn close_window(_hwnd: i64) -> A11yResult<()> {
     Err(A11yError::not_available("window close requires Windows"))
 }

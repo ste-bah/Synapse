@@ -50,6 +50,26 @@ pub fn is_window_minimized(hwnd: i64) -> A11yResult<bool> {
     platform::is_window_minimized(hwnd)
 }
 
+/// Returns whether a native HWND is visible.
+///
+/// # Errors
+///
+/// Returns a structured UIA error when the HWND is invalid, or
+/// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn is_window_visible(hwnd: i64) -> A11yResult<bool> {
+    platform::is_window_visible(hwnd)
+}
+
+/// Returns whether a native HWND is its own top-level root window.
+///
+/// # Errors
+///
+/// Returns a structured UIA error when the HWND is invalid, or
+/// `A11Y_NOT_AVAILABLE` on non-Windows platforms.
+pub fn is_top_level_window(hwnd: i64) -> A11yResult<bool> {
+    platform::is_top_level_window(hwnd)
+}
+
 /// Requests that a top-level native HWND close by posting `WM_CLOSE`.
 ///
 /// # Errors

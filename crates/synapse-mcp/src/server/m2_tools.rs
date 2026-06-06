@@ -1,11 +1,12 @@
 use super::{
     ActClickParams, ActClickResponse, ActClipboardParams, ActClipboardResponse, ActClipboardVerb,
-    ActKeymapParams, ActKeymapResponse, ActPadParams, ActPadResponse, ActPressParams,
-    ActPressResponse, ActScrollParams, ActScrollResponse, ActSetValueParams, ActSetValueResponse,
-    ActStrokeParams, ActStrokeResponse, ActTypeParams, ActTypeResponse, ErrorData, Json,
-    Parameters, ReleaseAllParams, ReleaseAllResponse, SynapseService, act_click_with_handle,
-    act_clipboard, act_keymap_with_handle, act_pad_with_handle, act_press_with_handle,
-    act_scroll_with_handle, act_set_value, act_set_value_request_details,
+    ActFocusWindowParams, ActFocusWindowResponse, ActKeymapParams, ActKeymapResponse, ActPadParams,
+    ActPadResponse, ActPressParams, ActPressResponse, ActScrollParams, ActScrollResponse,
+    ActSetValueParams, ActSetValueResponse, ActStrokeParams, ActStrokeResponse, ActTypeParams,
+    ActTypeResponse, ErrorData, Json, Parameters, ReleaseAllParams, ReleaseAllResponse,
+    SynapseService, act_click_with_handle, act_clipboard, act_focus_window,
+    act_focus_window_request_details, act_keymap_with_handle, act_pad_with_handle,
+    act_press_with_handle, act_scroll_with_handle, act_set_value, act_set_value_request_details,
     act_stroke_validation_failure_details, act_stroke_with_handle, act_type_with_handle,
     action_preflight::{ActionPreflightReadback, ForegroundProof},
     release_all_with_handles, tool, tool_router, validate_act_stroke_params,
@@ -257,6 +258,39 @@ impl SynapseService {
         )?;
         let result = act_set_value(params).await;
         self.audit_action_result("act_set_value", &result)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Focus or activate one visible top-level native window by exact hwnd, unique title_regex, or unique pid. The action fails closed on missing or ambiguous targets and verifies success with a separate GetForegroundWindow readback."
+    )]
+    pub async fn act_focus_window(
+        &self,
+        params: Parameters<ActFocusWindowParams>,
+    ) -> Result<Json<ActFocusWindowResponse>, ErrorData> {
+        let params = params.0;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "act_focus_window",
+            "tool.invocation kind=act_focus_window"
+        );
+        let request_details = act_focus_window_request_details(&params);
+        let preflight = match self.ensure_supported_use_allows_action("act_focus_window") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied_with_details("act_focus_window", &error, &request_details);
+                return Err(error);
+            }
+        };
+        self.audit_action_started_with_details(
+            "act_focus_window",
+            &json!({
+                "request": request_details,
+                "preflight": preflight,
+            }),
+        )?;
+        let result = act_focus_window(params).await;
+        self.audit_action_result("act_focus_window", &result)?;
         result.map(Json)
     }
 

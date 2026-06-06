@@ -1,6 +1,7 @@
 mod click;
 mod clipboard;
 mod config;
+mod focus_window;
 mod pad;
 pub(crate) mod postcondition;
 mod press;
@@ -32,6 +33,10 @@ pub(crate) use click::{
 pub use clipboard::ActClipboardFormat;
 pub use clipboard::{ActClipboardParams, ActClipboardResponse, ActClipboardVerb, act_clipboard};
 pub use config::M2ServiceConfig;
+pub use focus_window::{
+    ActFocusWindowParams, ActFocusWindowResponse, act_focus_window,
+    act_focus_window_request_details,
+};
 pub use pad::{ActPadParams, ActPadResponse, act_pad_with_handle};
 pub use postcondition::default_verify_timeout_ms;
 pub use press::action_from_press_params;

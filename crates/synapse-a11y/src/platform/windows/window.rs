@@ -17,9 +17,10 @@ use windows::{
             SendInput, VIRTUAL_KEY, VK_MENU,
         },
         UI::WindowsAndMessaging::{
-            BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextW,
-            GetWindowThreadProcessId, IsIconic, IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOW,
-            SetForegroundWindow, ShowWindow, SwitchToThisWindow, WM_CLOSE,
+            BringWindowToTop, EnumWindows, GA_ROOT, GetAncestor, GetForegroundWindow,
+            GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
+            IsWindowVisible, PostMessageW, SW_RESTORE, SW_SHOW, SetForegroundWindow, ShowWindow,
+            SwitchToThisWindow, WM_CLOSE,
         },
     },
     core::{BOOL, PWSTR},
@@ -175,6 +176,17 @@ pub fn is_window_minimized(hwnd: i64) -> A11yResult<bool> {
         });
     }
     Ok(unsafe { IsIconic(hwnd) }.as_bool())
+}
+
+pub fn is_window_visible(hwnd: i64) -> A11yResult<bool> {
+    let hwnd = valid_hwnd(hwnd)?;
+    Ok(unsafe { IsWindowVisible(hwnd) }.as_bool())
+}
+
+pub fn is_top_level_window(hwnd: i64) -> A11yResult<bool> {
+    let hwnd = valid_hwnd(hwnd)?;
+    let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+    Ok(root.0 == hwnd.0)
 }
 
 pub fn close_window(hwnd: i64) -> A11yResult<()> {
@@ -362,4 +374,20 @@ fn visible_top_level_hwnds() -> A11yResult<Vec<HWND>> {
     }
     .map_err(|err| A11yError::internal(format!("EnumWindows failed: {err}")))?;
     Ok(search.hwnds)
+}
+
+fn valid_hwnd(hwnd: i64) -> A11yResult<HWND> {
+    let hwnd = HWND(hwnd as *mut c_void);
+    if hwnd.0.is_null() {
+        return Err(A11yError::NoForeground {
+            detail: "HWND was null".to_owned(),
+        });
+    }
+    if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        Ok(hwnd)
+    } else {
+        Err(A11yError::NoForeground {
+            detail: format!("HWND 0x{:x} is not a valid window", hwnd.0 as isize),
+        })
+    }
 }
