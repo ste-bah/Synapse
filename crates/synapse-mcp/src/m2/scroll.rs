@@ -9,12 +9,16 @@ use serde::{Deserialize, Serialize};
 use synapse_action::{
     ActionBackend, ActionError, ActionHandle, EmitState, RecordedInput, RecordingBackend,
 };
-use synapse_core::{Action, Backend, Point};
+use synapse_core::{Action, Backend, ElementId, Point, error_codes};
 
 use crate::m1::mcp_error;
 use crate::m2::postcondition::{
     ActPostcondition, default_verify_timeout_ms, postcondition_not_requested,
 };
+#[cfg(windows)]
+use crate::m2::postcondition::{hash_json, no_observed_delta_error, postcondition_observed_delta};
+#[cfg(windows)]
+use serde_json::json;
 
 #[cfg(windows)]
 use std::ffi::c_void;
@@ -46,6 +50,7 @@ pub struct ActScrollParams {
     #[schemars(default)]
     pub dx: i32,
     pub at: Option<ActScrollPoint>,
+    pub target: Option<ActScrollElementTarget>,
     #[serde(default)]
     #[schemars(default)]
     pub smooth: bool,
@@ -62,6 +67,12 @@ pub struct ActScrollParams {
 pub struct ActScrollPoint {
     pub x: i32,
     pub y: i32,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActScrollElementTarget {
+    pub element_id: ElementId,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -94,6 +105,25 @@ pub async fn act_scroll_with_handle(
         return Ok(response(&params, false, 0, "none", started));
     }
 
+    if let Some(target) = &params.target {
+        #[cfg(windows)]
+        {
+            if let Some(backend_node_id) =
+                synapse_a11y::cdp_backend_from_element_id(&target.element_id)
+            {
+                return execute_cdp_scroll(&params, &target.element_id, backend_node_id, started)
+                    .await;
+            }
+        }
+        return Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "act_scroll target.element_id {} is not a CDP web element id; element-target scroll currently requires a cdcd backendNodeId",
+                target.element_id
+            ),
+        ));
+    }
+
     let actions = scroll_actions(&params)?;
     let mut wheel_event_count = actions.len();
     let mut backend_used = "software";
@@ -117,6 +147,20 @@ pub async fn act_scroll_with_handle(
     ))
 }
 
+impl ActScrollParams {
+    pub(crate) fn verify_delta_point_region(&self) -> Option<Point> {
+        if self.target.is_some() {
+            None
+        } else {
+            self.at.map(Into::into)
+        }
+    }
+
+    pub(crate) fn uses_element_target(&self) -> bool {
+        self.target.is_some()
+    }
+}
+
 impl From<ActScrollPoint> for Point {
     fn from(value: ActScrollPoint) -> Self {
         Self {
@@ -127,6 +171,12 @@ impl From<ActScrollPoint> for Point {
 }
 
 fn validate_scroll_params(params: &ActScrollParams) -> Result<(), ErrorData> {
+    if params.at.is_some() && params.target.is_some() {
+        return Err(mcp_error(
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "act_scroll accepts either at={x,y} or target={element_id}, not both",
+        ));
+    }
     if params.smooth {
         let step_count = smooth_step_count(params.dy, params.dx);
         if step_count > MAX_SMOOTH_SCROLL_STEPS {
@@ -139,6 +189,175 @@ fn validate_scroll_params(params: &ActScrollParams) -> Result<(), ErrorData> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+async fn execute_cdp_scroll(
+    params: &ActScrollParams,
+    element_id: &ElementId,
+    backend_node_id: i64,
+    started: Instant,
+) -> Result<ActScrollResponse, ErrorData> {
+    let hwnd = element_id
+        .parts()
+        .map_err(|err| {
+            mcp_error(
+                error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+                format!("web element id is malformed: {err}"),
+            )
+        })?
+        .hwnd;
+    let endpoint = synapse_a11y::endpoint_for_window(hwnd).ok_or_else(|| {
+        mcp_error(
+            error_codes::A11Y_CDP_UNREACHABLE,
+            format!(
+                "no reachable CDP endpoint for web element {element_id} (browser closed or debug port gone)"
+            ),
+        )
+    })?;
+    let title_hint = synapse_a11y::foreground_context(hwnd)
+        .map(|context| context.window_title)
+        .unwrap_or_default();
+    let before = if params.verify_delta {
+        Some(
+            synapse_a11y::cdp_node_scroll_state(&endpoint, &title_hint, backend_node_id)
+                .await
+                .map_err(|err| mcp_error(err.code(), err.to_string()))?,
+        )
+    } else {
+        None
+    };
+    let deltas = cdp_wheel_deltas(params)?;
+    let wheel_event_count = deltas.len();
+    let point = synapse_a11y::cdp_scroll_node(
+        &endpoint,
+        &title_hint,
+        backend_node_id,
+        deltas,
+        if params.smooth {
+            SMOOTH_SCROLL_INTERVAL_MS
+        } else {
+            0
+        },
+    )
+    .await
+    .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+    let postcondition = if let Some(before) = before {
+        tokio::time::sleep(Duration::from_millis(u64::from(params.verify_timeout_ms))).await;
+        let after = synapse_a11y::cdp_node_scroll_state(&endpoint, &title_hint, backend_node_id)
+            .await
+            .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+        let postcondition = verify_cdp_scroll_delta(params.verify_timeout_ms, &before, &after)?;
+        tracing::info!(
+            code = "M2_ACT_SCROLL_CDP_WHEEL",
+            kind = "act_scroll",
+            element_id = %element_id,
+            backend_node_id,
+            viewport_x = point.x,
+            viewport_y = point.y,
+            wheel_event_count,
+            dy = params.dy,
+            dx = params.dx,
+            smooth = params.smooth,
+            before = ?before,
+            after = ?after,
+            "readback=cdp_node.scroll_state tool=act_scroll cdp_scroll_after"
+        );
+        postcondition
+    } else {
+        tracing::info!(
+            code = "M2_ACT_SCROLL_CDP_WHEEL",
+            kind = "act_scroll",
+            element_id = %element_id,
+            backend_node_id,
+            viewport_x = point.x,
+            viewport_y = point.y,
+            wheel_event_count,
+            dy = params.dy,
+            dx = params.dx,
+            smooth = params.smooth,
+            "readback=cdp_dispatch tool=act_scroll cdp_scroll_after"
+        );
+        postcondition_not_requested("act_scroll", "cdp_node.scroll_state")
+    };
+    let mut response = response(params, true, wheel_event_count, "cdp", started);
+    response.postcondition = postcondition;
+    Ok(response)
+}
+
+#[cfg(windows)]
+fn cdp_wheel_deltas(
+    params: &ActScrollParams,
+) -> Result<Vec<synapse_a11y::CdpWheelDelta>, ErrorData> {
+    let mut ticks = if params.smooth {
+        smooth_scroll_ticks(params)?
+    } else {
+        vec![(params.dy, params.dx)]
+    };
+    ticks.retain(|(dy, dx)| *dy != 0 || *dx != 0);
+    Ok(ticks
+        .into_iter()
+        .map(|(dy, dx)| synapse_a11y::CdpWheelDelta {
+            delta_x: scroll_ticks_to_cdp_delta(dx),
+            delta_y: scroll_ticks_to_cdp_delta(dy),
+        })
+        .collect())
+}
+
+#[cfg(windows)]
+fn smooth_scroll_ticks(params: &ActScrollParams) -> Result<Vec<(i32, i32)>, ErrorData> {
+    let step_count = smooth_step_count(params.dy, params.dx);
+    let capacity = usize::try_from(step_count).map_err(|_err| {
+        mcp_error(
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "act_scroll smooth=true step count cannot fit in memory",
+        )
+    })?;
+    let mut ticks = Vec::with_capacity(capacity);
+    let mut vertical_ticks_remaining = params.dy;
+    let mut horizontal_ticks_remaining = params.dx;
+    for _ in 0..step_count {
+        ticks.push((
+            take_tick(&mut vertical_ticks_remaining),
+            take_tick(&mut horizontal_ticks_remaining),
+        ));
+    }
+    Ok(ticks)
+}
+
+#[cfg(windows)]
+fn scroll_ticks_to_cdp_delta(ticks: i32) -> f64 {
+    -f64::from(ticks.saturating_mul(WHEEL_DELTA))
+}
+
+#[cfg(windows)]
+fn verify_cdp_scroll_delta(
+    verify_timeout_ms: u32,
+    before: &synapse_a11y::CdpScrollState,
+    after: &synapse_a11y::CdpScrollState,
+) -> Result<ActPostcondition, ErrorData> {
+    let before_signature = hash_json(before)?;
+    let after_signature = hash_json(after)?;
+    if before == after {
+        return Err(no_observed_delta_error(
+            "act_scroll",
+            "cdp_node.scroll_state",
+            verify_timeout_ms,
+            before_signature,
+            after_signature,
+            json!({
+                "before": before,
+                "after": after,
+            }),
+        ));
+    }
+    Ok(postcondition_observed_delta(
+        "act_scroll",
+        "cdp_node.scroll_state",
+        before_signature,
+        after_signature,
+        "observed target DOM scroll state change after CDP wheel dispatch",
+    ))
 }
 
 fn scroll_actions(params: &ActScrollParams) -> Result<Vec<Action>, ErrorData> {
@@ -314,7 +533,11 @@ fn response(
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         postcondition: postcondition_not_requested(
             "act_scroll",
-            "target_point_pixels_or_foreground_ui",
+            if params.target.is_some() {
+                "cdp_node.scroll_state"
+            } else {
+                "target_point_pixels_or_foreground_ui"
+            },
         ),
     }
 }

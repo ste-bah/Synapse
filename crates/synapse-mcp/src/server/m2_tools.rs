@@ -461,11 +461,8 @@ impl SynapseService {
             "act_scroll",
             &action_preflight_details(&preflight),
         )?;
-        let point_region = params.at.map(|point| Point {
-            x: point.x,
-            y: point.y,
-        });
-        let before_delta_signature = if params.verify_delta {
+        let point_region = params.verify_delta_point_region();
+        let before_delta_signature = if params.verify_delta && !params.uses_element_target() {
             match self
                 .capture_action_delta_signature(160, point_region, false)
                 .await

@@ -26,6 +26,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
 use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
 use chromiumoxide::page::ScreenshotParams;
 use futures_util::StreamExt as _;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use crate::{A11yError, A11yResult, cdp_dom::rect_from_quad};
 
@@ -34,6 +35,33 @@ use crate::{A11yError, A11yResult, cdp_dom::rect_from_quad};
 pub struct CdpActionPoint {
     pub x: f64,
     pub y: f64,
+}
+
+/// One CDP wheel event in viewport CSS pixels.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct CdpWheelDelta {
+    pub delta_x: f64,
+    pub delta_y: f64,
+}
+
+/// Scroll source-of-truth read from the target node's DOM context.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CdpScrollState {
+    pub is_connected: bool,
+    pub window_scroll_x: f64,
+    pub window_scroll_y: f64,
+    pub target_scroll_left: f64,
+    pub target_scroll_top: f64,
+    pub target_scroll_width: f64,
+    pub target_scroll_height: f64,
+    pub target_client_width: f64,
+    pub target_client_height: f64,
+    pub target_tag: String,
+    pub target_id: String,
+    pub node_rect_left: f64,
+    pub node_rect_top: f64,
+    pub node_rect_width: f64,
+    pub node_rect_height: f64,
 }
 
 /// Which pointer button a CDP click uses.
@@ -157,6 +185,47 @@ pub async fn cdp_type_node(
     .map(|_point| ())
 }
 
+/// Dispatches wheel events over a web node after scrolling it into view.
+///
+/// # Errors
+///
+/// As [`cdp_click_node`].
+pub async fn cdp_scroll_node(
+    endpoint: &str,
+    page_title_hint: &str,
+    backend_node_id: i64,
+    deltas: Vec<CdpWheelDelta>,
+    interval_ms: u32,
+) -> A11yResult<CdpActionPoint> {
+    with_node_center(
+        endpoint,
+        page_title_hint,
+        backend_node_id,
+        |page, center| async move {
+            page.execute(mouse_event(
+                DispatchMouseEventType::MouseMoved,
+                center,
+                MouseButton::None,
+                0,
+            ))
+            .await
+            .map_err(|err| dispatch_err(&err))?;
+            let last_index = deltas.len().saturating_sub(1);
+            for (index, delta) in deltas.into_iter().enumerate() {
+                page.execute(wheel_event(center, delta))
+                    .await
+                    .map_err(|err| dispatch_err(&err))?;
+                if interval_ms > 0 && index < last_index {
+                    tokio::time::sleep(std::time::Duration::from_millis(u64::from(interval_ms)))
+                        .await;
+                }
+            }
+            Ok(center)
+        },
+    )
+    .await
+}
+
 /// Reads a web node's semantic value/text via CDP after resolving the exact
 /// backend node into a JavaScript object.
 ///
@@ -213,15 +282,37 @@ pub async fn cdp_node_value(
                 .map_err(|err| A11yError::CdpAxtreeFailed {
                     detail: format!("build Runtime.callFunctionOn params: {err}"),
                 })?;
-            page.evaluate_function(call)
-                .await
-                .map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("Runtime.callFunctionOn value readback: {err}"),
-                })?
-                .into_value::<String>()
-                .map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("Runtime.callFunctionOn value decode: {err}"),
-                })
+            call_function_on_value(&page, call, "value").await
+        },
+    )
+    .await
+}
+
+/// Reads the DOM scroll state attached to a web node's nearest scroll container.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if the node cannot be resolved or is detached.
+pub async fn cdp_node_scroll_state(
+    endpoint: &str,
+    page_title_hint: &str,
+    backend_node_id: i64,
+) -> A11yResult<CdpScrollState> {
+    with_node_page(
+        endpoint,
+        page_title_hint,
+        backend_node_id,
+        |page| async move {
+            let state = read_node_scroll_state(&page, backend_node_id).await?;
+            if !state.is_connected {
+                return Err(A11yError::CdpAxtreeFailed {
+                    detail: format!(
+                        "backendNodeId {backend_node_id} resolved to a detached DOM node"
+                    ),
+                });
+            }
+            Ok(state)
         },
     )
     .await
@@ -381,6 +472,16 @@ fn mouse_event(
     params
 }
 
+fn wheel_event(point: CdpActionPoint, delta: CdpWheelDelta) -> DispatchMouseEventParams {
+    let mut params =
+        DispatchMouseEventParams::new(DispatchMouseEventType::MouseWheel, point.x, point.y);
+    params.delta_x = Some(delta.delta_x);
+    params.delta_y = Some(delta.delta_y);
+    params.buttons = Some(0);
+    params.button = Some(MouseButton::None);
+    params
+}
+
 fn dispatch_err(err: &chromiumoxide::error::CdpError) -> A11yError {
     A11yError::CdpAxtreeFailed {
         detail: format!("CDP input dispatch failed: {err}"),
@@ -531,6 +632,119 @@ async fn node_content_rect(
         })?;
     rect_from_quad(model.result.model.content.inner()).ok_or_else(|| A11yError::CdpAxtreeFailed {
         detail: "node has no resolvable box model (not rendered)".to_owned(),
+    })
+}
+
+async fn read_node_scroll_state(
+    page: &chromiumoxide::Page,
+    backend_node_id: i64,
+) -> A11yResult<CdpScrollState> {
+    let resolve = ResolveNodeParams::builder()
+        .backend_node_id(BackendNodeId::new(backend_node_id))
+        .object_group("synapse_scroll_verify")
+        .build();
+    let resolved = page
+        .execute(resolve)
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("resolveNode for backendNodeId {backend_node_id}: {err}"),
+        })?;
+    let object_id =
+        resolved
+            .object
+            .object_id
+            .clone()
+            .ok_or_else(|| A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "resolveNode for backendNodeId {backend_node_id} returned no objectId"
+                ),
+            })?;
+    let call = CallFunctionOnParams::builder()
+        .function_declaration(
+            r#"function() {
+                const node = this;
+                const doc = (node && node.ownerDocument) || document;
+                const win = doc.defaultView || window;
+                const root = doc.scrollingElement || doc.documentElement || doc.body;
+                function isElement(value) {
+                    return Boolean(value && value.nodeType === 1);
+                }
+                function isScrollable(element) {
+                    if (!isElement(element)) { return false; }
+                    const style = win.getComputedStyle(element);
+                    const overflowY = style.overflowY || "";
+                    const overflowX = style.overflowX || "";
+                    const canY = /(auto|scroll|overlay)/.test(overflowY)
+                        && element.scrollHeight > element.clientHeight;
+                    const canX = /(auto|scroll|overlay)/.test(overflowX)
+                        && element.scrollWidth > element.clientWidth;
+                    return canY || canX;
+                }
+                let container = isElement(node) ? node : node.parentElement;
+                while (container && container !== root && !isScrollable(container)) {
+                    container = container.parentElement;
+                }
+                const target = (container && isScrollable(container)) ? container : root;
+                const rect = node && node.getBoundingClientRect
+                    ? node.getBoundingClientRect()
+                    : { left: 0, top: 0, width: 0, height: 0 };
+                return {
+                    is_connected: Boolean(node && node.isConnected),
+                    window_scroll_x: Number(win.scrollX || 0),
+                    window_scroll_y: Number(win.scrollY || 0),
+                    target_scroll_left: Number(target.scrollLeft || 0),
+                    target_scroll_top: Number(target.scrollTop || 0),
+                    target_scroll_width: Number(target.scrollWidth || 0),
+                    target_scroll_height: Number(target.scrollHeight || 0),
+                    target_client_width: Number(target.clientWidth || 0),
+                    target_client_height: Number(target.clientHeight || 0),
+                    target_tag: String(target.tagName || "DOCUMENT"),
+                    target_id: String(target.id || ""),
+                    node_rect_left: Number(rect.left || 0),
+                    node_rect_top: Number(rect.top || 0),
+                    node_rect_width: Number(rect.width || 0),
+                    node_rect_height: Number(rect.height || 0)
+                };
+            }"#,
+        )
+        .object_id(object_id)
+        .return_by_value(true)
+        .silent(true)
+        .build()
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("build Runtime.callFunctionOn scroll-state params: {err}"),
+        })?;
+    call_function_on_value(page, call, "scroll-state").await
+}
+
+async fn call_function_on_value<T>(
+    page: &chromiumoxide::Page,
+    call: CallFunctionOnParams,
+    label: &str,
+) -> A11yResult<T>
+where
+    T: DeserializeOwned,
+{
+    let returns = page
+        .execute(call)
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.callFunctionOn {label} readback: {err}"),
+        })?;
+    if let Some(exception) = &returns.exception_details {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.callFunctionOn {label} exception: {exception:?}"),
+        });
+    }
+    let remote = returns.result.result.clone();
+    let value = remote.value.ok_or_else(|| A11yError::CdpAxtreeFailed {
+        detail: format!(
+            "Runtime.callFunctionOn {label} returned no by-value payload (type={:?} subtype={:?} description={:?})",
+            remote.r#type, remote.subtype, remote.description
+        ),
+    })?;
+    serde_json::from_value::<T>(value).map_err(|err| A11yError::CdpAxtreeFailed {
+        detail: format!("Runtime.callFunctionOn {label} decode: {err}"),
     })
 }
 
