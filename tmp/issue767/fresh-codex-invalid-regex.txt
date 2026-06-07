@@ -1,0 +1,24 @@
+You are a fresh primary Codex process running only the Synapse #767 manual verification trigger.
+
+Rules:
+- Do not edit files.
+- Do not run shell commands.
+- Use only the real wired mcp__synapse tools.
+- First call mcp__synapse.health.
+- Then call mcp__synapse.act_press with exactly:
+  keys=["enter"]
+  hold_ms=33
+  backend="auto"
+  verify_delta=true
+  verify_timeout_ms=3000
+  allow_foreground_change=true
+  expected_foreground_title_regex="["
+- This must fail before key input is sent.
+- Return a concise final JSON object with:
+  case="edge_invalid_regex_no_input"
+  health_pid
+  act_press_ok=false
+  error_code
+  error_reason
+  error_field
+  error_message

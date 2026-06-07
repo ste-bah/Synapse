@@ -1,0 +1,1 @@
+{"case":"edge_wrong_expected_process","health_pid":20720,"act_press_ok":false,"error_code":"ACTION_FOREGROUND_LOST","error_reason":"foreground_change_policy_mismatch","process_match":false,"title_match":false,"error_message":"act_press verify_delta foreground target changed but did not match expected foreground policy within 3000 ms"}

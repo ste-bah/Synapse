@@ -1,0 +1,8 @@
+{
+  "case": "happy_allow_expected_notepad",
+  "health_pid": 20720,
+  "act_press_ok": true,
+  "act_press_backend_used": "software",
+  "postcondition_status": "observed_delta",
+  "postcondition_detail": "act_press verify_delta observed expected foreground transition after delivery; before_hwnd=0xdb0b60; after_hwnd=0x13d0e96; after_process=Notepad.exe; after_title_sha256=139af729dd2d32e08107b346f6f9f83c2c15f8ac5d82739d4fe3ac1cda51c537; expected_process_regex_present=true; expected_title_regex_present=true"
+}

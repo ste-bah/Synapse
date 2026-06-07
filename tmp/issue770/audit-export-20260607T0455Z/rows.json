@@ -1,0 +1,1902 @@
+[
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a7d128e4fc1c00000003",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "backend_used": "software",
+          "elapsed_ms": 30019,
+          "keys_pressed": 1,
+          "ok": true,
+          "postcondition": {
+            "after_signature": null,
+            "before_signature": null,
+            "detail": "act_press only verified low-level delivery; set verify_delta=true to require an observed Source-of-Truth delta",
+            "observed_delta": null,
+            "source_of_truth": "foreground_focused_ui_or_pixels",
+            "status": "not_requested"
+          }
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a7d17360332400000004",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "Add-Type -TypeDefinition @'\nusing System;\nusing System.Runtime.InteropServices;\npublic static class KeyStateReader {\n  [DllImport(\"user32.dll\")]\n  public static extern short GetAsyncKeyState(int vKey);\n}\n'@\n$states = @(\n  [ordered]@{ name='CTRL'; vk='0x11'; raw=[KeyStateReader]::GetAsyncKeyState(0x11) },\n  [ordered]@{ name='SHIFT'; vk='0x10'; raw=[KeyStateReader]::GetAsyncKeyState(0x10) },\n  [ordered]@{ name='ALT'; vk='0x12'; raw=[KeyStateReader]::GetAsyncKeyState(0x12) }\n) | ForEach-Object { [pscustomobject]@{ name=$_.name; vk=$_.vk; raw=$_.raw; down=(($_.raw -band 0x8000) -ne 0) } }\n$states | ConvertTo-Json -Compress"
+        ],
+        "command": "powershell.exe",
+        "env_keys": [],
+        "idempotency_key_present": false,
+        "request_sha256": "bb1e312d9d5d3d4ea98c79815dc45035a6d76bdf3fc69109a4dc78accc6aae32",
+        "timeout_ms": 5000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a7d1af68824000000005",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 1003,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "[{\"name\":\"CTRL\",\"vk\":\"0x11\",\"raw\":0,\"down\":false},{\"name\":\"SHIFT\",\"vk\":\"0x10\",\"raw\":0,\"down\":false},{\"name\":\"ALT\",\"vk\":\"0x12\",\"raw\":0,\"down\":false}]\r\n",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a7dc780d743000000006",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "neutralized_pads": 0,
+          "released_buttons": 0,
+          "released_keys": 0
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "release_all",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a882282088bc00000007",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "Code.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "neutralized_pads": 0,
+          "released_buttons": 0,
+          "released_keys": 0
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "Code.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "vscode",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "release_all",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a88a3448dac400000008",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "Code.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "neutralized_pads": 0,
+          "released_buttons": 0,
+          "released_keys": 0
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "Code.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "vscode",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "release_all",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a91c679c64940000000a",
+    "value": {
+      "active_profile_id": "vscode",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "vscode",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "after_foreground": {
+            "dpi_scale": 1.0,
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_dwm_composed": true,
+            "is_fullscreen": false,
+            "monitor_index": 0,
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "chrome.exe",
+            "process_path": "[redacted:path]",
+            "window_bounds": {
+              "h": 1940,
+              "w": 2976,
+              "x": 2079,
+              "y": 23
+            },
+            "window_title": "[redacted:window_title]"
+          },
+          "before_foreground": {
+            "dpi_scale": 1.0,
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_dwm_composed": true,
+            "is_fullscreen": false,
+            "monitor_index": 0,
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "Code.exe",
+            "process_path": "[redacted:path]",
+            "window_bounds": {
+              "h": 1414,
+              "w": 2582,
+              "x": 7669,
+              "y": 291
+            },
+            "window_title": "[redacted:window_title]"
+          },
+          "changed": true,
+          "elapsed_ms": 373,
+          "focus_attempts": 1,
+          "matched_window": {
+            "dpi_scale": 1.0,
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_dwm_composed": true,
+            "is_fullscreen": false,
+            "monitor_index": 0,
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "chrome.exe",
+            "process_path": "[redacted:path]",
+            "window_bounds": {
+              "h": 1940,
+              "w": 2976,
+              "x": 2079,
+              "y": 23
+            },
+            "window_title": "[redacted:window_title]"
+          },
+          "method": "win32_set_foreground_window",
+          "ok": true,
+          "postcondition": {
+            "after_signature": "302ce308a7a0b43a4d7d6abfe96c6287d9e7d72a50d87a1d80e9cdca01d869c0",
+            "before_signature": "1bcac9fe92a5dd29423d710e9f0b9f5ea404202a9a1d060e23d5df971b78fb42",
+            "detail": "act_focus_window foreground readback matched requested hwnd 0x9e08b0 and stayed stable for 300 ms",
+            "observed_delta": true,
+            "source_of_truth": "win32_foreground_window",
+            "status": "verified_state"
+          },
+          "source_of_truth": "win32_foreground_window",
+          "target": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "kind": "hwnd"
+          }
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "vscode",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_focus_window",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a91d88bca4580000000b",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "vscode",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "chrome",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "chrome.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "chrome",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "chrome.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_press"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a91e06e378200000000c",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "backend_used": "software",
+          "elapsed_ms": 77,
+          "keys_pressed": 2,
+          "ok": true,
+          "postcondition": {
+            "after_signature": "56c66194f7f923eaad6525285ec755408a9e938b74a68a90263a7329e0b60bbd",
+            "before_signature": "9373b21ccdfc07d6f9f5a5c5f47090f70e15afce12c0ee909038811e2c3de34f",
+            "detail": "act_press verify_delta observed a Source-of-Truth signature change after delivery",
+            "observed_delta": true,
+            "source_of_truth": "foreground_focused_ui_or_pixels",
+            "status": "observed_delta"
+          }
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a91f4ecdd15c0000000d",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "chrome",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "chrome",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "chrome.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "chrome",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "chrome.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_type"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_type",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6a91fbd464c180000000e",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "data": {
+          "code": "ACTION_POSTCONDITION_FAILED",
+          "detail": "focused text target changed before postcondition readback",
+          "source_of_truth": "foreground_focused_text_value",
+          "tool": "act_type",
+          "verify_delta": {
+            "after_signature": "3501c35c6e6d1e9a5d1d60b2f508c7b81e41fa2da1a27d8e08f562f42b26f58a",
+            "before_signature": "c9081895d02775a5a6623adda5b5fea34a49b566b6204f0f06fc929a45f1005e",
+            "readback": {
+              "after": {
+                "focused_bbox": {
+                  "h": 1748,
+                  "w": 2955,
+                  "x": 2090,
+                  "y": 204
+                },
+                "focused_element_id": "0x9e08b0:0000002a008a088c000000040000022a0000000800000035",
+                "focused_name_sha256": "a44e7a86c8d291dab6cf67d64ede899f64808efe3529698c072919199834d2f4",
+                "focused_role": "document",
+                "focused_selected_text_sha256": null,
+                "focused_value_len": 66,
+                "focused_value_sha256": "510f60b40a1c731131fb96a32fde87682bf6a4e2e99bad05f8f6c1f2bcd31b9b",
+                "foreground_hwnd": 10356912,
+                "foreground_pid": 25400,
+                "foreground_process": "chrome.exe",
+                "foreground_title_sha256": "2f4a405987534f75ab2819d1cd7221001af89ed3366d951b4126407ae3d76630",
+                "has_text_readback": true,
+                "readback_source": "uia_focused_value"
+              },
+              "before": {
+                "focused_bbox": {
+                  "h": 36,
+                  "w": 2360,
+                  "x": 2327,
+                  "y": 99
+                },
+                "focused_element_id": "0x9e08b0:0000002a009e08b000000004000000000000000000041659",
+                "focused_name_sha256": "e6c825d9df48528c1384eb8d181828cc0ae5ce0e5cefbbca9fddb600acd8ed7d",
+                "focused_role": "edit",
+                "focused_selected_text_sha256": null,
+                "focused_value_len": 0,
+                "focused_value_sha256": null,
+                "foreground_hwnd": 10356912,
+                "foreground_pid": 25400,
+                "foreground_process": "chrome.exe",
+                "foreground_title_sha256": "f8677170136b6ff9571413b5c4d69fe31a30d7e47671382d95a166004616e2f5",
+                "has_text_readback": true,
+                "readback_source": "uia_focused_empty_value_or_text"
+              }
+            }
+          }
+        },
+        "message": "act_type verify_delta Source-of-Truth postcondition failed: focused text target changed before postcondition readback"
+      },
+      "error_code": "ACTION_POSTCONDITION_FAILED",
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "error",
+      "tool": "act_type",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b26b3a8c017800000000",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "$ErrorActionPreference='Stop'; $env:TEST_INHERIT='SYN768_HAPPY'; $keys=@('PATHEXT','ComSpec','windir','SystemRoot','LOCALAPPDATA','APPDATA','ProgramFiles','ProgramData','PATH'); foreach($k in $keys){ $v=[Environment]::GetEnvironmentVariable($k,'Process'); \"ENV|$k|$v\" }; foreach($name in @('cmd','powershell','ssh')) { $cmd=Get-Command $name -ErrorAction SilentlyContinue; \"RESOLVE|$name|$($cmd.Source)\" }; $childPs=& powershell -NoProfile -Command '[Console]::Out.Write($env:TEST_INHERIT)'; $childCmd=& cmd /d /c 'echo %TEST_INHERIT%'; $childWhere=& where.exe cmd.exe; \"NESTED_PS|$childPs\"; \"NESTED_CMD|$($childCmd.Trim())\"; \"NESTED_WHERE_CMD|$($childWhere -join ';')\"; \"EXPECT|TEST_INHERIT|SYN768_HAPPY\""
+        ],
+        "command": "[redacted:path_like_string]",
+        "env_keys": [
+          "SYNAPSE_FSV_CASE",
+          "SYNAPSE_FSV_ISSUE"
+        ],
+        "idempotency_key_present": false,
+        "request_sha256": "437e812043e427c7d91203378db31d03861cae41cdb9d9d7829e8921a39e5e38",
+        "timeout_ms": 20000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b26b4db71b7000000001",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 316,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "[redacted:path_like_string]",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b26f304a761400000002",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "$ErrorActionPreference='Stop'; $keys=@('PATHEXT','ComSpec','windir','LOCALAPPDATA','APPDATA','ProgramFiles','ProgramData'); foreach($k in $keys){ \"ENV|$k|$([Environment]::GetEnvironmentVariable($k,'Process'))\" }; \"OVERRIDE|SYNAPSE_EDGE_OVERRIDE|$env:SYNAPSE_EDGE_OVERRIDE\"; $cmdPath=(Get-Command cmd -ErrorAction Stop).Source; \"RESOLVE|cmd|$cmdPath\"; $child=& cmd /d /c 'echo %SYNAPSE_EDGE_OVERRIDE%'; \"NESTED_CMD|$($child.Trim())\"; \"EXPECT|override|SYN768_EDGE_ENV\""
+        ],
+        "command": "[redacted:path_like_string]",
+        "env_keys": [
+          "SYNAPSE_EDGE_OVERRIDE",
+          "SYNAPSE_FSV_CASE",
+          "SYNAPSE_FSV_ISSUE"
+        ],
+        "idempotency_key_present": false,
+        "request_sha256": "eb7071c178c89aa5c9b8d8bc9e4a71f119798842c68b47fc23e77170350c7ec1",
+        "timeout_ms": 20000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b26f3953d6b000000003",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 148,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "[redacted:path_like_string]",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b271de1c006c00000004",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [],
+        "command": "",
+        "env_keys": [
+          "SYNAPSE_FSV_CASE",
+          "SYNAPSE_FSV_ISSUE"
+        ],
+        "idempotency_key_present": false,
+        "request_sha256": "88a26b496a11c701877207a3075de867f0afb45008ac5c404dc0ec7f39bbf1e0",
+        "timeout_ms": 20000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b271de59947c00000005",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "data": {
+          "code": "TOOL_PARAMS_INVALID"
+        },
+        "message": "act_run_shell command must not be empty"
+      },
+      "error_code": "TOOL_PARAMS_INVALID",
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "error",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b27a7769f05000000006",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "$env:SYN768_TIMEOUT_MARKER='SYN768_TIMEOUT_MARKER_20260607'; Write-Output 'STARTED|SYN768_TIMEOUT_MARKER_20260607'; Start-Sleep -Milliseconds 5000; Write-Output 'AFTER_SLEEP_SHOULD_NOT_PRINT'"
+        ],
+        "command": "[redacted:path_like_string]",
+        "env_keys": [
+          "SYNAPSE_FSV_CASE",
+          "SYNAPSE_FSV_ISSUE"
+        ],
+        "idempotency_key_present": false,
+        "request_sha256": "389830fa35a4f4a555d4288925670a59b92402732546bf250478e0aa80747adc",
+        "timeout_ms": 500,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b27a96e07d2800000007",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 523,
+          "exit_code": null,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "STARTED|SYN768_TIMEOUT_MARKER_20260607\r\n",
+          "stdout_truncated": false,
+          "timed_out": true
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b27eafb854c000000008",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-V"
+        ],
+        "command": "[redacted:path_like_string]",
+        "env_keys": [
+          "SYNAPSE_FSV_CASE",
+          "SYNAPSE_FSV_ISSUE"
+        ],
+        "idempotency_key_present": false,
+        "request_sha256": "de8d4467009d1c1cef0b0a692e1109a8fc2482e868c93c39efa577a7ad88e25b",
+        "timeout_ms": 10000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b27eb1401ae400000009",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 20,
+          "exit_code": 0,
+          "stderr": "OpenSSH_for_Windows_9.5p2, LibreSSL 3.8.2\r\n",
+          "stderr_truncated": false,
+          "stdout": "",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b314fb4402900000000a",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "$ErrorActionPreference='Stop'; $env:SYN770_PARENT='SYN770_PARENT_VALUE'; \"CASE|happy\"; foreach($k in @('PATHEXT','ComSpec','PATH')){ \"ENV|$k|$([Environment]::GetEnvironmentVariable($k,'Process'))\" }; $childPs=& powershell -NoProfile -Command '[Console]::Out.Write($env:SYN770_PARENT)'; $childCmd=& cmd /d /c 'echo %SYN770_PARENT%'; $whereCmd=@(& where.exe cmd.exe); \"PS_CHILD|$childPs\"; \"CMD_CHILD|$($childCmd.Trim())\"; \"WHERE_COUNT|$($whereCmd.Count)\"; \"WHERE_FIRST|$($whereCmd[0])\"; \"EXPECT|SYN770_PARENT|SYN770_PARENT_VALUE\"; if($childPs -ne 'SYN770_PARENT_VALUE'){ throw 'nested PowerShell env/output mismatch' }; if($childCmd.Trim() -ne 'SYN770_PARENT_VALUE'){ throw 'nested cmd env/output mismatch' }; if(-not $whereCmd -or $whereCmd[0] -notmatch 'cmd\\.exe$'){ throw 'where.exe cmd resolution mismatch' }"
+        ],
+        "command": "[redacted:path_like_string]",
+        "env_keys": [
+          "SYNAPSE_FSV_CASE",
+          "SYNAPSE_FSV_ISSUE"
+        ],
+        "idempotency_key_present": false,
+        "request_sha256": "a9002c6244b9228658e6a60f38ac887a256471b420f0b3c877229bbbed855278",
+        "timeout_ms": 20000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b3150e5739b00000000b",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 315,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "[redacted:path_like_string]",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b3181970e8700000000c",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-V"
+        ],
+        "command": "[redacted:path_like_string]",
+        "env_keys": [
+          "SYNAPSE_FSV_CASE",
+          "SYNAPSE_FSV_ISSUE"
+        ],
+        "idempotency_key_present": false,
+        "request_sha256": "58b9162122873e423756dbb1193528d95473c8788c40d1c7156aecc1297677ca",
+        "timeout_ms": 10000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b3181a6786d00000000d",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 11,
+          "exit_code": 0,
+          "stderr": "OpenSSH_for_Windows_9.5p2, LibreSSL 3.8.2\r\n",
+          "stderr_truncated": false,
+          "stdout": "",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b31c4e592c240000000e",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "$ErrorActionPreference='Stop'; \"CASE|edge_nested_output_volume\"; $lines=@(& cmd /d /c 'for /L %i in (1,1,64) do @echo SYN770_LINE_%i'); \"COUNT|$($lines.Count)\"; \"FIRST|$($lines[0])\"; \"LAST|$($lines[-1])\"; \"EXPECT|count|64\"; if($lines.Count -ne 64){ throw \"nested cmd output count mismatch: $($lines.Count)\" }; if($lines[0] -ne 'SYN770_LINE_1'){ throw 'nested cmd first line mismatch' }; if($lines[-1] -ne 'SYN770_LINE_64'){ throw 'nested cmd last line mismatch' }"
+        ],
+        "command": "[redacted:path_like_string]",
+        "env_keys": [
+          "SYNAPSE_FSV_CASE",
+          "SYNAPSE_FSV_ISSUE"
+        ],
+        "idempotency_key_present": false,
+        "request_sha256": "5f69a27aeaa7763a937112541c5db8b1e753013611ba2f61249594dfb9935fd5",
+        "timeout_ms": 20000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b31c575187540000000f",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 146,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "CASE|edge_nested_output_volume\r\nCOUNT|64\r\nFIRST|SYN770_LINE_1\r\nLAST|SYN770_LINE_64\r\nEXPECT|count|64\r\n",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b321d833b5f400000010",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "$env:SYN770_TIMEOUT_MARKER='SYN770_TIMEOUT_MARKER_20260607'; Write-Output 'STARTED|SYN770_TIMEOUT_MARKER_20260607'; Start-Sleep -Milliseconds 5000; Write-Output 'AFTER_SLEEP_SHOULD_NOT_PRINT'"
+        ],
+        "command": "[redacted:path_like_string]",
+        "env_keys": [
+          "SYNAPSE_FSV_CASE",
+          "SYNAPSE_FSV_ISSUE"
+        ],
+        "idempotency_key_present": false,
+        "request_sha256": "5027193f04aadf513f857dd5ca9f3fd8f29b5a3f48d45786035173f8a01c7c26",
+        "timeout_ms": 500,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b321f77ceb6000000011",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 520,
+          "exit_code": null,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "STARTED|SYN770_TIMEOUT_MARKER_20260607\r\n",
+          "stdout_truncated": false,
+          "timed_out": true
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  }
+]

@@ -1,0 +1,3186 @@
+[
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b69389111e7aec00000042",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "chrome",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_focus_window"
+        },
+        "request": {
+          "source_of_truth": "win32_foreground_window",
+          "stable_ms": 100,
+          "target": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "pid": "[redacted:high_cardinality_id]",
+            "title_regex": null
+          },
+          "verify_timeout_ms": 2000
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_focus_window",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b693891b825b7000000043",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "chrome.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "after_foreground": {
+            "dpi_scale": 1.0,
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_dwm_composed": true,
+            "is_fullscreen": false,
+            "monitor_index": 0,
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "chrome.exe",
+            "process_path": "[redacted:path]",
+            "window_bounds": {
+              "h": 1050,
+              "w": 1350,
+              "x": -32768,
+              "y": -32768
+            },
+            "window_title": "[redacted:window_title]"
+          },
+          "before_foreground": {
+            "dpi_scale": 1.0,
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_dwm_composed": true,
+            "is_fullscreen": false,
+            "monitor_index": 0,
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_bounds": {
+              "h": 936,
+              "w": 1752,
+              "x": 27,
+              "y": 38
+            },
+            "window_title": "[redacted:window_title]"
+          },
+          "changed": true,
+          "elapsed_ms": 170,
+          "focus_attempts": 1,
+          "matched_window": {
+            "dpi_scale": 1.0,
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_dwm_composed": true,
+            "is_fullscreen": false,
+            "monitor_index": 0,
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "chrome.exe",
+            "process_path": "[redacted:path]",
+            "window_bounds": {
+              "h": 1050,
+              "w": 1350,
+              "x": -32768,
+              "y": -32768
+            },
+            "window_title": "[redacted:window_title]"
+          },
+          "method": "win32_set_foreground_window",
+          "ok": true,
+          "postcondition": {
+            "after_signature": "c4a974f5feb70d117a7d988d83afb91ef5be14b8ab0b81257eef0a9571a00cd9",
+            "before_signature": "953dfd74f7bc7e8e6e225702ee13a81ff1406778910dbedf73f4e1df6b13398c",
+            "detail": "act_focus_window foreground readback matched requested hwnd 0x60eb4 and stayed stable for 100 ms",
+            "observed_delta": true,
+            "source_of_truth": "win32_foreground_window",
+            "status": "verified_state"
+          },
+          "source_of_truth": "win32_foreground_window",
+          "target": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "kind": "hwnd"
+          }
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "chrome.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_focus_window",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b693aa1438c5b800000048",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "chrome",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_click"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b693ab45aed5a000000049",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "backend_tier_used": "cdp",
+          "backend_used": "cdp",
+          "double_click_window_ms": 500,
+          "elapsed_ms": 5121,
+          "inter_click_delay_ms": 125,
+          "ok": true,
+          "postcondition": {
+            "after_signature": null,
+            "before_signature": null,
+            "detail": "act_click only verified low-level delivery; set verify_delta=true to require an observed Source-of-Truth delta",
+            "observed_delta": null,
+            "source_of_truth": "foreground_focused_ui_or_pixels",
+            "status": "not_requested"
+          },
+          "press_hold_ms": 120,
+          "required_foreground": false,
+          "tier_attempts": [
+            {
+              "detail": "web element click delivered through Chrome DevTools Protocol",
+              "error_code": null,
+              "reason_code": null,
+              "required_foreground": false,
+              "status": "delivered",
+              "tier": "cdp"
+            }
+          ],
+          "used_invoke_pattern": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b693da44dbeb700000004e",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "chrome",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_click"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b693da45255dc80000004f",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "data": {
+          "code": "ACTION_FOREGROUND_LEASE_BUSY",
+          "detail": "act_click requires the foreground input lease, but it is held by session Some(\"c583c33d-fea4-4531-98c6-e5ac13cf00ca\"); retry_after_ms=11277",
+          "holder_session_id": "c583c33d-fea4-4531-98c6-e5ac13cf00ca",
+          "requesting_session_id": "6455dbf9-46bf-45b8-a7b3-77498da3bcb8",
+          "retry_after_ms": 11277,
+          "silent_fallback_allowed": false,
+          "tier_attempts": [
+            {
+              "detail": "foreground input lease busy: act_click requires the foreground input lease, but it is held by session Some(\"c583c33d-fea4-4531-98c6-e5ac13cf00ca\"); retry_after_ms=11277",
+              "error_code": "ACTION_FOREGROUND_LEASE_BUSY",
+              "reason_code": "foreground_lease_busy",
+              "required_foreground": true,
+              "status": "failed",
+              "tier": "foreground"
+            }
+          ]
+        },
+        "message": "foreground input lease busy: act_click requires the foreground input lease, but it is held by session Some(\"c583c33d-fea4-4531-98c6-e5ac13cf00ca\"); retry_after_ms=11277"
+      },
+      "error_code": "ACTION_FOREGROUND_LEASE_BUSY",
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "error",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b693dd22623c7c00000050",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "terminal",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_click"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b693dd23085bd400000051",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "pwsh.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "backend_tier_used": "uia",
+          "backend_used": "uia",
+          "double_click_window_ms": 500,
+          "elapsed_ms": 7,
+          "inter_click_delay_ms": 125,
+          "ok": true,
+          "postcondition": {
+            "after_signature": null,
+            "before_signature": null,
+            "detail": "act_click only verified low-level delivery; set verify_delta=true to require an observed Source-of-Truth delta",
+            "observed_delta": null,
+            "source_of_truth": "foreground_focused_ui_or_pixels",
+            "status": "not_requested"
+          },
+          "press_hold_ms": 120,
+          "required_foreground": false,
+          "tier_attempts": [
+            {
+              "detail": "UI Automation semantic click delivered; outcomes=invoked",
+              "error_code": null,
+              "reason_code": null,
+              "required_foreground": false,
+              "status": "delivered",
+              "tier": "uia"
+            }
+          ],
+          "used_invoke_pattern": true
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "pwsh.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "powershell",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b69400c4f8ac000000005e",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "chrome",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_click"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b69401f6861b1c0000005f",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "backend_tier_used": "cdp",
+          "backend_used": "cdp",
+          "double_click_window_ms": 500,
+          "elapsed_ms": 5123,
+          "inter_click_delay_ms": 125,
+          "ok": true,
+          "postcondition": {
+            "after_signature": null,
+            "before_signature": null,
+            "detail": "act_click only verified low-level delivery; set verify_delta=true to require an observed Source-of-Truth delta",
+            "observed_delta": null,
+            "source_of_truth": "foreground_focused_ui_or_pixels",
+            "status": "not_requested"
+          },
+          "press_hold_ms": 120,
+          "required_foreground": false,
+          "tier_attempts": [
+            {
+              "detail": "web element click delivered through Chrome DevTools Protocol",
+              "error_code": null,
+              "reason_code": null,
+              "required_foreground": false,
+              "status": "delivered",
+              "tier": "cdp"
+            }
+          ],
+          "used_invoke_pattern": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b69495f92262600000006a",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "chrome",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_click"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b694972afd02d00000006b",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "backend_tier_used": "cdp",
+          "backend_used": "cdp",
+          "double_click_window_ms": 500,
+          "elapsed_ms": 5126,
+          "inter_click_delay_ms": 125,
+          "ok": true,
+          "postcondition": {
+            "after_signature": null,
+            "before_signature": null,
+            "detail": "act_click only verified low-level delivery; set verify_delta=true to require an observed Source-of-Truth delta",
+            "observed_delta": null,
+            "source_of_truth": "foreground_focused_ui_or_pixels",
+            "status": "not_requested"
+          },
+          "press_hold_ms": 120,
+          "required_foreground": false,
+          "tier_attempts": [
+            {
+              "detail": "web element click delivered through Chrome DevTools Protocol",
+              "error_code": null,
+              "reason_code": null,
+              "required_foreground": false,
+              "status": "delivered",
+              "tier": "cdp"
+            }
+          ],
+          "used_invoke_pattern": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b694b725755f0400000070",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "chrome",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_click"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b694b85756e32000000071",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "backend_tier_used": "cdp",
+          "backend_used": "cdp",
+          "double_click_window_ms": 500,
+          "elapsed_ms": 5129,
+          "inter_click_delay_ms": 125,
+          "ok": true,
+          "postcondition": {
+            "after_signature": null,
+            "before_signature": null,
+            "detail": "act_click only verified low-level delivery; set verify_delta=true to require an observed Source-of-Truth delta",
+            "observed_delta": null,
+            "source_of_truth": "foreground_focused_ui_or_pixels",
+            "status": "not_requested"
+          },
+          "press_hold_ms": 120,
+          "required_foreground": false,
+          "tier_attempts": [
+            {
+              "detail": "web element click delivered through Chrome DevTools Protocol",
+              "error_code": null,
+              "reason_code": null,
+              "required_foreground": false,
+              "status": "delivered",
+              "tier": "cdp"
+            }
+          ],
+          "used_invoke_pattern": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b694bbce3802dc00000072",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "terminal",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_click"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b694bbcecbcc1000000073",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "pwsh.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "backend_tier_used": "uia",
+          "backend_used": "uia",
+          "double_click_window_ms": 500,
+          "elapsed_ms": 7,
+          "inter_click_delay_ms": 125,
+          "ok": true,
+          "postcondition": {
+            "after_signature": null,
+            "before_signature": null,
+            "detail": "act_click only verified low-level delivery; set verify_delta=true to require an observed Source-of-Truth delta",
+            "observed_delta": null,
+            "source_of_truth": "foreground_focused_ui_or_pixels",
+            "status": "not_requested"
+          },
+          "press_hold_ms": 120,
+          "required_foreground": false,
+          "tier_attempts": [
+            {
+              "detail": "UI Automation semantic click delivered; outcomes=invoked",
+              "error_code": null,
+              "reason_code": null,
+              "required_foreground": false,
+              "status": "delivered",
+              "tier": "uia"
+            }
+          ],
+          "used_invoke_pattern": true
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "pwsh.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "powershell",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_click",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b80051c9328000000001",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "hwnd": "[redacted:high_cardinality_id]",
+          "launched_at": "[redacted:timing]",
+          "matched_title": "[redacted:window_title]",
+          "pid": "[redacted:high_cardinality_id]",
+          "reason": null
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_launch",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b805eff14e0c00000002",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "[redacted:path_like_string]"
+        ],
+        "command": "powershell.exe",
+        "env_keys": [],
+        "idempotency_key_present": true,
+        "request_sha256": "338d3fd2bff14230dc39e54af6b2bd3adbd89e42490edd1f39acbb03db741148",
+        "timeout_ms": 300000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8062ba9c48800000003",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 989,
+          "exit_code": 2,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b80eda5c7f0400000004",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "[redacted:path_like_string]"
+        ],
+        "command": "powershell.exe",
+        "env_keys": [],
+        "idempotency_key_present": true,
+        "request_sha256": "3fe0ef8c93f36c61f36f46a06c081fd81f1ec714b042da332cb14e941966127c",
+        "timeout_ms": 300000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b81449b7651c00000005",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "terminal",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_press"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b81505e7a24c00000006",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "cmd.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "data": {
+          "code": "ACTION_FOREGROUND_LOST",
+          "foreground_change_policy": {
+            "allow_foreground_change": true,
+            "expected_foreground_process_regex": "(?i)^notepad\\.exe$",
+            "expected_foreground_title_regex": "(?i)notepad"
+          },
+          "matches": {
+            "process": false,
+            "title": "[redacted:window_title]"
+          },
+          "reason": "foreground_change_policy_mismatch",
+          "source_of_truth": "foreground_focused_ui_or_pixels",
+          "tool": "act_press",
+          "verify_delta": {
+            "after": {
+              "cdp_endpoint_present": false,
+              "cdp_status": null,
+              "cursor_position": null,
+              "element_count": 8,
+              "elements_sha256": "779f67ed07038d01657351be45b18abc610d87b32d970b47101c81ec1c11774b",
+              "focused_bbox": {
+                "h": 217,
+                "w": 856,
+                "x": 2121,
+                "y": 890
+              },
+              "focused_element_id": "0x660924:0000002a00660924",
+              "focused_name_sha256": "b11b4ca186c00769a40d69f084d0f73538b4c3942e13b0ae9b7c5ff763876e3c",
+              "focused_role": "dialog",
+              "focused_value_sha256": null,
+              "foreground_hwnd": 6687012,
+              "foreground_pid": 40024,
+              "foreground_process": "cmd.exe",
+              "foreground_title": "[redacted:window_title]",
+              "foreground_title_sha256": "b11b4ca186c00769a40d69f084d0f73538b4c3942e13b0ae9b7c5ff763876e3c",
+              "pixel": {
+                "bitmap_sha256": "[redacted:image]",
+                "detail": "captured 856x217 BGRA bytes=743008",
+                "region": {
+                  "h": 217,
+                  "w": 856,
+                  "x": 2121,
+                  "y": 890
+                },
+                "status": "ok"
+              },
+              "point_pixel": null,
+              "web_path": "[redacted:path]"
+            },
+            "after_signature": "e391744e385ac133c6a326448487cd43af56dfdcf1644520c0873375efeb26e1",
+            "before": {
+              "cdp_endpoint_present": false,
+              "cdp_status": null,
+              "cursor_position": null,
+              "element_count": 34,
+              "elements_sha256": "949f6d2f3c6f2e478b62f1a62b0449412c4744a1f5db0a095e4c62a9a7f9cbf0",
+              "focused_bbox": {
+                "h": 864,
+                "w": 1730,
+                "x": 380,
+                "y": 441
+              },
+              "focused_element_id": "0x1080dea:0000002a00d90b6000000004000006b1",
+              "focused_name_sha256": "39ba27384f6ce4de6e3c6b19f66c5f7a203721b2a972ce816590b975cba7cc04",
+              "focused_role": "terminal",
+              "focused_value_sha256": null,
+              "foreground_hwnd": 17305066,
+              "foreground_pid": 26700,
+              "foreground_process": "WindowsTerminal.exe",
+              "foreground_title": "[redacted:window_title]",
+              "foreground_title_sha256": "1b69b3015be0eb6931ebd466357da7d19bbcae405b8b747963fa05d88069c3b1",
+              "pixel": {
+                "bitmap_sha256": "[redacted:image]",
+                "detail": "captured 1752x936 BGRA bytes=6559488",
+                "region": {
+                  "h": 936,
+                  "w": 1752,
+                  "x": 369,
+                  "y": 380
+                },
+                "status": "ok"
+              },
+              "point_pixel": null,
+              "web_path": "[redacted:path]"
+            },
+            "before_signature": "daadfd0aca9c48b29133f08a2f65c6c9200f6231bce57d8e71c96f07345314c4",
+            "timeout_ms": 3000
+          }
+        },
+        "message": "act_press verify_delta foreground target changed but did not match expected foreground policy within 3000 ms"
+      },
+      "error_code": "ACTION_FOREGROUND_LOST",
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "cmd.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "cmd",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "error",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b818af0e931400000007",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 42213,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b84386a5a0b800000009",
+    "value": {
+      "active_profile_id": "chrome",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "chrome",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "hwnd": "[redacted:high_cardinality_id]",
+          "launched_at": "[redacted:timing]",
+          "matched_title": "[redacted:window_title]",
+          "pid": "[redacted:high_cardinality_id]",
+          "reason": null
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "chrome",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_launch",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b84c653a01680000000a",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "[redacted:path_like_string]"
+        ],
+        "command": "powershell.exe",
+        "env_keys": [],
+        "idempotency_key_present": true,
+        "request_sha256": "993e049ce8197a32557e7d6ee04352d647543810d25805e26da068f94b99e3cf",
+        "timeout_ms": 120000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8509be1972c0000000b",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 18085,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b864182f7c280000000c",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "[redacted:path_like_string]"
+        ],
+        "command": "powershell.exe",
+        "env_keys": [],
+        "idempotency_key_present": true,
+        "request_sha256": "4624952cf17b593d3d11a9319d620d4a0074acbbe08af766c30a2224def5c785",
+        "timeout_ms": 120000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8685cbd00640000000d",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "terminal",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_press"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8691d7bb6600000000e",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "Notepad.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "backend_used": "software",
+          "elapsed_ms": 55,
+          "keys_pressed": 1,
+          "ok": true,
+          "postcondition": {
+            "after_signature": "b801b05fe3f242c50ae5508f8aea95ed97469be8887516b0c7c6e8987f6829ea",
+            "before_signature": "e979b3a983ab83152703e76ac1a4fab1dcf33b9703df5bcf2243e560cd4274dd",
+            "detail": "act_press verify_delta observed expected foreground transition after delivery; before_hwnd=0xdb0b60; after_hwnd=0x13d0e96; after_process=Notepad.exe; after_title_sha256=139af729dd2d32e08107b346f6f9f83c2c15f8ac5d82739d4fe3ac1cda51c537; expected_process_regex_present=true; expected_title_regex_present=true",
+            "observed_delta": true,
+            "source_of_truth": "foreground_focused_ui_or_pixels",
+            "status": "observed_delta"
+          }
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "Notepad.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "notepad",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b86b52112df40000000f",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 31026,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b87f8153b35c00000011",
+    "value": {
+      "active_profile_id": "notepad",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "notepad",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "hwnd": "[redacted:high_cardinality_id]",
+          "launched_at": "[redacted:timing]",
+          "matched_title": "[redacted:window_title]",
+          "pid": "[redacted:high_cardinality_id]",
+          "reason": null
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "notepad",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_launch",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b883be98ef5800000012",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "[redacted:path_like_string]"
+        ],
+        "command": "powershell.exe",
+        "env_keys": [],
+        "idempotency_key_present": true,
+        "request_sha256": "ed0c888c34301515e2517a24a1fd2e3d744c68ee110709995b55b9b7e73cb12e",
+        "timeout_ms": 120000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b887c2b202b000000013",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "terminal",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_press"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b887c2e7169400000014",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "data": {
+          "code": "TOOL_PARAMS_INVALID",
+          "detail": "expected_foreground_title_regex is not a valid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class",
+          "field": "expected_foreground_title_regex",
+          "pattern": "[",
+          "reason": "invalid_expected_foreground_regex",
+          "tool": "act_press"
+        },
+        "message": "expected_foreground_title_regex is not a valid regex: regex parse error:\n    [\n    ^\nerror: unclosed character class"
+      },
+      "error_code": "TOOL_PARAMS_INVALID",
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "error",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8891d8de65800000015",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 23056,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b88fcc0c41c400000016",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "terminal",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_press"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8908c5aeafc00000017",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "Notepad.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "data": {
+          "code": "ACTION_FOREGROUND_LOST",
+          "reason": "unexpected_foreground_change",
+          "source_of_truth": "foreground_focused_ui_or_pixels",
+          "tool": "act_press",
+          "verify_delta": {
+            "after": {
+              "cdp_endpoint_present": false,
+              "cdp_status": null,
+              "cursor_position": null,
+              "element_count": 67,
+              "elements_sha256": "e60518f5e01c15cd20904d7dd79765f89770a1c5d92c9e9c23f439555bc71992",
+              "focused_bbox": {
+                "h": 1283,
+                "w": 2049,
+                "x": 66,
+                "y": 169
+              },
+              "focused_element_id": "0x2b109c:0000002a002b109c",
+              "focused_name_sha256": "95642d5b26314c1242bf9d4f9e000abc14eab04fe463056933278cc01ed71b35",
+              "focused_role": "document",
+              "focused_value_sha256": null,
+              "foreground_hwnd": 14617440,
+              "foreground_pid": 31048,
+              "foreground_process": "Notepad.exe",
+              "foreground_title": "[redacted:window_title]",
+              "foreground_title_sha256": "139af729dd2d32e08107b346f6f9f83c2c15f8ac5d82739d4fe3ac1cda51c537",
+              "pixel": {
+                "bitmap_sha256": "[redacted:image]",
+                "detail": "captured 2067x1452 BGRA bytes=12005136",
+                "region": {
+                  "h": 1452,
+                  "w": 2067,
+                  "x": 57,
+                  "y": 57
+                },
+                "status": "ok"
+              },
+              "point_pixel": null,
+              "web_path": "[redacted:path]"
+            },
+            "after_signature": "40563af48d365e94c90513924dcc7a63eab35610db54cfe32fcee72d5619a9b0",
+            "before": {
+              "cdp_endpoint_present": false,
+              "cdp_status": null,
+              "cursor_position": null,
+              "element_count": 34,
+              "elements_sha256": "8ced6dc00c722fd8f90018641ad809eb3e229fb4b95e0b1093c1755304170610",
+              "focused_bbox": {
+                "h": 864,
+                "w": 1730,
+                "x": 494,
+                "y": 555
+              },
+              "focused_element_id": "0x4005b4:0000002a01660d7200000004000006ed",
+              "focused_name_sha256": "844ff0d342cb9a8b070b0b13da5eb6884bf9672afeceaba3524d2652eeeefb33",
+              "focused_role": "terminal",
+              "focused_value_sha256": null,
+              "foreground_hwnd": 4195764,
+              "foreground_pid": 26700,
+              "foreground_process": "WindowsTerminal.exe",
+              "foreground_title": "[redacted:window_title]",
+              "foreground_title_sha256": "6a92f970dd11e6f6f13bcbf708245fcb71242e3c8aa669c63ff4a5c868c3a610",
+              "pixel": {
+                "bitmap_sha256": "[redacted:image]",
+                "detail": "captured 1752x936 BGRA bytes=6559488",
+                "region": {
+                  "h": 936,
+                  "w": 1752,
+                  "x": 483,
+                  "y": 494
+                },
+                "status": "ok"
+              },
+              "point_pixel": null,
+              "web_path": "[redacted:path]"
+            },
+            "before_signature": "a49403a8ddd4047770f562b2d58ce3c5df0b100343eb5ff1ff00f4e11f7ba5a2",
+            "timeout_ms": 3000
+          }
+        },
+        "message": "act_press verify_delta cannot accept observed delta because foreground target changed within 3000 ms"
+      },
+      "error_code": "ACTION_FOREGROUND_LOST",
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "Notepad.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "notepad",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "error",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b89cf0498f6c00000019",
+    "value": {
+      "active_profile_id": "notepad",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "notepad",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "hwnd": "[redacted:high_cardinality_id]",
+          "launched_at": "[redacted:timing]",
+          "matched_title": "[redacted:window_title]",
+          "pid": "[redacted:high_cardinality_id]",
+          "reason": null
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "notepad",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_launch",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8a16f8d97600000001a",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "args": [
+          "-NoProfile",
+          "-WindowStyle",
+          "Hidden",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-Command",
+          "[redacted:path_like_string]"
+        ],
+        "command": "powershell.exe",
+        "env_keys": [],
+        "idempotency_key_present": true,
+        "request_sha256": "170b9e111de39c5684c605884c277503301951342c244d9d0df62ae0f95c6ed6",
+        "timeout_ms": 120000,
+        "working_dir": "[redacted:path_like_string]"
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8a5df10a6b40000001b",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "preflight": {
+          "active_profile_id_before": "terminal",
+          "after": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "applied": false,
+          "before": {
+            "hwnd": "[redacted:high_cardinality_id]",
+            "is_minimized": false,
+            "observed_profile_id": "terminal",
+            "pid": "[redacted:high_cardinality_id]",
+            "process_name": "WindowsTerminal.exe",
+            "process_path": "[redacted:path]",
+            "window_title": "[redacted:window_title]"
+          },
+          "focus_attempted": false,
+          "status": "not_applicable",
+          "target": null,
+          "target_profile_id": null,
+          "tool": "act_press"
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "started",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8a69f62f4bc0000001c",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "Notepad.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "data": {
+          "code": "ACTION_FOREGROUND_LOST",
+          "foreground_change_policy": {
+            "allow_foreground_change": true,
+            "expected_foreground_process_regex": "(?i)^calc\\.exe$",
+            "expected_foreground_title_regex": "(?i)calculator"
+          },
+          "matches": {
+            "process": false,
+            "title": "[redacted:window_title]"
+          },
+          "reason": "foreground_change_policy_mismatch",
+          "source_of_truth": "foreground_focused_ui_or_pixels",
+          "tool": "act_press",
+          "verify_delta": {
+            "after": {
+              "cdp_endpoint_present": false,
+              "cdp_status": null,
+              "cursor_position": null,
+              "element_count": 67,
+              "elements_sha256": "c1997efb6b5b744973b337e6e2b15bc7060db12c33f6ef96ed3f69ca3858ce84",
+              "focused_bbox": {
+                "h": 1283,
+                "w": 2049,
+                "x": 180,
+                "y": 283
+              },
+              "focused_element_id": "0x1890f1c:0000002a01890f1c",
+              "focused_name_sha256": "95642d5b26314c1242bf9d4f9e000abc14eab04fe463056933278cc01ed71b35",
+              "focused_role": "document",
+              "focused_value_sha256": null,
+              "foreground_hwnd": 15797078,
+              "foreground_pid": 31048,
+              "foreground_process": "Notepad.exe",
+              "foreground_title": "[redacted:window_title]",
+              "foreground_title_sha256": "139af729dd2d32e08107b346f6f9f83c2c15f8ac5d82739d4fe3ac1cda51c537",
+              "pixel": {
+                "bitmap_sha256": "[redacted:image]",
+                "detail": "captured 2067x1452 BGRA bytes=12005136",
+                "region": {
+                  "h": 1452,
+                  "w": 2067,
+                  "x": 171,
+                  "y": 171
+                },
+                "status": "ok"
+              },
+              "point_pixel": null,
+              "web_path": "[redacted:path]"
+            },
+            "after_signature": "02950cf6632c26b4c223a2776c3de46746e277b4e35c94a75b4263e98425526f",
+            "before": {
+              "cdp_endpoint_present": false,
+              "cdp_status": null,
+              "cursor_position": null,
+              "element_count": 34,
+              "elements_sha256": "9b4c75ac254e2ef0e53fab65859ac8e34e25c6eadb1a9aadabf43bdc6a7da669",
+              "focused_bbox": {
+                "h": 864,
+                "w": 1730,
+                "x": 76,
+                "y": 137
+              },
+              "focused_element_id": "0x1680d72:0000002a06ea0886000000040000070a",
+              "focused_name_sha256": "844ff0d342cb9a8b070b0b13da5eb6884bf9672afeceaba3524d2652eeeefb33",
+              "focused_role": "terminal",
+              "focused_value_sha256": null,
+              "foreground_hwnd": 23596402,
+              "foreground_pid": 26700,
+              "foreground_process": "WindowsTerminal.exe",
+              "foreground_title": "[redacted:window_title]",
+              "foreground_title_sha256": "beed21559dfb3da91af41609f0ce40bff7f9ee10d33771f63ec949134211be40",
+              "pixel": {
+                "bitmap_sha256": "[redacted:image]",
+                "detail": "captured 1752x936 BGRA bytes=6559488",
+                "region": {
+                  "h": 936,
+                  "w": 1752,
+                  "x": 65,
+                  "y": 76
+                },
+                "status": "ok"
+              },
+              "point_pixel": null,
+              "web_path": "[redacted:path]"
+            },
+            "before_signature": "2bdcfc6d2acf3577c5b1f05f1a602e8ed138463b3b714ec9cf927ffcef9d6193",
+            "timeout_ms": 3000
+          }
+        },
+        "message": "act_press verify_delta foreground target changed but did not match expected foreground policy within 3000 ms"
+      },
+      "error_code": "ACTION_FOREGROUND_LOST",
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "Notepad.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "notepad",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "error",
+      "tool": "act_press",
+      "ts_ns": "[redacted:timing]"
+    }
+  },
+  {
+    "cf_name": "CF_ACTION_LOG",
+    "key_hex": "18b6b8a89e0dd56c0000001d",
+    "value": {
+      "active_profile_id": "terminal",
+      "active_profile_schema_version": 2,
+      "audit_context": {
+        "app_context": {
+          "process_name": "WindowsTerminal.exe",
+          "process_path": "[redacted:path]",
+          "target_id": "profile-registry/audit-data",
+          "window_title": "[redacted:window_title]"
+        },
+        "backend_policy": {
+          "default": "auto",
+          "keyboard_default": "auto",
+          "mouse_default": "auto",
+          "pad_default": "auto"
+        },
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "profile_version": "2",
+        "session_id": "[redacted:high_cardinality_id]"
+      },
+      "audit_id": "[redacted:high_cardinality_id]",
+      "details": {
+        "response": {
+          "duration_ms": 30834,
+          "exit_code": 0,
+          "stderr": "",
+          "stderr_truncated": false,
+          "stdout": "",
+          "stdout_truncated": false,
+          "timed_out": false
+        }
+      },
+      "error_code": null,
+      "foreground": {
+        "hwnd": "[redacted:high_cardinality_id]",
+        "pid": "[redacted:high_cardinality_id]",
+        "process_name": "WindowsTerminal.exe",
+        "process_path": "[redacted:path]",
+        "profile_id": "terminal",
+        "profile_schema_version": 2,
+        "window_title": "[redacted:window_title]"
+      },
+      "profile_id": "terminal",
+      "profile_schema_version": 2,
+      "profile_version": "2",
+      "redacted": false,
+      "redactions": [],
+      "schema_version": 1,
+      "seq": "[redacted:high_cardinality_id]",
+      "session_id": "[redacted:high_cardinality_id]",
+      "status": "ok",
+      "tool": "act_run_shell",
+      "ts_ns": "[redacted:timing]"
+    }
+  }
+]

@@ -1,0 +1,26 @@
+You are a fresh primary Codex process running only the Synapse #767 manual verification trigger.
+
+Rules:
+- Do not edit files.
+- Do not run shell commands.
+- Use only the real wired mcp__synapse tools.
+- First call mcp__synapse.health.
+- Then call mcp__synapse.act_press with exactly:
+  keys=["enter"]
+  hold_ms=33
+  backend="auto"
+  verify_delta=true
+  verify_timeout_ms=3000
+  allow_foreground_change=true
+  expected_foreground_process_regex="(?i)^calc\\.exe$"
+  expected_foreground_title_regex="(?i)calculator"
+- This should send Enter, but fail because the controlled launcher opens Notepad, not Calculator.
+- Return a concise final JSON object with:
+  case="edge_wrong_expected_process"
+  health_pid
+  act_press_ok=false
+  error_code
+  error_reason
+  process_match
+  title_match
+  error_message

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "policy": "strict",
+  "rows_scanned": 200,
+  "rows_exported": 69,
+  "rows_redacted": 69,
+  "fields_redacted": 917,
+  "redacted_by_class": {
+    "high_cardinality_id": 459,
+    "image": 2,
+    "path": 166,
+    "path_like_string": 41,
+    "timing": 74,
+    "window_title": 175
+  },
+  "retained_fields": [
+    "schema_version",
+    "profile_id",
+    "profile_version",
+    "profile_schema_version",
+    "active_profile_id",
+    "active_profile_schema_version",
+    "foreground.profile_id",
+    "foreground.profile_schema_version",
+    "foreground.process_name",
+    "tool",
+    "status",
+    "error_code",
+    "details.response.backend"
+  ],
+  "fail_closed_rules": [
+    "explicit consent argument must be present and enabled",
+    "consent row is written only from the consented export call",
+    "redaction policy must be selected and match explicit consent",
+    "external sharing remains false in local bundles",
+    "matching rows larger than max_row_bytes abort the export before files are written"
+  ]
+}

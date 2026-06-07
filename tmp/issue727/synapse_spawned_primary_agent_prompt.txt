@@ -1,0 +1,70 @@
+You are a PRIMARY Claude agent spawned by Synapse for manual FSV of GitHub issue #727 after the native edit backend fix.
+
+Rules:
+- Use the real wired Synapse MCP tools, especially health, control_lease_status, find, and act_type.
+- Do not use a helper script, unit test, or direct file write as the trigger. Every text-entry trigger must be mcp__synapse__act_type with into_element.
+- You may use local shell/file reads only for separate Source-of-Truth reads after each MCP trigger.
+- Do not close terminals or unrelated processes. Do not click or take foreground control.
+- Output a final JSON object with actual before/after state and tool-response evidence.
+
+Known runtime state:
+- daemon bind: http://127.0.0.1:7700/mcp
+- daemon PID expected: 51856
+- fixture window title: Synapse FSV 727 UIA
+- fixture hwnd: 4788518
+- foreground sentinel hwnd: 40635352
+- state file SoT: C:\code\Synapse\tmp\issue727\state.json
+- normal element id: 0x791100:0000002a00791100
+- read-only element id: 0x81166:0000002a00081166
+- password element id: 0xae108e:0000002a00ae108e
+- multiline element id: 0x11010e0:0000002a011010e0
+
+Manual FSV procedure:
+1. Precondition: call mcp__synapse__health, mcp__synapse__control_lease_status, and mcp__synapse__find for window_hwnd=4788518. Read the state file and read GetForegroundWindow via PowerShell. The operator may use the machine; the hard invariant is fixture hwnd 4788518 must not become foreground during background act_type calls.
+2. Happy path normal field:
+   - Read state file and foreground before.
+   - Call mcp__synapse__act_type into normal element with text "FSV727 primary normal", verify_delta=true, verify_timeout_ms=250.
+   - Read state file and foreground after.
+   - Expected SoT: normal="FSV727 primary normal", normal_len=21, fixture is not foreground, response backend_tier_used="win32_message", required_foreground=false, target_readback_required=false, target_text_integrity="win32_text_message_readback".
+3. Edge empty input:
+   - Read state/foreground before.
+   - Call mcp__synapse__act_type into normal element with text "", verify_delta=true, verify_timeout_ms=250.
+   - Read state/foreground after.
+   - Expected SoT: normal="", normal_len=0, fixture is not foreground, response backend_tier_used="win32_message", required_foreground=false, target_text_integrity="win32_text_message_readback".
+4. Edge read-only input:
+   - Read state/foreground before.
+   - Call mcp__synapse__act_type into read-only element with text "SHOULD-NOT-WRITE-727", verify_delta=true, verify_timeout_ms=250.
+   - This should fail closed. Record the error code/message/data.
+   - Read state/foreground after.
+   - Expected SoT: read_only="LOCKED-727", read_only_len=10, fixture is not foreground.
+5. Edge password input:
+   - Read state/foreground before.
+   - Call mcp__synapse__act_type into password element with text "p@ss727", verify_delta=true, verify_timeout_ms=250.
+   - Read state/foreground after.
+   - Expected SoT: password_len=7, no raw password value in state file, fixture is not foreground, response backend_tier_used="win32_message", required_foreground=false, target_text_integrity="win32_text_message_password_length_readback", target_readback_required=false.
+6. Edge multiline input:
+   - Read state/foreground before.
+   - Call mcp__synapse__act_type into multiline element with text containing one real newline between the lines: LineA-727 then LineB-727, verify_delta=true, verify_timeout_ms=250.
+   - Read state/foreground after. Also use a separate PowerShell WM_GETTEXT/WM_GETTEXTLENGTH read on child HWND 0x11010e0 to prove the physical control text.
+   - Expected SoT: state file multiline is "LineA-727\r\nLineB-727", multiline_len=20; WM_GETTEXT also returns "LineA-727\r\nLineB-727" with length 20; fixture is not foreground; response backend_tier_used="win32_message", required_foreground=false, target_readback_required=false, target_text_integrity="win32_text_message_readback", postcondition.source_of_truth="win32_window_text".
+7. End: call mcp__synapse__control_lease_status again.
+
+Final output JSON schema:
+{
+  "issue": 727,
+  "agent_kind": "primary_claude",
+  "daemon_pid": 51856,
+  "tool_surface_loaded": true,
+  "fixture_hwnd": 4788518,
+  "sentinel_hwnd": 40635352,
+  "precondition": {...},
+  "happy_normal": {...},
+  "edge_empty": {...},
+  "edge_readonly": {...},
+  "edge_password": {...},
+  "edge_multiline": {...},
+  "final_lease": {...},
+  "passed": boolean,
+  "failure_reason": string|null
+}
+

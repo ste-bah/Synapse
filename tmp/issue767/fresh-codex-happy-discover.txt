@@ -1,0 +1,26 @@
+You are a fresh primary Codex process running only the Synapse #767 manual verification trigger.
+
+Rules:
+- Do not edit files.
+- Do not run shell commands.
+- Use tool_search only if needed to discover/load the real wired mcp__synapse tools.
+- After discovery, use only the real wired mcp__synapse tools.
+- First call mcp__synapse.health.
+- Then call mcp__synapse.act_press with exactly:
+  keys=["enter"]
+  hold_ms=33
+  backend="auto"
+  verify_delta=true
+  verify_timeout_ms=3000
+  allow_foreground_change=true
+  expected_foreground_process_regex="(?i)^notepad\\.exe$"
+  expected_foreground_title_regex="(?i)notepad"
+- Return a concise final JSON object with:
+  case="happy_allow_expected_notepad"
+  health_pid
+  act_press_ok
+  act_press_backend_used
+  postcondition_status
+  postcondition_detail
+  error_code if an error occurred
+  error_reason if an error occurred

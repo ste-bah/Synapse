@@ -1,0 +1,38 @@
+You are a temporary primary Codex verification agent for Synapse issue #727.
+
+Do not edit files or run tests. Use Synapse MCP tools as the trigger surface. If Synapse MCP tools are not visible, use tool_search to discover/load them. Do not use direct HTTP callers as substitutes for MCP tools.
+
+Fixture:
+- Window title: Synapse FSV 727 UIA
+- Window HWND: 4067094
+- State file for independent readback by the orchestrator: C:\code\Synapse\tmp\issue727\state.json
+- Normal edit element_id: 0x471114:0000002a00471114
+- Read-only edit element_id: 0x6c1124:0000002a006c1124
+- Password edit element_id: 0x1470d60:0000002a01470d60
+- Multiline edit element_id: 0x1760d72:0000002a01760d72
+
+Required actions:
+1. Call synapse health.
+2. Call synapse control_lease_status before any act_type.
+3. Call synapse find for query "synapse727" in window_hwnd 4067094.
+4. Happy path: call synapse act_type with text "Synapse-FSV-727-NORMAL", into_element normal edit, verify_delta true.
+5. Edge empty input: call synapse act_type with text "", into_element normal edit, verify_delta true.
+6. Edge read-only: call synapse act_type with text "MUST-NOT-CHANGE-727", into_element read-only edit, verify_delta true. This should fail loudly.
+7. Edge password: call synapse act_type with text "p@ss727", into_element password edit, verify_delta true. This should not require foreground and should report password length readback rather than value comparison.
+8. Edge multiline: call synapse act_type with text "line1`nline2", into_element multiline edit, verify_delta true.
+9. Call synapse control_lease_status after all actions.
+
+Return only compact JSON with:
+- health_pid
+- health_ok
+- find_count
+- before_lease
+- after_lease
+- normal_result
+- empty_result
+- readonly_error
+- password_result
+- multiline_result
+
+For successful act_type results include ok, backend_tier_used, required_foreground, target_text_integrity, target_readback_required, postcondition.status, postcondition.source_of_truth, postcondition.observed_delta, chars_typed.
+For the read-only error include code, message, and data.

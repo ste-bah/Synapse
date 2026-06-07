@@ -1,0 +1,1 @@
+{"case":"edge_invalid_regex_no_input","health_pid":20720,"act_press_ok":false,"error_code":"TOOL_PARAMS_INVALID","error_reason":"invalid_expected_foreground_regex","error_field":"expected_foreground_title_regex","error_message":"expected_foreground_title_regex is not a valid regex: regex parse error: [ ^ error: unclosed character class"}
