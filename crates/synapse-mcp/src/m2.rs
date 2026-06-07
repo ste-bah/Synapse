@@ -23,7 +23,7 @@ use synapse_action::{
     ActionStateSnapshot, BackendRateLimitControl, BackendResolutionPolicy, LeaseOutcome,
     RELEASE_ALL_HANDLE, RecordingBackend, initialize_double_click_timing_cache, lease,
 };
-use synapse_core::error_codes;
+use synapse_core::{Point, error_codes};
 use tokio::{sync::watch, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -71,12 +71,14 @@ pub(crate) struct ForegroundInputLeaseGuard {
     tool: &'static str,
     session_id: String,
     release_on_drop: bool,
+    context_restore: Option<ForegroundInputContextSnapshot>,
 }
 
 impl ForegroundInputLeaseGuard {
     fn renewed(tool: &'static str, session_id: String) -> Self {
         Self {
             tool,
+            context_restore: Some(ForegroundInputContextSnapshot::capture(tool, &session_id)),
             session_id,
             release_on_drop: false,
         }
@@ -85,14 +87,30 @@ impl ForegroundInputLeaseGuard {
     fn auto_acquired(tool: &'static str, session_id: String) -> Self {
         Self {
             tool,
+            context_restore: Some(ForegroundInputContextSnapshot::capture(tool, &session_id)),
             session_id,
             release_on_drop: true,
+        }
+    }
+
+    pub(crate) fn disable_context_restore(&mut self, reason_code: &'static str) {
+        if self.context_restore.take().is_some() {
+            tracing::info!(
+                code = "INPUT_LEASE_CONTEXT_RESTORE_DISABLED",
+                tool = self.tool,
+                session_id = %self.session_id,
+                reason_code,
+                "readback=foreground_input_context outcome=restore_disabled"
+            );
         }
     }
 }
 
 impl Drop for ForegroundInputLeaseGuard {
     fn drop(&mut self) {
+        if let Some(context_restore) = &self.context_restore {
+            context_restore.restore(self.tool, &self.session_id);
+        }
         if !self.release_on_drop {
             return;
         }
@@ -117,6 +135,257 @@ impl Drop for ForegroundInputLeaseGuard {
             }
         }
     }
+}
+
+#[derive(Clone, Debug)]
+struct ForegroundInputContextSnapshot {
+    cursor: Option<Point>,
+    foreground_hwnd: Option<i64>,
+    foreground_title: Option<String>,
+    cursor_capture_error: Option<String>,
+    foreground_capture_error: Option<String>,
+}
+
+impl ForegroundInputContextSnapshot {
+    fn capture(tool: &'static str, session_id: &str) -> Self {
+        let cursor_read = synapse_action::backend::software::cursor_position();
+        let foreground_read = synapse_a11y::current_foreground_context();
+
+        let (cursor, cursor_capture_error) = match cursor_read {
+            Ok(point) => (Some(point), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let (foreground_hwnd, foreground_title, foreground_capture_error) = match foreground_read {
+            Ok(context) => (Some(context.hwnd), Some(context.window_title), None),
+            Err(error) => (None, None, Some(error.to_string())),
+        };
+
+        let snapshot = Self {
+            cursor,
+            foreground_hwnd,
+            foreground_title,
+            cursor_capture_error,
+            foreground_capture_error,
+        };
+        snapshot.log_capture(tool, session_id);
+        snapshot
+    }
+
+    fn log_capture(&self, tool: &'static str, session_id: &str) {
+        if self.cursor.is_some() && self.foreground_hwnd.is_some() {
+            if let Some(cursor) = self.cursor {
+                tracing::info!(
+                    code = "INPUT_LEASE_CONTEXT_CAPTURED",
+                    tool,
+                    session_id,
+                    cursor_x = cursor.x,
+                    cursor_y = cursor.y,
+                    foreground_hwnd = ?self.foreground_hwnd,
+                    foreground_title = ?self.foreground_title,
+                    "readback=foreground_input_context outcome=captured"
+                );
+            }
+            return;
+        }
+
+        tracing::warn!(
+            code = error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            tool,
+            session_id,
+            reason_code = self.capture_reason_code(),
+            cursor = ?self.cursor,
+            foreground_hwnd = ?self.foreground_hwnd,
+            cursor_error = ?self.cursor_capture_error,
+            foreground_error = ?self.foreground_capture_error,
+            "foreground input context capture incomplete"
+        );
+    }
+
+    fn restore(&self, tool: &'static str, session_id: &str) {
+        let cursor = self.restore_cursor(tool, session_id);
+        let foreground = self.restore_foreground(tool, session_id);
+        tracing::info!(
+            code = "INPUT_LEASE_CONTEXT_RESTORE_SUMMARY",
+            tool,
+            session_id,
+            cursor_outcome = cursor,
+            foreground_outcome = foreground,
+            "readback=foreground_input_context outcome=restore_summary"
+        );
+    }
+
+    fn restore_cursor(&self, tool: &'static str, session_id: &str) -> &'static str {
+        let Some(cursor) = self.cursor else {
+            tracing::warn!(
+                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                tool,
+                session_id,
+                reason_code = "cursor_capture_unavailable",
+                capture_error = ?self.cursor_capture_error,
+                "foreground input cursor restore skipped"
+            );
+            return "skipped";
+        };
+
+        match synapse_action::backend::software::set_cursor_position(cursor) {
+            Ok(actual) => {
+                tracing::info!(
+                    code = "INPUT_LEASE_CONTEXT_CURSOR_RESTORED",
+                    tool,
+                    session_id,
+                    requested_x = cursor.x,
+                    requested_y = cursor.y,
+                    actual_x = actual.x,
+                    actual_y = actual.y,
+                    "readback=cursor_position outcome=restored"
+                );
+                "restored"
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                    tool,
+                    session_id,
+                    reason_code = "cursor_restore_failed",
+                    requested_x = cursor.x,
+                    requested_y = cursor.y,
+                    detail = %error,
+                    "foreground input cursor restore failed"
+                );
+                "failed"
+            }
+        }
+    }
+
+    fn restore_foreground(&self, tool: &'static str, session_id: &str) -> &'static str {
+        let Some(hwnd) = self.foreground_hwnd else {
+            tracing::warn!(
+                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                tool,
+                session_id,
+                reason_code = "foreground_capture_unavailable",
+                capture_error = ?self.foreground_capture_error,
+                "foreground window restore skipped"
+            );
+            return "skipped";
+        };
+
+        if !foreground_window_is_alive(hwnd) {
+            tracing::warn!(
+                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                tool,
+                session_id,
+                reason_code = "prior_foreground_closed",
+                foreground_hwnd = hwnd,
+                foreground_title = ?self.foreground_title,
+                "foreground window restore skipped because prior HWND is gone"
+            );
+            return "skipped";
+        }
+
+        match synapse_a11y::focus_window(hwnd) {
+            Ok(()) => match synapse_a11y::current_foreground_context() {
+                Ok(after) if after.hwnd == hwnd => {
+                    tracing::info!(
+                        code = "INPUT_LEASE_CONTEXT_FOREGROUND_RESTORED",
+                        tool,
+                        session_id,
+                        foreground_hwnd = hwnd,
+                        foreground_title = ?self.foreground_title,
+                        after_hwnd = after.hwnd,
+                        after_title = %after.window_title,
+                        "readback=foreground_window outcome=restored"
+                    );
+                    "restored"
+                }
+                Ok(after) => {
+                    tracing::error!(
+                        code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                        tool,
+                        session_id,
+                        reason_code = "foreground_readback_mismatch",
+                        requested_hwnd = hwnd,
+                        actual_hwnd = after.hwnd,
+                        actual_title = %after.window_title,
+                        "foreground window restore readback mismatch"
+                    );
+                    "failed"
+                }
+                Err(error) => {
+                    tracing::error!(
+                        code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                        tool,
+                        session_id,
+                        reason_code = "foreground_readback_failed",
+                        requested_hwnd = hwnd,
+                        detail = %error,
+                        "foreground window restore readback failed"
+                    );
+                    "failed"
+                }
+            },
+            Err(error) => {
+                tracing::error!(
+                    code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                    tool,
+                    session_id,
+                    reason_code = "foreground_restore_failed",
+                    foreground_hwnd = hwnd,
+                    foreground_title = ?self.foreground_title,
+                    detail = %error,
+                    "foreground window restore failed"
+                );
+                "failed"
+            }
+        }
+    }
+
+    fn capture_reason_code(&self) -> &'static str {
+        match (self.cursor.is_some(), self.foreground_hwnd.is_some()) {
+            (false, false) => "cursor_and_foreground_capture_failed",
+            (false, true) => "cursor_capture_failed",
+            (true, false) => "foreground_capture_failed",
+            (true, true) => "captured",
+        }
+    }
+}
+
+#[cfg(windows)]
+fn foreground_window_is_alive(hwnd: i64) -> bool {
+    use std::ffi::c_void;
+
+    use windows::Win32::{
+        Foundation::{CloseHandle, HWND},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+        UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow},
+    };
+
+    const STILL_ACTIVE_EXIT_CODE: u32 = 259;
+
+    let hwnd = HWND(hwnd as *mut c_void);
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return false;
+    }
+
+    let mut process_id = 0_u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&raw mut process_id)) };
+    if process_id == 0 {
+        return false;
+    }
+    let Ok(handle) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) })
+    else {
+        return false;
+    };
+    let mut exit_code = 0_u32;
+    let alive = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) }.is_ok()
+        && exit_code == STILL_ACTIVE_EXIT_CODE;
+    let _ = unsafe { CloseHandle(handle) };
+    alive
+}
+
+#[cfg(not(windows))]
+fn foreground_window_is_alive(_hwnd: i64) -> bool {
+    false
 }
 
 pub(crate) fn acquire_foreground_input_lease(

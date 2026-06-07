@@ -47,6 +47,11 @@ fn error_codes_match_literal_names() {
     assert_literal!(STUCK_KEY_AUTO_RELEASED);
     assert_literal!(SAFETY_RELEASE_ALL_FIRED);
     assert_literal!(SAFETY_OPERATOR_HOTKEY_FIRED);
+    assert_literal!(ACTION_FOREGROUND_LEASE_BUSY);
+    assert_literal!(ACTION_FOREGROUND_LEASE_NOT_HELD);
+    assert_literal!(ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED);
+    assert_literal!(ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED);
+    assert_literal!(ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED);
 
     assert_literal!(REFLEX_CAP_REACHED);
     assert_literal!(REFLEX_KIND_INVALID);

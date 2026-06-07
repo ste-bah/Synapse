@@ -58,6 +58,11 @@ pub(super) fn cursor_position() -> Result<Point, ActionError> {
     })
 }
 
+pub(super) fn set_cursor_position(point: Point) -> Result<Point, ActionError> {
+    send_absolute_mouse_move(point, "foreground input context cursor restore")?;
+    cursor_position()
+}
+
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_move"))]
 pub(super) fn mouse_move(
     target: &MouseTarget,

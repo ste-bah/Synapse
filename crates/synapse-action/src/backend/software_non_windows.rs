@@ -44,6 +44,21 @@ mod linux {
         Ok(Point { x, y })
     }
 
+    /// Moves the current X11 cursor and returns the separately-read final
+    /// position.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ActionError::BackendUnavailable` when the X11 backend cannot be
+    /// initialized, the move fails, or final cursor readback fails.
+    pub fn set_cursor_position(point: Point) -> Result<Point, ActionError> {
+        let mut enigo = enigo()?;
+        enigo
+            .move_mouse(point.x, point.y, Coordinate::Abs)
+            .map_err(enigo_error("restore cursor position"))?;
+        cursor_position()
+    }
+
     impl ActionBackend for SoftwareBackend {
         #[tracing::instrument(skip_all, fields(backend = "software_linux_x11"))]
         fn execute(&self, action: &Action, state: &mut EmitState) -> Result<(), ActionError> {
@@ -498,7 +513,7 @@ mod linux {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-pub use linux::{SoftwareBackend, cursor_position};
+pub use linux::{SoftwareBackend, cursor_position, set_cursor_position};
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 mod unsupported {
@@ -523,6 +538,18 @@ mod unsupported {
     pub fn cursor_position() -> Result<Point, ActionError> {
         Err(ActionError::BackendUnavailable {
             detail: "software cursor position is implemented on Windows and Linux/X11 only"
+                .to_owned(),
+        })
+    }
+
+    /// Moves the current software cursor and returns final cursor readback.
+    ///
+    /// # Errors
+    ///
+    /// Always returns `ActionError::BackendUnavailable` on unsupported targets.
+    pub fn set_cursor_position(_point: Point) -> Result<Point, ActionError> {
+        Err(ActionError::BackendUnavailable {
+            detail: "software cursor restore is implemented on Windows and Linux/X11 only"
                 .to_owned(),
         })
     }
@@ -575,4 +602,4 @@ mod unsupported {
 }
 
 #[cfg(not(all(unix, not(target_os = "macos"))))]
-pub use unsupported::{SoftwareBackend, cursor_position};
+pub use unsupported::{SoftwareBackend, cursor_position, set_cursor_position};

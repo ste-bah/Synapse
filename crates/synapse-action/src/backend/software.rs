@@ -29,6 +29,17 @@ pub fn cursor_position() -> Result<Point, ActionError> {
     mouse::cursor_position()
 }
 
+/// Moves the software cursor to a Win32 screen coordinate and returns the
+/// separately-read final cursor position.
+///
+/// # Errors
+///
+/// Returns `ActionError::BackendUnavailable` when the OS rejects the cursor
+/// move or final readback does not match the requested point.
+pub fn set_cursor_position(point: Point) -> Result<Point, ActionError> {
+    mouse::set_cursor_position(point)
+}
+
 impl ActionBackend for SoftwareBackend {
     #[tracing::instrument(skip_all, fields(backend = "software"))]
     fn execute(&self, action: &Action, state: &mut EmitState) -> Result<(), ActionError> {

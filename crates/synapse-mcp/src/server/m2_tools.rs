@@ -310,7 +310,7 @@ impl SynapseService {
                 "preflight": preflight,
             }),
         )?;
-        let _lease_guard =
+        let mut lease_guard =
             match acquire_tool_foreground_input_lease("act_focus_window", &request_context) {
                 Ok(guard) => guard,
                 Err(error) => {
@@ -322,6 +322,7 @@ impl SynapseService {
                     return Err(error);
                 }
             };
+        lease_guard.disable_context_restore("act_focus_window_intentional_foreground_change");
         let result = act_focus_window(params).await;
         self.audit_action_result("act_focus_window", &result)?;
         result.map(Json)
