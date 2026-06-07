@@ -1052,7 +1052,7 @@ fn unix_ms_now() -> u64 {
 /// Validates a `set_target` window HWND is live and snapshottable, returning its
 /// (title, process_name) so the response confirms exactly which window was bound.
 /// Fail-loud: a dead/invalid/unresolvable HWND is `TARGET_WINDOW_NOT_FOUND`.
-fn validate_target_window(hwnd: i64) -> Result<(String, String), ErrorData> {
+pub(crate) fn validate_target_window(hwnd: i64) -> Result<(String, String), ErrorData> {
     synapse_capture::validate_hwnd(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,

@@ -36,7 +36,14 @@ const MAX_SHELL_TIMEOUT_MS: u32 = 600_000;
 const DEFAULT_LAUNCH_TIMEOUT_MS: u32 = 10_000;
 const MAX_LAUNCH_TIMEOUT_MS: u32 = 600_000;
 #[cfg(windows)]
+const SW_HIDE: u16 = 0;
+#[cfg(windows)]
 const SW_SHOWNORMAL: u16 = 1;
+const DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS: u32 = 120_000;
+const MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS: u32 = 600_000;
+const DEFAULT_AGENT_SPAWN_HOLD_OPEN_MS: u32 = 60_000;
+const MAX_AGENT_SPAWN_HOLD_OPEN_MS: u32 = 3_600_000;
+const MAX_AGENT_SPAWN_PROMPT_BYTES: usize = 128 * 1024;
 const MAX_SHELL_IDEMPOTENCY_KEY_BYTES: usize = 256;
 const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
 const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
@@ -396,6 +403,206 @@ pub struct ActLaunchParams {
     #[serde(default)]
     #[schemars(default)]
     pub force_renderer_accessibility: Option<bool>,
+    /// Windows console window state for console targets launched through
+    /// `CreateProcessW`. `hidden` uses CREATE_NO_WINDOW so background helper
+    /// shells do not flash a visible blank console.
+    #[serde(default)]
+    #[schemars(default)]
+    pub windows_console_window_state: Option<LaunchWindowState>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LaunchWindowState {
+    Normal,
+    Hidden,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActSpawnAgentCli {
+    Codex,
+    Claude,
+}
+
+impl ActSpawnAgentCli {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActSpawnAgentTarget {
+    Window {
+        window_hwnd: i64,
+    },
+    Cdp {
+        window_hwnd: i64,
+        cdp_target_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActSpawnAgentParams {
+    pub cli: ActSpawnAgentCli,
+    /// Optional work prompt for the spawned primary agent. Synapse prepends a
+    /// mandatory provisioning preflight that calls health/tools through the real
+    /// client MCP surface and binds the requested target.
+    #[serde(default)]
+    #[schemars(default)]
+    pub prompt: Option<String>,
+    /// Optional per-session perception target that the spawned agent must bind
+    /// with set_target before act_spawn_agent returns success.
+    #[serde(default)]
+    #[schemars(default)]
+    pub target: Option<ActSpawnAgentTarget>,
+    /// Working directory for the primary agent. Defaults to the daemon process
+    /// current directory.
+    #[serde(default)]
+    #[schemars(default)]
+    pub working_dir: Option<String>,
+    /// Streamable HTTP MCP endpoint for the spawned agent. Defaults to the
+    /// canonical local Synapse daemon endpoint.
+    #[serde(default = "default_agent_spawn_mcp_url")]
+    #[schemars(default = "default_agent_spawn_mcp_url")]
+    pub mcp_url: String,
+    /// Time to wait for a distinct MCP session/target registry readback.
+    #[serde(default = "default_agent_spawn_wait_timeout_ms")]
+    #[schemars(
+        default = "default_agent_spawn_wait_timeout_ms",
+        range(min = 1, max = 600_000)
+    )]
+    pub wait_timeout_ms: u32,
+    /// Provision-only agents hold the primary process open long enough for
+    /// manual readback; task prompts may continue doing useful work during this
+    /// interval.
+    #[serde(default = "default_agent_spawn_hold_open_ms")]
+    #[schemars(
+        default = "default_agent_spawn_hold_open_ms",
+        range(min = 0, max = 3_600_000)
+    )]
+    pub hold_open_ms: u32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActSpawnAgentResponse {
+    pub spawn_id: String,
+    pub cli: ActSpawnAgentCli,
+    pub launcher_process_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_process_id: Option<u32>,
+    pub session_id: String,
+    pub mcp_url: String,
+    pub working_dir: String,
+    pub launched_at_unix_ms: u64,
+    pub registered_at_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<ActSpawnAgentTarget>,
+    pub log_paths: ActSpawnAgentLogPaths,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActSpawnAgentLogPaths {
+    pub log_dir: String,
+    pub prompt_path: String,
+    pub stdout_path: String,
+    pub stderr_path: String,
+    pub final_message_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_config_path: Option<String>,
+}
+
+#[must_use]
+pub fn default_agent_spawn_mcp_url() -> String {
+    "http://127.0.0.1:7700/mcp".to_owned()
+}
+
+#[must_use]
+pub const fn default_agent_spawn_wait_timeout_ms() -> u32 {
+    DEFAULT_AGENT_SPAWN_WAIT_TIMEOUT_MS
+}
+
+#[must_use]
+pub const fn default_agent_spawn_hold_open_ms() -> u32 {
+    DEFAULT_AGENT_SPAWN_HOLD_OPEN_MS
+}
+
+pub fn validate_agent_spawn_params(params: &ActSpawnAgentParams) -> Result<(), ErrorData> {
+    if params.mcp_url.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent mcp_url must not be empty",
+        ));
+    }
+    if params.mcp_url.len() > 2_048 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent mcp_url must be <= 2048 bytes",
+        ));
+    }
+    if params.mcp_url.chars().any(char::is_whitespace) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent mcp_url must not contain whitespace",
+        ));
+    }
+    if !(params.mcp_url.starts_with("http://") || params.mcp_url.starts_with("https://")) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent mcp_url must be an http:// or https:// URL",
+        ));
+    }
+    if params.wait_timeout_ms == 0 || params.wait_timeout_ms > MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "act_spawn_agent wait_timeout_ms must be 1..={MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS}"
+            ),
+        ));
+    }
+    if params.hold_open_ms > MAX_AGENT_SPAWN_HOLD_OPEN_MS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("act_spawn_agent hold_open_ms must be <= {MAX_AGENT_SPAWN_HOLD_OPEN_MS}"),
+        ));
+    }
+    if let Some(prompt) = &params.prompt {
+        if prompt.len() > MAX_AGENT_SPAWN_PROMPT_BYTES {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("act_spawn_agent prompt must be <= {MAX_AGENT_SPAWN_PROMPT_BYTES} bytes"),
+            ));
+        }
+    }
+    if let Some(working_dir) = &params.working_dir {
+        if working_dir.trim().is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "act_spawn_agent working_dir must not be empty",
+            ));
+        }
+    }
+    if let Some(ActSpawnAgentTarget::Cdp { cdp_target_id, .. }) = &params.target {
+        if cdp_target_id.trim().is_empty()
+            || !cdp_target_id.chars().all(|ch| ('!'..='~').contains(&ch))
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "act_spawn_agent cdp_target_id must contain only visible ASCII characters",
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -438,6 +645,7 @@ pub fn launch_request_details(params: &ActLaunchParams) -> serde_json::Value {
         "idempotency_key_present": params.idempotency_key.is_some(),
         "cdp_debug": params.cdp_debug,
         "force_renderer_accessibility": params.force_renderer_accessibility,
+        "windows_console_window_state": params.windows_console_window_state,
         "windows_new_console": launch_target_needs_new_console(&params.target),
         "request_sha256": launch_request_sha256(params).ok(),
     })
@@ -478,6 +686,7 @@ pub fn launch_process_history_row(
         "reason": response.reason,
         "cdp_debug": params.cdp_debug,
         "force_renderer_accessibility": params.force_renderer_accessibility,
+        "windows_console_window_state": params.windows_console_window_state,
         "cdp_debug_port": response.cdp_debug_port,
         "cdp_endpoint": response.cdp_endpoint,
         "cdp_user_data_dir": response.cdp_user_data_dir,
@@ -790,6 +999,7 @@ fn launch_request_sha256(params: &ActLaunchParams) -> Result<String, ErrorData> 
         "timeout_ms": params.timeout_ms,
         "cdp_debug": params.cdp_debug,
         "force_renderer_accessibility": params.force_renderer_accessibility,
+        "windows_console_window_state": params.windows_console_window_state,
     });
     let bytes = serde_json::to_vec(&payload).map_err(|error| {
         mcp_error(
@@ -1705,7 +1915,6 @@ fn spawn_windows_console_child(params: &ActLaunchParams) -> Result<u32, ErrorDat
         Win32::{
             Foundation::CloseHandle,
             System::Threading::{
-                CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_UNICODE_ENVIRONMENT,
                 CreateProcessW, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
             },
         },
@@ -1731,7 +1940,10 @@ fn spawn_windows_console_child(params: &ActLaunchParams) -> Result<u32, ErrorDat
     let startup_info = STARTUPINFOW {
         cb: startup_info_cb,
         dwFlags: STARTF_USESHOWWINDOW,
-        wShowWindow: SW_SHOWNORMAL,
+        wShowWindow: match params.windows_console_window_state {
+            Some(LaunchWindowState::Hidden) => SW_HIDE,
+            Some(LaunchWindowState::Normal) | None => SW_SHOWNORMAL,
+        },
         ..Default::default()
     };
 
@@ -1747,7 +1959,7 @@ fn spawn_windows_console_child(params: &ActLaunchParams) -> Result<u32, ErrorDat
             None,
             None,
             false,
-            CREATE_NEW_CONSOLE | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT,
+            console_creation_flags(params),
             Some(environment.as_ptr().cast()),
             current_dir,
             &raw const startup_info,
@@ -1774,6 +1986,21 @@ fn spawn_windows_console_child(params: &ActLaunchParams) -> Result<u32, ErrorDat
             }),
         )),
     }
+}
+
+#[cfg(windows)]
+fn console_creation_flags(
+    params: &ActLaunchParams,
+) -> windows::Win32::System::Threading::PROCESS_CREATION_FLAGS {
+    use windows::Win32::System::Threading::{
+        CREATE_NEW_CONSOLE, CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_UNICODE_ENVIRONMENT,
+    };
+
+    let console_flag = match params.windows_console_window_state {
+        Some(LaunchWindowState::Hidden) => CREATE_NO_WINDOW,
+        Some(LaunchWindowState::Normal) | None => CREATE_NEW_CONSOLE,
+    };
+    console_flag | CREATE_NEW_PROCESS_GROUP | CREATE_UNICODE_ENVIRONMENT
 }
 
 #[cfg(windows)]
@@ -3341,6 +3568,7 @@ mod tests {
             idempotency_key: None,
             cdp_debug: None,
             force_renderer_accessibility: None,
+            windows_console_window_state: None,
         }
     }
 

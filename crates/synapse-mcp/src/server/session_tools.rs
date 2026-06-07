@@ -122,7 +122,10 @@ impl SynapseService {
 }
 
 impl SynapseService {
-    fn session_list_impl(&self, include_closed: bool) -> Result<SessionListResponse, ErrorData> {
+    pub(crate) fn session_list_impl(
+        &self,
+        include_closed: bool,
+    ) -> Result<SessionListResponse, ErrorData> {
         let now_unix_ms = unix_time_ms_now();
         let (registry_reads, stale_after_ms, registry_entry_count) =
             self.session_registry_reads(now_unix_ms)?;
@@ -167,7 +170,10 @@ impl SynapseService {
         })
     }
 
-    fn session_status_impl(&self, session_id: &str) -> Result<SessionStatusResponse, ErrorData> {
+    pub(crate) fn session_status_impl(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionStatusResponse, ErrorData> {
         let now_unix_ms = unix_time_ms_now();
         let (registry_reads, stale_after_ms, _registry_entry_count) =
             self.session_registry_reads(now_unix_ms)?;
@@ -273,6 +279,7 @@ fn synthetic_registry_read(
         closed_at_unix_ms: None,
         last_action: None,
         last_reason_code: None,
+        spawned_agent: None,
     }
 }
 

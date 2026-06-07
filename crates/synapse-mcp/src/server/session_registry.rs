@@ -31,6 +31,7 @@ pub(crate) struct SessionRegistryEntry {
     pub closed_at_unix_ms: Option<u64>,
     pub last_action: Option<String>,
     pub last_reason_code: Option<String>,
+    pub spawned_agent: Option<SpawnedAgentRead>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -56,6 +57,23 @@ pub(crate) struct SessionRegistryRead {
     pub last_action: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_agent: Option<SpawnedAgentRead>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SpawnedAgentRead {
+    pub spawn_id: String,
+    pub cli: String,
+    pub launcher_process_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_process_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by_session_id: Option<String>,
+    pub launched_at_unix_ms: u64,
+    pub launch_target: String,
+    pub log_dir: String,
 }
 
 impl Default for SessionRegistry {
@@ -104,6 +122,7 @@ impl SessionRegistry {
                 closed_at_unix_ms: None,
                 last_action: None,
                 last_reason_code: None,
+                spawned_agent: None,
             });
         entry.transport = transport.to_owned();
         entry.client_name = Some(client_name.clone());
@@ -135,6 +154,7 @@ impl SessionRegistry {
                 closed_at_unix_ms: None,
                 last_action: None,
                 last_reason_code: None,
+                spawned_agent: None,
             });
         entry.last_seen_unix_ms = now_unix_ms;
         if let Some(action) = action {
@@ -159,9 +179,40 @@ impl SessionRegistry {
                 closed_at_unix_ms: None,
                 last_action: None,
                 last_reason_code: None,
+                spawned_agent: None,
             });
         entry.last_seen_unix_ms = now_unix_ms;
         entry.closed_at_unix_ms = Some(now_unix_ms);
+    }
+
+    pub(crate) fn record_spawned_agent(
+        &mut self,
+        session_id: &str,
+        spawned_agent: SpawnedAgentRead,
+        now_unix_ms: u64,
+    ) {
+        let entry = self
+            .entries
+            .entry(session_id.to_owned())
+            .or_insert_with(|| SessionRegistryEntry {
+                session_id: session_id.to_owned(),
+                transport: "http".to_owned(),
+                client_name: None,
+                client_version: None,
+                protocol_version: None,
+                agent_kind: spawned_agent.cli.clone(),
+                started_at_unix_ms: now_unix_ms,
+                last_seen_unix_ms: now_unix_ms,
+                closed_at_unix_ms: None,
+                last_action: None,
+                last_reason_code: None,
+                spawned_agent: None,
+            });
+        if entry.agent_kind == "unknown" {
+            entry.agent_kind = spawned_agent.cli.clone();
+        }
+        entry.last_seen_unix_ms = entry.last_seen_unix_ms.max(now_unix_ms);
+        entry.spawned_agent = Some(spawned_agent);
     }
 
     pub(crate) fn reads(&self, now_unix_ms: u64) -> Vec<SessionRegistryRead> {
@@ -199,6 +250,7 @@ impl SessionRegistry {
             closed_at_unix_ms: entry.closed_at_unix_ms,
             last_action: entry.last_action.clone(),
             last_reason_code: entry.last_reason_code.clone(),
+            spawned_agent: entry.spawned_agent.clone(),
         }
     }
 }
@@ -255,6 +307,32 @@ mod tests {
         let closed = registry.reads(1_251).remove(0);
         assert_eq!(closed.lifecycle, "closed");
         assert_eq!(closed.closed_at_unix_ms, Some(1_250));
+    }
+
+    #[test]
+    fn registry_records_spawned_agent_process_attribution() {
+        let mut registry = SessionRegistry::default();
+        registry.record_initialized("s1", &state("codex"), "http", 1_000);
+        registry.record_spawned_agent(
+            "s1",
+            SpawnedAgentRead {
+                spawn_id: "spawn-1".to_owned(),
+                cli: "codex".to_owned(),
+                launcher_process_id: 123,
+                agent_process_id: Some(456),
+                started_by_session_id: Some("parent".to_owned()),
+                launched_at_unix_ms: 990,
+                launch_target: "pwsh.exe".to_owned(),
+                log_dir: "C:\\temp\\spawn-1".to_owned(),
+            },
+            1_050,
+        );
+
+        let read = registry.reads(1_060).remove(0);
+        let spawned = read.spawned_agent.unwrap();
+        assert_eq!(spawned.spawn_id, "spawn-1");
+        assert_eq!(spawned.launcher_process_id, 123);
+        assert_eq!(spawned.agent_process_id, Some(456));
     }
 
     #[test]

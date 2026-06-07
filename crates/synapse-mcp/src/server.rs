@@ -103,12 +103,13 @@ use crate::{
     },
     m4::{
         ActComboParams, ActComboResponse, ActLaunchParams, ActLaunchResponse, ActRunShellParams,
-        ActRunShellResponse, M4ServiceConfig, RunShellAuthorization, authorize_run_shell,
-        execute_combo, launch, launch_process_history_row, launch_process_history_row_key,
-        launch_request_details, required_combo_permissions, run_authorized_shell,
-        run_shell_idempotency_completed_row, run_shell_idempotency_replay,
-        run_shell_idempotency_reservation_row, run_shell_idempotency_row_key,
-        run_shell_request_details,
+        ActRunShellResponse, ActSpawnAgentCli, ActSpawnAgentLogPaths, ActSpawnAgentParams,
+        ActSpawnAgentResponse, ActSpawnAgentTarget, LaunchWindowState, M4ServiceConfig,
+        RunShellAuthorization, authorize_run_shell, execute_combo, launch,
+        launch_process_history_row, launch_process_history_row_key, launch_request_details,
+        required_combo_permissions, run_authorized_shell, run_shell_idempotency_completed_row,
+        run_shell_idempotency_replay, run_shell_idempotency_reservation_row,
+        run_shell_idempotency_row_key, run_shell_request_details, validate_agent_spawn_params,
     },
 };
 
