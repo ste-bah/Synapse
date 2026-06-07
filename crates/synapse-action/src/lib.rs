@@ -59,7 +59,8 @@ pub use invoke::{
 };
 pub use lease::{
     DEFAULT_LEASE_TTL_MS, LeaseError, LeaseOutcome, LeaseStatus, MAX_LEASE_TTL_MS,
-    MIN_LEASE_TTL_MS, force_preempt as force_preempt_input_lease,
+    MIN_LEASE_TTL_MS, OPERATOR_LEASE_OWNER_SESSION_ID, OPERATOR_PREEMPT_LEASE_TTL_MS,
+    force_clear as force_clear_input_lease, force_preempt as force_preempt_input_lease,
     ttl_from_ms as input_lease_ttl_from_ms,
 };
 pub use path::{

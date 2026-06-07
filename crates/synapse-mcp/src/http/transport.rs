@@ -320,6 +320,9 @@ async fn cleanup_stale_session_inputs_once(
     action_handle: &ActionHandle,
     session_manager: &LocalSessionManager,
 ) {
+    let active_sessions = active_http_session_ids(session_manager).await;
+    cleanup_stale_session_lease_once(&active_sessions);
+
     let snapshot = match action_handle.session_inputs_snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -335,7 +338,6 @@ async fn cleanup_stale_session_inputs_once(
         return;
     }
 
-    let active_sessions = active_http_session_ids(session_manager).await;
     for session in snapshot.sessions {
         if active_sessions.contains(&session.session_id) {
             continue;
@@ -352,6 +354,29 @@ async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTree
         .keys()
         .map(|session_id| session_id.as_ref().to_owned())
         .collect()
+}
+
+fn cleanup_stale_session_lease_once(active_sessions: &BTreeSet<String>) {
+    let status = synapse_action::lease::status();
+    let Some(owner_session_id) = status.owner_session_id.clone() else {
+        return;
+    };
+    if owner_session_id == synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID {
+        return;
+    }
+    if active_sessions.contains(&owner_session_id) {
+        return;
+    }
+    let released = synapse_action::lease::release_if_owner(&owner_session_id);
+    tracing::info!(
+        code = "MCP_HTTP_SESSION_LEASE_STALE_CLEANUP",
+        session_id = %owner_session_id,
+        released,
+        before = ?status,
+        after = ?synapse_action::lease::status(),
+        active_session_count = active_sessions.len(),
+        "readback=input_lease edge=http_session_gone after_cleanup"
+    );
 }
 
 async fn release_stale_session_inputs(action_handle: &ActionHandle, session_id: &str) {
@@ -957,6 +982,41 @@ mod tests {
         cancel.cancel();
         let final_snapshot = join.await?;
         assert!(final_snapshot.held_keys.is_empty());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_session_cleanup_releases_absent_lease_without_inputs() -> anyhow::Result<()> {
+        let cancel = CancellationToken::new();
+        let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
+        let (handle, snapshot_handle, join) =
+            ActionEmitter::spawn_with_backend(cancel.clone(), backend);
+        let session_manager = LocalSessionManager::default();
+        let stale_session_id = "stale-lease-session";
+        let _prior = synapse_action::lease::force_clear("http_stale_lease_test_reset");
+        let _held = synapse_action::lease::try_acquire(stale_session_id, Duration::from_secs(30));
+
+        let before_state = snapshot_handle.snapshot().await?;
+        let before_lease = synapse_action::lease::status();
+        println!(
+            "readback=http_session_cleanup edge=stale_lease before_state={before_state:?} before_lease={before_lease:?}"
+        );
+
+        cleanup_stale_session_inputs_once(&handle, &session_manager).await;
+
+        let after_state = snapshot_handle.snapshot().await?;
+        let after_lease = synapse_action::lease::status();
+        println!(
+            "readback=http_session_cleanup edge=stale_lease after_state={after_state:?} after_lease={after_lease:?}"
+        );
+        assert!(!after_lease.held);
+        assert_eq!(after_lease.owner_session_id, None);
+
+        cancel.cancel();
+        let final_snapshot = join.await?;
+        assert!(final_snapshot.held_keys.is_empty());
+        let _prior = synapse_action::lease::force_clear("http_stale_lease_test_reset");
 
         Ok(())
     }

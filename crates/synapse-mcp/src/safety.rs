@@ -102,12 +102,19 @@ fn parse_bool_env(name: &str) -> synapse_action::ActionResult<bool> {
 
 fn handle_operator_hotkey(m3_state: &SharedM3State) {
     let started = Instant::now();
+    let preempted_lease = synapse_action::force_preempt_input_lease("operator_hotkey");
     let disable_report = disable_reflexes(m3_state);
     let release_all_report = fire_release_all();
     let elapsed = started.elapsed();
     tracing::warn!(
         code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
         hotkey = "ctrl+alt+shift+p",
+        input_lease_preempted = preempted_lease.is_some(),
+        input_lease_prior_owner = ?preempted_lease
+            .as_ref()
+            .and_then(|status| status.owner_session_id.clone()),
+        input_lease_operator_owner = synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID,
+        input_lease_operator_ttl_ms = synapse_action::OPERATOR_PREEMPT_LEASE_TTL_MS,
         disabled_reflexes = disable_report.disabled_ids.len(),
         disabled_reflex_ids = ?disable_report.disabled_ids,
         reflex_result = disable_report.result,

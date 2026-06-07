@@ -263,12 +263,12 @@ mod tests {
 
     fn serial() -> MutexGuard<'static, ()> {
         let guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        let _prior = lease::force_preempt("lease_tools_test_reset");
+        let _prior = lease::force_clear("lease_tools_test_reset");
         guard
     }
 
     fn reset() {
-        let _prior = lease::force_preempt("lease_tools_test_reset");
+        let _prior = lease::force_clear("lease_tools_test_reset");
     }
 
     fn error_code(error: &rmcp::ErrorData) -> Option<String> {

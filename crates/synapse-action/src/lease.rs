@@ -31,6 +31,10 @@ pub const DEFAULT_LEASE_TTL_MS: u64 = 5_000;
 pub const MIN_LEASE_TTL_MS: u64 = 100;
 /// Maximum acceptable lease lifetime (clamped by [`ttl_from_ms`]).
 pub const MAX_LEASE_TTL_MS: u64 = 30_000;
+/// Synthetic holder used when the operator panic hotkey preempts agents.
+pub const OPERATOR_LEASE_OWNER_SESSION_ID: &str = "__operator__";
+/// How long the operator owns the real-input resource after panic preemption.
+pub const OPERATOR_PREEMPT_LEASE_TTL_MS: u64 = MAX_LEASE_TTL_MS;
 
 /// Internal lease record. Stored behind the process-global mutex.
 #[derive(Clone, Debug)]
@@ -258,7 +262,7 @@ pub fn release_if_owner(session_id: &str) -> bool {
     released
 }
 
-/// Operator override: force-releases whoever holds the lease (e.g. panic hotkey).
+/// Operator override: transfers the lease to the operator (e.g. panic hotkey).
 ///
 /// Returns the prior holder's snapshot, if any, so the preemption can be logged.
 pub fn force_preempt(reason: &str) -> Option<LeaseStatus> {
@@ -271,6 +275,31 @@ pub fn force_preempt(reason: &str) -> Option<LeaseStatus> {
             reason,
             prior_owner = ?prior.owner_session_id,
             "input lease force-preempted by operator"
+        );
+    }
+    *guard = Some(InputLease {
+        owner_session_id: OPERATOR_LEASE_OWNER_SESSION_ID.to_owned(),
+        acquired_at: now,
+        renewed_at: now,
+        ttl: ttl_from_ms(OPERATOR_PREEMPT_LEASE_TTL_MS),
+    });
+    prior
+}
+
+/// Unconditionally clears the process-global lease.
+///
+/// This is intentionally separate from [`force_preempt`]: operator preemption
+/// must leave a visible, bounded operator holder so agents fail closed instead
+/// of immediately reacquiring the foreground resource.
+pub fn force_clear(reason: &str) -> Option<LeaseStatus> {
+    let now = Instant::now();
+    let mut guard = lock();
+    let prior = guard.as_ref().map(|lease| lease.status(now));
+    if let Some(prior) = &prior {
+        tracing::info!(
+            reason,
+            prior_owner = ?prior.owner_session_id,
+            "input lease force-cleared"
         );
     }
     *guard = None;
@@ -303,12 +332,12 @@ mod tests {
 
     fn serial() -> MutexGuard<'static, ()> {
         let guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        let _prior = force_preempt("test_reset");
+        let _prior = force_clear("test_reset");
         guard
     }
 
     fn reset() {
-        let _prior = force_preempt("test_reset");
+        let _prior = force_clear("test_reset");
     }
 
     #[test]
@@ -407,6 +436,64 @@ mod tests {
         assert!(status().held);
         assert!(release_if_owner(owner));
         assert!(!status().held);
+        reset();
+    }
+
+    #[test]
+    fn operator_preempt_transfers_lease_to_operator_holder() {
+        let _serial = serial();
+        let owner = "fsv-operator-owner";
+        let _held = try_acquire(owner, ttl_from_ms(5_000));
+
+        let prior = force_preempt("operator_preempt_test");
+        assert_eq!(
+            prior
+                .as_ref()
+                .and_then(|status| status.owner_session_id.as_deref()),
+            Some(owner)
+        );
+        let after = status();
+        assert!(after.held);
+        assert_eq!(
+            after.owner_session_id.as_deref(),
+            Some(OPERATOR_LEASE_OWNER_SESSION_ID)
+        );
+        assert_eq!(after.ttl_ms, Some(OPERATOR_PREEMPT_LEASE_TTL_MS));
+        println!(
+            "readback=input_lease edge=operator_preempt owner_before={:?} owner_after={:?} ttl_after={:?}",
+            prior.and_then(|status| status.owner_session_id),
+            after.owner_session_id,
+            after.ttl_ms
+        );
+        reset();
+    }
+
+    #[test]
+    fn operator_preempt_refuses_prior_owner_until_operator_ttl_lapses() {
+        let _serial = serial();
+        let owner = "fsv-operator-prior";
+        let _held = try_acquire(owner, ttl_from_ms(5_000));
+        let _prior = force_preempt("operator_preempt_test");
+
+        match try_acquire(owner, ttl_from_ms(5_000)) {
+            LeaseOutcome::Busy { holder, .. } => {
+                assert_eq!(
+                    holder.owner_session_id.as_deref(),
+                    Some(OPERATOR_LEASE_OWNER_SESSION_ID)
+                );
+            }
+            other => {
+                panic!("expected prior owner to be refused after operator preempt, got {other:?}")
+            }
+        }
+        match release(owner) {
+            Err(LeaseError::NotHeld { holder, .. }) => {
+                assert_eq!(holder.as_deref(), Some(OPERATOR_LEASE_OWNER_SESSION_ID));
+            }
+            other => {
+                panic!("expected prior owner release to fail after operator preempt, got {other:?}")
+            }
+        }
         reset();
     }
 
