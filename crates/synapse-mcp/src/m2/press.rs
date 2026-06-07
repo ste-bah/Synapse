@@ -84,6 +84,9 @@ pub async fn act_keymap_with_handle(
         hold_ms: params.hold_ms,
         backend: params.backend,
         verify_delta: false,
+        allow_foreground_change: false,
+        expected_foreground_process_regex: None,
+        expected_foreground_title_regex: None,
         verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
     };
     let response =

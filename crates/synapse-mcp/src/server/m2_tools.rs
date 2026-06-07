@@ -349,6 +349,14 @@ impl SynapseService {
             }
         };
         self.audit_action_started_with_details("act_press", &action_preflight_details(&preflight))?;
+        let foreground_change_policy = match act_press_foreground_change_policy(&params) {
+            Ok(policy) => policy,
+            Err(error) => {
+                let result: Result<ActPressResponse, ErrorData> = Err(error);
+                self.audit_action_result("act_press", &result)?;
+                return result.map(Json);
+            }
+        };
         let before_delta_signature = if params.verify_delta {
             match self.capture_action_delta_signature(160, None, false).await {
                 Ok(signature) => Some(signature),
@@ -380,8 +388,13 @@ impl SynapseService {
             act_press_with_handle(handle, recording, connection_closed_cancel, params).await;
         let result = match (result, before_delta_signature) {
             (Ok(response), Some(before)) => {
-                self.verify_act_press_response(response, before, verify_timeout_ms)
-                    .await
+                self.verify_act_press_response(
+                    response,
+                    before,
+                    verify_timeout_ms,
+                    foreground_change_policy,
+                )
+                .await
             }
             (other, _) => other,
         };
@@ -976,6 +989,7 @@ struct ClickDeltaSignature {
     foreground_hwnd: i64,
     foreground_pid: u32,
     foreground_process: String,
+    foreground_title: String,
     foreground_title_sha256: Option<String>,
     focused_element_id: Option<String>,
     focused_role: Option<String>,
@@ -990,6 +1004,31 @@ struct ClickDeltaSignature {
     cursor_position: Option<Point>,
     pixel: ClickPixelSignature,
     point_pixel: Option<ClickPixelSignature>,
+}
+
+#[derive(Clone, Debug)]
+struct ForegroundChangePolicy {
+    allow: bool,
+    expected_process_regex: Option<regex::Regex>,
+    expected_process_pattern: Option<String>,
+    expected_title_regex: Option<regex::Regex>,
+    expected_title_pattern: Option<String>,
+}
+
+impl ForegroundChangePolicy {
+    fn reject() -> Self {
+        Self {
+            allow: false,
+            expected_process_regex: None,
+            expected_process_pattern: None,
+            expected_title_regex: None,
+            expected_title_pattern: None,
+        }
+    }
+
+    fn has_expectations(&self) -> bool {
+        self.expected_process_regex.is_some() || self.expected_title_regex.is_some()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1299,12 +1338,14 @@ impl SynapseService {
 
         let focused = input.focused.clone();
         let elements_sha256 = elements_fingerprint_hash(&input.elements)?;
+        let foreground_title_sha256 = non_empty_sha256(&input.foreground.window_title);
         let pixel = capture_pixel_signature(input.foreground.window_bounds);
         Ok(ClickDeltaSignature {
             foreground_hwnd: input.foreground.hwnd,
             foreground_pid: input.foreground.pid,
             foreground_process: input.foreground.process_name,
-            foreground_title_sha256: non_empty_sha256(&input.foreground.window_title),
+            foreground_title: input.foreground.window_title,
+            foreground_title_sha256,
             focused_element_id: focused.as_ref().map(|item| item.element_id.to_string()),
             focused_role: focused.as_ref().map(|item| item.role.clone()),
             focused_name_sha256: focused
@@ -1451,6 +1492,7 @@ impl SynapseService {
         mut response: ActPressResponse,
         before: ClickDeltaSignature,
         verify_timeout_ms: u32,
+        foreground_change_policy: ForegroundChangePolicy,
     ) -> Result<ActPressResponse, ErrorData> {
         response.postcondition = self
             .verify_action_delta(
@@ -1459,6 +1501,7 @@ impl SynapseService {
                 before,
                 verify_timeout_ms,
                 None,
+                foreground_change_policy,
             )
             .await?;
         Ok(response)
@@ -1482,6 +1525,7 @@ impl SynapseService {
                 before,
                 verify_timeout_ms,
                 point_region,
+                ForegroundChangePolicy::reject(),
             )
             .await?;
         Ok(response)
@@ -1500,6 +1544,7 @@ impl SynapseService {
                 before,
                 verify_timeout_ms,
                 None,
+                ForegroundChangePolicy::reject(),
             )
             .await?;
         Ok(response)
@@ -1512,72 +1557,21 @@ impl SynapseService {
         before: ClickDeltaSignature,
         timeout_ms: u32,
         point_region: Option<Point>,
+        foreground_change_policy: ForegroundChangePolicy,
     ) -> Result<ActPostcondition, ErrorData> {
         tokio::time::sleep(Duration::from_millis(u64::from(timeout_ms))).await;
         let after = self
             .capture_action_delta_signature(160, point_region, source_of_truth.contains("cursor"))
             .await?;
-        if point_region.is_some() {
-            let before_point = before.point_pixel.clone();
-            let after_point = after.point_pixel.clone();
-            let before_hash = verify_hash_json(&before_point)?;
-            let after_hash = verify_hash_json(&after_point)?;
-            if before_point == after_point {
-                return Err(source_no_observed_delta_error(
-                    tool,
-                    source_of_truth,
-                    timeout_ms,
-                    before_hash,
-                    after_hash,
-                    json!({
-                        "point": point_region,
-                        "before_point_pixel": before_point,
-                        "after_point_pixel": after_point,
-                    }),
-                ));
-            }
-            return Ok(postcondition_observed_delta(
-                tool,
-                source_of_truth,
-                before_hash,
-                after_hash,
-                "observed a target point pixel signature change after delivery",
-            ));
-        }
-
-        let before_hash = signature_hash(&before)?;
-        let after_hash = signature_hash(&after)?;
-        if foreground_identity_changed(&before, &after) {
-            return Err(foreground_lost_delta_error(
-                tool,
-                source_of_truth,
-                timeout_ms,
-                &before_hash,
-                &after_hash,
-                &before,
-                &after,
-            ));
-        }
-        if before == after {
-            return Err(source_no_observed_delta_error(
-                tool,
-                source_of_truth,
-                timeout_ms,
-                before_hash,
-                after_hash,
-                json!({
-                    "before": before,
-                    "after": after,
-                }),
-            ));
-        }
-        Ok(postcondition_observed_delta(
+        verify_captured_action_delta(
             tool,
             source_of_truth,
-            before_hash,
-            after_hash,
-            "observed a Source-of-Truth signature change after delivery",
-        ))
+            timeout_ms,
+            before,
+            after,
+            point_region,
+            foreground_change_policy,
+        )
     }
 
     async fn verify_act_pad_response(
@@ -1616,6 +1610,305 @@ impl SynapseService {
         );
         Ok(response)
     }
+}
+
+fn verify_captured_action_delta(
+    tool: &str,
+    source_of_truth: &str,
+    timeout_ms: u32,
+    before: ClickDeltaSignature,
+    after: ClickDeltaSignature,
+    point_region: Option<Point>,
+    foreground_change_policy: ForegroundChangePolicy,
+) -> Result<ActPostcondition, ErrorData> {
+    if point_region.is_some() {
+        let before_point = before.point_pixel.clone();
+        let after_point = after.point_pixel.clone();
+        let before_hash = verify_hash_json(&before_point)?;
+        let after_hash = verify_hash_json(&after_point)?;
+        if before_point == after_point {
+            return Err(source_no_observed_delta_error(
+                tool,
+                source_of_truth,
+                timeout_ms,
+                before_hash,
+                after_hash,
+                json!({
+                    "point": point_region,
+                    "before_point_pixel": before_point,
+                    "after_point_pixel": after_point,
+                }),
+            ));
+        }
+        return Ok(postcondition_observed_delta(
+            tool,
+            source_of_truth,
+            before_hash,
+            after_hash,
+            "observed a target point pixel signature change after delivery",
+        ));
+    }
+
+    let before_hash = signature_hash(&before)?;
+    let after_hash = signature_hash(&after)?;
+    if foreground_identity_changed(&before, &after) {
+        return verify_foreground_transition(
+            tool,
+            source_of_truth,
+            timeout_ms,
+            before_hash,
+            after_hash,
+            &before,
+            &after,
+            &foreground_change_policy,
+        );
+    }
+    if foreground_change_policy.has_expectations() {
+        return Err(postcondition_failed_error(
+            tool,
+            source_of_truth,
+            "expected foreground transition did not occur",
+            before_hash,
+            after_hash,
+            json!({
+                "before": before,
+                "after": after,
+                "foreground_change_policy": foreground_change_policy_readback(&foreground_change_policy),
+            }),
+        ));
+    }
+    if before == after {
+        return Err(source_no_observed_delta_error(
+            tool,
+            source_of_truth,
+            timeout_ms,
+            before_hash,
+            after_hash,
+            json!({
+                "before": before,
+                "after": after,
+            }),
+        ));
+    }
+    Ok(postcondition_observed_delta(
+        tool,
+        source_of_truth,
+        before_hash,
+        after_hash,
+        "observed a Source-of-Truth signature change after delivery",
+    ))
+}
+
+fn act_press_foreground_change_policy(
+    params: &ActPressParams,
+) -> Result<ForegroundChangePolicy, ErrorData> {
+    let has_process_expectation = params.expected_foreground_process_regex.is_some();
+    let has_title_expectation = params.expected_foreground_title_regex.is_some();
+    let has_expectation = has_process_expectation || has_title_expectation;
+
+    if !params.verify_delta && (params.allow_foreground_change || has_expectation) {
+        return Err(act_press_policy_params_invalid(
+            "verify_delta",
+            "act_press foreground-change verification policy requires verify_delta=true",
+            "verify_delta_required",
+        ));
+    }
+
+    if !params.allow_foreground_change && has_expectation {
+        return Err(act_press_policy_params_invalid(
+            "allow_foreground_change",
+            "expected foreground regex fields require allow_foreground_change=true",
+            "allow_foreground_change_required",
+        ));
+    }
+
+    if !params.allow_foreground_change {
+        return Ok(ForegroundChangePolicy::reject());
+    }
+
+    let expected_process_pattern = params.expected_foreground_process_regex.clone();
+    let expected_title_pattern = params.expected_foreground_title_regex.clone();
+    let expected_process_regex = compile_act_press_policy_regex(
+        "expected_foreground_process_regex",
+        expected_process_pattern.as_deref(),
+    )?;
+    let expected_title_regex = compile_act_press_policy_regex(
+        "expected_foreground_title_regex",
+        expected_title_pattern.as_deref(),
+    )?;
+
+    Ok(ForegroundChangePolicy {
+        allow: true,
+        expected_process_regex,
+        expected_process_pattern,
+        expected_title_regex,
+        expected_title_pattern,
+    })
+}
+
+fn compile_act_press_policy_regex(
+    field: &'static str,
+    pattern: Option<&str>,
+) -> Result<Option<regex::Regex>, ErrorData> {
+    let Some(pattern) = pattern else {
+        return Ok(None);
+    };
+    if pattern.trim().is_empty() {
+        return Err(act_press_policy_params_invalid(
+            field,
+            format!("{field} must not be empty"),
+            "empty_expected_foreground_regex",
+        ));
+    }
+    regex::Regex::new(pattern)
+        .map(Some)
+        .map_err(|error| act_press_policy_invalid_regex(field, pattern, &error))
+}
+
+fn verify_foreground_transition(
+    tool: &str,
+    source_of_truth: &str,
+    timeout_ms: u32,
+    before_hash: String,
+    after_hash: String,
+    before: &ClickDeltaSignature,
+    after: &ClickDeltaSignature,
+    policy: &ForegroundChangePolicy,
+) -> Result<ActPostcondition, ErrorData> {
+    if !policy.allow {
+        return Err(foreground_lost_delta_error(
+            tool,
+            source_of_truth,
+            timeout_ms,
+            &before_hash,
+            &after_hash,
+            before,
+            after,
+        ));
+    }
+
+    let process_matches = policy
+        .expected_process_regex
+        .as_ref()
+        .map_or(true, |regex| regex.is_match(&after.foreground_process));
+    let title_matches = policy
+        .expected_title_regex
+        .as_ref()
+        .map_or(true, |regex| regex.is_match(&after.foreground_title));
+
+    if !process_matches || !title_matches {
+        return Err(foreground_change_policy_mismatch_error(
+            tool,
+            source_of_truth,
+            timeout_ms,
+            &before_hash,
+            &after_hash,
+            before,
+            after,
+            policy,
+            process_matches,
+            title_matches,
+        ));
+    }
+
+    tracing::info!(
+        code = "ACTION_FOREGROUND_CHANGE_ACCEPTED",
+        tool,
+        source_of_truth,
+        timeout_ms,
+        before_hwnd = before.foreground_hwnd,
+        after_hwnd = after.foreground_hwnd,
+        before_pid = before.foreground_pid,
+        after_pid = after.foreground_pid,
+        before_process = %before.foreground_process,
+        after_process = %after.foreground_process,
+        after_title_sha256 = ?after.foreground_title_sha256,
+        expected_process_regex = ?policy.expected_process_pattern,
+        expected_title_regex = ?policy.expected_title_pattern,
+        before_signature = before_hash,
+        after_signature = after_hash,
+        "verify_delta accepted declared foreground target transition"
+    );
+
+    Ok(postcondition_observed_delta(
+        tool,
+        source_of_truth,
+        before_hash,
+        after_hash,
+        format!(
+            "observed expected foreground transition after delivery; before_hwnd=0x{:x}; after_hwnd=0x{:x}; after_process={}; after_title_sha256={}; expected_process_regex_present={}; expected_title_regex_present={}",
+            before.foreground_hwnd,
+            after.foreground_hwnd,
+            after.foreground_process,
+            after.foreground_title_sha256.as_deref().unwrap_or("none"),
+            policy.expected_process_regex.is_some(),
+            policy.expected_title_regex.is_some()
+        ),
+    ))
+}
+
+fn foreground_change_policy_readback(policy: &ForegroundChangePolicy) -> Value {
+    json!({
+        "allow_foreground_change": policy.allow,
+        "expected_foreground_process_regex": policy.expected_process_pattern,
+        "expected_foreground_title_regex": policy.expected_title_pattern,
+    })
+}
+
+fn act_press_policy_params_invalid(
+    field: &'static str,
+    detail: impl Into<String>,
+    reason: &'static str,
+) -> ErrorData {
+    let detail = detail.into();
+    tracing::error!(
+        code = error_codes::TOOL_PARAMS_INVALID,
+        tool = "act_press",
+        field,
+        reason,
+        detail = %detail,
+        "act_press foreground-change policy parameters invalid"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "tool": "act_press",
+            "field": field,
+            "reason": reason,
+            "detail": detail,
+        })),
+    )
+}
+
+fn act_press_policy_invalid_regex(
+    field: &'static str,
+    pattern: &str,
+    error: &regex::Error,
+) -> ErrorData {
+    let detail = format!("{field} is not a valid regex: {error}");
+    tracing::error!(
+        code = error_codes::TOOL_PARAMS_INVALID,
+        tool = "act_press",
+        field,
+        reason = "invalid_expected_foreground_regex",
+        pattern,
+        regex_error = %error,
+        "act_press foreground-change policy regex invalid"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "tool": "act_press",
+            "field": field,
+            "reason": "invalid_expected_foreground_regex",
+            "pattern": pattern,
+            "detail": detail,
+        })),
+    )
 }
 
 fn can_route_click_element_background_first(
@@ -1899,6 +2192,8 @@ fn foreground_lost_delta_error(
         after_pid = after.foreground_pid,
         before_process = %before.foreground_process,
         after_process = %after.foreground_process,
+        before_title_sha256 = ?before.foreground_title_sha256,
+        after_title_sha256 = ?after.foreground_title_sha256,
         before_signature = before_hash,
         after_signature = after_hash,
         "verify_delta foreground target identity changed before postcondition readback"
@@ -1910,8 +2205,69 @@ fn foreground_lost_delta_error(
         ),
         Some(json!({
             "code": error_codes::ACTION_FOREGROUND_LOST,
+            "reason": "unexpected_foreground_change",
             "tool": tool,
             "source_of_truth": source_of_truth,
+            "verify_delta": {
+                "timeout_ms": timeout_ms,
+                "before_signature": before_hash,
+                "after_signature": after_hash,
+                "before": before,
+                "after": after,
+            }
+        })),
+    )
+}
+
+fn foreground_change_policy_mismatch_error(
+    tool: &str,
+    source_of_truth: &str,
+    timeout_ms: u32,
+    before_hash: &str,
+    after_hash: &str,
+    before: &ClickDeltaSignature,
+    after: &ClickDeltaSignature,
+    policy: &ForegroundChangePolicy,
+    process_matches: bool,
+    title_matches: bool,
+) -> ErrorData {
+    tracing::error!(
+        code = error_codes::ACTION_FOREGROUND_LOST,
+        reason = "foreground_change_policy_mismatch",
+        tool,
+        source_of_truth,
+        timeout_ms,
+        before_hwnd = before.foreground_hwnd,
+        after_hwnd = after.foreground_hwnd,
+        before_pid = before.foreground_pid,
+        after_pid = after.foreground_pid,
+        before_process = %before.foreground_process,
+        after_process = %after.foreground_process,
+        before_title_sha256 = ?before.foreground_title_sha256,
+        after_title_sha256 = ?after.foreground_title_sha256,
+        expected_process_regex = ?policy.expected_process_pattern,
+        expected_title_regex = ?policy.expected_title_pattern,
+        process_matches,
+        title_matches,
+        before_signature = before_hash,
+        after_signature = after_hash,
+        "verify_delta foreground target changed but did not match declared policy"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{tool} verify_delta foreground target changed but did not match expected foreground policy within {timeout_ms} ms"
+        ),
+        Some(json!({
+            "code": error_codes::ACTION_FOREGROUND_LOST,
+            "reason": "foreground_change_policy_mismatch",
+            "tool": tool,
+            "source_of_truth": source_of_truth,
+            "foreground_change_policy": foreground_change_policy_readback(policy),
+            "matches": {
+                "process": process_matches,
+                "title": title_matches,
+            },
             "verify_delta": {
                 "timeout_ms": timeout_ms,
                 "before_signature": before_hash,
@@ -2415,6 +2771,160 @@ mod tests {
         );
     }
 
+    #[test]
+    fn act_press_verify_delta_rejects_foreground_change_by_default() {
+        let before = click_signature(100, 10, "WindowsTerminal.exe", "Terminal", 1);
+        let after = click_signature(
+            200,
+            20,
+            "chrome.exe",
+            "Device Activation - Google Chrome",
+            1,
+        );
+
+        let error = verify_captured_action_delta(
+            "act_press",
+            "foreground_focused_ui_or_pixels",
+            250,
+            before,
+            after,
+            None,
+            ForegroundChangePolicy::reject(),
+        )
+        .expect_err("unexpected foreground changes must remain fail-closed");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LOST)
+        );
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("unexpected_foreground_change")
+        );
+    }
+
+    #[test]
+    fn act_press_verify_delta_accepts_declared_foreground_transition() {
+        let before = click_signature(100, 10, "WindowsTerminal.exe", "Terminal", 1);
+        let after = click_signature(
+            200,
+            20,
+            "chrome.exe",
+            "Device Activation - Google Chrome",
+            1,
+        );
+        let policy = ForegroundChangePolicy {
+            allow: true,
+            expected_process_regex: Some(regex::Regex::new("^chrome\\.exe$").unwrap()),
+            expected_process_pattern: Some("^chrome\\.exe$".to_owned()),
+            expected_title_regex: Some(regex::Regex::new("Device Activation").unwrap()),
+            expected_title_pattern: Some("Device Activation".to_owned()),
+        };
+
+        let postcondition = verify_captured_action_delta(
+            "act_press",
+            "foreground_focused_ui_or_pixels",
+            250,
+            before,
+            after,
+            None,
+            policy,
+        )
+        .expect("declared foreground transition should satisfy verify_delta");
+
+        assert_eq!(postcondition.status, "observed_delta");
+        assert_eq!(postcondition.observed_delta, Some(true));
+        assert!(
+            postcondition
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("expected foreground transition"))
+        );
+    }
+
+    #[test]
+    fn act_press_verify_delta_rejects_declared_transition_to_wrong_title() {
+        let before = click_signature(100, 10, "WindowsTerminal.exe", "Terminal", 1);
+        let after = click_signature(200, 20, "chrome.exe", "New Tab - Google Chrome", 1);
+        let policy = ForegroundChangePolicy {
+            allow: true,
+            expected_process_regex: Some(regex::Regex::new("^chrome\\.exe$").unwrap()),
+            expected_process_pattern: Some("^chrome\\.exe$".to_owned()),
+            expected_title_regex: Some(regex::Regex::new("Device Activation").unwrap()),
+            expected_title_pattern: Some("Device Activation".to_owned()),
+        };
+
+        let error = verify_captured_action_delta(
+            "act_press",
+            "foreground_focused_ui_or_pixels",
+            250,
+            before,
+            after,
+            None,
+            policy,
+        )
+        .expect_err("wrong foreground title must fail closed");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_FOREGROUND_LOST)
+        );
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("foreground_change_policy_mismatch")
+        );
+        assert_eq!(
+            data.pointer("/matches/process").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            data.pointer("/matches/title").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn act_press_foreground_policy_requires_verify_delta_before_input() {
+        let params = act_press_params(false, true, None, None);
+
+        let error = act_press_foreground_change_policy(&params)
+            .expect_err("foreground-change policy without verify_delta must fail before input");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("verify_delta_required")
+        );
+    }
+
+    #[test]
+    fn act_press_foreground_policy_rejects_invalid_regex_before_input() {
+        let params = act_press_params(true, true, None, Some("["));
+
+        let error = act_press_foreground_change_policy(&params)
+            .expect_err("invalid foreground regex must fail before input");
+        let data = error.data.as_ref().expect("structured error data");
+
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("invalid_expected_foreground_regex")
+        );
+        assert_eq!(
+            data.get("field").and_then(Value::as_str),
+            Some("expected_foreground_title_regex")
+        );
+    }
+
     fn foreground_proof(
         hwnd: i64,
         pid: u32,
@@ -2457,6 +2967,68 @@ mod tests {
             steam_appid: None,
             is_fullscreen: false,
             is_dwm_composed: true,
+        }
+    }
+
+    fn act_press_params(
+        verify_delta: bool,
+        allow_foreground_change: bool,
+        expected_process_regex: Option<&str>,
+        expected_title_regex: Option<&str>,
+    ) -> ActPressParams {
+        ActPressParams {
+            keys: vec!["enter".to_owned()],
+            hold_ms: 33,
+            backend: crate::m2::PressBackend::Auto,
+            verify_delta,
+            allow_foreground_change,
+            expected_foreground_process_regex: expected_process_regex.map(str::to_owned),
+            expected_foreground_title_regex: expected_title_regex.map(str::to_owned),
+            verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
+        }
+    }
+
+    fn click_signature(
+        hwnd: i64,
+        pid: u32,
+        process_name: &str,
+        window_title: &str,
+        element_count: usize,
+    ) -> ClickDeltaSignature {
+        ClickDeltaSignature {
+            foreground_hwnd: hwnd,
+            foreground_pid: pid,
+            foreground_process: process_name.to_owned(),
+            foreground_title: window_title.to_owned(),
+            foreground_title_sha256: non_empty_sha256(window_title),
+            focused_element_id: Some("focused.synthetic".to_owned()),
+            focused_role: Some("Edit".to_owned()),
+            focused_name_sha256: non_empty_sha256("synthetic focus"),
+            focused_value_sha256: non_empty_sha256("synthetic value"),
+            focused_bbox: Some(Rect {
+                x: 1,
+                y: 2,
+                w: 300,
+                h: 40,
+            }),
+            element_count,
+            elements_sha256: format!("elements-{element_count}"),
+            cdp_status: Some("unavailable".to_owned()),
+            cdp_endpoint_present: false,
+            web_path: None,
+            cursor_position: None,
+            pixel: ClickPixelSignature {
+                status: "synthetic".to_owned(),
+                region: Rect {
+                    x: 0,
+                    y: 0,
+                    w: 800,
+                    h: 600,
+                },
+                bitmap_sha256: Some("pixel-signature".to_owned()),
+                detail: Some("synthetic pixel signature".to_owned()),
+            },
+            point_pixel: None,
         }
     }
 }

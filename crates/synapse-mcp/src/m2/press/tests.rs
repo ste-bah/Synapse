@@ -26,6 +26,9 @@ async fn recording_backend_readback_orders_chord_and_default_hold() {
         hold_ms: default_hold_ms(),
         backend: default_press_backend(),
         verify_delta: false,
+        allow_foreground_change: false,
+        expected_foreground_process_regex: None,
+        expected_foreground_title_regex: None,
         verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
     };
     let before = recording.events();

@@ -21,6 +21,24 @@ pub struct ActPressParams {
     #[serde(default)]
     #[schemars(default)]
     pub verify_delta: bool,
+    #[serde(default)]
+    #[schemars(
+        default,
+        description = "When verify_delta=true, accept a foreground-window identity change as the observed postcondition. Defaults false so unexpected focus loss still fails closed."
+    )]
+    pub allow_foreground_change: bool,
+    #[serde(default)]
+    #[schemars(
+        default,
+        description = "Optional regex that the after-read foreground process name must match when allow_foreground_change=true. Invalid regexes fail before key input is sent."
+    )]
+    pub expected_foreground_process_regex: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        default,
+        description = "Optional regex that the after-read foreground window title must match when allow_foreground_change=true. Invalid regexes fail before key input is sent."
+    )]
+    pub expected_foreground_title_regex: Option<String>,
     #[serde(default = "default_verify_timeout_ms")]
     #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
     pub verify_timeout_ms: u32,

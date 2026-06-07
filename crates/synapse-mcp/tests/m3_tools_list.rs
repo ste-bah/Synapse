@@ -81,6 +81,7 @@ async fn m3_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<
 
     assert_schema_roots_closed(tools)?;
     assert_motion_semantics_are_advertised(tools)?;
+    assert_act_press_foreground_policy_described(tools)?;
     let defaults = m3_default_readbacks(tools)?;
 
     let snapshot = json!({
@@ -198,6 +199,48 @@ fn assert_motion_semantics_are_advertised(tools: &[Value]) -> anyhow::Result<()>
         stroke_description.contains("wind_mouse"),
         "act_stroke description must advertise wind_mouse availability: {stroke_description}"
     );
+    Ok(())
+}
+
+fn assert_act_press_foreground_policy_described(tools: &[Value]) -> anyhow::Result<()> {
+    let tool = tool_by_name(tools, "act_press")?;
+
+    let allow_description = value_at(
+        tool,
+        "inputSchema.properties.allow_foreground_change.description",
+    )?
+    .as_str()
+    .context("act_press allow_foreground_change description missing")?;
+    ensure!(
+        allow_description.contains("accept a foreground-window identity change")
+            && allow_description.contains("unexpected focus loss still fails closed"),
+        "act_press allow_foreground_change schema must describe fail-closed foreground transition semantics: {allow_description}"
+    );
+
+    let process_description = value_at(
+        tool,
+        "inputSchema.properties.expected_foreground_process_regex.description",
+    )?
+    .as_str()
+    .context("act_press expected_foreground_process_regex description missing")?;
+    ensure!(
+        process_description.contains("after-read foreground process name")
+            && process_description.contains("Invalid regexes fail before key input is sent"),
+        "act_press expected_foreground_process_regex schema must describe pre-input regex validation: {process_description}"
+    );
+
+    let title_description = value_at(
+        tool,
+        "inputSchema.properties.expected_foreground_title_regex.description",
+    )?
+    .as_str()
+    .context("act_press expected_foreground_title_regex description missing")?;
+    ensure!(
+        title_description.contains("after-read foreground window title")
+            && title_description.contains("Invalid regexes fail before key input is sent"),
+        "act_press expected_foreground_title_regex schema must describe pre-input regex validation: {title_description}"
+    );
+
     Ok(())
 }
 
