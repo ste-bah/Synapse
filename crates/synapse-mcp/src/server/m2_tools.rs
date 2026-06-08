@@ -1489,35 +1489,35 @@ impl SynapseService {
                     Err(error) => Err(error),
                 }
             }
-            Err(error)
-                if can_route_click_element_background_first(&params, recording.as_ref())
-                    && should_try_next_click_tier(&error) =>
-            {
-                if click_postdispatch_readback_failed(&error) {
-                    match self
-                        .reconcile_click_postdispatch_error(
-                            &params,
-                            &error,
-                            before.clone(),
-                            verify_timeout_ms,
-                            target_window_hwnd,
-                            started,
-                        )
-                        .await
-                    {
-                        Ok(response) => return Ok(response),
-                        Err(verify_error) => {
-                            tracing::warn!(
-                                code = click_error_data_code(&verify_error)
-                                    .unwrap_or(error_codes::ACTION_POSTCONDITION_FAILED),
-                                kind = "act_click",
-                                original_error_code = click_error_data_code(&error)
-                                    .unwrap_or(error_codes::ACTION_TARGET_INVALID),
-                                detail = %verify_error.message,
-                                "act_click post-dispatch UIA readback error was not reconciled by target-window SoT; trying next eligible delivery tier"
-                            );
-                        }
+            Err(error) if click_postdispatch_readback_failed(&error) => {
+                match self
+                    .reconcile_click_postdispatch_error(
+                        &params,
+                        &error,
+                        before.clone(),
+                        verify_timeout_ms,
+                        target_window_hwnd,
+                        started,
+                    )
+                    .await
+                {
+                    Ok(response) => return Ok(response),
+                    Err(verify_error) => {
+                        tracing::warn!(
+                            code = click_error_data_code(&verify_error)
+                                .unwrap_or(error_codes::ACTION_POSTCONDITION_FAILED),
+                            kind = "act_click",
+                            original_error_code = click_error_data_code(&error)
+                                .unwrap_or(error_codes::ACTION_TARGET_INVALID),
+                            detail = %verify_error.message,
+                            "act_click post-dispatch UIA readback error was not reconciled by target-window SoT; considering next eligible delivery tier"
+                        );
                     }
+                }
+                if !can_route_click_element_background_first(&params, recording.as_ref())
+                    || !should_try_next_click_tier(&error)
+                {
+                    return Err(error);
                 }
                 let tier_attempts = click_tier_attempts_from_error(&error);
                 if should_try_click_postmessage_tier(&tier_attempts) {
@@ -3952,6 +3952,24 @@ mod tests {
         );
         assert!(click_postdispatch_readback_failed(&error));
         assert!(should_try_next_click_tier(&error));
+    }
+
+    #[test]
+    fn click_router_recognizes_toggle_readback_failure_when_background_route_disabled() {
+        let mut params = act_click_element_params();
+        params.use_invoke_pattern = true;
+        params.coordinate_fallback_on_unsupported = false;
+        let error = postdispatch_click_error(
+            "accessibility backend failed: TogglePattern.toggle returned for element 0x1:0000002a00000001, but ToggleState stayed Off",
+        );
+
+        println!(
+            "readback=act_click_postdispatch edge=toggle_background_route_disabled can_route={} reconcile={}",
+            can_route_click_element_background_first(&params, None),
+            click_postdispatch_readback_failed(&error)
+        );
+        assert!(!can_route_click_element_background_first(&params, None));
+        assert!(click_postdispatch_readback_failed(&error));
     }
 
     #[test]
