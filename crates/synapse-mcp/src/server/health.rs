@@ -39,6 +39,10 @@ impl SynapseService {
         subsystems.insert("action".to_owned(), self.action_health());
         subsystems.insert("audio".to_owned(), self.audio_health());
         subsystems.insert("http".to_owned(), self.http_health(active_sessions));
+        subsystems.insert(
+            "daemon_lifecycle".to_owned(),
+            crate::daemon_lifecycle::health_subsystem(),
+        );
         let tool_surface = self.tool_surface_fingerprint();
         if let Some(error) = &tool_surface.error {
             subsystems.insert(

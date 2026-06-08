@@ -113,6 +113,23 @@ pub(super) async fn serve(
         }
     };
 
+    let lifecycle_paths =
+        crate::daemon_lifecycle::configure(crate::daemon_lifecycle::DaemonLifecycleConfig {
+            mode: "http",
+            bind_addr: Some(addr.to_string()),
+            db_path: db_path.clone(),
+        })
+        .context("configure daemon lifecycle ledger")?;
+    crate::daemon_lifecycle::install_panic_hook();
+    tracing::info!(
+        code = "MCP_DAEMON_LIFECYCLE_READY",
+        run_current_path = %lifecycle_paths.run_current_path,
+        tool_last_path = %lifecycle_paths.tool_last_path,
+        tool_events_path = %lifecycle_paths.tool_events_path,
+        exit_events_path = %lifecycle_paths.exit_events_path,
+        "daemon lifecycle ledger ready"
+    );
+
     if !addr.ip().is_loopback() {
         tracing::warn!(
             code = "MCP_HTTP_NON_LOOPBACK_BIND_ALLOWED",
@@ -169,6 +186,14 @@ pub(super) async fn serve(
                     "refusing to start: storage open failed at daemon startup"
                 );
             }
+            crate::daemon_lifecycle::record_startup_exit(
+                "startup_storage_open_failed",
+                serde_json::json!({
+                    "db_path": db_path.display().to_string(),
+                    "detail": detail,
+                }),
+            )
+            .context("record daemon lifecycle startup storage-open failure")?;
             return Ok(ExitCode::from(4));
         }
         tracing::info!(
@@ -213,6 +238,8 @@ pub(super) async fn serve(
             ExitCode::SUCCESS
         }
     };
+    crate::daemon_lifecycle::record_graceful_exit("http_service_completed")
+        .context("record daemon lifecycle graceful HTTP service completion")?;
     Ok(code)
 }
 

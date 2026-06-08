@@ -1,7 +1,10 @@
 use super::{
-    ErrorData, Implementation, ServerCapabilities, ServerHandler, ServerInfo, SynapseService,
-    mcp_error, tool_handler,
+    ErrorData, Implementation, ServerCapabilities, ServerHandler, ServerInfo, SessionTarget,
+    SynapseService, mcp_error, tool_handler,
 };
+use futures_util::FutureExt as _;
+use serde_json::{Value, json};
+use std::panic::AssertUnwindSafe;
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SynapseService {
@@ -11,24 +14,40 @@ impl ServerHandler for SynapseService {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResult, ErrorData> {
         let tool_name = request.name.to_string();
+        let mcp_session_id =
+            super::context::optional_mcp_session_id_from_request_context(&context)?;
+        let lifecycle_guard =
+            self.begin_daemon_lifecycle_tool_call(&tool_name, mcp_session_id.as_deref())?;
         let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        match self.tool_router.call(context).await {
-            Ok(result) => Ok(result),
-            Err(error) if error.data.is_none() && error.message == "tool not found" => {
-                Err(mcp_error(
-                    synapse_core::error_codes::TOOL_NOT_FOUND,
-                    format!("tool not found: {tool_name}"),
-                ))
+        match AssertUnwindSafe(self.tool_router.call(context))
+            .catch_unwind()
+            .await
+        {
+            Ok(Ok(result)) => {
+                lifecycle_guard.finish_ok().map_err(lifecycle_mcp_error)?;
+                Ok(result)
             }
-            Err(error)
-                if error.data.is_none() && error.code == rmcp::model::ErrorCode::INVALID_PARAMS =>
-            {
-                Err(mcp_error(
-                    synapse_core::error_codes::TOOL_PARAMS_INVALID,
-                    error.message.to_string(),
-                ))
+            Ok(Err(error)) => {
+                let error = normalize_tool_error(&tool_name, error);
+                lifecycle_guard
+                    .finish_error(error_snapshot(&error))
+                    .map_err(lifecycle_mcp_error)?;
+                Err(error)
             }
-            Err(error) => Err(error),
+            Err(payload) => {
+                let panic_message =
+                    crate::daemon_lifecycle::panic_payload_message(payload.as_ref());
+                std::mem::forget(payload);
+                let panic = json!({
+                    "payload": panic_message,
+                    "tool": tool_name,
+                    "mcp_session_id": mcp_session_id.clone(),
+                });
+                lifecycle_guard
+                    .finish_panic(panic)
+                    .map_err(lifecycle_mcp_error)?;
+                Err(tool_panic_mcp_error(&tool_name, mcp_session_id.as_deref()))
+            }
         }
     }
 
@@ -62,4 +81,121 @@ impl ServerHandler for SynapseService {
         ))
         .with_instructions(self.instructions())
     }
+}
+
+impl SynapseService {
+    fn begin_daemon_lifecycle_tool_call(
+        &self,
+        tool_name: &str,
+        mcp_session_id: Option<&str>,
+    ) -> Result<crate::daemon_lifecycle::ToolCallGuard, ErrorData> {
+        let (audit_context, audit_context_read_error) = match self.current_action_audit_context() {
+            Ok(context) => (
+                Some(serde_json::to_value(context).map_err(|error| {
+                    lifecycle_mcp_error(anyhow::anyhow!(
+                        "serialize daemon lifecycle audit context: {error}"
+                    ))
+                })?),
+                None,
+            ),
+            Err(error) => (None, Some(error_snapshot(&error))),
+        };
+        let (foreground, foreground_read_error) = match self.current_audit_foreground() {
+            Ok(foreground) => (
+                Some(serde_json::to_value(foreground).map_err(|error| {
+                    lifecycle_mcp_error(anyhow::anyhow!(
+                        "serialize daemon lifecycle foreground: {error}"
+                    ))
+                })?),
+                None,
+            ),
+            Err(error) => (None, Some(error_snapshot(&error))),
+        };
+        let (session_target, session_target_read_error) = match self.session_target(mcp_session_id)
+        {
+            Ok(target) => (target.as_ref().map(session_target_value), None),
+            Err(error) => (None, Some(error_snapshot(&error))),
+        };
+        crate::daemon_lifecycle::begin_tool_call(crate::daemon_lifecycle::ToolCallStart {
+            tool: tool_name.to_owned(),
+            mcp_session_id: mcp_session_id.map(ToOwned::to_owned),
+            audit_context,
+            audit_context_read_error,
+            foreground,
+            foreground_read_error,
+            session_target,
+            session_target_read_error,
+        })
+        .map_err(lifecycle_mcp_error)
+    }
+}
+
+fn normalize_tool_error(tool_name: &str, error: ErrorData) -> ErrorData {
+    if error.data.is_none() && error.message == "tool not found" {
+        return mcp_error(
+            synapse_core::error_codes::TOOL_NOT_FOUND,
+            format!("tool not found: {tool_name}"),
+        );
+    }
+    if error.data.is_none() && error.code == rmcp::model::ErrorCode::INVALID_PARAMS {
+        return mcp_error(
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            error.message.to_string(),
+        );
+    }
+    error
+}
+
+fn session_target_value(target: &SessionTarget) -> Value {
+    match target {
+        SessionTarget::Window { hwnd } => json!({
+            "kind": "window",
+            "hwnd": hwnd,
+        }),
+        SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        } => json!({
+            "kind": "cdp",
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": cdp_target_id,
+        }),
+    }
+}
+
+fn error_snapshot(error: &ErrorData) -> Value {
+    json!({
+        "rmcp_code": error.code.0,
+        "message": error.message.to_string(),
+        "data": error.data.clone(),
+        "synapse_code": error.data.as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str),
+    })
+}
+
+fn lifecycle_mcp_error(error: anyhow::Error) -> ErrorData {
+    ErrorData::new(
+        rmcp::model::ErrorCode(-32099),
+        format!("daemon lifecycle ledger failure: {error:#}"),
+        Some(json!({
+            "code": synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+            "detail_code": "MCP_DAEMON_LIFECYCLE_WRITE_FAILED",
+            "daemon_lifecycle": crate::daemon_lifecycle::diagnostic_value(),
+        })),
+    )
+}
+
+fn tool_panic_mcp_error(tool_name: &str, mcp_session_id: Option<&str>) -> ErrorData {
+    ErrorData::new(
+        rmcp::model::ErrorCode(-32099),
+        format!("tool {tool_name} panicked; daemon lifecycle ledger captured the panic"),
+        Some(json!({
+            "code": synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+            "detail_code": "MCP_TOOL_PANIC",
+            "tool": tool_name,
+            "mcp_session_id": mcp_session_id,
+            "daemon_lifecycle": crate::daemon_lifecycle::diagnostic_value(),
+        })),
+    )
 }

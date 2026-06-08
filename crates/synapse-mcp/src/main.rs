@@ -42,6 +42,7 @@
     )
 )]
 mod connect;
+mod daemon_lifecycle;
 mod doctor;
 mod http;
 mod m1;
@@ -197,6 +198,11 @@ async fn main() -> ExitCode {
     match run().await {
         Ok(code) => code,
         Err(err) => {
+            if let Err(lifecycle_error) =
+                daemon_lifecycle::record_top_level_error(&format!("{err:#}"))
+            {
+                eprintln!("synapse-mcp lifecycle error: {lifecycle_error:#}");
+            }
             eprintln!("synapse-mcp error: {err:#}");
             ExitCode::from(1)
         }
@@ -361,6 +367,22 @@ async fn run_stdio(
         }
     };
 
+    let lifecycle_paths = daemon_lifecycle::configure(daemon_lifecycle::DaemonLifecycleConfig {
+        mode: "stdio",
+        bind_addr: None,
+        db_path: db_path.clone(),
+    })
+    .context("configure daemon lifecycle ledger")?;
+    daemon_lifecycle::install_panic_hook();
+    tracing::info!(
+        code = "MCP_DAEMON_LIFECYCLE_READY",
+        run_current_path = %lifecycle_paths.run_current_path,
+        tool_last_path = %lifecycle_paths.tool_last_path,
+        tool_events_path = %lifecycle_paths.tool_events_path,
+        exit_events_path = %lifecycle_paths.exit_events_path,
+        "daemon lifecycle ledger ready"
+    );
+
     let rmcp_token = CancellationToken::new();
     let emitter_shutdown_token = CancellationToken::new();
     let emitter_connection_closed_token = CancellationToken::new();
@@ -392,6 +414,8 @@ async fn run_stdio(
             Ok(service) => service,
             Err(err) if err.to_string().contains("connection closed") => {
                 tracing::info!(code = "MCP_STDIO_CLOSED_BEFORE_INIT", "stdio closed before init");
+                daemon_lifecycle::record_graceful_exit("stdio_closed_before_init")
+                    .context("record daemon lifecycle graceful stdio close before init")?;
                 drop(telemetry_guard);
                 return Ok(ExitCode::SUCCESS);
             }
@@ -402,6 +426,8 @@ async fn run_stdio(
             rmcp_token.cancel();
             emitter_shutdown_token.cancel();
             tracing::info!(code = "MCP_SHUTDOWN_GRACEFUL", "shutdown signal received before init");
+            daemon_lifecycle::record_graceful_exit("stdio_signal_before_init")
+                .context("record daemon lifecycle graceful stdio shutdown before init")?;
             drop(telemetry_guard);
             std::process::exit(0);
         }
@@ -423,11 +449,15 @@ async fn run_stdio(
             shutdown.cancel();
             wait_for_m2_emitter_done(m2_emitter_done).await;
             wait_task.abort();
+            daemon_lifecycle::record_graceful_exit("stdio_signal_after_init")
+                .context("record daemon lifecycle graceful stdio shutdown after init")?;
             drop(telemetry_guard);
             std::process::exit(0);
         }
     };
 
+    daemon_lifecycle::record_graceful_exit("stdio_service_completed")
+        .context("record daemon lifecycle graceful stdio service completion")?;
     drop(telemetry_guard);
     Ok(code)
 }

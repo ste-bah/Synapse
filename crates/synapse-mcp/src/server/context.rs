@@ -954,6 +954,18 @@ pub(super) fn mcp_session_id_from_request_context(
     mcp_session_id_from_extensions(&request_context.extensions)
 }
 
+pub(super) fn optional_mcp_session_id_from_request_context(
+    request_context: &RequestContext<RoleServer>,
+) -> Result<Option<String>, ErrorData> {
+    let Some(parts) = request_context
+        .extensions
+        .get::<axum::http::request::Parts>()
+    else {
+        return Ok(crate::http::current_mcp_session_id());
+    };
+    mcp_session_id_from_headers(&parts.headers)
+}
+
 fn mcp_session_id_from_extensions(
     extensions: &rmcp::model::Extensions,
 ) -> Result<Option<String>, ErrorData> {

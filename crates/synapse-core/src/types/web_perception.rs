@@ -128,7 +128,7 @@ pub struct CdpDiagnostics {
     /// Number of DOM/AX nodes surfaced into `elements` from the attached tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attached_node_count: Option<u32>,
-    /// CDP TargetID selected for the DOM snapshot. Present after a successful
+    /// CDP `TargetID` selected for the DOM snapshot. Present after a successful
     /// attach so agents can prove which existing tab was read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_target_id: Option<String>,
