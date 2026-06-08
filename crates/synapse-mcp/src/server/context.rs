@@ -1640,6 +1640,64 @@ mod scope_gate_tests {
     }
 
     #[tokio::test]
+    async fn generic_action_audit_result_inherits_current_mcp_session_id() -> anyhow::Result<()> {
+        let profiles = TempDir::new()?;
+        write_profile(
+            &profiles.path().join("notepad.toml"),
+            "notepad",
+            "productivity",
+        )?;
+        let service = service_with_profiles(profiles.path(), false)?;
+        install_synthetic_notepad_input(&service)?;
+        let session_id = "generic-action-audit-session";
+
+        let before_count = {
+            let runtime = service.reflex_runtime()?;
+            let runtime = runtime
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("reflex runtime lock poisoned"))?;
+            let before_counts = runtime.storage_cf_row_counts()?;
+            cf_count(&before_counts, cf::CF_ACTION_LOG)
+        };
+
+        let result: Result<Value, rmcp::ErrorData> = Ok(json!({
+            "ok": true,
+            "backend_used": "software",
+            "backend_tier_used": "foreground",
+            "required_foreground": true,
+        }));
+        crate::http::with_current_mcp_session_id_for_test(session_id, async {
+            service.audit_action_result("act_press", &result)
+        })
+        .await?;
+
+        let (after_count, rows) = {
+            let runtime = service.reflex_runtime()?;
+            let runtime = runtime
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("reflex runtime lock poisoned"))?;
+            let after_counts = runtime.storage_cf_row_counts()?;
+            (
+                cf_count(&after_counts, cf::CF_ACTION_LOG),
+                runtime.storage_cf_tail_rows(cf::CF_ACTION_LOG, 1)?,
+            )
+        };
+
+        assert_eq!(after_count, before_count + 1);
+        let stored: Value = serde_json::from_slice(&rows[0].1)?;
+        assert_eq!(stored["tool"], "act_press");
+        assert_eq!(stored["status"], "ok");
+        assert_eq!(stored["session_id"], session_id);
+        assert_eq!(stored["audit_context"]["session_id"], session_id);
+        assert_eq!(
+            stored["details"]["response"]["backend_tier_used"],
+            "foreground"
+        );
+        assert_eq!(stored["details"]["response"]["required_foreground"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn session_teardown_removes_virtual_clipboard_buffer() -> anyhow::Result<()> {
         let profiles = TempDir::new()?;
         let service = service_with_profiles(profiles.path(), false)?;

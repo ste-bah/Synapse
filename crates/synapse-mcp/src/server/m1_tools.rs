@@ -476,7 +476,7 @@ impl SynapseService {
             "background": true,
             "required_foreground": false,
         });
-        self.audit_action_started_with_details(TOOL, &request_details)?;
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
             .cdp_open_tab_impl(
                 &session_id,
@@ -487,7 +487,7 @@ impl SynapseService {
                 &process_name,
             )
             .await;
-        self.audit_action_result(TOOL, &result)?;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
     }
 
@@ -515,11 +515,16 @@ impl SynapseService {
         let owner = match self.cdp_target_owner_for_close(&session_id, &params.0.cdp_target_id) {
             Ok(owner) => owner,
             Err(error) => {
-                self.audit_action_denied_with_details(TOOL, &error, &request_details);
+                self.audit_action_denied_with_details_for_request(
+                    TOOL,
+                    &error,
+                    &request_details,
+                    &request_context,
+                );
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details(
+        self.audit_action_started_with_details_for_session(
             TOOL,
             &json!({
                 "session_id": &session_id,
@@ -528,11 +533,12 @@ impl SynapseService {
                 "cdp_target_id": &params.0.cdp_target_id,
                 "required_foreground": false,
             }),
+            &session_id,
         )?;
         let result = self
             .cdp_close_tab_impl(&session_id, &params.0.cdp_target_id, owner)
             .await;
-        self.audit_action_result(TOOL, &result)?;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
     }
 }

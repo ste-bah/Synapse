@@ -29,6 +29,8 @@ pub struct ActSetValueParams {
 pub struct ActSetValueResponse {
     pub ok: bool,
     pub method: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
     pub source_of_truth: String,
     pub requested_len: u32,
     pub before_len: u32,
@@ -128,6 +130,8 @@ pub async fn act_set_value(params: ActSetValueParams) -> Result<ActSetValueRespo
 
     Ok(ActSetValueResponse {
         ok: true,
+        backend_tier_used: set_backend_tier(&set_readback).to_owned(),
+        required_foreground: false,
         method: set_readback.method,
         source_of_truth: SOURCE_OF_TRUTH.to_owned(),
         requested_len,
@@ -160,7 +164,16 @@ pub fn act_set_value_request_details(params: &ActSetValueParams) -> Value {
         "requested_len": params.text.chars().count(),
         "requested_sha256": text_signature(&params.text),
         "verify_timeout_ms": params.verify_timeout_ms,
+        "required_foreground": false,
     })
+}
+
+fn set_backend_tier(readback: &synapse_a11y::ElementValueSetReadback) -> &'static str {
+    if readback.method == "uia_native_window_text_message" {
+        "win32_message"
+    } else {
+        "uia"
+    }
 }
 
 fn validate_set_value_params(params: &ActSetValueParams) -> Result<(), ErrorData> {

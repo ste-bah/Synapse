@@ -100,6 +100,8 @@ function Die($m)   { throw "[synapse-setup] FATAL: $m" }
 $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
 $processToolSurfaceHashAtStart = $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START
 $script:SynapseSetupMaintenanceLockStream = $null
+$script:SynapseSetupMaintenanceLockPath = $null
+$script:SynapseSetupMaintenanceLockReason = $null
 
 function Get-ProcessLineage {
     param([int]$StartPid = $PID)
@@ -157,6 +159,8 @@ function Acquire-SynapseSetupMaintenanceLock {
     }
 
     $script:SynapseSetupMaintenanceLockStream = $stream
+    $script:SynapseSetupMaintenanceLockPath = $Path
+    $script:SynapseSetupMaintenanceLockReason = $Reason
     $self = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue
     $lineageText = (Get-ProcessLineage | ForEach-Object { "{0}:{1}" -f $_.ProcessId, $_.Name }) -join ' <- '
     $owner = [ordered]@{
@@ -179,6 +183,57 @@ function Acquire-SynapseSetupMaintenanceLock {
     $stream.Write($bytes, 0, $bytes.Length)
     $stream.Flush($true)
     Info "Maintenance lock acquired reason=$Reason path=$Path pid=$PID"
+}
+
+function Release-SynapseSetupMaintenanceLock {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('released','failed')][string]$State,
+        [string]$ErrorMessage
+    )
+
+    if ($null -eq $script:SynapseSetupMaintenanceLockStream) {
+        return
+    }
+
+    $stream = $script:SynapseSetupMaintenanceLockStream
+    try {
+        $self = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue
+        $owner = [ordered]@{
+            schema = 'synapse_setup_maintenance_lock/v1'
+            state = $State
+            reason = $script:SynapseSetupMaintenanceLockReason
+            pid = $PID
+            parent_pid = if ($self) { $self.ParentProcessId } else { $null }
+            process_name = if ($self) { $self.Name } else { $null }
+            command_line = if ($self) { $self.CommandLine } else { $null }
+            source_dir = $SourceDir
+            bind = $Bind
+            released_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+            cleanup_policy = 'never close terminal windows globally; only exact process IDs spawned by this setup operation or verified synapse-mcp targets may be stopped'
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ErrorMessage)) {
+            $owner.error = ($ErrorMessage -replace '\s+', ' ').Trim()
+        }
+        $json = $owner | ConvertTo-Json -Depth 6
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($json + "`n")
+        $stream.SetLength(0)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+        Info "Maintenance lock $State path=$script:SynapseSetupMaintenanceLockPath pid=$PID"
+    } catch {
+        Info "WARN: could not write maintenance lock release state path=$script:SynapseSetupMaintenanceLockPath error=$($_.Exception.Message)"
+    } finally {
+        $stream.Dispose()
+        $script:SynapseSetupMaintenanceLockStream = $null
+        $script:SynapseSetupMaintenanceLockPath = $null
+        $script:SynapseSetupMaintenanceLockReason = $null
+    }
+}
+
+trap {
+    $errorText = $_ | Out-String
+    Release-SynapseSetupMaintenanceLock -State failed -ErrorMessage $errorText
+    break
 }
 
 function Quote-WindowsCommandArgument {
@@ -1908,6 +1963,7 @@ if ($Remove) {
         }
     }
     Info "Done (remove)."
+    Release-SynapseSetupMaintenanceLock -State released
     return
 }
 
@@ -2266,3 +2322,4 @@ Step "Done"
 Info "Synapse daemon is live on http://$Bind (MCP: http://$Bind/mcp)."
 Info "Token: $TokenPath   DB: $DbPath   Profiles: $ProfilesDir"
 Info "WSL clients: run scripts/synapse-install.sh from WSL to wire Claude Code + Codex there."
+Release-SynapseSetupMaintenanceLock -State released

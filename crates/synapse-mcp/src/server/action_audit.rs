@@ -3,7 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rmcp::ErrorData;
+use rmcp::{ErrorData, RoleServer, service::RequestContext};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -13,8 +13,13 @@ use crate::m1::mcp_error;
 static ACTION_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl SynapseService {
-    pub(super) fn audit_action_started(&self, tool: &'static str) -> Result<(), ErrorData> {
-        self.write_action_audit_row(tool, "started", None, &json!({}), None)
+    pub(super) fn audit_action_started_for_request(
+        &self,
+        tool: &'static str,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let session_id = action_session_id_from_request_context(request_context)?;
+        self.write_action_audit_row(tool, "started", None, &json!({}), session_id.as_deref())
     }
 
     pub(super) fn audit_action_started_with_details(
@@ -23,6 +28,16 @@ impl SynapseService {
         details: &Value,
     ) -> Result<(), ErrorData> {
         self.write_action_audit_row(tool, "started", None, details, None)
+    }
+
+    pub(super) fn audit_action_started_with_details_for_request(
+        &self,
+        tool: &'static str,
+        details: &Value,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let session_id = action_session_id_from_request_context(request_context)?;
+        self.write_action_audit_row(tool, "started", None, details, session_id.as_deref())
     }
 
     pub(super) fn audit_action_started_with_details_for_session(
@@ -36,6 +51,15 @@ impl SynapseService {
 
     pub(super) fn audit_action_denied(&self, tool: &'static str, error: &ErrorData) {
         self.audit_action_denied_with_details(tool, error, &json!({}));
+    }
+
+    pub(super) fn audit_action_denied_for_request(
+        &self,
+        tool: &'static str,
+        error: &ErrorData,
+        request_context: &RequestContext<RoleServer>,
+    ) {
+        self.audit_action_denied_with_details_for_request(tool, error, &json!({}), request_context);
     }
 
     pub(super) fn audit_action_denied_with_details(
@@ -54,6 +78,47 @@ impl SynapseService {
                 "request": details,
             }),
             None,
+        ) {
+            tracing::warn!(
+                code = "ACTION_AUDIT_WRITE_FAILED",
+                tool,
+                status = "denied",
+                audit_error = %audit_error,
+                "action audit write failed after denied action"
+            );
+        }
+    }
+
+    pub(super) fn audit_action_denied_with_details_for_request(
+        &self,
+        tool: &'static str,
+        error: &ErrorData,
+        details: &Value,
+        request_context: &RequestContext<RoleServer>,
+    ) {
+        let session_id = match action_session_id_from_request_context(request_context) {
+            Ok(session_id) => session_id,
+            Err(session_error) => {
+                tracing::warn!(
+                    code = "ACTION_AUDIT_SESSION_ID_READ_FAILED",
+                    tool,
+                    source_error = %session_error.message,
+                    source_error_data = ?session_error.data,
+                    "action audit could not read request MCP session id for denied action"
+                );
+                None
+            }
+        };
+        if let Err(audit_error) = self.write_action_audit_row(
+            tool,
+            "denied",
+            error_data_code(error),
+            &json!({
+                "message": error.message.to_string(),
+                "data": error.data.clone(),
+                "request": details,
+            }),
+            session_id.as_deref(),
         ) {
             tracing::warn!(
                 code = "ACTION_AUDIT_WRITE_FAILED",
@@ -93,6 +158,19 @@ impl SynapseService {
         }
     }
 
+    pub(super) fn audit_action_result_for_request<T: Serialize>(
+        &self,
+        tool: &'static str,
+        result: &Result<T, ErrorData>,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let session_id = action_session_id_from_request_context(request_context)?;
+        match session_id.as_deref() {
+            Some(session_id) => self.audit_action_result_for_session(tool, result, session_id),
+            None => self.audit_action_result(tool, result),
+        }
+    }
+
     pub(super) fn audit_action_result_for_session<T: Serialize>(
         &self,
         tool: &'static str,
@@ -122,14 +200,6 @@ impl SynapseService {
         }
     }
 
-    pub(super) fn audit_action_ok_with_details(
-        &self,
-        tool: &'static str,
-        details: &Value,
-    ) -> Result<(), ErrorData> {
-        self.write_action_audit_row(tool, "ok", None, details, None)
-    }
-
     pub(super) fn audit_action_ok_with_details_for_session(
         &self,
         tool: &'static str,
@@ -139,12 +209,24 @@ impl SynapseService {
         self.write_action_audit_row(tool, "ok", None, details, Some(session_id))
     }
 
-    pub(super) fn audit_action_error_with_details(
+    pub(super) fn audit_action_ok_with_details_for_request(
+        &self,
+        tool: &'static str,
+        details: &Value,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<(), ErrorData> {
+        let session_id = action_session_id_from_request_context(request_context)?;
+        self.write_action_audit_row(tool, "ok", None, details, session_id.as_deref())
+    }
+
+    pub(super) fn audit_action_error_with_details_for_request(
         &self,
         tool: &'static str,
         error: &ErrorData,
         details: &Value,
+        request_context: &RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
+        let session_id = action_session_id_from_request_context(request_context)?;
         self.write_action_audit_row(
             tool,
             "error",
@@ -154,7 +236,7 @@ impl SynapseService {
                 "data": error.data.clone(),
                 "request": details,
             }),
-            None,
+            session_id.as_deref(),
         )
     }
 
@@ -178,17 +260,18 @@ impl SynapseService {
         )
     }
 
-    pub(super) fn audit_action_result_best_effort<T: Serialize>(
+    pub(super) fn audit_action_result_for_request_best_effort<T: Serialize>(
         &self,
         tool: &'static str,
         result: &Result<T, ErrorData>,
+        request_context: &RequestContext<RoleServer>,
     ) {
-        if let Err(error) = self.audit_action_result(tool, result) {
+        if let Err(error) = self.audit_action_result_for_request(tool, result, request_context) {
             tracing::warn!(
                 code = "ACTION_AUDIT_WRITE_FAILED",
                 tool,
                 audit_error = %error,
-                "action audit write failed after action result"
+                "action audit write failed after request-scoped action result"
             );
         }
     }
@@ -204,8 +287,11 @@ impl SynapseService {
         let (ts_ns, seq) = next_audit_key_parts();
         let active_profile = self.action_audit_active_profile();
         let mut audit_context = self.current_action_audit_context()?;
+        let action_session_id = action_session_id
+            .map(str::to_owned)
+            .or_else(crate::http::current_mcp_session_id);
         if let Some(action_session_id) = action_session_id {
-            audit_context.session_id = Some(action_session_id.to_owned());
+            audit_context.session_id = Some(action_session_id);
         }
         let session_id = audit_context.session_id.clone();
         let profile_id = audit_context.profile_id.clone();
@@ -326,6 +412,12 @@ impl SynapseService {
                 .map(|profile| profile.schema_version)
         })
     }
+}
+
+fn action_session_id_from_request_context(
+    request_context: &RequestContext<RoleServer>,
+) -> Result<Option<String>, ErrorData> {
+    super::context::mcp_session_id_from_request_context(request_context)
 }
 
 struct ActionAuditProfileRef {

@@ -133,14 +133,18 @@ impl SynapseService {
         let preflight = match self.ensure_supported_use_allows_action("act_click") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied("act_click", &error);
+                self.audit_action_denied_for_request("act_click", &error, &request_context);
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details("act_click", &action_preflight_details(&preflight))?;
+        self.audit_action_started_with_details_for_request(
+            "act_click",
+            &action_preflight_details(&preflight),
+            &request_context,
+        )?;
         if let Err(error) = ensure_everquest_click_backend(&params, &preflight) {
             let result: Result<ActClickResponse, ErrorData> = Err(error);
-            self.audit_action_result("act_click", &result)?;
+            self.audit_action_result_for_request("act_click", &result, &request_context)?;
             return result.map(Json);
         }
         let target_window_hwnd = if params.verify_delta {
@@ -148,7 +152,7 @@ impl SynapseService {
                 Ok(hwnd) => hwnd,
                 Err(error) => {
                     let result: Result<ActClickResponse, ErrorData> = Err(error);
-                    self.audit_action_result("act_click", &result)?;
+                    self.audit_action_result_for_request("act_click", &result, &request_context)?;
                     return result.map(Json);
                 }
             }
@@ -163,7 +167,7 @@ impl SynapseService {
                 Ok(signature) => Some(signature),
                 Err(error) => {
                     let result: Result<ActClickResponse, ErrorData> = Err(error);
-                    self.audit_action_result("act_click", &result)?;
+                    self.audit_action_result_for_request("act_click", &result, &request_context)?;
                     return result.map(Json);
                 }
             }
@@ -194,7 +198,7 @@ impl SynapseService {
             )
             .await
         };
-        self.audit_action_result("act_click", &result)?;
+        self.audit_action_result_for_request("act_click", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -215,18 +219,22 @@ impl SynapseService {
         let preflight = match self.ensure_supported_use_allows_action("act_type") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied("act_type", &error);
+                self.audit_action_denied_for_request("act_type", &error, &request_context);
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details("act_type", &action_preflight_details(&preflight))?;
+        self.audit_action_started_with_details_for_request(
+            "act_type",
+            &action_preflight_details(&preflight),
+            &request_context,
+        )?;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         if params.into_element.is_none()
             && let Err(error) = self.ensure_act_type_foreground(&preflight, recording.as_ref())
         {
             let result: Result<ActTypeResponse, ErrorData> = Err(error);
-            self.audit_action_result("act_type", &result)?;
+            self.audit_action_result_for_request("act_type", &result, &request_context)?;
             return result.map(Json);
         }
         let _lease_guard = if params.into_element.is_none() {
@@ -234,7 +242,7 @@ impl SynapseService {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     let result: Result<ActTypeResponse, ErrorData> = Err(error);
-                    self.audit_action_result("act_type", &result)?;
+                    self.audit_action_result_for_request("act_type", &result, &request_context)?;
                     return result.map(Json);
                 }
             }
@@ -248,7 +256,7 @@ impl SynapseService {
                 Ok(signature) => Some(signature),
                 Err(error) => {
                     let result: Result<ActTypeResponse, ErrorData> = Err(error);
-                    self.audit_action_result("act_type", &result)?;
+                    self.audit_action_result_for_request("act_type", &result, &request_context)?;
                     return result.map(Json);
                 }
             }
@@ -263,7 +271,7 @@ impl SynapseService {
             }
             (other, _) => other,
         };
-        self.audit_action_result("act_type", &result)?;
+        self.audit_action_result_for_request("act_type", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -273,6 +281,7 @@ impl SynapseService {
     pub async fn act_set_value(
         &self,
         params: Parameters<ActSetValueParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActSetValueResponse>, ErrorData> {
         let params = params.0;
         tracing::info!(
@@ -284,19 +293,25 @@ impl SynapseService {
         let preflight = match self.ensure_supported_use_allows_action("act_set_value") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied_with_details("act_set_value", &error, &request_details);
+                self.audit_action_denied_with_details_for_request(
+                    "act_set_value",
+                    &error,
+                    &request_details,
+                    &request_context,
+                );
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details(
+        self.audit_action_started_with_details_for_request(
             "act_set_value",
             &json!({
                 "request": request_details,
                 "preflight": preflight,
             }),
+            &request_context,
         )?;
         let result = act_set_value(params).await;
-        self.audit_action_result("act_set_value", &result)?;
+        self.audit_action_result_for_request("act_set_value", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -318,32 +333,39 @@ impl SynapseService {
         let preflight = match self.ensure_supported_use_allows_action("act_focus_window") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied_with_details("act_focus_window", &error, &request_details);
+                self.audit_action_denied_with_details_for_request(
+                    "act_focus_window",
+                    &error,
+                    &request_details,
+                    &request_context,
+                );
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details(
+        self.audit_action_started_with_details_for_request(
             "act_focus_window",
             &json!({
                 "request": request_details,
                 "preflight": preflight,
             }),
+            &request_context,
         )?;
         let mut lease_guard =
             match acquire_tool_foreground_input_lease("act_focus_window", &request_context) {
                 Ok(guard) => guard,
                 Err(error) => {
-                    self.audit_action_error_with_details(
+                    self.audit_action_error_with_details_for_request(
                         "act_focus_window",
                         &error,
                         &request_details,
+                        &request_context,
                     )?;
                     return Err(error);
                 }
             };
         lease_guard.disable_context_restore("act_focus_window_intentional_foreground_change");
         let result = act_focus_window(params).await;
-        self.audit_action_result("act_focus_window", &result)?;
+        self.audit_action_result_for_request("act_focus_window", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -363,16 +385,20 @@ impl SynapseService {
         let preflight = match self.ensure_supported_use_allows_action("act_press") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied("act_press", &error);
+                self.audit_action_denied_for_request("act_press", &error, &request_context);
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details("act_press", &action_preflight_details(&preflight))?;
+        self.audit_action_started_with_details_for_request(
+            "act_press",
+            &action_preflight_details(&preflight),
+            &request_context,
+        )?;
         let foreground_change_policy = match act_press_foreground_change_policy(&params) {
             Ok(policy) => policy,
             Err(error) => {
                 let result: Result<ActPressResponse, ErrorData> = Err(error);
-                self.audit_action_result("act_press", &result)?;
+                self.audit_action_result_for_request("act_press", &result, &request_context)?;
                 return result.map(Json);
             }
         };
@@ -384,7 +410,7 @@ impl SynapseService {
                 Ok(signature) => Some(signature),
                 Err(error) => {
                     let result: Result<ActPressResponse, ErrorData> = Err(error);
-                    self.audit_action_result("act_press", &result)?;
+                    self.audit_action_result_for_request("act_press", &result, &request_context)?;
                     return result.map(Json);
                 }
             }
@@ -402,7 +428,7 @@ impl SynapseService {
             Ok(guard) => guard,
             Err(error) => {
                 let result: Result<ActPressResponse, ErrorData> = Err(error);
-                self.audit_action_result("act_press", &result)?;
+                self.audit_action_result_for_request("act_press", &result, &request_context)?;
                 return result.map(Json);
             }
         };
@@ -420,7 +446,7 @@ impl SynapseService {
             }
             (other, _) => other,
         };
-        self.audit_action_result("act_press", &result)?;
+        self.audit_action_result_for_request("act_press", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -445,16 +471,22 @@ impl SynapseService {
         let preflight = match self.ensure_supported_use_allows_action("act_keymap") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied_with_details("act_keymap", &error, &request_details);
+                self.audit_action_denied_with_details_for_request(
+                    "act_keymap",
+                    &error,
+                    &request_details,
+                    &request_context,
+                );
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details(
+        self.audit_action_started_with_details_for_request(
             "act_keymap",
             &json!({
                 "request": request_details,
                 "preflight": preflight,
             }),
+            &request_context,
         )?;
         let profile = {
             let runtime = self.profile_runtime()?;
@@ -486,7 +518,12 @@ impl SynapseService {
         ) {
             Ok(guard) => guard,
             Err(error) => {
-                self.audit_action_error_with_details("act_keymap", &error, &request_details)?;
+                self.audit_action_error_with_details_for_request(
+                    "act_keymap",
+                    &error,
+                    &request_details,
+                    &request_context,
+                )?;
                 return Err(error);
             }
         };
@@ -498,7 +535,7 @@ impl SynapseService {
             params,
         )
         .await;
-        self.audit_action_result("act_keymap", &result)?;
+        self.audit_action_result_for_request("act_keymap", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -521,7 +558,12 @@ impl SynapseService {
             Err(error) => {
                 let failure_details = act_stroke_validation_failure_details(&params, &error);
                 log_act_stroke_failure(&failure_details, &error);
-                self.audit_action_error_with_details("act_stroke", &error, &failure_details)?;
+                self.audit_action_error_with_details_for_request(
+                    "act_stroke",
+                    &error,
+                    &failure_details,
+                    &request_context,
+                )?;
                 return Err(error);
             }
         };
@@ -529,20 +571,22 @@ impl SynapseService {
         let preflight = match self.ensure_supported_use_allows_action("act_stroke") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied_with_details(
+                self.audit_action_denied_with_details_for_request(
                     "act_stroke",
                     &error,
                     &json!({
                         "stroke": stroke_details,
                         "failure": act_stroke_error_details(&error),
                     }),
+                    &request_context,
                 );
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details(
+        self.audit_action_started_with_details_for_request(
             "act_stroke",
             &act_stroke_audit_details(&stroke_details, &preflight),
+            &request_context,
         )?;
         let before_delta_signature = if params.verify_delta {
             match self
@@ -551,10 +595,11 @@ impl SynapseService {
             {
                 Ok(signature) => Some(signature),
                 Err(error) => {
-                    self.audit_action_error_with_details(
+                    self.audit_action_error_with_details_for_request(
                         "act_stroke",
                         &error,
                         &act_stroke_failure_audit_details(&stroke_details, &preflight, &error),
+                        &request_context,
                     )?;
                     return Err(error);
                 }
@@ -572,7 +617,12 @@ impl SynapseService {
                     let failure_details =
                         act_stroke_failure_audit_details(&stroke_details, &preflight, &error);
                     log_act_stroke_failure(&failure_details, &error);
-                    self.audit_action_error_with_details("act_stroke", &error, &failure_details)?;
+                    self.audit_action_error_with_details_for_request(
+                        "act_stroke",
+                        &error,
+                        &failure_details,
+                        &request_context,
+                    )?;
                     return Err(error);
                 }
             }
@@ -597,20 +647,26 @@ impl SynapseService {
         };
         match &result {
             Ok(response) => {
-                self.audit_action_ok_with_details(
+                self.audit_action_ok_with_details_for_request(
                     "act_stroke",
                     &json!({
                         "response": response,
                         "stroke": stroke_details,
                         "preflight": preflight,
                     }),
+                    &request_context,
                 )?;
             }
             Err(error) => {
                 let failure_details =
                     act_stroke_failure_audit_details(&stroke_details, &preflight, error);
                 log_act_stroke_failure(&failure_details, error);
-                self.audit_action_error_with_details("act_stroke", error, &failure_details)?;
+                self.audit_action_error_with_details_for_request(
+                    "act_stroke",
+                    error,
+                    &failure_details,
+                    &request_context,
+                )?;
             }
         }
         result.map(Json)
@@ -667,13 +723,14 @@ impl SynapseService {
         let preflight = match self.ensure_supported_use_allows_action("act_scroll") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied("act_scroll", &error);
+                self.audit_action_denied_for_request("act_scroll", &error, &request_context);
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details(
+        self.audit_action_started_with_details_for_request(
             "act_scroll",
             &action_preflight_details(&preflight),
+            &request_context,
         )?;
         let point_region = params.verify_delta_point_region();
         let before_delta_signature = if params.verify_delta && !params.uses_element_target() {
@@ -684,7 +741,7 @@ impl SynapseService {
                 Ok(signature) => Some(signature),
                 Err(error) => {
                     let result: Result<ActScrollResponse, ErrorData> = Err(error);
-                    self.audit_action_result("act_scroll", &result)?;
+                    self.audit_action_result_for_request("act_scroll", &result, &request_context)?;
                     return result.map(Json);
                 }
             }
@@ -699,7 +756,7 @@ impl SynapseService {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     let result: Result<ActScrollResponse, ErrorData> = Err(error);
-                    self.audit_action_result("act_scroll", &result)?;
+                    self.audit_action_result_for_request("act_scroll", &result, &request_context)?;
                     return result.map(Json);
                 }
             }
@@ -714,7 +771,7 @@ impl SynapseService {
             }
             (other, _) => other,
         };
-        self.audit_action_result("act_scroll", &result)?;
+        self.audit_action_result_for_request("act_scroll", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -733,11 +790,15 @@ impl SynapseService {
         let preflight = match self.ensure_supported_use_allows_action("act_pad") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied("act_pad", &error);
+                self.audit_action_denied_for_request("act_pad", &error, &request_context);
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details("act_pad", &action_preflight_details(&preflight))?;
+        self.audit_action_started_with_details_for_request(
+            "act_pad",
+            &action_preflight_details(&preflight),
+            &request_context,
+        )?;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         let snapshot_handle = if params.verify_delta {
@@ -751,7 +812,7 @@ impl SynapseService {
                 Err(error) => {
                     let error = mcp_error(error.code(), error.to_string());
                     let result: Result<ActPadResponse, ErrorData> = Err(error);
-                    self.audit_action_result("act_pad", &result)?;
+                    self.audit_action_result_for_request("act_pad", &result, &request_context)?;
                     return result.map(Json);
                 }
             }
@@ -767,7 +828,7 @@ impl SynapseService {
             }
             (other, _, _) => other,
         };
-        self.audit_action_result("act_pad", &result)?;
+        self.audit_action_result_for_request("act_pad", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -826,6 +887,7 @@ impl SynapseService {
     pub async fn action_diagnostic_rate_limit_override(
         &self,
         params: Parameters<ActionDiagnosticRateLimitOverrideParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActionDiagnosticRateLimitOverrideResponse>, ErrorData> {
         let params = params.0;
         const TOOL: &str = "action_diagnostic_rate_limit_override";
@@ -841,26 +903,42 @@ impl SynapseService {
         if let Err(error) =
             require_diagnostic_confirm(&params.confirm, ACTION_DIAGNOSTIC_RATE_LIMIT_CONFIRM, TOOL)
         {
-            self.audit_action_denied_with_details(TOOL, &error, &request_details);
+            self.audit_action_denied_with_details_for_request(
+                TOOL,
+                &error,
+                &request_details,
+                &request_context,
+            );
             return Err(error);
         }
         if let Err(error) = validate_diagnostic_ttl_ms(params.ttl_ms) {
-            self.audit_action_denied_with_details(TOOL, &error, &request_details);
+            self.audit_action_denied_with_details_for_request(
+                TOOL,
+                &error,
+                &request_details,
+                &request_context,
+            );
             return Err(error);
         }
         let preflight = match self.ensure_supported_use_allows_action("act_stroke") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied_with_details(TOOL, &error, &request_details);
+                self.audit_action_denied_with_details_for_request(
+                    TOOL,
+                    &error,
+                    &request_details,
+                    &request_context,
+                );
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details(
+        self.audit_action_started_with_details_for_request(
             TOOL,
             &json!({
                 "request": request_details,
                 "preflight": preflight,
             }),
+            &request_context,
         )?;
         let control = self.m2_rate_limit_control()?;
         let override_readback = control
@@ -874,12 +952,13 @@ impl SynapseService {
             reset_scheduled: true,
         };
         schedule_rate_limit_reset(control, ResolvedBackend::Software, params.ttl_ms);
-        self.audit_action_ok_with_details(
+        self.audit_action_ok_with_details_for_request(
             TOOL,
             &json!({
                 "response": response,
                 "preflight": preflight,
             }),
+            &request_context,
         )?;
         Ok(Json(response))
     }
@@ -890,6 +969,7 @@ impl SynapseService {
     pub async fn action_diagnostic_queue_full_setup(
         &self,
         params: Parameters<ActionDiagnosticQueueFullSetupParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActionDiagnosticQueueFullSetupResponse>, ErrorData> {
         let params = params.0;
         const TOOL: &str = "action_diagnostic_queue_full_setup";
@@ -906,26 +986,42 @@ impl SynapseService {
         if let Err(error) =
             require_diagnostic_confirm(&params.confirm, ACTION_DIAGNOSTIC_QUEUE_FULL_CONFIRM, TOOL)
         {
-            self.audit_action_denied_with_details(TOOL, &error, &request_details);
+            self.audit_action_denied_with_details_for_request(
+                TOOL,
+                &error,
+                &request_details,
+                &request_context,
+            );
             return Err(error);
         }
         if let Err(error) = validate_queue_blocker_duration_ms(params.blocker_duration_ms) {
-            self.audit_action_denied_with_details(TOOL, &error, &request_details);
+            self.audit_action_denied_with_details_for_request(
+                TOOL,
+                &error,
+                &request_details,
+                &request_context,
+            );
             return Err(error);
         }
         let preflight = match self.ensure_supported_use_allows_action("act_stroke") {
             Ok(preflight) => preflight,
             Err(error) => {
-                self.audit_action_denied_with_details(TOOL, &error, &request_details);
+                self.audit_action_denied_with_details_for_request(
+                    TOOL,
+                    &error,
+                    &request_details,
+                    &request_context,
+                );
                 return Err(error);
             }
         };
-        self.audit_action_started_with_details(
+        self.audit_action_started_with_details_for_request(
             TOOL,
             &json!({
                 "request": request_details,
                 "preflight": preflight,
             }),
+            &request_context,
         )?;
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_session_id(None)?;
@@ -934,7 +1030,12 @@ impl SynapseService {
                 error_codes::ACTION_BACKEND_UNAVAILABLE,
                 "action_diagnostic_queue_full_setup requires the real action emitter, not the recording backend",
             );
-            self.audit_action_error_with_details(TOOL, &error, &request_details)?;
+            self.audit_action_error_with_details_for_request(
+                TOOL,
+                &error,
+                &request_details,
+                &request_context,
+            )?;
             return Err(error);
         }
         let from = synapse_action::backend::software::cursor_position()
@@ -957,7 +1058,12 @@ impl SynapseService {
                     "action_diagnostic_queue_full_setup failed to observe ACTION_QUEUE_FULL after {filler_attempts} attempts and {queued_fillers} queued fillers"
                 ),
             );
-            self.audit_action_error_with_details(TOOL, &error, &request_details)?;
+            self.audit_action_error_with_details_for_request(
+                TOOL,
+                &error,
+                &request_details,
+                &request_context,
+            )?;
             return Err(error);
         }
         let response = ActionDiagnosticQueueFullSetupResponse {
@@ -972,12 +1078,13 @@ impl SynapseService {
             queue_full_observed,
             next_act_stroke_expected_error: error_codes::ACTION_QUEUE_FULL.to_owned(),
         };
-        self.audit_action_ok_with_details(
+        self.audit_action_ok_with_details_for_request(
             TOOL,
             &json!({
                 "response": response,
                 "preflight": preflight,
             }),
+            &request_context,
         )?;
         Ok(Json(response))
     }
@@ -986,6 +1093,7 @@ impl SynapseService {
     pub async fn release_all(
         &self,
         params: Parameters<ReleaseAllParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ReleaseAllResponse>, ErrorData> {
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
@@ -995,7 +1103,7 @@ impl SynapseService {
         let (handle, snapshot_handle, reflex_runtime) = self.m2_release_all_context()?;
         let result =
             release_all_with_handles(handle, snapshot_handle, reflex_runtime, params.0).await;
-        self.audit_action_result_best_effort("release_all", &result);
+        self.audit_action_result_for_request_best_effort("release_all", &result, &request_context);
         result.map(Json)
     }
 }
@@ -2825,8 +2933,10 @@ fn clipboard_response_audit_details(response: &ActClipboardResponse) -> Value {
             "text_len": response.text_len,
             "text_present": response.text.is_some(),
             "backing": response.backing,
+            "backend_tier_used": response.backend_tier_used,
             "source_of_truth": response.source_of_truth,
             "os_clipboard_touched": response.os_clipboard_touched,
+            "required_foreground": response.required_foreground,
             "lease_required": response.lease_required,
             "elapsed_ms": response.elapsed_ms,
         },
@@ -2841,6 +2951,8 @@ fn clipboard_request_audit_details(params: &ActClipboardParams) -> Value {
         "session_scoped": true,
         "source_of_truth": "session_clipboard_buffer",
         "os_clipboard_touched": false,
+        "backend_tier_used": "session_buffer",
+        "required_foreground": false,
         "lease_required": false,
     })
 }

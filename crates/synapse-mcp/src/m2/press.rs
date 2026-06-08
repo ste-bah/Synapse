@@ -57,6 +57,8 @@ pub async fn act_press_with_handle(
         keys_pressed: key_count,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         backend_used: backend_used_name(backend).to_owned(),
+        backend_tier_used: "foreground".to_owned(),
+        required_foreground: true,
         postcondition: press_postcondition_not_requested(),
     })
 }
@@ -101,6 +103,8 @@ pub async fn act_keymap_with_handle(
         keys_pressed: response.keys_pressed,
         elapsed_ms: response.elapsed_ms,
         backend_used: response.backend_used,
+        backend_tier_used: response.backend_tier_used,
+        required_foreground: response.required_foreground,
     })
 }
 

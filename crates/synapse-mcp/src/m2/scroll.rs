@@ -87,6 +87,8 @@ pub struct ActScrollResponse {
     pub smooth_interval_ms: u32,
     pub scheduled_smooth_total_ms: u32,
     pub backend_used: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
     pub elapsed_ms: u32,
     pub postcondition: ActPostcondition,
 }
@@ -532,6 +534,7 @@ fn response(
     started: Instant,
 ) -> ActScrollResponse {
     let wheel_event_count = u32::try_from(wheel_event_count).unwrap_or(u32::MAX);
+    let backend_tier_used = scroll_backend_tier_used(params, scrolled, backend_used);
     ActScrollResponse {
         ok: true,
         dy: params.dy,
@@ -546,6 +549,8 @@ fn response(
         },
         scheduled_smooth_total_ms: scheduled_smooth_total_ms(params.smooth, wheel_event_count),
         backend_used: backend_used.to_owned(),
+        backend_tier_used: backend_tier_used.to_owned(),
+        required_foreground: scroll_required_foreground(backend_tier_used),
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         postcondition: postcondition_not_requested(
             "act_scroll",
@@ -556,6 +561,27 @@ fn response(
             },
         ),
     }
+}
+
+fn scroll_backend_tier_used(
+    params: &ActScrollParams,
+    scrolled: bool,
+    backend_used: &'static str,
+) -> &'static str {
+    if !scrolled {
+        return "none";
+    }
+    if params.target.is_some() || backend_used == "cdp" {
+        return "cdp";
+    }
+    if params.at.is_some() || backend_used == "software_window_message" {
+        return "postmessage";
+    }
+    "foreground"
+}
+
+fn scroll_required_foreground(backend_tier_used: &str) -> bool {
+    backend_tier_used == "foreground"
 }
 
 const fn scheduled_smooth_total_ms(smooth: bool, wheel_event_count: u32) -> u32 {

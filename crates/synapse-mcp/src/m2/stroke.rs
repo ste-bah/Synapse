@@ -140,6 +140,8 @@ pub struct ActStrokeResponse {
     pub duration_ms: f64,
     pub modifiers_used: Vec<StrokeModifier>,
     pub backend_used: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
     pub elapsed_ms: u32,
     pub postcondition: ActPostcondition,
 }
@@ -965,6 +967,8 @@ fn response(
         duration_ms: stroke_plan.duration_ms,
         modifiers_used: params.modifiers.clone(),
         backend_used: backend_used_name(backend).to_owned(),
+        backend_tier_used: "foreground".to_owned(),
+        required_foreground: true,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         postcondition: postcondition_not_requested("act_stroke", "cursor_foreground_ui_or_pixels"),
     }
@@ -985,6 +989,8 @@ fn cdp_aim_response(params: &ActStrokeParams, started: Instant) -> ActStrokeResp
         duration_ms: 0.0,
         modifiers_used: params.modifiers.clone(),
         backend_used: "cdp".to_owned(),
+        backend_tier_used: "cdp".to_owned(),
+        required_foreground: false,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         postcondition: postcondition_not_requested("act_stroke", "cdp_pointer_or_foreground_ui"),
     }

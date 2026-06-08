@@ -44,6 +44,7 @@ impl SynapseService {
     pub async fn act_combo(
         &self,
         params: Parameters<ActComboParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActComboResponse>, ErrorData> {
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
@@ -54,14 +55,14 @@ impl SynapseService {
         let required = required_combo_permissions(&params.0)?;
         self.require_m3_permissions("act_combo", &required)?;
         if let Err(error) = self.ensure_supported_use_allows_action("act_combo") {
-            self.audit_action_denied("act_combo", &error);
+            self.audit_action_denied_for_request("act_combo", &error, &request_context);
             return Err(error);
         }
         self.refresh_reflex_audit_context()?;
-        self.audit_action_started("act_combo")?;
+        self.audit_action_started_for_request("act_combo", &request_context)?;
         let runtime = self.reflex_runtime()?;
         let result = execute_combo(runtime, params.0).await;
-        self.audit_action_result("act_combo", &result)?;
+        self.audit_action_result_for_request("act_combo", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -80,7 +81,7 @@ impl SynapseService {
             "tool.invocation kind=act_run_shell"
         );
         if let Err(error) = self.ensure_supported_use_allows_action("act_run_shell") {
-            self.audit_action_denied("act_run_shell", &error);
+            self.audit_action_denied_for_request("act_run_shell", &error, &request_context);
             return Err(error);
         }
         let raw_params = params.0;
@@ -124,7 +125,7 @@ impl SynapseService {
             "tool.invocation kind=act_run_shell_start"
         );
         if let Err(error) = self.ensure_supported_use_allows_action("act_run_shell") {
-            self.audit_action_denied("act_run_shell_start", &error);
+            self.audit_action_denied_for_request("act_run_shell_start", &error, &request_context);
             return Err(error);
         }
         let raw_params = params.0;
@@ -161,7 +162,7 @@ impl SynapseService {
             "tool.invocation kind=act_run_shell_status"
         );
         if let Err(error) = self.ensure_supported_use_allows_action("act_run_shell") {
-            self.audit_action_denied("act_run_shell_status", &error);
+            self.audit_action_denied_for_request("act_run_shell_status", &error, &request_context);
             return Err(error);
         }
         let params = params.0;
@@ -195,7 +196,7 @@ impl SynapseService {
             "tool.invocation kind=act_run_shell_cancel"
         );
         if let Err(error) = self.ensure_supported_use_allows_action("act_run_shell") {
-            self.audit_action_denied("act_run_shell_cancel", &error);
+            self.audit_action_denied_for_request("act_run_shell_cancel", &error, &request_context);
             return Err(error);
         }
         let params = params.0;
@@ -226,7 +227,7 @@ impl SynapseService {
             "tool.invocation kind=act_launch"
         );
         if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
-            self.audit_action_denied("act_launch", &error);
+            self.audit_action_denied_for_request("act_launch", &error, &request_context);
             return Err(error);
         }
         let params = params.0;
@@ -326,20 +327,21 @@ impl SynapseService {
             "tool.invocation kind=act_spawn_agent"
         );
         if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
-            self.audit_action_denied(ACT_SPAWN_AGENT, &error);
+            self.audit_action_denied_for_request(ACT_SPAWN_AGENT, &error, &request_context);
             return Err(error);
         }
         let started_by_session_id =
             super::context::mcp_session_id_from_request_context(&request_context)?;
         let params = params.0;
-        self.audit_action_started_with_details(
+        self.audit_action_started_with_details_for_request(
             ACT_SPAWN_AGENT,
             &agent_spawn_request_details(&params, started_by_session_id.as_deref()),
+            &request_context,
         )?;
         let result = self
             .act_spawn_agent_impl(params, started_by_session_id)
             .await;
-        self.audit_action_result(ACT_SPAWN_AGENT, &result)?;
+        self.audit_action_result_for_request(ACT_SPAWN_AGENT, &result, &request_context)?;
         result.map(Json)
     }
 }

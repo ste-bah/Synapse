@@ -63,6 +63,16 @@ pub(crate) fn current_mcp_session_id() -> Option<String> {
     CURRENT_MCP_SESSION_ID.try_with(Clone::clone).ok().flatten()
 }
 
+#[cfg(test)]
+pub(crate) async fn with_current_mcp_session_id_for_test<F, T>(session_id: &str, future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    CURRENT_MCP_SESSION_ID
+        .scope(Some(session_id.to_owned()), future)
+        .await
+}
+
 pub(super) fn load_session_config() -> anyhow::Result<SessionConfig> {
     let mut config = SessionConfig::default();
     let idle_timeout_secs = session_idle_timeout_secs()?;

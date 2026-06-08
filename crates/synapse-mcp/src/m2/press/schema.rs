@@ -71,6 +71,8 @@ pub struct ActPressResponse {
     pub keys_pressed: u32,
     pub elapsed_ms: u32,
     pub backend_used: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
     pub postcondition: ActPostcondition,
 }
 
@@ -85,6 +87,8 @@ pub struct ActKeymapResponse {
     pub keys_pressed: u32,
     pub elapsed_ms: u32,
     pub backend_used: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
 }
 
 impl PressBackend {

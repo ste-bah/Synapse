@@ -40,6 +40,8 @@ pub struct ActFocusWindowParams {
 pub struct ActFocusWindowResponse {
     pub ok: bool,
     pub method: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
     pub source_of_truth: String,
     pub target: FocusWindowTargetReadback,
     pub before_foreground: ForegroundContext,
@@ -127,6 +129,8 @@ pub async fn act_focus_window(
     Ok(ActFocusWindowResponse {
         ok: true,
         method: verification.method.to_owned(),
+        backend_tier_used: "foreground".to_owned(),
+        required_foreground: true,
         source_of_truth: SOURCE_OF_TRUTH.to_owned(),
         target: target_readback,
         before_foreground: before,
