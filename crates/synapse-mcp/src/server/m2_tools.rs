@@ -21,9 +21,9 @@ use crate::m2::postcondition::{
 use crate::m2::{
     ActClickPostcondition, ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA,
     CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, act_click_postmessage_with_params,
-    act_stroke_error_details, act_stroke_request_details, attach_click_tier_attempts,
-    click_params_can_route_background_first, click_target_root_hwnd, click_tier_delivered,
-    click_tier_failed, emitted_text,
+    act_stroke_error_details, act_stroke_request_details, action_from_press_params,
+    attach_click_tier_attempts, click_params_can_route_background_first, click_target_root_hwnd,
+    click_tier_delivered, click_tier_failed, emitted_text,
 };
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
@@ -473,6 +473,11 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
+        if let Err(error) = action_from_press_params(&params) {
+            let result: Result<ActPressResponse, ErrorData> = Err(error);
+            self.audit_action_result_for_request("act_press", &result, &request_context)?;
+            return result.map(Json);
+        }
         let before_delta_signature = if params.verify_delta {
             match self
                 .capture_action_delta_signature(160, None, false, None)

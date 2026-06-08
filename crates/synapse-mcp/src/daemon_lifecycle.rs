@@ -87,6 +87,7 @@ struct ToolEvent {
     session_target_read_error: Option<Value>,
     error: Option<Value>,
     panic: Option<Value>,
+    detail: Option<Value>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +117,17 @@ struct DaemonLifecycleState {
 #[derive(Debug)]
 pub(crate) struct ToolCallGuard {
     seq: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ContextEvent {
+    pub event_kind: &'static str,
+    pub tool: &'static str,
+    pub status: &'static str,
+    pub mcp_session_id: Option<String>,
+    pub foreground: Option<Value>,
+    pub foreground_read_error: Option<Value>,
+    pub detail: Value,
 }
 
 pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonLifecyclePaths> {
@@ -257,10 +269,48 @@ pub(crate) fn begin_tool_call(start: ToolCallStart) -> anyhow::Result<ToolCallGu
         session_target_read_error: start.session_target_read_error,
         error: None,
         panic: None,
+        detail: None,
     };
     write_tool_event(state, &event)?;
     state.in_flight.insert(seq, event);
     Ok(ToolCallGuard { seq })
+}
+
+pub(crate) fn record_context_event(input: ContextEvent) -> anyhow::Result<u64> {
+    let slot = state_slot();
+    let mut guard = slot
+        .lock()
+        .map_err(|_error| anyhow::anyhow!("daemon lifecycle state lock poisoned"))?;
+    let Some(state) = guard.as_mut() else {
+        bail!("daemon lifecycle ledger is not configured");
+    };
+    state.seq = state.seq.saturating_add(1);
+    let seq = state.seq;
+    let recorded_at_unix_ms = now_unix_ms();
+    let event = ToolEvent {
+        schema_version: SCHEMA_VERSION,
+        run_id: state.run.run_id.clone(),
+        pid: state.run.pid,
+        seq,
+        event_kind: input.event_kind.to_owned(),
+        tool: input.tool.to_owned(),
+        status: input.status.to_owned(),
+        started_at_unix_ms: recorded_at_unix_ms,
+        finished_at_unix_ms: Some(recorded_at_unix_ms),
+        duration_ms: Some(0),
+        mcp_session_id: input.mcp_session_id,
+        audit_context: None,
+        audit_context_read_error: None,
+        foreground: input.foreground,
+        foreground_read_error: input.foreground_read_error,
+        session_target: None,
+        session_target_read_error: None,
+        error: None,
+        panic: None,
+        detail: Some(input.detail),
+    };
+    write_tool_event(state, &event)?;
+    Ok(seq)
 }
 
 impl ToolCallGuard {
@@ -646,6 +696,56 @@ mod tests {
         assert_eq!(events.lines().count(), 2);
         assert!(events.contains("\"status\":\"started\""));
         assert!(events.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn records_context_event_to_physical_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure(DaemonLifecycleConfig {
+            mode: "http",
+            bind_addr: Some("127.0.0.1:7700".to_owned()),
+            db_path: temp.path().to_path_buf(),
+        })
+        .unwrap();
+
+        let seq = record_context_event(ContextEvent {
+            event_kind: "foreground_context_restore",
+            tool: "act_press",
+            status: "skipped_human_moved",
+            mcp_session_id: Some("session-restore".to_owned()),
+            foreground: Some(json!({"hwnd": 2222, "pid": 3333})),
+            foreground_read_error: None,
+            detail: json!({
+                "code": "FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED",
+                "reason_code": "foreground_restore_skipped_human_moved",
+                "detail": {
+                    "prior_hwnd": 1111,
+                    "expected_pid": 4444,
+                },
+            }),
+        })
+        .unwrap();
+
+        let last: ToolEvent = read_optional_json(Path::new(&paths.tool_last_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.seq, seq);
+        assert_eq!(last.event_kind, "foreground_context_restore");
+        assert_eq!(last.tool, "act_press");
+        assert_eq!(last.status, "skipped_human_moved");
+        assert_eq!(last.mcp_session_id.as_deref(), Some("session-restore"));
+        assert_eq!(
+            last.detail
+                .as_ref()
+                .and_then(|detail| detail.get("code"))
+                .and_then(Value::as_str),
+            Some("FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED")
+        );
+
+        let events = fs::read_to_string(&paths.tool_events_path).unwrap();
+        assert!(events.contains("\"event_kind\":\"foreground_context_restore\""));
+        assert!(events.contains("\"status\":\"skipped_human_moved\""));
+        assert!(events.contains("\"code\":\"FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED\""));
     }
 
     #[test]

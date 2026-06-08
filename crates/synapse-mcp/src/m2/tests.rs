@@ -1,7 +1,10 @@
 use synapse_core::{Action, Backend, Key, KeyCode};
 use tokio_util::sync::CancellationToken;
 
-use super::{M2State, RECORDING_BACKEND_ENV, recording_backend_enabled};
+use super::{
+    ForegroundRestoreCurrentDecision, M2State, RECORDING_BACKEND_ENV,
+    foreground_restore_current_decision, recording_backend_enabled,
+};
 
 #[test]
 fn from_env_reads_recording_backend_env() {
@@ -194,6 +197,45 @@ fn recording_backend_env_parser_handles_happy_path_and_edges() {
         assert_eq!(state.recording_enabled(), expected);
         assert!(state.emitter_available());
         assert_eq!(event_count, 0);
+    }
+}
+
+#[test]
+fn foreground_restore_current_decision_skips_when_current_foreground_moved() {
+    let captured_hwnd = 0x1001;
+    let expected_pid = 42;
+    let cases = [
+        (
+            "same_hwnd_and_pid",
+            captured_hwnd,
+            expected_pid,
+            ForegroundRestoreCurrentDecision::AlreadyCurrent,
+        ),
+        (
+            "different_hwnd",
+            0x2002,
+            expected_pid,
+            ForegroundRestoreCurrentDecision::SkipHumanMoved,
+        ),
+        (
+            "same_hwnd_different_pid",
+            captured_hwnd,
+            99,
+            ForegroundRestoreCurrentDecision::SkipHumanMoved,
+        ),
+    ];
+
+    for (name, current_hwnd, current_pid, expected) in cases {
+        let actual = foreground_restore_current_decision(
+            captured_hwnd,
+            expected_pid,
+            current_hwnd,
+            current_pid,
+        );
+        println!(
+            "readback=foreground_restore_decision scenario={name} captured_hwnd=0x{captured_hwnd:x} expected_pid={expected_pid} current_hwnd=0x{current_hwnd:x} current_pid={current_pid} expected={expected:?} actual={actual:?}"
+        );
+        assert_eq!(actual, expected);
     }
 }
 

@@ -14,11 +14,10 @@ mod type_text;
 use std::{
     fmt,
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
 };
 
 use rmcp::{ErrorData, model::ErrorCode};
-use serde_json::json;
+use serde_json::{Value, json};
 use synapse_action::{
     ActionBackend, ActionEmitter, ActionEmitterSnapshotHandle, ActionError, ActionHandle,
     ActionStateSnapshot, BackendRateLimitControl, BackendResolutionPolicy, LeaseOutcome,
@@ -33,8 +32,6 @@ const FOREGROUND_RESTORE_STABILITY_INTERVAL_MS: u64 = 250;
 const FOREGROUND_RESTORE_LEASE_MARGIN_MS: u64 = 1_000;
 pub(crate) const FOREGROUND_CONTEXT_RESTORE_STABILITY_MS: u64 =
     FOREGROUND_RESTORE_STABILITY_INTERVAL_MS * FOREGROUND_RESTORE_STABILITY_SAMPLES as u64;
-const FOREGROUND_RESTORE_STABILITY_INTERVAL: Duration =
-    Duration::from_millis(FOREGROUND_RESTORE_STABILITY_INTERVAL_MS);
 
 #[allow(unused_imports)]
 pub use click::{ActClickParams, ActClickPostcondition, ActClickResponse, act_click_with_handle};
@@ -300,6 +297,18 @@ impl ForegroundInputContextSnapshot {
                 capture_error = ?self.foreground_capture_error,
                 "foreground window restore skipped"
             );
+            record_foreground_restore_context_event(
+                tool,
+                session_id,
+                "skipped",
+                error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                "foreground_capture_unavailable",
+                None,
+                None,
+                json!({
+                    "capture_error": self.foreground_capture_error,
+                }),
+            );
             return "skipped";
         };
         let Some(expected_pid) = self.foreground_pid else {
@@ -311,6 +320,19 @@ impl ForegroundInputContextSnapshot {
                 foreground_hwnd = hwnd,
                 foreground_title = ?self.foreground_title,
                 "foreground window restore skipped because prior owner pid was not captured"
+            );
+            record_foreground_restore_context_event(
+                tool,
+                session_id,
+                "skipped",
+                error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                "foreground_pid_capture_unavailable",
+                None,
+                None,
+                json!({
+                    "prior_hwnd": hwnd,
+                    "prior_title": self.foreground_title,
+                }),
             );
             return "skipped";
         };
@@ -325,6 +347,20 @@ impl ForegroundInputContextSnapshot {
                 expected_pid,
                 foreground_title = ?self.foreground_title,
                 "foreground window restore skipped because prior owner process identity was not captured"
+            );
+            record_foreground_restore_context_event(
+                tool,
+                session_id,
+                "skipped",
+                error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                "foreground_process_identity_capture_unavailable",
+                None,
+                None,
+                json!({
+                    "prior_hwnd": hwnd,
+                    "expected_pid": expected_pid,
+                    "prior_title": self.foreground_title,
+                }),
             );
             return "skipped";
         };
@@ -350,132 +386,133 @@ impl ForegroundInputContextSnapshot {
                 foreground_title = ?self.foreground_title,
                 "foreground window restore skipped because prior HWND/PID is not restorable"
             );
+            record_foreground_restore_context_event(
+                tool,
+                session_id,
+                "skipped",
+                error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                readiness.reason_code,
+                None,
+                None,
+                json!({
+                    "prior_hwnd": hwnd,
+                    "expected_pid": expected_pid,
+                    "actual_pid": readiness.actual_pid,
+                    "expected_process_started_at_100ns": expected_process_started_at_100ns,
+                    "actual_process_started_at_100ns": readiness.actual_process_started_at_100ns,
+                    "exit_code": readiness.exit_code,
+                    "wait_status": readiness.wait_status,
+                    "prior_title": self.foreground_title,
+                }),
+            );
             return "skipped";
         }
 
-        match synapse_a11y::focus_window_with_intent(
-            hwnd,
-            synapse_a11y::ForegroundActivationIntent::LeaseContextRestore { caller: tool },
-        ) {
-            Ok(()) => match synapse_a11y::current_foreground_context() {
-                Ok(after) if after.hwnd == hwnd && after.pid == expected_pid => {
-                    for sample in 1..=FOREGROUND_RESTORE_STABILITY_SAMPLES {
-                        std::thread::sleep(FOREGROUND_RESTORE_STABILITY_INTERVAL);
-                        let stable = foreground_window_restore_readiness(
-                            hwnd,
-                            expected_pid,
-                            expected_process_started_at_100ns,
-                        );
-                        if !stable.alive {
-                            tracing::warn!(
-                                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
-                                tool,
-                                session_id,
-                                reason_code = stable.reason_code,
-                                foreground_hwnd = hwnd,
-                                expected_pid,
-                                actual_pid = ?stable.actual_pid,
-                                expected_process_started_at_100ns,
-                                actual_process_started_at_100ns = ?stable.actual_process_started_at_100ns,
-                                exit_code = ?stable.exit_code,
-                                wait_status = ?stable.wait_status,
-                                foreground_title = ?self.foreground_title,
-                                stability_sample = sample,
-                                "foreground window restore skipped because prior HWND/PID closed during restore"
-                            );
-                            return "skipped";
-                        }
-                        match synapse_a11y::current_foreground_context() {
-                            Ok(stable_after)
-                                if stable_after.hwnd == hwnd
-                                    && stable_after.pid == expected_pid => {}
-                            Ok(stable_after) => {
-                                tracing::error!(
-                                    code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
-                                    tool,
-                                    session_id,
-                                    reason_code = "foreground_stability_readback_mismatch",
-                                    requested_hwnd = hwnd,
-                                    expected_pid,
-                                    actual_hwnd = stable_after.hwnd,
-                                    actual_pid = stable_after.pid,
-                                    actual_title = %stable_after.window_title,
-                                    stability_sample = sample,
-                                    "foreground window restore stability readback mismatch"
-                                );
-                                return "failed";
-                            }
-                            Err(error) => {
-                                tracing::error!(
-                                    code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
-                                    tool,
-                                    session_id,
-                                    reason_code = "foreground_stability_readback_failed",
-                                    foreground_hwnd = hwnd,
-                                    expected_pid,
-                                    detail = %error,
-                                    stability_sample = sample,
-                                    "foreground window restore stability readback failed"
-                                );
-                                return "failed";
-                            }
-                        }
-                    }
-                    tracing::info!(
-                        code = "INPUT_LEASE_CONTEXT_FOREGROUND_RESTORED",
-                        tool,
-                        session_id,
-                        foreground_hwnd = hwnd,
-                        foreground_pid = expected_pid,
-                        foreground_title = ?self.foreground_title,
-                        after_hwnd = after.hwnd,
-                        after_pid = after.pid,
-                        after_title = %after.window_title,
-                        "readback=foreground_window outcome=restored"
-                    );
-                    "restored"
-                }
-                Ok(after) => {
-                    tracing::error!(
-                        code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
-                        tool,
-                        session_id,
-                        reason_code = "foreground_readback_mismatch",
-                        requested_hwnd = hwnd,
-                        expected_pid,
-                        actual_hwnd = after.hwnd,
-                        actual_pid = after.pid,
-                        actual_title = %after.window_title,
-                        "foreground window restore readback mismatch"
-                    );
-                    "failed"
-                }
-                Err(error) => {
-                    tracing::error!(
-                        code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
-                        tool,
-                        session_id,
-                        reason_code = "foreground_readback_failed",
-                        requested_hwnd = hwnd,
-                        detail = %error,
-                        "foreground window restore readback failed"
-                    );
-                    "failed"
-                }
-            },
+        let current = match synapse_a11y::current_foreground_context() {
+            Ok(current) => current,
             Err(error) => {
-                tracing::error!(
-                    code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                tracing::warn!(
+                    code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
                     tool,
                     session_id,
-                    reason_code = "foreground_restore_failed",
+                    reason_code = "foreground_current_read_failed",
+                    foreground_hwnd = hwnd,
+                    expected_pid,
+                    foreground_title = ?self.foreground_title,
+                    detail = %error,
+                    "foreground window restore skipped because current foreground readback failed"
+                );
+                record_foreground_restore_context_event(
+                    tool,
+                    session_id,
+                    "skipped",
+                    error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                    "foreground_current_read_failed",
+                    None,
+                    Some(json!({
+                        "detail": error.to_string(),
+                    })),
+                    json!({
+                        "prior_hwnd": hwnd,
+                        "expected_pid": expected_pid,
+                        "prior_title": self.foreground_title,
+                    }),
+                );
+                return "skipped";
+            }
+        };
+
+        match foreground_restore_current_decision(hwnd, expected_pid, current.hwnd, current.pid) {
+            ForegroundRestoreCurrentDecision::AlreadyCurrent => {
+                tracing::info!(
+                    code = "INPUT_LEASE_CONTEXT_FOREGROUND_ALREADY_CURRENT",
+                    tool,
+                    session_id,
                     foreground_hwnd = hwnd,
                     foreground_pid = expected_pid,
                     foreground_title = ?self.foreground_title,
-                    detail = %error,
-                    "foreground window restore failed"
+                    current_hwnd = current.hwnd,
+                    current_pid = current.pid,
+                    current_title = %current.window_title,
+                    "readback=foreground_window outcome=already_current"
                 );
-                "failed"
+                record_foreground_restore_context_event(
+                    tool,
+                    session_id,
+                    "already_current",
+                    "INPUT_LEASE_CONTEXT_FOREGROUND_ALREADY_CURRENT",
+                    "foreground_already_current",
+                    Some(json!({
+                        "hwnd": current.hwnd,
+                        "pid": current.pid,
+                        "process_name": current.process_name,
+                        "window_title": current.window_title,
+                    })),
+                    None,
+                    json!({
+                        "prior_hwnd": hwnd,
+                        "expected_pid": expected_pid,
+                        "expected_process_started_at_100ns": expected_process_started_at_100ns,
+                        "prior_title": self.foreground_title,
+                    }),
+                );
+                return "already_current";
+            }
+            ForegroundRestoreCurrentDecision::SkipHumanMoved => {
+                tracing::warn!(
+                    code = error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+                    tool,
+                    session_id,
+                    reason_code = "foreground_restore_skipped_human_moved",
+                    prior_hwnd = hwnd,
+                    expected_pid,
+                    prior_title = ?self.foreground_title,
+                    current_hwnd = current.hwnd,
+                    current_pid = current.pid,
+                    current_title = %current.window_title,
+                    "foreground window restore skipped because current foreground moved after lease capture"
+                );
+                record_foreground_restore_context_event(
+                    tool,
+                    session_id,
+                    "skipped_human_moved",
+                    error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+                    "foreground_restore_skipped_human_moved",
+                    Some(json!({
+                        "hwnd": current.hwnd,
+                        "pid": current.pid,
+                        "process_name": current.process_name,
+                        "window_title": current.window_title,
+                    })),
+                    None,
+                    json!({
+                        "prior_hwnd": hwnd,
+                        "expected_pid": expected_pid,
+                        "expected_process_started_at_100ns": expected_process_started_at_100ns,
+                        "prior_title": self.foreground_title,
+                    }),
+                );
+                return "skipped_human_moved";
             }
         }
     }
@@ -498,6 +535,70 @@ struct ForegroundWindowRestoreReadiness {
     actual_process_started_at_100ns: Option<u64>,
     exit_code: Option<u32>,
     wait_status: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ForegroundRestoreCurrentDecision {
+    AlreadyCurrent,
+    SkipHumanMoved,
+}
+
+fn foreground_restore_current_decision(
+    captured_hwnd: i64,
+    expected_pid: u32,
+    current_hwnd: i64,
+    current_pid: u32,
+) -> ForegroundRestoreCurrentDecision {
+    if current_hwnd == captured_hwnd && current_pid == expected_pid {
+        ForegroundRestoreCurrentDecision::AlreadyCurrent
+    } else {
+        ForegroundRestoreCurrentDecision::SkipHumanMoved
+    }
+}
+
+fn record_foreground_restore_context_event(
+    tool: &'static str,
+    session_id: &str,
+    status: &'static str,
+    code: &'static str,
+    reason_code: &'static str,
+    foreground: Option<Value>,
+    foreground_read_error: Option<Value>,
+    detail: Value,
+) {
+    let detail = json!({
+        "code": code,
+        "reason_code": reason_code,
+        "detail": detail,
+    });
+    match crate::daemon_lifecycle::record_context_event(crate::daemon_lifecycle::ContextEvent {
+        event_kind: "foreground_context_restore",
+        tool,
+        status,
+        mcp_session_id: Some(session_id.to_owned()),
+        foreground,
+        foreground_read_error,
+        detail,
+    }) {
+        Ok(seq) => tracing::info!(
+            code = "INPUT_LEASE_CONTEXT_RESTORE_EVENT_RECORDED",
+            tool,
+            session_id,
+            status,
+            seq,
+            reason_code,
+            "readback=daemon_lifecycle outcome=foreground_context_restore_recorded"
+        ),
+        Err(error) => tracing::error!(
+            code = "INPUT_LEASE_CONTEXT_RESTORE_EVENT_WRITE_FAILED",
+            tool,
+            session_id,
+            status,
+            reason_code,
+            detail = %error,
+            "foreground input context restore event write failed"
+        ),
+    }
 }
 
 #[cfg(windows)]
