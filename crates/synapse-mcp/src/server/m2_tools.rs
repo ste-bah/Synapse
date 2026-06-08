@@ -364,7 +364,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Focus or activate one visible top-level native window by exact hwnd, unique title_regex, or unique pid. The action fails closed on missing or ambiguous targets and verifies success with a separate GetForegroundWindow readback."
+        description = "Operator-intent foreground action: lease-gated focus/activation of one visible top-level native window by exact hwnd, unique title_regex, or unique pid. Do not use as an action/perception precondition. It fails closed on missing, ambiguous, or contended targets and verifies success with a separate GetForegroundWindow readback."
     )]
     pub async fn act_focus_window(
         &self,
