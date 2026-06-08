@@ -39,6 +39,7 @@ impl SynapseService {
         subsystems.insert("action".to_owned(), self.action_health());
         subsystems.insert("audio".to_owned(), self.audio_health());
         subsystems.insert("http".to_owned(), self.http_health(active_sessions));
+        subsystems.insert("daemon_drain".to_owned(), self.daemon_drain_health());
         subsystems.insert(
             "daemon_lifecycle".to_owned(),
             crate::daemon_lifecycle::health_subsystem(),
@@ -65,6 +66,34 @@ impl SynapseService {
             tool_surface_sha256: tool_surface.sha256,
             tool_names: tool_surface.names,
             subsystems,
+        }
+    }
+
+    fn daemon_drain_health(&self) -> SubsystemHealth {
+        let snapshot = self.drain_state_handle().snapshot();
+        let status = if snapshot.state_error.is_some() {
+            "error"
+        } else if snapshot.draining {
+            "draining"
+        } else {
+            "ok"
+        };
+        let detail = if let Some(error) = snapshot.state_error {
+            error
+        } else if snapshot.draining {
+            format!(
+                "reason_code={} source={} started_at_unix_ms={}",
+                snapshot.reason_code.unwrap_or("unknown"),
+                snapshot.source.unwrap_or("unknown"),
+                snapshot.started_at_unix_ms.unwrap_or_default()
+            )
+        } else {
+            "daemon accepting work".to_owned()
+        };
+        SubsystemHealth {
+            status: status.to_owned(),
+            detail: Some(detail),
+            ..SubsystemHealth::default()
         }
     }
 

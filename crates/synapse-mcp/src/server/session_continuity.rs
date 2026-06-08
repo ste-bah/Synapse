@@ -44,6 +44,13 @@ pub(crate) struct ContinuityCleanupReadback {
     pub lease_row_deleted: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LeaseContinuityCleanupReadback {
+    pub row_existed_before: bool,
+    pub row_exists_after: bool,
+    pub row_deleted: bool,
+}
+
 impl SynapseService {
     pub(super) fn persist_session_target(
         &self,
@@ -448,6 +455,42 @@ pub(crate) fn delete_persisted_session_continuity_rows_from_db(
         session_id,
         readback = ?readback,
         "readback=CF_SESSIONS after=session_continuity_deleted"
+    );
+    Ok(readback)
+}
+
+pub(crate) fn delete_persisted_session_lease_row(
+    m3_state: &SharedM3State,
+    session_id: &str,
+) -> Result<LeaseContinuityCleanupReadback, String> {
+    let db = session_continuity_db_from_state(m3_state)?;
+    delete_persisted_session_lease_row_from_db(&db, session_id)
+}
+
+pub(crate) fn delete_persisted_session_lease_row_from_db(
+    db: &Db,
+    session_id: &str,
+) -> Result<LeaseContinuityCleanupReadback, String> {
+    let key = session_lease_key(session_id);
+    let row_existed_before = cf_row_exists(db, &key).map_err(|error| error.to_string())?;
+    db.delete_batch(cf::CF_SESSIONS, [key.clone()])
+        .map_err(|error| error.to_string())?;
+    let row_exists_after = cf_row_exists(db, &key).map_err(|error| error.to_string())?;
+    if row_exists_after {
+        return Err(format!(
+            "session lease continuity row still exists after delete for {session_id}"
+        ));
+    }
+    let readback = LeaseContinuityCleanupReadback {
+        row_existed_before,
+        row_exists_after,
+        row_deleted: row_existed_before && !row_exists_after,
+    };
+    tracing::info!(
+        code = "MCP_SESSION_LEASE_CONTINUITY_DELETED",
+        session_id,
+        readback = ?readback,
+        "readback=CF_SESSIONS after=session_lease_continuity_deleted"
     );
     Ok(readback)
 }

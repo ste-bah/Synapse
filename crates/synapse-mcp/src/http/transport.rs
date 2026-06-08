@@ -20,6 +20,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
     session::{SessionState, SessionStore, SessionStoreError, local::LocalSessionManager},
 };
+use serde::Serialize;
 #[cfg(test)]
 use synapse_action::ActionHandle;
 use synapse_action::ActionStateSnapshot;
@@ -41,13 +42,37 @@ use crate::{
 type McpHttpService = StreamableHttpService<SynapseService, LocalSessionManager>;
 const STALE_SESSION_INPUT_CLEANUP_INTERVAL: Duration = Duration::from_millis(250);
 const M2_EMITTER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const DRAIN_RESPONSE_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone)]
 struct HttpState {
     health_service: Arc<SynapseService>,
     session_manager: Arc<LocalSessionManager>,
     shutdown_cancel: CancellationToken,
+    drain_state: crate::server::drain::DaemonDrainState,
     sse_state: SseState,
+}
+
+struct HttpRouterRuntime {
+    app: Router,
+    session_manager: Arc<LocalSessionManager>,
+    session_lifecycle: crate::server::session_lifecycle::SessionLifecycleState,
+    drain_state: crate::server::drain::DaemonDrainState,
+}
+
+#[derive(Debug, Serialize)]
+struct DaemonShutdownInputCleanupReport {
+    reason: &'static str,
+    active_sessions_before: usize,
+    cleaned_sessions: usize,
+    orphan_lease_owner_cleanup:
+        Option<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
+    final_lease_held: bool,
+    final_lease_owner_session_id: Option<String>,
+    final_lease_is_operator: bool,
+    lease_still_held_after_cleanup: bool,
+    failure_count: usize,
+    session_reports: Vec<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
 }
 
 pub(super) async fn serve(
@@ -206,7 +231,7 @@ pub(super) async fn serve(
     let _operator_hotkey_guard = crate::safety::install_operator_hotkey(service.m3_state_handle())
         .context("install operator panic hotkey")?;
     let m2_emitter_done = service.m2_emitter_done_receiver();
-    let app = router(&shutdown_cancel, local_addr, sse_state, service)
+    let runtime = router(&shutdown_cancel, local_addr, sse_state, service)
         .context("build HTTP MCP router")?;
 
     tracing::info!(
@@ -215,7 +240,7 @@ pub(super) async fn serve(
         "starting streamable HTTP MCP transport"
     );
 
-    let mut server_task = spawn_server(listener, app, shutdown_cancel.clone());
+    let mut server_task = spawn_server(listener, runtime.app, shutdown_cancel.clone());
     let m2_done_after_server_stop = m2_emitter_done.clone();
     let m2_done_after_signal = m2_emitter_done;
     let code = tokio::select! {
@@ -224,16 +249,39 @@ pub(super) async fn serve(
                 .context("serve HTTP MCP transport")?;
             if shutdown_cancel.is_cancelled() {
                 connection_closed_cancel.cancel();
+                let cleanup = cleanup_active_session_inputs_for_shutdown(
+                    &runtime.session_lifecycle,
+                    &runtime.session_manager,
+                    "http_endpoint",
+                ).await;
+                tracing::info!(
+                    code = "MCP_HTTP_SHUTDOWN_INPUT_CLEANUP",
+                    cleanup = ?cleanup,
+                    "readback=session_input_ownership edge=http_endpoint_shutdown after_cleanup"
+                );
                 wait_for_m2_emitter_done(m2_done_after_server_stop, "http_endpoint").await;
             }
             ExitCode::SUCCESS
         }
         signal = wait_for_shutdown_signal("http") => {
             signal?;
+            let drain = runtime.drain_state.mark_draining("signal");
             tracing::info!(code = "MCP_SHUTDOWN_GRACEFUL", "HTTP shutdown signal received");
+            time::sleep(DRAIN_RESPONSE_GRACE_TIMEOUT).await;
             shutdown_cancel.cancel();
             connection_closed_cancel.cancel();
             wait_for_server_stop(&mut server_task).await?;
+            let cleanup = cleanup_active_session_inputs_for_shutdown(
+                &runtime.session_lifecycle,
+                &runtime.session_manager,
+                "signal",
+            ).await;
+            tracing::info!(
+                code = "MCP_HTTP_SHUTDOWN_INPUT_CLEANUP",
+                drain = ?drain,
+                cleanup = ?cleanup,
+                "readback=session_input_ownership edge=signal_shutdown after_cleanup"
+            );
             wait_for_m2_emitter_done(m2_done_after_signal, "signal").await;
             ExitCode::SUCCESS
         }
@@ -248,7 +296,7 @@ fn router(
     bind_addr: SocketAddr,
     sse_state: SseState,
     service: SynapseService,
-) -> anyhow::Result<Router> {
+) -> anyhow::Result<HttpRouterRuntime> {
     let auth = Arc::new(HttpAuth::load(bind_addr).context("load HTTP bearer token")?);
     tracing::info!(
         code = "MCP_HTTP_AUTH_CONFIGURED",
@@ -256,6 +304,7 @@ fn router(
         "HTTP bearer token configured"
     );
     let health_service = Arc::new(service.clone());
+    let drain_state = service.drain_state_handle();
     let session_registry = service.session_registry_handle();
     let terminated_sessions = service.terminated_sessions_handle();
     let session_lifecycle = service
@@ -271,16 +320,17 @@ fn router(
         session::SessionCleanupState::new(Arc::clone(&session_manager), session_lifecycle.clone());
     let _stale_cleanup_task = spawn_stale_session_input_cleanup(
         Arc::clone(&session_manager),
-        session_lifecycle,
+        session_lifecycle.clone(),
         shutdown_cancel.child_token(),
     );
     let state = HttpState {
         health_service,
-        session_manager,
+        session_manager: Arc::clone(&session_manager),
         shutdown_cancel: shutdown_cancel.clone(),
+        drain_state: drain_state.clone(),
         sse_state,
     };
-    Ok(Router::new()
+    let app = Router::new()
         .route("/health", get(health))
         .route("/shutdown", post(shutdown))
         .route("/events", get(events).post(publish_event))
@@ -298,7 +348,13 @@ fn router(
             auth,
             auth::require_http_security,
         ))
-        .with_state(state))
+        .with_state(state);
+    Ok(HttpRouterRuntime {
+        app,
+        session_manager,
+        session_lifecycle,
+        drain_state,
+    })
 }
 
 fn streamable_service(
@@ -490,6 +546,63 @@ async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTree
         .keys()
         .map(|session_id| session_id.as_ref().to_owned())
         .collect()
+}
+
+async fn cleanup_active_session_inputs_for_shutdown(
+    session_lifecycle: &crate::server::session_lifecycle::SessionLifecycleState,
+    session_manager: &LocalSessionManager,
+    reason: &'static str,
+) -> DaemonShutdownInputCleanupReport {
+    let active_sessions = active_http_session_ids(session_manager).await;
+    let mut session_reports = Vec::with_capacity(active_sessions.len());
+    for session_id in &active_sessions {
+        session_reports.push(
+            session_lifecycle
+                .release_session_inputs_for_daemon_shutdown(session_id, reason)
+                .await,
+        );
+    }
+    let mut orphan_lease_owner_cleanup = None;
+    let mut final_lease = synapse_action::lease::status();
+    if let Some(owner_session_id) = final_lease.owner_session_id.clone()
+        && owner_session_id != synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID
+        && !active_sessions.contains(&owner_session_id)
+    {
+        orphan_lease_owner_cleanup = Some(
+            session_lifecycle
+                .release_session_inputs_for_daemon_shutdown(&owner_session_id, reason)
+                .await,
+        );
+        final_lease = synapse_action::lease::status();
+    }
+    let final_lease_is_operator = final_lease.owner_session_id.as_deref()
+        == Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID);
+    let lease_still_held_after_cleanup = final_lease.held && !final_lease_is_operator;
+    let mut failure_count = session_reports
+        .iter()
+        .filter(|report| report.failed)
+        .count();
+    if orphan_lease_owner_cleanup
+        .as_ref()
+        .is_some_and(|report| report.failed)
+    {
+        failure_count += 1;
+    }
+    if lease_still_held_after_cleanup {
+        failure_count += 1;
+    }
+    DaemonShutdownInputCleanupReport {
+        reason,
+        active_sessions_before: active_sessions.len(),
+        cleaned_sessions: session_reports.len(),
+        orphan_lease_owner_cleanup,
+        final_lease_held: final_lease.held,
+        final_lease_owner_session_id: final_lease.owner_session_id,
+        final_lease_is_operator,
+        lease_still_held_after_cleanup,
+        failure_count,
+        session_reports,
+    }
 }
 
 #[cfg(test)]
@@ -901,6 +1014,12 @@ async fn health(State(state): State<HttpState>) -> Json<Health> {
 
 async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     let active_sessions = state.session_manager.sessions.read().await.len();
+    let drain = state.drain_state.mark_draining("http_shutdown");
+    let shutdown_cancel = state.shutdown_cancel.clone();
+    tokio::spawn(async move {
+        time::sleep(DRAIN_RESPONSE_GRACE_TIMEOUT).await;
+        shutdown_cancel.cancel();
+    });
     let user_agent = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
@@ -916,15 +1035,16 @@ async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Respons
         code = "MCP_SHUTDOWN_GRACEFUL",
         source = "http_shutdown",
         pid = std::process::id(),
-        "HTTP shutdown endpoint cancelling daemon shutdown token"
+        delay_ms = DRAIN_RESPONSE_GRACE_TIMEOUT.as_millis(),
+        "HTTP shutdown endpoint scheduled daemon shutdown after drain grace"
     );
-    state.shutdown_cancel.cancel();
     (
         StatusCode::ACCEPTED,
         Json(serde_json::json!({
             "ok": true,
             "pid": std::process::id(),
             "shutdown": "requested",
+            "drain": drain,
             "active_sessions_before_shutdown": active_sessions,
         })),
     )

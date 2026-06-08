@@ -132,6 +132,23 @@ pub struct SessionInputCleanupReport {
 
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "shutdown FSV readback reports exact before/after lease row booleans"
+)]
+pub struct SessionShutdownInputCleanupReport {
+    pub session_id: String,
+    pub reason: String,
+    pub input: SessionInputCleanupReport,
+    pub lease_row_existed_before: bool,
+    pub lease_row_deleted: bool,
+    pub lease_row_exists_after: bool,
+    pub failed: bool,
+    pub error_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionTargetCleanupReport {
     pub target_cleared: bool,
     pub target_sessions_before: usize,
@@ -414,6 +431,49 @@ impl SessionLifecycleState {
             );
             Err(session_teardown_error(report))
         }
+    }
+
+    pub(crate) async fn release_session_inputs_for_daemon_shutdown(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> SessionShutdownInputCleanupReport {
+        let mut report = SessionShutdownInputCleanupReport {
+            session_id: session_id.to_owned(),
+            reason: reason.to_owned(),
+            ..SessionShutdownInputCleanupReport::default()
+        };
+        if let Err(error) = validate_lifecycle_session_id(session_id) {
+            report.failed = true;
+            report.error_message = Some(error.message.to_string());
+            return report;
+        }
+        report.input = self.cleanup_inputs_and_lease(session_id).await;
+        match super::session_continuity::delete_persisted_session_lease_row(
+            &self.m3_state,
+            session_id,
+        ) {
+            Ok(readback) => {
+                report.lease_row_existed_before = readback.row_existed_before;
+                report.lease_row_deleted = readback.row_deleted;
+                report.lease_row_exists_after = readback.row_exists_after;
+            }
+            Err(error) => {
+                report.failed = true;
+                report.error_message = Some(error);
+            }
+        }
+        if report.input.failed {
+            report.failed = true;
+        }
+        tracing::info!(
+            code = "MCP_SESSION_SHUTDOWN_INPUT_CLEANUP",
+            session_id,
+            reason,
+            report = ?report,
+            "readback=session_input_ownership edge=daemon_shutdown after_cleanup"
+        );
+        report
     }
 
     pub(crate) async fn cleanup_expired_lease_inputs_once(&self) {

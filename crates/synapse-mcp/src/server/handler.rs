@@ -18,11 +18,47 @@ impl ServerHandler for SynapseService {
             super::context::optional_mcp_session_id_from_request_context(&context)?;
         let lifecycle_guard =
             self.begin_daemon_lifecycle_tool_call(&tool_name, mcp_session_id.as_deref())?;
-        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        match AssertUnwindSafe(self.tool_router.call(context))
-            .catch_unwind()
-            .await
+        let shutdown_cancel = self.shutdown_cancel_token()?;
+        let drain_state = self.drain_state_handle();
+        let drain_cancel = drain_state.token();
+        let drain_snapshot = drain_state.snapshot();
+        if drain_snapshot.draining || drain_cancel.is_cancelled() || shutdown_cancel.is_cancelled()
         {
+            let snapshot = if drain_snapshot.draining {
+                drain_snapshot
+            } else {
+                drain_state.mark_draining("shutdown_token")
+            };
+            let error =
+                daemon_restarting_mcp_error(&tool_name, mcp_session_id.as_deref(), snapshot);
+            lifecycle_guard
+                .finish_error(error_snapshot(&error))
+                .map_err(lifecycle_mcp_error)?;
+            return Err(error);
+        }
+        let context = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        let tool_call = AssertUnwindSafe(self.tool_router.call(context)).catch_unwind();
+        tokio::pin!(tool_call);
+        let result = tokio::select! {
+            _ = drain_cancel.cancelled() => {
+                let snapshot = drain_state.mark_draining("drain_token");
+                let error = daemon_restarting_mcp_error(&tool_name, mcp_session_id.as_deref(), snapshot);
+                lifecycle_guard
+                    .finish_error(error_snapshot(&error))
+                    .map_err(lifecycle_mcp_error)?;
+                return Err(error);
+            }
+            _ = shutdown_cancel.cancelled() => {
+                let snapshot = drain_state.mark_draining("shutdown_token");
+                let error = daemon_restarting_mcp_error(&tool_name, mcp_session_id.as_deref(), snapshot);
+                lifecycle_guard
+                    .finish_error(error_snapshot(&error))
+                    .map_err(lifecycle_mcp_error)?;
+                return Err(error);
+            }
+            result = &mut tool_call => result,
+        };
+        match result {
             Ok(Ok(result)) => {
                 lifecycle_guard.finish_ok().map_err(lifecycle_mcp_error)?;
                 Ok(result)
@@ -172,6 +208,24 @@ fn error_snapshot(error: &ErrorData) -> Value {
             .and_then(|data| data.get("code"))
             .and_then(Value::as_str),
     })
+}
+
+fn daemon_restarting_mcp_error(
+    tool_name: &str,
+    mcp_session_id: Option<&str>,
+    snapshot: super::drain::DaemonDrainSnapshot,
+) -> ErrorData {
+    ErrorData::new(
+        rmcp::model::ErrorCode(-32099),
+        format!("daemon is restarting; tool {tool_name} was refused before transport shutdown"),
+        Some(json!({
+            "code": synapse_core::error_codes::DAEMON_RESTARTING,
+            "retryable": true,
+            "tool": tool_name,
+            "mcp_session_id": mcp_session_id,
+            "drain": snapshot,
+        })),
+    )
 }
 
 fn lifecycle_mcp_error(error: anyhow::Error) -> ErrorData {

@@ -124,6 +124,7 @@ mod action_audit;
 mod action_preflight;
 mod audit_context;
 mod context;
+pub(crate) mod drain;
 mod everquest_autocombat;
 mod everquest_contextgraph;
 mod everquest_domain;
@@ -206,6 +207,7 @@ pub struct SynapseService {
     m2_state: SharedM2State,
     m3_state: SharedM3State,
     m4_config: M4ServiceConfig,
+    drain_state: drain::DaemonDrainState,
     session_targets: SharedSessionTargets,
     cdp_target_owners: SharedCdpTargetOwners,
     session_registry: SharedSessionRegistry,
@@ -230,6 +232,7 @@ impl SynapseService {
             m2_state: shared_m2_state_from_env()?,
             m3_state: shared_m3_state_from_env()?,
             m4_config: M4ServiceConfig::from_env()?,
+            drain_state: drain::DaemonDrainState::default(),
             session_targets: Arc::new(Mutex::new(HashMap::new())),
             cdp_target_owners: Arc::new(Mutex::new(HashMap::new())),
             session_registry: Arc::new(Mutex::new(SessionRegistry::default())),
@@ -265,6 +268,7 @@ impl SynapseService {
                 sse_state,
             )?,
             m4_config,
+            drain_state: drain::DaemonDrainState::default(),
             session_targets: Arc::new(Mutex::new(HashMap::new())),
             cdp_target_owners: Arc::new(Mutex::new(HashMap::new())),
             session_registry: Arc::new(Mutex::new(SessionRegistry::default())),
@@ -300,6 +304,7 @@ impl SynapseService {
                 sse_state,
             )?,
             m4_config,
+            drain_state: drain::DaemonDrainState::default(),
             session_targets: Arc::new(Mutex::new(HashMap::new())),
             cdp_target_owners: Arc::new(Mutex::new(HashMap::new())),
             session_registry: Arc::new(Mutex::new(SessionRegistry::default())),
@@ -317,6 +322,22 @@ impl SynapseService {
 
     pub(crate) fn m3_state_handle(&self) -> SharedM3State {
         Arc::clone(&self.m3_state)
+    }
+
+    pub(crate) fn drain_state_handle(&self) -> drain::DaemonDrainState {
+        self.drain_state.clone()
+    }
+
+    pub(crate) fn shutdown_cancel_token(&self) -> Result<CancellationToken, ErrorData> {
+        self.m3_state
+            .lock()
+            .map(|state| state.shutdown_cancel.clone())
+            .map_err(|_err| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "M3 service state lock poisoned while reading daemon shutdown token",
+                )
+            })
     }
 
     pub(crate) const fn session_targets_ref(&self) -> &SharedSessionTargets {
