@@ -163,6 +163,7 @@ mod target_claims;
 mod target_policy;
 #[cfg(test)]
 mod tests;
+mod workspace_blackboard;
 
 use session_registry::{SessionRegistry, SharedSessionRegistry};
 use target_claims::SharedTargetClaims;
@@ -422,6 +423,7 @@ impl SynapseService {
             + Self::lease_tool_router()
             + Self::session_tool_router()
             + Self::agent_mailbox_tool_router()
+            + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()
             + Self::m3_tool_router()

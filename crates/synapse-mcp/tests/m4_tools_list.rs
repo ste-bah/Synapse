@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 103] = [
+const EXPECTED_TOOLS: [&str; 107] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -108,6 +108,10 @@ const EXPECTED_TOOLS: [&str; 103] = [
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
+    "workspace_get",
+    "workspace_list",
+    "workspace_put",
+    "workspace_subscribe",
 ];
 
 #[tokio::test]

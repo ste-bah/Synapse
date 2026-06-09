@@ -19,6 +19,7 @@ pub struct StdioMcpClient {
     stdin: Option<ChildStdin>,
     stdout: Lines<BufReader<ChildStdout>>,
     stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
+    _temp_db_dir: Option<tempfile::TempDir>,
     next_id: u64,
     raw_rx: Vec<String>,
     raw_tx: Vec<String>,
@@ -68,6 +69,18 @@ impl StdioMcpClient {
 
     pub fn launch_with_env(log_dir: Option<&Path>, envs: &[(&str, &str)]) -> anyhow::Result<Self> {
         let bin = mcp_binary_path()?;
+        let caller_supplied_db = envs
+            .iter()
+            .any(|(key, _value)| key.eq_ignore_ascii_case("SYNAPSE_DB"));
+        let temp_db_dir = if caller_supplied_db {
+            None
+        } else {
+            Some(
+                tempfile::Builder::new()
+                    .prefix("synapse-stdio-db-")
+                    .tempdir()?,
+            )
+        };
         let mut command = Command::new(bin);
         command
             .args(["--mode", "stdio"])
@@ -76,6 +89,9 @@ impl StdioMcpClient {
             .stderr(Stdio::piped())
             .env("SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY", "1")
             .env("SYNAPSE_LOG_LEVEL", "debug");
+        if let Some(temp_db_dir) = temp_db_dir.as_ref() {
+            command.env("SYNAPSE_DB", temp_db_dir.path().join("db"));
+        }
         if let Some(log_dir) = log_dir {
             command.env("SYNAPSE_LOG_DIR", log_dir);
         }
@@ -92,6 +108,7 @@ impl StdioMcpClient {
             stdin: Some(stdin),
             stdout: BufReader::new(stdout).lines(),
             stderr_task: Some(tokio::spawn(read_stderr(stderr))),
+            _temp_db_dir: temp_db_dir,
             next_id: 0,
             raw_rx: Vec::new(),
             raw_tx: Vec::new(),
