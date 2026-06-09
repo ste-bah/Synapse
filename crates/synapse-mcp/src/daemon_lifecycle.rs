@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use synapse_core::SubsystemHealth;
@@ -64,6 +65,16 @@ pub(crate) struct ToolCallStart {
     pub foreground_read_error: Option<Value>,
     pub session_target: Option<Value>,
     pub session_target_read_error: Option<Value>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct InFlightToolCallRead {
+    pub seq: u64,
+    pub tool: String,
+    pub mcp_session_id: Option<String>,
+    pub started_at_unix_ms: u64,
+    pub elapsed_ms: u64,
+    pub status: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -404,6 +415,32 @@ pub(crate) fn diagnostic_value() -> Value {
             "detail": "daemon lifecycle ledger not configured in this process",
         }),
     }
+}
+
+pub(crate) fn in_flight_tool_calls_for_session(
+    session_id: &str,
+) -> anyhow::Result<Vec<InFlightToolCallRead>> {
+    let slot = state_slot();
+    let guard = slot
+        .lock()
+        .map_err(|_error| anyhow::anyhow!("daemon lifecycle state lock poisoned"))?;
+    let Some(state) = guard.as_ref() else {
+        bail!("daemon lifecycle ledger is not configured");
+    };
+    let now = now_unix_ms();
+    Ok(state
+        .in_flight
+        .values()
+        .filter(|event| event.mcp_session_id.as_deref() == Some(session_id))
+        .map(|event| InFlightToolCallRead {
+            seq: event.seq,
+            tool: event.tool.clone(),
+            mcp_session_id: event.mcp_session_id.clone(),
+            started_at_unix_ms: event.started_at_unix_ms,
+            elapsed_ms: now.saturating_sub(event.started_at_unix_ms),
+            status: event.status.clone(),
+        })
+        .collect())
 }
 
 pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {

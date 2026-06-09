@@ -30,6 +30,7 @@ pub(crate) type SharedTargetClaims = Arc<Mutex<TargetClaimRegistry>>;
 #[derive(Debug, Default)]
 pub(crate) struct TargetClaimRegistry {
     claims: BTreeMap<String, TargetClaimEntry>,
+    next_generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -41,6 +42,7 @@ pub(crate) struct TargetClaimEntry {
     renewed_at_unix_ms: u64,
     ttl_ms: u64,
     expires_at_unix_ms: u64,
+    generation: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -58,6 +60,22 @@ pub enum TargetClaimTargetParam {
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetClaimParams {
+    #[serde(default)]
+    #[schemars(default)]
+    pub target: Option<TargetClaimTargetParam>,
+    #[serde(default = "default_target_claim_ttl_ms")]
+    #[schemars(
+        default = "default_target_claim_ttl_ms",
+        range(min = 1000, max = 600000)
+    )]
+    pub ttl_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TargetClaimAdoptParams {
+    /// Existing owner session id read from target_claim_status/session_list.
+    pub owner_session_id: String,
     #[serde(default)]
     #[schemars(default)]
     pub target: Option<TargetClaimTargetParam>,
@@ -96,6 +114,7 @@ pub struct TargetClaimRead {
     pub ttl_ms: u64,
     pub expires_at_unix_ms: u64,
     pub expires_in_ms: u64,
+    pub generation: u64,
     pub source_of_truth: String,
 }
 
@@ -105,6 +124,19 @@ pub struct TargetClaimResponse {
     pub session_id: String,
     pub outcome: String,
     pub claim: TargetClaimRead,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TargetClaimAdoptResponse {
+    pub session_id: String,
+    pub adopted_from_session_id: String,
+    pub outcome: String,
+    pub prior_claim: TargetClaimRead,
+    pub claim: TargetClaimRead,
+    pub owner_in_flight_before: Vec<crate::daemon_lifecycle::InFlightToolCallRead>,
+    pub owner_teardown_report: crate::server::session_lifecycle::SessionTeardownReport,
+    pub source_of_truth: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -196,6 +228,101 @@ impl SynapseService {
                 "target_claim",
             )),
         }
+    }
+
+    #[tool(
+        description = "Explicitly recover a target claim from an older live same-agent MCP session after client churn/compaction. The caller must provide the current owner_session_id from target_claim_status/session_list; adoption fails closed unless both sessions have the same client identity, the caller is newer, and the old owner has no in-flight tool call. On success the old session is terminated through session lifecycle cleanup before the caller receives the target claim."
+    )]
+    pub async fn target_claim_adopt(
+        &self,
+        params: Parameters<TargetClaimAdoptParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TargetClaimAdoptResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "target_claim_adopt",
+            "tool.invocation kind=target_claim_adopt"
+        );
+        let session_id = require_claim_session_id(&request_context)?;
+        let TargetClaimAdoptParams {
+            owner_session_id,
+            target,
+            ttl_ms,
+        } = params.0;
+        super::session_tools::validate_session_id(&owner_session_id)?;
+        if owner_session_id == session_id {
+            return Err(adopt_refused_error(
+                &session_id,
+                &owner_session_id,
+                "target_claim_adopt requires a different owner_session_id",
+                None,
+                None,
+            ));
+        }
+        validate_target_claim_ttl(ttl_ms)?;
+        let target = self.resolve_target_claim_target(&session_id, target)?;
+        validate_claim_target(&target)?;
+        let now = unix_time_ms_now();
+        let live_sessions = self.live_target_claim_sessions(now, Some(&session_id))?;
+        let prior_entry = {
+            let mut guard = self.lock_target_claims()?;
+            guard.prune_inactive(now, &live_sessions);
+            guard.get(&target_key(&target))
+        }
+        .ok_or_else(|| target_claim_not_found_error("target_claim_adopt", &session_id, &target))?;
+        if prior_entry.owner_session_id != owner_session_id {
+            return Err(adopt_refused_error(
+                &session_id,
+                &owner_session_id,
+                "target_claim_adopt owner_session_id does not match the live target claim owner",
+                None,
+                None,
+            ));
+        }
+        let prior_claim = prior_entry.read(now);
+        let (_requester, _owner, owner_in_flight_before) =
+            self.ensure_same_agent_adoption_allowed(&session_id, &owner_session_id, now)?;
+
+        let lifecycle = self.session_lifecycle_state()?;
+        let owner_teardown_report = lifecycle
+            .teardown_session(&owner_session_id, "target_claim_adopt")
+            .await?;
+
+        let now_after = unix_time_ms_now();
+        let live_sessions_after = self.live_target_claim_sessions(now_after, Some(&session_id))?;
+        let mut guard = self.lock_target_claims()?;
+        guard.prune_inactive(now_after, &live_sessions_after);
+        let (entry, _claim_outcome) =
+            match guard.claim(&session_id, target, ttl_ms, now_after, &live_sessions_after) {
+                Ok(result) => result,
+                Err(conflict) => {
+                    return Err(conflict_error(
+                        "target_claim_adopt",
+                        &session_id,
+                        &conflict,
+                        "adopt_after_owner_teardown",
+                    ));
+                }
+            };
+        tracing::info!(
+            code = "TARGET_CLAIM_ADOPTED",
+            session_id = %session_id,
+            adopted_from_session_id = %owner_session_id,
+            target_key = %entry.target_key,
+            generation = entry.generation,
+            prior_generation = prior_entry.generation,
+            "readback=target_claim_adopt outcome=adopted"
+        );
+        Ok(Json(TargetClaimAdoptResponse {
+            session_id,
+            adopted_from_session_id: owner_session_id,
+            outcome: "adopted".to_owned(),
+            prior_claim,
+            claim: entry.read(now_after),
+            owner_in_flight_before,
+            owner_teardown_report,
+            source_of_truth: source_of_truth(),
+        }))
     }
 
     #[tool(
@@ -404,6 +531,120 @@ impl SynapseService {
         }
         Ok(live)
     }
+
+    fn ensure_same_agent_adoption_allowed(
+        &self,
+        requester_session_id: &str,
+        owner_session_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<
+        (
+            super::session_registry::SessionRegistryRead,
+            super::session_registry::SessionRegistryRead,
+            Vec<crate::daemon_lifecycle::InFlightToolCallRead>,
+        ),
+        ErrorData,
+    > {
+        let (requester, owner) = {
+            let guard = self.session_registry_ref().lock().map_err(|_error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "session registry lock poisoned while validating target claim adoption",
+                )
+            })?;
+            let reads = guard.reads(now_unix_ms);
+            let requester = reads
+                .iter()
+                .find(|read| read.session_id == requester_session_id)
+                .cloned()
+                .ok_or_else(|| {
+                    adopt_refused_error(
+                        requester_session_id,
+                        owner_session_id,
+                        "requesting session is missing from session registry",
+                        None,
+                        None,
+                    )
+                })?;
+            let owner = reads
+                .iter()
+                .find(|read| read.session_id == owner_session_id)
+                .cloned()
+                .ok_or_else(|| {
+                    adopt_refused_error(
+                        requester_session_id,
+                        owner_session_id,
+                        "owner session is missing from session registry",
+                        Some(&requester),
+                        None,
+                    )
+                })?;
+            (requester, owner)
+        };
+        if requester.lifecycle != "live" || owner.lifecycle != "live" {
+            return Err(adopt_refused_error(
+                requester_session_id,
+                owner_session_id,
+                "target_claim_adopt requires both sessions to be live before explicit takeover",
+                Some(&requester),
+                Some(&owner),
+            ));
+        }
+        if requester.agent_kind == "unknown" || requester.agent_kind != owner.agent_kind {
+            return Err(adopt_refused_error(
+                requester_session_id,
+                owner_session_id,
+                "target_claim_adopt requires matching known agent_kind",
+                Some(&requester),
+                Some(&owner),
+            ));
+        }
+        if requester.client_name.is_none() || requester.client_name != owner.client_name {
+            return Err(adopt_refused_error(
+                requester_session_id,
+                owner_session_id,
+                "target_claim_adopt requires matching client_name",
+                Some(&requester),
+                Some(&owner),
+            ));
+        }
+        if requester.started_at_unix_ms <= owner.started_at_unix_ms {
+            return Err(adopt_refused_error(
+                requester_session_id,
+                owner_session_id,
+                "target_claim_adopt requires the adopting session to be newer than the owner",
+                Some(&requester),
+                Some(&owner),
+            ));
+        }
+        let owner_in_flight = crate::daemon_lifecycle::in_flight_tool_calls_for_session(
+            owner_session_id,
+        )
+        .map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("read daemon lifecycle in-flight tool calls: {error:#}"),
+            )
+        })?;
+        if !owner_in_flight.is_empty() {
+            return Err(owner_active_error(
+                requester_session_id,
+                owner_session_id,
+                owner_in_flight,
+                "owner session has in-flight tool calls",
+            ));
+        }
+        let lease_status = synapse_action::lease::status();
+        if lease_status.owner_session_id.as_deref() == Some(owner_session_id) {
+            return Err(owner_active_error(
+                requester_session_id,
+                owner_session_id,
+                Vec::new(),
+                "owner session holds the foreground input lease",
+            ));
+        }
+        Ok((requester, owner, owner_in_flight))
+    }
 }
 
 pub(crate) fn cleanup_claims_for_session(
@@ -457,30 +698,34 @@ impl TargetClaimRegistry {
                 tool: "target_claim",
             });
         }
-        let outcome = if self.claims.contains_key(&target_key) {
-            "renewed"
+        let existing = self.claims.get(&target_key).cloned();
+        let same_owner = existing
+            .as_ref()
+            .is_some_and(|entry| entry.owner_session_id == session_id);
+        let outcome = if same_owner { "renewed" } else { "claimed" };
+        let generation = if same_owner {
+            existing.as_ref().map_or(0, |entry| entry.generation)
         } else {
-            "claimed"
+            self.allocate_generation()
         };
-        let entry = self
-            .claims
-            .entry(target_key.clone())
-            .and_modify(|entry| {
-                entry.owner_session_id = session_id.to_owned();
-                entry.renewed_at_unix_ms = now_unix_ms;
-                entry.ttl_ms = ttl_ms;
-                entry.expires_at_unix_ms = now_unix_ms.saturating_add(ttl_ms);
-            })
-            .or_insert_with(|| TargetClaimEntry {
-                target_key,
-                target,
-                owner_session_id: session_id.to_owned(),
-                claimed_at_unix_ms: now_unix_ms,
-                renewed_at_unix_ms: now_unix_ms,
-                ttl_ms,
-                expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms),
-            })
-            .clone();
+        let claimed_at_unix_ms = if same_owner {
+            existing
+                .as_ref()
+                .map_or(now_unix_ms, |entry| entry.claimed_at_unix_ms)
+        } else {
+            now_unix_ms
+        };
+        let entry = TargetClaimEntry {
+            target_key: target_key.clone(),
+            target,
+            owner_session_id: session_id.to_owned(),
+            claimed_at_unix_ms,
+            renewed_at_unix_ms: now_unix_ms,
+            ttl_ms,
+            expires_at_unix_ms: now_unix_ms.saturating_add(ttl_ms),
+            generation,
+        };
+        self.claims.insert(target_key, entry.clone());
         Ok((entry, outcome))
     }
 
@@ -521,6 +766,10 @@ impl TargetClaimRegistry {
             .cloned()
     }
 
+    fn get(&self, target_key: &str) -> Option<TargetClaimEntry> {
+        self.claims.get(target_key).cloned()
+    }
+
     pub(crate) fn reads(&self, now_unix_ms: u64) -> Vec<TargetClaimRead> {
         self.claims
             .values()
@@ -533,6 +782,11 @@ impl TargetClaimRegistry {
             entry.expires_at_unix_ms > now_unix_ms
                 && live_sessions.contains(&entry.owner_session_id)
         });
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.saturating_add(1);
+        self.next_generation
     }
 }
 
@@ -547,6 +801,7 @@ impl TargetClaimEntry {
             ttl_ms: self.ttl_ms,
             expires_at_unix_ms: self.expires_at_unix_ms,
             expires_in_ms: self.expires_at_unix_ms.saturating_sub(now_unix_ms),
+            generation: self.generation,
             source_of_truth: source_of_truth(),
         }
     }
@@ -709,7 +964,99 @@ fn conflict_error(
             "claim": read,
             "read_only_observe_allowed": true,
             "mutation_allowed": false,
-            "resolution": "release the claim, wait for claim expiry, or use a different target",
+            "resolution": "release the claim, wait for claim expiry, use a different target, or call target_claim_adopt only for an older idle same-agent owner read from the Source of Truth",
+        })),
+    )
+}
+
+fn target_claim_not_found_error(
+    tool: &'static str,
+    requester_session_id: &str,
+    target: &SessionTarget,
+) -> ErrorData {
+    let key = target_key(target);
+    tracing::warn!(
+        code = error_codes::TARGET_CLAIM_NOT_FOUND,
+        tool,
+        requester_session_id,
+        target_key = %key,
+        "target claim adoption found no live claim for target"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("{tool} found no live claim for target {key}"),
+        Some(json!({
+            "code": error_codes::TARGET_CLAIM_NOT_FOUND,
+            "tool": tool,
+            "requester_session_id": requester_session_id,
+            "target_key": key,
+            "target": target_wire(target),
+            "source_of_truth": source_of_truth(),
+            "resolution": "read target_claim_status/session_list and call target_claim for unowned or expired targets",
+        })),
+    )
+}
+
+fn adopt_refused_error(
+    requester_session_id: &str,
+    owner_session_id: &str,
+    reason: &str,
+    requester: Option<&super::session_registry::SessionRegistryRead>,
+    owner: Option<&super::session_registry::SessionRegistryRead>,
+) -> ErrorData {
+    tracing::warn!(
+        code = error_codes::TARGET_CLAIM_ADOPT_REFUSED,
+        requester_session_id,
+        owner_session_id,
+        reason,
+        "target claim adoption refused"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("target_claim_adopt refused: {reason}"),
+        Some(json!({
+            "code": error_codes::TARGET_CLAIM_ADOPT_REFUSED,
+            "tool": "target_claim_adopt",
+            "requester_session_id": requester_session_id,
+            "owner_session_id": owner_session_id,
+            "reason": reason,
+            "requester": requester,
+            "owner": owner,
+            "source_of_truth": "session registry + daemon target claim registry",
+            "mutation_allowed": false,
+        })),
+    )
+}
+
+fn owner_active_error(
+    requester_session_id: &str,
+    owner_session_id: &str,
+    owner_in_flight: Vec<crate::daemon_lifecycle::InFlightToolCallRead>,
+    reason: &str,
+) -> ErrorData {
+    let lease_status = synapse_action::lease::status();
+    tracing::warn!(
+        code = error_codes::TARGET_CLAIM_OWNER_ACTIVE,
+        requester_session_id,
+        owner_session_id,
+        reason,
+        in_flight_count = owner_in_flight.len(),
+        lease_owner_session_id = ?lease_status.owner_session_id,
+        "target claim adoption refused because owner is active"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("target_claim_adopt refused: {reason}"),
+        Some(json!({
+            "code": error_codes::TARGET_CLAIM_OWNER_ACTIVE,
+            "tool": "target_claim_adopt",
+            "requester_session_id": requester_session_id,
+            "owner_session_id": owner_session_id,
+            "reason": reason,
+            "owner_in_flight": owner_in_flight,
+            "lease": lease_status,
+            "source_of_truth": "daemon lifecycle in-flight ledger + input lease registry",
+            "mutation_allowed": false,
         })),
     )
 }
@@ -777,5 +1124,35 @@ mod tests {
             second.0.owner_session_id
         );
         assert_eq!(second.0.owner_session_id, "b");
+    }
+
+    #[test]
+    fn claim_generation_increments_only_on_new_owner() {
+        let mut registry = TargetClaimRegistry::default();
+        let target = SessionTarget::Window { hwnd: 0x9012 };
+        let live_a = BTreeSet::from(["a".to_owned()]);
+        let first = registry
+            .claim("a", target.clone(), 10_000, 1_000, &live_a)
+            .expect("first claim should succeed")
+            .0;
+        let renewed = registry
+            .claim("a", target.clone(), 10_000, 1_500, &live_a)
+            .expect("same owner renew should succeed")
+            .0;
+        let live_b = BTreeSet::from(["b".to_owned()]);
+        registry.prune_inactive(2_001, &live_b);
+        let reclaimed = registry
+            .claim("b", target, 10_000, 2_001, &live_b)
+            .expect("new owner should claim after stale prune")
+            .0;
+
+        println!(
+            "readback=target_claim_generation first={} renewed={} reclaimed={}",
+            first.generation, renewed.generation, reclaimed.generation
+        );
+        assert_eq!(first.generation, 1);
+        assert_eq!(renewed.generation, first.generation);
+        assert!(reclaimed.generation > renewed.generation);
+        assert_eq!(reclaimed.owner_session_id, "b");
     }
 }

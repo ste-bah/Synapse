@@ -6,7 +6,7 @@ use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
 const MATRIX_DOC: &str = include_str!("../../../docs/multi-agent-capability-matrix.md");
 
-const EXPECTED_MATRIX_TOOLS: [&str; 51] = [
+const EXPECTED_MATRIX_TOOLS: [&str; 52] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -56,6 +56,7 @@ const EXPECTED_MATRIX_TOOLS: [&str; 51] = [
     "subscribe",
     "subscribe_cancel",
     "target_claim",
+    "target_claim_adopt",
     "target_claim_status",
     "target_release",
 ];

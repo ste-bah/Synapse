@@ -3,8 +3,10 @@ use super::{
     SynapseService, mcp_error, tool_handler,
 };
 use futures_util::FutureExt as _;
+use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
 use std::panic::AssertUnwindSafe;
+use synapse_core::error_codes;
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for SynapseService {
@@ -18,6 +20,14 @@ impl ServerHandler for SynapseService {
             super::context::optional_mcp_session_id_from_request_context(&context)?;
         let lifecycle_guard =
             self.begin_daemon_lifecycle_tool_call(&tool_name, mcp_session_id.as_deref())?;
+        if let Some(session_id) = mcp_session_id.as_deref()
+            && let Err(error) = self.reject_terminated_session_tool_call(&tool_name, session_id)
+        {
+            lifecycle_guard
+                .finish_error(error_snapshot(&error))
+                .map_err(lifecycle_mcp_error)?;
+            return Err(error);
+        }
         let shutdown_cancel = self.shutdown_cancel_token()?;
         let drain_state = self.drain_state_handle();
         let drain_cancel = drain_state.token();
@@ -120,6 +130,39 @@ impl ServerHandler for SynapseService {
 }
 
 impl SynapseService {
+    fn reject_terminated_session_tool_call(
+        &self,
+        tool_name: &str,
+        session_id: &str,
+    ) -> Result<(), ErrorData> {
+        let terminated = self.terminated_sessions.lock().map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "terminated-session registry lock poisoned while admitting MCP tool call",
+            )
+        })?;
+        if !terminated.contains(session_id) {
+            return Ok(());
+        }
+        tracing::warn!(
+            code = error_codes::HTTP_SESSION_INVALID,
+            session_id,
+            tool = tool_name,
+            "MCP tool call rejected because session lifecycle already terminated it"
+        );
+        Err(ErrorData::new(
+            ErrorCode(-32099),
+            format!("MCP session {session_id:?} was terminated and cannot call {tool_name}"),
+            Some(json!({
+                "code": error_codes::HTTP_SESSION_INVALID,
+                "session_id": session_id,
+                "tool": tool_name,
+                "reason": "session_terminated",
+                "source_of_truth": "terminated-session registry",
+            })),
+        ))
+    }
+
     fn begin_daemon_lifecycle_tool_call(
         &self,
         tool_name: &str,

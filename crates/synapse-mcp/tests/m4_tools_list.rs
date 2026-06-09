@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 99] = [
+const EXPECTED_TOOLS: [&str; 100] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -102,6 +102,7 @@ const EXPECTED_TOOLS: [&str; 99] = [
     "subscribe",
     "subscribe_cancel",
     "target_claim",
+    "target_claim_adopt",
     "target_claim_status",
     "target_release",
 ];
@@ -131,7 +132,7 @@ async fn m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<
         .map(str::to_owned)
         .collect::<Vec<_>>();
     assert_eq!(names, expected);
-    assert_eq!(names.len(), 99);
+    assert_eq!(names.len(), EXPECTED_TOOLS.len());
     assert_no_duplicate_names(&names)?;
 
     assert_schema_roots_closed(tools)?;
