@@ -19,7 +19,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
@@ -36,6 +36,7 @@ const AGENT_SPAWN_SHELL_ENV_VAR: &str = "SYNAPSE_AGENT_SPAWN_SHELL";
 const AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT: usize = 80;
 const AGENT_SPAWN_POLL_INTERVAL_MS: u64 = 250;
 const AGENT_SPAWN_LOG_TAIL_BYTES: usize = 8 * 1024;
+const AGENT_SPAWN_ORPHAN_RECOVERY_STALE_MS: u64 = 10 * 60 * 1000;
 
 #[cfg(windows)]
 const AGENT_SPAWN_WINDOWS_SHELL_CANDIDATES: &[(&str, &str)] = &[
@@ -404,6 +405,15 @@ impl SynapseService {
         validate_agent_spawn_params(&params)?;
         validate_spawn_target(&params.target)?;
 
+        let orphan_recovery = recover_orphaned_agent_spawn_terminal_artifacts()?;
+        if orphan_recovery.recovered_count > 0 {
+            tracing::warn!(
+                code = "AGENT_SPAWN_ORPHAN_RECOVERY",
+                ?orphan_recovery,
+                "act_spawn_agent recovered stale non-terminal agent spawn artifacts before launching a new agent"
+            );
+        }
+
         let working_dir = resolve_agent_working_dir(params.working_dir.as_deref())?;
         let token = read_synapse_bearer_token()?;
         let before_session_ids = self.current_session_ids()?;
@@ -454,6 +464,9 @@ impl SynapseService {
             launch_host.source.clone(),
         );
         env.insert("SYNAPSE_MCP_URL".to_owned(), params.mcp_url.clone());
+        env.insert("PYTHONUTF8".to_owned(), "1".to_owned());
+        env.insert("PYTHONIOENCODING".to_owned(), "utf-8".to_owned());
+        env.insert("PYTHONUNBUFFERED".to_owned(), "1".to_owned());
 
         let launch_params = ActLaunchParams {
             target: launch_host.target.clone(),
@@ -1281,8 +1294,425 @@ fn write_agent_spawn_daemon_terminal_artifacts(
     })
 }
 
+#[derive(Debug, Default)]
+struct AgentSpawnOrphanRecoveryReport {
+    scanned_count: usize,
+    recovered_count: usize,
+    skipped_terminal_count: usize,
+    skipped_live_count: usize,
+    skipped_fresh_count: usize,
+    recovered_spawn_ids: Vec<String>,
+}
+
+fn recover_orphaned_agent_spawn_terminal_artifacts()
+-> Result<AgentSpawnOrphanRecoveryReport, ErrorData> {
+    let root = agent_spawn_root_dir()?;
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AgentSpawnOrphanRecoveryReport::default());
+        }
+        Err(error) => {
+            return Err(mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "act_spawn_agent failed to read agent spawn root {} during orphan recovery: {error}",
+                    root.display()
+                ),
+            ));
+        }
+    };
+    let now = unix_time_ms_now();
+    let mut report = AgentSpawnOrphanRecoveryReport::default();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "act_spawn_agent failed to read an agent spawn root entry at {} during orphan recovery: {error}",
+                    root.display()
+                ),
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "act_spawn_agent failed to read file type for {} during orphan recovery: {error}",
+                    entry.path().display()
+                ),
+            )
+        })?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let spawn_id = entry.file_name().to_string_lossy().into_owned();
+        if !spawn_id.starts_with("agent-spawn-") {
+            continue;
+        }
+        report.scanned_count += 1;
+        let log_dir = entry.path();
+        let decision = agent_spawn_orphan_recovery_decision(&spawn_id, &log_dir, now)?;
+        match decision {
+            AgentSpawnOrphanRecoveryDecision::SkipTerminal => {
+                report.skipped_terminal_count += 1;
+            }
+            AgentSpawnOrphanRecoveryDecision::SkipLive => {
+                report.skipped_live_count += 1;
+            }
+            AgentSpawnOrphanRecoveryDecision::SkipFresh => {
+                report.skipped_fresh_count += 1;
+            }
+            AgentSpawnOrphanRecoveryDecision::Recover(recovery) => {
+                write_agent_spawn_orphan_terminal_artifacts(&spawn_id, &log_dir, &recovery)?;
+                report.recovered_count += 1;
+                report.recovered_spawn_ids.push(spawn_id);
+            }
+        }
+    }
+    Ok(report)
+}
+
+#[derive(Debug)]
+enum AgentSpawnOrphanRecoveryDecision {
+    SkipTerminal,
+    SkipLive,
+    SkipFresh,
+    Recover(AgentSpawnOrphanRecovery),
+}
+
+#[derive(Debug)]
+struct AgentSpawnOrphanRecovery {
+    status: &'static str,
+    reason: &'static str,
+    cli: String,
+    wrapper_process_id: Option<u32>,
+    source_completion_status: Option<Value>,
+    source_completion_status_error: Option<String>,
+    status_age_ms: Option<u64>,
+}
+
+fn agent_spawn_orphan_recovery_decision(
+    spawn_id: &str,
+    log_dir: &Path,
+    now: u64,
+) -> Result<AgentSpawnOrphanRecoveryDecision, ErrorData> {
+    let completion_status_path = log_dir.join("completion-status.json");
+    let status_age_ms =
+        file_age_ms(&completion_status_path, now).or_else(|| file_age_ms(log_dir, now));
+    let status_bytes = match fs::read(&completion_status_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if stale_enough_for_orphan_recovery(status_age_ms) {
+                return Ok(AgentSpawnOrphanRecoveryDecision::Recover(
+                    AgentSpawnOrphanRecovery {
+                        status: "orphaned_status_missing_recovered",
+                        reason: "missing_completion_status_stale",
+                        cli: "unknown".to_owned(),
+                        wrapper_process_id: None,
+                        source_completion_status: None,
+                        source_completion_status_error: Some(format!(
+                            "completion-status.json was missing for stale spawn directory {spawn_id}"
+                        )),
+                        status_age_ms,
+                    },
+                ));
+            }
+            return Ok(AgentSpawnOrphanRecoveryDecision::SkipFresh);
+        }
+        Err(error) => {
+            return Err(mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "act_spawn_agent failed to read agent spawn completion status {} during orphan recovery: {error}",
+                    completion_status_path.display()
+                ),
+            ));
+        }
+    };
+    let status_json = match serde_json::from_slice::<Value>(&status_bytes) {
+        Ok(status_json) => status_json,
+        Err(error) => {
+            if stale_enough_for_orphan_recovery(status_age_ms) {
+                return Ok(AgentSpawnOrphanRecoveryDecision::Recover(
+                    AgentSpawnOrphanRecovery {
+                        status: "orphaned_status_invalid_recovered",
+                        reason: "invalid_completion_status_stale",
+                        cli: "unknown".to_owned(),
+                        wrapper_process_id: None,
+                        source_completion_status: None,
+                        source_completion_status_error: Some(error.to_string()),
+                        status_age_ms,
+                    },
+                ));
+            }
+            return Ok(AgentSpawnOrphanRecoveryDecision::SkipFresh);
+        }
+    };
+    let Some(status) = status_json.get("status").and_then(Value::as_str) else {
+        if stale_enough_for_orphan_recovery(status_age_ms) {
+            return Ok(AgentSpawnOrphanRecoveryDecision::Recover(
+                AgentSpawnOrphanRecovery {
+                    status: "orphaned_status_invalid_recovered",
+                    reason: "missing_status_field_stale",
+                    cli: status_json
+                        .get("cli")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_owned(),
+                    wrapper_process_id: wrapper_process_id_from_status(&status_json),
+                    source_completion_status: Some(status_json),
+                    source_completion_status_error: None,
+                    status_age_ms,
+                },
+            ));
+        }
+        return Ok(AgentSpawnOrphanRecoveryDecision::SkipFresh);
+    };
+    if status != "running" {
+        return Ok(AgentSpawnOrphanRecoveryDecision::SkipTerminal);
+    }
+    let wrapper_process_id = wrapper_process_id_from_status(&status_json);
+    if let Some(pid) = wrapper_process_id {
+        if wrapper_process_is_live_for_status(pid, &status_json) {
+            return Ok(AgentSpawnOrphanRecoveryDecision::SkipLive);
+        }
+        return Ok(AgentSpawnOrphanRecoveryDecision::Recover(
+            AgentSpawnOrphanRecovery {
+                status: "orphaned_running_recovered",
+                reason: "running_status_wrapper_process_gone",
+                cli: status_json
+                    .get("cli")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                wrapper_process_id,
+                source_completion_status: Some(status_json),
+                source_completion_status_error: None,
+                status_age_ms,
+            },
+        ));
+    }
+    if stale_enough_for_orphan_recovery(status_age_ms) {
+        return Ok(AgentSpawnOrphanRecoveryDecision::Recover(
+            AgentSpawnOrphanRecovery {
+                status: "orphaned_running_recovered",
+                reason: "running_status_without_wrapper_pid_stale",
+                cli: status_json
+                    .get("cli")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_owned(),
+                wrapper_process_id: None,
+                source_completion_status: Some(status_json),
+                source_completion_status_error: None,
+                status_age_ms,
+            },
+        ));
+    }
+    Ok(AgentSpawnOrphanRecoveryDecision::SkipFresh)
+}
+
+fn stale_enough_for_orphan_recovery(age_ms: Option<u64>) -> bool {
+    age_ms.is_some_and(|age_ms| age_ms >= AGENT_SPAWN_ORPHAN_RECOVERY_STALE_MS)
+}
+
+fn wrapper_process_id_from_status(status: &Value) -> Option<u32> {
+    status
+        .get("wrapper_process_id")
+        .or_else(|| status.get("powershell_process_id"))
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+fn wrapper_process_is_live_for_status(pid: u32, status: &Value) -> bool {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let mut system = System::new();
+    let sys_pid = Pid::from_u32(pid);
+    system.refresh_processes(ProcessesToUpdate::Some(&[sys_pid]), false);
+    let Some(process) = system.process(sys_pid) else {
+        return false;
+    };
+    let Some(wrapper_started_at_unix_ms) = status
+        .get("wrapper_started_at_unix_ms")
+        .and_then(Value::as_u64)
+    else {
+        return true;
+    };
+    let process_started_at_unix_ms = process.start_time().saturating_mul(1000);
+    process_started_at_unix_ms.abs_diff(wrapper_started_at_unix_ms) <= 30_000
+}
+
+fn wrapper_process_is_live_for_recovery(recovery: &AgentSpawnOrphanRecovery) -> bool {
+    let Some(pid) = recovery.wrapper_process_id else {
+        return false;
+    };
+    if let Some(status) = &recovery.source_completion_status {
+        wrapper_process_is_live_for_status(pid, status)
+    } else {
+        process_exists(pid)
+    }
+}
+
+fn write_agent_spawn_orphan_terminal_artifacts(
+    spawn_id: &str,
+    log_dir: &Path,
+    recovery: &AgentSpawnOrphanRecovery,
+) -> Result<(), ErrorData> {
+    let stdout_path = log_dir.join("stdout.jsonl");
+    let stderr_path = log_dir.join("stderr.log");
+    let final_message_path = log_dir.join("final-message.txt");
+    let completion_status_path = log_dir.join("completion-status.json");
+    let stdout_len = file_len(&stdout_path);
+    let stderr_len = file_len(&stderr_path);
+    let final_message_len_before = file_len(&final_message_path);
+    let (stdout_line_count, last_stdout_event_type) = stdout_summary_lossy(&stdout_path);
+    let stdout_tail = tail_file_lossy(&stdout_path, AGENT_SPAWN_LOG_TAIL_BYTES);
+    let stderr_tail = tail_file_lossy(&stderr_path, AGENT_SPAWN_LOG_TAIL_BYTES);
+    let completed_at_unix_ms = unix_time_ms_now();
+    let details = json!({
+        "reason": recovery.reason,
+        "spawn_id": spawn_id,
+        "log_dir": log_dir.display().to_string(),
+        "wrapper_process_id": recovery.wrapper_process_id,
+        "wrapper_process_live": wrapper_process_is_live_for_recovery(recovery),
+        "status_age_ms": recovery.status_age_ms,
+        "stale_threshold_ms": AGENT_SPAWN_ORPHAN_RECOVERY_STALE_MS,
+        "source_completion_status": &recovery.source_completion_status,
+        "source_completion_status_error": &recovery.source_completion_status_error,
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
+    });
+    if final_message_len_before == 0 {
+        let final_message = json!({
+            "schema_version": 1,
+            "spawn_id": spawn_id,
+            "cli": &recovery.cli,
+            "status": recovery.status,
+            "exit_code": null,
+            "error_message": "agent spawn wrapper exited, disappeared, or daemon state was lost before a terminal completion artifact was written",
+            "message": "Synapse act_spawn_agent orphan recovery wrote this terminal artifact because a stale spawn directory did not contain a terminal final-message/completion-status pair.",
+            "stdout_path": stdout_path.display().to_string(),
+            "stderr_path": stderr_path.display().to_string(),
+            "completion_status_path": completion_status_path.display().to_string(),
+            "details": details.clone(),
+        });
+        let bytes = serde_json::to_vec_pretty(&final_message).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("act_spawn_agent failed to encode orphan recovery final-message artifact: {error}"),
+            )
+        })?;
+        fs::write(&final_message_path, bytes).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "act_spawn_agent failed to write orphan recovery final-message artifact {}: {error}",
+                    final_message_path.display()
+                ),
+            )
+        })?;
+    }
+    let final_message_len_after = file_len(&final_message_path);
+    let completion_status = json!({
+        "schema_version": 1,
+        "spawn_id": spawn_id,
+        "cli": &recovery.cli,
+        "status": recovery.status,
+        "exit_code": null,
+        "error_message": "agent spawn wrapper exited, disappeared, or daemon state was lost before a terminal completion artifact was written",
+        "wrapper_process_id": recovery.wrapper_process_id,
+        "wrapper_process_live": wrapper_process_is_live_for_recovery(recovery),
+        "wrapper_started_at_unix_ms": recovery
+            .source_completion_status
+            .as_ref()
+            .and_then(|status| status.get("wrapper_started_at_unix_ms"))
+            .and_then(Value::as_u64),
+        "completed_at_unix_ms": completed_at_unix_ms,
+        "elapsed_ms": null,
+        "requested_hold_open_ms": recovery
+            .source_completion_status
+            .as_ref()
+            .and_then(|status| status.get("requested_hold_open_ms"))
+            .cloned(),
+        "hold_open_elapsed_ms_met": false,
+        "final_message_path": final_message_path.display().to_string(),
+        "final_message_bytes": final_message_len_after,
+        "final_message_present": final_message_len_after > 0,
+        "final_message_source": if final_message_len_before > 0 {
+            "preexisting_final_message_without_terminal_status"
+        } else {
+            "orphan_recovery_artifact_json"
+        },
+        "recovered_final_message_written": false,
+        "fallback_final_message_written": final_message_len_before == 0,
+        "stdout_path": stdout_path.display().to_string(),
+        "stdout_line_count": stdout_line_count,
+        "last_stdout_event_type": last_stdout_event_type,
+        "stdout_bytes": stdout_len,
+        "stderr_path": stderr_path.display().to_string(),
+        "stderr_bytes": stderr_len,
+        "daemon_terminal_artifact": true,
+        "orphan_recovery_artifact": true,
+        "completion_status_source": "act_spawn_agent_orphan_recovery",
+        "source_completion_status_error": &recovery.source_completion_status_error,
+        "log_dir": log_dir.display().to_string(),
+        "details": details,
+    });
+    let bytes = serde_json::to_vec_pretty(&completion_status).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_spawn_agent failed to encode orphan recovery completion-status artifact: {error}"),
+        )
+    })?;
+    fs::write(&completion_status_path, bytes).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to write orphan recovery completion-status artifact {}: {error}",
+                completion_status_path.display()
+            ),
+        )
+    })?;
+    Ok(())
+}
+
 fn file_len(path: &Path) -> u64 {
     fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+fn file_age_ms(path: &Path, now: u64) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    let modified = modified.duration_since(UNIX_EPOCH).ok()?.as_millis();
+    let modified = u64::try_from(modified).ok()?;
+    Some(now.saturating_sub(modified))
+}
+
+fn stdout_summary_lossy(path: &Path) -> (u64, Option<String>) {
+    let Some(stdout) = tail_file_lossy(path, usize::MAX) else {
+        return (0, None);
+    };
+    let mut line_count = 0;
+    let mut last_event_type = None;
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        line_count += 1;
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            if let Some(event_type) = value.get("type").and_then(Value::as_str) {
+                last_event_type = Some(event_type.to_owned());
+            } else if let Some(event_type) = value
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+            {
+                last_event_type = Some(event_type.to_owned());
+            }
+        }
+    }
+    (line_count, last_event_type)
 }
 
 fn validate_spawn_target(target: &Option<ActSpawnAgentTarget>) -> Result<(), ErrorData> {
@@ -1479,14 +1909,22 @@ fn build_agent_spawn_prompt(
         "Do not add an artificial hold-open sleep after completing the provisioning checks and assigned task.".to_owned()
     } else {
         format!(
-            "After the provisioning checks and assigned task, keep this primary process alive for at least {} ms using a normal local shell sleep command, then finish.",
-            params.hold_open_ms
+            "After the provisioning checks and assigned task, keep this primary process alive for at least {} ms using Start-Sleep -Milliseconds {}, then finish.",
+            params.hold_open_ms, params.hold_open_ms
         )
     };
     Ok(format!(
         "You are a primary {cli} agent spawned by Synapse act_spawn_agent.\n\
 Spawn ID: {spawn_id}\n\
 Working directory: {working_dir}\n\
+Windows shell contract:\n\
+- Your local shell commands run under PowerShell on Windows, not Bash.\n\
+- Do not use Bash heredocs such as `python - <<'PY'`. For multi-line Python, pipe a PowerShell here-string into Python:\n\
+  @'\n\
+  print(\"ok\")\n\
+  '@ | python -\n\
+- Use `Start-Sleep -Milliseconds N` for sleeps.\n\
+- Write evidence/report files as UTF-8.\n\
 Mandatory provisioning checks:\n\
 1. Use the real Synapse MCP health tool through your normal configured MCP client. Do not use curl, direct HTTP, helper scripts, or local storage writes as a substitute.\n\
 2. Use the real Synapse MCP session_list tool through your normal configured MCP client.\n\
@@ -1586,8 +2024,18 @@ fn agent_spawn_wrapper_powershell(
     let cli = ps_single_quote(params.cli.as_str());
     format!(
         "$ErrorActionPreference = 'Stop'\n\
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)\n\
+$OutputEncoding = $Utf8NoBom\n\
+$PSDefaultParameterValues['*:Encoding'] = 'utf8'\n\
+try {{ [Console]::OutputEncoding = $Utf8NoBom }} catch {{}}\n\
+try {{ [Console]::InputEncoding = $Utf8NoBom }} catch {{}}\n\
+$env:PYTHONUTF8 = '1'\n\
+$env:PYTHONIOENCODING = 'utf-8'\n\
+$env:PYTHONUNBUFFERED = '1'\n\
+Remove-Item Env:PYTHONLEGACYWINDOWSSTDIO -ErrorAction SilentlyContinue\n\
 $spawnId = {spawn_id_expr}\n\
 $spawnCli = {cli}\n\
+$spawnWrapperProcessId = $PID\n\
 $requestedHoldOpenMs = [int64]{hold_open_ms}\n\
 $spawnPromptPath = {prompt_path}\n\
 $spawnStdoutPath = {stdout_path}\n\
@@ -1610,7 +2058,7 @@ function Get-SpawnStdoutSummary([string]$Path) {{\n\
     $lineCount = 0\n\
     $lastEventType = $null\n\
     if (Test-Path -LiteralPath $Path) {{\n\
-        foreach ($line in Get-Content -LiteralPath $Path) {{\n\
+        foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {{\n\
             if ([string]::IsNullOrWhiteSpace($line)) {{ continue }}\n\
             $lineCount++\n\
             try {{\n\
@@ -1626,7 +2074,7 @@ function Get-SpawnStdoutSummary([string]$Path) {{\n\
 function Get-SpawnFinalAssistantTextFromStdout([string]$Path) {{\n\
     $finalText = $null\n\
     if (Test-Path -LiteralPath $Path) {{\n\
-        foreach ($line in Get-Content -LiteralPath $Path) {{\n\
+        foreach ($line in Get-Content -LiteralPath $Path -Encoding UTF8) {{\n\
             if ([string]::IsNullOrWhiteSpace($line)) {{ continue }}\n\
             try {{\n\
                 $event = $line | ConvertFrom-Json -ErrorAction Stop\n\
@@ -1689,6 +2137,7 @@ function Write-SpawnCompletionStatus([string]$Status, [int]$ExitCode, [string]$E
         status = $Status\n\
         exit_code = $ExitCode\n\
         error_message = $ErrorMessage\n\
+        wrapper_process_id = $spawnWrapperProcessId\n\
         wrapper_started_at_unix_ms = $spawnStartedAtUnixMs\n\
         completed_at_unix_ms = $now\n\
         elapsed_ms = $elapsed\n\
@@ -1712,7 +2161,7 @@ function Write-SpawnCompletionStatus([string]$Status, [int]$ExitCode, [string]$E
 try {{\n\
     Write-SpawnCompletionStatus -Status 'running' -ExitCode -1 -ErrorMessage $null -FallbackFinalMessageWritten:$false\n\
     Set-Location -LiteralPath {working_dir}\n\
-    $prompt = Get-Content -Raw -LiteralPath $spawnPromptPath\n\
+    $prompt = Get-Content -Raw -LiteralPath $spawnPromptPath -Encoding UTF8\n\
 {command_body}\
     $spawnExitCode = if ($null -eq $LASTEXITCODE) {{ 0 }} else {{ [int]$LASTEXITCODE }}\n\
     $spawnTerminalStatus = if ($spawnExitCode -eq 0) {{ 'completed' }} else {{ 'failed' }}\n\
@@ -1720,7 +2169,7 @@ try {{\n\
     $spawnErrorMessage = $_.Exception.Message\n\
     $spawnExitCode = 1\n\
     $spawnTerminalStatus = 'wrapper_error'\n\
-    try {{ Add-Content -LiteralPath $spawnStderrPath -Value (\"SYNAPSE_AGENT_SPAWN_WRAPPER_ERROR: \" + $spawnErrorMessage) }} catch {{}}\n\
+    try {{ Add-Content -LiteralPath $spawnStderrPath -Value (\"SYNAPSE_AGENT_SPAWN_WRAPPER_ERROR: \" + $spawnErrorMessage) -Encoding UTF8 }} catch {{}}\n\
 }} finally {{\n\
     $finalBytesBeforeFallback = Get-SpawnFileLength -Path $spawnFinalMessagePath\n\
     $fallbackWritten = $false\n\
@@ -1918,6 +2367,111 @@ fn launch_lifecycle_tool_error(message: &'static str, data: serde_json::Value) -
         "M4 launch lifecycle tool error: {message}"
     );
     ErrorData::new(ErrorCode(-32099), message, Some(data))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_spawn_params() -> ActSpawnAgentParams {
+        ActSpawnAgentParams {
+            cli: ActSpawnAgentCli::Codex,
+            prompt: Some("write a report".to_owned()),
+            target: None,
+            working_dir: None,
+            mcp_url: "http://127.0.0.1:7700/mcp".to_owned(),
+            wait_timeout_ms: 30_000,
+            hold_open_ms: 1234,
+        }
+    }
+
+    #[test]
+    fn spawn_prompt_names_powershell_contract() {
+        let dir = Path::new(r"C:\code\Synapse");
+        let prompt = build_agent_spawn_prompt("agent-spawn-test", &test_spawn_params(), dir)
+            .expect("build spawn prompt");
+
+        assert!(prompt.contains("PowerShell on Windows, not Bash"));
+        assert!(prompt.contains("Do not use Bash heredocs"));
+        assert!(prompt.contains("@'"));
+        assert!(prompt.contains("Start-Sleep -Milliseconds 1234"));
+    }
+
+    #[test]
+    fn spawn_wrapper_forces_utf8_and_records_wrapper_pid() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let files = AgentSpawnFiles {
+            log_dir: dir.path().to_path_buf(),
+            prompt_path: dir.path().join("prompt.txt"),
+            stdout_path: dir.path().join("stdout.jsonl"),
+            stderr_path: dir.path().join("stderr.log"),
+            final_message_path: dir.path().join("final-message.txt"),
+            completion_status_path: dir.path().join("completion-status.json"),
+            debug_path: None,
+            mcp_config_path: None,
+        };
+        let script = agent_spawn_powershell_script(&test_spawn_params(), &files, dir.path())
+            .expect("build wrapper script");
+
+        assert!(script.contains("$env:PYTHONUTF8 = '1'"));
+        assert!(script.contains("$env:PYTHONIOENCODING = 'utf-8'"));
+        assert!(script.contains("Remove-Item Env:PYTHONLEGACYWINDOWSSTDIO"));
+        assert!(script.contains("wrapper_process_id = $spawnWrapperProcessId"));
+        assert!(script.contains("Get-Content -Raw -LiteralPath $spawnPromptPath -Encoding UTF8"));
+    }
+
+    #[test]
+    fn orphan_recovery_writes_terminal_artifacts_for_dead_wrapper() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let log_dir = dir.path().join("agent-spawn-test");
+        fs::create_dir_all(&log_dir).expect("create log dir");
+        let completion_status_path = log_dir.join("completion-status.json");
+        let stdout_path = log_dir.join("stdout.jsonl");
+        fs::write(
+            &completion_status_path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "spawn_id": "agent-spawn-test",
+                "cli": "codex",
+                "status": "running",
+                "wrapper_process_id": 99_999_999u32,
+                "wrapper_started_at_unix_ms": unix_time_ms_now().saturating_sub(120_000),
+                "requested_hold_open_ms": 60_000
+            }))
+            .expect("encode running status"),
+        )
+        .expect("write running status");
+        fs::write(
+            &stdout_path,
+            b"{\"type\":\"agent_message\",\"text\":\"partial\"}\n",
+        )
+        .expect("write stdout");
+
+        let decision =
+            agent_spawn_orphan_recovery_decision("agent-spawn-test", &log_dir, unix_time_ms_now())
+                .expect("orphan decision");
+        let AgentSpawnOrphanRecoveryDecision::Recover(recovery) = decision else {
+            panic!("dead wrapper should recover");
+        };
+        write_agent_spawn_orphan_terminal_artifacts("agent-spawn-test", &log_dir, &recovery)
+            .expect("write orphan artifacts");
+
+        let status: Value = serde_json::from_slice(
+            &fs::read(&completion_status_path).expect("read recovered status"),
+        )
+        .expect("parse recovered status");
+        assert_eq!(
+            status.get("status").and_then(Value::as_str),
+            Some("orphaned_running_recovered")
+        );
+        assert_eq!(
+            status
+                .get("orphan_recovery_artifact")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(log_dir.join("final-message.txt").exists());
+    }
 }
 
 async fn run_shell_with_idempotency(
