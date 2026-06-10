@@ -25,6 +25,8 @@ const CHROMIUM_RENDERER_UIA_SUPPLEMENT_MAX_NODES: usize = 160;
 #[cfg(windows)]
 const A11Y_TARGET_WINDOW_MINIMIZED: &str = "A11Y_TARGET_WINDOW_MINIMIZED";
 #[cfg(windows)]
+const A11Y_UIA_WORKER_TIMEOUT: &str = synapse_core::error_codes::A11Y_UIA_WORKER_TIMEOUT;
+#[cfg(windows)]
 const A11Y_TARGET_WINDOW_NO_UIA_CONTENT: &str = "A11Y_TARGET_WINDOW_NO_UIA_CONTENT";
 #[cfg(windows)]
 const A11Y_TARGET_WINDOW_SNAPSHOT_FAILED: &str = "A11Y_TARGET_WINDOW_SNAPSHOT_FAILED";
@@ -883,15 +885,15 @@ mod linux_x11 {
 
 #[cfg(windows)]
 pub fn platform_input(depth: u32, mode: PerceptionMode) -> Result<ObservationInput, ErrorData> {
-    let tree = synapse_a11y::snapshot_focused_window(depth).map_err(|err| a11y_error(&err))?;
-    let hwnd = tree
-        .root
-        .parts()
-        .map_err(|err| {
-            crate::m1::mcp_error(synapse_core::error_codes::OBSERVE_INTERNAL, err.to_string())
-        })?
-        .hwnd;
-    let foreground = windows_foreground_context(hwnd)?;
+    let foreground = synapse_a11y::current_foreground_context().map_err(|err| a11y_error(&err))?;
+    let hwnd = foreground.hwnd;
+    let tree = synapse_a11y::snapshot_window_from_hwnd(hwnd, depth).map_err(|err| {
+        if err.code() == A11Y_UIA_WORKER_TIMEOUT {
+            uia_worker_timeout_error(&foreground, "platform_input.snapshot_focused_window", &err)
+        } else {
+            a11y_error(&err)
+        }
+    })?;
     let mut input = input_from_tree_and_foreground(tree, foreground, mode)?;
     input.is_minimized = synapse_a11y::is_window_minimized(hwnd).unwrap_or(false);
     Ok(input)
@@ -916,6 +918,13 @@ pub fn window_input_from_hwnd(
     let tree = match synapse_a11y::snapshot_window_from_hwnd(hwnd, depth) {
         Ok(tree) => tree,
         Err(error) => {
+            if error.code() == A11Y_UIA_WORKER_TIMEOUT {
+                return Err(uia_worker_timeout_error(
+                    &foreground,
+                    "window_input_from_hwnd.snapshot",
+                    &error,
+                ));
+            }
             tracing::warn!(
                 code = A11Y_TARGET_WINDOW_SNAPSHOT_FAILED,
                 hwnd,
@@ -1385,8 +1394,31 @@ fn a11y_error(err: &synapse_a11y::A11yError) -> ErrorData {
             synapse_core::error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
             err.to_string(),
         ),
+        synapse_a11y::A11yError::UiaWorkerTimeout { .. } => {
+            crate::m1::mcp_error(err.code(), err.to_string())
+        }
         _ => crate::m1::mcp_error(synapse_core::error_codes::OBSERVE_INTERNAL, err.to_string()),
     }
+}
+
+#[cfg(windows)]
+fn uia_worker_timeout_error(
+    foreground: &ForegroundContext,
+    phase: &'static str,
+    err: &synapse_a11y::A11yError,
+) -> ErrorData {
+    crate::m1::mcp_error(
+        A11Y_UIA_WORKER_TIMEOUT,
+        format!(
+            "UIA traversal timed out phase={phase} hwnd=0x{:x} pid={} process={} title={:?} bounds={:?} detail={} remediation=restart synapse-mcp to create a fresh UIA worker; avoid broad UIA traversal against this target until the provider is responsive or use a background CDP/OCR path",
+            foreground.hwnd,
+            foreground.pid,
+            foreground.process_name,
+            foreground.window_title,
+            foreground.window_bounds,
+            err
+        ),
+    )
 }
 
 #[cfg(windows)]

@@ -212,6 +212,9 @@ fn a11y_error_to_action(
         synapse_a11y::A11yError::NotAvailable { detail } => {
             crate::ActionError::BackendUnavailable { detail }
         }
+        synapse_a11y::A11yError::UiaWorkerTimeout { .. } => {
+            crate::ActionError::BackendUnavailable { detail }
+        }
         synapse_a11y::A11yError::ForegroundActivationRefused { .. } => {
             crate::ActionError::ForegroundActivationRefused { detail }
         }

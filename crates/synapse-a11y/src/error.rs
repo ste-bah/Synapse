@@ -25,6 +25,8 @@ pub enum A11yError {
     CdpAttachFailed { detail: String },
     #[error("Chromium accessibility tree retrieval failed: {detail}")]
     CdpAxtreeFailed { detail: String },
+    #[error("UI Automation worker job timed out: {detail}")]
+    UiaWorkerTimeout { detail: String },
     #[error("foreground activation refused: {detail}")]
     ForegroundActivationRefused { detail: String },
     #[error("invalid element id: {detail}")]
@@ -50,6 +52,7 @@ impl A11yError {
             Self::CdpUnreachable { .. } => error_codes::A11Y_CDP_UNREACHABLE,
             Self::CdpAttachFailed { .. } => error_codes::A11Y_CDP_ATTACH_FAILED,
             Self::CdpAxtreeFailed { .. } => error_codes::A11Y_CDP_AXTREE_FAILED,
+            Self::UiaWorkerTimeout { .. } => error_codes::A11Y_UIA_WORKER_TIMEOUT,
             Self::ForegroundActivationRefused { .. } => error_codes::FOREGROUND_ACTIVATION_REFUSED,
             Self::InvalidElementId { .. } | Self::Internal { .. } => error_codes::OBSERVE_INTERNAL,
         }
@@ -72,6 +75,13 @@ impl A11yError {
     #[must_use]
     pub fn foreground_activation_refused(detail: impl Into<String>) -> Self {
         Self::ForegroundActivationRefused {
+            detail: detail.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn uia_worker_timeout(detail: impl Into<String>) -> Self {
+        Self::UiaWorkerTimeout {
             detail: detail.into(),
         }
     }

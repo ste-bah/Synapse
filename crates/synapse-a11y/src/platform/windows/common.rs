@@ -1,8 +1,12 @@
 use std::{
     ffi::c_void,
-    sync::{Mutex, OnceLock, mpsc},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use synapse_core::{Rect, UiaPattern};
@@ -34,6 +38,7 @@ type UiaJob = Box<dyn FnOnce(&UIAutomation) + Send + 'static>;
 
 static UIA_WORKER: OnceLock<ProcessUiaWorker> = OnceLock::new();
 static UIA_WORKER_INIT_LOCK: Mutex<()> = Mutex::new(());
+const DEFAULT_UIA_WORKER_JOB_TIMEOUT: Duration = Duration::from_secs(10);
 const FALLBACK_RUNTIME_ID_PREFIX: &str = "ffffffff";
 const FNV64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV64_PRIME: u64 = 0x0100_0000_01b3;
@@ -46,6 +51,7 @@ pub(super) struct RuntimeIdHexReadback {
 
 struct ProcessUiaWorker {
     tx: mpsc::Sender<UiaJob>,
+    timed_out: Arc<AtomicBool>,
 }
 
 fn worker() -> A11yResult<&'static ProcessUiaWorker> {
@@ -86,7 +92,10 @@ fn start_worker() -> A11yResult<ProcessUiaWorker> {
         owned_window_count = readback.owned_window_count,
         "UI Automation worker initialized"
     );
-    Ok(ProcessUiaWorker { tx })
+    Ok(ProcessUiaWorker {
+        tx,
+        timed_out: Arc::new(AtomicBool::new(false)),
+    })
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -128,16 +137,45 @@ fn uia_worker_thread(
 pub(super) fn with_automation<T: Send + 'static>(
     action: impl FnOnce(&UIAutomation) -> A11yResult<T> + Send + 'static,
 ) -> A11yResult<T> {
+    with_automation_operation("uia_worker_job", DEFAULT_UIA_WORKER_JOB_TIMEOUT, action)
+}
+
+pub(super) fn with_automation_operation<T: Send + 'static>(
+    operation: impl Into<String>,
+    timeout: Duration,
+    action: impl FnOnce(&UIAutomation) -> A11yResult<T> + Send + 'static,
+) -> A11yResult<T> {
+    let operation = operation.into();
+    let worker = worker()?;
+    if worker.timed_out.load(Ordering::SeqCst) {
+        return Err(A11yError::uia_worker_timeout(format!(
+            "operation={operation} phase=worker_unavailable previous_timeout=true timeout_ms={} remediation=restart synapse-mcp; previous UIA worker job exceeded its bounded deadline and the worker is fail-closed to avoid queuing more work behind a blocked cross-process provider",
+            timeout.as_millis()
+        )));
+    }
+
     let (reply_tx, reply_rx) = mpsc::sync_channel(1);
-    worker()?
+    let started = Instant::now();
+    worker
         .tx
         .send(Box::new(move |automation| {
             let _ = reply_tx.send(action(automation));
         }))
         .map_err(|err| A11yError::internal(format!("send UIA worker job failed: {err}")))?;
-    reply_rx
-        .recv()
-        .map_err(|err| A11yError::internal(format!("receive UIA worker job failed: {err}")))?
+    match reply_rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            worker.timed_out.store(true, Ordering::SeqCst);
+            Err(A11yError::uia_worker_timeout(format!(
+                "operation={operation} phase=worker_reply_recv timeout_ms={} elapsed_ms={} remediation=restart synapse-mcp; UIA provider call did not return before the bounded worker deadline, daemon stayed alive, and the worker is fail-closed to avoid unbounded queued jobs",
+                timeout.as_millis(),
+                started.elapsed().as_millis()
+            )))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(A11yError::internal(format!(
+            "receive UIA worker job failed for operation={operation}: channel disconnected"
+        ))),
+    }
 }
 
 pub(super) fn worker_readback() -> A11yResult<UiaWorkerReadback> {

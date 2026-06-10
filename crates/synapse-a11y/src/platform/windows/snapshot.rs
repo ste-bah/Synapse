@@ -17,7 +17,7 @@ use crate::{A11yError, A11yResult, ElementSearchScope};
 use super::common::{
     TreeView, cached_hwnd, cached_patterns, cached_rect, cached_role,
     cached_runtime_id_hex_or_fallback, cached_value, create_cache_request, map_uia_error,
-    non_empty, pattern_property, with_automation,
+    non_empty, pattern_property, with_automation, with_automation_operation,
 };
 
 static SNAPSHOT_CACHE: Mutex<Option<SnapshotCache>> = Mutex::new(None);
@@ -33,6 +33,7 @@ const SNAPSHOT_NODE_BUDGET: usize = 4000;
 /// complete tree and re-ran at depth 1 whenever a walk took >25ms — fatal for
 /// inherently slower cross-process UWP/ApplicationFrameHost trees.
 const SNAPSHOT_DEADLINE: Duration = Duration::from_millis(400);
+const SNAPSHOT_WORKER_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const RAW_SUPPLEMENT_NODE_BUDGET: usize = 60;
 const CHROMIUM_RENDERER_CONTENT_TOP_INSET_PX: i32 = 96;
 // Packaged Notepad exposes these top-level menu items through raw
@@ -75,20 +76,28 @@ pub fn snapshot_window_from_hwnd(hwnd: i64, depth: u32) -> A11yResult<Accessible
     let hwnd = isize::try_from(hwnd).map_err(|err| A11yError::InvalidElementId {
         detail: err.to_string(),
     })?;
-    with_automation(move |automation| {
-        let root = automation
-            .element_from_handle(Handle::from(hwnd))
-            .map_err(map_uia_error)?;
-        snapshot_from_root(automation, &root, depth)
-    })
+    with_automation_operation(
+        format!("snapshot_window_from_hwnd hwnd=0x{hwnd:x} depth={depth}"),
+        SNAPSHOT_WORKER_REPLY_TIMEOUT,
+        move |automation| {
+            let root = automation
+                .element_from_handle(Handle::from(hwnd))
+                .map_err(map_uia_error)?;
+            snapshot_from_root(automation, &root, depth)
+        },
+    )
 }
 
 pub fn snapshot_element(id: &ElementId, depth: u32) -> A11yResult<AccessibleSubtree> {
     let id = id.clone();
-    with_automation(move |automation| {
-        let root = super::resolve::re_resolve_on_worker(automation, &id)?;
-        snapshot_from_root(automation, &root, depth)
-    })
+    with_automation_operation(
+        format!("snapshot_element element_id={id} depth={depth}"),
+        SNAPSHOT_WORKER_REPLY_TIMEOUT,
+        move |automation| {
+            let root = super::resolve::re_resolve_on_worker(automation, &id)?;
+            snapshot_from_root(automation, &root, depth)
+        },
+    )
 }
 
 pub(super) fn snapshot_from_root(
@@ -176,12 +185,18 @@ pub fn find_by_name_and_pattern_in_window(
     let hwnd = isize::try_from(hwnd).map_err(|err| A11yError::InvalidElementId {
         detail: err.to_string(),
     })?;
-    with_automation(move |automation| {
-        let root = automation
-            .element_from_handle(Handle::from(hwnd))
-            .map_err(map_uia_error)?;
-        find_by_name_and_pattern_from_root(automation, &root, &name, pattern, scope)
-    })
+    with_automation_operation(
+        format!(
+            "find_by_name_and_pattern_in_window hwnd=0x{hwnd:x} scope={scope:?} pattern={pattern:?}"
+        ),
+        SNAPSHOT_WORKER_REPLY_TIMEOUT,
+        move |automation| {
+            let root = automation
+                .element_from_handle(Handle::from(hwnd))
+                .map_err(map_uia_error)?;
+            find_by_name_and_pattern_from_root(automation, &root, &name, pattern, scope)
+        },
+    )
 }
 
 pub fn chromium_renderer_accessibility_nodes_from_window(
@@ -195,12 +210,18 @@ pub fn chromium_renderer_accessibility_nodes_from_window(
     let hwnd = isize::try_from(hwnd).map_err(|err| A11yError::InvalidElementId {
         detail: err.to_string(),
     })?;
-    with_automation(move |automation| {
-        let root = automation
-            .element_from_handle(Handle::from(hwnd))
-            .map_err(map_uia_error)?;
-        chromium_renderer_accessibility_nodes_from_root(automation, &root, depth, max_nodes)
-    })
+    with_automation_operation(
+        format!(
+            "chromium_renderer_accessibility_nodes_from_window hwnd=0x{hwnd:x} depth={depth} max_nodes={max_nodes}"
+        ),
+        SNAPSHOT_WORKER_REPLY_TIMEOUT,
+        move |automation| {
+            let root = automation
+                .element_from_handle(Handle::from(hwnd))
+                .map_err(map_uia_error)?;
+            chromium_renderer_accessibility_nodes_from_root(automation, &root, depth, max_nodes)
+        },
+    )
 }
 
 fn chromium_renderer_accessibility_nodes_from_root(

@@ -23,6 +23,7 @@ fn error_codes_match_literal_names() {
     assert_literal!(A11Y_CDP_EXTENSION_DETACHED);
     assert_literal!(A11Y_CDP_EXTENSION_TIMEOUT);
     assert_literal!(A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED);
+    assert_literal!(A11Y_UIA_WORKER_TIMEOUT);
     assert_literal!(DETECTION_MODEL_NOT_LOADED);
     assert_literal!(DETECTION_MODEL_INFER_FAILED);
     assert_literal!(DETECTION_NO_FRAME);
