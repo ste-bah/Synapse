@@ -26,6 +26,10 @@ Chrome extension direct-localhost WebSocket bridge for background tab control
 through `chrome.tabs`. DOM attach through the debugger API is intentionally
 unavailable in the normal end-user bridge. If no CDP endpoint is available, the
 UIA tree is still returned, but it is the browser shell, not the page DOM.
+The normal-profile `chrome.tabs` bridge is also refused at runtime when the
+current Chrome profile/process readback shows any external extension or native
+host with `debugger` or `nativeMessaging`, because those surfaces can create the
+same operator-visible debugger/native-host popup when tab events occur.
 
 ## Diagnostics
 
@@ -66,7 +70,8 @@ The intended strategy ladder is:
    loopback debug endpoint exists.
 2. Non-attach Chrome extension `chrome.tabs` navigation for normal-profile
    background tab open, close, navigate, reload, back, and forward over the
-   direct localhost WebSocket bridge.
+   direct localhost WebSocket bridge, only after the live profile/process
+   Source of Truth is popup-free.
 3. OCR/capture over tiled browser content when CDP is down or attach fails.
 4. Explicit `uia_only` for browser chrome/native UI when neither DOM nor OCR
    produced page content.

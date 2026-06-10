@@ -30,7 +30,10 @@ Background tab commands (`openTab`, `closeTab`, and `navigateTab`) use
 `chrome.tabs.reload`, `chrome.tabs.goBack`, and `chrome.tabs.goForward`. They do
 not call `chrome.debugger.getTargets` or `chrome.debugger.attach`; target IDs
 returned by this path are synthetic `chrome-tab:<tabId>` IDs backed by
-`chrome.tabs` readback.
+`chrome.tabs` readback. The daemon refuses these normal-profile commands before
+queueing them whenever the live Chrome profile/process Source of Truth still
+contains any external `debugger` or `nativeMessaging` surface, because even a tab
+event can wake another extension's debugger/native-host popup on an unsafe host.
 
 Attach-capable commands (`snapshot`, `clickNode`, `typeNode`, and `nodeValue`)
 are unavailable in the normal end-user install. The normal service worker
@@ -53,7 +56,9 @@ Synapse refuses a normal-profile attach-capable command, the diagnostic detail
 includes any external Chrome `debugger` or `nativeMessaging` profile/process
 surface found at that moment. A remaining end-user debugger/native-host popup is
 therefore attributed to a concrete extension or process instead of being
-reported as an ambiguous Synapse bridge failure.
+reported as an ambiguous Synapse bridge failure. Background normal-profile tab
+commands follow the same runtime guard; they are available only after the
+external profile/process readback is popup-free.
 
 The full Windows setup script applies the supported Chrome policy remediation by
 default:
