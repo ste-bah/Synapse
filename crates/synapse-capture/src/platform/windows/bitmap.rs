@@ -327,18 +327,36 @@ fn copy_region_bgra(frame: &CapturedFrame, region: Rect) -> Result<Vec<u8>, Capt
         detail: err.to_string(),
     })?;
     let texture = frame.texture.get();
+    let texture_desc = texture_desc(texture);
+    validate_region_inside_texture(region, texture_desc.Width, texture_desc.Height)?;
     let staging = create_staging_texture(texture, width, height)?;
     let context = unsafe { texture.GetDevice() }
         .and_then(|device| unsafe { device.GetImmediateContext() })
         .map_err(capture_unsupported)?;
     let source: ID3D11Resource = texture.cast().map_err(capture_unsupported)?;
     let target: ID3D11Resource = staging.cast().map_err(capture_unsupported)?;
+    let source_left = u32::try_from(region.x).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid source region x {}: {err}", region.x),
+    })?;
+    let source_top = u32::try_from(region.y).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid source region y {}: {err}", region.y),
+    })?;
+    let source_right = u32::try_from(region.x.saturating_add(region.w)).map_err(|err| {
+        CaptureError::TargetInvalid {
+            detail: format!("invalid source region right edge for {region:?}: {err}"),
+        }
+    })?;
+    let source_bottom = u32::try_from(region.y.saturating_add(region.h)).map_err(|err| {
+        CaptureError::TargetInvalid {
+            detail: format!("invalid source region bottom edge for {region:?}: {err}"),
+        }
+    })?;
     let source_box = D3D11_BOX {
-        left: u32::try_from(region.x).unwrap_or(0),
-        top: u32::try_from(region.y).unwrap_or(0),
+        left: source_left,
+        top: source_top,
         front: 0,
-        right: u32::try_from(region.x.saturating_add(region.w)).unwrap_or(width),
-        bottom: u32::try_from(region.y.saturating_add(region.h)).unwrap_or(height),
+        right: source_right,
+        bottom: source_bottom,
         back: 1,
     };
     unsafe {
@@ -355,15 +373,20 @@ fn copy_region_bgra(frame: &CapturedFrame, region: Rect) -> Result<Vec<u8>, Capt
     bytes
 }
 
+fn texture_desc(texture: &ID3D11Texture2D) -> D3D11_TEXTURE2D_DESC {
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe {
+        texture.GetDesc(&raw mut desc);
+    }
+    desc
+}
+
 fn create_staging_texture(
     texture: &ID3D11Texture2D,
     width: u32,
     height: u32,
 ) -> Result<ID3D11Texture2D, CaptureError> {
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    unsafe {
-        texture.GetDesc(&raw mut desc);
-    }
+    let mut desc = texture_desc(texture);
     desc.Width = width;
     desc.Height = height;
     desc.MipLevels = 1;
@@ -399,15 +422,39 @@ fn copy_mapped_rows(
     let height = usize::try_from(height).map_err(|err| CaptureError::TargetInvalid {
         detail: err.to_string(),
     })?;
+    let byte_len = row_len
+        .checked_mul(height)
+        .ok_or_else(|| CaptureError::TargetInvalid {
+            detail: format!("invalid OCR bitmap dimensions {width}x{height}"),
+        })?;
     let row_pitch =
         usize::try_from(mapped.RowPitch).map_err(|err| CaptureError::GraphicsApiUnsupported {
             detail: err.to_string(),
         })?;
-    let mut output = vec![0_u8; row_len.saturating_mul(height)];
+    if mapped.pData.is_null() {
+        return Err(CaptureError::GraphicsApiUnsupported {
+            detail: "D3D11 Map returned null pData for BGRA readback".to_owned(),
+        });
+    }
+    if row_pitch < row_len {
+        return Err(CaptureError::GraphicsApiUnsupported {
+            detail: format!(
+                "D3D11 Map returned row pitch {row_pitch} smaller than row byte length {row_len}"
+            ),
+        });
+    }
+    let mut output = vec![0_u8; byte_len];
+    let base = mapped.pData.cast::<u8>();
     for row in 0..height {
-        let source = unsafe {
-            slice::from_raw_parts((mapped.pData as *const u8).add(row * row_pitch), row_len)
-        };
+        let source_offset =
+            row.checked_mul(row_pitch)
+                .ok_or_else(|| CaptureError::GraphicsApiUnsupported {
+                    detail: format!(
+                        "D3D11 mapped row offset overflow for row {row}, pitch {row_pitch}"
+                    ),
+                })?;
+        let source =
+            unsafe { slice::from_raw_parts(base.add(source_offset).cast_const(), row_len) };
         let start = row.saturating_mul(row_len);
         output[start..start + row_len].copy_from_slice(source);
     }
@@ -417,6 +464,37 @@ fn copy_mapped_rows(
         }
     }
     Ok(output)
+}
+
+fn validate_region_inside_texture(
+    region: Rect,
+    texture_width: u32,
+    texture_height: u32,
+) -> Result<(), CaptureError> {
+    validate_bitmap_region(region)?;
+    if region.x < 0 || region.y < 0 {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!("source region {region:?} has negative coordinates"),
+        });
+    }
+    let right = u32::try_from(region.x.saturating_add(region.w)).map_err(|err| {
+        CaptureError::TargetInvalid {
+            detail: format!("invalid source region right edge for {region:?}: {err}"),
+        }
+    })?;
+    let bottom = u32::try_from(region.y.saturating_add(region.h)).map_err(|err| {
+        CaptureError::TargetInvalid {
+            detail: format!("invalid source region bottom edge for {region:?}: {err}"),
+        }
+    })?;
+    if right > texture_width || bottom > texture_height {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!(
+                "source region {region:?} exceeds D3D texture bounds {texture_width}x{texture_height}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn copy_screen_region_bgra(region: Rect) -> Result<Vec<u8>, CaptureError> {
@@ -586,6 +664,78 @@ impl Drop for GdiCaptureScratch {
         let _ = unsafe { SelectObject(self.memory_dc, self.old_object) };
         let _ = unsafe { DeleteObject(HGDIOBJ::from(self.bitmap)) };
         let _ = unsafe { DeleteDC(self.memory_dc) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+
+    use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
+
+    use super::{copy_mapped_rows, validate_region_inside_texture};
+    use crate::CaptureError;
+    use synapse_core::Rect;
+
+    #[test]
+    fn mapped_row_copy_rejects_null_pointer() {
+        let mapped = D3D11_MAPPED_SUBRESOURCE {
+            pData: std::ptr::null_mut(),
+            RowPitch: 16,
+            DepthPitch: 16,
+        };
+
+        let error = copy_mapped_rows(&mapped, 4, 1, false).unwrap_err();
+
+        assert!(matches!(error, CaptureError::GraphicsApiUnsupported { .. }));
+        assert!(error.to_string().contains("null pData"));
+    }
+
+    #[test]
+    fn mapped_row_copy_rejects_short_pitch() {
+        let mut bytes = [0_u8; 8];
+        let mapped = D3D11_MAPPED_SUBRESOURCE {
+            pData: bytes.as_mut_ptr().cast::<c_void>(),
+            RowPitch: 3,
+            DepthPitch: 8,
+        };
+
+        let error = copy_mapped_rows(&mapped, 1, 1, false).unwrap_err();
+
+        assert!(matches!(error, CaptureError::GraphicsApiUnsupported { .. }));
+        assert!(error.to_string().contains("row pitch 3"));
+    }
+
+    #[test]
+    fn mapped_row_copy_honors_pitch_padding_and_bgra_order() {
+        let mut bytes = [1_u8, 2, 3, 4, 99, 99, 5, 6, 7, 8, 88, 88];
+        let mapped = D3D11_MAPPED_SUBRESOURCE {
+            pData: bytes.as_mut_ptr().cast::<c_void>(),
+            RowPitch: 6,
+            DepthPitch: 12,
+        };
+
+        let output = copy_mapped_rows(&mapped, 1, 2, false).unwrap();
+
+        assert_eq!(output, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn texture_region_validation_rejects_source_box_overflow() {
+        let error = validate_region_inside_texture(
+            Rect {
+                x: 8,
+                y: 31,
+                w: 940,
+                h: 330,
+            },
+            940,
+            330,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, CaptureError::TargetInvalid { .. }));
+        assert!(error.to_string().contains("exceeds D3D texture bounds"));
     }
 }
 
