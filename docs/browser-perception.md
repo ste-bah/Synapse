@@ -148,8 +148,16 @@ Chrome session, the supported attach path is:
    external native-messaging wrapper process. Those surfaces can display the
    same user-visible debugger/native-host popup even though Synapse is not the
    caller. The remediation is to disable/remove the external extension or apply
-   a Chrome `ExtensionSettings.blocked_permissions` policy to that extension,
-   refresh/restart Chrome, and rerun the verifier.
+   a Chrome `ExtensionSettings.blocked_permissions` policy to that extension.
+   `scripts\install-synapse-chrome-debugger.ps1
+   -ApplyExternalChromeDebuggerPolicy` merges
+   `blocked_permissions=["debugger","nativeMessaging"]` for the exact external
+   extension IDs discovered in the Chrome profile/process SoT. The script fails
+   with `SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED` if the current
+   principal cannot write the policy key. After policy is written,
+   refresh/restart Chrome and rerun the verifier; do not certify popup-free
+   readiness until the separate profile/process readback shows the external
+   surface is gone.
 10. If the current browser session still exposes no endpoint or extension bridge,
    fail closed with
    `web_path = "uia_only"` or `ocr`; do not claim DOM/control readback. Relaunch

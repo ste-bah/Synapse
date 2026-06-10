@@ -47,3 +47,25 @@ bridge is tabs-only. The verifier names the extension ID, profile, and process
 SoT so the host can remove the external surface or apply a Chrome
 `ExtensionSettings.blocked_permissions` policy before treating the system as
 popup-free.
+
+To apply the supported Chrome policy remediation for the discovered external
+extensions, run:
+
+```powershell
+scripts\install-synapse-chrome-debugger.ps1 -ApplyExternalChromeDebuggerPolicy
+```
+
+The full Windows setup script exposes the same remediation switch:
+
+```powershell
+scripts\synapse-setup.ps1 -ApplyExternalChromeDebuggerPolicy
+```
+
+This merges `blocked_permissions=["debugger","nativeMessaging"]` into the
+current user's Chrome `ExtensionSettings` policy for the exact external
+extension IDs found in the Chrome profile/process SoT. If the current Windows
+principal cannot write the policy key, the script fails with
+`SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED` and names the registry path.
+After policy is written, Chrome must reload policy or restart; the verifier
+still fails closed until the profile/process SoT shows the external debugger or
+native-messaging surface is gone.

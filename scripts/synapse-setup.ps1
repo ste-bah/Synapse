@@ -61,6 +61,17 @@
   does not install or launch native messaging because Chrome may create a
   visible cmd.exe wrapper for native hosts.
 
+.PARAMETER ApplyExternalChromeDebuggerPolicy
+  When Chrome has active external extensions with debugger/nativeMessaging
+  permissions, attempt the supported Chrome ExtensionSettings remediation by
+  merging blocked_permissions=["debugger","nativeMessaging"] for the exact
+  offending extension IDs. Setup still fails closed until Chrome policy/profile
+  and process readback prove the external surface is gone.
+
+.PARAMETER ChromePolicyHive
+  Chrome policy hive used with -ApplyExternalChromeDebuggerPolicy. Defaults to
+  HKCU. HKLM requires a principal that can write machine policy.
+
 .PARAMETER MaintenanceLockPath
   File-lock Source of Truth that serializes setup/remove across multiple
   agents. The file contents name the owning PID and cleanup policy; the held
@@ -84,6 +95,9 @@ param(
     [string]$Bind        = '127.0.0.1:7700',
     [string]$ExePath     = "$env:USERPROFILE\.cargo\bin\synapse-mcp.exe",
     [string]$ChromeNativeHostExePath = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
+    [switch]$ApplyExternalChromeDebuggerPolicy,
+    [ValidateSet('HKCU', 'HKLM')]
+    [string]$ChromePolicyHive = 'HKCU',
     [string]$CargoTarget = "$env:LOCALAPPDATA\synapse\build-target",
     [string]$DbPath      = "$env:LOCALAPPDATA\synapse\db-daemon",
     [string]$ProfilesDir = "$env:USERPROFILE\.cargo\bin\profiles",
@@ -103,6 +117,34 @@ $ErrorActionPreference = 'Stop'
 function Info($m)  { Write-Host "[synapse-setup] $m" }
 function Step($m)  { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
 function Die($m)   { throw "[synapse-setup] FATAL: $m" }
+
+function Invoke-SynapseChromeBridgeVerifier {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstallerPath,
+        [Parameter(Mandatory = $true)]
+        [string]$NativeHostExePath,
+        [switch]$ApplyExternalPolicy,
+        [ValidateSet('HKCU', 'HKLM')]
+        [string]$PolicyHive = 'HKCU'
+    )
+
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
+        Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_MISSING path=$InstallerPath remediation=setup requires the repo script that verifies the direct localhost Chrome bridge and removes stale nativeMessaging registration"
+    }
+    $chromeBridgeArgs = @{
+        SynapseNativeHostExe = $NativeHostExePath
+        ChromePolicyHive = $PolicyHive
+    }
+    if ($ApplyExternalPolicy) {
+        $chromeBridgeArgs.ApplyExternalChromeDebuggerPolicy = $true
+    }
+    $readback = & $InstallerPath @chromeBridgeArgs
+    if (-not $readback.ok) {
+        Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_FAILED path=$InstallerPath remediation=installer did not return ok=true"
+    }
+    return $readback
+}
 
 $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
 $processToolSurfaceHashAtStart = $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START
@@ -2181,6 +2223,20 @@ if ($candidatePreflight.Sha256 -ne $installSourceHash) {
 }
 Info "Candidate daemon accepted for handoff sha256=$installSourceHash tool_count=$($candidatePreflight.ToolCount) tool_surface_sha256=$($candidatePreflight.ToolSurfaceSha256)"
 
+Step "Preflighting Chrome direct localhost bridge before daemon handoff"
+$chromeBridgeInstaller = Join-Path $PSScriptRoot 'install-synapse-chrome-debugger.ps1'
+$chromeBridgePreflight = Invoke-SynapseChromeBridgeVerifier `
+    -InstallerPath $chromeBridgeInstaller `
+    -NativeHostExePath $ChromeNativeHostExePath `
+    -ApplyExternalPolicy:$ApplyExternalChromeDebuggerPolicy `
+    -PolicyHive $ChromePolicyHive
+Info ("Chrome direct bridge preflight accepted transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_scope={4}" -f `
+    $chromeBridgePreflight.daemon_bridge_transport, `
+    $chromeBridgePreflight.extension_id, `
+    $chromeBridgePreflight.native_host_registry_present, `
+    $chromeBridgePreflight.native_host_manifest_present, `
+    $chromeBridgePreflight.chrome_policy_scope)
+
 # ---------------------------------------------------------------------------
 # 5. Drain the running daemon, then install the proven binary
 # ---------------------------------------------------------------------------
@@ -2220,19 +2276,17 @@ Info "Installed binary reports: $ver"
 Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash"
 
 Step "Verifying Chrome direct localhost bridge"
-$chromeBridgeInstaller = Join-Path $PSScriptRoot 'install-synapse-chrome-debugger.ps1'
-if (-not (Test-Path -LiteralPath $chromeBridgeInstaller -PathType Leaf)) {
-    Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_MISSING path=$chromeBridgeInstaller remediation=setup requires the repo script that verifies the direct localhost Chrome bridge and removes stale nativeMessaging registration"
-}
-$chromeBridgeReadback = & $chromeBridgeInstaller -SynapseNativeHostExe $ChromeNativeHostExePath
-if (-not $chromeBridgeReadback.ok) {
-    Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_FAILED path=$chromeBridgeInstaller remediation=installer did not return ok=true"
-}
-Info ("Chrome direct bridge verified transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3}" -f `
+$chromeBridgeReadback = Invoke-SynapseChromeBridgeVerifier `
+    -InstallerPath $chromeBridgeInstaller `
+    -NativeHostExePath $ChromeNativeHostExePath `
+    -ApplyExternalPolicy:$ApplyExternalChromeDebuggerPolicy `
+    -PolicyHive $ChromePolicyHive
+Info ("Chrome direct bridge verified transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_scope={4}" -f `
     $chromeBridgeReadback.daemon_bridge_transport, `
     $chromeBridgeReadback.extension_id, `
     $chromeBridgeReadback.native_host_registry_present, `
-    $chromeBridgeReadback.native_host_manifest_present)
+    $chromeBridgeReadback.native_host_manifest_present, `
+    $chromeBridgeReadback.chrome_policy_scope)
 
 # ---------------------------------------------------------------------------
 # 6. Deploy bundled profiles next to the exe (executable-relative lookup) +
