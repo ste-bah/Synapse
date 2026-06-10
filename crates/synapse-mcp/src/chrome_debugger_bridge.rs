@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     process::ExitCode,
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -22,18 +22,21 @@ use serde_json::{Value, json};
 use synapse_core::{AccessibleNode, CdpCapability, CdpStatus, Rect, error_codes};
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{Notify, oneshot},
+    sync::{Notify, RwLock, oneshot},
     time::timeout,
 };
 
 const EXTENSION_ID: &str = "leoocgnkjnplbfdbklajepahofecgfbk";
 const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
+const CHROME_DEBUGGER_SILENT_FLAG: &str = "--silent-debugger-extension-api";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const NATIVE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
+const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
-const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger and register the native host with scripts\\install-synapse-chrome-debugger.ps1; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk native_host=com.synapse.chrome_debugger";
+const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
+const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger, register the native host with scripts\\install-synapse-chrome-debugger.ps1, and launch Chrome with --silent-debugger-extension-api before using attach-capable debugger bridge commands; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk native_host=com.synapse.chrome_debugger";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
 
@@ -127,6 +130,9 @@ impl ChromeDebuggerBridgeError {
             Some(error_codes::A11Y_CDP_EXTENSION_TIMEOUT) => {
                 error_codes::A11Y_CDP_EXTENSION_TIMEOUT
             }
+            Some(error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED) => {
+                error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED
+            }
             Some(error_codes::A11Y_CDP_AXTREE_FAILED) => error_codes::A11Y_CDP_AXTREE_FAILED,
             Some(error_codes::A11Y_CDP_ATTACH_FAILED) => error_codes::A11Y_CDP_ATTACH_FAILED,
             _ => error_codes::A11Y_CDP_ATTACH_FAILED,
@@ -134,6 +140,27 @@ impl ChromeDebuggerBridgeError {
         Self {
             code,
             detail: detail.into(),
+        }
+    }
+
+    fn debugger_warning_unsuppressed(
+        hwnd: i64,
+        pid: Option<u32>,
+        process_name: Option<&str>,
+        command_line: Option<&[String]>,
+        reason: impl Into<String>,
+    ) -> Self {
+        let process_name = process_name.unwrap_or("unknown");
+        let command_line = command_line
+            .map(|parts| format!("{parts:?}"))
+            .unwrap_or_else(|| "unreadable".to_owned());
+        Self {
+            code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
+            detail: format!(
+                "Chrome debugger extension attach refused before chrome.debugger.attach because Chrome would surface its debugger warning UI; hwnd={hwnd} pid={} process_name={process_name:?} required_flag={CHROME_DEBUGGER_SILENT_FLAG:?} command_line={command_line} reason={}",
+                pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string()),
+                reason.into()
+            ),
         }
     }
 }
@@ -185,6 +212,62 @@ pub(crate) struct ChromeDebuggerTypeResult {
 pub(crate) struct ChromeDebuggerNodeValue {
     pub value: String,
     pub target_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerOpenTabResult {
+    pub target_id: String,
+    pub tab_id: u32,
+    pub target_type: String,
+    pub url: String,
+    pub title: String,
+    pub target_attached: bool,
+    pub target_count_before: u32,
+    pub target_count_after: u32,
+    pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerCloseTabResult {
+    pub target_id: String,
+    pub tab_id: u32,
+    pub target_count_before: u32,
+    pub target_count_after: u32,
+    pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerTargetInfo {
+    pub target_id: String,
+    pub tab_id: u32,
+    pub target_type: String,
+    pub url: String,
+    pub title: String,
+    pub target_candidate_count: u32,
+    pub target_selection_reason: String,
+    pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerNavigateResult {
+    pub target_id: String,
+    pub tab_id: u32,
+    pub action: String,
+    pub requested_url: Option<String>,
+    pub before_url: String,
+    pub before_title: String,
+    pub after_url: String,
+    pub after_title: String,
+    pub ready_state: String,
+    pub history_current_index: i64,
+    pub history_entry_count: u32,
+    pub history_readback_source: String,
+    pub readback_backend: String,
+    pub navigation_error_text: Option<String>,
+    pub is_download: Option<bool>,
+    pub target_candidate_count: u32,
+    pub target_selection_reason: String,
+    pub extension_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,6 +717,142 @@ fn bridge() -> &'static ChromeDebuggerBridge {
     })
 }
 
+async fn send_attach_command(
+    hwnd: i64,
+    kind: &'static str,
+    payload: Value,
+) -> Result<Value, ChromeDebuggerBridgeError> {
+    ensure_debugger_warning_suppressed(hwnd)?;
+    bridge().send_command(kind, payload).await
+}
+
+#[derive(Clone, Debug)]
+struct DebuggerAttachProcessState {
+    pid: u32,
+    process_name: String,
+    command_line: Vec<String>,
+}
+
+#[cfg(windows)]
+fn ensure_debugger_warning_suppressed(hwnd: i64) -> Result<(), ChromeDebuggerBridgeError> {
+    let state = debugger_attach_process_state(hwnd)?;
+    if command_line_has_silent_debugger_flag(&state.command_line) {
+        return Ok(());
+    }
+    Err(ChromeDebuggerBridgeError::debugger_warning_unsuppressed(
+        hwnd,
+        Some(state.pid),
+        Some(&state.process_name),
+        Some(&state.command_line),
+        "target browser process command line lacks the required silent debugger switch",
+    ))
+}
+
+#[cfg(not(windows))]
+fn ensure_debugger_warning_suppressed(hwnd: i64) -> Result<(), ChromeDebuggerBridgeError> {
+    Err(ChromeDebuggerBridgeError::debugger_warning_unsuppressed(
+        hwnd,
+        None,
+        None,
+        None,
+        "target browser process command line cannot be verified on this platform",
+    ))
+}
+
+#[cfg(windows)]
+fn debugger_attach_process_state(
+    hwnd: i64,
+) -> Result<DebuggerAttachProcessState, ChromeDebuggerBridgeError> {
+    use std::ffi::c_void;
+
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow},
+    };
+
+    let hwnd_value = HWND(hwnd as *mut c_void);
+    if !unsafe { IsWindow(Some(hwnd_value)) }.as_bool() {
+        return Err(ChromeDebuggerBridgeError::debugger_warning_unsuppressed(
+            hwnd,
+            None,
+            None,
+            None,
+            "target hwnd is not a live window",
+        ));
+    }
+
+    let mut raw_pid = 0_u32;
+    unsafe { GetWindowThreadProcessId(hwnd_value, Some(&raw mut raw_pid)) };
+    if raw_pid == 0 {
+        return Err(ChromeDebuggerBridgeError::debugger_warning_unsuppressed(
+            hwnd,
+            None,
+            None,
+            None,
+            "target hwnd owner pid was unavailable",
+        ));
+    }
+
+    let pid = Pid::from_u32(raw_pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always)
+            .without_tasks(),
+    );
+    let Some(process) = system.process(pid) else {
+        return Err(ChromeDebuggerBridgeError::debugger_warning_unsuppressed(
+            hwnd,
+            Some(raw_pid),
+            None,
+            None,
+            "target hwnd owner pid was not present in the process table",
+        ));
+    };
+
+    let process_name = process.name().to_string_lossy().into_owned();
+    let command_line = process
+        .cmd()
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if command_line.is_empty() {
+        return Err(ChromeDebuggerBridgeError::debugger_warning_unsuppressed(
+            hwnd,
+            Some(raw_pid),
+            Some(&process_name),
+            None,
+            "target browser process command line was unreadable",
+        ));
+    }
+
+    Ok(DebuggerAttachProcessState {
+        pid: raw_pid,
+        process_name,
+        command_line,
+    })
+}
+
+fn command_line_has_silent_debugger_flag(command_line: &[String]) -> bool {
+    let exact_or_valued = |arg: &str| {
+        let arg = arg.trim_matches('"').to_ascii_lowercase();
+        arg == CHROME_DEBUGGER_SILENT_FLAG
+            || arg
+                .strip_prefix(CHROME_DEBUGGER_SILENT_FLAG)
+                .is_some_and(|rest| rest.starts_with('='))
+    };
+
+    command_line.iter().any(|arg| exact_or_valued(arg))
+        || command_line
+            .join(" ")
+            .split_whitespace()
+            .any(exact_or_valued)
+}
+
 pub(crate) async fn fetch_dom_snapshot(
     hwnd: i64,
     foreground_title: &str,
@@ -641,18 +860,18 @@ pub(crate) async fn fetch_dom_snapshot(
     target_id_hint: Option<&str>,
     max_nodes: usize,
 ) -> Result<ChromeDebuggerDomSnapshot, ChromeDebuggerBridgeError> {
-    let result = bridge()
-        .send_command(
-            "snapshot",
-            json!({
-                "hwnd": hwnd,
-                "foregroundTitle": foreground_title,
-                "foregroundUrlHint": foreground_url_hint,
-                "targetIdHint": target_id_hint,
-                "maxNodes": max_nodes,
-            }),
-        )
-        .await?;
+    let result = send_attach_command(
+        hwnd,
+        "snapshot",
+        json!({
+            "hwnd": hwnd,
+            "foregroundTitle": foreground_title,
+            "foregroundUrlHint": foreground_url_hint,
+            "targetIdHint": target_id_hint,
+            "maxNodes": max_nodes,
+        }),
+    )
+    .await?;
     let snapshot =
         serde_json::from_value::<ExtensionSnapshotResponse>(result).map_err(|error| {
             ChromeDebuggerBridgeError::protocol(format!(
@@ -702,19 +921,19 @@ pub(crate) async fn click_node(
     button: ChromeDebuggerMouseButton,
     click_count: i64,
 ) -> Result<ChromeDebuggerClickPoint, ChromeDebuggerBridgeError> {
-    let result = bridge()
-        .send_command(
-            "clickNode",
-            json!({
-                "hwnd": hwnd,
-                "foregroundTitle": foreground_title,
-                "targetIdHint": target_id_hint,
-                "backendNodeId": backend_node_id,
-                "button": button.as_str(),
-                "clickCount": click_count.max(1),
-            }),
-        )
-        .await?;
+    let result = send_attach_command(
+        hwnd,
+        "clickNode",
+        json!({
+            "hwnd": hwnd,
+            "foregroundTitle": foreground_title,
+            "targetIdHint": target_id_hint,
+            "backendNodeId": backend_node_id,
+            "button": button.as_str(),
+            "clickCount": click_count.max(1),
+        }),
+    )
+    .await?;
     serde_json::from_value::<ChromeDebuggerClickPoint>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger click response: {error}"
@@ -729,18 +948,18 @@ pub(crate) async fn type_node(
     backend_node_id: i64,
     text: &str,
 ) -> Result<ChromeDebuggerTypeResult, ChromeDebuggerBridgeError> {
-    let result = bridge()
-        .send_command(
-            "typeNode",
-            json!({
-                "hwnd": hwnd,
-                "foregroundTitle": foreground_title,
-                "targetIdHint": target_id_hint,
-                "backendNodeId": backend_node_id,
-                "text": text,
-            }),
-        )
-        .await?;
+    let result = send_attach_command(
+        hwnd,
+        "typeNode",
+        json!({
+            "hwnd": hwnd,
+            "foregroundTitle": foreground_title,
+            "targetIdHint": target_id_hint,
+            "backendNodeId": backend_node_id,
+            "text": text,
+        }),
+    )
+    .await?;
     serde_json::from_value::<ChromeDebuggerTypeResult>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger type response: {error}"
@@ -754,20 +973,108 @@ pub(crate) async fn node_value(
     target_id_hint: Option<&str>,
     backend_node_id: i64,
 ) -> Result<ChromeDebuggerNodeValue, ChromeDebuggerBridgeError> {
-    let result = bridge()
-        .send_command(
-            "nodeValue",
-            json!({
-                "hwnd": hwnd,
-                "foregroundTitle": foreground_title,
-                "targetIdHint": target_id_hint,
-                "backendNodeId": backend_node_id,
-            }),
-        )
-        .await?;
+    let result = send_attach_command(
+        hwnd,
+        "nodeValue",
+        json!({
+            "hwnd": hwnd,
+            "foregroundTitle": foreground_title,
+            "targetIdHint": target_id_hint,
+            "backendNodeId": backend_node_id,
+        }),
+    )
+    .await?;
     serde_json::from_value::<ChromeDebuggerNodeValue>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger node value response: {error}"
+        ))
+    })
+}
+
+pub(crate) async fn open_tab(
+    hwnd: i64,
+    url: &str,
+) -> Result<ChromeDebuggerOpenTabResult, ChromeDebuggerBridgeError> {
+    let result = bridge()
+        .send_command(
+            "openTab",
+            json!({
+                "hwnd": hwnd,
+                "url": url,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerOpenTabResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger open tab response: {error}"
+        ))
+    })
+}
+
+pub(crate) async fn close_tab(
+    hwnd: i64,
+    target_id: &str,
+) -> Result<ChromeDebuggerCloseTabResult, ChromeDebuggerBridgeError> {
+    let result = bridge()
+        .send_command(
+            "closeTab",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerCloseTabResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger close tab response: {error}"
+        ))
+    })
+}
+
+pub(crate) async fn target_info(
+    hwnd: i64,
+    target_id: &str,
+) -> Result<ChromeDebuggerTargetInfo, ChromeDebuggerBridgeError> {
+    let result = bridge()
+        .send_command(
+            "targetInfo",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerTargetInfo>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger target info response: {error}"
+        ))
+    })
+}
+
+pub(crate) async fn navigate_tab(
+    hwnd: i64,
+    target_id: &str,
+    action: &str,
+    url: Option<&str>,
+    wait_timeout_ms: u64,
+    ignore_cache: bool,
+) -> Result<ChromeDebuggerNavigateResult, ChromeDebuggerBridgeError> {
+    let result = bridge()
+        .send_command(
+            "navigateTab",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+                "action": action,
+                "url": url,
+                "waitTimeoutMs": wait_timeout_ms,
+                "ignoreCache": ignore_cache,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerNavigateResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger navigate response: {error}"
         ))
     })
 }
@@ -836,30 +1143,15 @@ pub(crate) async fn run_native_host(
     let base_url = http_base_url(bind);
     let client = reqwest::Client::new();
     let pid = std::process::id();
-    let register = NativeRegisterRequest {
-        origin: invocation.origin.clone(),
+    let registered = register_native_host(
+        &client,
+        &base_url,
+        &token,
+        &invocation,
         pid,
-        parent_window: invocation.parent_window.clone(),
-        bridge_protocol_version: BRIDGE_PROTOCOL_VERSION,
-    };
-    let response = client
-        .post(format!("{base_url}/chrome-debugger/native/register"))
-        .bearer_auth(&token)
-        .json(&register)
-        .send()
-        .await
-        .context("register Chrome debugger native host with Synapse daemon")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let detail = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "Chrome debugger native host register failed status={status} detail={detail}"
-        );
-    }
-    let registered = response
-        .json::<NativeRegisterResponse>()
-        .await
-        .context("decode Chrome debugger native register response")?;
+        "native_host_start",
+    )
+    .await?;
     tracing::info!(
         code = "CHROME_DEBUGGER_NATIVE_HOST_STARTED",
         host_id = %registered.host_id,
@@ -868,18 +1160,26 @@ pub(crate) async fn run_native_host(
         "Chrome debugger native host bridge started"
     );
 
-    let host_id = registered.host_id;
+    let host_id = Arc::new(RwLock::new(registered.host_id));
     let reader_client = client.clone();
     let reader_token = token.clone();
     let reader_base_url = base_url.clone();
-    let reader_host_id = host_id.clone();
+    let reader_invocation = invocation.clone();
+    let reader_host_id = Arc::clone(&host_id);
     let mut reader_task = tokio::spawn(async move {
-        read_native_messages(reader_client, reader_base_url, reader_token, reader_host_id).await
+        read_native_messages(
+            reader_client,
+            reader_base_url,
+            reader_token,
+            reader_invocation,
+            pid,
+            reader_host_id,
+        )
+        .await
     });
-    let mut poll_task =
-        tokio::spawn(
-            async move { poll_commands_to_chrome(client, base_url, token, host_id).await },
-        );
+    let mut poll_task = tokio::spawn(async move {
+        poll_commands_to_chrome(client, base_url, token, invocation, pid, host_id).await
+    });
 
     tokio::select! {
         reader_result = &mut reader_task => {
@@ -909,6 +1209,49 @@ pub(crate) async fn run_native_host(
             }
         }
     }
+}
+
+async fn register_native_host(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    invocation: &NativeHostInvocation,
+    pid: u32,
+    reason: &'static str,
+) -> anyhow::Result<NativeRegisterResponse> {
+    let register = NativeRegisterRequest {
+        origin: invocation.origin.clone(),
+        pid,
+        parent_window: invocation.parent_window.clone(),
+        bridge_protocol_version: BRIDGE_PROTOCOL_VERSION,
+    };
+    let response = client
+        .post(format!("{base_url}/chrome-debugger/native/register"))
+        .bearer_auth(&token)
+        .json(&register)
+        .send()
+        .await
+        .context("register Chrome debugger native host with Synapse daemon")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "Chrome debugger native host register failed status={status} detail={detail}"
+        );
+    }
+    let registered = response
+        .json::<NativeRegisterResponse>()
+        .await
+        .context("decode Chrome debugger native register response")?;
+    tracing::info!(
+        code = "CHROME_DEBUGGER_NATIVE_HOST_REGISTERED_WITH_DAEMON",
+        host_id = %registered.host_id,
+        origin = %invocation.origin,
+        pid,
+        reason,
+        "Chrome debugger native host registered with daemon"
+    );
+    Ok(registered)
 }
 
 fn load_token_value() -> anyhow::Result<String> {
@@ -944,16 +1287,19 @@ async fn read_native_messages(
     client: reqwest::Client,
     base_url: String,
     token: String,
-    host_id: String,
+    invocation: NativeHostInvocation,
+    pid: u32,
+    host_id: Arc<RwLock<String>>,
 ) -> anyhow::Result<()> {
     let mut stdin = tokio::io::stdin();
     loop {
         let Some(message) = read_native_frame(&mut stdin).await? else {
+            let current_host_id = host_id.read().await.clone();
             let _ = post_native_message(
                 &client,
                 &base_url,
                 &token,
-                &host_id,
+                &current_host_id,
                 json!({
                     "type": "event",
                     "event": "nativePortDisconnected",
@@ -963,7 +1309,34 @@ async fn read_native_messages(
             .await;
             return Ok(());
         };
-        post_native_message(&client, &base_url, &token, &host_id, message).await?;
+        let mut current_host_id = host_id.read().await.clone();
+        match post_native_message(
+            &client,
+            &base_url,
+            &token,
+            &current_host_id,
+            message.clone(),
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(error) if is_unknown_native_host_error(&error) => {
+                reregister_native_host_until_available(
+                    &client,
+                    &base_url,
+                    &token,
+                    &invocation,
+                    pid,
+                    &host_id,
+                    &current_host_id,
+                    "message_unknown_host_id",
+                )
+                .await?;
+                current_host_id = host_id.read().await.clone();
+                post_native_message(&client, &base_url, &token, &current_host_id, message).await?;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -971,21 +1344,51 @@ async fn poll_commands_to_chrome(
     client: reqwest::Client,
     base_url: String,
     token: String,
-    host_id: String,
+    invocation: NativeHostInvocation,
+    pid: u32,
+    host_id: Arc<RwLock<String>>,
 ) -> anyhow::Result<ExitCode> {
     let mut stdout = tokio::io::stdout();
     loop {
-        let response = client
+        let current_host_id = host_id.read().await.clone();
+        let response = match client
             .get(format!(
-                "{base_url}/chrome-debugger/native/next?host_id={host_id}&timeout_ms=15000"
+                "{base_url}/chrome-debugger/native/next?host_id={current_host_id}&timeout_ms=15000"
             ))
             .bearer_auth(&token)
             .send()
             .await
-            .context("poll Chrome debugger daemon command queue")?;
+        {
+            Ok(response) => response,
+            Err(error) if is_transient_daemon_transport_error(&error) => {
+                tracing::warn!(
+                    code = "CHROME_DEBUGGER_NATIVE_DAEMON_UNREACHABLE",
+                    host_id = %current_host_id,
+                    error = %error,
+                    "Chrome debugger native host waiting for Synapse daemon transport"
+                );
+                tokio::time::sleep(NATIVE_DAEMON_RECONNECT_DELAY).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("poll Chrome debugger daemon command queue"),
+        };
         if !response.status().is_success() {
             let status = response.status();
             let detail = response.text().await.unwrap_or_default();
+            if is_unknown_native_host_detail(&detail) {
+                reregister_native_host_until_available(
+                    &client,
+                    &base_url,
+                    &token,
+                    &invocation,
+                    pid,
+                    &host_id,
+                    &current_host_id,
+                    "poll_unknown_host_id",
+                )
+                .await?;
+                continue;
+            }
             anyhow::bail!("Chrome debugger native poll failed status={status} detail={detail}");
         }
         let next = response
@@ -996,6 +1399,68 @@ async fn poll_commands_to_chrome(
             write_native_frame(&mut stdout, &serde_json::to_value(command)?).await?;
         }
     }
+}
+
+async fn reregister_native_host_until_available(
+    client: &reqwest::Client,
+    base_url: &str,
+    token: &str,
+    invocation: &NativeHostInvocation,
+    pid: u32,
+    host_id: &Arc<RwLock<String>>,
+    observed_host_id: &str,
+    reason: &'static str,
+) -> anyhow::Result<()> {
+    if host_id.read().await.as_str() != observed_host_id {
+        return Ok(());
+    }
+    loop {
+        match register_native_host(client, base_url, token, invocation, pid, reason).await {
+            Ok(registered) => {
+                tracing::warn!(
+                    code = "CHROME_DEBUGGER_NATIVE_HOST_REREGISTERED",
+                    old_host_id = %observed_host_id,
+                    new_host_id = %registered.host_id,
+                    reason,
+                    "Chrome debugger native host re-registered after daemon bridge state changed"
+                );
+                *host_id.write().await = registered.host_id;
+                return Ok(());
+            }
+            Err(error) if is_transient_daemon_register_error(&error) => {
+                tracing::warn!(
+                    code = "CHROME_DEBUGGER_NATIVE_HOST_REREGISTER_RETRY",
+                    old_host_id = %observed_host_id,
+                    reason,
+                    error = %format!("{error:#}"),
+                    "Chrome debugger native host waiting to re-register with Synapse daemon"
+                );
+                tokio::time::sleep(NATIVE_DAEMON_RECONNECT_DELAY).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_unknown_native_host_error(error: &anyhow::Error) -> bool {
+    is_unknown_native_host_detail(&format!("{error:#}"))
+}
+
+fn is_unknown_native_host_detail(detail: &str) -> bool {
+    detail.contains(UNKNOWN_NATIVE_HOST_ID_FRAGMENT)
+}
+
+fn is_transient_daemon_transport_error(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_request()
+}
+
+fn is_transient_daemon_register_error(error: &anyhow::Error) -> bool {
+    let detail = format!("{error:#}").to_ascii_lowercase();
+    detail.contains("error sending request")
+        || detail.contains("connection refused")
+        || detail.contains("connection reset")
+        || detail.contains("timed out")
+        || detail.contains("operation timed out")
 }
 
 async fn post_native_message(
@@ -1108,6 +1573,17 @@ mod tests {
     }
 
     #[test]
+    fn native_host_unknown_id_error_is_restart_recoverable() {
+        let detail = r#"{"ok":false,"code":"A11Y_CDP_EXTENSION_UNAVAILABLE","detail":"unknown chrome debugger native host_id \"chrome-native-old\""}"#;
+        let error =
+            anyhow::anyhow!("Chrome debugger native poll failed status=400 detail={detail}");
+
+        assert!(is_unknown_native_host_detail(detail));
+        assert!(is_unknown_native_host_error(&error));
+        assert!(!is_unknown_native_host_detail("bridge protocol mismatch"));
+    }
+
+    #[test]
     fn extension_unavailable_maps_to_explicit_cdp_status() {
         let error = ChromeDebuggerBridgeError::unavailable();
 
@@ -1118,5 +1594,47 @@ mod tests {
                 .detail()
                 .contains("install the bundled Synapse Chrome extension")
         );
+    }
+
+    #[test]
+    fn debugger_warning_preflight_error_maps_to_attach_failed_status() {
+        let command_line = vec![
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_owned(),
+            "--profile-directory=Default".to_owned(),
+        ];
+        let error = ChromeDebuggerBridgeError::debugger_warning_unsuppressed(
+            1234,
+            Some(5678),
+            Some("chrome.exe"),
+            Some(&command_line),
+            "missing flag",
+        );
+
+        assert_eq!(
+            error.code(),
+            error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED
+        );
+        assert_eq!(error.cdp_status(), CdpStatus::AttachFailed);
+        assert!(error.detail().contains("--silent-debugger-extension-api"));
+        assert!(error.detail().contains("pid=5678"));
+    }
+
+    #[test]
+    fn command_line_silent_debugger_flag_detection_is_exact() {
+        assert!(command_line_has_silent_debugger_flag(&[
+            "chrome.exe".to_owned(),
+            "--silent-debugger-extension-api".to_owned(),
+        ]));
+        assert!(command_line_has_silent_debugger_flag(&[
+            "chrome.exe --silent-debugger-extension-api --profile-directory=Default".to_owned(),
+        ]));
+        assert!(command_line_has_silent_debugger_flag(&[
+            "chrome.exe".to_owned(),
+            "--silent-debugger-extension-api=true".to_owned(),
+        ]));
+        assert!(!command_line_has_silent_debugger_flag(&[
+            "chrome.exe".to_owned(),
+            "--not-silent-debugger-extension-api".to_owned(),
+        ]));
     }
 }

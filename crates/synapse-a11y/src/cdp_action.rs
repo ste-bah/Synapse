@@ -22,7 +22,8 @@ use chromiumoxide::cdp::browser_protocol::input::{
     InsertTextParams, MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    CaptureScreenshotFormat, GetLayoutMetricsParams, Viewport,
+    CaptureScreenshotFormat, GetLayoutMetricsParams, GetNavigationHistoryParams, NavigateParams,
+    NavigateToHistoryEntryParams, ReloadParams, Viewport,
 };
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use chromiumoxide::page::ScreenshotParams;
@@ -91,6 +92,76 @@ pub struct CdpActiveElementState {
     pub value: String,
     pub selection_start: Option<u32>,
     pub selection_end: Option<u32>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum CdpPageNavigationAction {
+    Navigate,
+    Reload,
+    Back,
+    Forward,
+}
+
+impl CdpPageNavigationAction {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Navigate => "navigate",
+            Self::Reload => "reload",
+            Self::Back => "back",
+            Self::Forward => "forward",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CdpPageState {
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub history_current_index: i64,
+    pub history_entry_count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CdpPageNavigationResult {
+    pub target_id: String,
+    pub action: String,
+    pub requested_url: Option<String>,
+    pub before: CdpPageState,
+    pub after: CdpPageState,
+    pub navigation_error_text: Option<String>,
+    pub is_download: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+enum CdpPageReadbackExpectation {
+    Stable,
+    UrlChanged { previous_url: String },
+    HistoryEntry { current_index: i64, url: String },
+}
+
+impl CdpPageReadbackExpectation {
+    fn matches(&self, state: &CdpPageState) -> bool {
+        match self {
+            Self::Stable => true,
+            Self::UrlChanged { previous_url } => state.url != *previous_url,
+            Self::HistoryEntry { current_index, url } => {
+                state.history_current_index == *current_index && state.url == *url
+            }
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self {
+            Self::Stable => "stable loaded page".to_owned(),
+            Self::UrlChanged { previous_url } => {
+                format!("url to change from {previous_url:?}")
+            }
+            Self::HistoryEntry { current_index, url } => {
+                format!("historyIndex={current_index} and url={url:?}")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -339,6 +410,125 @@ pub async fn cdp_active_element_state(
             .map_err(|err| A11yError::CdpAxtreeFailed {
                 detail: format!("Runtime.evaluate active-element decode: {err}"),
             })
+    })
+    .await
+}
+
+/// Navigates/reloads/history-navigates a specific CDP page target and returns a
+/// separate post-command DOM/history readback for the same target.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if the Page command fails, reports a navigation
+/// error, history has no requested entry, or the readback never reaches a
+/// stable loaded state within `wait_timeout_ms`.
+pub async fn cdp_navigate_page_target(
+    endpoint: &str,
+    target_id: &str,
+    action: CdpPageNavigationAction,
+    url: Option<&str>,
+    wait_timeout_ms: u64,
+    ignore_cache: bool,
+) -> A11yResult<CdpPageNavigationResult> {
+    let requested_url = url.map(ToOwned::to_owned);
+    with_target_page(endpoint, target_id, |page| async move {
+        let target_id = page.target_id().inner().clone();
+        let before = read_page_state(&page).await?;
+        let mut navigation_error_text = None;
+        let mut is_download = None;
+        let mut readback_expectation = CdpPageReadbackExpectation::Stable;
+        match action {
+            CdpPageNavigationAction::Navigate => {
+                let Some(url) = requested_url.as_deref() else {
+                    return Err(A11yError::CdpAxtreeFailed {
+                        detail: "Page.navigate requires a URL".to_owned(),
+                    });
+                };
+                let navigated = page
+                    .execute(NavigateParams::new(url.to_owned()))
+                    .await
+                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                        detail: format!("Page.navigate({url:?}): {err}"),
+                    })?;
+                navigation_error_text = navigated.result.error_text.clone();
+                is_download = navigated.result.is_download;
+                if navigation_error_text.is_none() && url != before.url {
+                    readback_expectation = CdpPageReadbackExpectation::UrlChanged {
+                        previous_url: before.url.clone(),
+                    };
+                }
+            }
+            CdpPageNavigationAction::Reload => {
+                let reload = ReloadParams::builder().ignore_cache(ignore_cache).build();
+                page.execute(reload)
+                    .await
+                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                        detail: format!("Page.reload(ignoreCache={ignore_cache}): {err}"),
+                    })?;
+            }
+            CdpPageNavigationAction::Back | CdpPageNavigationAction::Forward => {
+                let history = page
+                    .execute(GetNavigationHistoryParams::default())
+                    .await
+                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                        detail: format!("Page.getNavigationHistory before history action: {err}"),
+                    })?
+                    .result;
+                let delta = if action == CdpPageNavigationAction::Back {
+                    -1
+                } else {
+                    1
+                };
+                let target_index = history.current_index + delta;
+                let Some(entry) = history
+                    .entries
+                    .get(usize::try_from(target_index).unwrap_or(usize::MAX))
+                else {
+                    return Err(A11yError::CdpAxtreeFailed {
+                        detail: format!(
+                            "Page.{} refused: currentIndex={} entries={}",
+                            action.as_str(),
+                            history.current_index,
+                            history.entries.len()
+                        ),
+                    });
+                };
+                page.execute(NavigateToHistoryEntryParams::new(entry.id))
+                    .await
+                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                        detail: format!("Page.navigateToHistoryEntry(entryId={}): {err}", entry.id),
+                    })?;
+                readback_expectation = CdpPageReadbackExpectation::HistoryEntry {
+                    current_index: target_index,
+                    url: entry.url.clone(),
+                };
+            }
+        }
+        let after = wait_for_page_readback(&page, wait_timeout_ms, &readback_expectation).await?;
+        if let Some(error_text) = navigation_error_text.as_deref() {
+            let url = requested_url.as_deref().unwrap_or("");
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "Page.navigate({url:?}) failed: {error_text}; observed after readback url={:?} title={:?} readyState={:?} historyIndex={} historyEntries={} isDownload={:?}",
+                    after.url,
+                    after.title,
+                    after.ready_state,
+                    after.history_current_index,
+                    after.history_entry_count,
+                    is_download
+                ),
+            });
+        }
+        Ok(CdpPageNavigationResult {
+            target_id,
+            action: action.as_str().to_owned(),
+            requested_url,
+            before,
+            after,
+            navigation_error_text,
+            is_download,
+        })
     })
     .await
 }
@@ -789,6 +979,99 @@ fn cdp_key_event(
     }
     builder.build().map_err(|err| A11yError::CdpAxtreeFailed {
         detail: format!("build Input.dispatchKeyEvent params: {err}"),
+    })
+}
+
+async fn wait_for_page_readback(
+    page: &chromiumoxide::Page,
+    wait_timeout_ms: u64,
+    expectation: &CdpPageReadbackExpectation,
+) -> A11yResult<CdpPageState> {
+    let started = tokio::time::Instant::now();
+    let budget = std::time::Duration::from_millis(wait_timeout_ms);
+    let mut last_state: Option<CdpPageState> = None;
+    let mut last_error: Option<String> = None;
+    loop {
+        match read_page_state(page).await {
+            Ok(state) => {
+                let loaded = state.ready_state == "complete" || state.ready_state == "interactive";
+                if loaded && expectation.matches(&state) {
+                    return Ok(state);
+                }
+                last_state = Some(state);
+            }
+            Err(err) => {
+                last_error = Some(err.to_string());
+            }
+        }
+        if started.elapsed() >= budget {
+            if let Some(state) = last_state {
+                return Err(A11yError::CdpAxtreeFailed {
+                    detail: format!(
+                        "page readback did not settle within {wait_timeout_ms} ms waiting for {}; last url={:?} title={:?} readyState={:?} historyIndex={} historyEntries={}",
+                        expectation.detail(),
+                        state.url,
+                        state.title,
+                        state.ready_state,
+                        state.history_current_index,
+                        state.history_entry_count
+                    ),
+                });
+            }
+            if let Some(error) = last_error {
+                return Err(A11yError::CdpAxtreeFailed {
+                    detail: format!(
+                        "page readback did not settle within {wait_timeout_ms} ms; last readback error: {error}"
+                    ),
+                });
+            }
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "page readback did not settle within {wait_timeout_ms} ms; no page state readback"
+                ),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+async fn read_page_state(page: &chromiumoxide::Page) -> A11yResult<CdpPageState> {
+    #[derive(Debug, Deserialize)]
+    struct DomState {
+        url: String,
+        title: String,
+        ready_state: String,
+    }
+
+    let dom = page
+        .evaluate_expression(
+            r#"(() => ({
+                url: String(location.href || ""),
+                title: String(document.title || ""),
+                ready_state: String(document.readyState || "")
+            }))()"#,
+        )
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.evaluate page readback: {err}"),
+        })?
+        .into_value::<DomState>()
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.evaluate page readback decode: {err}"),
+        })?;
+    let history = page
+        .execute(GetNavigationHistoryParams::default())
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Page.getNavigationHistory readback: {err}"),
+        })?
+        .result;
+    Ok(CdpPageState {
+        url: dom.url,
+        title: dom.title,
+        ready_state: dom.ready_state,
+        history_current_index: history.current_index,
+        history_entry_count: u32::try_from(history.entries.len()).unwrap_or(u32::MAX),
     })
 }
 

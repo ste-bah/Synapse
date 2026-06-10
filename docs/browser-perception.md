@@ -65,8 +65,10 @@ The intended strategy ladder is:
    loopback debug endpoint exists.
 2. Chrome debugger extension/native-messaging CDP for the user's normal Chrome
    profile when raw CDP is unreachable.
-3. OCR/capture over tiled browser content when CDP is down or attach fails.
-4. Explicit `uia_only` for browser chrome/native UI when neither DOM nor OCR
+3. Non-attach Chrome extension `chrome.tabs` navigation for normal-profile
+   background tab open, close, navigate, reload, back, and forward.
+4. OCR/capture over tiled browser content when CDP is down or attach fails.
+5. Explicit `uia_only` for browser chrome/native UI when neither DOM nor OCR
    produced page content.
 
 ## Launching a Browser for DOM Access
@@ -122,7 +124,20 @@ Chrome session, the supported attach path is:
    `scripts\install-synapse-chrome-debugger.ps1`. The stable extension ID is
    `leoocgnkjnplbfdbklajepahofecgfbk`; the native host name is
    `com.synapse.chrome_debugger`.
-7. If the current browser session still exposes no endpoint or extension bridge,
+7. Use the non-attach `chrome.tabs` bridge for normal-profile Chrome tab
+   navigation (`cdp_open_tab`, `cdp_close_tab`, and extension-backed
+   `cdp_navigate_tab`). This path uses `chrome.tabs.create`,
+   `chrome.tabs.remove`, `chrome.tabs.update`, `chrome.tabs.reload`,
+   `chrome.tabs.goBack`, and `chrome.tabs.goForward`; it must not call
+   `chrome.debugger.attach`.
+8. Before using attach-capable Chrome debugger extension commands, read the
+   target Chrome process command line and require
+   `--silent-debugger-extension-api`. Chrome intentionally shows a
+   "`started debugging this browser`" warning UI when an extension calls
+   `chrome.debugger.attach` without that switch. Synapse therefore fails closed
+   with `A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED` before attach if the switch is
+   absent or unreadable.
+9. If the current browser session still exposes no endpoint or extension bridge,
    fail closed with
    `web_path = "uia_only"` or `ocr`; do not claim DOM/control readback. Relaunch
    is a user/session decision because it changes the authenticated browser

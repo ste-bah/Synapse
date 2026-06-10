@@ -743,6 +743,7 @@ pub struct ActSpawnAgentLogPaths {
     pub final_message_path: String,
     pub completion_status_path: String,
     pub task_started_path: String,
+    pub task_started_script_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

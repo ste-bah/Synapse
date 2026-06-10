@@ -547,6 +547,7 @@ pub(crate) fn click_reason_for_error_code(error_code: &str) -> &'static str {
         | error_codes::ACTION_RATE_LIMITED
         | error_codes::A11Y_CDP_UNREACHABLE
         | error_codes::A11Y_CDP_ATTACH_FAILED
+        | error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED
         | error_codes::A11Y_CDP_AXTREE_FAILED => CLICK_REASON_BACKEND_UNAVAILABLE,
         error_codes::ACTION_TARGET_INVALID | error_codes::ACTION_ELEMENT_NOT_RESOLVED => {
             CLICK_REASON_TARGET_INVALID

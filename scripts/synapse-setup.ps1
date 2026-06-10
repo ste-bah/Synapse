@@ -55,6 +55,11 @@
 .PARAMETER Bind
   Loopback address the daemon binds. Default 127.0.0.1:7700.
 
+.PARAMETER ChromeNativeHostExePath
+  Installed path for the Chrome native-messaging bridge. Setup builds this
+  binary with the daemon and installs it next to synapse-mcp.exe so Chrome
+  debugger bridge restart fixes are not left stale after daemon updates.
+
 .PARAMETER MaintenanceLockPath
   File-lock Source of Truth that serializes setup/remove across multiple
   agents. The file contents name the owning PID and cleanup policy; the held
@@ -77,6 +82,7 @@ param(
     [switch]$SkipBuild,
     [string]$Bind        = '127.0.0.1:7700',
     [string]$ExePath     = "$env:USERPROFILE\.cargo\bin\synapse-mcp.exe",
+    [string]$ChromeNativeHostExePath = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
     [string]$CargoTarget = "$env:LOCALAPPDATA\synapse\build-target",
     [string]$DbPath      = "$env:LOCALAPPDATA\synapse\db-daemon",
     [string]$ProfilesDir = "$env:USERPROFILE\.cargo\bin\profiles",
@@ -1942,6 +1948,100 @@ function Stop-SynapseMcpProcesses {
         $Reason, $TimeoutSeconds, $remaining.Count, (Format-SynapseMcpProcessSnapshot -Snapshot $remaining))
 }
 
+function Get-SynapseChromeNativeHostProcessSnapshot {
+    param([Parameter(Mandatory=$true)][string]$NativeHostExePath)
+
+    $expectedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($NativeHostExePath)
+    @(Get-CimInstance Win32_Process -Filter "Name='synapse-chrome-native-host.exe'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ExecutablePath -and
+            ($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($_.ExecutablePath) -ieq $expectedPath)
+        } |
+        Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine)
+}
+
+function Format-SynapseChromeNativeHostProcessSnapshot {
+    param($Snapshot)
+    $rows = @($Snapshot | ForEach-Object {
+        "pid=$($_.ProcessId) ppid=$($_.ParentProcessId) path=$($_.ExecutablePath) cmd=$($_.CommandLine)"
+    })
+    if ($rows.Count -eq 0) { return '<none>' }
+    return ($rows -join "`n")
+}
+
+function Assert-SynapseChromeNativeHostStopTarget {
+    param(
+        [Parameter(Mandatory=$true)]$SnapshotProcess,
+        [Parameter(Mandatory=$true)][string]$NativeHostExePath
+    )
+
+    $pidValue = [int]$SnapshotProcess.ProcessId
+    $current = Get-CimInstance Win32_Process -Filter "ProcessId=$pidValue" -ErrorAction SilentlyContinue
+    if (-not $current) {
+        Info "Chrome native host stop target already exited pid=$pidValue"
+        return $null
+    }
+
+    $expectedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($NativeHostExePath)
+    $actualPath = if ($current.ExecutablePath) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($current.ExecutablePath) } else { '' }
+    if ($current.Name -ine 'synapse-chrome-native-host.exe' -or $actualPath -ine $expectedPath) {
+        Die ("SYNAPSE_CHROME_NATIVE_HOST_STOP_TARGET_MISMATCH pid={0} expected_path={1} actual_name={2} actual_path={3} command_line={4} remediation=PID was reused or snapshot was not the Synapse Chrome native host; refusing exact-PID stop" -f `
+            $pidValue,
+            $expectedPath,
+            $current.Name,
+            $current.ExecutablePath,
+            $current.CommandLine)
+    }
+    if ($current.CommandLine -notmatch 'chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/') {
+        Die ("SYNAPSE_CHROME_NATIVE_HOST_STOP_UNVERIFIED pid={0} name={1} command_line={2} remediation=command line does not prove the Synapse Chrome extension bridge target; refusing exact-PID stop" -f `
+            $pidValue,
+            $current.Name,
+            $current.CommandLine)
+    }
+
+    return $current
+}
+
+function Stop-SynapseChromeNativeHostProcesses {
+    param(
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [Parameter(Mandatory=$true)][string]$NativeHostExePath,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $before = @(Get-SynapseChromeNativeHostProcessSnapshot -NativeHostExePath $NativeHostExePath)
+    Info "Chrome native host process stop requested reason=$Reason before_count=$($before.Count)"
+    Info ("Chrome native host process stop before:`n{0}" -f (Format-SynapseChromeNativeHostProcessSnapshot -Snapshot $before))
+    foreach ($proc in $before) {
+        $verified = Assert-SynapseChromeNativeHostStopTarget -SnapshotProcess $proc -NativeHostExePath $NativeHostExePath
+        if (-not $verified) { continue }
+        $pidValue = [int]$verified.ProcessId
+        try {
+            Stop-Process -Id $pidValue -Force -ErrorAction Stop
+            Info "Chrome native host exact-PID stop issued pid=$pidValue reason=$Reason"
+        } catch {
+            Die ("SYNAPSE_CHROME_NATIVE_HOST_STOP_FAILED pid={0} reason={1} error={2} remediation=setup only stops verified synapse-chrome-native-host.exe PIDs; it never stops cmd.exe/native-messaging wrapper or terminal processes" -f `
+                $pidValue,
+                $Reason,
+                $_.Exception.Message)
+        }
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        Start-Sleep -Milliseconds 250
+        $after = @(Get-SynapseChromeNativeHostProcessSnapshot -NativeHostExePath $NativeHostExePath)
+        if ($after.Count -eq 0) {
+            Info "Chrome native host process stop verified reason=$Reason after_count=0"
+            return
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    $remaining = @(Get-SynapseChromeNativeHostProcessSnapshot -NativeHostExePath $NativeHostExePath)
+    Die ("SYNAPSE_CHROME_NATIVE_HOST_STOP_FAILED reason={0} timeout_s={1} remaining_count={2} remaining=`n{3}" -f `
+        $Reason, $TimeoutSeconds, $remaining.Count, (Format-SynapseChromeNativeHostProcessSnapshot -Snapshot $remaining))
+}
+
 # ---------------------------------------------------------------------------
 # Uninstall path
 # ---------------------------------------------------------------------------
@@ -2008,6 +2108,9 @@ if (-not $SkipBuild) {
     $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
+    $builtChromeNativeHost = Join-Path $CargoTarget 'release\synapse-chrome-native-host.exe'
+    if (-not (Test-Path $builtChromeNativeHost)) { Die "Build reported success but $builtChromeNativeHost is missing." }
+    Info "Built Chrome native host: $builtChromeNativeHost ($([math]::Round((Get-Item $builtChromeNativeHost).Length/1MB,1)) MB)"
 }
 
 # ---------------------------------------------------------------------------
@@ -2117,6 +2220,35 @@ if ($installedHash -ne $installSourceHash) {
 $ver = (& $ExePath --version) 2>&1
 Info "Installed binary reports: $ver"
 Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash"
+
+if (-not $SkipBuild) {
+    Step "Installing Chrome native host -> $ChromeNativeHostExePath"
+    $nativeHostSourceHash = Get-SynapseFileSha256 -Path $builtChromeNativeHost
+    Stop-SynapseChromeNativeHostProcesses -Reason 'install_chrome_native_host' -NativeHostExePath $ChromeNativeHostExePath
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ChromeNativeHostExePath) | Out-Null
+    $nativeHostOldHash = $null
+    if (Test-Path -LiteralPath $ChromeNativeHostExePath) {
+        $nativeHostOldHash = Get-SynapseFileSha256 -Path $ChromeNativeHostExePath
+        $nativeHostBackupPath = "$ChromeNativeHostExePath.bak"
+        Copy-Item -LiteralPath $ChromeNativeHostExePath -Destination $nativeHostBackupPath -Force
+        $nativeHostBackupHash = Get-SynapseFileSha256 -Path $nativeHostBackupPath
+        if ($nativeHostBackupHash -ne $nativeHostOldHash) {
+            Die "SYNAPSE_CHROME_NATIVE_HOST_BACKUP_HASH_MISMATCH installed=$ChromeNativeHostExePath backup=$nativeHostBackupPath installed_hash=$nativeHostOldHash backup_hash=$nativeHostBackupHash remediation=backup bytes changed during copy; refusing to install candidate"
+        }
+        Info "Backed up old Chrome native host -> $nativeHostBackupPath sha256=$nativeHostBackupHash"
+    }
+    Copy-Item -LiteralPath $builtChromeNativeHost -Destination $ChromeNativeHostExePath -Force
+    if (-not (Test-Path -LiteralPath $ChromeNativeHostExePath)) {
+        Die "SYNAPSE_CHROME_NATIVE_HOST_INSTALL_MISSING path=$ChromeNativeHostExePath remediation=setup could not find the installed Chrome native host binary after copy"
+    }
+    $nativeHostInstalledHash = Get-SynapseFileSha256 -Path $ChromeNativeHostExePath
+    if ($nativeHostInstalledHash -ne $nativeHostSourceHash) {
+        Die "SYNAPSE_CHROME_NATIVE_HOST_HASH_MISMATCH path=$ChromeNativeHostExePath expected_sha256=$nativeHostSourceHash actual_sha256=$nativeHostInstalledHash remediation=installed Chrome native host bytes do not match the release build"
+    }
+    Info "Installed Chrome native host verified path=$ChromeNativeHostExePath sha256=$nativeHostInstalledHash previous_sha256=$nativeHostOldHash"
+} else {
+    Info "SkipBuild: leaving Chrome native host binary unchanged path=$ChromeNativeHostExePath"
+}
 
 # ---------------------------------------------------------------------------
 # 6. Deploy bundled profiles next to the exe (executable-relative lookup) +

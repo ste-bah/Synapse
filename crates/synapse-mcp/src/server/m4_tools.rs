@@ -965,6 +965,7 @@ struct AgentSpawnFiles {
     final_message_path: PathBuf,
     completion_status_path: PathBuf,
     task_started_path: PathBuf,
+    task_started_script_path: PathBuf,
     debug_path: Option<PathBuf>,
     mcp_config_path: Option<PathBuf>,
 }
@@ -979,6 +980,7 @@ impl AgentSpawnFiles {
             final_message_path: self.final_message_path.display().to_string(),
             completion_status_path: self.completion_status_path.display().to_string(),
             task_started_path: self.task_started_path.display().to_string(),
+            task_started_script_path: self.task_started_script_path.display().to_string(),
             debug_path: self
                 .debug_path
                 .as_ref()
@@ -1926,12 +1928,31 @@ fn prepare_agent_spawn_files(
     let final_message_path = log_dir.join("final-message.txt");
     let completion_status_path = log_dir.join("completion-status.json");
     let task_started_path = log_dir.join("task-started.json");
+    let task_started_script_path = log_dir.join("write-task-started.ps1");
     let debug_path =
         (params.cli == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-debug.log"));
     let mcp_config_path =
         (params.cli == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-mcp-config.json"));
 
-    let prompt = build_agent_spawn_prompt(spawn_id, params, working_dir, &task_started_path)?;
+    let task_started_script =
+        build_agent_spawn_task_start_script(spawn_id, params, &task_started_path);
+    fs::write(&task_started_script_path, task_started_script).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_spawn_agent failed to write task-start script {}: {error}",
+                task_started_script_path.display()
+            ),
+        )
+    })?;
+
+    let prompt = build_agent_spawn_prompt(
+        spawn_id,
+        params,
+        working_dir,
+        &task_started_path,
+        &task_started_script_path,
+    )?;
     fs::write(&prompt_path, prompt).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
@@ -1978,6 +1999,7 @@ fn prepare_agent_spawn_files(
         final_message_path,
         completion_status_path,
         task_started_path,
+        task_started_script_path,
         debug_path,
         mcp_config_path,
     })
@@ -2000,6 +2022,7 @@ fn build_agent_spawn_prompt(
     params: &ActSpawnAgentParams,
     working_dir: &Path,
     task_started_path: &Path,
+    task_started_script_path: &Path,
 ) -> Result<String, ErrorData> {
     let target_instruction = match &params.target {
         Some(target) => {
@@ -2018,7 +2041,6 @@ fn build_agent_spawn_prompt(
         }
     };
     let assigned_prompt = params.prompt.as_deref().unwrap_or("").trim();
-    let assigned_prompt_present = !assigned_prompt.is_empty();
     let assigned_block = if assigned_prompt.is_empty() {
         "No additional task was provided; perform only the provisioning checks above.".to_owned()
     } else {
@@ -2035,12 +2057,8 @@ fn build_agent_spawn_prompt(
         )
     };
     let task_started_path_display = task_started_path.display().to_string();
-    let task_started_path_ps = ps_single_quoted_path(task_started_path);
-    let task_started_assigned_prompt_present = if assigned_prompt_present {
-        "$true"
-    } else {
-        "$false"
-    };
+    let task_started_script_path_display = task_started_script_path.display().to_string();
+    let task_started_script_path_ps = ps_single_quoted_path(task_started_script_path);
     Ok(format!(
         "You are a primary {cli} agent spawned by Synapse act_spawn_agent.\n\
 Spawn ID: {spawn_id}\n\
@@ -2059,14 +2077,10 @@ Mandatory provisioning checks:\n\
 {target_instruction}\n\
 5. If any Synapse MCP tool is missing or fails, stop and report the exact tool/error.\n\
 6. Before performing the assigned task or hold-open sleep, write the required task-start readiness artifact to: {task_started_path}\n\
-   Use one local PowerShell command equivalent to this, replacing <your_session_id> with this spawned MCP session id:\n\
-   $taskStartedPath = {task_started_path_ps}\n\
-   $taskStartedTempPath = \"$taskStartedPath.tmp.$PID\"\n\
-   $taskStarted = [ordered]@{{ schema_version = 1; spawn_id = '{spawn_id}'; cli = '{cli}'; session_id = '<your_session_id>'; status = 'started'; health_ok = $true; target_ok = $true; assigned_prompt_present = {task_started_assigned_prompt_present}; task_started_path = $taskStartedPath; started_at_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }}\n\
-   [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($taskStartedPath)) | Out-Null\n\
-   $taskStarted | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $taskStartedTempPath -Encoding UTF8\n\
-   Move-Item -LiteralPath $taskStartedTempPath -Destination $taskStartedPath -Force\n\
-   Then read the artifact back and verify the JSON fields match; if the artifact cannot be read back, stop and report the exact error.\n\
+   Helper path: {task_started_script_path}\n\
+   Run the daemon-generated PowerShell helper exactly once after replacing <your_session_id> with this spawned MCP session id:\n\
+   & {task_started_script_path_ps} -SessionId '<your_session_id>'\n\
+   Do not rewrite the helper inline. The helper writes the JSON atomically, reads {task_started_path} back, and fails closed with an exact mismatch error if any field is wrong.\n\
 7. In your final response, include one compact JSON object containing spawn_id, health_ok, session_id, target_ok, task_started_path, and any error.\n\
 \n\
 {assigned_block}\n\
@@ -2077,11 +2091,86 @@ Mandatory provisioning checks:\n\
         working_dir = working_dir.display(),
         target_instruction = target_instruction,
         task_started_path = task_started_path_display,
-        task_started_path_ps = task_started_path_ps,
-        task_started_assigned_prompt_present = task_started_assigned_prompt_present,
+        task_started_script_path_ps = task_started_script_path_ps,
+        task_started_script_path = task_started_script_path_display,
         assigned_block = assigned_block,
         hold_instruction = hold_instruction,
     ))
+}
+
+fn build_agent_spawn_task_start_script(
+    spawn_id: &str,
+    params: &ActSpawnAgentParams,
+    task_started_path: &Path,
+) -> String {
+    let spawn_id = ps_single_quote(spawn_id);
+    let cli = ps_single_quote(params.cli.as_str());
+    let task_started_path = ps_single_quoted_path(task_started_path);
+    let assigned_prompt_present = if params
+        .prompt
+        .as_deref()
+        .is_some_and(|prompt| !prompt.trim().is_empty())
+    {
+        "$true"
+    } else {
+        "$false"
+    };
+    format!(
+        "param(\n\
+    [Parameter(Mandatory = $true)]\n\
+    [ValidateNotNullOrEmpty()]\n\
+    [string]$SessionId\n\
+)\n\
+$ErrorActionPreference = 'Stop'\n\
+Set-StrictMode -Version Latest\n\
+$taskStartedPath = {task_started_path}\n\
+$taskStartedTempPath = \"$taskStartedPath.tmp.$PID\"\n\
+$taskStarted = [ordered]@{{\n\
+    schema_version = 1\n\
+    spawn_id = {spawn_id}\n\
+    cli = {cli}\n\
+    session_id = $SessionId\n\
+    status = 'started'\n\
+    health_ok = $true\n\
+    target_ok = $true\n\
+    assigned_prompt_present = {assigned_prompt_present}\n\
+    task_started_path = $taskStartedPath\n\
+    started_at_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n\
+}}\n\
+[System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($taskStartedPath)) | Out-Null\n\
+$taskStarted | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $taskStartedTempPath -Encoding UTF8\n\
+Move-Item -LiteralPath $taskStartedTempPath -Destination $taskStartedPath -Force\n\
+\n\
+$readBack = Get-Content -LiteralPath $taskStartedPath -Raw -Encoding UTF8 | ConvertFrom-Json\n\
+$expected = [ordered]@{{\n\
+    schema_version = 1\n\
+    spawn_id = {spawn_id}\n\
+    cli = {cli}\n\
+    session_id = $SessionId\n\
+    status = 'started'\n\
+    health_ok = $true\n\
+    target_ok = $true\n\
+    assigned_prompt_present = {assigned_prompt_present}\n\
+    task_started_path = $taskStartedPath\n\
+}}\n\
+foreach ($key in $expected.Keys) {{\n\
+    $property = $readBack.PSObject.Properties.Item($key)\n\
+    if ($null -eq $property) {{ throw (\"task-started missing field {{0}}\" -f $key) }}\n\
+    $actual = $property.Value\n\
+    $expectedValue = $expected[$key]\n\
+    if ($actual -ne $expectedValue) {{\n\
+        throw (\"task-started mismatch for {{0}}: expected '{{1}}' actual '{{2}}'\" -f $key, $expectedValue, $actual)\n\
+    }}\n\
+}}\n\
+if ($null -eq $readBack.started_at_unix_ms -or [int64]$readBack.started_at_unix_ms -le 0) {{\n\
+    throw 'task-started missing valid started_at_unix_ms'\n\
+}}\n\
+$readBack | ConvertTo-Json -Depth 8\n",
+        task_started_path = task_started_path,
+        spawn_id = spawn_id,
+        cli = cli,
+        assigned_prompt_present = assigned_prompt_present,
+    )
 }
 
 fn agent_spawn_powershell_script(
@@ -2675,11 +2764,13 @@ mod tests {
     fn spawn_prompt_names_powershell_contract() {
         let dir = Path::new(r"C:\code\Synapse");
         let task_started_path = dir.join("task-started.json");
+        let task_started_script_path = dir.join("write-task-started.ps1");
         let prompt = build_agent_spawn_prompt(
             "agent-spawn-test",
             &test_spawn_params(),
             dir,
             &task_started_path,
+            &task_started_script_path,
         )
         .expect("build spawn prompt");
 
@@ -2689,9 +2780,17 @@ mod tests {
         assert!(prompt.contains("Start-Sleep -Milliseconds 1234"));
         assert!(prompt.contains("task-start readiness artifact"));
         assert!(prompt.contains("task-started.json"));
-        assert!(prompt.contains("$taskStartedTempPath"));
-        assert!(prompt.contains("Move-Item -LiteralPath $taskStartedTempPath"));
-        assert!(prompt.contains("assigned_prompt_present = $true"));
+        assert!(prompt.contains("write-task-started.ps1"));
+        assert!(prompt.contains("Do not rewrite the helper inline"));
+
+        let script = build_agent_spawn_task_start_script(
+            "agent-spawn-test",
+            &test_spawn_params(),
+            &task_started_path,
+        );
+        assert!(script.contains("-f $key, $expectedValue, $actual"));
+        assert!(!script.contains("$key:"));
+        assert!(script.contains("assigned_prompt_present = $true"));
     }
 
     #[test]
@@ -2717,6 +2816,7 @@ mod tests {
             final_message_path: dir.path().join("final-message.txt"),
             completion_status_path: dir.path().join("completion-status.json"),
             task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
             debug_path: None,
             mcp_config_path: None,
         };
@@ -2775,6 +2875,7 @@ mod tests {
             final_message_path: dir.path().join("final-message.txt"),
             completion_status_path: dir.path().join("completion-status.json"),
             task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
             debug_path: None,
             mcp_config_path: None,
         };
@@ -2823,6 +2924,7 @@ mod tests {
             final_message_path: dir.path().join("final-message.txt"),
             completion_status_path: dir.path().join("completion-status.json"),
             task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
             debug_path: None,
             mcp_config_path: None,
         };

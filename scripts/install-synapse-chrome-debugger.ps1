@@ -4,6 +4,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$silentDebuggerSwitch = '--silent-debugger-extension-api'
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $extensionDir = Join-Path $repoRoot 'extensions\synapse-chrome-debugger'
@@ -65,6 +66,15 @@ if ($readbackManifest.allowed_origins[0] -ne "chrome-extension://$ExtensionId/")
     throw "SYNAPSE_CHROME_NATIVE_HOST_ORIGIN_MISMATCH expected=chrome-extension://$ExtensionId/ actual=$($readbackManifest.allowed_origins[0])"
 }
 
+$chromeProcesses = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+    $commandLine = [string]$_.CommandLine
+    [pscustomobject]@{
+        pid = [int]$_.ProcessId
+        command_line_readable = -not [string]::IsNullOrWhiteSpace($commandLine)
+        has_silent_debugger_switch = $commandLine -match '(^|\s)--silent-debugger-extension-api(\s|=|$)'
+    }
+})
+
 [pscustomobject]@{
     ok = $true
     native_host = $hostName
@@ -73,4 +83,9 @@ if ($readbackManifest.allowed_origins[0] -ne "chrome-extension://$ExtensionId/")
     binary = $readbackManifest.path
     extension_id = $ExtensionId
     extension_dir = $extensionDir
+    background_navigation_backend = 'chrome.tabs_no_debugger_attach'
+    attach_popup_prevention = 'attach_capable_commands_fail_closed_unless_chrome_has_silent_debugger_switch'
+    silent_debugger_switch_required_for_attach_commands = $true
+    silent_debugger_switch = $silentDebuggerSwitch
+    current_chrome_processes = $chromeProcesses
 }

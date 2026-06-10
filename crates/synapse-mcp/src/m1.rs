@@ -543,6 +543,71 @@ pub struct CdpCloseTabResponse {
     pub current: Option<TargetWire>,
 }
 
+#[derive(Copy, Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CdpNavigateAction {
+    Navigate,
+    Reload,
+    Back,
+    Forward,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpNavigateTabParams {
+    /// Browser HWND whose target table contains the CDP target. If omitted, the
+    /// caller must already have an active CDP session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// CDP TargetID to navigate. If omitted, the active session CDP target is used.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Navigation operation. `navigate` requires `url`; raw CDP uses
+    /// Page.getNavigationHistory for history actions, while the normal Chrome
+    /// extension bridge uses chrome.tabs history methods without debugger attach.
+    pub action: CdpNavigateAction,
+    /// Destination URL for `action=navigate`.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Optional caller load/readback budget. Defaults to the bridge/CDP command
+    /// budget and is capped by the daemon command timeout.
+    #[serde(default)]
+    pub wait_timeout_ms: Option<u64>,
+    /// `Page.reload(ignoreCache=true)` for `action=reload`.
+    #[serde(default)]
+    pub ignore_cache: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpNavigateTabResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub action: CdpNavigateAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_url: Option<String>,
+    pub before_url: String,
+    pub before_title: String,
+    pub after_url: String,
+    pub after_title: String,
+    pub ready_state: String,
+    pub history_current_index: i64,
+    pub history_entry_count: u32,
+    pub history_readback_source: String,
+    pub readback_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_error_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_download: Option<bool>,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+    pub target_candidate_count: u32,
+    pub target_selection_reason: String,
+}
+
 pub fn empty_input_schema() -> Arc<JsonObject> {
     common::schema_for_type::<EmptyParams>()
 }
