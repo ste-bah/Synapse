@@ -720,9 +720,10 @@ fn bridge() -> &'static ChromeDebuggerBridge {
 async fn send_attach_command(
     hwnd: i64,
     kind: &'static str,
-    payload: Value,
+    mut payload: Value,
 ) -> Result<Value, ChromeDebuggerBridgeError> {
-    ensure_debugger_warning_suppressed(hwnd)?;
+    let state = verify_debugger_warning_suppressed(hwnd)?;
+    attach_suppression_attestation(&mut payload, &state)?;
     bridge().send_command(kind, payload).await
 }
 
@@ -734,10 +735,12 @@ struct DebuggerAttachProcessState {
 }
 
 #[cfg(windows)]
-fn ensure_debugger_warning_suppressed(hwnd: i64) -> Result<(), ChromeDebuggerBridgeError> {
+fn verify_debugger_warning_suppressed(
+    hwnd: i64,
+) -> Result<DebuggerAttachProcessState, ChromeDebuggerBridgeError> {
     let state = debugger_attach_process_state(hwnd)?;
     if command_line_has_silent_debugger_flag(&state.command_line) {
-        return Ok(());
+        return Ok(state);
     }
     Err(ChromeDebuggerBridgeError::debugger_warning_unsuppressed(
         hwnd,
@@ -749,7 +752,9 @@ fn ensure_debugger_warning_suppressed(hwnd: i64) -> Result<(), ChromeDebuggerBri
 }
 
 #[cfg(not(windows))]
-fn ensure_debugger_warning_suppressed(hwnd: i64) -> Result<(), ChromeDebuggerBridgeError> {
+fn verify_debugger_warning_suppressed(
+    hwnd: i64,
+) -> Result<DebuggerAttachProcessState, ChromeDebuggerBridgeError> {
     Err(ChromeDebuggerBridgeError::debugger_warning_unsuppressed(
         hwnd,
         None,
@@ -757,6 +762,27 @@ fn ensure_debugger_warning_suppressed(hwnd: i64) -> Result<(), ChromeDebuggerBri
         None,
         "target browser process command line cannot be verified on this platform",
     ))
+}
+
+fn attach_suppression_attestation(
+    payload: &mut Value,
+    state: &DebuggerAttachProcessState,
+) -> Result<(), ChromeDebuggerBridgeError> {
+    let Some(object) = payload.as_object_mut() else {
+        return Err(ChromeDebuggerBridgeError::protocol(
+            "Chrome debugger attach command payload was not a JSON object",
+        ));
+    };
+    object.insert("debuggerAttachSuppressionVerified".to_owned(), true.into());
+    object.insert(
+        "debuggerAttachSuppression".to_owned(),
+        json!({
+            "requiredSwitch": CHROME_DEBUGGER_SILENT_FLAG,
+            "processId": state.pid,
+            "processName": state.process_name,
+        }),
+    );
+    Ok(())
 }
 
 #[cfg(windows)]

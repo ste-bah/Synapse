@@ -84,7 +84,7 @@ $chromeProcesses = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -
     extension_id = $ExtensionId
     extension_dir = $extensionDir
     background_navigation_backend = 'chrome.tabs_no_debugger_attach'
-    attach_popup_prevention = 'attach_capable_commands_fail_closed_unless_chrome_has_silent_debugger_switch'
+    attach_popup_prevention = 'daemon_command_line_preflight_plus_extension_attestation_gate'
     silent_debugger_switch_required_for_attach_commands = $true
     silent_debugger_switch = $silentDebuggerSwitch
     current_chrome_processes = $chromeProcesses

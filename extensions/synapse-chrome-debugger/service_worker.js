@@ -2,9 +2,11 @@ const HOST_NAME = "com.synapse.chrome_debugger";
 const PROTOCOL_VERSION = 1;
 const ERROR_ATTACH_FAILED = "A11Y_CDP_ATTACH_FAILED";
 const ERROR_AXTREE_FAILED = "A11Y_CDP_AXTREE_FAILED";
+const ERROR_DEBUGGER_WARNING_UNSUPPRESSED = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 const ERROR_EXTENSION_DETACHED = "A11Y_CDP_EXTENSION_DETACHED";
 const ERROR_EXTENSION_TIMEOUT = "A11Y_CDP_EXTENSION_TIMEOUT";
 const ERROR_EXTENSION_UNAVAILABLE = "A11Y_CDP_EXTENSION_UNAVAILABLE";
+const SILENT_DEBUGGER_SWITCH = "--silent-debugger-extension-api";
 const DETACH_SURFACE_MS = 5000;
 
 let nativePort = null;
@@ -116,7 +118,7 @@ async function handleCommand(command) {
 
 async function handleSnapshot(params) {
   const selected = await selectPageTarget(params);
-  return await withAttached(selected, async (debuggee) => {
+  return await withAttached(selected, params, async (debuggee) => {
     await sendCdp(debuggee, "Accessibility.enable", {});
     const tree = await sendCdp(debuggee, "Accessibility.getFullAXTree", {});
     const axNodes = Array.isArray(tree.nodes) ? tree.nodes : [];
@@ -168,7 +170,7 @@ async function handleSnapshot(params) {
 async function handleClickNode(params) {
   const backendNodeId = requiredNumber(params.backendNodeId, "backendNodeId");
   const selected = await selectPageTarget(params);
-  return await withAttached(selected, async (debuggee) => {
+  return await withAttached(selected, params, async (debuggee) => {
     await sendCdp(debuggee, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
     const bbox = await boxForBackend(debuggee, backendNodeId);
     if (!bbox || bbox.w <= 0 || bbox.h <= 0) {
@@ -212,7 +214,7 @@ async function handleTypeNode(params) {
   const backendNodeId = requiredNumber(params.backendNodeId, "backendNodeId");
   const text = String(params.text ?? "");
   const selected = await selectPageTarget(params);
-  return await withAttached(selected, async (debuggee) => {
+  return await withAttached(selected, params, async (debuggee) => {
     await sendCdp(debuggee, "DOM.scrollIntoViewIfNeeded", { backendNodeId });
     const bbox = await boxForBackend(debuggee, backendNodeId);
     if (!bbox || bbox.w <= 0 || bbox.h <= 0) {
@@ -261,7 +263,7 @@ async function handleTypeNode(params) {
 async function handleNodeValue(params) {
   const backendNodeId = requiredNumber(params.backendNodeId, "backendNodeId");
   const selected = await selectPageTarget(params);
-  return await withAttached(selected, async (debuggee) => {
+  return await withAttached(selected, params, async (debuggee) => {
     const resolved = await sendCdp(debuggee, "DOM.resolveNode", { backendNodeId });
     const objectId = resolved?.object?.objectId;
     if (!objectId) {
@@ -484,13 +486,25 @@ function selectedPage(target, targetCandidateCount, selectionReason) {
   };
 }
 
-async function withAttached(selected, operation) {
+async function withAttached(selected, params, operation) {
+  requireAttachSuppressionVerified(params);
   const debuggee = await attachForCommand(selected);
   try {
     return await operation(debuggee);
   } finally {
     await detachAfterCommand(debuggee, selected.tabId);
   }
+}
+
+function requireAttachSuppressionVerified(params) {
+  if (params?.debuggerAttachSuppressionVerified === true) {
+    return;
+  }
+  throw bridgeError(
+    ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
+    `chrome.debugger.attach refused before attach because the daemon did not attest debugger warning suppression; ` +
+      `hwnd=${String(params?.hwnd ?? "unknown")} requiredFlag=${SILENT_DEBUGGER_SWITCH}`
+  );
 }
 
 async function attachForCommand(selected) {

@@ -32,4 +32,6 @@ shows its "`started debugging this browser`" warning UI when an extension calls
 `chrome.debugger.attach`. Synapse checks the target window owner PID and process
 command line before attach; if the switch is absent or unreadable, Synapse
 returns `A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED` and does not call
-`chrome.debugger.attach`.
+`chrome.debugger.attach`. The extension also requires the daemon's explicit
+suppression attestation on attach-capable native commands, so stale or malformed
+native commands fail before `chrome.debugger.attach`.

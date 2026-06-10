@@ -136,7 +136,9 @@ Chrome session, the supported attach path is:
    "`started debugging this browser`" warning UI when an extension calls
    `chrome.debugger.attach` without that switch. Synapse therefore fails closed
    with `A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED` before attach if the switch is
-   absent or unreadable.
+   absent or unreadable. The extension must also refuse attach-capable commands
+   unless the daemon includes a verified suppression attestation, which prevents
+   stale native commands from surfacing the browser warning.
 9. If the current browser session still exposes no endpoint or extension bridge,
    fail closed with
    `web_path = "uia_only"` or `ocr`; do not claim DOM/control readback. Relaunch
