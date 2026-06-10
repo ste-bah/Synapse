@@ -29,6 +29,11 @@ attempts direct localhost registration again. Commands execute only after the
 daemon asks through the fixed extension origin and daemon-issued bridge token.
 The normal bridge does not call `runtime.connectNative()`, so Chrome does not
 create a native-host `cmd.exe` wrapper on end-user systems.
+The verifier also removes stale Synapse native-host registration from every
+Chrome Windows lookup hive (`HKCU`/`HKLM`, 32-bit and 64-bit views) and returns
+the before/after registry readback. If any Synapse native-host key remains, the
+verifier fails closed with the exact hive/path/ACL evidence instead of
+certifying the host.
 
 Registration is also fail-closed. If the daemon sees any live Chrome
 profile/process Source of Truth that is not popup-free, it refuses the direct

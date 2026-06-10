@@ -136,6 +136,10 @@ Chrome session, the supported attach path is:
    token, a 20s WebSocket keepalive while connected, and a 30s `chrome.alarms`
    reconnect tick so the MV3 service worker reconnects after daemon restarts
    without native messaging.
+   The verifier removes stale Synapse native-host registration from all Windows
+   Chrome lookup hives (`HKCU`/`HKLM`, 32-bit and 64-bit views) and fails closed
+   with per-key readback/ACL evidence if any Synapse native-host registration
+   remains.
 7. Use the non-attach `chrome.tabs` bridge for normal-profile Chrome tab
    navigation (`cdp_open_tab`, `cdp_close_tab`, and extension-backed
    `cdp_navigate_tab`). This path uses `chrome.tabs.create`,

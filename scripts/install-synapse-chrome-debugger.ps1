@@ -235,6 +235,121 @@ function Write-ChromeExternalDebuggerPolicyAuto {
     throw "SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED_ALL_HIVES requested_hive=$Hive block_scope=$BlockScope attempts=$attemptDetail remediation=setup could not persist Chrome ExtensionSettings blocked_permissions=[debugger,nativeMessaging] in any allowed hive; run setup elevated so HKLM can be written, repair HKCU Software\Policies ACL so the current user can write, or disable/remove the named external Chrome extension/native host before certifying popup-free state"
 }
 
+function Get-SynapseNativeHostRegistryTargets {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HostName
+    )
+
+    @(
+        [pscustomobject]@{
+            hive = 'HKCU'
+            registry_view = '64'
+            path = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$HostName"
+        },
+        [pscustomobject]@{
+            hive = 'HKLM'
+            registry_view = '64'
+            path = "HKLM:\Software\Google\Chrome\NativeMessagingHosts\$HostName"
+        },
+        [pscustomobject]@{
+            hive = 'HKCU'
+            registry_view = '32'
+            path = "HKCU:\Software\Wow6432Node\Google\Chrome\NativeMessagingHosts\$HostName"
+        },
+        [pscustomobject]@{
+            hive = 'HKLM'
+            registry_view = '32'
+            path = "HKLM:\Software\Wow6432Node\Google\Chrome\NativeMessagingHosts\$HostName"
+        }
+    )
+}
+
+function Read-SynapseNativeHostRegistryEntries {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HostName
+    )
+
+    $entries = @()
+    foreach ($target in (Get-SynapseNativeHostRegistryTargets -HostName $HostName)) {
+        if (-not (Test-Path -LiteralPath $target.path)) {
+            continue
+        }
+        try {
+            $key = Get-Item -LiteralPath $target.path -ErrorAction Stop
+            $manifestPath = [string]$key.GetValue('')
+            $entries += [pscustomobject]@{
+                hive = $target.hive
+                registry_view = $target.registry_view
+                path = $target.path
+                manifest_path = $manifestPath
+                read_error = $null
+            }
+        } catch {
+            $entries += [pscustomobject]@{
+                hive = $target.hive
+                registry_view = $target.registry_view
+                path = $target.path
+                manifest_path = $null
+                read_error = $_.Exception.Message
+            }
+        }
+    }
+    return @($entries)
+}
+
+function Remove-SynapseNativeHostRegistryEntries {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$HostName
+    )
+
+    $before = @(Read-SynapseNativeHostRegistryEntries -HostName $HostName)
+    $removed = @()
+    $failures = @()
+
+    foreach ($entry in $before) {
+        try {
+            Remove-Item -LiteralPath $entry.path -Force -ErrorAction Stop
+            $removed += [pscustomobject]@{
+                hive = $entry.hive
+                registry_view = $entry.registry_view
+                path = $entry.path
+                manifest_path = $entry.manifest_path
+            }
+        } catch {
+            $failures += [pscustomobject]@{
+                hive = $entry.hive
+                registry_view = $entry.registry_view
+                path = $entry.path
+                manifest_path = $entry.manifest_path
+                error = $_.Exception.Message
+                acl_detail = Get-RegistryAclDiagnostic -Path $entry.path
+            }
+        }
+    }
+
+    $after = @(Read-SynapseNativeHostRegistryEntries -HostName $HostName)
+    if ($failures.Count -gt 0 -or $after.Count -gt 0) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            host_name = $HostName
+            before = $before
+            removed = $removed
+            after = $after
+            failures = $failures
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_NATIVE_HOST_REGISTRY_REMOVE_FAILED_ALL_HIVES detail=$detail remediation=normal bridge must not leave Synapse nativeMessaging host registration in any Chrome lookup hive because Chrome can launch visible native-host wrappers; remove the listed registry keys from a principal that can write them and rerun this verifier"
+    }
+
+    [pscustomobject]@{
+        host_name = $HostName
+        before = $before
+        removed = $removed
+        after = $after
+    }
+}
+
 if ($ExtensionId -notmatch '^[a-p]{32}$') {
     throw "SYNAPSE_CHROME_EXTENSION_ID_INVALID extension_id=$ExtensionId remediation=Chrome extension IDs are 32 lowercase characters in the range a-p; refusing to inspect profiles with an ambiguous extension identity"
 }
@@ -271,12 +386,7 @@ New-Item -ItemType Directory -Force -Path $nativeRoot | Out-Null
 $hostName = 'com.synapse.chrome_debugger'
 $hostManifestPath = Join-Path $nativeRoot "$hostName.json"
 $registryPath = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\$hostName"
-if (Test-Path -LiteralPath $registryPath) {
-    Remove-Item -LiteralPath $registryPath -Force
-}
-if (Test-Path -LiteralPath $registryPath) {
-    throw "SYNAPSE_CHROME_NATIVE_HOST_REGISTRY_REMOVE_FAILED path=$registryPath remediation=normal bridge must not leave a nativeMessaging host registered because Chrome may launch cmd.exe as an intermediary"
-}
+$nativeHostRegistryCleanup = Remove-SynapseNativeHostRegistryEntries -HostName $hostName
 if (Test-Path -LiteralPath $hostManifestPath -PathType Leaf) {
     Remove-Item -LiteralPath $hostManifestPath -Force
 }
@@ -431,7 +541,9 @@ if (-not $AllowExternalChromeDebuggerOrNativeMessaging -and
     required_native_messaging_permission_present = $false
     optional_native_messaging_permission_present = $false
     localhost_host_permission_present = $true
-    native_host_registry_present = (Test-Path -LiteralPath $registryPath)
+    native_host_registry_keys = @((Get-SynapseNativeHostRegistryTargets -HostName $hostName) | ForEach-Object { $_.path })
+    native_host_registry_cleanup = $nativeHostRegistryCleanup
+    native_host_registry_present = ($nativeHostRegistryCleanup.after.Count -gt 0)
     native_host_manifest_present = (Test-Path -LiteralPath $hostManifestPath)
     silent_debugger_switch_required_for_attach_commands = $false
     silent_debugger_switch = $null
