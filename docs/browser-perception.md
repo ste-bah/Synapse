@@ -155,19 +155,21 @@ Chrome session, the supported attach path is:
    caller. The remediation is to disable/remove the external extension or apply
    a Chrome `ExtensionSettings.blocked_permissions` policy.
    Windows setup applies the supported policy remediation by default:
-   `scripts\synapse-setup.ps1` merges
-   `blocked_permissions=["debugger","nativeMessaging"]` into the wildcard `"*"`
-   policy entry, so current and future extensions cannot load with those
-   permissions. The standalone bridge verifier applies the same policy by
-   default with `scripts\install-synapse-chrome-debugger.ps1`. Passing
-   `-ApplyExternalChromeDebuggerPolicy:$false` is diagnostic-only and cannot
-   certify a popup-free end-user host. `-ChromePolicyBlockScope
+   `scripts\synapse-setup.ps1` uses `-ChromePolicyHive Auto`, tries HKCU first
+   and then HKLM, and accepts setup only after a separate readback proves
+   `blocked_permissions=["debugger","nativeMessaging"]` is present in the
+   wildcard `"*"` policy entry, so current and future extensions cannot load
+   with those permissions. The standalone bridge verifier applies the same
+   policy by default with `scripts\install-synapse-chrome-debugger.ps1`.
+   Passing `-ApplyExternalChromeDebuggerPolicy:$false` is diagnostic-only and
+   cannot certify a popup-free end-user host. `-ChromePolicyBlockScope
    DetectedExtensions` limits the merge to currently discovered extension IDs.
    The scripts fail with
-   `SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED` if the current principal
-   cannot write the policy key. After policy is written, refresh/restart Chrome
-   and rerun the verifier; do not certify popup-free readiness until the
-   separate profile/process readback shows the external surface is gone.
+   `SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED_ALL_HIVES` if no allowed
+   policy hive can persist and read back the required policy. After policy is
+   written, refresh/restart Chrome and rerun the verifier; do not certify
+   popup-free readiness until the separate profile/process readback shows the
+   external surface is gone.
    Runtime `observe` diagnostics also include a live
    `external_chrome_popup_risk` profile/process summary when Synapse refuses a
    normal-profile attach-capable command, so remaining popups are attributed to

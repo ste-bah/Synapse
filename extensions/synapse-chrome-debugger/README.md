@@ -72,9 +72,11 @@ default:
 scripts\synapse-setup.ps1
 ```
 
-That default setup path merges `blocked_permissions=["debugger","nativeMessaging"]`
-into the current user's Chrome `ExtensionSettings` wildcard `"*"` policy entry,
-which blocks current and future extensions from loading with those permissions.
+That default setup path uses `-ChromePolicyHive Auto`: it tries HKCU first, then
+HKLM, and accepts the setup only after a separate policy readback proves that
+`blocked_permissions=["debugger","nativeMessaging"]` was merged into the Chrome
+`ExtensionSettings` wildcard `"*"` policy entry. This blocks current and future
+extensions from loading with those permissions.
 Passing `-ApplyExternalChromeDebuggerPolicy:$false` is diagnostic-only and cannot
 certify an end-user host as popup-free.
 
@@ -87,9 +89,9 @@ scripts\install-synapse-chrome-debugger.ps1
 
 Use `-ChromePolicyBlockScope DetectedExtensions` only when the operator
 intentionally wants to limit remediation to the currently discovered extension
-IDs. If the current Windows principal cannot write the policy key, the script
-fails with
-`SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED` and names the registry path.
+IDs. If no allowed hive can persist the policy, the script fails with
+`SYNAPSE_CHROME_POLICY_REMEDIATION_WRITE_FAILED_ALL_HIVES` and includes the
+per-hive registry path, ACL/readback failure, and remediation.
 After policy is written, Chrome must reload policy or restart; the verifier
 still fails closed until the profile/process SoT shows the external debugger or
 native-messaging surface is gone.

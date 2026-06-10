@@ -73,7 +73,9 @@
 
 .PARAMETER ChromePolicyHive
   Chrome policy hive used with -ApplyExternalChromeDebuggerPolicy. Defaults to
-  HKCU. HKLM requires a principal that can write machine policy.
+  Auto, which tries HKCU first and then HKLM. HKLM requires a principal that can
+  write machine policy. Setup fails closed with per-hive ACL/readback evidence
+  if no allowed hive can persist the required policy.
 
 .PARAMETER ChromePolicyBlockScope
   Chrome ExtensionSettings scope used with -ApplyExternalChromeDebuggerPolicy.
@@ -106,8 +108,8 @@ param(
     [string]$ExePath     = "$env:USERPROFILE\.cargo\bin\synapse-mcp.exe",
     [string]$ChromeNativeHostExePath = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
     [switch]$ApplyExternalChromeDebuggerPolicy = $true,
-    [ValidateSet('HKCU', 'HKLM')]
-    [string]$ChromePolicyHive = 'HKCU',
+    [ValidateSet('Auto', 'HKCU', 'HKLM')]
+    [string]$ChromePolicyHive = 'Auto',
     [ValidateSet('AllExtensions', 'DetectedExtensions')]
     [string]$ChromePolicyBlockScope = 'AllExtensions',
     [string]$CargoTarget = "$env:LOCALAPPDATA\synapse\build-target",
@@ -137,8 +139,8 @@ function Invoke-SynapseChromeBridgeVerifier {
         [Parameter(Mandatory = $true)]
         [string]$NativeHostExePath,
         [switch]$ApplyExternalPolicy,
-        [ValidateSet('HKCU', 'HKLM')]
-        [string]$PolicyHive = 'HKCU',
+        [ValidateSet('Auto', 'HKCU', 'HKLM')]
+        [string]$PolicyHive = 'Auto',
         [ValidateSet('AllExtensions', 'DetectedExtensions')]
         [string]$PolicyBlockScope = 'AllExtensions'
     )
