@@ -63,14 +63,16 @@ pub fn screen_region_to_bgra_bitmap(region: Rect) -> Result<CapturedBgraBitmap, 
     platform::screen_region_to_bgra_bitmap(region)
 }
 
-/// Captures a window-relative region into raw BGRA bytes. Windows uses WGC
-/// `CreateForWindow` first and falls back to `PrintWindow(PW_RENDERFULLCONTENT)`
-/// with the backend reported in the result. Non-Windows builds fail loudly.
+/// Captures a window-relative region into raw BGRA bytes. Windows uses passive
+/// WGC `CreateForWindow` capture and reports that backend in the result.
+/// Non-Windows builds fail loudly.
 ///
 /// # Errors
 ///
 /// Returns [`CaptureError`] when the HWND/region is invalid, no WGC frame
-/// arrives, `PrintWindow` fails, or the bitmap copy fails.
+/// arrives, WGC returns blank output, or the bitmap copy fails. Synapse does
+/// not automatically call `PrintWindow`, because Windows re-enters target
+/// process `WM_PRINT`/`WM_PRINTCLIENT` handlers for that API.
 pub fn window_region_to_bgra_bitmap(
     hwnd: i64,
     region: Rect,
@@ -79,8 +81,20 @@ pub fn window_region_to_bgra_bitmap(
     platform::window_region_to_bgra_bitmap(hwnd, region, timeout_ms)
 }
 
+/// Returns the full window bitmap region used by `window_region_to_bgra_bitmap`.
+/// For minimized Windows targets this uses the restored placement extent rather
+/// than the minimized icon rectangle.
+///
+/// # Errors
+///
+/// Returns [`CaptureError`] when the HWND cannot be resolved or the resulting
+/// bitmap bounds are empty/invalid.
+pub fn window_capture_region(hwnd: i64) -> Result<Rect, CaptureError> {
+    platform::window_capture_region(hwnd)
+}
+
 /// Converts a client-relative region to the full-window coordinate space used
-/// by WGC/PrintWindow frames for this HWND.
+/// by per-window WGC frames for this HWND.
 ///
 /// # Errors
 ///

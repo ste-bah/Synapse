@@ -144,6 +144,18 @@ fn auto_backend_falls_back_only_for_graphics_unsupported() {
         CaptureBackendPreference::Auto,
         &invalid
     ));
+
+    let printwindow_disabled = CaptureError::PrintWindowDisabled {
+        detail: "target-process WM_PRINT rendering disabled".to_owned(),
+    };
+    assert!(!should_fallback_to_dxgi(
+        CaptureBackendPreference::Auto,
+        &printwindow_disabled
+    ));
+    assert_eq!(
+        printwindow_disabled.code(),
+        error_codes::CAPTURE_PRINTWINDOW_DISABLED
+    );
 }
 
 #[test]

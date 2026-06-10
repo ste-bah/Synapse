@@ -11,6 +11,7 @@ fn error_codes_match_literal_names() {
     assert_literal!(OBSERVE_NO_PERCEPTION_AVAILABLE);
     assert_literal!(OBSERVE_INTERNAL);
     assert_literal!(CAPTURE_GRAPHICS_API_UNSUPPORTED);
+    assert_literal!(CAPTURE_PRINTWINDOW_DISABLED);
     assert_literal!(CAPTURE_TARGET_LOST);
     assert_literal!(CAPTURE_NO_DIRTY_REGIONS);
     assert_literal!(A11Y_NOT_AVAILABLE);
@@ -24,6 +25,7 @@ fn error_codes_match_literal_names() {
     assert_literal!(A11Y_CDP_EXTENSION_TIMEOUT);
     assert_literal!(A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED);
     assert_literal!(A11Y_UIA_WORKER_TIMEOUT);
+    assert_literal!(A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE);
     assert_literal!(DETECTION_MODEL_NOT_LOADED);
     assert_literal!(DETECTION_MODEL_INFER_FAILED);
     assert_literal!(DETECTION_NO_FRAME);

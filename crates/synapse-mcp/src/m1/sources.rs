@@ -23,13 +23,16 @@ const MAX_FS_RECENT_EVENTS: usize = 5;
 #[cfg(windows)]
 const CHROMIUM_RENDERER_UIA_SUPPLEMENT_MAX_NODES: usize = 160;
 #[cfg(windows)]
-const A11Y_TARGET_WINDOW_MINIMIZED: &str = "A11Y_TARGET_WINDOW_MINIMIZED";
+const A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE: &str =
+    synapse_core::error_codes::A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE;
 #[cfg(windows)]
 const A11Y_UIA_WORKER_TIMEOUT: &str = synapse_core::error_codes::A11Y_UIA_WORKER_TIMEOUT;
 #[cfg(windows)]
 const A11Y_TARGET_WINDOW_NO_UIA_CONTENT: &str = "A11Y_TARGET_WINDOW_NO_UIA_CONTENT";
 #[cfg(windows)]
 const A11Y_TARGET_WINDOW_SNAPSHOT_FAILED: &str = "A11Y_TARGET_WINDOW_SNAPSHOT_FAILED";
+#[cfg(windows)]
+const MINIMIZED_WINDOW_CAPTURE_PROBE_TIMEOUT_MS: u64 = 250;
 
 pub fn synthetic_notepad_input() -> ObservationInput {
     let at = Utc::now();
@@ -908,12 +911,38 @@ pub fn window_input_from_hwnd(
     validate_live_target_hwnd(hwnd)?;
     let foreground = windows_foreground_context(hwnd)?;
     if synapse_a11y::is_window_minimized(hwnd).map_err(|err| a11y_error(&err))? {
-        return Ok(degraded_window_input(
-            foreground,
-            mode,
-            true,
-            A11Y_TARGET_WINDOW_MINIMIZED,
-        ));
+        let mut input = match synapse_a11y::snapshot_window_from_hwnd(hwnd, depth) {
+            Ok(tree) => {
+                let mut input = input_from_tree_and_foreground(tree, foreground, mode)?;
+                input.is_minimized = true;
+                mark_sparse_minimized_target_a11y(&mut input);
+                input
+            }
+            Err(error) => {
+                if error.code() == A11Y_UIA_WORKER_TIMEOUT {
+                    return Err(uia_worker_timeout_error(
+                        &foreground,
+                        "window_input_from_hwnd.minimized_snapshot",
+                        &error,
+                    ));
+                }
+                tracing::warn!(
+                    code = A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE,
+                    hwnd,
+                    error_code = error.code(),
+                    error = %error,
+                    "minimized target UIA snapshot failed without restoring the window"
+                );
+                degraded_window_input(
+                    foreground,
+                    mode,
+                    true,
+                    A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE,
+                )
+            }
+        };
+        populate_minimized_window_capture_probe(hwnd, &mut input);
+        return Ok(input);
     }
     let tree = match synapse_a11y::snapshot_window_from_hwnd(hwnd, depth) {
         Ok(tree) => tree,
@@ -987,6 +1016,79 @@ fn degraded_window_input(
         input.mode_override = Some(mode);
     }
     input
+}
+
+#[cfg(windows)]
+fn populate_minimized_window_capture_probe(hwnd: i64, input: &mut ObservationInput) {
+    let started = Instant::now();
+    let region = match synapse_capture::window_capture_region(hwnd) {
+        Ok(region) => region,
+        Err(error) => {
+            tracing::warn!(
+                code = "A11Y_TARGET_WINDOW_MINIMIZED_CAPTURE_EXTENT_UNAVAILABLE",
+                hwnd,
+                error_code = error.code(),
+                error = %error,
+                "minimized target capture extent could not be resolved"
+            );
+            input.capture_status = SensorStatus::DegradedSensorFailed {
+                reason_code: format!("A11Y_TARGET_WINDOW_MINIMIZED_CAPTURE_{}", error.code()),
+            };
+            return;
+        }
+    };
+    if region.w <= 0 || region.h <= 0 {
+        input.capture_status = SensorStatus::DegradedSensorFailed {
+            reason_code: "A11Y_TARGET_WINDOW_MINIMIZED_CAPTURE_EMPTY".to_owned(),
+        };
+        return;
+    }
+    match synapse_capture::window_region_to_bgra_bitmap(
+        hwnd,
+        region,
+        MINIMIZED_WINDOW_CAPTURE_PROBE_TIMEOUT_MS,
+    ) {
+        Ok(captured) => {
+            input.capture_status = SensorStatus::Healthy;
+            input.sensor_latency_ms.insert(
+                format!("capture.{}", captured.capture_backend),
+                started.elapsed().as_secs_f32() * 1000.0,
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                code = "A11Y_TARGET_WINDOW_MINIMIZED_CAPTURE_UNAVAILABLE",
+                hwnd,
+                error_code = error.code(),
+                error = %error,
+                "minimized target UIA is unavailable and target-window capture probe also failed"
+            );
+            input.capture_status = SensorStatus::DegradedSensorFailed {
+                reason_code: format!("A11Y_TARGET_WINDOW_MINIMIZED_CAPTURE_{}", error.code()),
+            };
+        }
+    }
+}
+
+#[cfg(windows)]
+fn mark_sparse_minimized_target_a11y(input: &mut ObservationInput) {
+    let has_accessible_content = input
+        .elements
+        .iter()
+        .any(|node| node.depth > 0 && !is_standard_window_chrome_node(node));
+    if has_accessible_content {
+        return;
+    }
+    tracing::warn!(
+        code = A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE,
+        hwnd = input.foreground.hwnd,
+        title = %input.foreground.window_title,
+        process_name = %input.foreground.process_name,
+        "minimized target UIA snapshot exposed no accessible child content"
+    );
+    input.a11y_status = SensorStatus::DegradedSensorFailed {
+        reason_code: A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE.to_owned(),
+    };
 }
 
 #[cfg(windows)]

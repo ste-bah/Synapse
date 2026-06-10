@@ -4,6 +4,8 @@ use synapse_core::error_codes;
 pub enum CaptureError {
     #[error("CAPTURE_GRAPHICS_API_UNSUPPORTED: {detail}")]
     GraphicsApiUnsupported { detail: String },
+    #[error("CAPTURE_PRINTWINDOW_DISABLED: {detail}")]
+    PrintWindowDisabled { detail: String },
     #[error("CAPTURE_TARGET_LOST: {detail}")]
     TargetLost { detail: String },
     #[error("CAPTURE_TARGET_INVALID: {detail}")]
@@ -19,6 +21,7 @@ impl CaptureError {
     pub const fn code(&self) -> &'static str {
         match self {
             Self::GraphicsApiUnsupported { .. } => error_codes::CAPTURE_GRAPHICS_API_UNSUPPORTED,
+            Self::PrintWindowDisabled { .. } => error_codes::CAPTURE_PRINTWINDOW_DISABLED,
             Self::TargetLost { .. } => error_codes::CAPTURE_TARGET_LOST,
             Self::TargetInvalid { .. } => error_codes::CAPTURE_TARGET_INVALID,
             Self::NoDirtyRegions => error_codes::CAPTURE_NO_DIRTY_REGIONS,

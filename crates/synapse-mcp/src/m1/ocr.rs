@@ -1,12 +1,19 @@
 use rmcp::ErrorData;
-use synapse_core::{OcrBackend, OcrResult, OcrWord, Rect, error_codes};
+use synapse_core::{ForegroundContext, OcrBackend, OcrResult, OcrWord, Rect, error_codes};
 use synapse_perception::{TextRegion, read_text as platform_read_text, read_text_with_provider};
 
 use crate::m1::{M1State, ReadTextParams, current_input, mcp_error, window_input_from_hwnd};
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ReadTextCaptureSource {
+    Screen,
+    Window { hwnd: i64, window_region: Rect },
+}
+
 #[derive(Clone, Debug)]
 pub struct ResolvedReadTextRequest {
     pub region: Rect,
+    pub capture_source: ReadTextCaptureSource,
     pub requested_backend: OcrBackend,
     pub effective_backend: OcrBackend,
     pub lang_hint: Option<String>,
@@ -30,10 +37,11 @@ pub fn resolve_read_text_request(
     params: &ReadTextParams,
     target_hwnd: Option<i64>,
 ) -> Result<ResolvedReadTextRequest, ErrorData> {
-    let region = text_region(state, params, target_hwnd)?;
+    let (region, capture_source) = text_region(state, params, target_hwnd)?;
     validate_ocr_region(region)?;
     Ok(ResolvedReadTextRequest {
         region,
+        capture_source,
         requested_backend: params.backend,
         effective_backend: effective_ocr_backend(params.backend)?,
         lang_hint: params.lang_hint.clone(),
@@ -128,6 +136,7 @@ pub fn ocr_result_from_web_bitmap(
         .map_err(|err| mcp_error(err.code(), err.to_string()))?;
     let request = ResolvedReadTextRequest {
         region,
+        capture_source: ReadTextCaptureSource::Screen,
         requested_backend: OcrBackend::Auto,
         effective_backend: OcrBackend::Winrt,
         lang_hint: lang_hint.map(str::to_owned),
@@ -140,21 +149,27 @@ fn text_region(
     state: &M1State,
     params: &ReadTextParams,
     target_hwnd: Option<i64>,
-) -> Result<Rect, ErrorData> {
+) -> Result<(Rect, ReadTextCaptureSource), ErrorData> {
+    let target_hwnd = params.window_hwnd.or(target_hwnd);
     if let Some(region) = params.region {
-        return Ok(region);
+        let capture_source = match target_hwnd {
+            Some(hwnd) => target_window_region_capture_source(hwnd, region)?,
+            None => ReadTextCaptureSource::Screen,
+        };
+        return Ok((region, capture_source));
     }
     if let Some(element_id) = &params.element_id {
         if state.synthetic.is_none() {
-            return synapse_a11y::element_bounding_rect(element_id).map_err(|err| {
+            let region = synapse_a11y::element_bounding_rect(element_id).map_err(|err| {
                 mcp_error(
                     error_codes::OCR_NO_TEXT,
                     format!("element_id has no live visible OCR region: {err}"),
                 )
-            });
+            })?;
+            return Ok((region, ReadTextCaptureSource::Screen));
         }
         let input = current_input(state, 2)?;
-        return input
+        let region = input
             .elements
             .iter()
             .find(|node| &node.element_id == element_id)
@@ -164,20 +179,39 @@ fn text_region(
                     error_codes::OCR_NO_TEXT,
                     "element_id has no visible OCR region",
                 )
-            });
+            })?;
+        return Ok((region, ReadTextCaptureSource::Screen));
     }
 
-    let input = if let Some(hwnd) = params.window_hwnd.or(target_hwnd) {
-        window_input_from_hwnd(hwnd, 2, state.perception_mode)?
-    } else {
-        current_input(state, 2)?
+    let Some(hwnd) = target_hwnd else {
+        let input = current_input(state, 2)?;
+        let region = input.focused.map(|focused| focused.bbox).ok_or_else(|| {
+            mcp_error(
+                error_codes::OCR_NO_TEXT,
+                "read_text requires region, element_id, or a focused element with a visible OCR region",
+            )
+        })?;
+        return Ok((region, ReadTextCaptureSource::Screen));
     };
-    input.focused.map(|focused| focused.bbox).ok_or_else(|| {
+
+    let input = {
+        fail_if_minimized_target_needs_uia_region(hwnd)?;
+        window_input_from_hwnd(hwnd, 2, state.perception_mode)?
+    };
+    let absolute_region = input.focused.map(|focused| focused.bbox).ok_or_else(|| {
         mcp_error(
             error_codes::OCR_NO_TEXT,
             "read_text requires region, element_id, or a focused element with a visible OCR region",
         )
-    })
+    })?;
+    let window_region = absolute_region_to_window_region(&input.foreground, absolute_region)?;
+    Ok((
+        window_region,
+        ReadTextCaptureSource::Window {
+            hwnd,
+            window_region,
+        },
+    ))
 }
 
 fn validate_ocr_region(region: Rect) -> Result<(), ErrorData> {
@@ -191,6 +225,109 @@ fn validate_ocr_region(region: Rect) -> Result<(), ErrorData> {
         ));
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn target_window_region_capture_source(
+    hwnd: i64,
+    client_region: Rect,
+) -> Result<ReadTextCaptureSource, ErrorData> {
+    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!("read_text window_hwnd {hwnd:#x} is not a live window: {error}"),
+        )
+    })?;
+    let window_region =
+        synapse_capture::client_region_to_window_region(hwnd, client_region).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "read_text could not convert client-relative region {client_region:?} for hwnd {hwnd:#x} into target-window bitmap coordinates: {error}"
+                ),
+            )
+        })?;
+    Ok(ReadTextCaptureSource::Window {
+        hwnd,
+        window_region,
+    })
+}
+
+#[cfg(not(windows))]
+fn target_window_region_capture_source(
+    _hwnd: i64,
+    _window_region: Rect,
+) -> Result<ReadTextCaptureSource, ErrorData> {
+    Err(mcp_error(
+        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "read_text target-window OCR requires Windows window capture",
+    ))
+}
+
+#[cfg(windows)]
+fn fail_if_minimized_target_needs_uia_region(hwnd: i64) -> Result<(), ErrorData> {
+    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!("read_text window_hwnd {hwnd:#x} is not a live window: {error}"),
+        )
+    })?;
+    if synapse_a11y::is_window_minimized(hwnd).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("read_text could not determine minimized state for hwnd {hwnd:#x}: {error}"),
+        )
+    })? {
+        return Err(mcp_error(
+            error_codes::A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE,
+            format!(
+                "read_text target hwnd {hwnd:#x} is minimized and no explicit window-relative OCR region was supplied; UIA focused-region lookup is unavailable without restoring the window"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn fail_if_minimized_target_needs_uia_region(_hwnd: i64) -> Result<(), ErrorData> {
+    Err(mcp_error(
+        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "read_text target-window OCR requires Windows UI Automation",
+    ))
+}
+
+fn absolute_region_to_window_region(
+    foreground: &ForegroundContext,
+    absolute_region: Rect,
+) -> Result<Rect, ErrorData> {
+    let window_region = Rect {
+        x: absolute_region.x.saturating_sub(foreground.window_bounds.x),
+        y: absolute_region.y.saturating_sub(foreground.window_bounds.y),
+        w: absolute_region.w,
+        h: absolute_region.h,
+    };
+    if absolute_region.x < foreground.window_bounds.x
+        || absolute_region.y < foreground.window_bounds.y
+        || absolute_region.x.saturating_add(absolute_region.w)
+            > foreground
+                .window_bounds
+                .x
+                .saturating_add(foreground.window_bounds.w)
+        || absolute_region.y.saturating_add(absolute_region.h)
+            > foreground
+                .window_bounds
+                .y
+                .saturating_add(foreground.window_bounds.h)
+    {
+        return Err(mcp_error(
+            error_codes::OCR_NO_TEXT,
+            format!(
+                "focused OCR region {absolute_region:?} is outside target window bounds {:?}",
+                foreground.window_bounds
+            ),
+        ));
+    }
+    Ok(window_region)
 }
 
 fn effective_ocr_backend(backend: OcrBackend) -> Result<OcrBackend, ErrorData> {

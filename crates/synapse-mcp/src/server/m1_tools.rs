@@ -216,7 +216,9 @@ impl SynapseService {
         Ok(Json(super::match_find_input(&input, &params.0)))
     }
 
-    #[tool(description = "OCR text from a screen region or visible element")]
+    #[tool(
+        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; with no target it uses legacy screen-region OCR. PrintWindow is disabled because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers."
+    )]
     pub async fn read_text(
         &self,
         params: Parameters<ReadTextParams>,
@@ -265,7 +267,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture a PNG/JPEG screenshot. With window_hwnd or this MCP session's active target, captures that window in the background using per-window WGC with PrintWindow fallback and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture."
+        description = "Capture a PNG/JPEG screenshot. With window_hwnd or this MCP session's active target, captures that window in the background using passive per-window WGC and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture. PrintWindow is disabled because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers."
     )]
     pub async fn capture_screenshot(
         &self,
@@ -293,12 +295,14 @@ impl SynapseService {
                         ),
                     )
                 })?,
-                None => Rect {
-                    x: 0,
-                    y: 0,
-                    w: target_context.window_bounds.w,
-                    h: target_context.window_bounds.h,
-                },
+                None => synapse_capture::window_capture_region(window_hwnd).map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "capture_screenshot could not resolve target bitmap bounds for {window_hwnd:#x}: {error}"
+                        ),
+                    )
+                })?,
             };
             return capture_target_window_screenshot_to_file(
                 &params.0,
@@ -2229,18 +2233,15 @@ impl SynapseService {
             return read_text_request_uncached(&request);
         }
 
-        let captured =
-            synapse_capture::screen_region_to_bgra_bitmap(request.region).map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "OCR screen capture failed for region {:?}: {error}",
-                        request.region
-                    ),
-                )
-            })?;
+        let captured = capture_ocr_bitmap(&request)?;
         let bitmap_sha256 = sha256_hex(&captured.bytes);
-        let cache_key = ocr_cache_key(&request, captured.width, captured.height, &bitmap_sha256);
+        let cache_key = ocr_cache_key(
+            &request,
+            captured.width,
+            captured.height,
+            &bitmap_sha256,
+            captured.capture_backend,
+        );
         let runtime = self.reflex_runtime()?;
 
         {
@@ -2252,6 +2253,7 @@ impl SynapseService {
                 captured.width,
                 captured.height,
                 &bitmap_sha256,
+                &captured,
             )? {
                 tracing::info!(
                     code = "OCR_CACHE_HIT",
@@ -2280,6 +2282,10 @@ impl SynapseService {
             effective_backend: request.effective_backend,
             lang: request.lang(),
             region: request.region,
+            capture_source: captured.capture_source.to_owned(),
+            capture_backend: captured.capture_backend.to_owned(),
+            capture_hwnd: captured.capture_hwnd,
+            capture_region: captured.capture_region,
             bitmap_sha256: bitmap_sha256.clone(),
             bitmap_width: captured.width,
             bitmap_height: captured.height,
@@ -2323,6 +2329,7 @@ impl SynapseService {
                 captured.width,
                 captured.height,
                 &bitmap_sha256,
+                &captured,
             )?
             .ok_or_else(|| {
                 mcp_error(
@@ -2363,6 +2370,76 @@ impl SynapseService {
 }
 
 #[cfg(windows)]
+struct CapturedOcrBitmap {
+    bitmap: synapse_capture::CapturedBgraBitmap,
+    capture_source: &'static str,
+    capture_backend: &'static str,
+    capture_hwnd: Option<i64>,
+    capture_region: Rect,
+}
+
+#[cfg(windows)]
+impl std::ops::Deref for CapturedOcrBitmap {
+    type Target = synapse_capture::CapturedBgraBitmap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.bitmap
+    }
+}
+
+#[cfg(windows)]
+fn capture_ocr_bitmap(
+    request: &crate::m1::ResolvedReadTextRequest,
+) -> Result<CapturedOcrBitmap, ErrorData> {
+    match request.capture_source {
+        crate::m1::ReadTextCaptureSource::Screen => {
+            let bitmap =
+                synapse_capture::screen_region_to_bgra_bitmap(request.region).map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "OCR screen capture failed for region {:?}: {error}",
+                            request.region
+                        ),
+                    )
+                })?;
+            Ok(CapturedOcrBitmap {
+                bitmap,
+                capture_source: "screen",
+                capture_backend: "gdi_screen_region_bgra",
+                capture_hwnd: None,
+                capture_region: request.region,
+            })
+        }
+        crate::m1::ReadTextCaptureSource::Window {
+            hwnd,
+            window_region,
+        } => {
+            let captured = synapse_capture::window_region_to_bgra_bitmap(
+                hwnd,
+                window_region,
+                WINDOW_SCREENSHOT_TIMEOUT_MS,
+            )
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "OCR target-window capture failed for hwnd {hwnd:#x} region {window_region:?}: {error}"
+                    ),
+                )
+            })?;
+            Ok(CapturedOcrBitmap {
+                bitmap: captured.bitmap,
+                capture_source: "window",
+                capture_backend: captured.capture_backend,
+                capture_hwnd: Some(hwnd),
+                capture_region: window_region,
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct OcrCacheRow {
@@ -2373,6 +2450,10 @@ struct OcrCacheRow {
     effective_backend: OcrBackend,
     lang: String,
     region: Rect,
+    capture_source: String,
+    capture_backend: String,
+    capture_hwnd: Option<i64>,
+    capture_region: Rect,
     bitmap_sha256: String,
     bitmap_width: u32,
     bitmap_height: u32,
@@ -2390,6 +2471,7 @@ fn read_ocr_cache_row(
     bitmap_width: u32,
     bitmap_height: u32,
     bitmap_sha256: &str,
+    captured: &CapturedOcrBitmap,
 ) -> Result<Option<OcrCacheRow>, ErrorData> {
     let rows = runtime
         .storage_cf_prefix_rows(cf::CF_OCR_CACHE, cache_key.as_bytes(), 1)
@@ -2418,6 +2500,7 @@ fn read_ocr_cache_row(
         bitmap_width,
         bitmap_height,
         bitmap_sha256,
+        captured,
     ) {
         tracing::warn!(
             code = "OCR_CACHE_ROW_INVALID",
@@ -2438,6 +2521,7 @@ fn valid_ocr_cache_row(
     bitmap_width: u32,
     bitmap_height: u32,
     bitmap_sha256: &str,
+    captured: &CapturedOcrBitmap,
 ) -> bool {
     row.schema_version == SCHEMA_VERSION
         && row.cache_key == cache_key
@@ -2445,6 +2529,10 @@ fn valid_ocr_cache_row(
         && row.effective_backend == request.effective_backend
         && row.lang == request.lang()
         && row.region == request.region
+        && row.capture_source == captured.capture_source
+        && row.capture_backend == captured.capture_backend
+        && row.capture_hwnd == captured.capture_hwnd
+        && row.capture_region == captured.capture_region
         && row.bitmap_width == bitmap_width
         && row.bitmap_height == bitmap_height
         && row.bitmap_sha256 == bitmap_sha256
@@ -2457,12 +2545,14 @@ fn ocr_cache_key(
     bitmap_width: u32,
     bitmap_height: u32,
     bitmap_sha256: &str,
+    capture_backend: &str,
 ) -> String {
     format!(
-        "ocr/cache/v1/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
+        "ocr/cache/v2/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
         ocr_backend_name(request.requested_backend),
         ocr_backend_name(request.effective_backend),
         sha256_hex(request.lang().as_bytes()),
+        capture_backend,
         request.region.x,
         request.region.y,
         request.region.w,
@@ -3007,7 +3097,7 @@ mod tests {
             other => panic!("expected cdp wire, got {other:?}"),
         }
     }
-    use crate::m1::ResolvedReadTextRequest;
+    use crate::m1::{ReadTextCaptureSource, ResolvedReadTextRequest};
     use synapse_core::{OcrBackend, Rect};
 
     #[test]
@@ -3040,6 +3130,7 @@ mod tests {
                 w: 200,
                 h: 80,
             },
+            capture_source: ReadTextCaptureSource::Screen,
             requested_backend: OcrBackend::Winrt,
             effective_backend: OcrBackend::Winrt,
             lang_hint: Some("en-US".to_owned()),
@@ -3049,11 +3140,12 @@ mod tests {
         let first_hash = sha256_hex(&[1, 2, 3, 4]);
         let second_hash = sha256_hex(&[1, 2, 3, 5]);
 
-        let first = ocr_cache_key(&request, 200, 80, &first_hash);
-        let second = ocr_cache_key(&request, 200, 80, &second_hash);
+        let first = ocr_cache_key(&request, 200, 80, &first_hash, "gdi_screen_region_bgra");
+        let second = ocr_cache_key(&request, 200, 80, &second_hash, "gdi_screen_region_bgra");
 
         assert_ne!(first, second);
         assert!(first.contains("/winrt/winrt/"));
+        assert!(first.contains("/gdi_screen_region_bgra/"));
     }
 
     #[test]
@@ -3065,16 +3157,17 @@ mod tests {
                 w: 200,
                 h: 80,
             },
+            capture_source: ReadTextCaptureSource::Screen,
             requested_backend: OcrBackend::Winrt,
             effective_backend: OcrBackend::Winrt,
             lang_hint: None,
             synthetic: false,
         };
         let hash = sha256_hex(&[9, 9, 9, 9]);
-        let explicit_key = ocr_cache_key(&explicit, 200, 80, &hash);
+        let explicit_key = ocr_cache_key(&explicit, 200, 80, &hash, "gdi_screen_region_bgra");
 
         explicit.requested_backend = OcrBackend::Auto;
-        let auto_key = ocr_cache_key(&explicit, 200, 80, &hash);
+        let auto_key = ocr_cache_key(&explicit, 200, 80, &hash, "gdi_screen_region_bgra");
 
         assert_ne!(explicit_key, auto_key);
         assert!(auto_key.contains("/auto/winrt/"));

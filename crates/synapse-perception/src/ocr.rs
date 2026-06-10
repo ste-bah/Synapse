@@ -473,6 +473,11 @@ mod platform {
     }
 
     fn validate_bgra_len(width: u32, height: u32, bytes: &[u8]) -> PerceptionResult<()> {
+        if width == 0 || height == 0 {
+            return Err(backend_unavailable(format!(
+                "OCR BGRA bitmap dimensions must be non-zero: {width}x{height}"
+            )));
+        }
         let expected_len = u64::from(width)
             .checked_mul(u64::from(height))
             .and_then(|pixels| pixels.checked_mul(4))
@@ -540,7 +545,7 @@ mod platform {
             BitmapPixelFormat::Bgra8,
             width,
             height,
-            BitmapAlphaMode::Premultiplied,
+            BitmapAlphaMode::Ignore,
         )
         .map_err(|err| backend_unavailable(err.to_string()))
     }

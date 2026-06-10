@@ -28,7 +28,10 @@ use detection::{DetectionRuntime, DetectionRuntimeConfig, default_detection_conf
 pub use ocr::ocr_result_from_web_bitmap;
 #[cfg(windows)]
 pub use ocr::read_text_request_from_bgra;
-pub use ocr::{ResolvedReadTextRequest, read_text_request_uncached, resolve_read_text_request};
+pub use ocr::{
+    ReadTextCaptureSource, ResolvedReadTextRequest, read_text_request_uncached,
+    resolve_read_text_request,
+};
 use search::{element_match, entity_match};
 pub use sources::{FsRecentTracker, populate_clipboard_summary, populate_fs_recent};
 use sources::{
@@ -265,12 +268,15 @@ pub enum FindResultKind {
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadTextParams {
+    /// OCR region. With `window_hwnd` or this MCP session's active window
+    /// target, this is window-client-relative. With no target, this is an
+    /// absolute screen region.
     #[serde(default)]
     pub region: Option<Rect>,
     #[serde(default)]
     pub element_id: Option<ElementId>,
     /// Explicit per-call window override (HWND). Takes precedence over the
-    /// session's active target when resolving a focused OCR region.
+    /// session's active target.
     #[serde(default)]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
