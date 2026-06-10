@@ -270,7 +270,8 @@ fn external_chrome_profile_surfaces() -> Vec<String> {
             continue;
         }
         let profile = profile_dir.file_name().to_string_lossy().into_owned();
-        for pref_file in ["Secure Preferences", "Preferences"] {
+        let mut runtime_by_id: HashMap<String, ChromeExtensionRuntimeState> = HashMap::new();
+        for pref_file in ["Preferences", "Secure Preferences"] {
             let pref_path = profile_dir.path().join(pref_file);
             let Ok(raw) = std::fs::read_to_string(&pref_path) else {
                 continue;
@@ -292,6 +293,12 @@ fn external_chrome_profile_surfaces() -> Vec<String> {
                 if extension_id == EXTENSION_ID {
                     continue;
                 }
+                let mut runtime_state = chrome_extension_runtime_state(setting);
+                if pref_file == "Preferences" {
+                    runtime_by_id.insert(extension_id.clone(), runtime_state.clone());
+                } else if let Some(preferences_runtime_state) = runtime_by_id.get(extension_id) {
+                    runtime_state = preferences_runtime_state.clone();
+                }
                 let permissions = active_api_permissions(setting);
                 let has_debugger = permissions
                     .iter()
@@ -302,14 +309,22 @@ fn external_chrome_profile_surfaces() -> Vec<String> {
                 if !has_debugger && !has_native {
                     continue;
                 }
+                if !runtime_state.runtime_enabled {
+                    continue;
+                }
                 let name = setting
                     .get("manifest")
                     .and_then(|manifest| manifest.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or("<unnamed>");
                 rows.push(format!(
-                    "profile={profile} pref={pref_file} extension_id={extension_id} name={name:?} active_api={}",
-                    permissions.join(",")
+                    "profile={profile} pref={pref_file} extension_id={extension_id} name={name:?} active_api={} runtime_enabled=true active_bit={} disable_reasons={}",
+                    permissions.join(","),
+                    runtime_state
+                        .active_bit
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "<absent>".to_owned()),
+                    format_disable_reasons(&runtime_state.disable_reasons)
                 ));
             }
         }
@@ -333,6 +348,45 @@ fn active_api_permissions(setting: &Value) -> Vec<String> {
     permissions.sort();
     permissions.dedup();
     permissions
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ChromeExtensionRuntimeState {
+    active_bit: Option<bool>,
+    disable_reasons: Vec<u64>,
+    runtime_enabled: bool,
+}
+
+fn chrome_extension_runtime_state(setting: &Value) -> ChromeExtensionRuntimeState {
+    let active_bit = setting.get("active_bit").and_then(Value::as_bool);
+    let mut disable_reasons = setting
+        .get("disable_reasons")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+        .unwrap_or_default();
+    disable_reasons.sort_unstable();
+    disable_reasons.dedup();
+    let runtime_enabled = active_bit != Some(false) && disable_reasons.is_empty();
+    ChromeExtensionRuntimeState {
+        active_bit,
+        disable_reasons,
+        runtime_enabled,
+    }
+}
+
+fn format_disable_reasons(disable_reasons: &[u64]) -> String {
+    if disable_reasons.is_empty() {
+        "[]".to_owned()
+    } else {
+        format!(
+            "[{}]",
+            disable_reasons
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
 }
 
 fn external_chrome_native_messaging_processes() -> Vec<String> {
@@ -2243,6 +2297,38 @@ mod tests {
         assert!(error.detail().contains("Source of Truth is not popup-free"));
         assert!(error.detail().contains("fcoeoabgfenejglbffodgkkbkcdhcgfn"));
         assert!(error.detail().contains("raw CDP"));
+    }
+
+    #[test]
+    fn chrome_extension_runtime_state_treats_disabled_permission_rows_as_not_enabled() {
+        let setting = json!({
+            "active_bit": false,
+            "disable_reasons": [65536],
+            "active_permissions": {
+                "api": ["downloads", "nativeMessaging"]
+            }
+        });
+
+        let runtime_state = chrome_extension_runtime_state(&setting);
+
+        assert_eq!(runtime_state.active_bit, Some(false));
+        assert_eq!(runtime_state.disable_reasons, vec![65536]);
+        assert!(!runtime_state.runtime_enabled);
+    }
+
+    #[test]
+    fn chrome_extension_runtime_state_fails_closed_when_disabled_state_is_absent() {
+        let setting = json!({
+            "active_permissions": {
+                "api": ["nativeMessaging"]
+            }
+        });
+
+        let runtime_state = chrome_extension_runtime_state(&setting);
+
+        assert_eq!(runtime_state.active_bit, None);
+        assert!(runtime_state.disable_reasons.is_empty());
+        assert!(runtime_state.runtime_enabled);
     }
 
     #[test]

@@ -11,16 +11,23 @@ const TAB_TARGET_PREFIX = "chrome-tab:";
 const BRIDGE_TOKEN_HEADER = "X-Synapse-Bridge-Token";
 const DAEMON_WS_BASE_URL = "ws://127.0.0.1:7700";
 const WEBSOCKET_KEEPALIVE_MS = 20000;
+const RECONNECT_INITIAL_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
+const DISCONNECTED_KEEPALIVE_MS = 20000;
 
 let hostId = null;
 let bridgeToken = null;
 let connectInFlight = null;
 let webSocket = null;
 let keepAliveTimer = null;
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+let disconnectedKeepAliveTimer = null;
+let permanentlyDisabled = false;
 
 function startBridge() {
   if (chrome.runtime.id !== EXPECTED_EXTENSION_ID) {
-    disableBridgeUntilChromeRestart(
+    disableBridgePermanently(
       `extension id mismatch: actual=${chrome.runtime.id} expected=${EXPECTED_EXTENSION_ID}; ` +
         `reload the unpacked extension from the Synapse extension directory so the daemon can ` +
         `authenticate the bridge origin`,
@@ -32,6 +39,9 @@ function startBridge() {
 }
 
 function connectDaemon() {
+  if (permanentlyDisabled) {
+    return;
+  }
   if (connectInFlight) {
     return;
   }
@@ -45,16 +55,17 @@ function connectDaemon() {
     connectWebSocket();
     return;
   }
+  clearReconnectTimer();
   connectInFlight = registerDaemon()
     .catch((error) => {
       if (error?.code === ERROR_DEBUGGER_WARNING_UNSUPPRESSED) {
-        disableBridgeUntilChromeRestart(
+        scheduleReconnect(
           `direct daemon register refused unsafe profile: ${errorMessage(error)}`,
           ERROR_DEBUGGER_WARNING_UNSUPPRESSED
         );
         return;
       }
-      disableBridgeUntilChromeRestart(
+      scheduleReconnect(
         `direct daemon register failed: ${errorMessage(error)}`,
         ERROR_DAEMON_UNAVAILABLE
       );
@@ -97,18 +108,60 @@ async function registerDaemon() {
   connectWebSocket();
 }
 
-function disableBridgeUntilChromeRestart(detail, code) {
+function disableBridgePermanently(detail, code) {
   closeWebSocket();
+  clearReconnectTimer();
+  stopDisconnectedKeepAlive();
+  permanentlyDisabled = true;
   hostId = null;
   bridgeToken = null;
   console.error(
-    `Synapse daemon bridge disabled until Chrome or extension restart: ${detail}; ` +
+    `Synapse daemon bridge disabled permanently for this extension load: ${detail}; ` +
       `code=${code}`
   );
 }
 
+function scheduleReconnect(detail, code) {
+  if (permanentlyDisabled) {
+    return;
+  }
+  closeWebSocket();
+  hostId = null;
+  bridgeToken = null;
+  const delayMs = Math.min(
+    RECONNECT_MAX_MS,
+    RECONNECT_INITIAL_MS * 2 ** Math.min(reconnectAttempt, 5)
+  );
+  reconnectAttempt += 1;
+  console.warn(
+    `Synapse daemon bridge disconnected; reconnect scheduled: code=${code} ` +
+      `attempt=${reconnectAttempt} delay_ms=${delayMs} detail=${detail}`
+  );
+  startDisconnectedKeepAlive();
+  if (reconnectTimer) {
+    return;
+  }
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectDaemon();
+  }, delayMs);
+}
+
+function clearReconnectTimer() {
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+function resetReconnectState() {
+  reconnectAttempt = 0;
+  clearReconnectTimer();
+  stopDisconnectedKeepAlive();
+}
+
 function connectWebSocket() {
-  if (!hostId || !bridgeToken || webSocket) {
+  if (permanentlyDisabled || !hostId || !bridgeToken || webSocket) {
     return;
   }
   const url = new URL("/chrome-debugger/native/ws", DAEMON_WS_BASE_URL);
@@ -117,11 +170,13 @@ function connectWebSocket() {
   const socket = new WebSocket(url.toString());
   webSocket = socket;
   socket.onopen = () => {
+    resetReconnectState();
+    console.info(`Synapse daemon bridge connected: host_id=${hostId}`);
     startWebSocketKeepAlive(socket);
   };
   socket.onmessage = (event) => {
     handleWebSocketMessage(event.data).catch((error) => {
-      disableBridgeUntilChromeRestart(
+      scheduleReconnect(
         `direct daemon websocket message failed: ${errorMessage(error)}`,
         ERROR_DAEMON_UNAVAILABLE
       );
@@ -129,12 +184,12 @@ function connectWebSocket() {
   };
   socket.onerror = () => {
     if (webSocket === socket) {
-      disableBridgeUntilChromeRestart("direct daemon websocket error", ERROR_DAEMON_UNAVAILABLE);
+      scheduleReconnect("direct daemon websocket error", ERROR_DAEMON_UNAVAILABLE);
     }
   };
   socket.onclose = () => {
     if (webSocket === socket) {
-      disableBridgeUntilChromeRestart("direct daemon websocket closed", ERROR_DAEMON_UNAVAILABLE);
+      scheduleReconnect("direct daemon websocket closed", ERROR_DAEMON_UNAVAILABLE);
     }
   };
 }
@@ -175,7 +230,7 @@ function startWebSocketKeepAlive(socket) {
         sent_at_unix_ms: Date.now()
       }));
     } catch (error) {
-      disableBridgeUntilChromeRestart(
+      scheduleReconnect(
         `direct daemon websocket keepalive failed: ${errorMessage(error)}`,
         ERROR_DAEMON_UNAVAILABLE
       );
@@ -190,6 +245,37 @@ function stopWebSocketKeepAlive() {
   }
 }
 
+function startDisconnectedKeepAlive() {
+  if (disconnectedKeepAliveTimer) {
+    return;
+  }
+  disconnectedKeepAliveTimer = setInterval(() => {
+    if (permanentlyDisabled || (webSocket && isWebSocketUsable(webSocket))) {
+      stopDisconnectedKeepAlive();
+      return;
+    }
+    try {
+      const platformInfo = chrome.runtime.getPlatformInfo();
+      if (platformInfo && typeof platformInfo.catch === "function") {
+        platformInfo.catch((error) => {
+          console.warn(
+            `Synapse daemon bridge reconnect keepalive failed: ${errorMessage(error)}`
+          );
+        });
+      }
+    } catch (error) {
+      console.warn(`Synapse daemon bridge reconnect keepalive threw: ${errorMessage(error)}`);
+    }
+  }, DISCONNECTED_KEEPALIVE_MS);
+}
+
+function stopDisconnectedKeepAlive() {
+  if (disconnectedKeepAliveTimer) {
+    clearInterval(disconnectedKeepAliveTimer);
+    disconnectedKeepAliveTimer = null;
+  }
+}
+
 function closeWebSocket() {
   stopWebSocketKeepAlive();
   const socket = webSocket;
@@ -198,7 +284,7 @@ function closeWebSocket() {
     try {
       socket.close();
     } catch (_) {
-      // Closing is best-effort during dormant cleanup.
+      // Closing is best-effort during reconnect cleanup.
     }
   }
 }

@@ -7,7 +7,8 @@ tabs-first: background tab open/close/navigation use `chrome.tabs` APIs and the
 extension does not require the `debugger` or `nativeMessaging` permissions.
 It also does not require `chrome.alarms` or any recurring wakeup permission. If
 the daemon is unavailable or the live Chrome profile is unsafe, the failure is
-logged once and the bridge stays dormant until Chrome or the extension restarts.
+logged with the exact daemon error code and the bridge retries with bounded
+backoff while remaining fail-closed to browser commands.
 
 Stable extension ID: `leoocgnkjnplbfdbklajepahofecgfbk`
 
@@ -31,8 +32,11 @@ The extension registers with the loopback daemon at `http://127.0.0.1:7700`,
 then keeps an authenticated WebSocket open at `ws://127.0.0.1:7700` with a 20s
 keepalive. Commands execute only after the daemon asks through the fixed
 extension origin and daemon-issued bridge token. If registration, message post,
-or WebSocket keepalive fails, the bridge fails closed and does not retry on a
-timer.
+or WebSocket keepalive fails, the bridge closes the stale token, logs the code
+and reconnect delay, and re-registers with bounded WebSocket reconnect. While
+disconnected it performs only a low-frequency `chrome.runtime.getPlatformInfo()`
+heartbeat to keep the MV3 worker available for reconnect; it does not request
+`chrome.alarms`.
 The normal bridge does not call `runtime.connectNative()`, so Chrome does not
 create a native-host `cmd.exe` wrapper on end-user systems.
 The verifier also removes stale Synapse native-host registration from every
@@ -48,9 +52,10 @@ Registration is also fail-closed. If the daemon sees any live Chrome
 profile/process Source of Truth that is not popup-free, it refuses the direct
 bridge registration with `A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED` before
 accepting a Chrome-hosted command channel. The service worker treats that exact
-error as an unsafe-profile condition and stays dormant until Chrome or the
-extension restarts. This keeps the failure visible while preventing repeated
-background wakeups on an unsafe end-user Chrome profile.
+error as an unsafe-profile condition, logs it with
+`A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED`, and retries with the same bounded
+backoff. This keeps the failure visible while preventing any browser command
+from queueing on an unsafe end-user Chrome profile.
 
 Background tab commands (`openTab`, `closeTab`, and `navigateTab`) use
 `chrome.tabs.create`, `chrome.tabs.remove`, `chrome.tabs.update`,

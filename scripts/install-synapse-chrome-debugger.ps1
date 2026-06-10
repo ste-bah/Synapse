@@ -660,7 +660,7 @@ if ($optionalPermissions -contains 'nativeMessaging') {
     throw "SYNAPSE_CHROME_EXTENSION_OPTIONAL_NATIVE_MESSAGING_FORBIDDEN path=$manifestPath remediation=normal end-user bridge must not request nativeMessaging"
 }
 if ($requiredPermissions -contains 'alarms' -or $optionalPermissions -contains 'alarms') {
-    throw "SYNAPSE_CHROME_EXTENSION_ALARMS_PERMISSION_FORBIDDEN path=$manifestPath remediation=normal end-user bridge must not use chrome.alarms or recurring wakeups; failures are logged once and the bridge remains dormant until Chrome or extension restart"
+    throw "SYNAPSE_CHROME_EXTENSION_ALARMS_PERMISSION_FORBIDDEN path=$manifestPath remediation=normal end-user bridge must not use chrome.alarms or recurring wakeups; daemon disconnects must be handled by bounded WebSocket reconnect plus a low-frequency runtime keepalive while disconnected"
 }
 if ($hostPermissions -notcontains 'http://127.0.0.1:7700/*') {
     throw "SYNAPSE_CHROME_EXTENSION_LOCALHOST_PERMISSION_MISSING path=$manifestPath remediation=normal bridge requires host_permissions http://127.0.0.1:7700/* for direct daemon registration and message posting"
@@ -696,12 +696,39 @@ $synapseChromeProfileReadback = @()
 $staleSynapseActivePermissions = @()
 $staleSynapseRecurringWakePermissions = @()
 $externalDebuggerOrNativeExtensions = @()
+$externalDisabledDebuggerOrNativeExtensions = @()
 $externalDebuggerExtensions = @()
+function Get-ChromeExtensionRuntimeState {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Setting
+    )
+
+    $activeBit = $null
+    if ($Setting.PSObject.Properties.Name -contains 'active_bit') {
+        $activeBit = [bool]$Setting.active_bit
+    }
+    $disableReasons = @()
+    if ($Setting.PSObject.Properties.Name -contains 'disable_reasons' -and $null -ne $Setting.disable_reasons) {
+        $disableReasons = @($Setting.disable_reasons)
+    }
+    $runtimeEnabled = $true
+    if ($activeBit -eq $false -or $disableReasons.Count -gt 0) {
+        $runtimeEnabled = $false
+    }
+
+    [pscustomobject]@{
+        active_bit = $activeBit
+        disable_reasons = $disableReasons
+        runtime_enabled = $runtimeEnabled
+    }
+}
 if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
     $profileDirs = @(Get-ChildItem -LiteralPath $chromeUserDataRoot -Directory -ErrorAction SilentlyContinue |
         Where-Object { $_.Name -ne 'Snapshots' })
     foreach ($profileDir in $profileDirs) {
-        foreach ($prefFileName in @('Secure Preferences', 'Preferences')) {
+        $extensionRuntimeById = @{}
+        foreach ($prefFileName in @('Preferences', 'Secure Preferences')) {
             $prefPath = Join-Path $profileDir.FullName $prefFileName
             if (-not (Test-Path -LiteralPath $prefPath -PathType Leaf)) {
                 continue
@@ -722,6 +749,12 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
             }
             foreach ($extensionProperty in $pref.extensions.settings.PSObject.Properties) {
                 $setting = $extensionProperty.Value
+                $runtimeState = Get-ChromeExtensionRuntimeState -Setting $setting
+                if ($prefFileName -eq 'Preferences') {
+                    $extensionRuntimeById[$extensionProperty.Name] = $runtimeState
+                } elseif ($extensionRuntimeById.ContainsKey($extensionProperty.Name)) {
+                    $runtimeState = $extensionRuntimeById[$extensionProperty.Name]
+                }
                 $activeApi = @()
                 if ($setting.active_permissions -and $setting.active_permissions.api) {
                     $activeApi = @($setting.active_permissions.api)
@@ -738,6 +771,9 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
                         manifest_path = $setting.path
                         active_api = $activeApi
                         granted_api = $grantedApi
+                        active_bit = $runtimeState.active_bit
+                        disable_reasons = $runtimeState.disable_reasons
+                        runtime_enabled = $runtimeState.runtime_enabled
                     }
                     $synapseChromeProfileReadback += $row
                     if ($activeApi -contains 'debugger' -or $activeApi -contains 'nativeMessaging') {
@@ -755,10 +791,17 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
                         location = $setting.location
                         manifest_path = $setting.path
                         active_api = $activeApi
+                        active_bit = $runtimeState.active_bit
+                        disable_reasons = $runtimeState.disable_reasons
+                        runtime_enabled = $runtimeState.runtime_enabled
                     }
-                    $externalDebuggerOrNativeExtensions += $externalRow
-                    if ($activeApi -contains 'debugger') {
-                        $externalDebuggerExtensions += $externalRow
+                    if ($runtimeState.runtime_enabled) {
+                        $externalDebuggerOrNativeExtensions += $externalRow
+                        if ($activeApi -contains 'debugger') {
+                            $externalDebuggerExtensions += $externalRow
+                        }
+                    } else {
+                        $externalDisabledDebuggerOrNativeExtensions += $externalRow
                     }
                 }
             }
@@ -825,6 +868,7 @@ if (-not $AllowExternalChromeDebuggerOrNativeMessaging -and
     }
     $detail = [pscustomobject]@{
         external_debugger_or_native_extensions = $externalDebuggerOrNativeExtensions
+        external_disabled_debugger_or_native_extensions = $externalDisabledDebuggerOrNativeExtensions
         external_debugger_extensions = $externalDebuggerExtensions
         external_native_messaging_processes = $externalNativeMessagingProcesses
         external_hazard_extension_ids = $externalHazardExtensionIds
@@ -848,7 +892,7 @@ if (-not $AllowExternalChromeDebuggerOrNativeMessaging -and
     daemon_bridge_transport = 'direct_localhost_websocket'
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
     background_navigation_backend = 'chrome.tabs_no_debugger_permission_no_native_messaging'
-    reconnect_driver = 'none_fail_closed_dormant_until_chrome_or_extension_restart'
+    reconnect_driver = 'bounded_websocket_reconnect_with_disconnected_extension_keepalive_no_alarms'
     attach_popup_prevention = 'normal_bridge_tabs_only_no_debugger_api_no_nativeMessaging_permission_plus_daemon_side_attach_disabled'
     normal_bridge_attach_commands_available = $false
     normal_bridge_debugger_api_calls_present = $false
@@ -874,6 +918,7 @@ if (-not $AllowExternalChromeDebuggerOrNativeMessaging -and
     synapse_chrome_profile_readback = $synapseChromeProfileReadback
     external_hazard_extension_ids = $externalHazardExtensionIds
     external_debugger_or_native_extensions = $externalDebuggerOrNativeExtensions
+    external_disabled_debugger_or_native_extensions = $externalDisabledDebuggerOrNativeExtensions
     external_debugger_extensions = $externalDebuggerExtensions
     external_native_messaging_processes = $externalNativeMessagingProcesses
 }
