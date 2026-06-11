@@ -65,6 +65,11 @@ fn assert_prd_defaults(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
         ),
         (
             "act_launch",
+            "inputSchema.properties.desktop.default",
+            Value::Null,
+        ),
+        (
+            "act_launch",
             "inputSchema.properties.env.default",
             json!({}),
         ),
@@ -218,6 +223,7 @@ fn assert_no_unexpected_m4_defaults(tools: &[Value]) -> anyhow::Result<Vec<Strin
         "act_combo.inputSchema.properties.backend.default",
         "act_launch.inputSchema.properties.args.default",
         "act_launch.inputSchema.properties.cdp_debug.default",
+        "act_launch.inputSchema.properties.desktop.default",
         "act_launch.inputSchema.properties.env.default",
         "act_launch.inputSchema.properties.force_renderer_accessibility.default",
         "act_launch.inputSchema.properties.timeout_ms.default",

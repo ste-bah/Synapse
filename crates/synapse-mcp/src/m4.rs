@@ -61,6 +61,10 @@ const SHELL_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 const SHELL_JOB_TAIL_DEFAULT_BYTES: u64 = 64 * 1024;
 const SHELL_JOB_TAIL_MAX_BYTES: u64 = 1024 * 1024;
 const SHELL_JOB_ID_MAX_BYTES: usize = 128;
+const SHELL_COMMAND_METADATA_POLICY: &str = "safe_display_v1";
+const SHELL_ARG_DISPLAY_MAX_BYTES: usize = 160;
+const SHELL_ARGS_DISPLAY_MAX_ITEMS: usize = 16;
+const SHELL_COMMAND_LINE_DISPLAY_MAX_BYTES: usize = 512;
 const SHELL_SESSION_ID_ENV: &str = "SYNAPSE_MCP_SESSION_ID";
 const SHELL_SESSION_DIR_ENV: &str = "SYNAPSE_SHELL_SESSION_DIR";
 const SHELL_WORKING_DIR_ENV: &str = "SYNAPSE_SHELL_WORKING_DIR";
@@ -560,8 +564,32 @@ pub struct ActRunShellJobStatus {
     pub status: String,
     pub pid: Option<u32>,
     pub command: String,
+    #[serde(default = "default_shell_command_metadata_policy")]
+    #[schemars(!default)]
+    pub command_metadata_policy: String,
     pub args: Vec<String>,
     pub command_line: String,
+    #[serde(default)]
+    #[schemars(!default)]
+    pub args_redacted: bool,
+    #[serde(default)]
+    #[schemars(!default)]
+    pub command_line_redacted: bool,
+    #[serde(default)]
+    #[schemars(!default)]
+    pub args_original_count: usize,
+    #[serde(default)]
+    #[schemars(!default)]
+    pub args_original_bytes: usize,
+    #[serde(default)]
+    #[schemars(!default)]
+    pub args_sha256: String,
+    #[serde(default)]
+    #[schemars(!default)]
+    pub command_line_original_bytes: usize,
+    #[serde(default)]
+    #[schemars(!default)]
+    pub command_line_sha256: String,
     pub working_dir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_dir: Option<String>,
@@ -585,6 +613,7 @@ pub struct ActRunShellJobStatus {
     pub request_sha256: String,
     pub matched_pattern: String,
     #[serde(default)]
+    #[schemars(!default)]
     pub remote_process_scope: ActRunShellRemoteProcessScope,
 }
 
@@ -653,6 +682,10 @@ struct RunShellIdempotencyRow {
     request_sha256: String,
     status: String,
     command_line: String,
+    #[serde(default)]
+    command_line_sha256: String,
+    #[serde(default)]
+    command_line_redacted: bool,
     matched_pattern: String,
     started_at: String,
     completed_at: Option<String>,
@@ -1098,6 +1131,7 @@ pub fn authorize_run_shell(
     validate_run_shell_params(params)?;
     let command_line = shell_command_line(params);
     let Some(matched_pattern) = config.shell_match(&command_line) else {
+        let command_metadata = shell_command_metadata(&params.command, &params.args);
         let reason = if config.allow_shell_count() == 0 {
             "no_allow_shell_policy"
         } else {
@@ -1109,8 +1143,16 @@ pub fn authorize_run_shell(
             json!({
                 "code": error_codes::SAFETY_SHELL_DENIED_BY_POLICY,
                 "command": params.command,
-                "args": params.args,
-                "command_line": command_line,
+                "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+                "args": command_metadata.args,
+                "args_redacted": command_metadata.args_redacted,
+                "args_original_count": command_metadata.args_original_count,
+                "args_original_bytes": command_metadata.args_original_bytes,
+                "args_sha256": command_metadata.args_sha256,
+                "command_line": command_metadata.command_line,
+                "command_line_redacted": command_metadata.command_line_redacted,
+                "command_line_original_bytes": command_metadata.command_line_original_bytes,
+                "command_line_sha256": command_metadata.command_line_sha256,
                 "working_dir": params.working_dir,
                 "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
                 "timeout_ms": params.timeout_ms,
@@ -1134,6 +1176,7 @@ pub async fn run_authorized_shell(
 ) -> Result<ActRunShellResponse, ErrorData> {
     let started = Instant::now();
     let idempotency_present = params.idempotency_key.is_some();
+    let trace_metadata = shell_command_metadata(&params.command, &params.args);
     let result = if should_background_direct_shell(&params, inline_await_limit_ms) {
         let start_params = run_shell_params_to_start_params(params);
         let started_job = start_authorized_shell_job(start_params, authorization, context)?;
@@ -1146,9 +1189,20 @@ pub async fn run_authorized_shell(
     } else {
         run_allowlisted_shell(params, context).await?
     };
+    let trace_command_line = if let Some(job) = &result.job {
+        job.command_line.as_str()
+    } else {
+        trace_metadata.command_line.as_str()
+    };
+    let trace_command_line_sha256 = if let Some(job) = &result.job {
+        job.command_line_sha256.as_str()
+    } else {
+        trace_metadata.command_line_sha256.as_str()
+    };
     tracing::info!(
         code = "M4_ACT_RUN_SHELL_EXECUTED",
-        command_line = %authorization.command_line,
+        command_line = %trace_command_line,
+        command_line_sha256 = %trace_command_line_sha256,
         matched_pattern = %authorization.matched_pattern,
         exit_code = ?result.exit_code,
         duration_ms = result.duration_ms,
@@ -1212,9 +1266,19 @@ pub fn run_shell_request_details(
     inline_await_limit_ms: u64,
 ) -> serde_json::Value {
     let will_background = should_background_direct_shell(params, inline_await_limit_ms);
+    let command_metadata = shell_command_metadata(&params.command, &params.args);
     json!({
         "command": params.command,
-        "args": params.args,
+        "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+        "args": command_metadata.args,
+        "args_redacted": command_metadata.args_redacted,
+        "args_original_count": command_metadata.args_original_count,
+        "args_original_bytes": command_metadata.args_original_bytes,
+        "args_sha256": command_metadata.args_sha256,
+        "command_line": command_metadata.command_line,
+        "command_line_redacted": command_metadata.command_line_redacted,
+        "command_line_original_bytes": command_metadata.command_line_original_bytes,
+        "command_line_sha256": command_metadata.command_line_sha256,
         "working_dir": params.working_dir,
         "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
         "timeout_ms": params.timeout_ms,
@@ -1245,9 +1309,19 @@ pub fn authorize_run_shell_start(
 }
 
 pub fn run_shell_start_request_details(params: &ActRunShellStartParams) -> serde_json::Value {
+    let command_metadata = shell_command_metadata(&params.command, &params.args);
     json!({
         "command": params.command,
-        "args": params.args,
+        "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+        "args": command_metadata.args,
+        "args_redacted": command_metadata.args_redacted,
+        "args_original_count": command_metadata.args_original_count,
+        "args_original_bytes": command_metadata.args_original_bytes,
+        "args_sha256": command_metadata.args_sha256,
+        "command_line": command_metadata.command_line,
+        "command_line_redacted": command_metadata.command_line_redacted,
+        "command_line_original_bytes": command_metadata.command_line_original_bytes,
+        "command_line_sha256": command_metadata.command_line_sha256,
         "working_dir": params.working_dir,
         "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
         "timeout_ms": params.timeout_ms,
@@ -1431,11 +1505,13 @@ pub fn start_authorized_shell_job(
         monitor_shell_job(child, process_job, monitor_status, monitor_paths, started).await;
     });
 
+    let command_metadata = shell_command_metadata(&params.command, &params.args);
     tracing::info!(
         code = "M4_ACT_RUN_SHELL_JOB_STARTED",
         job_id = %job_id,
         pid,
-        command_line = %authorization.command_line,
+        command_line = %command_metadata.command_line,
+        command_line_sha256 = %command_metadata.command_line_sha256,
         matched_pattern = %authorization.matched_pattern,
         timeout_ms = ?params.timeout_ms,
         session_id = ?status.session_id,
@@ -1781,6 +1857,7 @@ pub fn run_shell_idempotency_reservation_row(
         .as_deref()
         .map(|key| sha256_hex(key.as_bytes()))
         .unwrap_or_default();
+    let command_metadata = shell_command_metadata(&params.command, &params.args);
     let row = RunShellIdempotencyRow {
         schema_version: 2,
         tool: "act_run_shell".to_owned(),
@@ -1788,7 +1865,9 @@ pub fn run_shell_idempotency_reservation_row(
         idempotency_key_sha256: key_sha256,
         request_sha256: run_shell_request_sha256(params)?,
         status: "in_progress".to_owned(),
-        command_line: authorization.command_line.clone(),
+        command_line: command_metadata.command_line,
+        command_line_sha256: command_metadata.command_line_sha256,
+        command_line_redacted: command_metadata.command_line_redacted,
         matched_pattern: authorization.matched_pattern.clone(),
         started_at: chrono::Utc::now().to_rfc3339(),
         completed_at: None,
@@ -1813,6 +1892,7 @@ pub fn run_shell_idempotency_completed_row(
         .as_deref()
         .map(|key| sha256_hex(key.as_bytes()))
         .unwrap_or_default();
+    let command_metadata = shell_command_metadata(&params.command, &params.args);
     let now = chrono::Utc::now().to_rfc3339();
     let row = RunShellIdempotencyRow {
         schema_version: 2,
@@ -1821,7 +1901,9 @@ pub fn run_shell_idempotency_completed_row(
         idempotency_key_sha256: key_sha256,
         request_sha256: run_shell_request_sha256(params)?,
         status: "ok".to_owned(),
-        command_line: authorization.command_line.clone(),
+        command_line: command_metadata.command_line,
+        command_line_sha256: command_metadata.command_line_sha256,
+        command_line_redacted: command_metadata.command_line_redacted,
         matched_pattern: authorization.matched_pattern.clone(),
         started_at: now.clone(),
         completed_at: Some(now),
@@ -2684,6 +2766,7 @@ fn validate_run_shell_command_shape(
     params: &ActRunShellParams,
     command: &str,
 ) -> Result<(), ErrorData> {
+    let command_metadata = shell_command_metadata(&params.command, &params.args);
     if command != params.command {
         return Err(shell_tool_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -2692,7 +2775,10 @@ fn validate_run_shell_command_shape(
                 "code": error_codes::TOOL_PARAMS_INVALID,
                 "command": params.command,
                 "trimmed_command": command,
-                "args": params.args,
+                "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+                "args": command_metadata.args,
+                "args_redacted": command_metadata.args_redacted,
+                "args_sha256": command_metadata.args_sha256,
                 "working_dir": params.working_dir,
                 "reason": "command_has_outer_whitespace",
             }),
@@ -2706,7 +2792,10 @@ fn validate_run_shell_command_shape(
             json!({
                 "code": error_codes::TOOL_PARAMS_INVALID,
                 "command": params.command,
-                "args": params.args,
+                "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+                "args": command_metadata.args,
+                "args_redacted": command_metadata.args_redacted,
+                "args_sha256": command_metadata.args_sha256,
                 "working_dir": params.working_dir,
                 "reason": "command_must_not_be_quoted",
                 "expected_shape_windows": {
@@ -2723,7 +2812,10 @@ fn validate_run_shell_command_shape(
             json!({
                 "code": error_codes::TOOL_PARAMS_INVALID,
                 "command": params.command,
-                "args": params.args,
+                "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+                "args": command_metadata.args,
+                "args_redacted": command_metadata.args_redacted,
+                "args_sha256": command_metadata.args_sha256,
                 "working_dir": params.working_dir,
                 "reason": "command_has_unbalanced_quote",
             }),
@@ -2743,7 +2835,10 @@ fn validate_run_shell_command_shape(
         json!({
             "code": error_codes::TOOL_PARAMS_INVALID,
             "command": params.command,
-            "args": params.args,
+            "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+            "args": command_metadata.args,
+            "args_redacted": command_metadata.args_redacted,
+            "args_sha256": command_metadata.args_sha256,
             "working_dir": params.working_dir,
             "reason": "command_contains_arguments",
             "detected_executable_token": first_token,
@@ -4876,12 +4971,22 @@ fn write_shell_job_request(
     request_sha256: &str,
     context: Option<&ShellExecutionContext>,
 ) -> Result<(), ErrorData> {
+    let command_metadata = shell_command_metadata(&params.command, &params.args);
     let request = json!({
-        "schema_version": 2,
+        "schema_version": 3,
         "session_id": context.map(|context| context.session_id()),
         "session_dir": context.map(|context| path_string(context.session_dir())),
         "command": params.command,
-        "args": params.args,
+        "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+        "args": command_metadata.args,
+        "args_redacted": command_metadata.args_redacted,
+        "args_original_count": command_metadata.args_original_count,
+        "args_original_bytes": command_metadata.args_original_bytes,
+        "args_sha256": command_metadata.args_sha256,
+        "command_line": command_metadata.command_line,
+        "command_line_redacted": command_metadata.command_line_redacted,
+        "command_line_original_bytes": command_metadata.command_line_original_bytes,
+        "command_line_sha256": command_metadata.command_line_sha256,
         "working_dir": params.working_dir,
         "effective_working_dir": params.working_dir,
         "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
@@ -4926,13 +5031,14 @@ fn write_pretty_json_file<T: Serialize>(
 }
 
 fn write_shell_job_status(path: &Path, status: &ActRunShellJobStatus) -> Result<(), ErrorData> {
-    let bytes = serde_json::to_vec_pretty(status).map_err(|error| {
+    let safe_status = shell_job_status_with_safe_command_metadata(status);
+    let bytes = serde_json::to_vec_pretty(&safe_status).map_err(|error| {
         shell_tool_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("act_run_shell failed to encode shell job status: {error}"),
             json!({
                 "code": error_codes::TOOL_INTERNAL_ERROR,
-                "job_id": status.job_id,
+                "job_id": safe_status.job_id,
                 "path": path,
                 "reason": "job_status_encode_failed",
             }),
@@ -4945,7 +5051,7 @@ fn write_shell_job_status(path: &Path, status: &ActRunShellJobStatus) -> Result<
             format!("act_run_shell failed to write shell job status temp file: {error}"),
             json!({
                 "code": error_codes::STORAGE_WRITE_FAILED,
-                "job_id": status.job_id,
+                "job_id": safe_status.job_id,
                 "path": tmp_path,
                 "reason": "job_status_temp_write_failed",
             }),
@@ -4959,7 +5065,7 @@ fn write_shell_job_status(path: &Path, status: &ActRunShellJobStatus) -> Result<
             format!("act_run_shell failed to replace shell job status file: {error}"),
             json!({
                 "code": error_codes::STORAGE_WRITE_FAILED,
-                "job_id": status.job_id,
+                "job_id": safe_status.job_id,
                 "path": path,
                 "reason": "job_status_replace_failed",
             }),
@@ -4971,7 +5077,7 @@ fn write_shell_job_status(path: &Path, status: &ActRunShellJobStatus) -> Result<
             format!("act_run_shell failed to commit shell job status file: {error}"),
             json!({
                 "code": error_codes::STORAGE_WRITE_FAILED,
-                "job_id": status.job_id,
+                "job_id": safe_status.job_id,
                 "path": path,
                 "tmp_path": tmp_path,
                 "reason": "job_status_rename_failed",
@@ -5016,7 +5122,7 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
         )
     })?;
     normalize_shell_job_remote_process_scope(&mut job);
-    Ok(job)
+    Ok(shell_job_status_with_safe_command_metadata(&job))
 }
 
 fn normalize_shell_job_remote_process_scope(job: &mut ActRunShellJobStatus) {
@@ -5255,15 +5361,23 @@ fn shell_job_status_record(
     pid: Option<u32>,
     context: Option<&ShellExecutionContext>,
 ) -> ActRunShellJobStatus {
-    ActRunShellJobStatus {
+    let status = ActRunShellJobStatus {
         schema_version: 3,
         job_id: job_id.to_owned(),
         session_id: context.map(|context| context.session_id().to_owned()),
         status: status.to_owned(),
         pid,
         command: params.command.clone(),
+        command_metadata_policy: "legacy_raw".to_owned(),
         args: params.args.clone(),
         command_line: authorization.command_line.clone(),
+        args_redacted: false,
+        command_line_redacted: false,
+        args_original_count: 0,
+        args_original_bytes: 0,
+        args_sha256: String::new(),
+        command_line_original_bytes: 0,
+        command_line_sha256: String::new(),
         working_dir: params.working_dir.clone(),
         session_dir: context.map(|context| path_string(context.session_dir())),
         effective_working_dir: params.working_dir.clone(),
@@ -5284,7 +5398,8 @@ fn shell_job_status_record(
         request_sha256: request_sha256.to_owned(),
         matched_pattern: authorization.matched_pattern.clone(),
         remote_process_scope: shell_job_remote_process_scope_from_start_params(params),
-    }
+    };
+    shell_job_status_with_safe_command_metadata(&status)
 }
 
 fn open_shell_job_output(
@@ -5340,13 +5455,23 @@ fn spawn_shell_job_child(
     apply_no_window_tokio(&mut command);
 
     let mut child = command.spawn().map_err(|error| {
+        let command_metadata = shell_command_metadata(&params.command, &params.args);
         shell_tool_error(
             error_codes::ACTION_TARGET_INVALID,
             format!("act_run_shell_start failed to spawn command: {error}"),
             json!({
                 "code": error_codes::ACTION_TARGET_INVALID,
                 "command": params.command,
-                "args": params.args,
+                "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+                "args": command_metadata.args,
+                "args_redacted": command_metadata.args_redacted,
+                "args_original_count": command_metadata.args_original_count,
+                "args_original_bytes": command_metadata.args_original_bytes,
+                "args_sha256": command_metadata.args_sha256,
+                "command_line": command_metadata.command_line,
+                "command_line_redacted": command_metadata.command_line_redacted,
+                "command_line_original_bytes": command_metadata.command_line_original_bytes,
+                "command_line_sha256": command_metadata.command_line_sha256,
                 "working_dir": params.working_dir,
                 "reason": "spawn_failed",
             }),
@@ -5360,7 +5485,9 @@ fn spawn_shell_job_child(
             json!({
                 "code": error_codes::TOOL_INTERNAL_ERROR,
                 "command": params.command,
-                "args": params.args,
+                "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+                "args": shell_command_metadata(&params.command, &params.args).args,
+                "args_sha256": shell_args_sha256(&params.args),
                 "working_dir": params.working_dir,
                 "reason": "pid_unavailable",
             }),
@@ -6191,13 +6318,23 @@ fn spawn_shell_child(
     apply_no_window_tokio(&mut command);
 
     let mut child = command.spawn().map_err(|error| {
+        let command_metadata = shell_command_metadata(&params.command, &params.args);
         shell_tool_error(
             error_codes::ACTION_TARGET_INVALID,
             format!("act_run_shell failed to spawn command: {error}"),
             json!({
                 "code": error_codes::ACTION_TARGET_INVALID,
                 "command": params.command,
-                "args": params.args,
+                "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+                "args": command_metadata.args,
+                "args_redacted": command_metadata.args_redacted,
+                "args_original_count": command_metadata.args_original_count,
+                "args_original_bytes": command_metadata.args_original_bytes,
+                "args_sha256": command_metadata.args_sha256,
+                "command_line": command_metadata.command_line,
+                "command_line_redacted": command_metadata.command_line_redacted,
+                "command_line_original_bytes": command_metadata.command_line_original_bytes,
+                "command_line_sha256": command_metadata.command_line_sha256,
                 "working_dir": params.working_dir,
                 "reason": "spawn_failed",
             }),
@@ -6211,7 +6348,9 @@ fn spawn_shell_child(
             json!({
                 "code": error_codes::TOOL_INTERNAL_ERROR,
                 "command": params.command,
-                "args": params.args,
+                "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+                "args": shell_command_metadata(&params.command, &params.args).args,
+                "args_sha256": shell_args_sha256(&params.args),
                 "working_dir": params.working_dir,
                 "reason": "pid_unavailable",
             }),
@@ -6362,11 +6501,169 @@ async fn join_capped_stream(
 }
 
 fn shell_command_line(params: &ActRunShellParams) -> String {
-    std::iter::once(&params.command)
-        .chain(params.args.iter())
+    shell_command_line_from_parts(&params.command, &params.args)
+}
+
+fn shell_command_line_from_parts(command: &str, args: &[String]) -> String {
+    std::iter::once(command)
+        .chain(args.iter().map(String::as_str))
         .map(|part| quote_command_part(part))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[derive(Clone, Debug)]
+struct ShellCommandMetadata {
+    args: Vec<String>,
+    command_line: String,
+    args_redacted: bool,
+    command_line_redacted: bool,
+    args_original_count: usize,
+    args_original_bytes: usize,
+    args_sha256: String,
+    command_line_original_bytes: usize,
+    command_line_sha256: String,
+}
+
+fn default_shell_command_metadata_policy() -> String {
+    "legacy_raw".to_owned()
+}
+
+fn shell_command_metadata(command: &str, args: &[String]) -> ShellCommandMetadata {
+    let raw_command_line = shell_command_line_from_parts(command, args);
+    let args_sha256 = shell_args_sha256(args);
+    let command_line_sha256 = sha256_hex(raw_command_line.as_bytes());
+    let args_original_bytes = args.iter().map(|arg| arg.len()).sum();
+    let mut display_args = Vec::new();
+    let mut args_redacted = false;
+
+    for (index, arg) in args.iter().enumerate() {
+        if index >= SHELL_ARGS_DISPLAY_MAX_ITEMS {
+            args_redacted = true;
+            display_args.push(format!(
+                "[redacted:{}-additional-args:sha256={args_sha256}]",
+                args.len() - index
+            ));
+            break;
+        }
+        let display = shell_arg_metadata_display(arg);
+        if display != *arg {
+            args_redacted = true;
+        }
+        display_args.push(display);
+    }
+
+    let mut display_command_line = shell_command_line_from_parts(command, &display_args);
+    let mut command_line_redacted =
+        args_redacted || raw_command_line.len() > SHELL_COMMAND_LINE_DISPLAY_MAX_BYTES;
+    if display_command_line.len() > SHELL_COMMAND_LINE_DISPLAY_MAX_BYTES {
+        command_line_redacted = true;
+        display_command_line = format!(
+            "{} [redacted-command-line:sha256={command_line_sha256}:bytes={}:args={}]",
+            quote_command_part(command),
+            raw_command_line.len(),
+            args.len()
+        );
+    }
+
+    ShellCommandMetadata {
+        args: display_args,
+        command_line: display_command_line,
+        args_redacted,
+        command_line_redacted,
+        args_original_count: args.len(),
+        args_original_bytes,
+        args_sha256,
+        command_line_original_bytes: raw_command_line.len(),
+        command_line_sha256,
+    }
+}
+
+fn shell_args_sha256(args: &[String]) -> String {
+    let bytes = serde_json::to_vec(args).unwrap_or_else(|_error| args.join("\0").into_bytes());
+    sha256_hex(&bytes)
+}
+
+fn shell_arg_metadata_display(arg: &str) -> String {
+    if shell_arg_needs_metadata_redaction(arg) {
+        return format!(
+            "[redacted-arg:sha256={}:bytes={}]",
+            sha256_hex(arg.as_bytes()),
+            arg.len()
+        );
+    }
+    arg.to_owned()
+}
+
+fn shell_arg_needs_metadata_redaction(arg: &str) -> bool {
+    if arg.len() > SHELL_ARG_DISPLAY_MAX_BYTES || arg.contains(['\r', '\n']) {
+        return true;
+    }
+    let lower = arg.to_ascii_lowercase();
+    if [
+        "authorization:",
+        "bearer ",
+        "api_key",
+        "apikey",
+        "access_token",
+        "refresh_token",
+        "password",
+        "passwd",
+        "secret",
+        "recovery_code",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return true;
+    }
+    shell_arg_looks_like_opaque_token(arg)
+}
+
+fn shell_arg_looks_like_opaque_token(arg: &str) -> bool {
+    let trimmed = arg.trim_matches(['"', '\'']);
+    if trimmed.len() < 32 || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+    let mut has_alpha = false;
+    let mut has_digit = false;
+    let mut token_chars = 0usize;
+    for ch in trimmed.chars() {
+        if ch.is_ascii_alphabetic() {
+            has_alpha = true;
+            token_chars += 1;
+        } else if ch.is_ascii_digit() {
+            has_digit = true;
+            token_chars += 1;
+        } else if matches!(ch, '-' | '_' | '.' | '=' | '+' | '/') {
+            token_chars += 1;
+        }
+    }
+    has_alpha && has_digit && token_chars == trimmed.chars().count()
+}
+
+fn shell_job_status_with_safe_command_metadata(
+    status: &ActRunShellJobStatus,
+) -> ActRunShellJobStatus {
+    if status.command_metadata_policy == SHELL_COMMAND_METADATA_POLICY
+        && !status.args_sha256.is_empty()
+        && !status.command_line_sha256.is_empty()
+    {
+        return status.clone();
+    }
+    let metadata = shell_command_metadata(&status.command, &status.args);
+    let mut safe = status.clone();
+    safe.command_metadata_policy = SHELL_COMMAND_METADATA_POLICY.to_owned();
+    safe.args = metadata.args;
+    safe.command_line = metadata.command_line;
+    safe.args_redacted = metadata.args_redacted;
+    safe.command_line_redacted = metadata.command_line_redacted;
+    safe.args_original_count = metadata.args_original_count;
+    safe.args_original_bytes = metadata.args_original_bytes;
+    safe.args_sha256 = metadata.args_sha256;
+    safe.command_line_original_bytes = metadata.command_line_original_bytes;
+    safe.command_line_sha256 = metadata.command_line_sha256;
+    safe
 }
 
 fn launch_command_line(params: &ActLaunchParams) -> Result<String, ErrorData> {
@@ -7390,6 +7687,124 @@ mod tests {
             shell_command_line(&params),
             "cmd.exe /c \"echo hello\" \"\""
         );
+    }
+
+    #[test]
+    fn shell_command_metadata_redacts_large_and_secret_args() {
+        let large_body = format!(
+            "$body = @'\n{}\n'@; $body | gh issue comment 1 --body-file -",
+            "SYN877-LARGE-BODY-DO-NOT-ECHO ".repeat(12)
+        );
+        let secret_arg = "synapse_token_0123456789abcdef0123456789abcdef";
+        let args = vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            large_body.clone(),
+            secret_arg.to_owned(),
+        ];
+
+        let metadata = shell_command_metadata("powershell.exe", &args);
+
+        println!(
+            "readback=act_run_shell_metadata edge=large_secret before=large_bytes:{} token_bytes:{} after={metadata:?}",
+            large_body.len(),
+            secret_arg.len()
+        );
+        assert!(metadata.args_redacted);
+        assert!(metadata.command_line_redacted);
+        assert_eq!(metadata.args_original_count, 4);
+        assert!(metadata.args_sha256.len() == 64);
+        assert!(metadata.command_line_sha256.len() == 64);
+        assert!(
+            !metadata
+                .args
+                .iter()
+                .any(|arg| arg.contains("SYN877-LARGE-BODY"))
+        );
+        assert!(!metadata.args.iter().any(|arg| arg.contains(secret_arg)));
+        assert!(!metadata.command_line.contains("SYN877-LARGE-BODY"));
+        assert!(!metadata.command_line.contains(secret_arg));
+    }
+
+    #[test]
+    fn shell_job_status_and_request_store_safe_command_metadata() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = ShellJobPaths {
+            job_dir: temp.path().to_path_buf(),
+            stdout_path: temp.path().join("stdout.log"),
+            stderr_path: temp.path().join("stderr.log"),
+            status_path: temp.path().join("status.json"),
+            request_path: temp.path().join("request.json"),
+        };
+        let raw_body = format!(
+            "Write-Output '{}'",
+            "SYN877-REQUEST-BODY-DO-NOT-PERSIST ".repeat(10)
+        );
+        let params = ActRunShellStartParams {
+            command: "powershell.exe".to_owned(),
+            args: vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                raw_body.clone(),
+            ],
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            job_id: Some("issue877-safe-metadata".to_owned()),
+        };
+        let authorization = RunShellAuthorization {
+            command_line: shell_command_line_from_parts(&params.command, &params.args),
+            matched_pattern: "__any_permitted__".to_owned(),
+        };
+        let request_sha = run_shell_start_request_sha256(&params)
+            .unwrap_or_else(|error| panic!("start request should hash: {error}"));
+
+        write_shell_job_request(&paths, &params, &request_sha, None)
+            .unwrap_or_else(|error| panic!("request should write: {error}"));
+        let status = shell_job_status_record(
+            "issue877-safe-metadata",
+            "running",
+            &params,
+            &paths,
+            &request_sha,
+            &authorization,
+            "2026-06-11T00:00:00Z".to_owned(),
+            Some(1234),
+            None,
+        );
+        write_shell_job_status(&paths.status_path, &status)
+            .unwrap_or_else(|error| panic!("status should write: {error}"));
+        let request_json = std::fs::read_to_string(&paths.request_path)
+            .unwrap_or_else(|error| panic!("request should read: {error}"));
+        let status_json = std::fs::read_to_string(&paths.status_path)
+            .unwrap_or_else(|error| panic!("status should read: {error}"));
+        let read_status = read_shell_job_status(&paths.status_path, "issue877-safe-metadata")
+            .unwrap_or_else(|error| panic!("status should decode: {error}"));
+
+        println!(
+            "readback=act_run_shell_metadata edge=status_request before=raw_bytes:{} after=request:{} status:{}",
+            raw_body.len(),
+            request_json,
+            status_json
+        );
+        assert!(!request_json.contains("SYN877-REQUEST-BODY-DO-NOT-PERSIST"));
+        assert!(!status_json.contains("SYN877-REQUEST-BODY-DO-NOT-PERSIST"));
+        assert!(
+            !read_status
+                .command_line
+                .contains("SYN877-REQUEST-BODY-DO-NOT-PERSIST")
+        );
+        assert!(read_status.args_redacted);
+        assert!(read_status.command_line_redacted);
+        assert_eq!(
+            read_status.command_metadata_policy,
+            SHELL_COMMAND_METADATA_POLICY
+        );
+        assert_eq!(read_status.args_original_count, 3);
+        assert_eq!(read_status.request_sha256, request_sha);
+        assert!(read_status.args_sha256.len() == 64);
+        assert!(read_status.command_line_sha256.len() == 64);
     }
 
     #[test]
