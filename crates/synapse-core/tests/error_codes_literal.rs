@@ -12,6 +12,7 @@ fn error_codes_match_literal_names() {
     assert_literal!(OBSERVE_INTERNAL);
     assert_literal!(CAPTURE_GRAPHICS_API_UNSUPPORTED);
     assert_literal!(CAPTURE_PRINTWINDOW_DISABLED);
+    assert_literal!(CAPTURE_PRINTWINDOW_BLACK);
     assert_literal!(CAPTURE_TARGET_LOST);
     assert_literal!(CAPTURE_NO_DIRTY_REGIONS);
     assert_literal!(A11Y_NOT_AVAILABLE);

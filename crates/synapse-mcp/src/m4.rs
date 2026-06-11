@@ -3677,17 +3677,32 @@ fn desktop_window_process_ids(
     let mut search = Search {
         process_ids: Vec::new(),
     };
-    unsafe {
+    let result = unsafe {
         EnumDesktopWindows(
             Some(handle),
             Some(enum_window),
             LPARAM((&raw mut search).cast::<core::ffi::c_void>() as isize),
         )
+    };
+    if let Err(error) = result {
+        if desktop_window_enum_error_means_empty(&error) {
+            return Ok(Vec::new());
+        }
+        return Err(format!(
+            "EnumDesktopWindows failed for hidden desktop: {error}"
+        ));
     }
-    .map_err(|error| format!("EnumDesktopWindows failed for hidden desktop: {error}"))?;
     search.process_ids.sort_unstable();
     search.process_ids.dedup();
     Ok(search.process_ids)
+}
+
+#[cfg(windows)]
+fn desktop_window_enum_error_means_empty(error: &windows::core::Error) -> bool {
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES};
+
+    let code = error.code();
+    code == ERROR_FILE_NOT_FOUND.to_hresult() || code == ERROR_NO_MORE_FILES.to_hresult()
 }
 
 #[cfg(windows)]
@@ -8464,6 +8479,29 @@ mod tests {
         assert_ne!(console_flags.0 & CREATE_UNICODE_ENVIRONMENT.0, 0);
         assert_ne!(console_flags.0 & CREATE_NO_WINDOW.0, 0);
         assert_ne!(console_flags.0 & CREATE_NEW_PROCESS_GROUP.0, 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hidden_desktop_enum_missing_or_exhausted_is_empty_readback() {
+        use windows::Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_FILES,
+        };
+        use windows::core::Error;
+
+        let file_not_found = Error::from_hresult(ERROR_FILE_NOT_FOUND.to_hresult());
+        let no_more_files = Error::from_hresult(ERROR_NO_MORE_FILES.to_hresult());
+        let access_denied = Error::from_hresult(ERROR_ACCESS_DENIED.to_hresult());
+
+        println!(
+            "readback=act_launch_desktop_enum_error before=file_not_found,no_more_files,access_denied after=empty:{},{} fail:{}",
+            desktop_window_enum_error_means_empty(&file_not_found),
+            desktop_window_enum_error_means_empty(&no_more_files),
+            desktop_window_enum_error_means_empty(&access_denied)
+        );
+        assert!(desktop_window_enum_error_means_empty(&file_not_found));
+        assert!(desktop_window_enum_error_means_empty(&no_more_files));
+        assert!(!desktop_window_enum_error_means_empty(&access_denied));
     }
 
     #[test]

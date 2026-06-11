@@ -29,11 +29,14 @@ pub use ocr::ocr_result_from_web_bitmap;
 #[cfg(windows)]
 pub use ocr::read_text_request_from_bgra;
 pub use ocr::{
-    ReadTextCaptureSource, ResolvedReadTextRequest, read_text_request_uncached,
-    resolve_read_text_request,
+    ReadTextCaptureSource, ResolvedReadTextRequest, effective_ocr_backend,
+    read_text_request_uncached, resolve_read_text_request,
 };
 use search::{element_match, entity_match};
-pub use sources::{FsRecentTracker, populate_clipboard_summary, populate_fs_recent};
+pub use sources::{
+    FsRecentTracker, hidden_desktop_input_from_worker_snapshot, populate_clipboard_summary,
+    populate_fs_recent,
+};
 use sources::{
     element_input_from_id, platform_input, synthetic_notepad_input, window_input_from_hwnd,
 };

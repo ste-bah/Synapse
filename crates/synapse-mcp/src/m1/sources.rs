@@ -1190,6 +1190,46 @@ fn input_from_tree_and_foreground(
 }
 
 #[cfg(windows)]
+pub fn hidden_desktop_input_from_worker_snapshot(
+    mut tree: synapse_core::AccessibleSubtree,
+    foreground: ForegroundContext,
+    mode: PerceptionMode,
+) -> ObservationInput {
+    rebase_nodes_to_foreground(&mut tree.nodes, &foreground);
+    let focused = tree
+        .nodes
+        .iter()
+        .find(|node| node.focused)
+        .or_else(|| tree.nodes.first())
+        .map(focused_from_node);
+    let mut input = ObservationInput::new(foreground);
+    input.focused = focused;
+    input.elements = tree.nodes;
+    input.a11y_status = SensorStatus::Healthy;
+    input.capture_status = SensorStatus::Disabled;
+    if mode != PerceptionMode::Auto {
+        input.mode_override = Some(mode);
+    }
+    mark_sparse_target_a11y(&mut input);
+    input
+}
+
+#[cfg(not(windows))]
+pub fn hidden_desktop_input_from_worker_snapshot(
+    _tree: synapse_core::AccessibleSubtree,
+    foreground: ForegroundContext,
+    mode: PerceptionMode,
+) -> ObservationInput {
+    let mut input = ObservationInput::new(foreground);
+    input.a11y_status = SensorStatus::Unavailable;
+    input.capture_status = SensorStatus::Unavailable;
+    if mode != PerceptionMode::Auto {
+        input.mode_override = Some(mode);
+    }
+    input
+}
+
+#[cfg(windows)]
 fn supplement_focused_element(input: &mut ObservationInput) {
     let Ok(mut focused_node) = synapse_a11y::focused_element_node() else {
         return;

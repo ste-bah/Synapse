@@ -10,6 +10,7 @@ use super::{
     resolve_read_text_request, set_capture_target_in_state, set_perception_mode_in_state,
     set_target_input_schema, tool, tool_router,
 };
+use crate::m1::{effective_ocr_backend, hidden_desktop_input_from_worker_snapshot};
 use rmcp::{RoleServer, service::RequestContext};
 
 use std::{
@@ -117,7 +118,25 @@ impl SynapseService {
         // Scope the (non-Send) state guard so it is released before any await.
         let mut input = {
             let state = self.m1_state()?;
-            let mut input = observe_input(&state, &params.0, target_hwnd)?;
+            let mut input = match observe_input(&state, &params.0, target_hwnd) {
+                Ok(input) => input,
+                Err(error) if params.0.subtree_root.is_none() => {
+                    let Some(hwnd) = target_hwnd else {
+                        return Err(error);
+                    };
+                    let Some(session_id) = mcp_session_id else {
+                        return Err(error);
+                    };
+                    self.hidden_desktop_observe_input(
+                        session_id,
+                        hwnd,
+                        params.0.depth.unwrap_or(2).min(6),
+                        state.perception_mode,
+                        error,
+                    )?
+                }
+                Err(error) => return Err(error),
+            };
             if include.fs && input.fs_recent.is_empty() {
                 populate_fs_recent(&mut input, &state.fs_recent_tracker);
             }
@@ -178,7 +197,9 @@ impl SynapseService {
             "tool.invocation kind=find"
         );
         let target = self.request_session_target(&request_context)?;
-        self.find_with_target(params, target).await
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
+        self.find_with_target(params, target, session_id.as_deref())
+            .await
     }
 
     #[cfg(test)]
@@ -186,13 +207,14 @@ impl SynapseService {
         &self,
         params: Parameters<FindParams>,
     ) -> Result<Json<FindResponse>, ErrorData> {
-        self.find_with_target(params, None).await
+        self.find_with_target(params, None, None).await
     }
 
     async fn find_with_target(
         &self,
         params: Parameters<FindParams>,
         target: Option<SessionTarget>,
+        mcp_session_id: Option<&str>,
     ) -> Result<Json<FindResponse>, ErrorData> {
         let explicit_hwnd = params.0.window_hwnd;
         let target_hwnd = explicit_hwnd.or_else(|| target_hwnd(&target));
@@ -203,7 +225,25 @@ impl SynapseService {
         };
         let mut input = {
             let mut state = self.m1_state()?;
-            super::build_find_input(&mut state, &params.0, target_hwnd)?
+            match super::build_find_input(&mut state, &params.0, target_hwnd) {
+                Ok(input) => input,
+                Err(error) => {
+                    let Some(hwnd) = target_hwnd else {
+                        return Err(error);
+                    };
+                    let Some(session_id) = mcp_session_id else {
+                        return Err(error);
+                    };
+                    let mut input = self.hidden_desktop_find_input(
+                        session_id,
+                        hwnd,
+                        state.perception_mode,
+                        error,
+                    )?;
+                    populate_detection_from_state(&mut state, &mut input);
+                    input
+                }
+            }
         };
         super::enrich_input_with_cdp_for_target(
             &mut input,
@@ -217,7 +257,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; with no target it uses legacy screen-region OCR. PrintWindow is disabled because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers."
+        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; with no target it uses legacy screen-region OCR. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path."
     )]
     pub async fn read_text(
         &self,
@@ -242,8 +282,9 @@ impl SynapseService {
                 .await
                 .map(Json);
         }
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let target_hwnd = self.request_session_target_hwnd(&request_context)?;
-        self.read_text_with_target_hwnd(params, target_hwnd)
+        self.read_text_with_target_hwnd(params, target_hwnd, session_id.as_deref())
     }
 
     #[cfg(test)]
@@ -251,23 +292,37 @@ impl SynapseService {
         &self,
         params: Parameters<ReadTextParams>,
     ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
-        self.read_text_with_target_hwnd(params, None)
+        self.read_text_with_target_hwnd(params, None, None)
     }
 
     fn read_text_with_target_hwnd(
         &self,
         params: Parameters<ReadTextParams>,
         target_hwnd: Option<i64>,
+        mcp_session_id: Option<&str>,
     ) -> Result<Json<synapse_core::OcrResult>, ErrorData> {
-        let request = {
+        let normal_result = ({
             let state = self.m1_state()?;
-            resolve_read_text_request(&state, &params.0, target_hwnd)?
-        };
-        self.read_text_request_with_cache(request).map(Json)
+            resolve_read_text_request(&state, &params.0, target_hwnd)
+        })
+        .and_then(|request| self.read_text_request_with_cache(request));
+        match normal_result {
+            Ok(result) => Ok(Json(result)),
+            Err(error) => {
+                let Some(hwnd) = params.0.window_hwnd.or(target_hwnd) else {
+                    return Err(error);
+                };
+                let Some(session_id) = mcp_session_id else {
+                    return Err(error);
+                };
+                self.read_text_hidden_desktop(&params.0, session_id, hwnd, error)
+                    .map(Json)
+            }
+        }
     }
 
     #[tool(
-        description = "Capture a PNG/JPEG screenshot. With window_hwnd or this MCP session's active target, captures that window in the background using passive per-window WGC and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture. PrintWindow is disabled because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers."
+        description = "Capture a PNG/JPEG screenshot. With window_hwnd or this MCP session's active target, captures that window in the background using passive per-window WGC and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path."
     )]
     pub async fn capture_screenshot(
         &self,
@@ -279,38 +334,51 @@ impl SynapseService {
             kind = "capture_screenshot",
             "tool.invocation kind=capture_screenshot"
         );
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let session_target_hwnd = self.request_session_target_hwnd(&request_context)?;
         if let Some(window_hwnd) = params.0.window_hwnd.or(session_target_hwnd) {
-            let target_context = resolve_capture_target_window_context(window_hwnd)?;
-            let region = match params.0.region {
-                Some(client_region) => synapse_capture::client_region_to_window_region(
+            let normal_result = (|| {
+                let target_context = resolve_capture_target_window_context(window_hwnd)?;
+                let region = match params.0.region {
+                    Some(client_region) => synapse_capture::client_region_to_window_region(
+                        window_hwnd,
+                        client_region,
+                    )
+                    .map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!(
+                                "capture_screenshot could not convert client-relative region {client_region:?} for target {window_hwnd:#x}: {error}"
+                            ),
+                        )
+                    })?,
+                    None => synapse_capture::window_capture_region(window_hwnd).map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!(
+                                "capture_screenshot could not resolve target bitmap bounds for {window_hwnd:#x}: {error}"
+                            ),
+                        )
+                    })?,
+                };
+                capture_target_window_screenshot_to_file(
+                    &params.0,
                     window_hwnd,
-                    client_region,
+                    region,
+                    Some(target_context),
                 )
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "capture_screenshot could not convert client-relative region {client_region:?} for target {window_hwnd:#x}: {error}"
-                        ),
+            })();
+            return match normal_result {
+                Ok(response) => Ok(Json(response)),
+                Err(error) => self
+                    .capture_hidden_desktop_screenshot_to_file(
+                        &params.0,
+                        session_id.as_deref(),
+                        window_hwnd,
+                        error,
                     )
-                })?,
-                None => synapse_capture::window_capture_region(window_hwnd).map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "capture_screenshot could not resolve target bitmap bounds for {window_hwnd:#x}: {error}"
-                        ),
-                    )
-                })?,
+                    .map(Json),
             };
-            return capture_target_window_screenshot_to_file(
-                &params.0,
-                window_hwnd,
-                region,
-                Some(target_context),
-            )
-            .map(Json);
         }
 
         let foreground = if params.0.region.is_some() {
@@ -381,7 +449,8 @@ impl SynapseService {
         let session_id = require_target_session_id(&request_context)?;
         let (target, wire, window_title, process_name) = match params.0.target {
             SetTargetParam::Window { window_hwnd } => {
-                let (title, process) = validate_target_window(window_hwnd)?;
+                let (title, process) =
+                    self.validate_target_window_for_session(&session_id, window_hwnd)?;
                 (
                     SessionTarget::Window { hwnd: window_hwnd },
                     TargetWire::Window { window_hwnd },
@@ -394,7 +463,8 @@ impl SynapseService {
                 cdp_target_id,
             } => {
                 validate_cdp_target_id(&cdp_target_id)?;
-                let (title, process) = validate_target_window(window_hwnd)?;
+                let (title, process) =
+                    self.validate_target_window_for_session(&session_id, window_hwnd)?;
                 self.ensure_cdp_target_bindable_for_window(
                     &session_id,
                     window_hwnd,
@@ -484,6 +554,278 @@ impl SynapseService {
             window_title: None,
             process_name: None,
         }))
+    }
+
+    fn validate_target_window_for_session(
+        &self,
+        session_id: &str,
+        hwnd: i64,
+    ) -> Result<(String, String), ErrorData> {
+        match validate_target_window(hwnd) {
+            Ok(target) => Ok(target),
+            Err(error) => {
+                let Some(context) = self.hidden_desktop_context_for_session(session_id, hwnd)?
+                else {
+                    return Err(error);
+                };
+                Ok((context.window_title, context.process_name))
+            }
+        }
+    }
+
+    fn hidden_desktop_observe_input(
+        &self,
+        session_id: &str,
+        hwnd: i64,
+        depth: u32,
+        mode: synapse_core::PerceptionMode,
+        original_error: ErrorData,
+    ) -> Result<synapse_perception::ObservationInput, ErrorData> {
+        let Some(snapshot) =
+            self.hidden_desktop_snapshot_for_session(session_id, hwnd, depth, original_error)?
+        else {
+            return Err(mcp_error(
+                error_codes::TARGET_WINDOW_NOT_FOUND,
+                format!(
+                    "hidden desktop target hwnd {hwnd:#x} was not found in session {session_id}"
+                ),
+            ));
+        };
+        Ok(hidden_desktop_input_from_worker_snapshot(
+            snapshot.tree,
+            snapshot.context,
+            mode,
+        ))
+    }
+
+    fn hidden_desktop_find_input(
+        &self,
+        session_id: &str,
+        hwnd: i64,
+        mode: synapse_core::PerceptionMode,
+        original_error: ErrorData,
+    ) -> Result<synapse_perception::ObservationInput, ErrorData> {
+        let Some(snapshot) = self.hidden_desktop_snapshot_for_session(
+            session_id,
+            hwnd,
+            super::find_snapshot_depth(),
+            original_error,
+        )?
+        else {
+            return Err(mcp_error(
+                error_codes::TARGET_WINDOW_NOT_FOUND,
+                format!(
+                    "hidden desktop target hwnd {hwnd:#x} was not found in session {session_id}"
+                ),
+            ));
+        };
+        Ok(hidden_desktop_input_from_worker_snapshot(
+            snapshot.tree,
+            snapshot.context,
+            mode,
+        ))
+    }
+
+    fn hidden_desktop_context_for_session(
+        &self,
+        session_id: &str,
+        hwnd: i64,
+    ) -> Result<Option<ForegroundContext>, ErrorData> {
+        let Some(hidden_desktop) = self.session_hidden_desktop_readback(session_id)? else {
+            return Ok(None);
+        };
+        for desktop_name in &hidden_desktop.desktop_names {
+            match crate::desktop_worker::hidden_desktop_window_context(desktop_name, hwnd) {
+                Ok(context) => return Ok(Some(context)),
+                Err(error) if hidden_worker_target_miss(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    fn hidden_desktop_snapshot_for_session(
+        &self,
+        session_id: &str,
+        hwnd: i64,
+        depth: u32,
+        original_error: ErrorData,
+    ) -> Result<Option<crate::desktop_worker::HiddenDesktopSnapshot>, ErrorData> {
+        let Some(hidden_desktop) = self.session_hidden_desktop_readback(session_id)? else {
+            return Err(original_error);
+        };
+        for desktop_name in &hidden_desktop.desktop_names {
+            match crate::desktop_worker::hidden_desktop_window_snapshot(desktop_name, hwnd, depth) {
+                Ok(snapshot) => return Ok(Some(snapshot)),
+                Err(error) if hidden_worker_target_miss(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(None)
+    }
+
+    fn hidden_desktop_capture_for_session(
+        &self,
+        session_id: Option<&str>,
+        hwnd: i64,
+        region: Option<Rect>,
+        client_region: bool,
+        original_error: ErrorData,
+    ) -> Result<crate::desktop_worker::HiddenDesktopCapture, ErrorData> {
+        let Some(session_id) = session_id else {
+            return Err(original_error);
+        };
+        let Some(hidden_desktop) = self.session_hidden_desktop_readback(session_id)? else {
+            return Err(original_error);
+        };
+        for desktop_name in &hidden_desktop.desktop_names {
+            match crate::desktop_worker::hidden_desktop_window_capture(
+                desktop_name,
+                hwnd,
+                region,
+                client_region,
+            ) {
+                Ok(capture) => return Ok(capture),
+                Err(error) if hidden_worker_target_miss(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!("hidden desktop target hwnd {hwnd:#x} was not found in session {session_id}"),
+        ))
+    }
+
+    fn capture_hidden_desktop_screenshot_to_file(
+        &self,
+        params: &CaptureScreenshotParams,
+        session_id: Option<&str>,
+        hwnd: i64,
+        original_error: ErrorData,
+    ) -> Result<CaptureScreenshotResponse, ErrorData> {
+        let output_path = screenshot_output_path(&params.path)?;
+        let format = screenshot_format_from_path(&output_path)?;
+        ensure_screenshot_path_available(&output_path, params.overwrite)?;
+        let captured = self.hidden_desktop_capture_for_session(
+            session_id,
+            hwnd,
+            params.region,
+            params.region.is_some(),
+            original_error,
+        )?;
+        let bitmap_sha256 = sha256_hex(&captured.bitmap.bytes);
+        write_screenshot_bitmap(
+            params,
+            output_path,
+            format,
+            captured.bitmap,
+            captured.capture_backend,
+            bitmap_sha256,
+            Some(captured.context),
+        )
+    }
+
+    #[cfg(windows)]
+    fn read_text_hidden_desktop(
+        &self,
+        params: &ReadTextParams,
+        session_id: &str,
+        hwnd: i64,
+        original_error: ErrorData,
+    ) -> Result<OcrResult, ErrorData> {
+        if params.element_id.is_some() {
+            return Err(original_error);
+        }
+        let effective_backend = effective_ocr_backend(params.backend)?;
+        let (request_region, capture_region, client_region, original_error) = if let Some(region) =
+            params.region
+        {
+            (region, Some(region), true, original_error)
+        } else {
+            let Some(snapshot) =
+                self.hidden_desktop_snapshot_for_session(session_id, hwnd, 2, original_error)?
+            else {
+                return Err(mcp_error(
+                    error_codes::TARGET_WINDOW_NOT_FOUND,
+                    format!(
+                        "hidden desktop target hwnd {hwnd:#x} was not found in session {session_id}"
+                    ),
+                ));
+            };
+            let mut input = hidden_desktop_input_from_worker_snapshot(
+                snapshot.tree,
+                snapshot.context.clone(),
+                synapse_core::PerceptionMode::Auto,
+            );
+            let Some(focused) = input.focused.take() else {
+                return Err(mcp_error(
+                    error_codes::OCR_NO_TEXT,
+                    "hidden desktop read_text found no focused element OCR region",
+                ));
+            };
+            let window_region = Rect {
+                x: focused
+                    .bbox
+                    .x
+                    .saturating_sub(snapshot.context.window_bounds.x),
+                y: focused
+                    .bbox
+                    .y
+                    .saturating_sub(snapshot.context.window_bounds.y),
+                w: focused.bbox.w,
+                h: focused.bbox.h,
+            };
+            (
+                window_region,
+                Some(window_region),
+                false,
+                mcp_error(
+                    error_codes::TARGET_WINDOW_NOT_FOUND,
+                    format!(
+                        "hidden desktop target hwnd {hwnd:#x} was lost before OCR capture in session {session_id}"
+                    ),
+                ),
+            )
+        };
+        let captured = self.hidden_desktop_capture_for_session(
+            Some(session_id),
+            hwnd,
+            capture_region,
+            client_region,
+            original_error,
+        )?;
+        let request = crate::m1::ResolvedReadTextRequest {
+            region: request_region,
+            capture_source: crate::m1::ReadTextCaptureSource::Window {
+                hwnd,
+                window_region: captured.capture_region,
+            },
+            requested_backend: params.backend,
+            effective_backend,
+            lang_hint: params.lang_hint.clone(),
+            synthetic: false,
+        };
+        self.read_text_request_with_captured_bitmap(
+            request,
+            CapturedOcrBitmap {
+                bitmap: captured.bitmap,
+                capture_source: "window",
+                capture_backend: captured.capture_backend,
+                capture_hwnd: Some(hwnd),
+                capture_region: captured.capture_region,
+            },
+        )
+    }
+
+    #[cfg(not(windows))]
+    fn read_text_hidden_desktop(
+        &self,
+        _params: &ReadTextParams,
+        _session_id: &str,
+        _hwnd: i64,
+        original_error: ErrorData,
+    ) -> Result<OcrResult, ErrorData> {
+        Err(original_error)
     }
 
     #[tool(
@@ -1850,6 +2192,17 @@ pub(crate) fn validate_target_window(hwnd: i64) -> Result<(String, String), Erro
     Ok((context.window_title, context.process_name))
 }
 
+fn hidden_worker_target_miss(error: &ErrorData) -> bool {
+    matches!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str),
+        Some(error_codes::TARGET_WINDOW_NOT_FOUND)
+    )
+}
+
 fn resolve_capture_target_window_context(hwnd: i64) -> Result<ForegroundContext, ErrorData> {
     synapse_capture::validate_hwnd(hwnd).map_err(|error| {
         mcp_error(
@@ -2367,6 +2720,18 @@ impl SynapseService {
         }
 
         let captured = capture_ocr_bitmap(&request)?;
+        self.read_text_request_with_captured_bitmap(request, captured)
+    }
+
+    #[cfg(windows)]
+    fn read_text_request_with_captured_bitmap(
+        &self,
+        request: crate::m1::ResolvedReadTextRequest,
+        captured: CapturedOcrBitmap,
+    ) -> Result<OcrResult, ErrorData> {
+        if request.synthetic || request.effective_backend != OcrBackend::Winrt {
+            return read_text_request_uncached(&request);
+        }
         let bitmap_sha256 = sha256_hex(&captured.bytes);
         let cache_key = ocr_cache_key(
             &request,
@@ -3174,8 +3539,9 @@ fn template_value(field_name: &str, path: &str, index: usize) -> PerceptionResul
 #[cfg(all(test, windows))]
 mod tests {
     use super::{
-        SessionTarget, TargetWire, ocr_cache_key, resolve_capture_target_window_context,
-        sha256_hex, target_wire, template_value, validate_target_window,
+        SessionTarget, TargetWire, hidden_worker_target_miss, mcp_error, ocr_cache_key,
+        resolve_capture_target_window_context, sha256_hex, target_wire, template_value,
+        validate_target_window,
     };
     use synapse_core::error_codes;
 
@@ -3208,6 +3574,21 @@ mod tests {
             .and_then(serde_json::Value::as_str);
         assert_eq!(code, Some(error_codes::TARGET_WINDOW_NOT_FOUND));
         println!("readback=capture_screenshot edge=dead_hwnd code={code:?}");
+    }
+
+    #[test]
+    fn hidden_worker_target_miss_does_not_swallow_capture_region_invalid() {
+        let target_error = mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            "hidden desktop hwnd was not found",
+        );
+        let capture_error = mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            "empty desktop worker capture region",
+        );
+
+        assert!(hidden_worker_target_miss(&target_error));
+        assert!(!hidden_worker_target_miss(&capture_error));
     }
 
     #[test]

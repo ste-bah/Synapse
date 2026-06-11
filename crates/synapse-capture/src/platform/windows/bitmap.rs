@@ -15,10 +15,12 @@ use windows::{
             SRCCOPY, SelectObject,
         },
     },
+    Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow},
     Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow},
     Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GWL_STYLE, GetClientRect, GetMenu, GetWindowLongW, GetWindowPlacement,
-        GetWindowRect, IsIconic, WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT,
+        GetWindowRect, IsIconic, PW_RENDERFULLCONTENT, WINDOW_EX_STYLE, WINDOW_STYLE,
+        WINDOWPLACEMENT,
     },
     core::Interface as _,
 };
@@ -118,6 +120,40 @@ pub fn window_region_to_bgra_bitmap(
             })
         }
     }
+}
+
+pub fn window_region_to_bgra_bitmap_printwindow(
+    hwnd: i64,
+    region: Rect,
+) -> Result<CapturedWindowBgraBitmap, CaptureError> {
+    validate_bitmap_region(region)?;
+    let hwnd_value = hwnd;
+    let hwnd = hwnd_from_i64(hwnd);
+    let (window_width, window_height) = window_capture_extent(hwnd)?;
+    validate_region_inside_window(region, window_width, window_height)?;
+    let bytes = printwindow_region_bgra(hwnd, hwnd_value, region, window_width, window_height)?;
+    if is_all_zero_bgra(&bytes) {
+        tracing::warn!(
+            code = synapse_core::error_codes::CAPTURE_PRINTWINDOW_BLACK,
+            hwnd = hwnd_value,
+            region = ?region,
+            "PrintWindow returned all-zero pixels"
+        );
+        return Err(CaptureError::PrintWindowBlack {
+            detail: format!(
+                "PrintWindow returned all-zero pixels for hwnd {hwnd_value:#x} region {region:?}; target likely does not render through WM_PRINT/WM_PRINTCLIENT"
+            ),
+        });
+    }
+    Ok(CapturedWindowBgraBitmap {
+        bitmap: CapturedBgraBitmap {
+            region,
+            width: u32::try_from(region.w).unwrap_or_default(),
+            height: u32::try_from(region.h).unwrap_or_default(),
+            bytes,
+        },
+        capture_backend: "printwindow",
+    })
 }
 
 pub fn window_capture_region(hwnd: i64) -> Result<Rect, CaptureError> {
@@ -581,6 +617,145 @@ fn validate_region_inside_window(
     Ok(())
 }
 
+fn printwindow_region_bgra(
+    hwnd: windows::Win32::Foundation::HWND,
+    hwnd_value: i64,
+    region: Rect,
+    window_width: i32,
+    window_height: i32,
+) -> Result<Vec<u8>, CaptureError> {
+    let full_width = u32::try_from(window_width).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid PrintWindow bitmap width {window_width}: {err}"),
+    })?;
+    let full_height = u32::try_from(window_height).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid PrintWindow bitmap height {window_height}: {err}"),
+    })?;
+    let full_byte_len = usize::try_from(full_width)
+        .ok()
+        .and_then(|w| {
+            usize::try_from(full_height)
+                .ok()
+                .and_then(|h| w.checked_mul(h))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| CaptureError::TargetInvalid {
+            detail: format!("invalid PrintWindow bitmap dimensions {window_width}x{window_height}"),
+        })?;
+    let window_dc = unsafe { GetDC(Some(hwnd)) };
+    if window_dc.is_invalid() {
+        return Err(CaptureError::GraphicsApiUnsupported {
+            detail: format!("GetDC returned null for hwnd {hwnd_value:#x}"),
+        });
+    }
+    let memory_dc = unsafe { CreateCompatibleDC(Some(window_dc)) };
+    if memory_dc.is_invalid() {
+        let _ = unsafe { ReleaseDC(Some(hwnd), window_dc) };
+        return Err(CaptureError::GraphicsApiUnsupported {
+            detail: format!("CreateCompatibleDC returned null for hwnd {hwnd_value:#x}"),
+        });
+    }
+    let scratch = match GdiCaptureScratch::new(
+        window_dc,
+        memory_dc,
+        full_width,
+        full_height,
+        full_byte_len,
+    ) {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            let _ = unsafe { ReleaseDC(Some(hwnd), window_dc) };
+            return Err(error);
+        }
+    };
+    let printed = unsafe {
+        PrintWindow(
+            hwnd,
+            scratch.memory_dc,
+            PRINT_WINDOW_FLAGS(PW_RENDERFULLCONTENT),
+        )
+    };
+    let _ = unsafe { ReleaseDC(Some(hwnd), window_dc) };
+    if !printed.as_bool() {
+        return Err(CaptureError::GraphicsApiUnsupported {
+            detail: format!(
+                "PrintWindow returned false for hwnd {hwnd_value:#x}; last_error={:?}",
+                unsafe { windows::Win32::Foundation::GetLastError() }
+            ),
+        });
+    }
+    let full_bytes =
+        unsafe { slice::from_raw_parts(scratch.bits.cast::<u8>(), full_byte_len) }.to_vec();
+    copy_bgra_region_from_bytes(&full_bytes, full_width, region)
+}
+
+fn copy_bgra_region_from_bytes(
+    full_bytes: &[u8],
+    full_width: u32,
+    region: Rect,
+) -> Result<Vec<u8>, CaptureError> {
+    let width = usize::try_from(region.w).map_err(|err| CaptureError::TargetInvalid {
+        detail: err.to_string(),
+    })?;
+    let height = usize::try_from(region.h).map_err(|err| CaptureError::TargetInvalid {
+        detail: err.to_string(),
+    })?;
+    let full_row_len = usize::try_from(full_width)
+        .ok()
+        .and_then(|value| value.checked_mul(4))
+        .ok_or_else(|| CaptureError::TargetInvalid {
+            detail: format!("invalid PrintWindow full width {full_width}"),
+        })?;
+    let row_len = width
+        .checked_mul(4)
+        .ok_or_else(|| CaptureError::TargetInvalid {
+            detail: format!("invalid PrintWindow crop width {}", region.w),
+        })?;
+    let byte_len = row_len
+        .checked_mul(height)
+        .ok_or_else(|| CaptureError::TargetInvalid {
+            detail: format!("invalid PrintWindow crop region {region:?}"),
+        })?;
+    let source_x = usize::try_from(region.x).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid PrintWindow crop x {}: {err}", region.x),
+    })?;
+    let source_y = usize::try_from(region.y).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid PrintWindow crop y {}: {err}", region.y),
+    })?;
+    let source_x_bytes = source_x
+        .checked_mul(4)
+        .ok_or_else(|| CaptureError::TargetInvalid {
+            detail: format!("invalid PrintWindow crop x {}", region.x),
+        })?;
+    let mut output = vec![0_u8; byte_len];
+    for row in 0..height {
+        let source_offset = source_y
+            .checked_add(row)
+            .and_then(|source_row| source_row.checked_mul(full_row_len))
+            .and_then(|source_row_offset| source_row_offset.checked_add(source_x_bytes))
+            .ok_or_else(|| CaptureError::TargetInvalid {
+                detail: format!("PrintWindow source offset overflow for {region:?}"),
+            })?;
+        let source_end =
+            source_offset
+                .checked_add(row_len)
+                .ok_or_else(|| CaptureError::TargetInvalid {
+                    detail: format!("PrintWindow source end overflow for {region:?}"),
+                })?;
+        if source_end > full_bytes.len() {
+            return Err(CaptureError::TargetInvalid {
+                detail: format!(
+                    "PrintWindow source region {region:?} exceeds captured byte length {}",
+                    full_bytes.len()
+                ),
+            });
+        }
+        let target_offset = row.saturating_mul(row_len);
+        output[target_offset..target_offset + row_len]
+            .copy_from_slice(&full_bytes[source_offset..source_end]);
+    }
+    Ok(output)
+}
+
 fn is_all_zero_bgra(bytes: &[u8]) -> bool {
     bytes.iter().all(|byte| *byte == 0)
 }
@@ -673,7 +848,7 @@ mod tests {
 
     use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
 
-    use super::{copy_mapped_rows, validate_region_inside_texture};
+    use super::{copy_bgra_region_from_bytes, copy_mapped_rows, validate_region_inside_texture};
     use crate::CaptureError;
     use synapse_core::Rect;
 
@@ -736,6 +911,34 @@ mod tests {
 
         assert!(matches!(error, CaptureError::TargetInvalid { .. }));
         assert!(error.to_string().contains("exceeds D3D texture bounds"));
+    }
+
+    #[test]
+    fn printwindow_region_copy_extracts_bgra_crop() {
+        let full = vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, //
+            13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        ];
+
+        let crop = copy_bgra_region_from_bytes(
+            &full,
+            3,
+            Rect {
+                x: 1,
+                y: 0,
+                w: 2,
+                h: 2,
+            },
+        )
+        .expect("crop succeeds");
+
+        assert_eq!(
+            crop,
+            vec![
+                5, 6, 7, 8, 9, 10, 11, 12, //
+                17, 18, 19, 20, 21, 22, 23, 24,
+            ]
+        );
     }
 }
 

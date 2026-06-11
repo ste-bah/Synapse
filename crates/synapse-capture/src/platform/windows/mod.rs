@@ -8,7 +8,7 @@ mod target;
 pub use bitmap::{
     captured_frame_region_to_bgra_bitmap, captured_frame_region_to_software_bitmap,
     client_region_to_window_region, screen_region_to_bgra_bitmap, screen_region_to_software_bitmap,
-    window_capture_region, window_region_to_bgra_bitmap,
+    window_capture_region, window_region_to_bgra_bitmap, window_region_to_bgra_bitmap_printwindow,
 };
 pub use capture::{run_dxgi_capture, run_graphics_capture};
 pub use coords::{

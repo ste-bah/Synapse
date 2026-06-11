@@ -330,7 +330,7 @@ fn absolute_region_to_window_region(
     Ok(window_region)
 }
 
-fn effective_ocr_backend(backend: OcrBackend) -> Result<OcrBackend, ErrorData> {
+pub fn effective_ocr_backend(backend: OcrBackend) -> Result<OcrBackend, ErrorData> {
     match backend {
         OcrBackend::Winrt | OcrBackend::Auto => Ok(OcrBackend::Winrt),
         OcrBackend::Crnn => Err(crnn_unavailable_error()),

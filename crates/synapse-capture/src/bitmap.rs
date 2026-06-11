@@ -81,6 +81,23 @@ pub fn window_region_to_bgra_bitmap(
     platform::window_region_to_bgra_bitmap(hwnd, region, timeout_ms)
 }
 
+/// Explicit `PrintWindow` capture for a window-region bitmap.
+///
+/// This is intentionally separate from `window_region_to_bgra_bitmap`: callers
+/// must opt in after proving the target is on a bounded worker desktop, because
+/// Windows asks the target process to handle `WM_PRINT`/`WM_PRINTCLIENT`.
+///
+/// # Errors
+///
+/// Returns [`CaptureError`] when the HWND/region is invalid, `PrintWindow`
+/// fails, returns all-zero pixels, or the `GDI` copy fails.
+pub fn window_region_to_bgra_bitmap_printwindow(
+    hwnd: i64,
+    region: Rect,
+) -> Result<CapturedWindowBgraBitmap, CaptureError> {
+    platform::window_region_to_bgra_bitmap_printwindow(hwnd, region)
+}
+
 /// Returns the full window bitmap region used by `window_region_to_bgra_bitmap`.
 /// For minimized Windows targets this uses the restored placement extent rather
 /// than the minimized icon rectangle.
