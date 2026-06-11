@@ -7,6 +7,7 @@ mod profile;
 mod reality;
 mod reflex;
 mod stored;
+mod timeline;
 mod web_perception;
 
 pub use action::*;
@@ -18,4 +19,5 @@ pub use profile::*;
 pub use reality::*;
 pub use reflex::*;
 pub use stored::*;
+pub use timeline::*;
 pub use web_perception::*;

@@ -38,6 +38,64 @@ fn open_fresh_db_creates_all_prd_cfs_and_schema_sentinel() -> Result<(), Box<dyn
 }
 
 #[test]
+fn opens_database_created_with_pre_timeline_layout() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("db");
+
+    // Recreate the historical 11-CF layout (everything except CF_TIMELINE)
+    // exactly as a pre-ADR binary would have left it on disk.
+    let legacy_cfs: Vec<&str> = cf::ALL_COLUMN_FAMILIES
+        .into_iter()
+        .filter(|name| *name != cf::CF_TIMELINE)
+        .collect();
+    {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+        let legacy = DB::open_cf(&options, &path, &legacy_cfs)?;
+        legacy.put(SCHEMA_VERSION_KEY, TEST_SCHEMA_VERSION.to_be_bytes())?;
+        let events = legacy
+            .cf_handle(cf::CF_EVENTS)
+            .ok_or("legacy CF_EVENTS handle missing")?;
+        legacy.put_cf(&events, DURABILITY_KEY, DURABILITY_VALUE)?;
+        legacy.flush_cf(&events)?;
+    }
+    let before = sorted_list_cf(&path)?;
+    println!(
+        "regression_state=db.list_cf edge=pre_timeline before={before:?} before_count={}",
+        before.len()
+    );
+    assert!(
+        !before.contains(&cf::CF_TIMELINE.to_owned()),
+        "precondition: legacy layout must not contain CF_TIMELINE"
+    );
+
+    let db = Db::open(&path, TEST_SCHEMA_VERSION)?;
+    let handles = existing_prd_handles(&db);
+    let preserved = db
+        .inner
+        .cf_handle(cf::CF_EVENTS)
+        .and_then(|handle| db.inner.get_cf(&handle, DURABILITY_KEY).transpose())
+        .transpose()?;
+    db.put_batch(cf::CF_TIMELINE, vec![(b"migrate".to_vec(), b"{}".to_vec())])?;
+    db.flush()?;
+    let timeline_rows = db.scan_cf(cf::CF_TIMELINE)?;
+    drop(db);
+
+    let after = sorted_list_cf(&path)?;
+    println!(
+        "regression_state=db.list_cf edge=pre_timeline after={after:?} preserved={:?} timeline_rows={} observed=additive_open:ok",
+        preserved.as_deref(),
+        timeline_rows.len()
+    );
+    assert_eq!(handles, sorted_prd_cfs());
+    assert_eq!(preserved.as_deref(), Some(DURABILITY_VALUE));
+    assert_eq!(timeline_rows.len(), 1);
+    assert!(after.contains(&cf::CF_TIMELINE.to_owned()));
+    Ok(())
+}
+
+#[test]
 fn mismatched_schema_errors_then_wipe_retry_succeeds() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("db");

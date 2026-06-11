@@ -17,7 +17,7 @@ pub enum RetentionTtl {
 }
 
 /// PRD §4/§6 storage retention defaults.
-pub const DEFAULTS: [RetentionDefault; 11] = [
+pub const DEFAULTS: [RetentionDefault; 12] = [
     RetentionDefault {
         cf: "CF_EVENTS",
         ttl: RetentionTtl::Hours(24),
@@ -83,5 +83,14 @@ pub const DEFAULTS: [RetentionDefault; 11] = [
         ttl: RetentionTtl::None,
         soft_cap_mb: 10,
         hard_cap_mb: 50,
+    },
+    // ADR 2026-06-11-timeline-data-model: long-retention operator activity
+    // timeline; TTL eviction additionally relies on periodic compaction so
+    // cold SST files still pass the TTL filter (see storage cf_options).
+    RetentionDefault {
+        cf: "CF_TIMELINE",
+        ttl: RetentionTtl::Days(90),
+        soft_cap_mb: 4096,
+        hard_cap_mb: 8192,
     },
 ];

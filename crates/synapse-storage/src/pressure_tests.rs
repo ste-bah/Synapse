@@ -87,34 +87,60 @@ fn disk_pressure_write_gating() -> Result<(), Box<dyn Error>> {
     let db = Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?;
     let config = test_config();
 
+    db.put_batch(cf::CF_TIMELINE, row("timeline-normal"))?;
+    db.flush()?;
+    let normal_timeline = db.scan_cf(cf::CF_TIMELINE)?;
+    println!(
+        "regression_state=cf_scan level=Normal timeline={} observed=timeline:{:?}",
+        normal_timeline.len(),
+        printable_keys(&normal_timeline)
+    );
+    assert_eq!(normal_timeline.len(), 1);
+
     pressure::run_once_with_free_bytes(&db.inner, &db.pressure, &config, 150)?;
     let before_observations = db.scan_cf(cf::CF_OBSERVATIONS)?;
     db.put_batch(cf::CF_OBSERVATIONS, row("obs-l3"))?;
     db.put_batch(cf::CF_EVENTS, row("event-l3"))?;
+    db.put_batch(cf::CF_TIMELINE, row("timeline-l3"))?;
     db.flush()?;
     let after_l3_observations = db.scan_cf(cf::CF_OBSERVATIONS)?;
     let after_l3_events = db.scan_cf(cf::CF_EVENTS)?;
+    let after_l3_timeline = db.scan_cf(cf::CF_TIMELINE)?;
     println!(
-        "regression_state=cf_scan level=Level3 before_observations={} after_observations={} after_events={} observed=observations:{:?},events:{:?}",
+        "regression_state=cf_scan level=Level3 before_observations={} after_observations={} after_events={} after_timeline={} observed=observations:{:?},events:{:?},timeline:{:?}",
         before_observations.len(),
         after_l3_observations.len(),
         after_l3_events.len(),
+        after_l3_timeline.len(),
         printable_keys(&after_l3_observations),
-        printable_keys(&after_l3_events)
+        printable_keys(&after_l3_events),
+        printable_keys(&after_l3_timeline)
     );
     assert!(after_l3_observations.is_empty());
     assert_eq!(after_l3_events.len(), 1);
+    assert_eq!(
+        after_l3_timeline.len(),
+        1,
+        "CF_TIMELINE writes must shed at Level3 (only the Normal-level row survives)"
+    );
 
     pressure::run_once_with_free_bytes(&db.inner, &db.pressure, &config, 50)?;
     db.put_batch(cf::CF_OBSERVATIONS, row("obs-l4"))?;
     db.put_batch(cf::CF_EVENTS, row("event-l4"))?;
     db.put_batch(cf::CF_REFLEX_AUDIT, row("audit-l4"))?;
     db.put_batch(cf::CF_SESSIONS, row("session-l4"))?;
+    db.put_batch(cf::CF_TIMELINE, row("timeline-l4"))?;
     db.flush()?;
     let after_l4_observations = db.scan_cf(cf::CF_OBSERVATIONS)?;
     let after_l4_events = db.scan_cf(cf::CF_EVENTS)?;
     let after_l4_audit = db.scan_cf(cf::CF_REFLEX_AUDIT)?;
     let after_l4_sessions = db.scan_cf(cf::CF_SESSIONS)?;
+    let after_l4_timeline = db.scan_cf(cf::CF_TIMELINE)?;
+    assert_eq!(
+        after_l4_timeline.len(),
+        1,
+        "CF_TIMELINE writes must shed at Level4 (only the Normal-level row survives)"
+    );
     println!(
         "regression_state=cf_scan level=Level4 observations={} events={} audit={} sessions={} observed=observations:{:?},events:{:?},audit:{:?},sessions:{:?}",
         after_l4_observations.len(),

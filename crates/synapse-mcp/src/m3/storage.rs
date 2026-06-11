@@ -27,7 +27,7 @@ const MAX_KEY_PREFIX_BYTES: usize = 128;
 const MAX_ROW_CAP: u64 = 1_000_000;
 const MAX_INSPECT_SAMPLE_ROWS_PER_CF: usize = 3;
 const MAX_INSPECT_SAMPLE_VALUE_CHARS: usize = 4096;
-const PROBE_WRITABLE_CFS: [&str; 11] = cf::ALL_COLUMN_FAMILIES;
+const PROBE_WRITABLE_CFS: [&str; cf::ALL_COLUMN_FAMILIES.len()] = cf::ALL_COLUMN_FAMILIES;
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

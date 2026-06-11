@@ -20,9 +20,11 @@ pub const CF_ACTION_LOG: &str = "CF_ACTION_LOG";
 pub const CF_PROCESS_HISTORY: &str = "CF_PROCESS_HISTORY";
 /// Generic bounded key-value extension.
 pub const CF_KV: &str = "CF_KV";
+/// Operator activity timeline (ADR 2026-06-11-timeline-data-model).
+pub const CF_TIMELINE: &str = "CF_TIMELINE";
 
 /// PRD §4 column family names, excluding `RocksDB`'s implicit `default` CF.
-pub const ALL_COLUMN_FAMILIES: [&str; 11] = [
+pub const ALL_COLUMN_FAMILIES: [&str; 12] = [
     CF_EVENTS,
     CF_OBSERVATIONS,
     CF_PROFILES,
@@ -34,4 +36,5 @@ pub const ALL_COLUMN_FAMILIES: [&str; 11] = [
     CF_ACTION_LOG,
     CF_PROCESS_HISTORY,
     CF_KV,
+    CF_TIMELINE,
 ];

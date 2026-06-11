@@ -5,6 +5,7 @@ pub mod compaction;
 pub mod error;
 mod gc;
 mod pressure;
+pub mod timeline;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -28,6 +29,8 @@ const DEFAULT_WRITE_BUFFER_BYTES: usize = 64 * MIB;
 const MODEL_CACHE_WRITE_BUFFER_BYTES: usize = 256 * MIB;
 const BLOCK_CACHE_BYTES: usize = 64 * MIB;
 const SCHEMA_VERSION_KEY: &[u8] = b"__schema_version";
+const TIMELINE_PERIODIC_COMPACTION_SECONDS: u64 = 86_400;
+const STORAGE_WRITES_SHED_TOTAL: &str = "storage_writes_shed_total";
 
 /// Opened storage handle.
 pub struct Db {
@@ -118,10 +121,20 @@ impl Db {
             return Ok(());
         }
         if !self.pressure.permits_write(cf_name) {
+            // Shedding is policy, not failure, but it must stay observable:
+            // consumers like the activity timeline mine continuity and need
+            // to detect recording gaps (ADR 2026-06-11-timeline-data-model).
+            synapse_telemetry::metrics::counter!(
+                STORAGE_WRITES_SHED_TOTAL,
+                "cf" => cf_name.to_owned()
+            )
+            .increment(kvs.len() as u64);
             tracing::warn!(
                 code = error_codes::STORAGE_WRITE_FAILED,
                 cf = cf_name,
                 pressure_level = ?self.pressure.level(),
+                dropped_rows = kvs.len(),
+                metric_name = STORAGE_WRITES_SHED_TOTAL,
                 "storage write dropped under disk pressure"
             );
             return Ok(());
@@ -581,6 +594,14 @@ fn cf_options(name: &'static str) -> Options {
         }
         cf::CF_OBSERVATIONS | cf::CF_SESSIONS => {
             options.set_compression_type(DBCompressionType::Zstd);
+        }
+        cf::CF_TIMELINE => {
+            options.set_compression_type(DBCompressionType::Zstd);
+            options.set_prefix_extractor(SliceTransform::create_fixed_prefix(8));
+            // 90-day TTL rows live in cold SST files that normal write churn
+            // never compacts; force every file through the TTL compaction
+            // filter at least daily (ADR 2026-06-11-timeline-data-model).
+            options.set_periodic_compaction_seconds(TIMELINE_PERIODIC_COMPACTION_SECONDS);
         }
         _ => {}
     }
