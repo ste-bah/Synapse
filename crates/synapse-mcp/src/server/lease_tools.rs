@@ -121,6 +121,30 @@ impl SynapseService {
             );
             return Err(error);
         }
+        // Journal first-time acquisitions (#897); renewals happen on every
+        // leased action and would flood the journal without adding signal.
+        // An acquisition that cannot be journaled is rolled back the same
+        // way as a persist failure: control-plane state must stay auditable.
+        if response.outcome == "acquired"
+            && let Err(journal_error) =
+                self.journal_lease_event(synapse_core::AgentEventKind::LeaseAcquired, &session_id, None, status.ttl_ms)
+        {
+            let released = lease::release_if_owner(&session_id);
+            let persisted_row_deleted = self.delete_persisted_session_lease(&session_id).is_ok();
+            tracing::error!(
+                code = error_codes::TOOL_INTERNAL_ERROR,
+                session_id,
+                released_after_journal_failure = released,
+                persisted_row_deleted,
+                error = ?journal_error,
+                "input lease acquire could not journal its agent event; rolled the acquisition back"
+            );
+            return Err(super::agent_events::agent_event_tool_error(
+                "control_lease_acquire",
+                &journal_error,
+                false,
+            ));
+        }
         Ok(Json(response))
     }
 
@@ -141,6 +165,17 @@ impl SynapseService {
         self.restore_session_lease_if_needed(&session_id)?;
         let response = release_lease_for_session(&session_id)?;
         self.delete_persisted_session_lease(&session_id)?;
+        // The release is already committed; a journal failure is surfaced
+        // with that context instead of pretending the release failed.
+        self.journal_lease_event(
+            synapse_core::AgentEventKind::LeaseReleased,
+            &session_id,
+            None,
+            None,
+        )
+        .map_err(|error| {
+            super::agent_events::agent_event_tool_error("control_lease_release", &error, true)
+        })?;
         Ok(Json(response))
     }
 
@@ -188,6 +223,13 @@ impl SynapseService {
             to_row_session_id = ?persist_readback.to_row_session_id,
             "readback=input_lease edge=handoff_committed"
         );
+        // Handoff = one released + one acquired event, both tagged with the
+        // handoff reason so the journal reconstructs the transfer (#897).
+        // The handoff is already committed; journal failure surfaces as such.
+        self.journal_lease_handoff_events(&session_id, &to_session, handoff.current.ttl_ms)
+            .map_err(|error| {
+                super::agent_events::agent_event_tool_error("control_lease_handoff", &error, true)
+            })?;
         Ok(Json(response))
     }
 
@@ -323,6 +365,65 @@ fn lease_status_for_session(session_id: &str) -> ControlLeaseResponse {
 }
 
 impl SynapseService {
+    /// Journals one input-lease lifecycle event (#897).
+    fn journal_lease_event(
+        &self,
+        kind: synapse_core::AgentEventKind,
+        session_id: &str,
+        reason_code: Option<&str>,
+        ttl_ms: Option<u64>,
+    ) -> Result<(), synapse_storage::StorageError> {
+        let db = self.m3_storage().map_err(|error| {
+            synapse_storage::StorageError::WriteFailed {
+                cf_name: synapse_storage::cf::CF_AGENT_EVENTS.to_owned(),
+                detail: format!("open storage for lease agent event: {}", error.message),
+            }
+        })?;
+        let mut record = synapse_core::AgentEventRecord::new(
+            super::agent_events::unix_time_ns_now(),
+            kind,
+        );
+        record.session_id = Some(session_id.to_owned());
+        record.reason_code = reason_code.map(ToOwned::to_owned);
+        record.attributes.conversation_id = Some(session_id.to_owned());
+        record.payload = json!({ "ttl_ms": ttl_ms });
+        super::agent_events::record_agent_event(&db, &record).map(|_readback| ())
+    }
+
+    /// Journals the released/acquired event pair for a committed handoff in
+    /// one storage batch.
+    fn journal_lease_handoff_events(
+        &self,
+        from_session_id: &str,
+        to_session_id: &str,
+        ttl_ms: Option<u64>,
+    ) -> Result<(), synapse_storage::StorageError> {
+        let db = self.m3_storage().map_err(|error| {
+            synapse_storage::StorageError::WriteFailed {
+                cf_name: synapse_storage::cf::CF_AGENT_EVENTS.to_owned(),
+                detail: format!("open storage for lease handoff agent events: {}", error.message),
+            }
+        })?;
+        let ts_ns = super::agent_events::unix_time_ns_now();
+        let mut released = synapse_core::AgentEventRecord::new(
+            ts_ns,
+            synapse_core::AgentEventKind::LeaseReleased,
+        );
+        released.session_id = Some(from_session_id.to_owned());
+        released.reason_code = Some("handoff".to_owned());
+        released.attributes.conversation_id = Some(from_session_id.to_owned());
+        released.payload = json!({ "to_session": to_session_id });
+        let mut acquired = synapse_core::AgentEventRecord::new(
+            ts_ns,
+            synapse_core::AgentEventKind::LeaseAcquired,
+        );
+        acquired.session_id = Some(to_session_id.to_owned());
+        acquired.reason_code = Some("handoff".to_owned());
+        acquired.attributes.conversation_id = Some(to_session_id.to_owned());
+        acquired.payload = json!({ "from_session": from_session_id, "ttl_ms": ttl_ms });
+        super::agent_events::record_agent_events(&db, &[released, acquired]).map(|_readbacks| ())
+    }
+
     fn ensure_handoff_recipient_live(
         &self,
         from_session_id: &str,

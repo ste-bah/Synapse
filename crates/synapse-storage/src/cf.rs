@@ -33,9 +33,14 @@ pub const CF_ROUTINES: &str = "CF_ROUTINES";
 /// it must survive every `CF_ROUTINES` replace-all, keyed by the same
 /// stable routine id.
 pub const CF_ROUTINE_STATE: &str = "CF_ROUTINE_STATE";
+/// Durable agent lifecycle/telemetry event journal (#897), keyed
+/// `(ts_ns, seq)` like `CF_TIMELINE`. One row per agent event (spawn, state
+/// change, tool call, turn, message, lease, exit) with OTel GenAI-aligned
+/// attributes. Append-only; retention is TTL + GC, never rewritten.
+pub const CF_AGENT_EVENTS: &str = "CF_AGENT_EVENTS";
 
 /// PRD §4 column family names, excluding `RocksDB`'s implicit `default` CF.
-pub const ALL_COLUMN_FAMILIES: [&str; 15] = [
+pub const ALL_COLUMN_FAMILIES: [&str; 16] = [
     CF_EVENTS,
     CF_OBSERVATIONS,
     CF_PROFILES,
@@ -51,4 +56,5 @@ pub const ALL_COLUMN_FAMILIES: [&str; 15] = [
     CF_EPISODES,
     CF_ROUTINES,
     CF_ROUTINE_STATE,
+    CF_AGENT_EVENTS,
 ];

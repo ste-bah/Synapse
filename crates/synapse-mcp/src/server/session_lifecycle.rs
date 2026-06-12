@@ -322,6 +322,9 @@ pub struct SessionStoreCleanupReport {
 pub struct SessionRegistryCleanupReport {
     pub closed_recorded: bool,
     pub reason_code: String,
+    /// Whether this teardown transitioned the registry entry to closed and
+    /// therefore journaled the terminal `exited` agent event (#897).
+    pub journal_event_written: bool,
     pub failed: bool,
     pub error_message: Option<String>,
 }
@@ -1371,23 +1374,54 @@ impl SessionLifecycleState {
         session_id: &str,
         reason: &str,
     ) -> SessionRegistryCleanupReport {
-        match self.session_registry.lock() {
+        let transitioned = match self.session_registry.lock() {
             Ok(mut registry) => {
-                registry.record_closed_with_reason(session_id, unix_time_ms_now(), Some(reason));
-                SessionRegistryCleanupReport {
-                    closed_recorded: true,
+                registry.record_closed_with_reason(session_id, unix_time_ms_now(), Some(reason))
+            }
+            Err(_error) => {
+                return SessionRegistryCleanupReport {
+                    closed_recorded: false,
                     reason_code: reason.to_owned(),
-                    failed: false,
-                    error_message: None,
+                    journal_event_written: false,
+                    failed: true,
+                    error_message: Some("session registry lock poisoned".to_owned()),
+                };
+            }
+        };
+        let mut report = SessionRegistryCleanupReport {
+            closed_recorded: true,
+            reason_code: reason.to_owned(),
+            journal_event_written: false,
+            failed: false,
+            error_message: None,
+        };
+        if transitioned {
+            // Terminal lifecycle fact: journal it durably (#897). The agent's
+            // task outcome is unknown to teardown, hence `indeterminate`.
+            match self.journal_session_exited_event(session_id, reason) {
+                Ok(()) => report.journal_event_written = true,
+                Err(error) => {
+                    report.failed = true;
+                    report.error_message = Some(error);
                 }
             }
-            Err(_error) => SessionRegistryCleanupReport {
-                closed_recorded: false,
-                reason_code: reason.to_owned(),
-                failed: true,
-                error_message: Some("session registry lock poisoned".to_owned()),
-            },
         }
+        report
+    }
+
+    fn journal_session_exited_event(&self, session_id: &str, reason: &str) -> Result<(), String> {
+        let db = session_store_db(&self.m3_state)?;
+        let mut record = synapse_core::AgentEventRecord::new(
+            super::agent_events::unix_time_ns_now(),
+            synapse_core::AgentEventKind::Exited,
+        );
+        record.session_id = Some(session_id.to_owned());
+        record.reason_code = Some(reason.to_owned());
+        record.end_state = Some(synapse_core::AgentEndState::Indeterminate);
+        record.attributes.conversation_id = Some(session_id.to_owned());
+        super::agent_events::record_agent_event_durable(&db, &record)
+            .map(|_readback| ())
+            .map_err(|error| format!("journal session exited event: {error}"))
     }
 }
 

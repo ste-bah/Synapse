@@ -947,13 +947,17 @@ impl SessionStore for SynapseMcpSessionStore {
             stored_at_unix_ms = persisted.stored_at_unix_ms,
             "loaded MCP HTTP session state from CF_KV"
         );
-        record_registry_initialized(
+        let newly_visible = record_registry_initialized(
             &self.session_registry,
             session_id,
             &persisted.state,
             persisted.stored_at_unix_ms,
         )
         .map_err(session_store_error)?;
+        if newly_visible {
+            journal_session_live_event(&self.db, session_id, &persisted.state, "session_restored")
+                .map_err(session_store_error)?;
+        }
         Ok(Some(persisted.state))
     }
 
@@ -975,8 +979,13 @@ impl SessionStore for SynapseMcpSessionStore {
             ttl_ms = self.ttl.map(duration_millis_u64),
             "persisted MCP HTTP session state to CF_KV"
         );
-        record_registry_initialized(&self.session_registry, session_id, state, stored_at_unix_ms)
-            .map_err(session_store_error)?;
+        let newly_visible =
+            record_registry_initialized(&self.session_registry, session_id, state, stored_at_unix_ms)
+                .map_err(session_store_error)?;
+        if newly_visible {
+            journal_session_live_event(&self.db, session_id, state, "session_initialized")
+                .map_err(session_store_error)?;
+        }
         Ok(())
     }
 
@@ -991,7 +1000,12 @@ impl SessionStore for SynapseMcpSessionStore {
             session_id,
             "deleted MCP HTTP session state from CF_KV"
         );
-        record_registry_closed(&self.session_registry, session_id).map_err(session_store_error)?;
+        let transitioned = record_registry_closed(&self.session_registry, session_id)
+            .map_err(session_store_error)?;
+        if transitioned {
+            journal_session_exited_event(&self.db, session_id, "http_session_store_deleted")
+                .map_err(session_store_error)?;
+        }
         Ok(())
     }
 }
@@ -1001,7 +1015,7 @@ fn record_registry_initialized(
     session_id: &str,
     state: &SessionState,
     now_unix_ms: u64,
-) -> Result<(), synapse_storage::StorageError> {
+) -> Result<bool, synapse_storage::StorageError> {
     let mut registry =
         session_registry
             .lock()
@@ -1009,14 +1023,13 @@ fn record_registry_initialized(
                 cf_name: cf::CF_KV.to_owned(),
                 detail: "session registry lock poisoned during session store".to_owned(),
             })?;
-    registry.record_initialized(session_id, state, "http", now_unix_ms);
-    Ok(())
+    Ok(registry.record_initialized(session_id, state, "http", now_unix_ms))
 }
 
 fn record_registry_closed(
     session_registry: &crate::server::session_registry::SharedSessionRegistry,
     session_id: &str,
-) -> Result<(), synapse_storage::StorageError> {
+) -> Result<bool, synapse_storage::StorageError> {
     let mut registry =
         session_registry
             .lock()
@@ -1024,11 +1037,55 @@ fn record_registry_closed(
                 cf_name: cf::CF_KV.to_owned(),
                 detail: "session registry lock poisoned during session delete".to_owned(),
             })?;
-    registry.record_closed(
+    Ok(registry.record_closed(
         session_id,
         crate::server::session_registry::unix_time_ms_now(),
+    ))
+}
+
+/// Journals a `state_changed → live` agent event for a session that just
+/// became visible through the HTTP session store (#897).
+fn journal_session_live_event(
+    db: &Db,
+    session_id: &str,
+    state: &SessionState,
+    reason_code: &str,
+) -> Result<(), synapse_storage::StorageError> {
+    use crate::server::{agent_events, session_registry};
+    let client_name = state.initialize_params.client_info.name.clone();
+    let agent_kind = session_registry::infer_agent_kind(&client_name);
+    let mut record = synapse_core::AgentEventRecord::new(
+        agent_events::unix_time_ns_now(),
+        synapse_core::AgentEventKind::StateChanged,
     );
-    Ok(())
+    record.session_id = Some(session_id.to_owned());
+    record.reason_code = Some(reason_code.to_owned());
+    record.state_to = Some("live".to_owned());
+    record.attributes.operation_name = Some(synapse_core::GenAiOperationName::InvokeAgent);
+    record.attributes.conversation_id = Some(session_id.to_owned());
+    record.attributes.agent_name = Some(client_name);
+    record.attributes.provider_name = agent_events::provider_for_agent_kind(&agent_kind);
+    agent_events::record_agent_event(db, &record).map(|_readback| ())
+}
+
+/// Journals a terminal `exited` agent event (durable flush) for a session
+/// the HTTP session store just deleted (#897). The outcome of the agent's
+/// work is unknown at this layer, so the end state is `indeterminate`.
+fn journal_session_exited_event(
+    db: &Db,
+    session_id: &str,
+    reason_code: &str,
+) -> Result<(), synapse_storage::StorageError> {
+    use crate::server::agent_events;
+    let mut record = synapse_core::AgentEventRecord::new(
+        agent_events::unix_time_ns_now(),
+        synapse_core::AgentEventKind::Exited,
+    );
+    record.session_id = Some(session_id.to_owned());
+    record.reason_code = Some(reason_code.to_owned());
+    record.end_state = Some(synapse_core::AgentEndState::Indeterminate);
+    record.attributes.conversation_id = Some(session_id.to_owned());
+    agent_events::record_agent_event_durable(db, &record).map(|_readback| ())
 }
 
 fn mcp_session_store_key(session_id: &str) -> Vec<u8> {

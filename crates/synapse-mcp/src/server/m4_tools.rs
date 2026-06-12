@@ -369,9 +369,31 @@ impl SynapseService {
             &agent_spawn_request_details(&params, started_by_session_id.as_deref()),
             &request_context,
         )?;
+        // The spawn id is allocated before any side effect so every journal
+        // event of this lifecycle (#897) shares one attribution anchor; a
+        // spawn that cannot be journaled is refused before launching.
+        let spawn_id = format!("agent-spawn-{}", new_reflex_id());
+        self.journal_spawn_requested(&spawn_id, &params, started_by_session_id.as_deref())?;
         let result = self
-            .act_spawn_agent_impl(params, started_by_session_id)
+            .act_spawn_agent_impl(params, started_by_session_id, spawn_id.clone())
             .await;
+        match &result {
+            Ok(response) => {
+                if let Err(journal_error) = self.journal_spawn_ready(response) {
+                    self.audit_action_result_for_request::<ActSpawnAgentResponse>(
+                        ACT_SPAWN_AGENT,
+                        &Err(journal_error.clone()),
+                        &request_context,
+                    )?;
+                    return Err(journal_error);
+                }
+            }
+            Err(error) => {
+                // The spawn error must win the response; the journal failure
+                // (if any) is already logged as AGENT_EVENT_WRITE_FAILED.
+                self.journal_spawn_failed(&spawn_id, error);
+            }
+        }
         self.audit_action_result_for_request(ACT_SPAWN_AGENT, &result, &request_context)?;
         result.map(Json)
     }
@@ -412,6 +434,7 @@ impl SynapseService {
         &self,
         params: ActSpawnAgentParams,
         started_by_session_id: Option<String>,
+        spawn_id: String,
     ) -> Result<ActSpawnAgentResponse, ErrorData> {
         validate_agent_spawn_params(&params)?;
         validate_spawn_target(&params.target)?;
@@ -428,7 +451,6 @@ impl SynapseService {
         let working_dir = resolve_agent_working_dir(params.working_dir.as_deref())?;
         let token = read_synapse_bearer_token()?;
         let before_session_ids = self.current_session_ids()?;
-        let spawn_id = format!("agent-spawn-{}", new_reflex_id());
         let launched_at_unix_ms = unix_time_ms_now();
         let wait_deadline = agent_spawn_wait_deadline(params.wait_timeout_ms)?;
         let files = prepare_agent_spawn_files(&spawn_id, &params, &working_dir)?;
@@ -975,6 +997,124 @@ impl SynapseService {
         })?;
         registry.record_spawned_agent(session_id, metadata, unix_time_ms_now());
         Ok(())
+    }
+
+    /// Journals `spawn_requested` (#897) before any spawn side effect; a
+    /// spawn whose lifecycle cannot be journaled is refused up front.
+    fn journal_spawn_requested(
+        &self,
+        spawn_id: &str,
+        params: &ActSpawnAgentParams,
+        started_by_session_id: Option<&str>,
+    ) -> Result<(), ErrorData> {
+        let db = self.m3_storage()?;
+        let mut record = synapse_core::AgentEventRecord::new(
+            super::agent_events::unix_time_ns_now(),
+            synapse_core::AgentEventKind::SpawnRequested,
+        );
+        record.spawn_id = Some(spawn_id.to_owned());
+        record.attributes.operation_name = Some(synapse_core::GenAiOperationName::CreateAgent);
+        record.attributes.agent_name = Some(params.cli.as_str().to_owned());
+        record.attributes.provider_name =
+            super::agent_events::provider_for_agent_kind(params.cli.as_str());
+        // Prompt CONTENT stays out of the journal (OTel GenAI opt-in rule);
+        // its length is enough for the dashboard to size the request.
+        record.payload = json!({
+            "started_by_session_id": started_by_session_id,
+            "prompt_chars": params.prompt.as_deref().map(|prompt| prompt.chars().count()),
+            "working_dir": params.working_dir,
+            "mcp_url": params.mcp_url,
+            "wait_timeout_ms": params.wait_timeout_ms,
+            "hold_open_ms": params.hold_open_ms,
+        });
+        super::agent_events::record_agent_event(&db, &record)
+            .map(|_readback| ())
+            .map_err(|error| {
+                super::agent_events::agent_event_tool_error(ACT_SPAWN_AGENT, &error, false)
+            })
+    }
+
+    /// Journals `spawn_ready` (#897) once the spawned agent has a registered
+    /// MCP session and a validated task-start artifact.
+    fn journal_spawn_ready(&self, response: &ActSpawnAgentResponse) -> Result<(), ErrorData> {
+        let db = self.m3_storage()?;
+        let mut record = synapse_core::AgentEventRecord::new(
+            super::agent_events::unix_time_ns_now(),
+            synapse_core::AgentEventKind::SpawnReady,
+        );
+        record.spawn_id = Some(response.spawn_id.clone());
+        record.session_id = Some(response.session_id.clone());
+        record.state_to = Some("live".to_owned());
+        record.attributes.operation_name = Some(synapse_core::GenAiOperationName::InvokeAgent);
+        record.attributes.agent_name = Some(response.cli.as_str().to_owned());
+        record.attributes.provider_name =
+            super::agent_events::provider_for_agent_kind(response.cli.as_str());
+        record.attributes.conversation_id = Some(response.session_id.clone());
+        record.payload = json!({
+            "launcher_process_id": response.launcher_process_id,
+            "agent_process_id": response.agent_process_id,
+            "launched_at_unix_ms": response.launched_at_unix_ms,
+            "registered_at_unix_ms": response.registered_at_unix_ms,
+            "task_started_at_unix_ms": response.task_started_at_unix_ms,
+            "launch_target": response.launch_target,
+            "log_dir": response.log_paths.log_dir,
+        });
+        super::agent_events::record_agent_event(&db, &record)
+            .map(|_readback| ())
+            .map_err(|error| {
+                super::agent_events::agent_event_tool_error(ACT_SPAWN_AGENT, &error, true)
+            })
+    }
+
+    /// Journals a terminal `exited` event (durable flush) for a failed spawn
+    /// (#897). The original spawn error always wins the tool response; a
+    /// journal failure here is logged (AGENT_EVENT_WRITE_FAILED) not raised.
+    fn journal_spawn_failed(&self, spawn_id: &str, error: &ErrorData) {
+        let db = match self.m3_storage() {
+            Ok(db) => db,
+            Err(storage_error) => {
+                tracing::error!(
+                    code = "AGENT_EVENT_WRITE_FAILED",
+                    spawn_id,
+                    detail = %storage_error.message,
+                    "spawn-failure agent event skipped: storage unavailable"
+                );
+                return;
+            }
+        };
+        let reason = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("agent_spawn_failed");
+        let error_code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        let mut record = synapse_core::AgentEventRecord::new(
+            super::agent_events::unix_time_ns_now(),
+            synapse_core::AgentEventKind::Exited,
+        );
+        record.spawn_id = Some(spawn_id.to_owned());
+        record.reason_code = Some(reason.to_owned());
+        record.end_state = Some(synapse_core::AgentEndState::Error);
+        record.attributes.error_type = error_code.map(ToOwned::to_owned);
+        record.payload = json!({
+            "error_message": error.message.chars().take(512).collect::<String>(),
+        });
+        if let Err(journal_error) =
+            super::agent_events::record_agent_event_durable(&db, &record)
+        {
+            tracing::error!(
+                code = "AGENT_EVENT_WRITE_FAILED",
+                spawn_id,
+                reason,
+                detail = %journal_error,
+                "spawn-failure agent event could not be journaled"
+            );
+        }
     }
 }
 

@@ -1,4 +1,5 @@
 mod action;
+mod agent_event;
 mod episode;
 mod event;
 mod geometry;
@@ -13,6 +14,7 @@ mod timeline;
 mod web_perception;
 
 pub use action::*;
+pub use agent_event::*;
 pub use episode::*;
 pub use event::*;
 pub use geometry::*;

@@ -8,7 +8,9 @@ pub mod types;
 
 pub use defaults::{DEFAULT_AIM_TRACK_EMA_ALPHA, SCHEMA_VERSION};
 pub use types::{
-    AccessibleNode, AccessibleQuery, AccessibleQueryScope, AccessibleSubtree, Action, AimCurve,
+    AGENT_EVENT_MAX_ID_CHARS, AGENT_EVENT_MAX_REASON_CHARS, AGENT_EVENT_RECORD_VERSION,
+    AccessibleNode, AccessibleQuery, AccessibleQueryScope, AccessibleSubtree, Action,
+    AgentEndState, AgentEventKind, AgentEventRecord, AimCurve,
     AimNaturalParams, AimStyle, AimTarget, AudioContext, AudioCue, AudioEvent, Backend,
     ButtonAction, CaptureRuntimeReadback, CdpCapability, CdpDiagnostics, CdpStatus,
     ClipboardSummary, ComboInput, ComboStep, DEFAULT_HUD_CONFIDENCE_THRESHOLD, DataPredicate,
@@ -16,7 +18,8 @@ pub use types::{
     ElementId, ElementIdParseError, ElementIdParts, EntityId, Event, EventExtension, EventFilter,
     EventFilterValidationError, EventRef, EventSource, EventSummary, FocusedElement,
     ForbiddenRawDataKind, ForegroundContext, FsEvent, FsEventKind, GamepadController,
-    GamepadReport, Health, HudExtractor, HudField, HudFieldError, HudFieldSpec, HudParser,
+    GamepadReport, GenAiAttributes, GenAiOperationName, Health, HudExtractor, HudField,
+    HudFieldError, HudFieldSpec, HudParser,
     HudReading, HudReadings, HudRegion, HudValue, HumanizeParams, InputBackendCapability,
     InputBackendDiagnostics, Key, KeyCode, KeystrokeDynamics, KeystrokeNaturalParams, MouseButton,
     MouseTarget, Observation, ObservationCaptureConfig, ObservationCaptureTarget,

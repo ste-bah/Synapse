@@ -1,3 +1,4 @@
+pub mod agent_events;
 mod batch;
 pub mod cf;
 pub mod codecs;
@@ -690,13 +691,14 @@ fn cf_options(name: &'static str) -> Options {
         cf::CF_OBSERVATIONS | cf::CF_SESSIONS => {
             options.set_compression_type(DBCompressionType::Zstd);
         }
-        cf::CF_TIMELINE | cf::CF_EPISODES => {
+        cf::CF_TIMELINE | cf::CF_EPISODES | cf::CF_AGENT_EVENTS => {
             options.set_compression_type(DBCompressionType::Zstd);
             options.set_prefix_extractor(SliceTransform::create_fixed_prefix(8));
-            // 90-day TTL rows live in cold SST files that normal write churn
+            // Long-TTL rows live in cold SST files that normal write churn
             // never compacts; force every file through the TTL compaction
             // filter at least daily (ADR 2026-06-11-timeline-data-model;
-            // CF_EPISODES shares the long-retention profile, #846).
+            // CF_EPISODES shares the long-retention profile, #846;
+            // CF_AGENT_EVENTS keys/expires the same way, #897).
             options.set_periodic_compaction_seconds(TIMELINE_PERIODIC_COMPACTION_SECONDS);
         }
         _ => {}

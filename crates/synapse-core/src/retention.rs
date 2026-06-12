@@ -17,7 +17,7 @@ pub enum RetentionTtl {
 }
 
 /// PRD §4/§6 storage retention defaults.
-pub const DEFAULTS: [RetentionDefault; 15] = [
+pub const DEFAULTS: [RetentionDefault; 16] = [
     RetentionDefault {
         cf: "CF_EVENTS",
         ttl: RetentionTtl::Hours(24),
@@ -120,5 +120,16 @@ pub const DEFAULTS: [RetentionDefault; 15] = [
         ttl: RetentionTtl::None,
         soft_cap_mb: 16,
         hard_cap_mb: 64,
+    },
+    // Durable agent-event journal (#897): the source of truth every Command
+    // Center panel reconciles against (fleet metrics, transcripts, cost).
+    // 30 days covers dashboard history without competing with CF_TIMELINE
+    // for disk; TTL eviction additionally relies on periodic compaction so
+    // cold SST files still pass the TTL filter (see storage cf_options).
+    RetentionDefault {
+        cf: "CF_AGENT_EVENTS",
+        ttl: RetentionTtl::Days(30),
+        soft_cap_mb: 512,
+        hard_cap_mb: 1024,
     },
 ];

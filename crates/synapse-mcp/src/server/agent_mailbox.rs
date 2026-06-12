@@ -285,6 +285,26 @@ impl SynapseService {
         let storage_readback = readback_exact_mailbox_row(&db, &row_key)?;
         let queue_depth_after = queue_depth_for_recipient(&db, &params.to_session, now_unix_ms)?;
 
+        // Journal the delivery fact (#897). The mailbox row is already
+        // committed, so a journal failure is surfaced with that context.
+        let mut journal_record = synapse_core::AgentEventRecord::new(
+            super::agent_events::unix_time_ns_now(),
+            synapse_core::AgentEventKind::MessageSent,
+        );
+        journal_record.session_id = Some(from_session.to_owned());
+        journal_record.attributes.conversation_id = Some(from_session.to_owned());
+        journal_record.payload = json!({
+            "to_session": &params.to_session,
+            "message_id": &message_id,
+            "message_kind": &message.kind,
+            "payload_bytes": storage_readback.value_len_bytes,
+            "value_sha256": &storage_readback.value_sha256,
+            "expires_at_unix_ms": message.expires_at_unix_ms,
+        });
+        super::agent_events::record_agent_event(&db, &journal_record).map_err(|error| {
+            super::agent_events::agent_event_tool_error("agent_send", &error, true)
+        })?;
+
         tracing::info!(
             code = "AGENT_MAILBOX_SEND_COMMITTED",
             from_session,
@@ -361,6 +381,35 @@ impl SynapseService {
         } else {
             Vec::new()
         };
+        // Journal receipts (#897) BEFORE deleting the drained rows: if the
+        // journal refuses, the inbox rows survive and the drain can retry —
+        // a message can never vanish unjournaled.
+        if params.drain && !scan.messages.is_empty() {
+            let receipt_ts_ns = super::agent_events::unix_time_ns_now();
+            let receipts = scan
+                .messages
+                .iter()
+                .map(|row| {
+                    let mut record = synapse_core::AgentEventRecord::new(
+                        receipt_ts_ns,
+                        synapse_core::AgentEventKind::MessageReceived,
+                    );
+                    record.session_id = Some(session_id.to_owned());
+                    record.attributes.conversation_id = Some(session_id.to_owned());
+                    record.payload = json!({
+                        "from_session": &row.message.from_session,
+                        "message_id": &row.message.message_id,
+                        "message_kind": &row.message.kind,
+                        "payload_bytes": row.encoded.len(),
+                        "sent_at_unix_ms": row.message.sent_at_unix_ms,
+                    });
+                    record
+                })
+                .collect::<Vec<_>>();
+            super::agent_events::record_agent_events(&db, &receipts).map_err(|error| {
+                super::agent_events::agent_event_tool_error("agent_inbox", &error, false)
+            })?;
+        }
         if !delete_keys.is_empty() {
             db.delete_batch(cf::CF_KV, delete_keys.clone())
                 .map_err(|error| {
@@ -937,6 +986,90 @@ mod tests {
             2_030,
         )?;
         assert_eq!(after.returned_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn send_and_drain_journal_physical_agent_event_rows() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        register_session(&service, "journal-sender", 1_000)?;
+        register_session(&service, "journal-recipient", 1_000)?;
+
+        let db = service
+            .m3_storage()
+            .map_err(|error| anyhow::anyhow!("open storage: {error:?}"))?;
+        let before = db.scan_cf(synapse_storage::cf::CF_AGENT_EVENTS)?;
+        println!(
+            "regression_state=cf_scan cf=CF_AGENT_EVENTS case=mailbox_journal before={}",
+            before.len()
+        );
+        assert!(before.is_empty(), "fresh DB must hold no agent events");
+
+        let sent = service.agent_send_impl_at(
+            AgentSendParams {
+                to_session: "journal-recipient".to_owned(),
+                kind: "finding".to_owned(),
+                payload: json!({"n": 1}),
+                artifact_handle: None,
+                ttl_ms: 60_000,
+            },
+            "journal-sender",
+            2_000,
+        )?;
+        let drained = service.agent_inbox_impl_at(
+            AgentInboxParams {
+                drain: true,
+                max_messages: 10,
+            },
+            "journal-recipient",
+            2_010,
+        )?;
+        assert_eq!(drained.returned_count, 1);
+        db.flush()
+            .map_err(|error| anyhow::anyhow!("flush journal batch: {error}"))?;
+
+        let rows = db.scan_cf(synapse_storage::cf::CF_AGENT_EVENTS)?;
+        let decoded: Vec<synapse_core::AgentEventRecord> = rows
+            .iter()
+            .map(|(key, value)| {
+                synapse_storage::agent_events::decode_agent_event_key(key)
+                    .map_err(|error| anyhow::anyhow!("journal key must decode: {error}"))?;
+                synapse_storage::decode_json(value)
+                    .map_err(|error| anyhow::anyhow!("journal row must decode: {error}"))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        println!(
+            "regression_state=cf_scan cf=CF_AGENT_EVENTS case=mailbox_journal after={} kinds={:?}",
+            decoded.len(),
+            decoded.iter().map(|record| record.kind).collect::<Vec<_>>()
+        );
+        assert_eq!(decoded.len(), 2, "one message_sent + one message_received");
+
+        let sent_event = &decoded[0];
+        assert_eq!(sent_event.kind, synapse_core::AgentEventKind::MessageSent);
+        assert_eq!(sent_event.session_id.as_deref(), Some("journal-sender"));
+        assert_eq!(sent_event.payload["to_session"], "journal-recipient");
+        assert_eq!(sent_event.payload["message_id"], sent.message_id.as_str());
+        assert!(
+            sent_event.payload.get("payload").is_none(),
+            "journal must carry metadata, never the message content"
+        );
+
+        let received_event = &decoded[1];
+        assert_eq!(
+            received_event.kind,
+            synapse_core::AgentEventKind::MessageReceived
+        );
+        assert_eq!(
+            received_event.session_id.as_deref(),
+            Some("journal-recipient")
+        );
+        assert_eq!(received_event.payload["from_session"], "journal-sender");
+        assert_eq!(
+            received_event.payload["message_id"],
+            sent.message_id.as_str()
+        );
         Ok(())
     }
 

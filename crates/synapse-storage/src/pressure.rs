@@ -337,6 +337,10 @@ fn compact_all(db: &DB) -> StorageResult<Vec<&'static str>> {
 fn permits_write_at(level: DiskPressureLevel, cf_name: &str) -> bool {
     match level {
         DiskPressureLevel::Normal | DiskPressureLevel::Level1 | DiskPressureLevel::Level2 => true,
+        // Level3 sheds rebuildable/cache CFs first. CF_AGENT_EVENTS stays
+        // writable like CF_ACTION_LOG: it is the control-plane audit journal
+        // (#897) and losing lifecycle events would blind fleet supervision
+        // exactly when the system is degrading.
         DiskPressureLevel::Level3 => !matches!(
             cf_name,
             cf::CF_OBSERVATIONS

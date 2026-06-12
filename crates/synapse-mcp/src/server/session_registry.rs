@@ -97,33 +97,42 @@ impl SessionRegistry {
         self.stale_after_ms
     }
 
+    /// Records (or refreshes) a session as initialized. Returns `true` when
+    /// the session became newly visible — the entry was created or was
+    /// previously closed — so callers journal exactly one lifecycle event
+    /// per live transition (#897).
     pub(crate) fn record_initialized(
         &mut self,
         session_id: &str,
         state: &SessionState,
         transport: &str,
         now_unix_ms: u64,
-    ) {
+    ) -> bool {
         let client_name = state.initialize_params.client_info.name.clone();
         let client_version = state.initialize_params.client_info.version.clone();
         let protocol_version = Some(format!("{:?}", state.initialize_params.protocol_version));
+        let mut newly_visible = false;
         let entry = self
             .entries
             .entry(session_id.to_owned())
-            .or_insert_with(|| SessionRegistryEntry {
-                session_id: session_id.to_owned(),
-                transport: transport.to_owned(),
-                client_name: None,
-                client_version: None,
-                protocol_version: None,
-                agent_kind: "unknown".to_owned(),
-                started_at_unix_ms: now_unix_ms,
-                last_seen_unix_ms: now_unix_ms,
-                closed_at_unix_ms: None,
-                last_action: None,
-                last_reason_code: None,
-                spawned_agent: None,
+            .or_insert_with(|| {
+                newly_visible = true;
+                SessionRegistryEntry {
+                    session_id: session_id.to_owned(),
+                    transport: transport.to_owned(),
+                    client_name: None,
+                    client_version: None,
+                    protocol_version: None,
+                    agent_kind: "unknown".to_owned(),
+                    started_at_unix_ms: now_unix_ms,
+                    last_seen_unix_ms: now_unix_ms,
+                    closed_at_unix_ms: None,
+                    last_action: None,
+                    last_reason_code: None,
+                    spawned_agent: None,
+                }
             });
+        newly_visible |= entry.closed_at_unix_ms.is_some();
         entry.transport = transport.to_owned();
         entry.client_name = Some(client_name.clone());
         entry.client_version = Some(client_version);
@@ -131,6 +140,7 @@ impl SessionRegistry {
         entry.agent_kind = infer_agent_kind(&client_name);
         entry.last_seen_unix_ms = entry.last_seen_unix_ms.max(now_unix_ms);
         entry.closed_at_unix_ms = None;
+        newly_visible
     }
 
     pub(crate) fn record_seen(
@@ -163,16 +173,19 @@ impl SessionRegistry {
         }
     }
 
-    pub(crate) fn record_closed(&mut self, session_id: &str, now_unix_ms: u64) {
-        self.record_closed_with_reason(session_id, now_unix_ms, None);
+    pub(crate) fn record_closed(&mut self, session_id: &str, now_unix_ms: u64) -> bool {
+        self.record_closed_with_reason(session_id, now_unix_ms, None)
     }
 
+    /// Records a session as closed. Returns `true` when this call actually
+    /// transitioned the entry to closed (it was open or unknown before), so
+    /// callers journal exactly one `exited` event per session (#897).
     pub(crate) fn record_closed_with_reason(
         &mut self,
         session_id: &str,
         now_unix_ms: u64,
         reason_code: Option<&str>,
-    ) {
+    ) -> bool {
         let entry = self
             .entries
             .entry(session_id.to_owned())
@@ -190,9 +203,11 @@ impl SessionRegistry {
                 last_reason_code: None,
                 spawned_agent: None,
             });
+        let transitioned = entry.closed_at_unix_ms.is_none();
         entry.last_seen_unix_ms = now_unix_ms;
         entry.closed_at_unix_ms = Some(now_unix_ms);
         entry.last_reason_code = reason_code.map(ToOwned::to_owned);
+        transitioned
     }
 
     pub(crate) fn record_spawned_agent(
@@ -276,7 +291,7 @@ fn duration_millis_u64(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn infer_agent_kind(client_name: &str) -> String {
+pub(crate) fn infer_agent_kind(client_name: &str) -> String {
     let lower = client_name.to_ascii_lowercase();
     if lower.contains("codex") {
         "codex".to_owned()
