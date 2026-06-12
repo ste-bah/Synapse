@@ -1104,9 +1104,7 @@ impl SynapseService {
         record.payload = json!({
             "error_message": error.message.chars().take(512).collect::<String>(),
         });
-        if let Err(journal_error) =
-            super::agent_events::record_agent_event_durable(&db, &record)
-        {
+        if let Err(journal_error) = super::agent_events::record_agent_event_durable(&db, &record) {
             tracing::error!(
                 code = "AGENT_EVENT_WRITE_FAILED",
                 spawn_id,
@@ -1142,6 +1140,12 @@ struct AgentSpawnFiles {
     task_started_script_path: PathBuf,
     debug_path: Option<PathBuf>,
     mcp_config_path: Option<PathBuf>,
+    /// Claude only: generated `--settings` file wiring the CLI's HTTP hooks
+    /// to the daemon's `/agent-events` ingress (#899).
+    hook_settings_path: Option<PathBuf>,
+    /// Codex only: generated `notify` program POSTing turn-complete events
+    /// to the same ingress (#899).
+    notify_script_path: Option<PathBuf>,
 }
 
 impl AgentSpawnFiles {
@@ -1161,6 +1165,14 @@ impl AgentSpawnFiles {
                 .map(|path| path.display().to_string()),
             mcp_config_path: self
                 .mcp_config_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            hook_settings_path: self
+                .hook_settings_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            notify_script_path: self
+                .notify_script_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
         }
@@ -2107,6 +2119,10 @@ fn prepare_agent_spawn_files(
         (params.cli == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-debug.log"));
     let mcp_config_path =
         (params.cli == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-mcp-config.json"));
+    let hook_settings_path =
+        (params.cli == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-hook-settings.json"));
+    let notify_script_path =
+        (params.cli == ActSpawnAgentCli::Codex).then(|| log_dir.join("codex-notify.ps1"));
 
     let task_started_script =
         build_agent_spawn_task_start_script(spawn_id, params, &task_started_path);
@@ -2165,6 +2181,37 @@ fn prepare_agent_spawn_files(
         })?;
     }
 
+    if let Some(settings_path) = &hook_settings_path {
+        let settings = build_claude_hook_settings(spawn_id, &params.mcp_url)?;
+        let encoded = serde_json::to_vec_pretty(&settings).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("act_spawn_agent failed to encode Claude hook settings: {error}"),
+            )
+        })?;
+        fs::write(settings_path, encoded).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "act_spawn_agent failed to write Claude hook settings {}: {error}",
+                    settings_path.display()
+                ),
+            )
+        })?;
+    }
+    if let Some(script_path) = &notify_script_path {
+        let script = build_codex_notify_script(spawn_id, &params.mcp_url, &log_dir)?;
+        fs::write(script_path, script).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "act_spawn_agent failed to write Codex notify script {}: {error}",
+                    script_path.display()
+                ),
+            )
+        })?;
+    }
+
     Ok(AgentSpawnFiles {
         log_dir,
         prompt_path,
@@ -2176,10 +2223,99 @@ fn prepare_agent_spawn_files(
         task_started_script_path,
         debug_path,
         mcp_config_path,
+        hook_settings_path,
+        notify_script_path,
     })
 }
 
-fn agent_spawn_root_dir() -> Result<PathBuf, ErrorData> {
+/// Derives the push-telemetry ingress endpoint from the MCP URL the spawned
+/// agent is wired to. The daemon serves both from one origin, so anything
+/// other than a `/mcp`-suffixed URL is a caller error, not a guessing game.
+fn agent_event_ingress_url(
+    spawn_id: &str,
+    mcp_url: &str,
+    source: &str,
+) -> Result<String, ErrorData> {
+    let Some(base) = mcp_url.strip_suffix("/mcp") else {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "act_spawn_agent cannot derive the /agent-events ingress URL: mcp_url {mcp_url:?} does not end with \"/mcp\""
+            ),
+        ));
+    };
+    if base.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("act_spawn_agent mcp_url {mcp_url:?} has no scheme/authority before \"/mcp\""),
+        ));
+    }
+    Ok(format!(
+        "{base}/agent-events?spawn_id={spawn_id}&source={source}"
+    ))
+}
+
+/// Claude Code `--settings` payload subscribing the daemon's ingress to the
+/// hook events listed in
+/// [`super::agent_event_ingress::CLAUDE_HOOK_SUBSCRIBED_EVENTS`]. Uses the
+/// CLI's native HTTP hooks (verified on Claude Code 2.1.176): no per-event
+/// child process, bearer injected via `allowedEnvVars` interpolation, and
+/// delivery failures are non-blocking for the agent.
+fn build_claude_hook_settings(spawn_id: &str, mcp_url: &str) -> Result<Value, ErrorData> {
+    let ingress_url = agent_event_ingress_url(spawn_id, mcp_url, "claude_code_hooks")?;
+    let hook_entry = json!({
+        "type": "http",
+        "url": ingress_url,
+        "headers": { "Authorization": "Bearer $SYNAPSE_BEARER_TOKEN" },
+        "allowedEnvVars": ["SYNAPSE_BEARER_TOKEN"],
+        // Localhost POST; anything slower than this means the daemon is
+        // gone and the agent should not crawl through its turn.
+        "timeout": 5,
+    });
+    let mut hooks = Map::new();
+    for event in super::agent_event_ingress::CLAUDE_HOOK_SUBSCRIBED_EVENTS {
+        hooks.insert(
+            (*event).to_owned(),
+            json!([{ "hooks": [hook_entry.clone()] }]),
+        );
+    }
+    Ok(json!({
+        "hooks": hooks,
+        "allowedHttpHookUrls": [format!("{}*", ingress_url)],
+        "httpHookAllowedEnvVars": ["SYNAPSE_BEARER_TOKEN"],
+    }))
+}
+
+/// Codex `notify` program: receives the notification JSON as its final argv
+/// argument and POSTs it verbatim to the ingress. Codex spawns it
+/// fire-and-forget, so delivery failures are persisted to
+/// `notify-errors.log` in the spawn directory — local evidence instead of a
+/// silent drop.
+fn build_codex_notify_script(
+    spawn_id: &str,
+    mcp_url: &str,
+    log_dir: &Path,
+) -> Result<String, ErrorData> {
+    let ingress_url = agent_event_ingress_url(spawn_id, mcp_url, "codex_notify")?;
+    let error_log = ps_single_quoted_path(&log_dir.join("notify-errors.log"));
+    Ok(format!(
+        "$ErrorActionPreference = 'Stop'\n\
+try {{\n\
+    $payload = $args[-1]\n\
+    if ([string]::IsNullOrWhiteSpace($payload)) {{ throw 'codex notify payload argument is missing' }}\n\
+    $token = $env:SYNAPSE_BEARER_TOKEN\n\
+    if ([string]::IsNullOrWhiteSpace($token)) {{ throw 'SYNAPSE_BEARER_TOKEN is not set in the codex notify environment' }}\n\
+    Invoke-RestMethod -Method Post -Uri {ingress_url} -Headers @{{ Authorization = \"Bearer $token\" }} -ContentType 'application/json' -Body $payload -TimeoutSec 5 | Out-Null\n\
+}} catch {{\n\
+    Add-Content -Path {error_log} -Value (\"{{0}}|codex-notify-post-failed|{{1}}\" -f (Get-Date -Format o), $_.Exception.Message)\n\
+    exit 1\n\
+}}\n",
+        ingress_url = ps_single_quote(&ingress_url),
+        error_log = error_log,
+    ))
+}
+
+pub(crate) fn agent_spawn_root_dir() -> Result<PathBuf, ErrorData> {
     let local_appdata = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
         mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
@@ -2361,17 +2497,28 @@ fn agent_spawn_powershell_script(
     let working_dir = ps_single_quoted_path(working_dir);
     let command_body = match params.cli {
         ActSpawnAgentCli::Codex => {
+            let Some(notify_script_path) = files.notify_script_path.as_ref() else {
+                return Err(mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "act_spawn_agent internal error: missing Codex notify script path",
+                ));
+            };
             let mcp_url_config = format!(
                 "mcp_servers.synapse.url={}",
                 toml_string_literal(&params.mcp_url)
             );
+            let notify_config = format!(
+                "notify=[\"powershell\",\"-NoLogo\",\"-NoProfile\",\"-NonInteractive\",\"-ExecutionPolicy\",\"Bypass\",\"-File\",{}]",
+                toml_string_literal(&notify_script_path.display().to_string())
+            );
             format!(
-                "$codexArgs = @('exec','-C',{working_dir},'-s','danger-full-access','--json','-o',{final_message_path},'-c',{mcp_url_config},'-c','mcp_servers.synapse.bearer_token_env_var=\"SYNAPSE_BEARER_TOKEN\"','-')\n\
+                "$codexArgs = @('exec','-C',{working_dir},'-s','danger-full-access','--json','-o',{final_message_path},'-c',{mcp_url_config},'-c','mcp_servers.synapse.bearer_token_env_var=\"SYNAPSE_BEARER_TOKEN\"','-c',{notify_config},'-')\n\
 $prompt | & codex @codexArgs 1> {stdout_path} 2> {stderr_path}\n\
 ",
                 working_dir = working_dir,
                 final_message_path = final_message_path,
                 mcp_url_config = ps_single_quote(&mcp_url_config),
+                notify_config = ps_single_quote(&notify_config),
                 stdout_path = stdout_path,
                 stderr_path = stderr_path,
             )
@@ -2389,14 +2536,22 @@ $prompt | & codex @codexArgs 1> {stdout_path} 2> {stderr_path}\n\
                     "act_spawn_agent internal error: missing Claude MCP config path",
                 ));
             };
+            let Some(hook_settings_path) = files.hook_settings_path.as_ref() else {
+                return Err(mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "act_spawn_agent internal error: missing Claude hook settings path",
+                ));
+            };
             let debug_path = ps_single_quoted_path(debug_path);
             let mcp_config_path = ps_single_quoted_path(mcp_config_path);
+            let hook_settings_path = ps_single_quoted_path(hook_settings_path);
             format!(
-                "$claudeArgs = @('-p','--verbose','--output-format','stream-json','--input-format','text','--permission-mode','bypassPermissions','--mcp-config',{mcp_config_path},'--strict-mcp-config','--add-dir',{working_dir},'--debug-file',{debug_path})\n\
+                "$claudeArgs = @('-p','--verbose','--output-format','stream-json','--input-format','text','--permission-mode','bypassPermissions','--mcp-config',{mcp_config_path},'--strict-mcp-config','--settings',{hook_settings_path},'--add-dir',{working_dir},'--debug-file',{debug_path})\n\
 $prompt | & claude @claudeArgs 1> {stdout_path} 2> {stderr_path}\n\
 ",
                 working_dir = working_dir,
                 mcp_config_path = mcp_config_path,
+                hook_settings_path = hook_settings_path,
                 debug_path = debug_path,
                 stdout_path = stdout_path,
                 stderr_path = stderr_path,
@@ -3069,6 +3224,8 @@ mod tests {
             task_started_script_path: dir.path().join("write-task-started.ps1"),
             debug_path: None,
             mcp_config_path: None,
+            hook_settings_path: None,
+            notify_script_path: None,
         };
         fs::write(
             &files.task_started_path,
@@ -3128,6 +3285,8 @@ mod tests {
             task_started_script_path: dir.path().join("write-task-started.ps1"),
             debug_path: None,
             mcp_config_path: None,
+            hook_settings_path: None,
+            notify_script_path: None,
         };
         fs::write(
             &files.task_started_path,
@@ -3177,6 +3336,8 @@ mod tests {
             task_started_script_path: dir.path().join("write-task-started.ps1"),
             debug_path: None,
             mcp_config_path: None,
+            hook_settings_path: None,
+            notify_script_path: Some(dir.path().join("codex-notify.ps1")),
         };
         let script = agent_spawn_powershell_script(&test_spawn_params(), &files, dir.path())
             .expect("build wrapper script");
@@ -3188,6 +3349,100 @@ mod tests {
         assert!(script.contains("$spawnTaskStartedPath"));
         assert!(script.contains("task_started_present"));
         assert!(script.contains("Get-Content -Raw -LiteralPath $spawnPromptPath -Encoding UTF8"));
+        assert!(
+            script.contains("'-c','notify=["),
+            "codex args must inject the notify program: {script}"
+        );
+        assert!(script.contains("codex-notify.ps1"));
+    }
+
+    #[test]
+    fn claude_spawn_script_injects_hook_settings() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let files = AgentSpawnFiles {
+            log_dir: dir.path().to_path_buf(),
+            prompt_path: dir.path().join("prompt.txt"),
+            stdout_path: dir.path().join("stdout.jsonl"),
+            stderr_path: dir.path().join("stderr.log"),
+            final_message_path: dir.path().join("final-message.txt"),
+            completion_status_path: dir.path().join("completion-status.json"),
+            task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
+            debug_path: Some(dir.path().join("claude-debug.log")),
+            mcp_config_path: Some(dir.path().join("claude-mcp-config.json")),
+            hook_settings_path: Some(dir.path().join("claude-hook-settings.json")),
+            notify_script_path: None,
+        };
+        let mut params = test_spawn_params();
+        params.cli = ActSpawnAgentCli::Claude;
+        let script = agent_spawn_powershell_script(&params, &files, dir.path())
+            .expect("build wrapper script");
+        assert!(
+            script.contains("'--settings'"),
+            "claude args must inject the hook settings file: {script}"
+        );
+        assert!(script.contains("claude-hook-settings.json"));
+    }
+
+    #[test]
+    fn claude_hook_settings_subscribe_every_ingress_event_with_bearer() {
+        let settings = build_claude_hook_settings("agent-spawn-test", "http://127.0.0.1:7700/mcp")
+            .expect("settings build");
+        let hooks = settings["hooks"].as_object().expect("hooks object");
+        for event in super::super::agent_event_ingress::CLAUDE_HOOK_SUBSCRIBED_EVENTS {
+            let entry = &hooks[*event][0]["hooks"][0];
+            assert_eq!(entry["type"], "http", "{event} must use a native HTTP hook");
+            assert_eq!(
+                entry["url"],
+                "http://127.0.0.1:7700/agent-events?spawn_id=agent-spawn-test&source=claude_code_hooks"
+            );
+            assert_eq!(
+                entry["headers"]["Authorization"],
+                "Bearer $SYNAPSE_BEARER_TOKEN"
+            );
+            assert_eq!(entry["allowedEnvVars"][0], "SYNAPSE_BEARER_TOKEN");
+        }
+        assert_eq!(
+            settings["allowedHttpHookUrls"][0],
+            "http://127.0.0.1:7700/agent-events?spawn_id=agent-spawn-test&source=claude_code_hooks*"
+        );
+        assert_eq!(
+            settings["httpHookAllowedEnvVars"][0],
+            "SYNAPSE_BEARER_TOKEN"
+        );
+    }
+
+    #[test]
+    fn codex_notify_script_posts_to_ingress_and_logs_failures() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let script =
+            build_codex_notify_script("agent-spawn-test", "http://127.0.0.1:7700/mcp", dir.path())
+                .expect("notify script build");
+        assert!(script.contains(
+            "http://127.0.0.1:7700/agent-events?spawn_id=agent-spawn-test&source=codex_notify"
+        ));
+        assert!(script.contains("$args[-1]"), "{script}");
+        assert!(script.contains("SYNAPSE_BEARER_TOKEN"));
+        assert!(script.contains("notify-errors.log"));
+        assert!(script.contains("TimeoutSec 5"));
+    }
+
+    #[test]
+    fn ingress_url_refuses_mcp_url_without_mcp_suffix() {
+        let error = agent_event_ingress_url("agent-spawn-test", "http://127.0.0.1:7700/", "x")
+            .expect_err("non-/mcp URL must fail closed");
+        assert!(
+            error.message.contains("does not end with"),
+            "{}",
+            error.message
+        );
+        let error = agent_event_ingress_url("agent-spawn-test", "/mcp", "x")
+            .expect_err("authority-less URL must fail closed");
+        assert!(
+            error.message.contains("no scheme/authority"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

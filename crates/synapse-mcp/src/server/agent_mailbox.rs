@@ -841,7 +841,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
     out
 }
 
-fn hash_bytes(bytes: &[u8]) -> String {
+pub(crate) fn hash_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{}", hex_bytes(digest.as_ref()))
 }

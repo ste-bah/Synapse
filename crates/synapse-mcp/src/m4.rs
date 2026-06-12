@@ -932,6 +932,14 @@ pub struct ActSpawnAgentLogPaths {
     pub debug_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp_config_path: Option<String>,
+    /// Claude only: generated `--settings` file that wires the CLI's HTTP
+    /// hooks to the daemon's `/agent-events` push-telemetry ingress (#899).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_settings_path: Option<String>,
+    /// Codex only: generated `notify` PowerShell script that POSTs
+    /// turn-complete events to the same ingress (#899).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_script_path: Option<String>,
 }
 
 #[must_use]

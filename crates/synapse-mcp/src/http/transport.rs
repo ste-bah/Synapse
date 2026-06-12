@@ -10,8 +10,9 @@ use std::{
 use anyhow::Context;
 use axum::{
     Json, Router,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode, header},
+    body::Body,
+    extract::{DefaultBodyLimit, Query, State},
+    http::{HeaderMap, Request, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response},
     routing::{get, post},
@@ -52,6 +53,9 @@ struct HttpState {
     shutdown_cancel: CancellationToken,
     drain_state: crate::server::drain::DaemonDrainState,
     sse_state: SseState,
+    /// Journal handle for the push-telemetry ingress (#899); the same DB the
+    /// MCP session store writes through.
+    agent_events_db: Arc<Db>,
 }
 
 struct HttpRouterRuntime {
@@ -374,6 +378,8 @@ fn router(
         .map_err(|error| anyhow::anyhow!("initialize session lifecycle state: {error:?}"))?;
     let (mcp_service, session_manager) = streamable_service(shutdown_cancel, service)
         .context("initialize HTTP MCP session state")?;
+    let agent_events_db =
+        session_store_db(&health_service).context("open storage for agent-event ingress")?;
     let session_request = session::SessionCleanupState::request_state(
         Arc::clone(&session_registry),
         terminated_sessions,
@@ -392,12 +398,20 @@ fn router(
         shutdown_cancel: shutdown_cancel.clone(),
         drain_state: drain_state.clone(),
         sse_state,
+        agent_events_db,
     };
     let protected_routes = Router::new()
         .route("/health", get(health))
         .route("/shutdown", post(shutdown))
         .route("/events", get(events).post(publish_event))
         .route("/events/stats", get(event_stats))
+        .route(
+            "/agent-events",
+            post(agent_events_ingest).layer(DefaultBodyLimit::max(
+                crate::server::agent_event_ingress::MAX_AGENT_EVENT_INGRESS_BODY_BYTES,
+            )),
+        )
+        .route("/agent-events/stats", get(agent_events_ingress_stats))
         .route(
             "/chrome-debugger/native/register",
             post(crate::chrome_debugger_bridge::http_register),
@@ -979,9 +993,13 @@ impl SessionStore for SynapseMcpSessionStore {
             ttl_ms = self.ttl.map(duration_millis_u64),
             "persisted MCP HTTP session state to CF_KV"
         );
-        let newly_visible =
-            record_registry_initialized(&self.session_registry, session_id, state, stored_at_unix_ms)
-                .map_err(session_store_error)?;
+        let newly_visible = record_registry_initialized(
+            &self.session_registry,
+            session_id,
+            state,
+            stored_at_unix_ms,
+        )
+        .map_err(session_store_error)?;
         if newly_visible {
             journal_session_live_event(&self.db, session_id, state, "session_initialized")
                 .map_err(session_store_error)?;
@@ -1652,6 +1670,63 @@ async fn event_stats(
     Query(query): Query<sse::StatsQuery>,
 ) -> Response {
     state.sse_state.stats(&query)
+}
+
+/// Push-telemetry ingress (#899): spawned agents POST their native hook /
+/// notify payloads here; the daemon normalizes them into `CF_AGENT_EVENTS`
+/// rows. Authentication is enforced by the surrounding bearer middleware.
+async fn agent_events_ingest(
+    State(state): State<HttpState>,
+    Query(query_pairs): Query<Vec<(String, String)>>,
+    request: Request<Body>,
+) -> Response {
+    use crate::server::agent_event_ingress as ingress;
+
+    let identity = match ingress::validate_ingress_identity(&query_pairs) {
+        Ok(identity) => identity,
+        Err(refusal) => return agent_events_refusal_response(&refusal),
+    };
+    let body = match axum::body::to_bytes(
+        request.into_body(),
+        ingress::MAX_AGENT_EVENT_INGRESS_BODY_BYTES,
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            return agent_events_refusal_response(&ingress::refuse_oversized_or_unreadable_body(
+                &identity.spawn_id,
+                &error.to_string(),
+            ));
+        }
+    };
+    match ingress::ingest_agent_event(&state.agent_events_db, &identity, &body) {
+        Ok((readback, record)) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "accepted": true,
+                "kind": record.kind,
+                "ts_ns": readback.ts_ns,
+                "seq": readback.seq,
+            })),
+        )
+            .into_response(),
+        Err(refusal) => agent_events_refusal_response(&refusal),
+    }
+}
+
+fn agent_events_refusal_response(
+    refusal: &crate::server::agent_event_ingress::AgentEventIngressRefusal,
+) -> Response {
+    let status =
+        StatusCode::from_u16(refusal.http_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (status, Json(refusal.response_body())).into_response()
+}
+
+/// Process-lifetime acceptance/rejection counters for the ingress, proving
+/// "no silent drops" (#899 acceptance).
+async fn agent_events_ingress_stats() -> Response {
+    Json(crate::server::agent_event_ingress::ingress_stats()).into_response()
 }
 
 fn spawn_server(

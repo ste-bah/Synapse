@@ -4,8 +4,9 @@
 //! [`synapse_storage::agent_events`]. Writers: HTTP session store (session
 //! initialized/restored/deleted), session lifecycle teardown (exited),
 //! `act_spawn_agent` (spawn requested/ready/failed), the agent mailbox
-//! (message sent/received), and the input-lease tools (acquired/released).
-//! Turn/tool-call/token events arrive with the push-telemetry ingress (#899).
+//! (message sent/received), the input-lease tools (acquired/released), and
+//! the push-telemetry ingress (#899, [`super::agent_event_ingress`]) through
+//! which spawned agents self-report turn/tool-call/attention events.
 //!
 //! # Durability contract (#897 acceptance)
 //!
@@ -120,15 +121,16 @@ pub(crate) fn record_agent_events(
     if rows.is_empty() {
         return Ok(readbacks);
     }
-    db.put_batch(cf::CF_AGENT_EVENTS, rows).inspect_err(|error| {
-        tracing::error!(
-            code = "AGENT_EVENT_WRITE_FAILED",
-            record_count = records.len(),
-            first_kind = ?records.first().map(|record| record.kind),
-            detail = %error,
-            "agent event batch enqueue failed"
-        );
-    })?;
+    db.put_batch(cf::CF_AGENT_EVENTS, rows)
+        .inspect_err(|error| {
+            tracing::error!(
+                code = "AGENT_EVENT_WRITE_FAILED",
+                record_count = records.len(),
+                first_kind = ?records.first().map(|record| record.kind),
+                detail = %error,
+                "agent event batch enqueue failed"
+            );
+        })?;
     for (record, readback) in records.iter().zip(&readbacks) {
         tracing::debug!(
             code = "AGENT_EVENT_RECORDED",

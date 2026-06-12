@@ -151,6 +151,7 @@ use crate::{
 
 mod action_audit;
 mod action_preflight;
+pub(crate) mod agent_event_ingress;
 pub(crate) mod agent_events;
 mod agent_mailbox;
 mod audit_context;
