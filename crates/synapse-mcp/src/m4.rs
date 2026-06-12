@@ -400,10 +400,42 @@ pub struct ActRunShellParams {
     #[schemars(
         default = "default_shell_timeout_ms",
         range(min = 1),
-        description = "Inline wait budget for direct act_run_shell. If this value exceeds the configured inline await limit, act_run_shell returns a durable job handle and does not infer a durable lifetime timeout; use act_run_shell_start.timeout_ms for an explicit durable job cap."
+        description = "Caller-requested inline wait budget in milliseconds. In execution_mode=inline this is honored directly, even above the daemon inline await limit. In execution_mode=auto, values above the inline await limit return a durable job handle."
     )]
     pub timeout_ms: u64,
+    #[serde(default = "default_run_shell_execution_mode")]
+    #[schemars(
+        default = "default_run_shell_execution_mode",
+        description = "Shell execution route: auto preserves compatibility and backgrounds only when timeout_ms exceeds the inline await limit; inline never backgrounds and waits up to timeout_ms; durable immediately returns a durable job handle."
+    )]
+    pub execution_mode: ActRunShellExecutionMode,
+    #[serde(default)]
+    #[schemars(
+        default,
+        range(min = 1),
+        description = "Optional explicit durable job lifetime cap in milliseconds. Valid only when execution_mode=durable or when execution_mode=auto will background because timeout_ms exceeds the inline await limit; omit for an unbounded durable job."
+    )]
+    pub durable_timeout_ms: Option<u64>,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActRunShellExecutionMode {
+    Auto,
+    Inline,
+    Durable,
+}
+
+impl ActRunShellExecutionMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Inline => "inline",
+            Self::Durable => "durable",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
@@ -430,6 +462,12 @@ pub struct ActRunShellResponse {
     pub background_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inline_await_limit_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_execution_mode: Option<ActRunShellExecutionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_execution_mode: Option<ActRunShellExecutionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1174,17 +1212,22 @@ pub async fn run_authorized_shell(
     inline_await_limit_ms: u64,
     context: Option<&ShellExecutionContext>,
 ) -> Result<ActRunShellResponse, ErrorData> {
+    validate_run_shell_execution_plan(&params, inline_await_limit_ms)?;
     let started = Instant::now();
     let idempotency_present = params.idempotency_key.is_some();
     let trace_metadata = shell_command_metadata(&params.command, &params.args);
-    let result = if should_background_direct_shell(&params, inline_await_limit_ms) {
+    let requested_execution_mode = params.execution_mode;
+    let result = if let Some(background_reason) =
+        direct_shell_background_reason(&params, inline_await_limit_ms)
+    {
         let start_params = run_shell_params_to_start_params(params);
         let started_job = start_authorized_shell_job(start_params, authorization, context)?;
         act_run_shell_background_response(
             started_job.job,
             elapsed_ms_u32(started),
-            "timeout_exceeds_inline_await_budget",
+            background_reason,
             inline_await_limit_ms,
+            requested_execution_mode,
         )
     } else {
         run_allowlisted_shell(params, context).await?
@@ -1220,8 +1263,40 @@ pub async fn run_authorized_shell(
     Ok(result)
 }
 
-fn should_background_direct_shell(params: &ActRunShellParams, inline_await_limit_ms: u64) -> bool {
-    params.timeout_ms > inline_await_limit_ms
+fn direct_shell_background_reason(
+    params: &ActRunShellParams,
+    inline_await_limit_ms: u64,
+) -> Option<&'static str> {
+    match params.execution_mode {
+        ActRunShellExecutionMode::Auto if params.timeout_ms > inline_await_limit_ms => {
+            Some("timeout_exceeds_inline_await_budget")
+        }
+        ActRunShellExecutionMode::Durable => Some("execution_mode_durable"),
+        ActRunShellExecutionMode::Auto | ActRunShellExecutionMode::Inline => None,
+    }
+}
+
+pub fn validate_run_shell_execution_plan(
+    params: &ActRunShellParams,
+    inline_await_limit_ms: u64,
+) -> Result<(), ErrorData> {
+    if params.durable_timeout_ms.is_some()
+        && direct_shell_background_reason(params, inline_await_limit_ms).is_none()
+    {
+        return Err(shell_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_run_shell durable_timeout_ms applies only to durable/background execution; set execution_mode=\"durable\" or use execution_mode=\"auto\" with timeout_ms above inline_await_limit_ms",
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "reason": "durable_timeout_requires_background",
+                "execution_mode": params.execution_mode.as_str(),
+                "timeout_ms": params.timeout_ms,
+                "inline_await_limit_ms": inline_await_limit_ms,
+                "durable_timeout_ms": params.durable_timeout_ms,
+            }),
+        ));
+    }
+    Ok(())
 }
 
 fn run_shell_params_to_start_params(params: ActRunShellParams) -> ActRunShellStartParams {
@@ -1230,7 +1305,7 @@ fn run_shell_params_to_start_params(params: ActRunShellParams) -> ActRunShellSta
         args: params.args,
         working_dir: params.working_dir,
         env: params.env,
-        timeout_ms: None,
+        timeout_ms: params.durable_timeout_ms,
         job_id: None,
     }
 }
@@ -1240,7 +1315,9 @@ fn act_run_shell_background_response(
     duration_ms: u32,
     reason: &'static str,
     inline_await_limit_ms: u64,
+    requested_execution_mode: ActRunShellExecutionMode,
 ) -> ActRunShellResponse {
+    let durable_timeout_ms = job.timeout_ms;
     ActRunShellResponse {
         exit_code: None,
         stdout: String::new(),
@@ -1256,6 +1333,9 @@ fn act_run_shell_background_response(
         backgrounded: true,
         background_reason: Some(reason.to_owned()),
         inline_await_limit_ms: Some(inline_await_limit_ms),
+        requested_execution_mode: Some(requested_execution_mode),
+        effective_execution_mode: Some(ActRunShellExecutionMode::Durable),
+        durable_timeout_ms,
         job_id: Some(job.job_id.clone()),
         job: Some(job),
     }
@@ -1265,8 +1345,14 @@ pub fn run_shell_request_details(
     params: &ActRunShellParams,
     inline_await_limit_ms: u64,
 ) -> serde_json::Value {
-    let will_background = should_background_direct_shell(params, inline_await_limit_ms);
+    let background_reason = direct_shell_background_reason(params, inline_await_limit_ms);
+    let will_background = background_reason.is_some();
     let command_metadata = shell_command_metadata(&params.command, &params.args);
+    let durable_timeout_ms_if_backgrounded = if will_background {
+        params.durable_timeout_ms
+    } else {
+        None
+    };
     json!({
         "command": params.command,
         "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
@@ -1282,11 +1368,18 @@ pub fn run_shell_request_details(
         "working_dir": params.working_dir,
         "env_keys": params.env.keys().cloned().collect::<Vec<_>>(),
         "timeout_ms": params.timeout_ms,
+        "execution_mode": params.execution_mode.as_str(),
         "inline_await_limit_ms": inline_await_limit_ms,
+        "background_reason": background_reason,
         "will_background": will_background,
-        "durable_timeout_ms_if_backgrounded": Option::<u64>::None,
-        "durable_timeout_policy": if will_background {
-            "unbounded_after_direct_handoff"
+        "durable_timeout_ms": params.durable_timeout_ms,
+        "durable_timeout_ms_if_backgrounded": durable_timeout_ms_if_backgrounded,
+        "durable_timeout_policy": if will_background && params.durable_timeout_ms.is_some() {
+            "explicit_timeout_ms"
+        } else if will_background {
+            "unbounded_until_exit_or_cancel"
+        } else if params.durable_timeout_ms.is_some() {
+            "invalid_without_background"
         } else {
             "inline_timeout_only"
         },
@@ -2722,6 +2815,12 @@ fn validate_run_shell_params(params: &ActRunShellParams) -> Result<(), ErrorData
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "act_run_shell timeout_ms must be >= 1",
+        ));
+    }
+    if matches!(params.durable_timeout_ms, Some(0)) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_run_shell durable_timeout_ms must be >= 1 when provided",
         ));
     }
     if let Some(key) = &params.idempotency_key {
@@ -4614,6 +4713,8 @@ fn run_shell_params_for_start_validation(params: &ActRunShellStartParams) -> Act
         working_dir: params.working_dir.clone(),
         env: params.env.clone(),
         timeout_ms: params.timeout_ms.unwrap_or(1),
+        execution_mode: ActRunShellExecutionMode::Durable,
+        durable_timeout_ms: params.timeout_ms,
         idempotency_key: None,
     }
 }
@@ -6114,6 +6215,7 @@ async fn run_allowlisted_shell(
     context: Option<&ShellExecutionContext>,
 ) -> Result<ActRunShellResponse, ErrorData> {
     let started = Instant::now();
+    let requested_execution_mode = params.execution_mode;
     let mut spawned = spawn_shell_child(&params, context)?;
     let (stdout_task, stderr_task) = spawn_capped_readers(&mut spawned.child)?;
     let (exit_code, timed_out) = wait_shell_child(&mut spawned.child, params.timeout_ms).await?;
@@ -6139,6 +6241,9 @@ async fn run_allowlisted_shell(
         backgrounded: false,
         background_reason: None,
         inline_await_limit_ms: None,
+        requested_execution_mode: Some(requested_execution_mode),
+        effective_execution_mode: Some(ActRunShellExecutionMode::Inline),
+        durable_timeout_ms: None,
         job_id: None,
         job: None,
     })
@@ -6826,6 +6931,10 @@ const fn default_shell_timeout_ms() -> u64 {
     DEFAULT_SHELL_TIMEOUT_MS
 }
 
+const fn default_run_shell_execution_mode() -> ActRunShellExecutionMode {
+    ActRunShellExecutionMode::Auto
+}
+
 const fn default_shell_job_tail_bytes() -> u64 {
     SHELL_JOB_TAIL_DEFAULT_BYTES
 }
@@ -7077,6 +7186,8 @@ mod tests {
             working_dir: None,
             env: BTreeMap::new(),
             timeout_ms,
+            execution_mode: ActRunShellExecutionMode::Auto,
+            durable_timeout_ms: None,
             idempotency_key: None,
         }
     }
@@ -8598,6 +8709,155 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn shell_inline_mode_honors_timeout_above_auto_background_limit() {
+        let inline_await_limit_ms = 1;
+        let mut params = shell_params(
+            "cmd.exe",
+            vec!["/c", "echo inline-override-ok"],
+            DEFAULT_SHELL_TIMEOUT_MS,
+        );
+        params.execution_mode = ActRunShellExecutionMode::Inline;
+        let mut config = shell_config_for(&params);
+        config.run_shell_inline_await_limit_ms = inline_await_limit_ms;
+
+        let response = match run_shell(&config, params).await {
+            Ok(response) => response,
+            Err(error) => panic!("inline execution mode should not auto-background: {error}"),
+        };
+
+        println!("readback=act_run_shell edge=inline_mode_above_limit after=response:{response:?}");
+        assert_eq!(response.exit_code, Some(0));
+        assert_eq!(response.stdout, "inline-override-ok\r\n");
+        assert!(!response.backgrounded);
+        assert_eq!(
+            response.requested_execution_mode,
+            Some(ActRunShellExecutionMode::Inline)
+        );
+        assert_eq!(
+            response.effective_execution_mode,
+            Some(ActRunShellExecutionMode::Inline)
+        );
+        assert_eq!(response.job_id, None);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_auto_background_uses_explicit_durable_timeout() {
+        let inline_await_limit_ms = 1;
+        let mut params = shell_params(
+            "cmd.exe",
+            vec!["/c", "echo auto-durable-timeout-ok"],
+            DEFAULT_SHELL_TIMEOUT_MS,
+        );
+        params.durable_timeout_ms = Some(5_000);
+        let mut config = shell_config_for(&params);
+        config.run_shell_inline_await_limit_ms = inline_await_limit_ms;
+
+        let response = match run_shell(&config, params).await {
+            Ok(response) => response,
+            Err(error) => panic!("auto background with durable timeout should run: {error}"),
+        };
+
+        println!("readback=act_run_shell edge=auto_background_timeout after=response:{response:?}");
+        assert!(response.backgrounded);
+        assert_eq!(
+            response.background_reason.as_deref(),
+            Some("timeout_exceeds_inline_await_budget")
+        );
+        assert_eq!(response.durable_timeout_ms, Some(5_000));
+        let job_id = response.job_id.clone().expect("job id should be returned");
+        let job = response.job.expect("job should be returned");
+        assert_eq!(job.timeout_ms, Some(5_000));
+        assert_durable_job_finishes_ok(&job_id, "auto-durable-timeout-ok").await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_durable_mode_returns_job_without_inline_limit() {
+        let inline_await_limit_ms = DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS;
+        let mut params = shell_params(
+            "cmd.exe",
+            vec!["/c", "echo explicit-durable-mode-ok"],
+            DEFAULT_SHELL_TIMEOUT_MS,
+        );
+        params.execution_mode = ActRunShellExecutionMode::Durable;
+        params.durable_timeout_ms = Some(5_000);
+        let mut config = shell_config_for(&params);
+        config.run_shell_inline_await_limit_ms = inline_await_limit_ms;
+
+        let response = match run_shell(&config, params).await {
+            Ok(response) => response,
+            Err(error) => panic!("durable execution mode should return a job handle: {error}"),
+        };
+
+        println!("readback=act_run_shell edge=durable_mode after=response:{response:?}");
+        assert!(response.backgrounded);
+        assert_eq!(
+            response.background_reason.as_deref(),
+            Some("execution_mode_durable")
+        );
+        assert_eq!(response.inline_await_limit_ms, Some(inline_await_limit_ms));
+        assert_eq!(
+            response.requested_execution_mode,
+            Some(ActRunShellExecutionMode::Durable)
+        );
+        assert_eq!(
+            response.effective_execution_mode,
+            Some(ActRunShellExecutionMode::Durable)
+        );
+        let job_id = response.job_id.clone().expect("job id should be returned");
+        let job = response.job.expect("job should be returned");
+        assert_eq!(job.timeout_ms, Some(5_000));
+        assert_durable_job_finishes_ok(&job_id, "explicit-durable-mode-ok").await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn shell_rejects_durable_timeout_when_execution_stays_inline() {
+        let mut params = shell_params("cmd.exe", vec!["/c", "echo should-not-run"], 30_000);
+        params.execution_mode = ActRunShellExecutionMode::Inline;
+        params.durable_timeout_ms = Some(5_000);
+        let config = shell_config_for(&params);
+
+        let error = match run_shell(&config, params).await {
+            Ok(response) => panic!("inline durable timeout should fail closed: {response:?}"),
+            Err(error) => error,
+        };
+
+        println!("readback=act_run_shell edge=inline_plus_durable_timeout after_error={error}");
+        assert!(error.message.contains("durable_timeout_ms applies only"));
+    }
+
+    #[cfg(windows)]
+    async fn assert_durable_job_finishes_ok(job_id: &str, expected_stdout: &str) {
+        for _ in 0..100 {
+            let status = shell_job_status(
+                &ActRunShellStatusParams {
+                    job_id: job_id.to_owned(),
+                    tail_bytes: 4096,
+                },
+                None,
+            )
+            .unwrap_or_else(|error| panic!("status should read durable job state: {error}"));
+            println!("readback=act_run_shell edge=durable_completion after=status:{status:?}");
+            if status.job.status == "finalizing" {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                continue;
+            }
+            if !status.running {
+                assert_eq!(status.job.status, "ok");
+                assert_eq!(status.job.exit_code, Some(0));
+                assert!(status.stdout_tail.contains(expected_stdout), "{status:?}");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        panic!("background job {job_id} did not complete within the regression readback window");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn shell_durable_timeout_persists_budget_expired_code() {
         let timeout_ms = 200;
         let args = vec![
@@ -8943,6 +9203,9 @@ mod tests {
             backgrounded: false,
             background_reason: None,
             inline_await_limit_ms: None,
+            requested_execution_mode: Some(ActRunShellExecutionMode::Auto),
+            effective_execution_mode: Some(ActRunShellExecutionMode::Inline),
+            durable_timeout_ms: None,
             job_id: None,
             job: None,
         };
@@ -8982,6 +9245,9 @@ mod tests {
             backgrounded: false,
             background_reason: None,
             inline_await_limit_ms: None,
+            requested_execution_mode: Some(ActRunShellExecutionMode::Auto),
+            effective_execution_mode: Some(ActRunShellExecutionMode::Inline),
+            durable_timeout_ms: None,
             job_id: None,
             job: None,
         };

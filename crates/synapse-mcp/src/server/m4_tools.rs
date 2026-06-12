@@ -13,7 +13,7 @@ use super::{
     run_shell_idempotency_replay, run_shell_idempotency_reservation_row,
     run_shell_idempotency_row_key, run_shell_request_details, run_shell_start_request_details,
     shell_execution_context_for_session, shell_job_status, start_authorized_shell_job, tool,
-    tool_router, validate_agent_spawn_params,
+    tool_router, validate_agent_spawn_params, validate_run_shell_execution_plan,
 };
 
 use std::{
@@ -88,7 +88,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Run an allowlisted executable child process. command is an executable path/name only; pass flags and shell snippets in args, using an explicit shell executable when shell syntax is required. timeout_ms is the direct inline wait budget. Requests with timeout_ms above the inline await budget return immediately as a durable background job with job_id/status/stdout/stderr paths and no inferred durable lifetime cap; poll act_run_shell_status and cancel with act_run_shell_cancel."
+        description = "Run an allowlisted executable child process. command is an executable path/name only; pass flags and shell snippets in args, using an explicit shell executable when shell syntax is required. execution_mode controls routing: auto preserves compatibility and backgrounds only when timeout_ms exceeds the inline await limit, inline never backgrounds and honors timeout_ms directly, durable returns a job handle immediately. durable_timeout_ms is an explicit durable job lifetime cap only when a durable/background job is created; omit for an unbounded durable job. Poll act_run_shell_status and cancel with act_run_shell_cancel."
     )]
     pub async fn act_run_shell(
         &self,
@@ -3111,6 +3111,7 @@ async fn run_shell_with_idempotency(
     inline_await_limit_ms: u64,
     context: Option<&ShellExecutionContext>,
 ) -> Result<ActRunShellResponse, ErrorData> {
+    validate_run_shell_execution_plan(&params, inline_await_limit_ms)?;
     let session_id = context.map(ShellExecutionContext::session_id);
     let Some(row_key) = run_shell_idempotency_row_key(&params, session_id)? else {
         return run_authorized_shell(params, &authorization, inline_await_limit_ms, context).await;

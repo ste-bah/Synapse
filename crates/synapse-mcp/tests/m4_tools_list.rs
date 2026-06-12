@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 109] = [
+const EXPECTED_TOOLS: [&str; 110] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -110,6 +110,7 @@ const EXPECTED_TOOLS: [&str; 109] = [
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
+    "timeline_search",
     "workspace_get",
     "workspace_list",
     "workspace_put",
@@ -215,8 +216,10 @@ fn assert_act_run_shell_semantics_described(tools: &[Value]) -> anyhow::Result<(
     ensure!(
         tool_description.contains("executable path/name only")
             && tool_description.contains("explicit shell executable")
-            && tool_description.contains("inline wait budget")
-            && tool_description.contains("no inferred durable lifetime cap"),
+            && tool_description.contains("execution_mode controls routing")
+            && tool_description.contains("inline never backgrounds")
+            && tool_description
+                .contains("durable_timeout_ms is an explicit durable job lifetime cap"),
         "act_run_shell description must explain executable-plus-args semantics: {tool_description}"
     );
 
@@ -242,9 +245,34 @@ fn assert_act_run_shell_semantics_described(tools: &[Value]) -> anyhow::Result<(
         .as_str()
         .context("act_run_shell timeout_ms description missing")?;
     ensure!(
-        timeout_description.contains("Inline wait budget")
-            && timeout_description.contains("does not infer a durable lifetime timeout"),
+        timeout_description.contains("Caller-requested inline wait budget")
+            && timeout_description.contains("execution_mode=inline")
+            && timeout_description.contains("execution_mode=auto"),
         "act_run_shell timeout_ms schema must separate inline and durable timeout semantics: {timeout_description}"
+    );
+
+    let execution_mode_description =
+        value_at(tool, "inputSchema.properties.execution_mode.description")?
+            .as_str()
+            .context("act_run_shell execution_mode description missing")?;
+    ensure!(
+        execution_mode_description.contains("auto preserves compatibility")
+            && execution_mode_description.contains("inline never backgrounds")
+            && execution_mode_description.contains("durable immediately returns"),
+        "act_run_shell execution_mode schema must describe routing choices: {execution_mode_description}"
+    );
+
+    let durable_timeout_description = value_at(
+        tool,
+        "inputSchema.properties.durable_timeout_ms.description",
+    )?
+    .as_str()
+    .context("act_run_shell durable_timeout_ms description missing")?;
+    ensure!(
+        durable_timeout_description.contains("Optional explicit durable job lifetime cap")
+            && durable_timeout_description.contains("Valid only when execution_mode=durable")
+            && durable_timeout_description.contains("omit for an unbounded durable job"),
+        "act_run_shell durable_timeout_ms schema must describe durable lifetime semantics: {durable_timeout_description}"
     );
 
     let start_tool = tool_by_name(tools, "act_run_shell_start")?;

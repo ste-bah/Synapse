@@ -229,7 +229,9 @@ fn assert_no_unexpected_m4_defaults(tools: &[Value]) -> anyhow::Result<Vec<Strin
         "act_launch.inputSchema.properties.timeout_ms.default",
         "act_launch.inputSchema.properties.windows_console_window_state.default",
         "act_run_shell.inputSchema.properties.args.default",
+        "act_run_shell.inputSchema.properties.durable_timeout_ms.default",
         "act_run_shell.inputSchema.properties.env.default",
+        "act_run_shell.inputSchema.properties.execution_mode.default",
         "act_run_shell.inputSchema.properties.timeout_ms.default",
     ]
     .into_iter()

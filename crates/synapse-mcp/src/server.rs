@@ -121,7 +121,7 @@ use crate::{
         run_shell_idempotency_replay, run_shell_idempotency_reservation_row,
         run_shell_idempotency_row_key, run_shell_request_details, run_shell_start_request_details,
         shell_execution_context_for_session, shell_job_status, start_authorized_shell_job,
-        validate_agent_spawn_params,
+        validate_agent_spawn_params, validate_run_shell_execution_plan,
     },
 };
 
