@@ -833,6 +833,10 @@ fn native_set_window_text(id: &ElementId, hwnd: HWND, value: &str) -> A11yResult
     )
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "thin SendMessageTimeoutW wrapper mirrors the Win32 call shape plus error context"
+)]
 fn send_native_text_message(
     id: &ElementId,
     hwnd: HWND,
@@ -880,6 +884,29 @@ pub fn element_metadata(id: &ElementId) -> A11yResult<ElementMetadataReadback> {
             keyboard_focusable: cached_bool(&element, UIProperty::IsKeyboardFocusable),
             patterns: cached_patterns(&element),
             value: cached_value(&element),
+        })
+    })
+}
+
+pub fn scroll_element_into_view(id: &ElementId) -> A11yResult<()> {
+    let id = id.clone();
+    with_automation(move |automation| {
+        let element = re_resolve_on_worker(automation, &id)?;
+        if !cached_bool(&element, UIProperty::IsEnabled) {
+            return Err(A11yError::ElementNotEnabled {
+                detail: format!("element {id} IsEnabled=false before UIA scroll-into-view"),
+            });
+        }
+        let pattern: UIScrollItemPattern =
+            element
+                .get_pattern()
+                .map_err(|err| A11yError::ElementPatternUnsupported {
+                    detail: format!(
+                        "ScrollItemPattern not exposed for {id}; scroll_element_into_view has no other tier: {err}"
+                    ),
+                })?;
+        pattern.scroll_into_view().map_err(|err| {
+            pattern_operation_error(&id, "ScrollItemPattern", "scroll_into_view", &err)
         })
     })
 }

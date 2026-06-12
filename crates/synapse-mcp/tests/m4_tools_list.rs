@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 110] = [
+const EXPECTED_TOOLS: [&str; 115] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -18,6 +18,7 @@ const EXPECTED_TOOLS: [&str; 110] = [
     "act_run_shell_start",
     "act_run_shell_status",
     "act_scroll",
+    "act_set_field_text",
     "act_set_value",
     "act_spawn_agent",
     "act_stroke",
@@ -110,6 +111,10 @@ const EXPECTED_TOOLS: [&str; 110] = [
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
+    "timeline_exclusions",
+    "timeline_pause",
+    "timeline_purge",
+    "timeline_resume",
     "timeline_search",
     "workspace_get",
     "workspace_list",

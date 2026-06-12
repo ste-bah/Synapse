@@ -241,6 +241,12 @@ pub fn scroll_element(_id: &ElementId, _dy: i32, _dx: i32) -> A11yResult<Element
     ))
 }
 
+pub fn scroll_element_into_view(_id: &ElementId) -> A11yResult<()> {
+    Err(A11yError::not_available(
+        "UIA scroll-into-view requires Windows",
+    ))
+}
+
 pub fn element_scroll_state(_id: &ElementId) -> A11yResult<crate::ElementScrollStateReadback> {
     Err(A11yError::not_available(
         "UIA element scroll state readback requires Windows",

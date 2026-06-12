@@ -203,6 +203,11 @@ pub enum ObserveSlot {
     Clipboard,
     Fs,
     Diagnostics,
+    /// Elements filtered to interactable controls only (edits, buttons, links,
+    /// form widgets). Implies `elements`; skips the structural depth cut and,
+    /// when `depth` is not set, raises the gather depth to the maximum so deep
+    /// native form fields are reachable without paging (#882).
+    Interactable,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -762,6 +767,7 @@ pub fn observe_include(params: &ObserveParams) -> ObserveInclude {
             clipboard: false,
             fs: false,
             diagnostics: false,
+            interactable_only: false,
             max_subtree_depth: 2,
             max_subtree_nodes: 60,
             element_offset: 0,
@@ -779,12 +785,29 @@ pub fn observe_include(params: &ObserveParams) -> ObserveInclude {
             ObserveSlot::Clipboard => include.clipboard = true,
             ObserveSlot::Fs => include.fs = true,
             ObserveSlot::Diagnostics => include.diagnostics = true,
+            ObserveSlot::Interactable => {
+                include.elements = true;
+                include.interactable_only = true;
+            }
         }
     }
-    include.max_subtree_depth = params.depth.unwrap_or(2).min(6);
+    include.max_subtree_depth = observe_gather_depth(params);
     include.max_subtree_nodes = params.max_elements.unwrap_or(60).clamp(1, 500);
     include.element_offset = params.element_offset.unwrap_or(0).min(100_000);
     include
+}
+
+/// A11y gather depth for one observe call. Interactable mode defaults to the
+/// maximum walk depth (form fields live deep in real trees); everything else
+/// keeps the historical default of 2. An explicit `depth` always wins.
+#[must_use]
+pub fn observe_gather_depth(params: &ObserveParams) -> u32 {
+    let default_depth = if params.include.contains(&ObserveSlot::Interactable) {
+        6
+    } else {
+        2
+    };
+    params.depth.unwrap_or(default_depth).min(6)
 }
 
 pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, ErrorData> {
@@ -820,7 +843,7 @@ pub fn observe_input(
     params: &ObserveParams,
     target_hwnd: Option<i64>,
 ) -> Result<ObservationInput, ErrorData> {
-    let depth = params.depth.unwrap_or(2).min(6);
+    let depth = observe_gather_depth(params);
     if let Some(element_id) = &params.subtree_root {
         return element_input_from_id(element_id, depth, state.perception_mode);
     }
@@ -2138,6 +2161,44 @@ mod tests {
         ProfileOcr, ProfileUseScope, SensorStatus, WebPerceptionPath,
     };
     use synapse_perception::TextRegion;
+
+    /// #882: `include:["interactable"]` implies elements, flips the semantic
+    /// filter on, and raises the default gather depth to the maximum; an
+    /// explicit `depth` always wins.
+    #[test]
+    fn interactable_slot_implies_elements_and_deep_gather() {
+        let params: ObserveParams = serde_json::from_value(json!({
+            "include": ["interactable"]
+        }))
+        .expect("interactable include slot must deserialize");
+        let include = observe_include(&params);
+        println!(
+            "readback=observe_include edge=interactable elements={} interactable_only={} depth={}",
+            include.elements, include.interactable_only, include.max_subtree_depth
+        );
+        assert!(include.elements);
+        assert!(include.interactable_only);
+        assert!(!include.diagnostics);
+        assert_eq!(include.max_subtree_depth, 6);
+        assert_eq!(observe_gather_depth(&params), 6);
+
+        let explicit_depth: ObserveParams = serde_json::from_value(json!({
+            "include": ["interactable"],
+            "depth": 3
+        }))
+        .expect("explicit depth with interactable must deserialize");
+        assert_eq!(observe_gather_depth(&explicit_depth), 3);
+
+        let default_params = ObserveParams::default();
+        let default_include = observe_include(&default_params);
+        println!(
+            "readback=observe_include edge=default interactable_only={} depth={}",
+            default_include.interactable_only, default_include.max_subtree_depth
+        );
+        assert!(!default_include.interactable_only);
+        assert!(default_include.diagnostics);
+        assert_eq!(observe_gather_depth(&default_params), 2);
+    }
 
     #[test]
     fn set_target_deserialize_names_canonical_shapes() {

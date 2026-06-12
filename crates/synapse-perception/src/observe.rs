@@ -33,6 +33,11 @@ pub struct ObserveInclude {
     pub clipboard: bool,
     pub fs: bool,
     pub diagnostics: bool,
+    /// When true, `elements` is filtered to interactable controls only (edits,
+    /// buttons, links, form widgets) before pagination, and the structural
+    /// depth cut is skipped — deep web form fields are exactly what this mode
+    /// exists to surface (#882).
+    pub interactable_only: bool,
     pub max_subtree_depth: u32,
     pub max_subtree_nodes: usize,
     pub element_offset: usize,
@@ -51,6 +56,7 @@ impl Default for ObserveInclude {
             clipboard: false,
             fs: false,
             diagnostics: true,
+            interactable_only: false,
             max_subtree_depth: DEFAULT_MAX_DEPTH,
             max_subtree_nodes: DEFAULT_MAX_ELEMENTS,
             element_offset: 0,
@@ -72,12 +78,107 @@ impl ObserveInclude {
             clipboard: false,
             fs: false,
             diagnostics: true,
+            interactable_only: false,
             max_subtree_depth: DEFAULT_MAX_DEPTH,
             max_subtree_nodes: DEFAULT_MAX_ELEMENTS,
             element_offset: 0,
             max_entities: DEFAULT_MAX_ENTITIES,
         }
     }
+}
+
+/// Roles that mark a node as an interactable control in both element
+/// vocabularies Synapse produces. Normalized comparison (lowercase, spaces and
+/// underscores removed) bridges the three producers:
+/// - CDP web AX roles: `button`, `link`, `textbox`, `searchbox`, `combobox`,
+///   `listbox`, `option`, `checkbox`, `radio`, `switch`, `slider`,
+///   `spinbutton`, `menuitem`, `tab`, `treeitem`, `gridcell` (the de facto
+///   interactive-role set used by accessibility-snapshot agent tooling)
+/// - UIA `ControlType` debug names: `Edit`, `Button`, `SplitButton`,
+///   `Hyperlink`, `ComboBox`, `CheckBox`, `RadioButton`, `MenuItem`,
+///   `TabItem`, `TreeItem`, `ListItem`, `Slider`, `Spinner`
+/// - Chromium-UIA localized roles: `check box`, `combo box`, `radio button`,
+///   `list item`, `menu item`, `tab item`, `hyperlink`, `edit`
+const INTERACTABLE_ROLES: [&str; 28] = [
+    "button",
+    "checkbox",
+    "combobox",
+    "edit",
+    "gridcell",
+    "hyperlink",
+    "link",
+    "listbox",
+    "listitem",
+    "menuitem",
+    "menuitemcheckbox",
+    "menuitemradio",
+    "option",
+    "radio",
+    "radiobutton",
+    "searchbox",
+    "slider",
+    "spinbutton",
+    "spinner",
+    "splitbutton",
+    "switch",
+    "tab",
+    "tabitem",
+    "textarea",
+    "textbox",
+    "textfield",
+    "togglebutton",
+    "treeitem",
+];
+
+/// True when `node` is an interactable control an agent can act on.
+///
+/// Disabled nodes are never interactable. A node qualifies by role (covers CDP
+/// web nodes, whose `patterns` are always empty) or by exposing an actionable
+/// UIA pattern (`Invoke`/`Toggle`/`Value`/`SelectionItem`/`ExpandCollapse`/
+/// `RangeValue`) on a non-structural role. `document` is special-cased: it is
+/// interactable only when it exposes a Value or Text pattern (Chromium maps
+/// `contenteditable` composers to the `document` role).
+#[must_use]
+pub fn is_interactable_node(node: &AccessibleNode) -> bool {
+    if !node.enabled {
+        return false;
+    }
+    let role = normalized_role(&node.role);
+    if INTERACTABLE_ROLES.contains(&role.as_str()) {
+        return true;
+    }
+    if role == "document" {
+        return node.patterns.iter().any(|pattern| {
+            matches!(
+                pattern,
+                synapse_core::UiaPattern::Value | synapse_core::UiaPattern::Text
+            )
+        });
+    }
+    if matches!(
+        role.as_str(),
+        "scrollbar" | "progressbar" | "titlebar" | "window" | "pane" | "group" | "generic"
+    ) {
+        return false;
+    }
+    node.patterns.iter().any(|pattern| {
+        matches!(
+            pattern,
+            synapse_core::UiaPattern::Invoke
+                | synapse_core::UiaPattern::Toggle
+                | synapse_core::UiaPattern::Value
+                | synapse_core::UiaPattern::SelectionItem
+                | synapse_core::UiaPattern::ExpandCollapse
+                | synapse_core::UiaPattern::RangeValue
+        )
+    })
+}
+
+fn normalized_role(role: &str) -> String {
+    role.chars()
+        .filter(|character| !character.is_whitespace() && *character != '_' && *character != '-')
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -199,6 +300,21 @@ impl ObservationAssembler {
         let (elements, elements_truncated, elements_page) =
             filter_elements(input.elements, include);
         let (entities, entities_truncated) = filter_entities(input.entities, include);
+        // #882: diagnostic payloads are opt-in. When the caller's include set
+        // does not request diagnostics, the heavy repeated blocks
+        // (input_backends, cdp probe evidence, capture config/runtime) are
+        // dropped from the wire shape. web_path stays — it is one enum and is
+        // the fidelity signal agents must always see (#682).
+        let (capture_config, capture_runtime, input_backends, cdp) = if include.diagnostics {
+            (
+                input.capture_config,
+                input.capture_runtime,
+                input.input_backends,
+                cdp,
+            )
+        } else {
+            (None, None, None, None)
+        };
         let mut observation = Observation {
             seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
             at: Utc::now(),
@@ -242,9 +358,9 @@ impl ObservationAssembler {
                 detection_status: input.detection_status,
                 audio_status: input.audio_status,
                 is_minimized: input.is_minimized,
-                capture_config: input.capture_config,
-                capture_runtime: input.capture_runtime,
-                input_backends: input.input_backends,
+                capture_config,
+                capture_runtime,
+                input_backends,
                 cdp,
                 web_path,
                 elements_truncated,
@@ -353,9 +469,16 @@ fn filter_elements(
         });
         return (Vec::new(), truncated, page);
     }
-    let before = elements.len();
-    elements.retain(|node| node.depth <= include.max_subtree_depth);
-    let depth_truncated = elements.len() != before;
+    let depth_truncated = if include.interactable_only {
+        // #882: the semantic filter replaces the structural depth cut — deep
+        // web form fields (real DOM-chain depths) are the point of this mode.
+        elements.retain(is_interactable_node);
+        false
+    } else {
+        let before = elements.len();
+        elements.retain(|node| node.depth <= include.max_subtree_depth);
+        elements.len() != before
+    };
     let total = elements.len();
     let offset = include.element_offset.min(total);
     let limit = include.max_subtree_nodes;

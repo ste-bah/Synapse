@@ -64,7 +64,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Returns structured state of the session's active target window (set via set_target) or the foreground window when no target is set, plus surrounding context"
+        description = "Returns structured state of the session's active target window (set via set_target) or the foreground window when no target is set, plus surrounding context. include:[\"interactable\"] returns only interactable/form elements (edits, buttons, links, form widgets) without the structural depth cut — the lean shape for form-filling. Diagnostic blocks (input_backends, cdp probe evidence, capture config/runtime) are emitted only when include requests diagnostics (or include is omitted)."
     )]
     pub async fn observe(
         &self,
@@ -132,7 +132,7 @@ impl SynapseService {
                     self.hidden_desktop_observe_input(
                         session_id,
                         hwnd,
-                        params.0.depth.unwrap_or(2).min(6),
+                        crate::m1::observe_gather_depth(&params.0),
                         state.perception_mode,
                         error,
                     )?
@@ -149,10 +149,22 @@ impl SynapseService {
         }
 
         if include.elements {
+            // #882: interactable mode filters semantically AFTER the gather, so
+            // the web gather cap must cover the whole page (plus any requested
+            // offset), not just one result page — otherwise the filter would
+            // only ever see the first page of mostly-structural nodes.
+            let cdp_max_nodes = if include.interactable_only {
+                include
+                    .element_offset
+                    .saturating_add(include.max_subtree_nodes)
+                    .max(crate::m1::find_cdp_max_nodes())
+            } else {
+                include.max_subtree_nodes
+            };
             super::enrich_input_with_cdp_for_target(
                 &mut input,
                 include.max_subtree_depth,
-                include.max_subtree_nodes,
+                cdp_max_nodes,
                 cdp_target_id_hint.as_deref(),
             )
             .await;

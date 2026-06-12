@@ -724,3 +724,178 @@ fn p99_ms(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(f64::total_cmp);
     samples.last().copied().unwrap_or_default()
 }
+
+/// #882: a web-form-shaped element list (structural noise + deep interactable
+/// fields) filtered with `interactable_only` keeps only actionable controls,
+/// regardless of depth, and pages over the filtered set.
+#[test]
+fn interactable_only_keeps_form_controls_and_ignores_depth() -> TestResult {
+    let mut input = notepad_input();
+    // Mixed vocabulary: web AX roles (empty patterns) + UIA roles (patterns).
+    input.elements = vec![
+        web_node(0, "RootWebArea", "Page"),
+        web_node(3, "generic", ""),
+        web_node(4, "heading", "Upload video"),
+        web_node(9, "textbox", "Title"),
+        web_node(11, "textbox", "Description"),
+        web_node(5, "button", "Next"),
+        web_node(6, "link", "Help"),
+        web_node(7, "StaticText", "Details"),
+        web_node(8, "image", "Thumbnail"),
+        uia_node(2, "Edit", "Search", vec![UiaPattern::Value]),
+        uia_node(1, "Pane", "Sidebar", vec![UiaPattern::Scroll]),
+        uia_node(2, "check box", "Agree", Vec::new()),
+        disabled_node(4, "button", "Submit"),
+    ];
+    let before_count = input.elements.len();
+    regression_log(format_args!(
+        "regression_check=interactable edge=web_form before=nodes:{before_count}"
+    ))?;
+
+    let observation = ObservationAssembler::new().assemble(
+        ObserveInclude {
+            interactable_only: true,
+            max_subtree_depth: 2,
+            ..ObserveInclude::default()
+        },
+        input,
+    )?;
+    let roles: Vec<(String, String, u32)> = observation
+        .elements
+        .iter()
+        .map(|node| (node.role.clone(), node.name.clone(), node.depth))
+        .collect();
+    regression_log(format_args!(
+        "regression_check=interactable edge=web_form after=kept:{} roles:{roles:?}",
+        observation.elements.len()
+    ))?;
+
+    // Both deep textboxes survive (depth 9 and 11 > max_subtree_depth 2).
+    assert!(
+        roles
+            .iter()
+            .any(|(role, name, depth)| role == "textbox" && name == "Title" && *depth == 9)
+    );
+    assert!(roles.iter().any(|(_, name, _)| name == "Description"));
+    // Buttons, links, UIA edit, and the localized "check box" role survive.
+    assert!(
+        roles
+            .iter()
+            .any(|(role, name, _)| role == "button" && name == "Next")
+    );
+    assert!(roles.iter().any(|(role, _, _)| role == "link"));
+    assert!(roles.iter().any(|(role, _, _)| role == "Edit"));
+    assert!(roles.iter().any(|(role, _, _)| role == "check box"));
+    // Structural/decorative/disabled nodes are gone.
+    assert!(!roles.iter().any(|(role, _, _)| {
+        matches!(
+            role.as_str(),
+            "RootWebArea" | "generic" | "heading" | "StaticText" | "image" | "Pane"
+        )
+    }));
+    assert!(!roles.iter().any(|(_, name, _)| name == "Submit"));
+    assert_eq!(observation.elements.len(), 6);
+    Ok(())
+}
+
+/// #882: diagnostics payloads (input_backends, cdp evidence, capture blocks)
+/// are emitted only when the include set requests diagnostics; web_path always
+/// survives as the fidelity signal.
+#[test]
+fn diagnostics_blocks_are_suppressed_when_not_requested() -> TestResult {
+    let suppressed = ObservationAssembler::new().assemble(
+        ObserveInclude {
+            diagnostics: false,
+            ..ObserveInclude::default()
+        },
+        diagnostics_heavy_input(),
+    )?;
+    regression_log(format_args!(
+        "regression_check=diagnostics edge=suppressed after=input_backends:{} cdp:{} capture_config:{} capture_runtime:{} web_path:{:?} bytes:{}",
+        suppressed.diagnostics.input_backends.is_some(),
+        suppressed.diagnostics.cdp.is_some(),
+        suppressed.diagnostics.capture_config.is_some(),
+        suppressed.diagnostics.capture_runtime.is_some(),
+        suppressed.diagnostics.web_path,
+        suppressed.diagnostics.size_bytes
+    ))?;
+    assert!(suppressed.diagnostics.input_backends.is_none());
+    assert!(suppressed.diagnostics.cdp.is_none());
+    assert!(suppressed.diagnostics.capture_config.is_none());
+    assert!(suppressed.diagnostics.capture_runtime.is_none());
+    assert_eq!(
+        suppressed.diagnostics.web_path,
+        Some(synapse_core::WebPerceptionPath::Cdp)
+    );
+
+    let included = ObservationAssembler::new()
+        .assemble(ObserveInclude::default(), diagnostics_heavy_input())?;
+    regression_log(format_args!(
+        "regression_check=diagnostics edge=default_included after=input_backends:{} cdp:{} bytes:{}",
+        included.diagnostics.input_backends.is_some(),
+        included.diagnostics.cdp.is_some(),
+        included.diagnostics.size_bytes
+    ))?;
+    assert!(included.diagnostics.input_backends.is_some());
+    assert!(included.diagnostics.cdp.is_some());
+    assert!(included.diagnostics.size_bytes > suppressed.diagnostics.size_bytes);
+    Ok(())
+}
+
+fn diagnostics_heavy_input() -> ObservationInput {
+    let mut input = notepad_input();
+    input.cdp = Some(synapse_core::CdpDiagnostics::unreachable_with_probe(
+        "chrome.exe",
+        "A11Y_CDP_UNREACHABLE",
+        vec![9222, 9223, 9224, 9225],
+        "no debug port reachable on loopback candidates",
+    ));
+    input.web_path = Some(synapse_core::WebPerceptionPath::Cdp);
+    input.input_backends = Some(synapse_core::InputBackendDiagnostics {
+        source: "test".to_owned(),
+        mouse_default: "software".to_owned(),
+        keyboard_default: "software".to_owned(),
+        pad_default: "vigem".to_owned(),
+        release_all_default: "software".to_owned(),
+        mouse: vec![
+            backend_capability("software"),
+            backend_capability("hardware"),
+        ],
+        keyboard: vec![
+            backend_capability("software"),
+            backend_capability("hardware"),
+        ],
+        pad: vec![backend_capability("vigem")],
+        release_all: vec![backend_capability("software")],
+    });
+    input
+}
+
+fn backend_capability(backend: &str) -> synapse_core::InputBackendCapability {
+    synapse_core::InputBackendCapability {
+        backend: backend.to_owned(),
+        available: true,
+        reason_code: None,
+        reason: None,
+        host_boundary: false,
+        transient: false,
+    }
+}
+
+fn web_node(depth: u32, role: &str, name: &str) -> AccessibleNode {
+    let mut item = node(depth, name, role, false);
+    item.patterns = Vec::new();
+    item
+}
+
+fn uia_node(depth: u32, role: &str, name: &str, patterns: Vec<UiaPattern>) -> AccessibleNode {
+    let mut item = node(depth, name, role, false);
+    item.patterns = patterns;
+    item
+}
+
+fn disabled_node(depth: u32, role: &str, name: &str) -> AccessibleNode {
+    let mut item = node(depth, name, role, false);
+    item.enabled = false;
+    item
+}

@@ -7,6 +7,7 @@ pub(crate) mod postcondition;
 mod press;
 mod release_all;
 mod scroll;
+mod set_field_text;
 mod set_value;
 mod stroke;
 mod type_text;
@@ -63,10 +64,20 @@ pub use press::{
 pub(crate) use press::{
     HwndKeyboardTargetState, ResolvedKeymapPress, act_keymap_response_from_press,
     act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
-    hwnd_keyboard_target_state, resolve_keymap_press,
+    delete_key_action, hwnd_keyboard_target_state, resolve_keymap_press, select_all_chord_action,
 };
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
 pub use scroll::{ActScrollParams, ActScrollResponse, act_scroll_with_handle};
+#[cfg(windows)]
+pub(crate) use set_field_text::act_set_field_text_web;
+pub use set_field_text::{
+    ActSetFieldTextParams, ActSetFieldTextResponse, act_set_field_text_request_details,
+};
+pub(crate) use set_field_text::{
+    METHOD_FOREGROUND_CLEAR, METHOD_FOREGROUND_REPLACE, SOURCE_UIA_PASSWORD_LENGTH,
+    SOURCE_UIA_VALUE, SetFieldTextRoute, TIER_FOREGROUND_KEYS, act_set_field_text_native,
+    finish_replace_response, set_field_text_route, validate_set_field_text_params,
+};
 pub use set_value::{
     ActSetValueParams, ActSetValueResponse, act_set_value, act_set_value_request_details,
 };

@@ -411,6 +411,19 @@ fn validate_hold_ms(hold_ms: u32) -> Result<(), ErrorData> {
     Ok(())
 }
 
+/// Select-all chord (Ctrl+A) for composite tools that replace field content
+/// (#882). `hold_ms` is the chord hold duration.
+pub(crate) fn select_all_chord_action(hold_ms: u32, backend: Backend) -> Result<Action, ErrorData> {
+    let keys = keys::normalized_keys(&["ctrl".to_owned(), "a".to_owned()])?;
+    Ok(press_action(keys, hold_ms, backend))
+}
+
+/// Single Delete key press for composite tools that clear field content (#882).
+pub(crate) fn delete_key_action(hold_ms: u32, backend: Backend) -> Result<Action, ErrorData> {
+    let keys = keys::normalized_keys(&["delete".to_owned()])?;
+    Ok(press_action(keys, hold_ms, backend))
+}
+
 fn press_action(keys: Vec<synapse_core::Key>, hold_ms: u32, backend: Backend) -> Action {
     if let [key] = keys.as_slice() {
         return Action::KeyPress {

@@ -44,8 +44,9 @@ use synapse_action::{
 };
 use synapse_core::{
     AccessibleNode, Action, AimCurve, Backend, ButtonAction, ElementId, FocusedElement,
-    ForegroundContext, MouseButton, MouseTarget, PathPoint, PathSpec, Point, Rect,
-    StrokeMotionModel, StrokeTiming, UiaPattern, VelocityProfile, error_codes,
+    ForegroundContext, KeystrokeDynamics, KeystrokeNaturalParams, MouseButton, MouseTarget,
+    PathPoint, PathSpec, Point, Rect, StrokeMotionModel, StrokeTiming, UiaPattern, VelocityProfile,
+    error_codes,
 };
 use synapse_perception::ObservationInput;
 use tokio_util::sync::CancellationToken;
@@ -470,6 +471,104 @@ impl SynapseService {
             other => other,
         };
         self.audit_action_result_for_request("act_set_value", &result, &request_context)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Set a field's text by REPLACING its full content — clear + type + verify in one call (the form-filling primitive; #882). Routing is decided up front from the target: CDP web element ids use a background select-all + insertText replace with a separate node-value readback; Chromium UIA editable targets (when CDP is unavailable) use the leased foreground tier — the target window must already be foreground (act_focus_window first), then click, Ctrl+A, type, and a separate UIA value readback; native elements route through the act_set_value background tiers. Empty text clears the field. Every tier fails closed with its own reason code — there is no cross-tier fallback and no append behavior."
+    )]
+    pub async fn act_set_field_text(
+        &self,
+        params: Parameters<crate::m2::ActSetFieldTextParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<crate::m2::ActSetFieldTextResponse>, ErrorData> {
+        let params = params.0;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "act_set_field_text",
+            "tool.invocation kind=act_set_field_text"
+        );
+        let request_details = crate::m2::act_set_field_text_request_details(&params);
+        let preflight = match self.ensure_supported_use_allows_action("act_set_field_text") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied_with_details_for_request(
+                    "act_set_field_text",
+                    &error,
+                    &request_details,
+                    &request_context,
+                );
+                return Err(error);
+            }
+        };
+        self.audit_action_started_with_details_for_request(
+            "act_set_field_text",
+            &json!({
+                "request": request_details,
+                "preflight": preflight,
+            }),
+            &request_context,
+        )?;
+        if let Err(error) = crate::m2::validate_set_field_text_params(&params) {
+            let result: Result<crate::m2::ActSetFieldTextResponse, ErrorData> = Err(error);
+            self.audit_action_result_for_request("act_set_field_text", &result, &request_context)?;
+            return result.map(Json);
+        }
+        if let Err(error) = self.ensure_target_claim_allows_action(
+            "act_set_field_text",
+            element_claim_target(&params.element_id),
+            &request_context,
+        ) {
+            return audit_target_claim_denial(self, "act_set_field_text", error, &request_context);
+        }
+        let route = match crate::m2::set_field_text_route(&params.element_id) {
+            Ok(route) => route,
+            Err(error) => {
+                let result: Result<crate::m2::ActSetFieldTextResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request(
+                    "act_set_field_text",
+                    &result,
+                    &request_context,
+                )?;
+                return result.map(Json);
+            }
+        };
+        let result = match route {
+            #[cfg(windows)]
+            crate::m2::SetFieldTextRoute::Web { backend_node_id } => {
+                self.act_set_field_text_background_guarded(&params, |params| {
+                    Box::pin(crate::m2::act_set_field_text_web(params, backend_node_id))
+                })
+                .await
+            }
+            #[cfg(not(windows))]
+            crate::m2::SetFieldTextRoute::Web { .. } => Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "act_set_field_text web tier is only available on Windows",
+            )),
+            crate::m2::SetFieldTextRoute::ChromiumForeground {
+                root_hwnd,
+                process_name,
+                metadata,
+            } => {
+                self.act_set_field_text_foreground_tier(
+                    &params,
+                    root_hwnd,
+                    &process_name,
+                    metadata,
+                    &preflight,
+                    &request_context,
+                )
+                .await
+            }
+            crate::m2::SetFieldTextRoute::NativeBackground => {
+                self.act_set_field_text_background_guarded(&params, |params| {
+                    Box::pin(crate::m2::act_set_field_text_native(params))
+                })
+                .await
+            }
+        };
+        self.audit_action_result_for_request("act_set_field_text", &result, &request_context)?;
         result.map(Json)
     }
 
@@ -1563,13 +1662,17 @@ fn acquire_tool_foreground_input_lease_with_ttl(
     request_context: &RequestContext<RoleServer>,
     ttl_ms: u64,
 ) -> Result<crate::m2::ForegroundInputLeaseGuard, ErrorData> {
-    let session_id = foreground_lease_session_id(request_context)?;
-    if let Some(session_id_ref) = session_id.as_deref()
-        && let Some(hidden_desktop) = service.session_hidden_desktop_readback(session_id_ref)?
-    {
+    // `None` here means the stdio transport by construction — an HTTP request
+    // without Mcp-Session-Id fails hard upstream. stdio is single-client, so
+    // the stable "stdio" owner (the same idiom the m3 layer uses) gives the
+    // lease registry a real owner instead of refusing every foreground tier
+    // over stdio.
+    let session_id =
+        foreground_lease_session_id(request_context)?.unwrap_or_else(|| "stdio".to_owned());
+    if let Some(hidden_desktop) = service.session_hidden_desktop_readback(&session_id)? {
         return Err(hidden_desktop_foreground_refusal(tool, &hidden_desktop));
     }
-    crate::m2::acquire_foreground_input_lease_with_ttl(tool, session_id.as_deref(), ttl_ms)
+    crate::m2::acquire_foreground_input_lease_with_ttl(tool, Some(&session_id), ttl_ms)
 }
 
 fn lease_ttl_for_hold_ms(hold_ms: u32) -> u64 {
@@ -2280,6 +2383,295 @@ impl SynapseService {
             "readback=foreground_click tool=act_type into_element_fallback=chromium_uia_value_pattern_refused"
         );
         Ok(())
+    }
+
+    /// Runs one background `act_set_field_text` tier inside the same
+    /// no-foreground-steal guard `act_set_value` uses: the OS foreground is
+    /// read before and after, and an activation of the target window fails
+    /// the call (epic #771).
+    async fn act_set_field_text_background_guarded<'params, Run>(
+        &self,
+        params: &'params crate::m2::ActSetFieldTextParams,
+        run: Run,
+    ) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData>
+    where
+        Run: FnOnce(
+            &'params crate::m2::ActSetFieldTextParams,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::m2::ActSetFieldTextResponse, ErrorData>,
+                    > + Send
+                    + 'params,
+            >,
+        >,
+    {
+        let foreground_guard = act_set_value_target_foreground_guard(&params.element_id)?;
+        let foreground_before = self
+            .current_audit_foreground()
+            .map_err(|error| act_set_value_foreground_read_error("before", "unknown", &error))?;
+        let response = run(params).await?;
+        let foreground_after = self.current_audit_foreground().map_err(|error| {
+            act_set_value_foreground_read_error("after", &response.source_of_truth, &error)
+        })?;
+        verify_background_target_not_activated(
+            "act_set_field_text",
+            &response.source_of_truth,
+            foreground_guard,
+            &foreground_before,
+            &foreground_after,
+        )?;
+        Ok(response)
+    }
+
+    /// Leased foreground tier for Chromium UIA editable targets: click the
+    /// element, prove focus landed on it, Ctrl+A, type (or Delete for empty
+    /// text), then a separate UIA value readback must equal the requested
+    /// text. The target window must already be foreground — Synapse never
+    /// activates it implicitly (epic #771).
+    async fn act_set_field_text_foreground_tier(
+        &self,
+        params: &crate::m2::ActSetFieldTextParams,
+        root_hwnd: i64,
+        process_name: &str,
+        metadata: synapse_a11y::ElementMetadataReadback,
+        preflight: &ActionPreflightReadback,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData> {
+        let started = Instant::now();
+        let target = ActTypeForegroundFallbackTarget {
+            element_id: params.element_id.to_string(),
+            root_hwnd,
+            process_name: process_name.to_owned(),
+            role: metadata.role.clone(),
+            automation_id_present: metadata.automation_id.is_some(),
+            bbox: metadata.bbox,
+            enabled: metadata.enabled,
+            keyboard_focusable: metadata.keyboard_focusable,
+            patterns: metadata.patterns.clone(),
+            name_len: metadata.name.chars().count(),
+            value_len: metadata.value.as_ref().map(|value| value.chars().count()),
+        };
+        let (handle, recording, _connection_closed_cancel) =
+            self.m2_action_context_for_request(request_context)?;
+        if recording.is_some() {
+            return Err(set_field_text_foreground_error(
+                &target,
+                error_codes::ACTION_BACKEND_UNAVAILABLE,
+                "foreground_tier_recording_backend_unsupported",
+                "act_set_field_text Chromium foreground tier requires the live foreground input tier and cannot run against the recording backend",
+            ));
+        }
+        let expected = preflight.after.as_ref().unwrap_or(&preflight.before);
+        if expected.hwnd != target.root_hwnd {
+            return Err(set_field_text_foreground_error(
+                &target,
+                error_codes::ACTION_FOREGROUND_LOST,
+                "target_window_not_foreground",
+                format!(
+                    "act_set_field_text Chromium foreground tier requires target hwnd 0x{:x} to be the current foreground hwnd, but preflight foreground was 0x{:x}; call act_focus_window first — Synapse never activates a window implicitly",
+                    target.root_hwnd, expected.hwnd
+                ),
+            ));
+        }
+
+        let before = synapse_a11y::element_value(&params.element_id).map_err(|error| {
+            set_field_text_foreground_error(
+                &target,
+                error.code(),
+                "before_value_read_failed",
+                format!(
+                    "act_set_field_text before-value UIA readback failed for element {}: {error}",
+                    params.element_id
+                ),
+            )
+        })?;
+
+        let _lease_guard =
+            acquire_tool_foreground_input_lease(self, "act_set_field_text", request_context)?;
+
+        // Actionability before the coordinate click (the Playwright `fill`
+        // discipline): scroll an off-viewport target into view, re-read its
+        // live bbox, and require the click point to land inside the target
+        // window — a stale below-the-fold bbox must never steer a foreground
+        // click into another window.
+        let mut target = target;
+        if metadata.patterns.contains(&UiaPattern::ScrollItem) {
+            synapse_a11y::scroll_element_into_view(&params.element_id).map_err(|error| {
+                set_field_text_foreground_error(
+                    &target,
+                    error.code(),
+                    "scroll_into_view_failed",
+                    format!(
+                        "act_set_field_text ScrollItemPattern scroll-into-view failed for element {}: {error}",
+                        params.element_id
+                    ),
+                )
+            })?;
+            target.bbox = synapse_a11y::element_bounding_rect(&params.element_id).map_err(
+                |error| {
+                    set_field_text_foreground_error(
+                        &target,
+                        error.code(),
+                        "post_scroll_bbox_read_failed",
+                        format!(
+                            "act_set_field_text post-scroll bounding-rect readback failed for element {}: {error}",
+                            params.element_id
+                        ),
+                    )
+                },
+            )?;
+            tracing::info!(
+                code = "M2_ACT_SET_FIELD_TEXT_SCROLLED_INTO_VIEW",
+                element_id = %params.element_id,
+                bbox_x = target.bbox.x,
+                bbox_y = target.bbox.y,
+                bbox_w = target.bbox.w,
+                bbox_h = target.bbox.h,
+                "readback=scroll_into_view tool=act_set_field_text"
+            );
+        }
+        let point = act_type_target_center_point(&target)?;
+        let window_bounds = synapse_a11y::foreground_context(root_hwnd)
+            .map_err(|error| {
+                set_field_text_foreground_error(
+                    &target,
+                    error.code(),
+                    "window_bounds_read_failed",
+                    format!(
+                        "act_set_field_text target window bounds readback failed for hwnd 0x{root_hwnd:x}: {error}"
+                    ),
+                )
+            })?
+            .window_bounds;
+        if !rect_contains_point(window_bounds, point) {
+            return Err(set_field_text_foreground_error(
+                &target,
+                error_codes::ACTION_TARGET_INVALID,
+                "target_click_point_outside_window",
+                format!(
+                    "act_set_field_text click point ({}, {}) is outside the target window bounds ({}, {}, {}x{}); the element is not visible in the viewport and could not be scrolled into it",
+                    point.x,
+                    point.y,
+                    window_bounds.x,
+                    window_bounds.y,
+                    window_bounds.w,
+                    window_bounds.h
+                ),
+            ));
+        }
+        let click_actions = [
+            Action::MouseMove {
+                to: MouseTarget::Screen { point },
+                curve: AimCurve::Instant,
+                duration_ms: ACT_TYPE_FOREGROUND_FALLBACK_CLICK_DURATION_MS,
+                backend: Backend::Auto,
+            },
+            Action::MouseButton {
+                button: MouseButton::Left,
+                action: ButtonAction::Press,
+                hold_ms: ACT_TYPE_FOREGROUND_FALLBACK_CLICK_HOLD_MS,
+                backend: Backend::Auto,
+            },
+        ];
+        for action in click_actions {
+            handle.execute(action).await.map_err(|error| {
+                set_field_text_foreground_error(
+                    &target,
+                    error.code(),
+                    "target_click_failed",
+                    format!(
+                        "act_set_field_text foreground click at ({}, {}) failed: {error}",
+                        point.x, point.y
+                    ),
+                )
+            })?;
+        }
+        tracing::info!(
+            code = "M2_ACT_SET_FIELD_TEXT_FOREGROUND_CLICKED",
+            element_id = %target.element_id,
+            root_hwnd = target.root_hwnd,
+            screen_x = point.x,
+            screen_y = point.y,
+            role = %target.role,
+            "readback=foreground_click tool=act_set_field_text tier=foreground_keys"
+        );
+
+        let focus_readback = self
+            .capture_act_type_text_signature(160, false, false)
+            .await?;
+        act_type_foreground_fallback_focus_matches_target(&target, &focus_readback.signature)?;
+
+        let select_all = crate::m2::select_all_chord_action(60, Backend::Auto)?;
+        handle.execute(select_all).await.map_err(|error| {
+            set_field_text_foreground_error(
+                &target,
+                error.code(),
+                "select_all_failed",
+                format!("act_set_field_text Ctrl+A select-all failed: {error}"),
+            )
+        })?;
+
+        let (method, replace_action) = if params.text.is_empty() {
+            (
+                crate::m2::METHOD_FOREGROUND_CLEAR,
+                crate::m2::delete_key_action(40, Backend::Auto)?,
+            )
+        } else {
+            (
+                crate::m2::METHOD_FOREGROUND_REPLACE,
+                Action::TypeText {
+                    text: params.text.clone(),
+                    dynamics: KeystrokeDynamics::Natural {
+                        params: KeystrokeNaturalParams::FAST,
+                    },
+                    backend: Backend::Auto,
+                },
+            )
+        };
+        handle.execute(replace_action).await.map_err(|error| {
+            set_field_text_foreground_error(
+                &target,
+                error.code(),
+                "replacement_input_failed",
+                format!("act_set_field_text foreground replacement input failed: {error}"),
+            )
+        })?;
+
+        tokio::time::sleep(Duration::from_millis(u64::from(params.verify_timeout_ms))).await;
+        let after = synapse_a11y::element_value(&params.element_id).map_err(|error| {
+            set_field_text_foreground_error(
+                &target,
+                error.code(),
+                "after_value_read_failed",
+                format!(
+                    "act_set_field_text after-value UIA readback failed for element {}: {error}",
+                    params.element_id
+                ),
+            )
+        })?;
+
+        if before.is_password || after.is_password {
+            return set_field_text_password_response(params, started, method, &before, &after);
+        }
+        crate::m2::finish_replace_response(
+            params,
+            started,
+            method,
+            crate::m2::TIER_FOREGROUND_KEYS,
+            true,
+            crate::m2::SOURCE_UIA_VALUE,
+            &before.value,
+            &after.value,
+            json!({
+                "element_id": params.element_id.to_string(),
+                "root_hwnd": target.root_hwnd,
+                "process_name": target.process_name,
+                "role": target.role,
+                "click_point": { "x": point.x, "y": point.y },
+                "focused_element_id": focus_readback.signature.focused_element_id,
+            }),
+        )
     }
 
     async fn capture_action_delta_signature(
@@ -4037,6 +4429,16 @@ fn ocr_focused_rect_text_readback(
     }
 }
 
+fn rect_contains_point(rect: Rect, point: Point) -> bool {
+    if rect.w <= 0 || rect.h <= 0 {
+        return false;
+    }
+    point.x >= rect.x
+        && point.x < rect.x.saturating_add(rect.w)
+        && point.y >= rect.y
+        && point.y < rect.y.saturating_add(rect.h)
+}
+
 fn rects_intersect(a: Rect, b: Rect) -> bool {
     if a.w <= 0 || a.h <= 0 || b.w <= 0 || b.h <= 0 {
         return false;
@@ -4369,6 +4771,108 @@ fn act_type_text_target_changed(
         return before.focused_bbox != after.focused_bbox;
     }
     false
+}
+
+/// Structured failure for the `act_set_field_text` foreground tier: precise
+/// reason code, full target evidence, and the action error detail.
+fn set_field_text_foreground_error(
+    target: &ActTypeForegroundFallbackTarget,
+    code: &'static str,
+    reason: &'static str,
+    detail: impl Into<String>,
+) -> ErrorData {
+    let detail = detail.into();
+    tracing::error!(
+        code,
+        tool = "act_set_field_text",
+        element_id = %target.element_id,
+        root_hwnd = target.root_hwnd,
+        reason,
+        detail = %detail,
+        "act_set_field_text foreground tier failed"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail.clone(),
+        Some(json!({
+            "code": code,
+            "tool": "act_set_field_text",
+            "reason": reason,
+            "detail": detail,
+            "target": target,
+            "backend_tier_used": crate::m2::TIER_FOREGROUND_KEYS,
+            "required_foreground": true,
+        })),
+    )
+}
+
+/// Password targets never expose value content; verification compares the
+/// UTF-16 password length Source of Truth instead, mirroring `act_set_value`.
+fn set_field_text_password_response(
+    params: &crate::m2::ActSetFieldTextParams,
+    started: Instant,
+    method: &str,
+    before: &synapse_a11y::ElementValueReadback,
+    after: &synapse_a11y::ElementValueReadback,
+) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData> {
+    let expected_len = params.text.encode_utf16().count();
+    let before_len = before.password_len.unwrap_or(0);
+    let after_len = after.password_len.unwrap_or(0);
+    let signature = |len: usize| format!("password_len:{len}");
+    let requested_len = u32::try_from(params.text.chars().count()).unwrap_or(u32::MAX);
+    if after.password_len != Some(expected_len) {
+        tracing::error!(
+            code = error_codes::ACTION_POSTCONDITION_FAILED,
+            tool = "act_set_field_text",
+            element_id = %params.element_id,
+            method,
+            before_len,
+            after_len,
+            expected_len,
+            "act_set_field_text password-length readback did not equal requested length"
+        );
+        return Err(ErrorData::new(
+            ErrorCode(-32099),
+            "act_set_field_text Source-of-Truth postcondition failed: password target length readback does not equal requested text length",
+            Some(json!({
+                "code": error_codes::ACTION_POSTCONDITION_FAILED,
+                "tool": "act_set_field_text",
+                "method": method,
+                "source_of_truth": crate::m2::SOURCE_UIA_PASSWORD_LENGTH,
+                "before_len": before_len,
+                "after_len": after_len,
+                "expected_len": expected_len,
+                "is_password": true,
+            })),
+        ));
+    }
+    let changed = before.password_len != after.password_len;
+    Ok(crate::m2::ActSetFieldTextResponse {
+        ok: true,
+        method: method.to_owned(),
+        backend_tier_used: crate::m2::TIER_FOREGROUND_KEYS.to_owned(),
+        required_foreground: true,
+        source_of_truth: crate::m2::SOURCE_UIA_PASSWORD_LENGTH.to_owned(),
+        requested_len,
+        before_len: u32::try_from(before_len).unwrap_or(u32::MAX),
+        after_len: u32::try_from(after_len).unwrap_or(u32::MAX),
+        requested_sha256: signature(expected_len),
+        before_sha256: signature(before_len),
+        after_sha256: signature(after_len),
+        changed,
+        postcondition: ActPostcondition {
+            status: "verified_state".to_owned(),
+            observed_delta: Some(changed),
+            source_of_truth: Some(crate::m2::SOURCE_UIA_PASSWORD_LENGTH.to_owned()),
+            before_signature: Some(signature(before_len)),
+            after_signature: Some(signature(after_len)),
+            detail: Some(
+                "act_set_field_text password target length equals requested length; value content intentionally not read or compared"
+                    .to_owned(),
+            ),
+        },
+        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+    })
 }
 
 fn act_type_foreground_fallback_recording_error(

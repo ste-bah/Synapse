@@ -177,6 +177,21 @@ pub fn element_metadata(id: &ElementId) -> A11yResult<ElementMetadataReadback> {
     platform::element_metadata(id)
 }
 
+/// Scrolls a re-resolved element into its container's viewport through UIA
+/// `ScrollItemPattern.ScrollIntoView` (#882). Composite tools call this before
+/// a coordinate click so an off-viewport target's stale bbox cannot steer the
+/// click into another window.
+///
+/// # Errors
+///
+/// Returns `A11Y_ELEMENT_STALE` when the element id cannot be re-resolved, a
+/// typed unsupported-pattern error when `ScrollItemPattern` is not exposed, a
+/// structured UIA error for pattern method failures, or `A11Y_NOT_AVAILABLE`
+/// on non-Windows platforms.
+pub fn scroll_element_into_view(id: &ElementId) -> A11yResult<()> {
+    platform::scroll_element_into_view(id)
+}
+
 /// Scrolls a re-resolved element through UIA `ScrollPattern` or
 /// `ScrollItemPattern` and returns before/after target readback.
 ///

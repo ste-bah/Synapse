@@ -320,6 +320,170 @@ pub async fn cdp_type_node(
     .map(|_point| ())
 }
 
+/// Readback for [`cdp_set_node_text`]: which selection strategy applied before
+/// the replace, and whether an empty replacement was delivered as a Delete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CdpSetNodeTextReadback {
+    /// `selected_value` (input/textarea `select()`) or
+    /// `selected_contenteditable` (DOM range over the editable host).
+    pub selection_mode: String,
+    /// True when `text` was empty and the selection was removed with a
+    /// synthesized Delete key instead of `Input.insertText`.
+    pub cleared_with_delete: bool,
+}
+
+/// JS run on the resolved node to select its full content before the replace.
+/// Mirrors the Playwright `fill` strategy: value controls use `select()`, a
+/// contenteditable host gets a DOM range over its contents. Returns a wire
+/// string so a non-editable target fails loud instead of appending.
+const CDP_SELECT_ALL_FUNCTION: &str = r#"function() {
+    if (this === null || this === undefined || !this.isConnected) { return 'detached'; }
+    if (typeof this.select === 'function' && ('value' in this) && !this.disabled && !this.readOnly) {
+        this.focus();
+        this.select();
+        return 'selected_value';
+    }
+    if (this.isContentEditable) {
+        this.focus();
+        const range = this.ownerDocument.createRange();
+        range.selectNodeContents(this);
+        const selection = this.ownerDocument.defaultView.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        return 'selected_contenteditable';
+    }
+    if (('value' in this) && (this.disabled || this.readOnly)) { return 'not_editable_disabled_or_readonly'; }
+    return 'not_editable';
+}"#;
+
+/// Replaces a web editable node's full text content (#882): real click to
+/// place focus/caret, best-effort `DOM.focus`, select-all on the exact
+/// resolved node, then `Input.insertText` — which replaces the active
+/// selection, the same strategy Playwright `fill()` uses. Empty `text`
+/// removes the selection with a synthesized Delete key.
+///
+/// Fail-loud: a target that is neither a value control nor contenteditable
+/// returns `A11Y_CDP_AXTREE_FAILED` naming the select-all readback — there is
+/// no append fallback. Callers must verify with a separate
+/// [`cdp_node_value`] readback.
+///
+/// # Errors
+///
+/// As [`cdp_click_node`], plus `A11Y_CDP_AXTREE_FAILED` for non-editable
+/// targets.
+pub async fn cdp_set_node_text(
+    endpoint: &str,
+    page_title_hint: &str,
+    target_id_hint: Option<&str>,
+    backend_node_id: i64,
+    text: &str,
+) -> A11yResult<CdpSetNodeTextReadback> {
+    use chromiumoxide::cdp::browser_protocol::dom::FocusParams;
+
+    let text = text.to_owned();
+    with_node_center(
+        endpoint,
+        page_title_hint,
+        target_id_hint,
+        backend_node_id,
+        |page, center| async move {
+            page.execute(mouse_event(
+                DispatchMouseEventType::MousePressed,
+                center,
+                MouseButton::Left,
+                1,
+            ))
+            .await
+            .map_err(|err| dispatch_err(&err))?;
+            page.execute(mouse_event(
+                DispatchMouseEventType::MouseReleased,
+                center,
+                MouseButton::Left,
+                1,
+            ))
+            .await
+            .map_err(|err| dispatch_err(&err))?;
+            // The click already places focus; DOM.focus is best-effort
+            // reinforcement (some AX nodes map to non-focusable wrappers).
+            let focus = FocusParams::builder()
+                .backend_node_id(BackendNodeId::new(backend_node_id))
+                .build();
+            let _ = page.execute(focus).await;
+
+            let resolve = ResolveNodeParams::builder()
+                .backend_node_id(BackendNodeId::new(backend_node_id))
+                .object_group("synapse_set_field_text")
+                .build();
+            let resolved =
+                page.execute(resolve)
+                    .await
+                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                        detail: format!("resolveNode for backendNodeId {backend_node_id}: {err}"),
+                    })?;
+            let object_id =
+                resolved
+                    .object
+                    .object_id
+                    .clone()
+                    .ok_or_else(|| A11yError::CdpAxtreeFailed {
+                        detail: format!(
+                            "resolveNode for backendNodeId {backend_node_id} returned no objectId"
+                        ),
+                    })?;
+            let call = CallFunctionOnParams::builder()
+                .function_declaration(CDP_SELECT_ALL_FUNCTION)
+                .object_id(object_id)
+                .return_by_value(true)
+                .silent(true)
+                .build()
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("build Runtime.callFunctionOn select-all params: {err}"),
+                })?;
+            let selection_mode: String = call_function_on_value(&page, call, "select-all").await?;
+            if !matches!(
+                selection_mode.as_str(),
+                "selected_value" | "selected_contenteditable"
+            ) {
+                return Err(A11yError::CdpAxtreeFailed {
+                    detail: format!(
+                        "cdp_set_node_text refused backendNodeId {backend_node_id}: target is not an editable web node (select-all readback: {selection_mode})"
+                    ),
+                });
+            }
+
+            let cleared_with_delete = text.is_empty();
+            if cleared_with_delete {
+                let delete = CdpKeyStroke {
+                    key: "Delete".to_owned(),
+                    code: "Delete".to_owned(),
+                    windows_virtual_key_code: 46,
+                    native_virtual_key_code: 46,
+                    key_identifier: None,
+                    text: None,
+                    unmodified_text: None,
+                    modifier_bit: 0,
+                    location: None,
+                };
+                page.execute(cdp_key_event(DispatchKeyEventType::KeyDown, &delete, 0)?)
+                    .await
+                    .map_err(|err| dispatch_err(&err))?;
+                page.execute(cdp_key_event(DispatchKeyEventType::KeyUp, &delete, 0)?)
+                    .await
+                    .map_err(|err| dispatch_err(&err))?;
+            } else {
+                page.execute(InsertTextParams::new(text))
+                    .await
+                    .map_err(|err| dispatch_err(&err))?;
+            }
+            Ok(CdpSetNodeTextReadback {
+                selection_mode,
+                cleared_with_delete,
+            })
+        },
+    )
+    .await
+}
+
 /// Dispatches a key sequence to a specific CDP page target without activating
 /// the browser window.
 ///
@@ -383,7 +547,9 @@ pub async fn cdp_mouse_stroke_target(
 ) -> A11yResult<CdpMouseStrokeResult> {
     validate_cdp_mouse_stroke_points(&points)?;
     let start = cdp_stroke_action_point(points[0]);
-    let end = cdp_stroke_action_point(*points.last().expect("validated non-empty points"));
+    let end = points
+        .last()
+        .map_or(start, |point| cdp_stroke_action_point(*point));
     let duration_ms = points.last().map_or(0.0, |point| point.elapsed_ms.max(0.0));
     let button = button
         .map(CdpMouseButton::to_cdp)
@@ -1012,7 +1178,9 @@ async fn dispatch_cdp_mouse_stroke(
     }
     page.execute(mouse_event(
         DispatchMouseEventType::MouseReleased,
-        cdp_stroke_action_point(*points.last().expect("validated non-empty points")),
+        points
+            .last()
+            .map_or(first_point, |point| cdp_stroke_action_point(*point)),
         button,
         1,
     ))
