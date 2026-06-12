@@ -22,9 +22,12 @@ pub const CF_PROCESS_HISTORY: &str = "CF_PROCESS_HISTORY";
 pub const CF_KV: &str = "CF_KV";
 /// Operator activity timeline (ADR 2026-06-11-timeline-data-model).
 pub const CF_TIMELINE: &str = "CF_TIMELINE";
+/// Derived episodes segmented from `CF_TIMELINE` (#846). Fully rebuildable:
+/// re-segmentation replaces day-aligned key ranges idempotently.
+pub const CF_EPISODES: &str = "CF_EPISODES";
 
 /// PRD §4 column family names, excluding `RocksDB`'s implicit `default` CF.
-pub const ALL_COLUMN_FAMILIES: [&str; 12] = [
+pub const ALL_COLUMN_FAMILIES: [&str; 13] = [
     CF_EVENTS,
     CF_OBSERVATIONS,
     CF_PROFILES,
@@ -37,4 +40,5 @@ pub const ALL_COLUMN_FAMILIES: [&str; 12] = [
     CF_PROCESS_HISTORY,
     CF_KV,
     CF_TIMELINE,
+    CF_EPISODES,
 ];

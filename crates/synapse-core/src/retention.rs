@@ -17,7 +17,7 @@ pub enum RetentionTtl {
 }
 
 /// PRD §4/§6 storage retention defaults.
-pub const DEFAULTS: [RetentionDefault; 12] = [
+pub const DEFAULTS: [RetentionDefault; 13] = [
     RetentionDefault {
         cf: "CF_EVENTS",
         ttl: RetentionTtl::Hours(24),
@@ -92,5 +92,14 @@ pub const DEFAULTS: [RetentionDefault; 12] = [
         ttl: RetentionTtl::Days(90),
         soft_cap_mb: 4096,
         hard_cap_mb: 8192,
+    },
+    // Derived episodes (#846): same retention horizon as their source
+    // timeline rows, far smaller footprint (one row per focused span, not
+    // per event). Rebuildable at any time by re-segmentation.
+    RetentionDefault {
+        cf: "CF_EPISODES",
+        ttl: RetentionTtl::Days(90),
+        soft_cap_mb: 256,
+        hard_cap_mb: 512,
     },
 ];

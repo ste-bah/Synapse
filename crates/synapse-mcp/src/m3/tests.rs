@@ -108,6 +108,7 @@ fn m3_tool_stub_names_are_stable() {
         "storage_pressure_sample",
         "timeline_search",
         "timeline_purge",
+        "episode_segment",
         "timeline_pause",
         "timeline_resume",
         "timeline_exclusions",

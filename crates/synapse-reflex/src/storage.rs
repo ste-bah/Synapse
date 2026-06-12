@@ -190,6 +190,26 @@ impl ReflexRuntime {
         self.db.flush()
     }
 
+    /// Atomically replaces rows in one column family: deletes plus puts in a
+    /// single synchronous flushed batch. For bounded derived-state rewrites
+    /// (episode re-segmentation #846) where readers must never observe a
+    /// half-replaced range; callers gate on disk pressure themselves before
+    /// invoking.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the column family is missing or the
+    /// write batch fails.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", cf_name, delete_count = deletes.len(), put_count = puts.len()))]
+    pub fn storage_replace_rows(
+        &self,
+        cf_name: &str,
+        deletes: Vec<Vec<u8>>,
+        puts: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> StorageResult<()> {
+        self.db.mutate_batch_pressure_bypass(cf_name, deletes, puts)
+    }
+
     /// Compacts one key range of a column family (tombstone reclamation after
     /// a bulk delete, per the timeline ADR purge mechanics).
     ///

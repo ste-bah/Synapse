@@ -1,4 +1,5 @@
 mod action;
+mod episode;
 mod event;
 mod geometry;
 mod health;
@@ -11,6 +12,7 @@ mod timeline;
 mod web_perception;
 
 pub use action::*;
+pub use episode::*;
 pub use event::*;
 pub use geometry::*;
 pub use health::*;

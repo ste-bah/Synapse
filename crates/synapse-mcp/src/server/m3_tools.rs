@@ -1,11 +1,11 @@
 use super::{
     AudioTailParams, AudioTailResponse, AudioTranscribeParams, AudioTranscribeResponse,
     AuditExportBundleParams, AuditExportBundleResponse, AuditIntelligenceQueryParams,
-    AuditIntelligenceQueryResponse, ErrorData, HygieneFlagsParams, HygieneFlagsResponse,
-    HygieneScanStorageParams, HygieneScanStorageResponse, HygieneScanTextParams,
-    HygieneScanTextResponse, Json, Parameters, ProfileActivateParams, ProfileActivateResponse,
-    ProfileAuthoringDecideParams, ProfileAuthoringDecideResponse, ProfileAuthoringExportParams,
-    ProfileAuthoringExportResponse, ProfileAuthoringGenerateParams,
+    AuditIntelligenceQueryResponse, EpisodeSegmentParams, EpisodeSegmentResponse, ErrorData,
+    HygieneFlagsParams, HygieneFlagsResponse, HygieneScanStorageParams, HygieneScanStorageResponse,
+    HygieneScanTextParams, HygieneScanTextResponse, Json, Parameters, ProfileActivateParams,
+    ProfileActivateResponse, ProfileAuthoringDecideParams, ProfileAuthoringDecideResponse,
+    ProfileAuthoringExportParams, ProfileAuthoringExportResponse, ProfileAuthoringGenerateParams,
     ProfileAuthoringGenerateResponse, ProfileAuthoringInspectParams,
     ProfileAuthoringInspectResponse, ProfileAuthoringListParams, ProfileAuthoringListResponse,
     ProfileListParams, ProfileListResponse, ProfileQualityRefreshParams,
@@ -30,7 +30,7 @@ use super::{
     pause_timeline, purge_timeline, put_probe_rows, query_audit_intelligence, query_flags,
     query_registry, record_replay, refresh_profile_quality, register_reflex, resume_timeline,
     rollback_registry_profile, run_storage_gc_once, scan_storage, scan_text_tool, search_timeline,
-    subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
+    segment_episodes, subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
     update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
@@ -776,6 +776,30 @@ impl SynapseService {
             .unwrap_or_else(|| "stdio".to_owned());
         let runtime = self.reflex_runtime()?;
         purge_timeline(&runtime, &params.0, &by_session).map(Json)
+    }
+
+    #[tool(
+        description = "Segment the operator activity timeline (CF_TIMELINE) into derived episodes (CF_EPISODES): contiguous spans of focused work with app, document, duration, and interaction summary. Deterministic and re-runnable; the range snaps outward to whole local days and each day is replaced atomically, so re-segmentation is idempotent"
+    )]
+    pub async fn episode_segment(
+        &self,
+        params: Parameters<EpisodeSegmentParams>,
+    ) -> Result<Json<EpisodeSegmentResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "episode_segment",
+            start_ts_ns = params.0.start_ts_ns,
+            end_ts_ns = params.0.end_ts_ns,
+            include_agent_activity = params.0.include_agent_activity,
+            dry_run = params.0.dry_run,
+            "tool.invocation kind=episode_segment"
+        );
+        self.require_m3_permissions(
+            "episode_segment",
+            &crate::m3::episodes::required_permissions(&params.0),
+        )?;
+        let runtime = self.reflex_runtime()?;
+        segment_episodes(&runtime, &params.0).map(Json)
     }
 
     #[tool(description = "Write bounded synthetic probe rows to a storage column family")]

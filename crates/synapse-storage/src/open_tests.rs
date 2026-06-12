@@ -42,11 +42,11 @@ fn opens_database_created_with_pre_timeline_layout() -> Result<(), Box<dyn Error
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("db");
 
-    // Recreate the historical 11-CF layout (everything except CF_TIMELINE)
-    // exactly as a pre-ADR binary would have left it on disk.
+    // Recreate the historical 11-CF layout (no CF_TIMELINE, and therefore no
+    // CF_EPISODES either) exactly as a pre-ADR binary would have left it.
     let legacy_cfs: Vec<&str> = cf::ALL_COLUMN_FAMILIES
         .into_iter()
-        .filter(|name| *name != cf::CF_TIMELINE)
+        .filter(|name| *name != cf::CF_TIMELINE && *name != cf::CF_EPISODES)
         .collect();
     {
         let mut options = Options::default();
@@ -92,6 +92,64 @@ fn opens_database_created_with_pre_timeline_layout() -> Result<(), Box<dyn Error
     assert_eq!(preserved.as_deref(), Some(DURABILITY_VALUE));
     assert_eq!(timeline_rows.len(), 1);
     assert!(after.contains(&cf::CF_TIMELINE.to_owned()));
+    Ok(())
+}
+
+#[test]
+fn opens_database_created_with_pre_episodes_layout() -> Result<(), Box<dyn Error>> {
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("db");
+
+    // Recreate the 12-CF layout (everything except CF_EPISODES) exactly as a
+    // pre-#846 binary would have left it on disk.
+    let legacy_cfs: Vec<&str> = cf::ALL_COLUMN_FAMILIES
+        .into_iter()
+        .filter(|name| *name != cf::CF_EPISODES)
+        .collect();
+    {
+        let mut options = Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+        let legacy = DB::open_cf(&options, &path, &legacy_cfs)?;
+        legacy.put(SCHEMA_VERSION_KEY, TEST_SCHEMA_VERSION.to_be_bytes())?;
+        let timeline = legacy
+            .cf_handle(cf::CF_TIMELINE)
+            .ok_or("legacy CF_TIMELINE handle missing")?;
+        legacy.put_cf(&timeline, DURABILITY_KEY, DURABILITY_VALUE)?;
+        legacy.flush_cf(&timeline)?;
+    }
+    let before = sorted_list_cf(&path)?;
+    println!(
+        "regression_state=db.list_cf edge=pre_episodes before={before:?} before_count={}",
+        before.len()
+    );
+    assert!(
+        !before.contains(&cf::CF_EPISODES.to_owned()),
+        "precondition: legacy layout must not contain CF_EPISODES"
+    );
+
+    let db = Db::open(&path, TEST_SCHEMA_VERSION)?;
+    let handles = existing_prd_handles(&db);
+    let preserved = db
+        .inner
+        .cf_handle(cf::CF_TIMELINE)
+        .and_then(|handle| db.inner.get_cf(&handle, DURABILITY_KEY).transpose())
+        .transpose()?;
+    db.put_batch(cf::CF_EPISODES, vec![(b"migrate".to_vec(), b"{}".to_vec())])?;
+    db.flush()?;
+    let episode_rows = db.scan_cf(cf::CF_EPISODES)?;
+    drop(db);
+
+    let after = sorted_list_cf(&path)?;
+    println!(
+        "regression_state=db.list_cf edge=pre_episodes after={after:?} preserved={:?} episode_rows={} observed=additive_open:ok",
+        preserved.as_deref(),
+        episode_rows.len()
+    );
+    assert_eq!(handles, sorted_prd_cfs());
+    assert_eq!(preserved.as_deref(), Some(DURABILITY_VALUE));
+    assert_eq!(episode_rows.len(), 1);
+    assert!(after.contains(&cf::CF_EPISODES.to_owned()));
     Ok(())
 }
 

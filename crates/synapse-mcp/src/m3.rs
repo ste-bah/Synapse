@@ -3,6 +3,7 @@ pub mod activity_recorder;
 pub mod audio;
 pub mod audit_export;
 pub mod audit_retention;
+pub mod episodes;
 pub mod hygiene;
 pub mod interaction_cadence;
 pub mod permissions;
@@ -552,7 +553,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 37] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 38] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -588,6 +589,7 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 37] {
         storage::storage_pressure_sample(),
         timeline::timeline_search(),
         timeline::timeline_purge(),
+        episodes::episode_segment(),
         timeline_control::timeline_pause(),
         timeline_control::timeline_resume(),
         timeline_control::timeline_exclusions(),

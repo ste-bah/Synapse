@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 119] = [
+const EXPECTED_TOOLS: [&str; 120] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -41,6 +41,7 @@ const EXPECTED_TOOLS: [&str; 119] = [
     "control_lease_handoff",
     "control_lease_release",
     "control_lease_status",
+    "episode_segment",
     "everquest_action_prior_record",
     "everquest_action_prior_scorecard",
     "everquest_autocombat",
