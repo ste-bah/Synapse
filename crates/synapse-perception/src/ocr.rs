@@ -315,19 +315,17 @@ mod platform {
 
     const OCR_MIN_RECOGNITION_HEIGHT_PX: u32 = 64;
     const OCR_MAX_UPSCALE: u32 = 6;
+    const OCR_SPARSE_TILE_MIN_WIDTH_PX: u32 = 640;
+    const OCR_SPARSE_TILE_TARGET_WIDTH_PX: u32 = 480;
+    const OCR_SPARSE_TILE_OVERLAP_PX: u32 = 96;
+    const OCR_SPARSE_ASPECT_RATIO_NUMERATOR: u32 = 6;
+    const OCR_BACKGROUND_DIFF_THRESHOLD: u16 = 90;
+    const OCR_CONTENT_PADDING_PX: u32 = 6;
 
     pub fn read_text(region: Rect) -> PerceptionResult<Vec<TextRegion>> {
         let captured = screen_region_to_bgra_bitmap(region)
             .map_err(|err| backend_unavailable(err.to_string()))?;
-        let (bitmap, scale) =
-            ocr_bitmap_from_bgra(captured.width, captured.height, &captured.bytes)?;
-        let engine = ocr_engine()?;
-        let result = engine
-            .RecognizeAsync(&bitmap)
-            .map_err(|err| backend_unavailable(err.to_string()))?
-            .join()
-            .map_err(|err| backend_unavailable(err.to_string()))?;
-        text_regions_from_result(region, &result, f64::from(scale))
+        read_text_from_bgra_bitmap(region, captured.width, captured.height, &captured.bytes)
     }
 
     pub fn read_text_from_software_bitmap(
@@ -349,14 +347,20 @@ mod platform {
         height: u32,
         bytes: &[u8],
     ) -> PerceptionResult<Vec<TextRegion>> {
-        let (bitmap, scale) = ocr_bitmap_from_bgra(width, height, bytes)?;
         let engine = ocr_engine()?;
-        let result = engine
-            .RecognizeAsync(&bitmap)
-            .map_err(|err| backend_unavailable(err.to_string()))?
-            .join()
-            .map_err(|err| backend_unavailable(err.to_string()))?;
-        text_regions_from_result(region, &result, f64::from(scale))
+        let max_dimension = ocr_max_image_dimension()?;
+        let primary = recognize_bgra_region(&engine, region, width, height, bytes, max_dimension);
+        let fallback = if should_try_sparse_ocr(width, height, max_dimension)
+            || matches!(
+                &primary,
+                Err(PerceptionError::OcrNoText { .. }
+                    | PerceptionError::OcrBackendUnavailable { .. })
+            ) {
+            sparse_bgra_alternative(&engine, region, width, height, bytes, max_dimension)
+        } else {
+            None
+        };
+        select_ocr_candidate(primary, fallback)
     }
 
     fn ocr_engine() -> PerceptionResult<&'static OcrEngine> {
@@ -420,6 +424,124 @@ mod platform {
         }
     }
 
+    fn recognize_bgra_region(
+        engine: &OcrEngine,
+        region: Rect,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+        max_dimension: u32,
+    ) -> PerceptionResult<Vec<TextRegion>> {
+        let (bitmap, scale) = ocr_bitmap_from_bgra(width, height, bytes, max_dimension)?;
+        let result = engine
+            .RecognizeAsync(&bitmap)
+            .map_err(|err| backend_unavailable(err.to_string()))?
+            .join()
+            .map_err(|err| backend_unavailable(err.to_string()))?;
+        text_regions_from_result(region, &result, f64::from(scale))
+    }
+
+    fn select_ocr_candidate(
+        primary: PerceptionResult<Vec<TextRegion>>,
+        fallback: Option<Vec<TextRegion>>,
+    ) -> PerceptionResult<Vec<TextRegion>> {
+        match (primary, fallback) {
+            (Ok(primary), Some(fallback))
+                if ocr_candidate_score(&fallback) > ocr_candidate_score(&primary) =>
+            {
+                Ok(fallback)
+            }
+            (Ok(primary), _) => Ok(primary),
+            (Err(_primary), Some(fallback)) if !fallback.is_empty() => Ok(fallback),
+            (Err(primary), _) => Err(primary),
+        }
+    }
+
+    fn sparse_bgra_alternative(
+        engine: &OcrEngine,
+        region: Rect,
+        width: u32,
+        height: u32,
+        bytes: &[u8],
+        max_dimension: u32,
+    ) -> Option<Vec<TextRegion>> {
+        validate_bgra_len(width, height, bytes).ok()?;
+        let mut best = None;
+        if let Some(bounds) = content_bounds_for_bgra(width, height, bytes) {
+            if let Some(candidate) = recognize_bgra_subregion(
+                engine,
+                region,
+                width,
+                height,
+                bytes,
+                bounds,
+                max_dimension,
+            ) {
+                best = Some(candidate);
+            }
+        }
+        if should_try_sparse_tiling(width, height, max_dimension) {
+            let mut tiled = Vec::new();
+            for tile in sparse_ocr_tiles(width, height, max_dimension) {
+                if let Some(mut words) = recognize_bgra_subregion(
+                    engine,
+                    region,
+                    width,
+                    height,
+                    bytes,
+                    tile,
+                    max_dimension,
+                ) {
+                    tiled.append(&mut words);
+                }
+            }
+            dedupe_text_regions(&mut tiled);
+            if !tiled.is_empty()
+                && best.as_ref().is_none_or(|current| {
+                    ocr_candidate_score(&tiled) > ocr_candidate_score(current)
+                })
+            {
+                best = Some(tiled);
+            }
+        }
+        best
+    }
+
+    fn recognize_bgra_subregion(
+        engine: &OcrEngine,
+        base_region: Rect,
+        source_width: u32,
+        source_height: u32,
+        source_bytes: &[u8],
+        subregion: BitmapRect,
+        max_dimension: u32,
+    ) -> Option<Vec<TextRegion>> {
+        let bytes = crop_bgra(source_width, source_height, source_bytes, subregion).ok()?;
+        let region = Rect {
+            x: base_region.x.saturating_add(u32_to_i32(subregion.x)),
+            y: base_region.y.saturating_add(u32_to_i32(subregion.y)),
+            w: u32_to_i32(subregion.w).max(1),
+            h: u32_to_i32(subregion.h).max(1),
+        };
+        recognize_bgra_region(
+            engine,
+            region,
+            subregion.w,
+            subregion.h,
+            &bytes,
+            max_dimension,
+        )
+        .ok()
+    }
+
+    fn ocr_candidate_score(words: &[TextRegion]) -> usize {
+        let text_len = words
+            .iter()
+            .map(|word| word.text.chars().count())
+            .sum::<usize>();
+        words.len().saturating_mul(1_000).saturating_add(text_len)
+    }
+
     fn round_scaled_to_i32(value: f32, scale: f64) -> i32 {
         let divisor = if scale.is_finite() && scale > 0.0 {
             scale
@@ -446,13 +568,18 @@ mod platform {
         PerceptionError::OcrBackendUnavailable { detail }
     }
 
+    fn ocr_max_image_dimension() -> PerceptionResult<u32> {
+        OcrEngine::MaxImageDimension().map_err(|err| backend_unavailable(err.to_string()))
+    }
+
     fn ocr_bitmap_from_bgra(
         width: u32,
         height: u32,
         bytes: &[u8],
+        max_dimension: u32,
     ) -> PerceptionResult<(SoftwareBitmap, u32)> {
         validate_bgra_len(width, height, bytes)?;
-        let scale = recognition_upscale(height);
+        let scale = recognition_upscale(width, height, max_dimension);
         let (width, height, bytes) = if scale > 1 {
             let width = width.checked_mul(scale).ok_or_else(|| {
                 backend_unavailable(format!("scaled OCR width overflowed: {width} * {scale}"))
@@ -492,13 +619,21 @@ mod platform {
         Ok(())
     }
 
-    fn recognition_upscale(height: u32) -> u32 {
+    fn recognition_upscale(width: u32, height: u32, max_dimension: u32) -> u32 {
         if height == 0 || height >= OCR_MIN_RECOGNITION_HEIGHT_PX {
             1
         } else {
-            OCR_MIN_RECOGNITION_HEIGHT_PX
+            let height_scale = OCR_MIN_RECOGNITION_HEIGHT_PX
                 .div_ceil(height)
-                .clamp(1, OCR_MAX_UPSCALE)
+                .clamp(1, OCR_MAX_UPSCALE);
+            let dimension_scale = if max_dimension == 0 || width == 0 {
+                OCR_MAX_UPSCALE
+            } else {
+                let width_scale = max_dimension / width;
+                let height_scale = max_dimension / height;
+                width_scale.min(height_scale).max(1)
+            };
+            height_scale.min(dimension_scale).clamp(1, OCR_MAX_UPSCALE)
         }
     }
 
@@ -550,17 +685,360 @@ mod platform {
         .map_err(|err| backend_unavailable(err.to_string()))
     }
 
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    struct BitmapRect {
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    }
+
+    fn should_try_sparse_ocr(width: u32, height: u32, max_dimension: u32) -> bool {
+        content_candidate_possible(width, height)
+            || should_try_sparse_tiling(width, height, max_dimension)
+    }
+
+    fn content_candidate_possible(width: u32, height: u32) -> bool {
+        width >= OCR_SPARSE_TILE_MIN_WIDTH_PX || height < OCR_MIN_RECOGNITION_HEIGHT_PX
+    }
+
+    fn should_try_sparse_tiling(width: u32, height: u32, max_dimension: u32) -> bool {
+        if width == 0 || height == 0 {
+            return false;
+        }
+        let too_wide_for_engine = max_dimension > 0 && width > max_dimension;
+        let sparse_horizontal_strip = width >= OCR_SPARSE_TILE_MIN_WIDTH_PX
+            && u64::from(width)
+                >= u64::from(height).saturating_mul(u64::from(OCR_SPARSE_ASPECT_RATIO_NUMERATOR));
+        too_wide_for_engine || sparse_horizontal_strip
+    }
+
+    fn sparse_ocr_tiles(width: u32, height: u32, max_dimension: u32) -> Vec<BitmapRect> {
+        if !should_try_sparse_tiling(width, height, max_dimension) {
+            return Vec::new();
+        }
+        let tile_width = OCR_SPARSE_TILE_TARGET_WIDTH_PX.min(width).max(1);
+        let overlap = OCR_SPARSE_TILE_OVERLAP_PX.min(tile_width.saturating_sub(1));
+        let step = tile_width.saturating_sub(overlap).max(1);
+        let mut tiles = Vec::new();
+        let mut x = 0;
+        loop {
+            let remaining = width.saturating_sub(x);
+            let w = remaining.min(tile_width);
+            tiles.push(BitmapRect {
+                x,
+                y: 0,
+                w,
+                h: height,
+            });
+            if x.saturating_add(w) >= width {
+                break;
+            }
+            x = x.saturating_add(step);
+            if x >= width {
+                break;
+            }
+        }
+        tiles
+    }
+
+    fn content_bounds_for_bgra(width: u32, height: u32, bytes: &[u8]) -> Option<BitmapRect> {
+        if !content_candidate_possible(width, height)
+            || validate_bgra_len(width, height, bytes).is_err()
+        {
+            return None;
+        }
+        let background = corner_average_bgr(width, height, bytes)?;
+        let mut min_x = width;
+        let mut min_y = height;
+        let mut max_x = 0;
+        let mut max_y = 0;
+        let mut found = false;
+        for y in 0..height {
+            for x in 0..width {
+                if pixel_differs_from_background(width, bytes, x, y, background) {
+                    found = true;
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+        let padding = OCR_CONTENT_PADDING_PX
+            .min(width.saturating_sub(1))
+            .min(height.saturating_sub(1));
+        min_x = min_x.saturating_sub(padding);
+        min_y = min_y.saturating_sub(padding);
+        max_x = max_x.saturating_add(padding).min(width.saturating_sub(1));
+        max_y = max_y.saturating_add(padding).min(height.saturating_sub(1));
+        let bounds = BitmapRect {
+            x: min_x,
+            y: min_y,
+            w: max_x.saturating_sub(min_x).saturating_add(1),
+            h: max_y.saturating_sub(min_y).saturating_add(1),
+        };
+        let original_area = u64::from(width).saturating_mul(u64::from(height));
+        let bounds_area = u64::from(bounds.w).saturating_mul(u64::from(bounds.h));
+        (bounds_area.saturating_mul(10) < original_area.saturating_mul(9)).then_some(bounds)
+    }
+
+    fn corner_average_bgr(width: u32, height: u32, bytes: &[u8]) -> Option<[u8; 3]> {
+        let corners = [
+            (0, 0),
+            (width.saturating_sub(1), 0),
+            (0, height.saturating_sub(1)),
+            (width.saturating_sub(1), height.saturating_sub(1)),
+        ];
+        let mut sums = [0_u32; 3];
+        for (x, y) in corners {
+            let offset = bgra_offset(width, x, y)?;
+            sums[0] = sums[0].saturating_add(u32::from(*bytes.get(offset)?));
+            sums[1] = sums[1].saturating_add(u32::from(*bytes.get(offset + 1)?));
+            sums[2] = sums[2].saturating_add(u32::from(*bytes.get(offset + 2)?));
+        }
+        Some([
+            u8::try_from(sums[0] / 4).ok()?,
+            u8::try_from(sums[1] / 4).ok()?,
+            u8::try_from(sums[2] / 4).ok()?,
+        ])
+    }
+
+    fn pixel_differs_from_background(
+        width: u32,
+        bytes: &[u8],
+        x: u32,
+        y: u32,
+        background: [u8; 3],
+    ) -> bool {
+        let Some(offset) = bgra_offset(width, x, y) else {
+            return false;
+        };
+        let Some(blue) = bytes.get(offset) else {
+            return false;
+        };
+        let Some(green) = bytes.get(offset + 1) else {
+            return false;
+        };
+        let Some(red) = bytes.get(offset + 2) else {
+            return false;
+        };
+        let diff = u16::from(blue.abs_diff(background[0]))
+            .saturating_add(u16::from(green.abs_diff(background[1])))
+            .saturating_add(u16::from(red.abs_diff(background[2])));
+        diff > OCR_BACKGROUND_DIFF_THRESHOLD
+    }
+
+    fn crop_bgra(
+        source_width: u32,
+        source_height: u32,
+        source_bytes: &[u8],
+        region: BitmapRect,
+    ) -> PerceptionResult<Vec<u8>> {
+        validate_bgra_len(source_width, source_height, source_bytes)?;
+        if region.w == 0
+            || region.h == 0
+            || region.x >= source_width
+            || region.y >= source_height
+            || region.x.saturating_add(region.w) > source_width
+            || region.y.saturating_add(region.h) > source_height
+        {
+            return Err(backend_unavailable(format!(
+                "OCR BGRA crop region out of bounds: source={source_width}x{source_height} region={region:?}"
+            )));
+        }
+        let row_len = usize::try_from(region.w)
+            .ok()
+            .and_then(|w| w.checked_mul(4))
+            .ok_or_else(|| backend_unavailable("OCR BGRA crop row length overflowed".to_owned()))?;
+        let capacity = usize::try_from(region.h)
+            .ok()
+            .and_then(|h| h.checked_mul(row_len))
+            .ok_or_else(|| backend_unavailable("OCR BGRA crop size overflowed".to_owned()))?;
+        let mut output = Vec::with_capacity(capacity);
+        for row in region.y..region.y.saturating_add(region.h) {
+            let start = bgra_offset(source_width, region.x, row).ok_or_else(|| {
+                backend_unavailable("OCR BGRA crop start offset overflowed".to_owned())
+            })?;
+            let end = start.checked_add(row_len).ok_or_else(|| {
+                backend_unavailable("OCR BGRA crop end offset overflowed".to_owned())
+            })?;
+            let slice = source_bytes.get(start..end).ok_or_else(|| {
+                backend_unavailable("OCR BGRA crop row was outside source bytes".to_owned())
+            })?;
+            output.extend_from_slice(slice);
+        }
+        Ok(output)
+    }
+
+    fn dedupe_text_regions(words: &mut Vec<TextRegion>) {
+        words.sort_by(|left, right| {
+            left.bbox
+                .y
+                .cmp(&right.bbox.y)
+                .then(left.bbox.x.cmp(&right.bbox.x))
+                .then(left.text.cmp(&right.text))
+        });
+        let mut deduped: Vec<TextRegion> = Vec::new();
+        'word: for word in words.drain(..) {
+            for existing in &mut deduped {
+                if rect_overlap_ratio(existing.bbox, word.bbox) >= 0.45 {
+                    if ocr_candidate_score(std::slice::from_ref(&word))
+                        > ocr_candidate_score(std::slice::from_ref(existing))
+                    {
+                        *existing = word;
+                    }
+                    continue 'word;
+                }
+            }
+            deduped.push(word);
+        }
+        *words = deduped;
+    }
+
+    fn rect_overlap_ratio(left: Rect, right: Rect) -> f64 {
+        let left_x2 = left.x.saturating_add(left.w.max(0));
+        let left_y2 = left.y.saturating_add(left.h.max(0));
+        let right_x2 = right.x.saturating_add(right.w.max(0));
+        let right_y2 = right.y.saturating_add(right.h.max(0));
+        let overlap_w = left_x2.min(right_x2).saturating_sub(left.x.max(right.x));
+        let overlap_h = left_y2.min(right_y2).saturating_sub(left.y.max(right.y));
+        if overlap_w <= 0 || overlap_h <= 0 {
+            return 0.0;
+        }
+        let overlap_area = f64::from(overlap_w) * f64::from(overlap_h);
+        let left_area = f64::from(left.w.max(0)) * f64::from(left.h.max(0));
+        let right_area = f64::from(right.w.max(0)) * f64::from(right.h.max(0));
+        let min_area = left_area.min(right_area);
+        if min_area <= 0.0 {
+            0.0
+        } else {
+            overlap_area / min_area
+        }
+    }
+
+    fn bgra_offset(width: u32, x: u32, y: u32) -> Option<usize> {
+        u64::from(y)
+            .checked_mul(u64::from(width))?
+            .checked_add(u64::from(x))?
+            .checked_mul(4)?
+            .try_into()
+            .ok()
+    }
+
+    fn u32_to_i32(value: u32) -> i32 {
+        i32::try_from(value).unwrap_or(i32::MAX)
+    }
+
     #[cfg(test)]
     mod tests {
-        use super::{OCR_MAX_UPSCALE, recognition_upscale};
+        use super::{
+            BitmapRect, OCR_MAX_UPSCALE, content_bounds_for_bgra, crop_bgra, recognition_upscale,
+            sparse_ocr_tiles,
+        };
 
         #[test]
         fn small_screen_ocr_regions_are_upscaled_before_recognition() {
-            assert_eq!(recognition_upscale(16), 4);
-            assert_eq!(recognition_upscale(32), 2);
-            assert_eq!(recognition_upscale(64), 1);
-            assert_eq!(recognition_upscale(0), 1);
-            assert_eq!(recognition_upscale(1), OCR_MAX_UPSCALE);
+            assert_eq!(recognition_upscale(256, 16, 4096), 4);
+            assert_eq!(recognition_upscale(256, 32, 4096), 2);
+            assert_eq!(recognition_upscale(256, 64, 4096), 1);
+            assert_eq!(recognition_upscale(256, 0, 4096), 1);
+            assert_eq!(recognition_upscale(8, 1, 4096), OCR_MAX_UPSCALE);
+        }
+
+        #[test]
+        fn wide_regions_do_not_upscale_past_winrt_dimension_limit() {
+            assert_eq!(recognition_upscale(3_490, 57, 4_000), 1);
+            assert_eq!(recognition_upscale(480, 57, 4_000), 2);
+        }
+
+        #[test]
+        fn sparse_ocr_tiles_cover_wide_strips_with_overlap() {
+            let tiles = sparse_ocr_tiles(1_300, 32, 4_000);
+            assert_eq!(
+                tiles,
+                vec![
+                    BitmapRect {
+                        x: 0,
+                        y: 0,
+                        w: 480,
+                        h: 32
+                    },
+                    BitmapRect {
+                        x: 384,
+                        y: 0,
+                        w: 480,
+                        h: 32
+                    },
+                    BitmapRect {
+                        x: 768,
+                        y: 0,
+                        w: 480,
+                        h: 32
+                    },
+                    BitmapRect {
+                        x: 1_152,
+                        y: 0,
+                        w: 148,
+                        h: 32
+                    }
+                ]
+            );
+        }
+
+        #[test]
+        fn bgra_crop_preserves_requested_tile_bytes() {
+            let mut bytes = Vec::new();
+            for pixel in 0_u8..12 {
+                bytes.extend_from_slice(&[pixel, pixel, pixel, 255]);
+            }
+            let crop = crop_bgra(
+                4,
+                3,
+                &bytes,
+                BitmapRect {
+                    x: 1,
+                    y: 1,
+                    w: 2,
+                    h: 2,
+                },
+            )
+            .expect("crop");
+            let pixels = crop
+                .chunks_exact(4)
+                .map(|pixel| pixel[0])
+                .collect::<Vec<_>>();
+            assert_eq!(pixels, vec![5, 6, 9, 10]);
+        }
+
+        #[test]
+        fn content_bounds_trim_blank_background_for_sparse_text() {
+            let width = 24_usize;
+            let height = 10_usize;
+            let mut bytes = vec![255_u8; width * height * 4];
+            for y in 4..6 {
+                for x in 16..20 {
+                    let offset = (y * width + x) * 4;
+                    bytes[offset] = 0;
+                    bytes[offset + 1] = 0;
+                    bytes[offset + 2] = 0;
+                    bytes[offset + 3] = 255;
+                }
+            }
+            let bounds = content_bounds_for_bgra(width as u32, height as u32, &bytes)
+                .expect("content bounds");
+            assert_eq!(
+                bounds,
+                BitmapRect {
+                    x: 10,
+                    y: 0,
+                    w: 14,
+                    h: 10
+                }
+            );
         }
     }
 }

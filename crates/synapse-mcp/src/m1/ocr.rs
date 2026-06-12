@@ -401,12 +401,19 @@ fn is_ambiguous_identifier_token(text: &str) -> bool {
     let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
     let has_separator = token.chars().any(identifier_separator);
     let lower = token.to_ascii_lowercase();
+    let short_all_ambiguous =
+        token.chars().count() <= 4 && token.chars().all(ambiguous_identifier_char);
     let has_ambiguous_pair = [
         "v1", "vl", "vi", "i1", "l1", "1l", "1i", "o0", "0o", "ol", "lo",
     ]
     .iter()
     .any(|pair| lower.contains(pair));
-    has_digit || has_separator || has_ambiguous_pair || lower == "vl" || lower == "v1"
+    has_digit
+        || has_separator
+        || short_all_ambiguous
+        || has_ambiguous_pair
+        || lower == "vl"
+        || lower == "v1"
 }
 
 const fn identifier_char(ch: char) -> bool {
@@ -449,5 +456,33 @@ impl synapse_perception::OcrProvider for SyntheticOcrProvider {
             },
             confidence: 0.99,
         }])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AMBIGUOUS_IDENTIFIER_CONFIDENCE_CAP, identifier_aware_confidence,
+        is_ambiguous_identifier_token,
+    };
+
+    #[test]
+    fn caps_short_tokens_collapsed_to_only_ambiguous_glyphs() {
+        for token in ["II", "OO", "ll", "00", "v1", "vl", "AMBIG724v1"] {
+            assert!(
+                is_ambiguous_identifier_token(token),
+                "{token} should be ambiguity-capped"
+            );
+            assert_eq!(
+                identifier_aware_confidence(token, 1.0),
+                AMBIGUOUS_IDENTIFIER_CONFIDENCE_CAP
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_cap_ordinary_words_containing_some_ambiguous_letters() {
+        assert!(!is_ambiguous_identifier_token("look"));
+        assert_eq!(identifier_aware_confidence("look", 0.96), 0.96);
     }
 }
