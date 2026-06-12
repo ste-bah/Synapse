@@ -29,11 +29,14 @@
 //! lease are tagged `agent { session_id }` (the lease is the canonical "an
 //! agent owns the foreground" signal, epic #719); everything else is `human`.
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-};
 use std::time::{Duration, Instant};
+use std::{
+    collections::VecDeque,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+    },
+};
 
 use anyhow::{Context, Result, bail};
 use chrono::Utc;
@@ -302,6 +305,32 @@ fn current_actor() -> TimelineActor {
 
 const INTERACTION_BUCKET_NS: u64 = 30_000_000_000;
 const INJECTED_UNATTRIBUTED_SESSION_ID: &str = "injected-input";
+const MAX_BROWSER_NAV_DEDUPE_KEYS: usize = 128;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowserNavigationEvent {
+    pub actor: TimelineActor,
+    pub app: Option<String>,
+    pub source: String,
+    pub event: String,
+    pub action: Option<String>,
+    pub url: String,
+    pub title: String,
+    pub tab_id: Option<u32>,
+    pub chrome_window_id: Option<i64>,
+    pub window_hwnd: Option<i64>,
+    pub cdp_target_id: Option<String>,
+    pub endpoint: Option<String>,
+    pub transport: Option<String>,
+    pub requested_url: Option<String>,
+    pub before_url: Option<String>,
+    pub before_title: Option<String>,
+    pub ready_state: Option<String>,
+    pub observed_at_unix_ms: Option<u64>,
+    pub active: Option<bool>,
+    pub highlighted: Option<bool>,
+    pub pinned: Option<bool>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct InteractionBucket {
@@ -476,6 +505,18 @@ fn bucket_start(ts_ns: u64) -> u64 {
 fn sha256_hex(text: &str) -> String {
     let digest = Sha256::digest(text.as_bytes());
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn browser_nav_dedupe_key(event: &BrowserNavigationEvent) -> String {
+    format!(
+        "{:?}\n{:?}\n{:?}\n{:?}\n{}\n{}",
+        event.actor,
+        event.tab_id,
+        event.cdp_target_id,
+        event.window_hwnd,
+        event.url.trim(),
+        event.title
+    )
 }
 
 fn interaction_actor(injected: bool) -> (TimelineActor, &'static str) {
@@ -1059,6 +1100,7 @@ pub struct ActivityRecorder {
     writer: TimelineWriter,
     config: RecorderConfig,
     last_clipboard_sha256: Mutex<Option<String>>,
+    browser_nav_dedupe_keys: Mutex<VecDeque<String>>,
     shutdown_requested: AtomicBool,
     sink_closed_logged: AtomicBool,
     worker: Mutex<Option<JoinHandle<()>>>,
@@ -1186,6 +1228,7 @@ impl ActivityRecorder {
             writer,
             config,
             last_clipboard_sha256: Mutex::new(None),
+            browser_nav_dedupe_keys: Mutex::new(VecDeque::new()),
             shutdown_requested: AtomicBool::new(false),
             sink_closed_logged: AtomicBool::new(false),
             worker: Mutex::new(Some(worker)),
@@ -1237,6 +1280,78 @@ impl ActivityRecorder {
         }
         if wrote_any {
             self.writer.flush_logged();
+        }
+    }
+
+    pub fn record_browser_navigation(&self, event: BrowserNavigationEvent) -> bool {
+        let url = event.url.trim();
+        if url.is_empty() {
+            tracing::warn!(
+                code = "TIMELINE_BROWSER_NAV_EMPTY_URL",
+                source = %event.source,
+                "skipping browser navigation timeline row with empty URL"
+            );
+            return false;
+        }
+        let app = event
+            .app
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .or_else(|| Some("chrome.exe".to_owned()));
+        if self
+            .writer
+            .suppressed(TimelineKind::BrowserNav, app.as_deref())
+        {
+            return false;
+        }
+        let dedupe_key = browser_nav_dedupe_key(&event);
+        if self.browser_nav_seen(&dedupe_key) {
+            return false;
+        }
+        let payload = json!({
+            "url": url,
+            "title": event.title.as_str(),
+            "tab_id": event.tab_id,
+            "chrome_window_id": event.chrome_window_id,
+            "window_hwnd": event.window_hwnd,
+            "cdp_target_id": event.cdp_target_id.as_deref(),
+            "endpoint": event.endpoint.as_deref(),
+            "transport": event.transport.as_deref(),
+            "source": event.source.as_str(),
+            "event": event.event.as_str(),
+            "action": event.action.as_deref(),
+            "requested_url": event.requested_url.as_deref(),
+            "before_url": event.before_url.as_deref(),
+            "before_title": event.before_title.as_deref(),
+            "ready_state": event.ready_state.as_deref(),
+            "observed_at_unix_ms": event.observed_at_unix_ms,
+            "active": event.active,
+            "highlighted": event.highlighted,
+            "pinned": event.pinned,
+        });
+        match self.writer.try_write(
+            now_ts_ns(),
+            TimelineKind::BrowserNav,
+            event.actor,
+            app,
+            payload,
+        ) {
+            Ok(()) => {
+                self.remember_browser_nav_key(dedupe_key);
+                self.writer.flush_logged();
+                true
+            }
+            Err(error) => {
+                self.writer.write_failures.fetch_add(1, Ordering::Relaxed);
+                tracing::error!(
+                    code = "TIMELINE_BROWSER_NAV_WRITE_FAILED",
+                    detail = %format!("{error:#}"),
+                    "failed to persist browser navigation timeline row"
+                );
+                false
+            }
         }
     }
 
@@ -1337,6 +1452,28 @@ impl ActivityRecorder {
                 );
                 false
             }
+        }
+    }
+
+    fn browser_nav_seen(&self, key: &str) -> bool {
+        let guard = match self.browser_nav_dedupe_keys.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.iter().any(|existing| existing == key)
+    }
+
+    fn remember_browser_nav_key(&self, key: String) {
+        let mut guard = match self.browser_nav_dedupe_keys.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.iter().any(|existing| existing == &key) {
+            return;
+        }
+        guard.push_back(key);
+        while guard.len() > MAX_BROWSER_NAV_DEDUPE_KEYS {
+            let _ = guard.pop_front();
         }
     }
 
@@ -1662,6 +1799,7 @@ mod tests {
                 idle_poll_interval_ms: MAX_IDLE_POLL_INTERVAL_MS,
             },
             last_clipboard_sha256: Mutex::new(None),
+            browser_nav_dedupe_keys: Mutex::new(VecDeque::new()),
             shutdown_requested: AtomicBool::new(true),
             sink_closed_logged: AtomicBool::new(false),
             worker: Mutex::new(None),
@@ -1832,6 +1970,93 @@ mod tests {
         assert_eq!(records[0].payload["path"], path);
         assert_eq!(records[0].payload["event_kind"], "modified");
         assert_eq!(records[0].payload["size_bytes"], 42);
+    }
+
+    #[test]
+    fn browser_navigation_writes_url_title_tab_id_and_dedupes() {
+        let (_dir, writer) = temp_writer();
+        let recorder = recorder_for_writer(writer.clone());
+        let event = BrowserNavigationEvent {
+            actor: TimelineActor::Human,
+            app: Some("chrome.exe".to_owned()),
+            source: "tabs.onUpdated".to_owned(),
+            event: "tabNavigation".to_owned(),
+            action: None,
+            url: "https://example.com/issue840".to_owned(),
+            title: "Issue 840 Example".to_owned(),
+            tab_id: Some(84001),
+            chrome_window_id: Some(11),
+            window_hwnd: None,
+            cdp_target_id: Some("chrome-tab:84001".to_owned()),
+            endpoint: Some("chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+            transport: Some("direct_http".to_owned()),
+            requested_url: None,
+            before_url: None,
+            before_title: None,
+            ready_state: Some("complete".to_owned()),
+            observed_at_unix_ms: Some(1_781_280_000_000),
+            active: Some(true),
+            highlighted: Some(true),
+            pinned: Some(false),
+        };
+
+        assert!(recorder.record_browser_navigation(event.clone()));
+        assert!(
+            !recorder.record_browser_navigation(event),
+            "duplicate browser nav rows should be suppressed"
+        );
+        let records = timeline_records(&writer);
+        println!("readback=browser_nav edge=human_tab_event after={records:?}");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, TimelineKind::BrowserNav);
+        assert_eq!(records[0].actor, TimelineActor::Human);
+        assert_eq!(records[0].app.as_deref(), Some("chrome.exe"));
+        assert_eq!(records[0].payload["url"], "https://example.com/issue840");
+        assert_eq!(records[0].payload["title"], "Issue 840 Example");
+        assert_eq!(records[0].payload["tab_id"], 84001);
+        assert_eq!(records[0].payload["ready_state"], "complete");
+    }
+
+    #[test]
+    fn browser_navigation_agent_event_keeps_session_id() {
+        let (_dir, writer) = temp_writer();
+        let recorder = recorder_for_writer(writer.clone());
+        let actor = TimelineActor::Agent {
+            session_id: "issue840-session".to_owned(),
+        };
+
+        assert!(recorder.record_browser_navigation(BrowserNavigationEvent {
+            actor: actor.clone(),
+            app: Some("chrome.exe".to_owned()),
+            source: "cdp_navigate_tab".to_owned(),
+            event: "tool_call".to_owned(),
+            action: Some("navigate".to_owned()),
+            url: "data:text/html,<title>Issue840Agent</title>".to_owned(),
+            title: "Issue840Agent".to_owned(),
+            tab_id: Some(84002),
+            chrome_window_id: None,
+            window_hwnd: Some(0x840),
+            cdp_target_id: Some("chrome-tab:84002".to_owned()),
+            endpoint: Some("chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+            transport: Some("chrome_tabs_extension".to_owned()),
+            requested_url: Some("data:text/html,<title>Issue840Agent</title>".to_owned()),
+            before_url: Some("about:blank".to_owned()),
+            before_title: Some(String::new()),
+            ready_state: Some("complete".to_owned()),
+            observed_at_unix_ms: None,
+            active: None,
+            highlighted: None,
+            pinned: None,
+        }));
+        let records = timeline_records(&writer);
+        println!("readback=browser_nav edge=agent_cdp after={records:?}");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].kind, TimelineKind::BrowserNav);
+        assert_eq!(records[0].actor, actor);
+        assert_eq!(records[0].payload["action"], "navigate");
+        assert_eq!(records[0].payload["window_hwnd"], 0x840);
     }
 
     #[test]

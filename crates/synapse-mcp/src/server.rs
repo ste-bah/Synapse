@@ -15,7 +15,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use synapse_action::{ActionHandle, ActionStateSnapshot, RecordingBackend};
-use synapse_core::{Health, SubsystemHealth, error_codes};
+use synapse_core::{Health, SubsystemHealth, error_codes, types::TimelineActor};
 use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -53,6 +53,7 @@ use crate::{
     },
     m3::{
         M3ServiceConfig, SharedM3State,
+        activity_recorder::BrowserNavigationEvent,
         audio::{
             AudioTailParams, AudioTailResponse, AudioTranscribeParams, AudioTranscribeResponse,
             populate_audio_summary, tail_audio, transcribe_audio,
@@ -241,6 +242,52 @@ pub struct SynapseService {
     terminated_sessions: session_lifecycle::SharedTerminatedSessions,
 }
 
+fn install_chrome_browser_navigation_sink(m3_state: &SharedM3State) {
+    let m3_state = Arc::clone(m3_state);
+    crate::chrome_debugger_bridge::set_browser_navigation_sink(Arc::new(move |event| {
+        let recorder = match m3_state.lock() {
+            Ok(state) => state.activity_recorder.clone(),
+            Err(_error) => {
+                tracing::error!(
+                    code = "TIMELINE_BROWSER_NAV_M3_LOCK_POISONED",
+                    "M3 service state lock poisoned while recording Chrome browser navigation"
+                );
+                return;
+            }
+        };
+        if let Some(recorder) = recorder {
+            let _ = recorder.record_browser_navigation(BrowserNavigationEvent {
+                actor: TimelineActor::Human,
+                app: Some("chrome.exe".to_owned()),
+                source: event.source,
+                event: event.event,
+                action: None,
+                url: event.url,
+                title: event.title,
+                tab_id: event.tab_id,
+                chrome_window_id: event.chrome_window_id,
+                window_hwnd: None,
+                cdp_target_id: event.cdp_target_id,
+                endpoint: event.endpoint,
+                transport: event.transport,
+                requested_url: None,
+                before_url: None,
+                before_title: None,
+                ready_state: event.ready_state,
+                observed_at_unix_ms: event.observed_at_unix_ms,
+                active: event.active,
+                highlighted: event.highlighted,
+                pinned: event.pinned,
+            });
+        } else {
+            tracing::error!(
+                code = "TIMELINE_BROWSER_NAV_RECORDER_MISSING",
+                "Chrome browser navigation event arrived before the activity recorder was available"
+            );
+        }
+    }));
+}
+
 impl SynapseService {
     #[must_use]
     pub fn new() -> Self {
@@ -251,12 +298,14 @@ impl SynapseService {
     }
 
     pub fn try_new() -> anyhow::Result<Self> {
+        let m3_state = shared_m3_state_from_env()?;
+        install_chrome_browser_navigation_sink(&m3_state);
         Ok(Self {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_env()?,
-            m3_state: shared_m3_state_from_env()?,
+            m3_state,
             m4_config: M4ServiceConfig::from_env()?,
             drain_state: drain::DaemonDrainState::default(),
             session_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -279,6 +328,14 @@ impl SynapseService {
         m4_config: M4ServiceConfig,
     ) -> anyhow::Result<Self> {
         let sse_state = SseState::with_max_subscriptions(m3_config.max_subscriptions);
+        let m3_state = shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
+            m3_config,
+            shutdown_cancel.clone(),
+            shutdown_reason,
+            Some(connection_closed_cancel.clone()),
+            sse_state,
+        )?;
+        install_chrome_browser_navigation_sink(&m3_state);
         Ok(Self {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
@@ -289,13 +346,7 @@ impl SynapseService {
                 shutdown_reason,
                 Some(connection_closed_cancel.clone()),
             )?,
-            m3_state: shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
-                m3_config,
-                shutdown_cancel,
-                shutdown_reason,
-                Some(connection_closed_cancel),
-                sse_state,
-            )?,
+            m3_state,
             m4_config,
             drain_state: drain::DaemonDrainState::default(),
             session_targets: Arc::new(Mutex::new(HashMap::new())),
@@ -318,6 +369,14 @@ impl SynapseService {
         m3_config: M3ServiceConfig,
         m4_config: M4ServiceConfig,
     ) -> anyhow::Result<Self> {
+        let m3_state = shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
+            m3_config,
+            shutdown_cancel.clone(),
+            shutdown_reason,
+            Some(connection_closed_cancel.clone()),
+            sse_state,
+        )?;
+        install_chrome_browser_navigation_sink(&m3_state);
         Ok(Self {
             started_at: Instant::now(),
             tool_router: Self::tool_router(),
@@ -328,13 +387,7 @@ impl SynapseService {
                 shutdown_reason,
                 Some(connection_closed_cancel.clone()),
             )?,
-            m3_state: shared_m3_state_from_config_with_shutdown_reason_and_sse_state(
-                m3_config,
-                shutdown_cancel,
-                shutdown_reason,
-                Some(connection_closed_cancel),
-                sse_state,
-            )?,
+            m3_state,
             m4_config,
             drain_state: drain::DaemonDrainState::default(),
             session_targets: Arc::new(Mutex::new(HashMap::new())),

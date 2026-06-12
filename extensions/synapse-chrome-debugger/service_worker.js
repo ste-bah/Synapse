@@ -14,6 +14,8 @@ const WEBSOCKET_KEEPALIVE_MS = 20000;
 const RECONNECT_INITIAL_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 const DISCONNECTED_KEEPALIVE_MS = 20000;
+const AGENT_NAVIGATION_CLAIM_TTL_MS = 30000;
+const MAX_RECENT_NAVIGATION_KEYS = 128;
 
 let hostId = null;
 let bridgeToken = null;
@@ -24,6 +26,8 @@ let reconnectTimer = null;
 let reconnectAttempt = 0;
 let disconnectedKeepAliveTimer = null;
 let permanentlyDisabled = false;
+const agentNavigationClaims = new Map();
+const recentNavigationKeys = [];
 
 function startBridge() {
   if (chrome.runtime.id !== EXPECTED_EXTENSION_ID) {
@@ -291,6 +295,21 @@ function closeWebSocket() {
 
 chrome.runtime.onInstalled.addListener(startBridge);
 chrome.runtime.onStartup.addListener(startBridge);
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (!changeInfo?.url && !changeInfo?.title && changeInfo?.status !== "complete") {
+    return;
+  }
+  postTabNavigationEvent("tabs.onUpdated", tab).catch((error) => {
+    console.warn(`Synapse tab navigation event dropped: ${errorMessage(error)}`);
+  });
+});
+chrome.tabs.onActivated.addListener((activeInfo) => {
+  chrome.tabs.get(activeInfo.tabId)
+    .then((tab) => postTabNavigationEvent("tabs.onActivated", tab))
+    .catch((error) => {
+      console.warn(`Synapse active tab navigation readback failed: ${errorMessage(error)}`);
+    });
+});
 
 startBridge();
 
@@ -341,6 +360,7 @@ function rejectAttachCommand(kind, params) {
 
 async function handleOpenTab(params) {
   const requestedUrl = normalizeOpenUrl(params.url);
+  const agentSessionId = normalizeOptionalSessionId(params.agentSessionId);
   const beforePages = await tabTargets();
   let tab;
   try {
@@ -354,6 +374,11 @@ async function handleOpenTab(params) {
   if (!tab || typeof tab.id !== "number") {
     throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.create returned no numeric tab id");
   }
+  markAgentNavigation(tab.id, {
+    action: "open",
+    requestedUrl: requestedUrl || "about:blank",
+    sessionId: agentSessionId
+  });
   const target = await waitForTabTarget(tab.id, 10000);
   const afterPages = await tabTargets();
   return {
@@ -405,12 +430,18 @@ async function handleNavigateTab(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const action = normalizeNavigateAction(params.action);
   const requestedUrl = action === "navigate" ? requiredUrl(params.url) : null;
+  const agentSessionId = normalizeOptionalSessionId(params.agentSessionId);
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
   const ignoreCache = Boolean(params.ignoreCache);
   const before = await tabPageState(selected.tabId, selected.target);
   let readbackExpectation = null;
   try {
     if (action === "navigate") {
+      markAgentNavigation(selected.tabId, {
+        action,
+        requestedUrl,
+        sessionId: agentSessionId
+      });
       await chrome.tabs.update(selected.tabId, { url: requestedUrl });
       if (requestedUrl !== before.url) {
         readbackExpectation = {
@@ -419,14 +450,29 @@ async function handleNavigateTab(params) {
         };
       }
     } else if (action === "reload") {
+      markAgentNavigation(selected.tabId, {
+        action,
+        requestedUrl: before.url,
+        sessionId: agentSessionId
+      });
       await chrome.tabs.reload(selected.tabId, { bypassCache: ignoreCache });
     } else if (action === "back") {
+      markAgentNavigation(selected.tabId, {
+        action,
+        requestedUrl: null,
+        sessionId: agentSessionId
+      });
       await chrome.tabs.goBack(selected.tabId);
       readbackExpectation = {
         description: `tab url to change after chrome.tabs.goBack from ${JSON.stringify(before.url)}`,
         matches: (state) => state.url !== before.url
       };
     } else if (action === "forward") {
+      markAgentNavigation(selected.tabId, {
+        action,
+        requestedUrl: null,
+        sessionId: agentSessionId
+      });
       await chrome.tabs.goForward(selected.tabId);
       readbackExpectation = {
         description: `tab url to change after chrome.tabs.goForward from ${JSON.stringify(before.url)}`,
@@ -671,6 +717,83 @@ function normalizeNavigateAction(action) {
   throw bridgeError(ERROR_ATTACH_FAILED, `unsupported navigation action ${String(action)}`);
 }
 
+function normalizeOptionalSessionId(value) {
+  const sessionId = String(value || "").trim();
+  return sessionId || null;
+}
+
+function markAgentNavigation(tabId, claim) {
+  if (!Number.isInteger(tabId) || !claim?.sessionId) {
+    return;
+  }
+  agentNavigationClaims.set(tabId, {
+    action: String(claim.action || ""),
+    requestedUrl: claim.requestedUrl === null ? null : String(claim.requestedUrl || ""),
+    sessionId: claim.sessionId,
+    at: Date.now()
+  });
+}
+
+function matchingAgentNavigationClaim(tabId, url, status) {
+  const claim = agentNavigationClaims.get(tabId);
+  if (!claim) {
+    return null;
+  }
+  const ageMs = Date.now() - claim.at;
+  if (ageMs > AGENT_NAVIGATION_CLAIM_TTL_MS) {
+    agentNavigationClaims.delete(tabId);
+    return null;
+  }
+  const requestedUrl = claim.requestedUrl || "";
+  const matchesUrl = !requestedUrl || !url || url === requestedUrl || url.startsWith(requestedUrl) || requestedUrl.startsWith(url);
+  if (!matchesUrl) {
+    return null;
+  }
+  if (status === "complete") {
+    agentNavigationClaims.delete(tabId);
+  }
+  return claim;
+}
+
+async function postTabNavigationEvent(source, tab) {
+  if (!tab || typeof tab.id !== "number") {
+    return;
+  }
+  const url = String(tab.pendingUrl || tab.url || "");
+  if (!url) {
+    return;
+  }
+  const title = String(tab.title || "");
+  const status = String(tab.status || "");
+  const agentClaim = matchingAgentNavigationClaim(tab.id, url, status);
+  if (agentClaim) {
+    return;
+  }
+  const key = `${tab.id}\n${url}\n${title}\n${status}`;
+  if (recentNavigationKeys.includes(key)) {
+    return;
+  }
+  recentNavigationKeys.push(key);
+  while (recentNavigationKeys.length > MAX_RECENT_NAVIGATION_KEYS) {
+    recentNavigationKeys.shift();
+  }
+  await postDaemonMessage({
+    type: "event",
+    event: "tabNavigation",
+    source,
+    target_id: targetIdForTabId(tab.id),
+    tab_id: tab.id,
+    chrome_window_id: Number.isInteger(tab.windowId) ? tab.windowId : null,
+    url,
+    title,
+    status,
+    active: Boolean(tab.active),
+    highlighted: Boolean(tab.highlighted),
+    pinned: Boolean(tab.pinned),
+    observed_at_unix_ms: Date.now()
+  });
+}
+
 function requiredUrl(url) {
   const value = String(url ?? "");
   if (!value || value.trim() !== value || value.includes("\u0000")) {
@@ -735,7 +858,7 @@ async function postDaemonMessage(message) {
       }
     });
   } catch (error) {
-    disableBridgeUntilChromeRestart(
+    disableBridgePermanently(
       `direct daemon message failed: ${errorMessage(error)}`,
       ERROR_DAEMON_UNAVAILABLE
     );

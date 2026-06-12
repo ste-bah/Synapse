@@ -627,6 +627,48 @@ struct ChromeResponseError {
     detail: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct ExtensionTabNavigationEvent {
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    target_id: String,
+    tab_id: u32,
+    #[serde(default)]
+    chrome_window_id: Option<i64>,
+    url: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    highlighted: bool,
+    #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
+    observed_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ChromeDebuggerBrowserNavigationEvent {
+    pub source: String,
+    pub event: String,
+    pub url: String,
+    pub title: String,
+    pub tab_id: Option<u32>,
+    pub chrome_window_id: Option<i64>,
+    pub cdp_target_id: Option<String>,
+    pub endpoint: Option<String>,
+    pub transport: Option<String>,
+    pub ready_state: Option<String>,
+    pub observed_at_unix_ms: Option<u64>,
+    pub active: Option<bool>,
+    pub highlighted: Option<bool>,
+    pub pinned: Option<bool>,
+}
+
 struct PendingResponse {
     host_id: String,
     kind: String,
@@ -664,6 +706,35 @@ struct ChromeDebuggerBridge {
     inner: Mutex<BridgeInner>,
     notify: Notify,
     command_seq: AtomicU64,
+}
+
+type BrowserNavigationSink = dyn Fn(ChromeDebuggerBrowserNavigationEvent) + Send + Sync + 'static;
+
+fn browser_navigation_sink_slot() -> &'static Mutex<Option<Arc<BrowserNavigationSink>>> {
+    static SINK: OnceLock<Mutex<Option<Arc<BrowserNavigationSink>>>> = OnceLock::new();
+    SINK.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn set_browser_navigation_sink(sink: Arc<BrowserNavigationSink>) {
+    match browser_navigation_sink_slot().lock() {
+        Ok(mut guard) => *guard = Some(sink),
+        Err(poisoned) => *poisoned.into_inner() = Some(sink),
+    }
+}
+
+fn emit_browser_navigation_event(event: ChromeDebuggerBrowserNavigationEvent) {
+    let sink = match browser_navigation_sink_slot().lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if let Some(sink) = sink {
+        sink(event);
+    } else {
+        tracing::warn!(
+            code = "CHROME_DEBUGGER_BROWSER_NAV_SINK_MISSING",
+            "Chrome debugger browser navigation event had no recorder sink"
+        );
+    }
 }
 
 impl ChromeDebuggerBridge {
@@ -728,6 +799,7 @@ impl ChromeDebuggerBridge {
     }
 
     fn post_message(&self, request: NativeMessageRequest) -> Result<(), String> {
+        let mut browser_navigation_event = None;
         let mut inner = self
             .inner
             .lock()
@@ -869,6 +941,35 @@ impl ChromeDebuggerBridge {
                         detail = %detail_for_log,
                         "Chrome debugger native port disconnected"
                     );
+                } else if event == "tabNavigation" {
+                    let decoded = serde_json::from_value::<ExtensionTabNavigationEvent>(
+                        request.message.clone(),
+                    )
+                    .map_err(|error| format!("decode Chrome tabNavigation event: {error}"))?;
+                    browser_navigation_event = Some(ChromeDebuggerBrowserNavigationEvent {
+                        source: decoded.source,
+                        event: "tabNavigation".to_owned(),
+                        url: decoded.url,
+                        title: decoded.title,
+                        tab_id: Some(decoded.tab_id),
+                        chrome_window_id: decoded.chrome_window_id,
+                        cdp_target_id: (!decoded.target_id.is_empty()).then_some(decoded.target_id),
+                        endpoint: host
+                            .extension_id
+                            .as_deref()
+                            .map(|extension_id| format!("chrome-extension://{extension_id}")),
+                        transport: host.transport.clone(),
+                        ready_state: (!decoded.status.is_empty()).then_some(decoded.status),
+                        observed_at_unix_ms: decoded.observed_at_unix_ms,
+                        active: Some(decoded.active),
+                        highlighted: Some(decoded.highlighted),
+                        pinned: Some(decoded.pinned),
+                    });
+                    tracing::info!(
+                        code = "CHROME_DEBUGGER_BROWSER_NAVIGATION_EVENT",
+                        host_id = %request.host_id,
+                        "Chrome debugger tab navigation event accepted"
+                    );
                 } else {
                     tracing::info!(
                         code = "CHROME_DEBUGGER_EXTENSION_EVENT",
@@ -894,6 +995,10 @@ impl ChromeDebuggerBridge {
                     "unknown Chrome debugger extension message"
                 );
             }
+        }
+        drop(inner);
+        if let Some(event) = browser_navigation_event {
+            emit_browser_navigation_event(event);
         }
         Ok(())
     }
@@ -1329,6 +1434,7 @@ pub(crate) async fn node_value(
 pub(crate) async fn open_tab(
     hwnd: i64,
     url: &str,
+    agent_session_id: Option<&str>,
 ) -> Result<ChromeDebuggerOpenTabResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_popup_safe(hwnd, "openTab")?;
     let result = bridge()
@@ -1337,6 +1443,7 @@ pub(crate) async fn open_tab(
             json!({
                 "hwnd": hwnd,
                 "url": url,
+                "agentSessionId": agent_session_id,
             }),
         )
         .await?;
@@ -1396,6 +1503,7 @@ pub(crate) async fn navigate_tab(
     url: Option<&str>,
     wait_timeout_ms: u64,
     ignore_cache: bool,
+    agent_session_id: Option<&str>,
 ) -> Result<ChromeDebuggerNavigateResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_popup_safe(hwnd, "navigateTab")?;
     let result = bridge()
@@ -1408,6 +1516,7 @@ pub(crate) async fn navigate_tab(
                 "url": url,
                 "waitTimeoutMs": wait_timeout_ms,
                 "ignoreCache": ignore_cache,
+                "agentSessionId": agent_session_id,
             }),
         )
         .await?;

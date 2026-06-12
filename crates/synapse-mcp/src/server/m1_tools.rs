@@ -16,6 +16,7 @@ use crate::m1::{
     ClipboardTimelineSample, FsTimelineEvent, effective_ocr_backend,
     hidden_desktop_input_from_worker_snapshot,
 };
+use crate::m3::activity_recorder::BrowserNavigationEvent;
 use rmcp::{RoleServer, service::RequestContext};
 
 use std::{
@@ -38,7 +39,7 @@ use sha2::{Digest as _, Sha256};
 use synapse_action::{BackendResolutionPolicy, ResolvedBackend, VigemBackend};
 use synapse_core::{
     ForegroundContext, HudFieldError, HudReadings, InputBackendCapability, InputBackendDiagnostics,
-    OcrResult, Profile, Rect, error_codes,
+    OcrResult, Profile, Rect, error_codes, types::TimelineActor,
 };
 use synapse_perception::ObservationAssembler;
 #[cfg(windows)]
@@ -234,6 +235,27 @@ impl SynapseService {
             recorder.record_observation_enrichment(observation, clipboard, fs_events);
         }
         Ok(())
+    }
+
+    fn record_browser_navigation_timeline(&self, event: BrowserNavigationEvent) {
+        let recorder = match self.m3_state.lock() {
+            Ok(state) => state.activity_recorder.clone(),
+            Err(_error) => {
+                tracing::error!(
+                    code = "TIMELINE_BROWSER_NAV_M3_LOCK_POISONED",
+                    "M3 service state lock poisoned while recording MCP browser navigation"
+                );
+                return;
+            }
+        };
+        if let Some(recorder) = recorder {
+            let _ = recorder.record_browser_navigation(event);
+        } else {
+            tracing::error!(
+                code = "TIMELINE_BROWSER_NAV_RECORDER_MISSING",
+                "MCP browser navigation completed before the activity recorder was available"
+            );
+        }
     }
 
     #[tool(description = "Search visible accessibility nodes and detected entities")]
@@ -1692,17 +1714,18 @@ impl SynapseService {
                 .await;
         }
 
-        let opened = crate::chrome_debugger_bridge::open_tab(window_hwnd, requested_url)
-            .await
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "cdp_open_tab Chrome debugger chrome.tabs.create/readback failed: {}",
-                        error.detail()
-                    ),
-                )
-            })?;
+        let opened =
+            crate::chrome_debugger_bridge::open_tab(window_hwnd, requested_url, Some(session_id))
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "cdp_open_tab Chrome debugger chrome.tabs.create/readback failed: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
         let endpoint = opened
             .extension_id
             .as_deref()
@@ -1745,6 +1768,31 @@ impl SynapseService {
             target_count_after = opened.target_count_after,
             "readback=chrome.tabs.query outcome=target_present"
         );
+        self.record_browser_navigation_timeline(BrowserNavigationEvent {
+            actor: TimelineActor::Agent {
+                session_id: session_id.to_owned(),
+            },
+            app: Some(process_name.to_owned()),
+            source: "cdp_open_tab".to_owned(),
+            event: "tool_call".to_owned(),
+            action: Some("open".to_owned()),
+            url: opened.url.clone(),
+            title: opened.title.clone(),
+            tab_id: Some(opened.tab_id),
+            chrome_window_id: None,
+            window_hwnd: Some(window_hwnd),
+            cdp_target_id: Some(cdp_target_id.clone()),
+            endpoint: Some(endpoint.clone()),
+            transport: Some("chrome_tabs_extension".to_owned()),
+            requested_url: Some(requested_url.to_owned()),
+            before_url: None,
+            before_title: None,
+            ready_state: None,
+            observed_at_unix_ms: None,
+            active: Some(false),
+            highlighted: None,
+            pinned: None,
+        });
         Ok(CdpOpenTabResponse {
             session_id: session_id.to_owned(),
             window_hwnd,
@@ -1814,6 +1862,31 @@ impl SynapseService {
             process_name = %process_name,
             "readback=Target.getTargets outcome=target_present"
         );
+        self.record_browser_navigation_timeline(BrowserNavigationEvent {
+            actor: TimelineActor::Agent {
+                session_id: session_id.to_owned(),
+            },
+            app: Some(process_name.to_owned()),
+            source: "cdp_open_tab".to_owned(),
+            event: "tool_call".to_owned(),
+            action: Some("open".to_owned()),
+            url: opened.target.url.clone(),
+            title: opened.target.title.clone(),
+            tab_id: None,
+            chrome_window_id: None,
+            window_hwnd: Some(window_hwnd),
+            cdp_target_id: Some(cdp_target_id.clone()),
+            endpoint: Some(endpoint.to_owned()),
+            transport: Some("raw_cdp".to_owned()),
+            requested_url: Some(requested_url.to_owned()),
+            before_url: None,
+            before_title: None,
+            ready_state: None,
+            observed_at_unix_ms: None,
+            active: Some(false),
+            highlighted: None,
+            pinned: None,
+        });
         Ok(CdpOpenTabResponse {
             session_id: session_id.to_owned(),
             window_hwnd,
@@ -1972,6 +2045,31 @@ impl SynapseService {
                 after_url = %navigated.after.url,
                 "readback=Page.getNavigationHistory+Runtime.evaluate outcome=target_navigated"
             );
+            self.record_browser_navigation_timeline(BrowserNavigationEvent {
+                actor: TimelineActor::Agent {
+                    session_id: session_id.to_owned(),
+                },
+                app: Some("chrome.exe".to_owned()),
+                source: "cdp_navigate_tab".to_owned(),
+                event: "tool_call".to_owned(),
+                action: Some(navigated.action.clone()),
+                url: navigated.after.url.clone(),
+                title: navigated.after.title.clone(),
+                tab_id: None,
+                chrome_window_id: None,
+                window_hwnd: Some(window_hwnd),
+                cdp_target_id: Some(navigated.target_id.clone()),
+                endpoint: Some(endpoint.clone()),
+                transport: Some("raw_cdp".to_owned()),
+                requested_url: navigated.requested_url.clone(),
+                before_url: Some(navigated.before.url.clone()),
+                before_title: Some(navigated.before.title.clone()),
+                ready_state: Some(navigated.after.ready_state.clone()),
+                observed_at_unix_ms: None,
+                active: Some(false),
+                highlighted: None,
+                pinned: None,
+            });
             return Ok(CdpNavigateTabResponse {
                 session_id: session_id.to_owned(),
                 window_hwnd,
@@ -2006,6 +2104,7 @@ impl SynapseService {
             requested_url,
             wait_timeout_ms,
             ignore_cache,
+            Some(session_id),
         )
         .await
         .map_err(|error| {
@@ -2038,6 +2137,31 @@ impl SynapseService {
             history_readback_source = %navigated.history_readback_source,
             "readback=chrome.tabs.get outcome=target_navigated"
         );
+        self.record_browser_navigation_timeline(BrowserNavigationEvent {
+            actor: TimelineActor::Agent {
+                session_id: session_id.to_owned(),
+            },
+            app: Some("chrome.exe".to_owned()),
+            source: "cdp_navigate_tab".to_owned(),
+            event: "tool_call".to_owned(),
+            action: Some(navigated.action.clone()),
+            url: navigated.after_url.clone(),
+            title: navigated.after_title.clone(),
+            tab_id: Some(navigated.tab_id),
+            chrome_window_id: None,
+            window_hwnd: Some(window_hwnd),
+            cdp_target_id: Some(navigated.target_id.clone()),
+            endpoint: Some(endpoint.clone()),
+            transport: Some("chrome_tabs_extension".to_owned()),
+            requested_url: navigated.requested_url.clone(),
+            before_url: Some(navigated.before_url.clone()),
+            before_title: Some(navigated.before_title.clone()),
+            ready_state: Some(navigated.ready_state.clone()),
+            observed_at_unix_ms: None,
+            active: Some(false),
+            highlighted: None,
+            pinned: None,
+        });
         Ok(CdpNavigateTabResponse {
             session_id: session_id.to_owned(),
             window_hwnd,
