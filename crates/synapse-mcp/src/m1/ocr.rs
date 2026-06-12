@@ -400,6 +400,9 @@ fn is_ambiguous_identifier_token(text: &str) -> bool {
     }
     let has_digit = token.chars().any(|ch| ch.is_ascii_digit());
     let has_separator = token.chars().any(identifier_separator);
+    if looks_like_ordinary_lowercase_word(token) && !has_digit && !has_separator {
+        return false;
+    }
     let lower = token.to_ascii_lowercase();
     let short_all_ambiguous =
         token.chars().count() <= 4 && token.chars().all(ambiguous_identifier_char);
@@ -414,6 +417,13 @@ fn is_ambiguous_identifier_token(text: &str) -> bool {
         || has_ambiguous_pair
         || lower == "vl"
         || lower == "v1"
+}
+
+fn looks_like_ordinary_lowercase_word(token: &str) -> bool {
+    token.len() >= 3
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() && ch.is_ascii_alphabetic())
 }
 
 const fn identifier_char(ch: char) -> bool {

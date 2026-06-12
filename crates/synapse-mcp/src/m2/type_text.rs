@@ -566,19 +566,12 @@ fn chromium_uia_value_pattern_should_be_refused(
     if !synapse_a11y::is_chromium_family(process_name) || !metadata.enabled {
         return false;
     }
-    if !metadata
-        .patterns
-        .iter()
-        .any(|pattern| *pattern == UiaPattern::Value)
-    {
+    if !metadata.patterns.contains(&UiaPattern::Value) {
         return false;
     }
     let role = metadata.role.to_ascii_lowercase();
     let editable_role = role.contains("edit") || role.contains("document") || role.contains("text");
-    let exposes_text_pattern = metadata
-        .patterns
-        .iter()
-        .any(|pattern| *pattern == UiaPattern::Text);
+    let exposes_text_pattern = metadata.patterns.contains(&UiaPattern::Text);
 
     metadata.keyboard_focusable && (editable_role || exposes_text_pattern)
 }

@@ -3762,19 +3762,11 @@ fn chromium_editable_value_pattern_requires_foreground_fallback(
     if !synapse_a11y::is_chromium_family(process_name) || !metadata.enabled {
         return false;
     }
-    if !metadata
-        .patterns
-        .iter()
-        .any(|pattern| *pattern == UiaPattern::Value)
-    {
+    if !metadata.patterns.contains(&UiaPattern::Value) {
         return false;
     }
     metadata.keyboard_focusable
-        && (act_type_editable_role(&metadata.role)
-            || metadata
-                .patterns
-                .iter()
-                .any(|pattern| *pattern == UiaPattern::Text))
+        && (act_type_editable_role(&metadata.role) || metadata.patterns.contains(&UiaPattern::Text))
 }
 
 fn act_type_editable_role(role: &str) -> bool {
@@ -3853,11 +3845,11 @@ fn verify_foreground_transition(
     let process_matches = policy
         .expected_process_regex
         .as_ref()
-        .map_or(true, |regex| regex.is_match(&after.foreground_process));
+        .is_none_or(|regex| regex.is_match(&after.foreground_process));
     let title_matches = policy
         .expected_title_regex
         .as_ref()
-        .map_or(true, |regex| regex.is_match(&after.foreground_title));
+        .is_none_or(|regex| regex.is_match(&after.foreground_title));
 
     if !process_matches || !title_matches {
         return Err(foreground_change_policy_mismatch_error(

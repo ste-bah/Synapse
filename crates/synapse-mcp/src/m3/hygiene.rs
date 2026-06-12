@@ -1269,7 +1269,7 @@ fn validate_limit(value: u32, min: u32, max: u32, name: &str) -> Result<u32, Err
 
 fn validate_hex_text(value: &str, field: &str) -> Result<(), ErrorData> {
     if value.is_empty()
-        || value.len() % 2 != 0
+        || !value.len().is_multiple_of(2)
         || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(invalid(format!(
@@ -1296,7 +1296,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(text.len() / 2);

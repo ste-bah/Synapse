@@ -695,7 +695,7 @@ pub fn empty_input_schema() -> Arc<JsonObject> {
 }
 
 pub fn set_target_input_schema() -> Arc<JsonObject> {
-    json!({
+    let schema = json!({
         "type": "object",
         "additionalProperties": false,
         "required": ["target"],
@@ -742,11 +742,11 @@ pub fn set_target_input_schema() -> Arc<JsonObject> {
                 ]
             }
         }
-    })
-    .as_object()
-    .expect("set_target input schema is a JSON object")
-    .clone()
-    .into()
+    });
+    match schema {
+        Value::Object(object) => object.into(),
+        _ => Map::new().into(),
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]

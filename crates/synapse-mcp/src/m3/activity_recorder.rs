@@ -72,6 +72,7 @@ const SHUTDOWN_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct RecorderConfig {
     pub idle_timeout_ms: u64,
     pub idle_poll_interval_ms: u64,
+    interaction_hook_enabled: bool,
 }
 
 impl RecorderConfig {
@@ -104,7 +105,14 @@ impl RecorderConfig {
         Ok(Self {
             idle_timeout_ms,
             idle_poll_interval_ms,
+            interaction_hook_enabled: true,
         })
+    }
+
+    #[cfg(test)]
+    fn without_interaction_hook(mut self) -> Self {
+        self.interaction_hook_enabled = false;
+        self
     }
 }
 
@@ -478,9 +486,10 @@ impl InteractionAccumulator {
         input_origin: &'static str,
         writer: &TimelineWriter,
     ) {
-        let needs_new = self.current.as_ref().map_or(true, |bucket| {
-            !bucket.accepts(ts_ns, context, &actor, input_origin)
-        });
+        let needs_new = self
+            .current
+            .as_ref()
+            .is_none_or(|bucket| !bucket.accepts(ts_ns, context, &actor, input_origin));
         if needs_new {
             self.flush(writer);
             self.current = Some(InteractionBucket::new(ts_ns, context, actor, input_origin));
@@ -1205,13 +1214,14 @@ impl ActivityRecorder {
         };
         let worker = tokio::spawn(run_worker(receiver, state));
         let idle_probe = tokio::spawn(run_idle_probe(sender.clone(), config.idle_poll_interval_ms));
-        let (interaction_hook, interaction_bridge) = if writer.control.is_paused() {
-            (None, None)
-        } else {
-            let (hook, bridge) = start_interaction_pipeline(&sender)
-                .context("start counts-only interaction cadence hook")?;
-            (Some(hook), Some(bridge))
-        };
+        let (interaction_hook, interaction_bridge) =
+            if writer.control.is_paused() || !config.interaction_hook_enabled {
+                (None, None)
+            } else {
+                let (hook, bridge) = start_interaction_pipeline(&sender)
+                    .context("start counts-only interaction cadence hook")?;
+                (Some(hook), Some(bridge))
+            };
         tracing::info!(
             code = "TIMELINE_RECORDER_STARTED",
             idle_timeout_ms = config.idle_timeout_ms,
@@ -1550,7 +1560,9 @@ impl ActivityRecorder {
         paused_until_ns: Option<u64>,
         changed_by: &str,
     ) -> Result<RecorderControlOutcome> {
-        self.flush_interactions_blocking();
+        if self.config.interaction_hook_enabled {
+            self.flush_interactions_blocking();
+        }
         let outcome = pause_recording(&self.writer, paused_until_ns, changed_by)?;
         if !outcome.was_paused {
             self.stop_interaction_hook();
@@ -1567,7 +1579,7 @@ impl ActivityRecorder {
     /// error says so explicitly).
     pub fn resume(&self, changed_by: &str) -> Result<RecorderControlOutcome> {
         let outcome = resume_recording(&self.writer, changed_by)?;
-        if outcome.was_paused {
+        if outcome.was_paused && self.config.interaction_hook_enabled {
             self.start_interaction_hook()
                 .context("timeline resumed but starting the interaction cadence hook failed")?;
         }
@@ -1797,6 +1809,7 @@ mod tests {
             config: RecorderConfig {
                 idle_timeout_ms: DEFAULT_IDLE_TIMEOUT_MS,
                 idle_poll_interval_ms: MAX_IDLE_POLL_INTERVAL_MS,
+                interaction_hook_enabled: false,
             },
             last_clipboard_sha256: Mutex::new(None),
             browser_nav_dedupe_keys: Mutex::new(VecDeque::new()),
@@ -2199,7 +2212,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("open temp db: {error}")),
         );
         let config = RecorderConfig::from_raw(Some("600000"))
-            .unwrap_or_else(|error| panic!("config: {error}"));
+            .unwrap_or_else(|error| panic!("config: {error}"))
+            .without_interaction_hook();
         let control = Arc::new(
             crate::m3::timeline_control::RecorderControl::hydrate(&db)
                 .unwrap_or_else(|error| panic!("hydrate control: {error:#}")),
@@ -2304,11 +2318,6 @@ mod tests {
             "readback=cf_timeline edge=real_foreground after=rows:{}",
             rows.len()
         );
-        assert_eq!(
-            rows.len(),
-            4,
-            "session_start + human focus_change + agent focus_change + session_end"
-        );
         let records: Vec<TimelineRecord> = rows
             .iter()
             .map(|(key, value)| {
@@ -2319,23 +2328,32 @@ mod tests {
                     .unwrap_or_else(|error| panic!("decode record: {error}"))
             })
             .collect();
-        assert_eq!(records[0].kind, TimelineKind::SessionStart);
-        assert_eq!(records[1].kind, TimelineKind::FocusChange);
-        assert_eq!(records[2].kind, TimelineKind::FocusChange);
-        assert_eq!(records[3].kind, TimelineKind::SessionEnd);
+        let primary_records: Vec<&TimelineRecord> = records
+            .iter()
+            .filter(|record| record.kind != TimelineKind::InteractionSummary)
+            .collect();
         assert_eq!(
-            records[1].app.as_deref(),
+            primary_records.len(),
+            4,
+            "session_start + human focus_change + agent focus_change + session_end; all rows={records:?}"
+        );
+        assert_eq!(primary_records[0].kind, TimelineKind::SessionStart);
+        assert_eq!(primary_records[1].kind, TimelineKind::FocusChange);
+        assert_eq!(primary_records[2].kind, TimelineKind::FocusChange);
+        assert_eq!(primary_records[3].kind, TimelineKind::SessionEnd);
+        assert_eq!(
+            primary_records[1].app.as_deref(),
             Some(context.process_name.as_str()),
             "focus_change row must carry the real foreground process"
         );
         assert_eq!(
-            records[1].actor,
+            primary_records[1].actor,
             TimelineActor::Human,
             "unleased foreground change must be attributed to the human"
         );
         let expected_session = format!("fsv-agent-{}", std::process::id());
         assert_eq!(
-            records[2].actor,
+            primary_records[2].actor,
             TimelineActor::Agent {
                 session_id: expected_session
             },
@@ -2362,7 +2380,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("open temp db: {error}")),
         );
         let config = RecorderConfig::from_raw(Some("600000"))
-            .unwrap_or_else(|error| panic!("config: {error}"));
+            .unwrap_or_else(|error| panic!("config: {error}"))
+            .without_interaction_hook();
         let control = Arc::new(
             RecorderControl::hydrate(&db).unwrap_or_else(|error| panic!("hydrate: {error:#}")),
         );
