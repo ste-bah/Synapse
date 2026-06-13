@@ -344,6 +344,13 @@ impl SynapseService {
         crate::m3::approvals::approval_snapshot(&db, kind)
     }
 
+    pub(crate) fn local_model_registry_snapshot(
+        &self,
+    ) -> Result<Vec<crate::m3::local_models::LocalModelRegistryRow>, ErrorData> {
+        let db = self.m3_storage()?;
+        crate::m3::local_models::local_model_snapshot(&db)
+    }
+
     pub(crate) fn approval_decide_from_activation(
         &self,
         params: &crate::m3::approvals::ApprovalActivationParams,

@@ -281,11 +281,12 @@ pub(super) async fn serve(
     // Periodic transcript ingester (#900): tails spawned-agent stdout JSONL
     // into CF_AGENT_TRANSCRIPTS. Same contract as the miner: a misconfigured
     // schedule is a startup failure, not a silently substituted default.
-    let _transcript_ingest_task = crate::server::agent_transcripts::spawn_periodic_transcript_ingest(
-        service.m3_state_handle(),
-        shutdown_cancel.clone(),
-    )
-    .context("spawn periodic transcript ingester")?;
+    let _transcript_ingest_task =
+        crate::server::agent_transcripts::spawn_periodic_transcript_ingest(
+            service.m3_state_handle(),
+            shutdown_cancel.clone(),
+        )
+        .context("spawn periodic transcript ingester")?;
 
     let _operator_hotkey_guard = crate::safety::install_operator_hotkey(service.m3_state_handle())
         .context("install operator panic hotkey")?;
@@ -1266,6 +1267,7 @@ struct DashboardStateResponse {
     approvals: DashboardPanel,
     suggestions: DashboardPanel,
     armed_runs: DashboardPanel,
+    local_models: DashboardPanel,
 }
 
 #[derive(Serialize)]
@@ -1338,6 +1340,15 @@ struct DashboardApprovalSurface {
     rows: Vec<crate::m3::approvals::ApprovalQueueItem>,
 }
 
+#[derive(Serialize)]
+struct DashboardLocalModelSurface {
+    tool: &'static str,
+    available: bool,
+    enabled_count: usize,
+    unhealthy_count: usize,
+    rows: Vec<crate::m3::local_models::LocalModelRegistryRow>,
+}
+
 async fn dashboard_index(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return response;
@@ -1397,6 +1408,7 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
             &tool_names,
             Some(crate::m3::approvals::ApprovalKind::ArmedRunReview),
         ),
+        local_models: local_model_panel(&state, &tool_names),
     };
     Json(response).into_response()
 }
@@ -1478,6 +1490,32 @@ fn approval_panel(
             },
         ),
         Err(error) => DashboardPanel::error("approval_list", format!("{error:?}")),
+    }
+}
+
+fn local_model_panel(state: &HttpState, tool_names: &BTreeSet<&str>) -> DashboardPanel {
+    if !tool_names.contains("local_model_list") {
+        return deferred_panel("local_model_list", tool_names);
+    }
+    match state.health_service.local_model_registry_snapshot() {
+        Ok(rows) => {
+            let enabled_count = rows.iter().filter(|row| row.enabled).count();
+            let unhealthy_count = rows
+                .iter()
+                .filter(|row| row.last_probe.as_ref().is_some_and(|probe| !probe.healthy))
+                .count();
+            DashboardPanel::ok(
+                "local_model_list",
+                DashboardLocalModelSurface {
+                    tool: "local_model_list",
+                    available: true,
+                    enabled_count,
+                    unhealthy_count,
+                    rows,
+                },
+            )
+        }
+        Err(error) => DashboardPanel::error("local_model_list", format!("{error:?}")),
     }
 }
 

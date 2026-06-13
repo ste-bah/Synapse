@@ -75,6 +75,13 @@ use crate::{
             HygieneScanStorageResponse, HygieneScanTextParams, HygieneScanTextResponse,
             query_flags, scan_storage, scan_text_tool,
         },
+        local_models::{
+            LocalModelListParams, LocalModelListResponse, LocalModelProbeParams,
+            LocalModelProbeResponse, LocalModelRegisterParams, LocalModelRegisterResponse,
+            LocalModelRemoveParams, LocalModelRemoveResponse, LocalModelUpdateParams,
+            LocalModelUpdateResponse, list_local_models, probe_local_model, register_local_model,
+            remove_local_model, update_local_model,
+        },
         permissions::{RequiredPermissions, authorization_error},
         profile::{
             ProfileActivateParams, ProfileActivateResponse, ProfileListParams, ProfileListResponse,

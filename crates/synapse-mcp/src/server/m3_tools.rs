@@ -10,40 +10,45 @@ use super::{
     EpisodeGetParams, EpisodeGetResponse, EpisodeListParams, EpisodeListResponse,
     EpisodeSegmentParams, EpisodeSegmentResponse, ErrorData, HygieneFlagsParams,
     HygieneFlagsResponse, HygieneScanStorageParams, HygieneScanStorageResponse,
-    HygieneScanTextParams, HygieneScanTextResponse, Json, Parameters, ProfileActivateParams,
-    ProfileActivateResponse, ProfileAuthoringDecideParams, ProfileAuthoringDecideResponse,
-    ProfileAuthoringExportParams, ProfileAuthoringExportResponse, ProfileAuthoringGenerateParams,
-    ProfileAuthoringGenerateResponse, ProfileAuthoringInspectParams,
-    ProfileAuthoringInspectResponse, ProfileAuthoringListParams, ProfileAuthoringListResponse,
-    ProfileListParams, ProfileListResponse, ProfileQualityRefreshParams,
-    ProfileQualityRefreshResponse, ProfileRegistryDisableParams, ProfileRegistryDisableResponse,
-    ProfileRegistryExportParams, ProfileRegistryExportResponse, ProfileRegistryImportParams,
-    ProfileRegistryImportResponse, ProfileRegistryInstallParams, ProfileRegistryInstallResponse,
-    ProfileRegistryQueryParams, ProfileRegistryQueryResponse, ProfileRegistryRollbackParams,
-    ProfileRegistryRollbackResponse, ReflexCancelParams, ReflexCancelResponse, ReflexHistoryParams,
-    ReflexHistoryResponse, ReflexListParams, ReflexListResponse, ReflexRegisterParams,
-    ReflexRegisterResponse, ReplayRecordParams, ReplayRecordResponse, RoutineInspectParams,
-    RoutineInspectResponse, RoutineListParams, RoutineListResponse, RoutineMineParams,
-    RoutineMineResponse, RoutineUpdateParams, RoutineUpdateResponse, StorageGcOnceParams,
-    StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
-    StoragePressureSampleParams, StoragePressureSampleResponse, StoragePutProbeRowsParams,
-    StoragePutProbeRowsResponse, SubscribeCancelParams, SubscribeCancelResponse, SubscribeParams,
-    SubscribeResponse, SynapseService, TimelineExclusionsParams, TimelineExclusionsResponse,
-    TimelinePauseParams, TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse,
-    TimelineResumeParams, TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
+    HygieneScanTextParams, HygieneScanTextResponse, Json, LocalModelListParams,
+    LocalModelListResponse, LocalModelProbeParams, LocalModelProbeResponse,
+    LocalModelRegisterParams, LocalModelRegisterResponse, LocalModelRemoveParams,
+    LocalModelRemoveResponse, LocalModelUpdateParams, LocalModelUpdateResponse, Parameters,
+    ProfileActivateParams, ProfileActivateResponse, ProfileAuthoringDecideParams,
+    ProfileAuthoringDecideResponse, ProfileAuthoringExportParams, ProfileAuthoringExportResponse,
+    ProfileAuthoringGenerateParams, ProfileAuthoringGenerateResponse,
+    ProfileAuthoringInspectParams, ProfileAuthoringInspectResponse, ProfileAuthoringListParams,
+    ProfileAuthoringListResponse, ProfileListParams, ProfileListResponse,
+    ProfileQualityRefreshParams, ProfileQualityRefreshResponse, ProfileRegistryDisableParams,
+    ProfileRegistryDisableResponse, ProfileRegistryExportParams, ProfileRegistryExportResponse,
+    ProfileRegistryImportParams, ProfileRegistryImportResponse, ProfileRegistryInstallParams,
+    ProfileRegistryInstallResponse, ProfileRegistryQueryParams, ProfileRegistryQueryResponse,
+    ProfileRegistryRollbackParams, ProfileRegistryRollbackResponse, ReflexCancelParams,
+    ReflexCancelResponse, ReflexHistoryParams, ReflexHistoryResponse, ReflexListParams,
+    ReflexListResponse, ReflexRegisterParams, ReflexRegisterResponse, ReplayRecordParams,
+    ReplayRecordResponse, RoutineInspectParams, RoutineInspectResponse, RoutineListParams,
+    RoutineListResponse, RoutineMineParams, RoutineMineResponse, RoutineUpdateParams,
+    RoutineUpdateResponse, StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams,
+    StorageInspectResponse, StoragePressureSampleParams, StoragePressureSampleResponse,
+    StoragePutProbeRowsParams, StoragePutProbeRowsResponse, SubscribeCancelParams,
+    SubscribeCancelResponse, SubscribeParams, SubscribeResponse, SynapseService,
+    TimelineExclusionsParams, TimelineExclusionsResponse, TimelinePauseParams,
+    TimelinePauseResponse, TimelinePurgeParams, TimelinePurgeResponse, TimelineResumeParams,
+    TimelineResumeResponse, TimelineSearchParams, TimelineSearchResponse,
     apply_storage_pressure_sample, cancel_file_jsonl_tail_watcher, cancel_reflex,
     cancel_subscription, decide_approval, decide_profile_authoring_candidate,
     disable_registry_profile, export_audit_bundle, export_profile_authoring_candidate,
     export_registry, generate_profile_authoring_candidate, get_episode, history_reflexes,
     import_registry, inspect_profile_authoring_candidate, inspect_routine, inspect_storage,
     install_file_jsonl_tail_watcher, install_registry_package, list_approvals, list_episodes,
-    list_profile_authoring_candidates, list_profiles, list_reflexes, list_routines,
-    mine_and_store_routines, pause_timeline, prepare_activation_links, purge_timeline,
-    put_probe_rows, query_audit_intelligence, query_flags, query_registry, record_replay,
-    refresh_profile_quality, register_reflex, request_approval, resume_timeline,
-    rollback_registry_profile, run_storage_gc_once, scan_storage, scan_text_tool, search_timeline,
-    segment_episodes, subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
-    update_approval_toast_state, update_routine, update_timeline_exclusions,
+    list_local_models, list_profile_authoring_candidates, list_profiles, list_reflexes,
+    list_routines, mine_and_store_routines, pause_timeline, prepare_activation_links,
+    probe_local_model, purge_timeline, put_probe_rows, query_audit_intelligence, query_flags,
+    query_registry, record_replay, refresh_profile_quality, register_local_model, register_reflex,
+    remove_local_model, request_approval, resume_timeline, rollback_registry_profile,
+    run_storage_gc_once, scan_storage, scan_text_tool, search_timeline, segment_episodes,
+    subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
+    update_approval_toast_state, update_local_model, update_routine, update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
 use std::sync::Arc;
@@ -972,6 +977,128 @@ impl SynapseService {
         )?;
         let runtime = self.reflex_runtime()?;
         query_flags(&runtime, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "Register one operator-supplied OpenAI-compatible local model endpoint in CF_KV after a forced structured tool-call probe. Stores no API key value; api_key_env_var is an environment variable name only."
+    )]
+    pub async fn local_model_register(
+        &self,
+        params: Parameters<LocalModelRegisterParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<LocalModelRegisterResponse>, ErrorData> {
+        let params = params.0;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "local_model_register",
+            name = %params.name,
+            model_id = %params.model_id,
+            has_api_key_env_var = params.api_key_env_var.is_some(),
+            "tool.invocation kind=local_model_register"
+        );
+        self.require_m3_permissions(
+            "local_model_register",
+            &crate::m3::local_models::required_permissions_register(&params),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        let db = self.m3_storage()?;
+        register_local_model(&db, params, &by_session)
+            .await
+            .map(Json)
+    }
+
+    #[tool(description = "List operator-supplied local model registry rows from CF_KV")]
+    pub async fn local_model_list(
+        &self,
+        params: Parameters<LocalModelListParams>,
+    ) -> Result<Json<LocalModelListResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "local_model_list",
+            name = ?params.0.name,
+            include_disabled = params.0.include_disabled,
+            limit = params.0.limit,
+            "tool.invocation kind=local_model_list"
+        );
+        self.require_m3_permissions(
+            "local_model_list",
+            &crate::m3::local_models::required_permissions_list(&params.0),
+        )?;
+        let db = self.m3_storage()?;
+        list_local_models(&db, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "Update one local model registry row in CF_KV. Endpoint/model/API-key changes are accepted only after the same forced structured tool-call probe passes."
+    )]
+    pub async fn local_model_update(
+        &self,
+        params: Parameters<LocalModelUpdateParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<LocalModelUpdateResponse>, ErrorData> {
+        let params = params.0;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "local_model_update",
+            name = %params.name,
+            new_name = ?params.new_name,
+            changes_endpoint = params.base_url.is_some() || params.model_id.is_some() || params.api_shape.is_some(),
+            "tool.invocation kind=local_model_update"
+        );
+        self.require_m3_permissions(
+            "local_model_update",
+            &crate::m3::local_models::required_permissions_update(&params),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        let db = self.m3_storage()?;
+        update_local_model(&db, params, &by_session).await.map(Json)
+    }
+
+    #[tool(description = "Remove one operator-supplied local model registry row from CF_KV")]
+    pub async fn local_model_remove(
+        &self,
+        params: Parameters<LocalModelRemoveParams>,
+    ) -> Result<Json<LocalModelRemoveResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "local_model_remove",
+            name = %params.0.name,
+            "tool.invocation kind=local_model_remove"
+        );
+        self.require_m3_permissions(
+            "local_model_remove",
+            &crate::m3::local_models::required_permissions_remove(&params.0),
+        )?;
+        let db = self.m3_storage()?;
+        remove_local_model(&db, &params.0).map(Json)
+    }
+
+    #[tool(
+        description = "Re-probe one local model registry row with a forced structured tool-call request, then persist healthy/unhealthy latency and token-rate metadata in CF_KV."
+    )]
+    pub async fn local_model_probe(
+        &self,
+        params: Parameters<LocalModelProbeParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<LocalModelProbeResponse>, ErrorData> {
+        let params = params.0;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "local_model_probe",
+            name = %params.name,
+            timeout_ms = ?params.timeout_ms,
+            "tool.invocation kind=local_model_probe"
+        );
+        self.require_m3_permissions(
+            "local_model_probe",
+            &crate::m3::local_models::required_permissions_probe(&params),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        let db = self.m3_storage()?;
+        probe_local_model(&db, &params, &by_session).await.map(Json)
     }
 
     #[tool(description = "Inspect storage sizes, row counts, and pressure state")]

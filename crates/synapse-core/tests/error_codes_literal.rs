@@ -121,6 +121,10 @@ fn error_codes_match_literal_names() {
     assert_literal!(MODEL_HASH_MISMATCH);
     assert_literal!(MODEL_LOAD_FAILED);
     assert_literal!(MODEL_BACKEND_UNAVAILABLE);
+    assert_literal!(MODEL_TOOLS_UNSUPPORTED);
+    assert_literal!(MODEL_ENDPOINT_UNREACHABLE);
+    assert_literal!(MODEL_REGISTRY_NOT_FOUND);
+    assert_literal!(MODEL_REGISTRY_CONFLICT);
 
     assert_literal!(SAFETY_KILLSWITCH_ACTIVE);
     assert_literal!(SAFETY_PROCESS_DENYLISTED);

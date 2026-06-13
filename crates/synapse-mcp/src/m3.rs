@@ -7,6 +7,7 @@ pub mod audit_retention;
 pub mod episodes;
 pub mod hygiene;
 pub mod interaction_cadence;
+pub mod local_models;
 pub mod permissions;
 pub mod profile;
 pub mod profile_authoring;
@@ -563,7 +564,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 47] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 52] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -596,6 +597,11 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 47] {
         hygiene::hygiene_scan_text(),
         hygiene::hygiene_scan_storage(),
         hygiene::hygiene_flags(),
+        local_models::local_model_register(),
+        local_models::local_model_list(),
+        local_models::local_model_update(),
+        local_models::local_model_remove(),
+        local_models::local_model_probe(),
         storage::storage_inspect(),
         storage::storage_put_probe_rows(),
         storage::storage_gc_once(),
