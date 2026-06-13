@@ -1,0 +1,186 @@
+/* =============================================================================
+ * Synapse Command Center — Design Tokens (single source of truth)  [#946]
+ * -----------------------------------------------------------------------------
+ * Authored in OKLCH for perceptually-uniform ramps. Semantic tokens name
+ * INTENT, not color. No dashboard view may hardcode a hex / px (off-scale) /
+ * font-name — only `var(--token)` (charter #945, this is the theme it
+ * references).
+ *
+ * Dark is the default (`:root`). Light mirrors the ramp under
+ * `:root[data-theme="light"]`. Every text-on-surface and status pair in here is
+ * WCAG 2.1 AA verified — see DESIGN.md › Contrast audit (resolved by the real
+ * Chrome OKLCH engine, not a re-implementation).
+ * ============================================================================= */
+
+:root {
+  color-scheme: dark;
+
+  /* ---- Canvas & surface ladder (lift = hierarchy, not shadows) ------------- */
+  --canvas:        oklch(0.16 0.004 285); /* app background, near-black faint-cool */
+  --surface-1:     oklch(0.20 0.005 285); /* cards, panels */
+  --surface-2:     oklch(0.24 0.006 285); /* hover, raised tiles */
+  --surface-3:     oklch(0.27 0.007 285); /* popovers, overlays, command palette */
+
+  /* ---- Hairlines ---------------------------------------------------------- */
+  --border-subtle: oklch(0.27 0.006 285); /* decorative divider inside cards (hairline; exempt) */
+  --border:        oklch(0.36 0.008 285); /* default panel/card border (decorative hairline; exempt) */
+  --border-strong: oklch(0.54 0.011 285); /* boundary of interactive/emphasized controls — >=3:1 */
+
+  /* ---- Text ramp ---------------------------------------------------------- */
+  --text-primary:  oklch(0.97 0.003 285); /* headings, key values */
+  --text-secondary:oklch(0.80 0.006 285); /* body */
+  --text-muted:    oklch(0.66 0.008 285); /* labels, metadata, timestamps */
+  --text-disabled: oklch(0.52 0.008 285); /* disabled only (AA-exempt, never load-bearing) */
+
+  /* ---- Single brand accent (lavender-blue, deployed scarcely) ------------- *
+   * L darkened from the 0.62 starting point to 0.54 so white label text on an
+   * accent-filled primary button clears WCAG AA (4.5:1) — see contrast audit. */
+  --accent:        oklch(0.54 0.18 264);
+  --accent-hover:  oklch(0.60 0.18 264);
+  --accent-fg:     oklch(0.98 0 0);       /* text/icon on an accent fill */
+  --focus-ring:    oklch(0.74 0.14 264);  /* focus indicator (>=3:1 on every surface) */
+
+  /* ---- Semantic status — solid hue (dots, icons, charts, borders) --------- */
+  /* These are the "graphical" status colors used for >=3:1 UI-component contrast
+   * (dots/icons/lines). Text labels use the *-fg badge foregrounds below. */
+  --success:       oklch(0.76 0.15 165);  /* teal-lean green */
+  --warning:       oklch(0.82 0.14  85);  /* amber */
+  --danger:        oklch(0.68 0.20  25);  /* red — reserved for genuinely urgent */
+  --info:          oklch(0.74 0.13 235);  /* blue — "working" */
+
+  /* ---- Status badges — tinted bg + darker-on-light fg + solid border ------ *
+   * Survives Windows forced-colors mode; never a fully saturated fill.
+   * fg-on-bg is AA (>=4.5:1) verified; border gives the forced-colors fallback. */
+  --success-bg:    oklch(0.30 0.05 165);
+  --success-fg:    oklch(0.90 0.13 165);
+  --success-border:oklch(0.50 0.11 165);
+  --warning-bg:    oklch(0.31 0.05  85);
+  --warning-fg:    oklch(0.92 0.13  85);
+  --warning-border:oklch(0.52 0.11  85);
+  --danger-bg:     oklch(0.30 0.07  25);
+  --danger-fg:     oklch(0.88 0.13  25);
+  --danger-border: oklch(0.52 0.16  25);
+  --info-bg:       oklch(0.30 0.05 235);
+  --info-fg:       oklch(0.90 0.11 235);
+  --info-border:   oklch(0.50 0.10 235);
+
+  /* ---- Elevation (dark: one soft shadow for overlays only; no glows) ------ */
+  --shadow-overlay: 0 8px 24px -8px oklch(0 0 0 / 0.55);
+
+  /* =====================================================================
+   * Scale tokens below are theme-invariant (shared by light + dark).
+   * ===================================================================== */
+
+  /* ---- Typography --------------------------------------------------------- */
+  --font-ui:   "Inter", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace, monospace;
+
+  --text-label-size: 11px;  --text-label-weight: 500; --text-label-tracking:  0.04em;
+  --text-xs-size:    12px;  --text-xs-weight:    400;
+  --text-sm-size:    13px;  --text-sm-weight:    400;
+  --text-base-size:  14px;  --text-base-weight:  400; --text-base-lh: 1.5;
+  --text-md-size:    16px;  --text-md-weight:    500;
+  --text-lg-size:    18px;  --text-lg-weight:    600;
+  --text-xl-size:    20px;  --text-xl-weight:    600;
+  --text-2xl-size:   24px;  --text-2xl-weight:   600; --text-2xl-tracking: -0.01em;
+  --text-display-size: 30px;--text-display-weight:600; --text-display-tracking: -0.02em;
+  --text-metric-size: 32px; --text-metric-weight: 600; /* tabular; 28–36 responsive */
+
+  /* ---- Spacing — 4px base unit, 8px dominant rhythm ----------------------- */
+  --space-0:    0px;
+  --space-0_5:  2px;
+  --space-1:    4px;
+  --space-2:    8px;
+  --space-3:    12px;
+  --space-4:    16px;
+  --space-6:    24px;
+  --space-8:    32px;
+  --space-12:   48px;
+  --space-16:   64px;
+  --space-24:   96px;
+
+  /* ---- Radius ------------------------------------------------------------- */
+  --radius-sm:  4px;
+  --radius-md:  6px;
+  --radius-lg:  8px;
+  --radius-xl:  12px;
+  --radius-pill: 9999px;
+
+  /* ---- Motion (respect prefers-reduced-motion; see bottom) ---------------- */
+  --motion-micro:    120ms;
+  --motion-standard: 200ms;
+  --motion-pulse:    1000ms;
+  --motion-ease:     cubic-bezier(0.2, 0, 0, 1); /* ease-out */
+
+  /* ---- Layout grid -------------------------------------------------------- */
+  --layout-sidebar:     264px;
+  --layout-content-max: 1440px;
+  --layout-gutter:      24px;
+  --layout-card-gap:    16px;
+  --layout-columns:     12;
+
+  /* ---- Density (comfortable default; compact via [data-density="compact"]) */
+  --density-row-height:   44px;
+  --density-card-padding: 16px;
+}
+
+/* Compact density — persisted in client state (#912). */
+:root[data-density="compact"] {
+  --density-row-height:   32px;
+  --density-card-padding: 12px;
+}
+
+/* =============================================================================
+ * Light theme — mirror the ramp (reverse lightness, slightly desaturate accents)
+ * ============================================================================= */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --canvas:        oklch(0.99 0.002 285);
+  --surface-1:     oklch(0.975 0.003 285);
+  --surface-2:     oklch(0.95 0.004 285);
+  --surface-3:     oklch(0.93 0.005 285);
+
+  --border-subtle: oklch(0.90 0.005 285);
+  --border:        oklch(0.82 0.007 285); /* decorative hairline (exempt) */
+  --border-strong: oklch(0.58 0.010 285); /* interactive/emphasized boundary — >=3:1 on light surface */
+
+  --text-primary:  oklch(0.22 0.006 285);
+  --text-secondary:oklch(0.38 0.008 285);
+  --text-muted:    oklch(0.50 0.009 285);
+  --text-disabled: oklch(0.64 0.008 285);
+
+  --accent:        oklch(0.55 0.17 264);
+  --accent-hover:  oklch(0.50 0.17 264);
+  --accent-fg:     oklch(0.99 0 0);
+  --focus-ring:    oklch(0.55 0.16 264);
+
+  --success:       oklch(0.55 0.14 165);
+  --warning:       oklch(0.62 0.14  75);
+  --danger:        oklch(0.55 0.20  25);
+  --info:          oklch(0.55 0.15 240);
+
+  --success-bg:    oklch(0.93 0.05 165);
+  --success-fg:    oklch(0.40 0.13 165);
+  --success-border:oklch(0.58 0.13 165); /* darkened for >=3:1 on light surface */
+  --warning-bg:    oklch(0.94 0.06  85);
+  --warning-fg:    oklch(0.42 0.12  70);
+  --warning-border:oklch(0.58 0.13  75);
+  --danger-bg:     oklch(0.94 0.04  25);
+  --danger-fg:     oklch(0.45 0.18  25);
+  --danger-border: oklch(0.56 0.19  25);
+  --info-bg:       oklch(0.93 0.04 240);
+  --info-fg:       oklch(0.42 0.14 240);
+  --info-border:   oklch(0.56 0.13 240);
+
+  --shadow-overlay: 0 8px 24px -8px oklch(0 0 0 / 0.18);
+}
+
+/* Accessibility: disable the status pulse but keep color/icon change (#946). */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --motion-micro:    0ms;
+    --motion-standard: 0ms;
+    --motion-pulse:    0ms;
+  }
+}

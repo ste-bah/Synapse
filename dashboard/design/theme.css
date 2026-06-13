@@ -1,0 +1,92 @@
+/* =============================================================================
+ * Synapse Command Center — Tailwind v4 theme  [#946]
+ * -----------------------------------------------------------------------------
+ * Re-exports the semantic tokens from tokens.css as Tailwind theme variables so
+ * views use utilities (`bg-canvas`, `text-secondary`, `border-strong`,
+ * `text-success`, `rounded-md`, `p-2`, `font-mono`, …) that all resolve to the
+ * single source of truth. `@theme inline` emits `var(--token)` references (not
+ * copied values) so light/dark switching via `:root[data-theme="light"]` keeps
+ * working through the utilities. No view may hardcode a hex/px/font — only
+ * these utilities or `var(--token)`.
+ *
+ * Usage in the SPA entry (#945/#912):
+ *   @import "tailwindcss";
+ *   @import "./tokens.css";
+ *   @import "./theme.css";
+ * ============================================================================= */
+
+@theme inline {
+  /* Canvas & surfaces */
+  --color-canvas:        var(--canvas);
+  --color-surface-1:     var(--surface-1);
+  --color-surface-2:     var(--surface-2);
+  --color-surface-3:     var(--surface-3);
+
+  /* Borders */
+  --color-border-subtle: var(--border-subtle);
+  --color-border:        var(--border);
+  --color-border-strong: var(--border-strong);
+
+  /* Text ramp */
+  --color-text-primary:   var(--text-primary);
+  --color-text-secondary: var(--text-secondary);
+  --color-text-muted:     var(--text-muted);
+  --color-text-disabled:  var(--text-disabled);
+
+  /* Accent */
+  --color-accent:       var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg:    var(--accent-fg);
+  --color-focus-ring:   var(--focus-ring);
+
+  /* Semantic status — solid (dots/icons/charts) */
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger:  var(--danger);
+  --color-info:    var(--info);
+
+  /* Semantic status — badge tint/fg/border */
+  --color-success-bg: var(--success-bg);  --color-success-fg: var(--success-fg);  --color-success-border: var(--success-border);
+  --color-warning-bg: var(--warning-bg);  --color-warning-fg: var(--warning-fg);  --color-warning-border: var(--warning-border);
+  --color-danger-bg:  var(--danger-bg);   --color-danger-fg:  var(--danger-fg);   --color-danger-border:  var(--danger-border);
+  --color-info-bg:    var(--info-bg);     --color-info-fg:    var(--info-fg);     --color-info-border:    var(--info-border);
+
+  /* Fonts */
+  --font-ui:   var(--font-ui);
+  --font-mono: var(--font-mono);
+
+  /* Type scale (font sizes) */
+  --text-label:   var(--text-label-size);
+  --text-xs:      var(--text-xs-size);
+  --text-sm:      var(--text-sm-size);
+  --text-base:    var(--text-base-size);
+  --text-md:      var(--text-md-size);
+  --text-lg:      var(--text-lg-size);
+  --text-xl:      var(--text-xl-size);
+  --text-2xl:     var(--text-2xl-size);
+  --text-display: var(--text-display-size);
+  --text-metric:  var(--text-metric-size);
+
+  /* Spacing (4px base) */
+  --spacing-0:   var(--space-0);
+  --spacing-0_5: var(--space-0_5);
+  --spacing-1:   var(--space-1);
+  --spacing-2:   var(--space-2);
+  --spacing-3:   var(--space-3);
+  --spacing-4:   var(--space-4);
+  --spacing-6:   var(--space-6);
+  --spacing-8:   var(--space-8);
+  --spacing-12:  var(--space-12);
+  --spacing-16:  var(--space-16);
+  --spacing-24:  var(--space-24);
+
+  /* Radius */
+  --radius-sm:   var(--radius-sm);
+  --radius-md:   var(--radius-md);
+  --radius-lg:   var(--radius-lg);
+  --radius-xl:   var(--radius-xl);
+  --radius-pill: var(--radius-pill);
+
+  /* Shadow */
+  --shadow-overlay: var(--shadow-overlay);
+}
