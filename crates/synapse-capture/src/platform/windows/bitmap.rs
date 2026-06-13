@@ -851,6 +851,44 @@ impl Drop for GdiCaptureScratch {
     }
 }
 
+fn validate_bitmap_region(region: Rect) -> Result<(), CaptureError> {
+    if region.w <= 0 || region.h <= 0 {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!("empty bitmap capture region {region:?}"),
+        });
+    }
+    Ok(())
+}
+
+fn clamp_region_to_frame(frame: &CapturedFrame, region: Rect) -> Result<Rect, CaptureError> {
+    if region.w <= 0 || region.h <= 0 {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!("empty OCR capture region {region:?}"),
+        });
+    }
+    let frame_w = i64::from(frame.width);
+    let frame_h = i64::from(frame.height);
+    let left = i64::from(region.x).clamp(0, frame_w);
+    let top = i64::from(region.y).clamp(0, frame_h);
+    let right = i64::from(region.x)
+        .saturating_add(i64::from(region.w))
+        .clamp(0, frame_w);
+    let bottom = i64::from(region.y)
+        .saturating_add(i64::from(region.h))
+        .clamp(0, frame_h);
+    if right <= left || bottom <= top {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!("OCR capture region {region:?} is outside frame bounds"),
+        });
+    }
+    Ok(Rect {
+        x: i32::try_from(left).unwrap_or(i32::MAX),
+        y: i32::try_from(top).unwrap_or(i32::MAX),
+        w: i32::try_from(right - left).unwrap_or(i32::MAX),
+        h: i32::try_from(bottom - top).unwrap_or(i32::MAX),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
@@ -949,42 +987,4 @@ mod tests {
             ]
         );
     }
-}
-
-fn validate_bitmap_region(region: Rect) -> Result<(), CaptureError> {
-    if region.w <= 0 || region.h <= 0 {
-        return Err(CaptureError::TargetInvalid {
-            detail: format!("empty bitmap capture region {region:?}"),
-        });
-    }
-    Ok(())
-}
-
-fn clamp_region_to_frame(frame: &CapturedFrame, region: Rect) -> Result<Rect, CaptureError> {
-    if region.w <= 0 || region.h <= 0 {
-        return Err(CaptureError::TargetInvalid {
-            detail: format!("empty OCR capture region {region:?}"),
-        });
-    }
-    let frame_w = i64::from(frame.width);
-    let frame_h = i64::from(frame.height);
-    let left = i64::from(region.x).clamp(0, frame_w);
-    let top = i64::from(region.y).clamp(0, frame_h);
-    let right = i64::from(region.x)
-        .saturating_add(i64::from(region.w))
-        .clamp(0, frame_w);
-    let bottom = i64::from(region.y)
-        .saturating_add(i64::from(region.h))
-        .clamp(0, frame_h);
-    if right <= left || bottom <= top {
-        return Err(CaptureError::TargetInvalid {
-            detail: format!("OCR capture region {region:?} is outside frame bounds"),
-        });
-    }
-    Ok(Rect {
-        x: i32::try_from(left).unwrap_or(i32::MAX),
-        y: i32::try_from(top).unwrap_or(i32::MAX),
-        w: i32::try_from(right - left).unwrap_or(i32::MAX),
-        h: i32::try_from(bottom - top).unwrap_or(i32::MAX),
-    })
 }

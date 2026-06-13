@@ -58,6 +58,9 @@ use crate::m3::approvals::{
 #[cfg(test)]
 mod tests;
 
+type CfKvRow = (Vec<u8>, Vec<u8>);
+type CfKvRows = Vec<CfKvRow>;
+
 const CONFIG_KEY: &str = "escalation/v1/config";
 const ITEM_PREFIX: &str = "escalation/v1/item/";
 const AUDIT_PREFIX: &str = "escalation/v1/audit/";
@@ -405,7 +408,7 @@ fn write_item_and_audit_with_extra_rows(
     item: &EscalationItem,
     event: &str,
     detail: Value,
-    extra_rows: Vec<(Vec<u8>, Vec<u8>)>,
+    extra_rows: CfKvRows,
 ) -> Result<(), ErrorData> {
     let extra_keys = extra_rows
         .iter()
@@ -574,7 +577,7 @@ fn store_policy(db: &Db, policy: &EscalationPolicy) -> Result<(), ErrorData> {
 fn approval_rows_for_opened_escalation(
     item: &EscalationItem,
     now_unix_ms: u64,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ErrorData> {
+) -> Result<CfKvRows, ErrorData> {
     let payload = json!({
         "schema": "synapse.escalation.approval.v1",
         "escalation_id": item.escalation_id,
