@@ -214,6 +214,8 @@ struct Cli {
     local_agent_spawn_id: Option<String>,
     #[arg(long, env = "SYNAPSE_LOCAL_AGENT_LOG_DIR", value_name = "PATH")]
     local_agent_log_dir: Option<PathBuf>,
+    #[arg(long, env = "SYNAPSE_LOCAL_AGENT_TARGET_JSON", value_name = "JSON")]
+    local_agent_target_json: Option<String>,
     #[arg(long, env = "SYNAPSE_LOCAL_AGENT_MAX_TURNS", default_value_t = 8)]
     local_agent_max_turns: u32,
     #[arg(
@@ -366,6 +368,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             mcp_url: cli.local_agent_mcp_url.clone(),
             spawn_id: cli.local_agent_spawn_id.clone(),
             log_dir: cli.local_agent_log_dir.clone(),
+            target_json: cli.local_agent_target_json.clone(),
             max_turns: cli.local_agent_max_turns,
             timeout_ms: cli.local_agent_timeout_ms,
             context_char_limit: cli.local_agent_context_char_limit,

@@ -843,6 +843,7 @@ pub enum LaunchWindowState {
 pub enum ActSpawnAgentCli {
     Codex,
     Claude,
+    LocalModel,
 }
 
 impl ActSpawnAgentCli {
@@ -851,7 +852,13 @@ impl ActSpawnAgentCli {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::LocalModel => "local-model",
         }
+    }
+
+    #[must_use]
+    pub const fn is_local_model(self) -> bool {
+        matches!(self, Self::LocalModel)
     }
 }
 
@@ -870,7 +877,16 @@ pub enum ActSpawnAgentTarget {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActSpawnAgentParams {
-    pub cli: ActSpawnAgentCli,
+    /// Back-compat agent selector for existing callers. New callers may use
+    /// `kind`; if both are supplied they must name the same agent kind.
+    #[serde(default)]
+    #[schemars(default)]
+    pub cli: Option<ActSpawnAgentCli>,
+    /// Agent kind to spawn. `local_model` launches the registry-backed local
+    /// model runner; `codex`/`claude` keep the existing CLI paths.
+    #[serde(default)]
+    #[schemars(default)]
+    pub kind: Option<ActSpawnAgentCli>,
     /// Optional model id for the spawned agent (Claude `--model`, Codex
     /// `-m/--model`). When set it is also recorded in the spawn manifest so the
     /// transcript ingester can attribute the spawn's cost — the Codex
@@ -881,6 +897,12 @@ pub struct ActSpawnAgentParams {
     #[serde(default)]
     #[schemars(default)]
     pub model: Option<String>,
+    /// Local-model only: registry row name to launch through the #931 runner.
+    /// `model` is accepted as a legacy alias when `kind/cli=local_model`, but
+    /// `model_ref` is the explicit field used by templates and the dashboard.
+    #[serde(default)]
+    #[schemars(default)]
+    pub model_ref: Option<String>,
     /// Optional work prompt for the spawned primary agent. Synapse prepends a
     /// mandatory provisioning preflight that calls health/tools through the real
     /// client MCP surface and binds the requested target.
@@ -923,6 +945,9 @@ pub struct ActSpawnAgentParams {
 pub struct ActSpawnAgentResponse {
     pub spawn_id: String,
     pub cli: ActSpawnAgentCli,
+    pub kind: ActSpawnAgentCli,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
     pub launcher_process_id: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_process_id: Option<u32>,
@@ -962,6 +987,9 @@ pub struct ActSpawnAgentLogPaths {
     /// turn-complete events to the same ingress (#899).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notify_script_path: Option<String>,
+    /// Local-model only: marker/config file written by the #931 runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_model_runner_path: Option<String>,
 }
 
 #[must_use]
@@ -980,6 +1008,7 @@ pub const fn default_agent_spawn_hold_open_ms() -> u64 {
 }
 
 pub fn validate_agent_spawn_params(params: &ActSpawnAgentParams) -> Result<(), ErrorData> {
+    let agent_kind = params.effective_cli()?;
     if params.mcp_url.trim().is_empty() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -1045,15 +1074,37 @@ pub fn validate_agent_spawn_params(params: &ActSpawnAgentParams) -> Result<(), E
                 format!("act_spawn_agent model must be <= {MAX_AGENT_SPAWN_MODEL_BYTES} bytes"),
             ));
         }
-        // Model ids are passed to the CLI as a single argv element; reject
-        // anything that is not a printable, whitespace-free token so it cannot
-        // smuggle extra arguments or control characters into the launch.
-        if model.chars().any(|ch| ch.is_whitespace() || ch.is_control()) {
+        // Provider CLI model ids are passed as a single argv element; reject
+        // whitespace/control characters so they cannot smuggle extra
+        // arguments. Local-model registry refs may contain spaces and are
+        // passed quoted through PowerShell, so they use model_ref validation.
+        if !agent_kind.is_local_model()
+            && model
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
                 "act_spawn_agent model must not contain whitespace or control characters",
             ));
         }
+    }
+    if let Some(model_ref) = &params.model_ref {
+        validate_local_model_ref(model_ref)?;
+    }
+    if agent_kind.is_local_model() {
+        let model_ref = params.local_model_ref().ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "act_spawn_agent local_model requires model_ref",
+            )
+        })?;
+        validate_local_model_ref(model_ref)?;
+    } else if params.model_ref.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent model_ref is only valid when kind is local_model",
+        ));
     }
     if let Some(ActSpawnAgentTarget::Cdp { cdp_target_id, .. }) = &params.target {
         if cdp_target_id.trim().is_empty()
@@ -1064,6 +1115,61 @@ pub fn validate_agent_spawn_params(params: &ActSpawnAgentParams) -> Result<(), E
                 "act_spawn_agent cdp_target_id must contain only visible ASCII characters",
             ));
         }
+    }
+    Ok(())
+}
+
+impl ActSpawnAgentParams {
+    pub fn effective_cli(&self) -> Result<ActSpawnAgentCli, ErrorData> {
+        match (self.cli, self.kind) {
+            (Some(cli), Some(kind)) if cli != kind => Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "act_spawn_agent cli and kind must match when both are supplied",
+            )),
+            (Some(cli), _) | (_, Some(cli)) => Ok(cli),
+            (None, None) => Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "act_spawn_agent requires cli or kind",
+            )),
+        }
+    }
+
+    pub fn local_model_ref(&self) -> Option<&str> {
+        self.model_ref
+            .as_deref()
+            .or_else(|| self.model.as_deref())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn model_for_spawn_manifest(&self, agent_kind: ActSpawnAgentCli) -> Option<&str> {
+        if agent_kind.is_local_model() {
+            self.local_model_ref()
+        } else {
+            self.model.as_deref()
+        }
+    }
+}
+
+fn validate_local_model_ref(model_ref: &str) -> Result<(), ErrorData> {
+    let trimmed = model_ref.trim();
+    if trimmed.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent model_ref must not be empty",
+        ));
+    }
+    if trimmed.chars().count() > 100 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent model_ref must be at most 100 characters",
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent model_ref must not contain control characters",
+        ));
     }
     Ok(())
 }

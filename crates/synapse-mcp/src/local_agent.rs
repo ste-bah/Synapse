@@ -11,11 +11,12 @@ use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use reqwest::Url;
 use rmcp::{
-    ServiceExt,
+    RoleClient, ServiceExt,
     model::{
         CallToolRequestParams, ClientCapabilities, ClientInfo, Content, Implementation, JsonObject,
         Tool,
     },
+    service::RunningService,
     transport::streamable_http_client::{
         StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
     },
@@ -33,6 +34,7 @@ pub(crate) struct LocalAgentCli {
     pub mcp_url: String,
     pub spawn_id: Option<String>,
     pub log_dir: Option<PathBuf>,
+    pub target_json: Option<String>,
     pub max_turns: u32,
     pub timeout_ms: u64,
     pub context_char_limit: usize,
@@ -40,6 +42,8 @@ pub(crate) struct LocalAgentCli {
     pub no_stream: bool,
     pub allow_non_loopback: bool,
 }
+
+type LocalMcpClient = RunningService<RoleClient, ClientInfo>;
 
 #[derive(Debug, Deserialize)]
 struct LocalModelListResult {
@@ -121,6 +125,8 @@ struct Runner {
     log_dir: PathBuf,
     stdout: File,
     token: String,
+    mcp: LocalMcpClient,
+    mcp_session_id: String,
     event_url: Url,
     endpoint_url: Url,
     endpoint_api_key: Option<String>,
@@ -140,18 +146,20 @@ struct Runner {
 pub(crate) async fn run_from_cli(cli: LocalAgentCli) -> anyhow::Result<ExitCode> {
     let mut runner = Runner::new(cli).await?;
     let result = runner.run_loop().await;
-    match result {
+    let exit_code = match result {
         Ok(()) => {
             runner.write_success_status()?;
-            Ok(ExitCode::SUCCESS)
+            ExitCode::SUCCESS
         }
         Err(error) => {
             let detail = format!("{error:#}");
             let code = error_code_from_detail(&detail);
             runner.write_failure(code, &detail).await?;
-            Ok(ExitCode::from(1))
+            ExitCode::from(1)
         }
-    }
+    };
+    let _ = runner.mcp.close().await;
+    Ok(exit_code)
 }
 
 impl Runner {
@@ -196,7 +204,7 @@ impl Runner {
             StreamableHttpClientTransportConfig::with_uri(cli.mcp_url.clone())
                 .auth_header(token.clone()),
         );
-        let mut mcp = client_info
+        let mcp = client_info
             .serve(transport)
             .await
             .context("initialize Synapse MCP local-agent session")?;
@@ -211,6 +219,7 @@ impl Runner {
         let _health = call_mcp_tool_json(mcp.peer(), "health", Map::new())
             .await
             .context("call Synapse health tool")?;
+        let mcp_session_id = current_mcp_session_id(mcp.peer()).await?;
         let mut list_args = Map::new();
         list_args.insert("name".to_owned(), Value::from(model_name.to_owned()));
         list_args.insert("include_disabled".to_owned(), Value::from(true));
@@ -241,11 +250,13 @@ impl Runner {
             .build()
             .context("build local-agent HTTP client")?;
         let conversation_id = format!("local-model-{}", Uuid::now_v7().simple());
+        bind_requested_target(mcp.peer(), cli.target_json.as_deref()).await?;
         write_json_file(
             log_dir.join("local-model-runner.json"),
             &json!({
                 "schema_version": 1,
                 "spawn_id": spawn_id,
+                "session_id": mcp_session_id.clone(),
                 "registry_name": registry.name,
                 "model": registry.model_id,
                 "mcp_url": cli.mcp_url,
@@ -256,11 +267,19 @@ impl Runner {
                 "started_at_unix_ms": unix_time_ms_now(),
             }),
         )?;
+        let task_started_path = log_dir.join("task-started.json");
         write_json_file(
-            log_dir.join("task-started.json"),
+            task_started_path.clone(),
             &json!({
                 "schema_version": 1,
                 "spawn_id": spawn_id,
+                "cli": "local-model",
+                "session_id": mcp_session_id.clone(),
+                "status": "started",
+                "health_ok": true,
+                "target_ok": true,
+                "assigned_prompt_present": true,
+                "task_started_path": task_started_path.display().to_string(),
                 "registry_name": registry.name,
                 "model": registry.model_id,
                 "conversation_id": conversation_id,
@@ -296,6 +315,8 @@ impl Runner {
             log_dir,
             stdout,
             token,
+            mcp,
+            mcp_session_id,
             event_url,
             endpoint_url,
             endpoint_api_key,
@@ -313,6 +334,7 @@ impl Runner {
         };
         runner.write_line(json!({
             "type": "local.thread.started",
+            "session_id": runner.mcp_session_id,
             "conversation_id": runner.conversation_id,
             "model": runner.registry.model_id,
             "registry_name": runner.registry.name,
@@ -321,7 +343,7 @@ impl Runner {
         runner
             .post_event(json!({
                 "event": "state_changed",
-                "session_id": runner.conversation_id,
+                "session_id": runner.mcp_session_id,
                 "conversation_id": runner.conversation_id,
                 "model": runner.registry.model_id,
                 "registry_name": runner.registry.name,
@@ -330,7 +352,6 @@ impl Runner {
                 "tool_count": runner.tools.len(),
             }))
             .await?;
-        let _ = mcp.close().await;
         Ok(runner)
     }
 
@@ -352,13 +373,14 @@ impl Runner {
             }))?;
             self.post_event(json!({
                 "event": "turn_started",
-                "session_id": self.conversation_id,
+                "session_id": self.mcp_session_id,
                 "conversation_id": self.conversation_id,
                 "model": self.registry.model_id,
                 "registry_name": self.registry.name,
                 "turn_index": turn,
             }))
             .await?;
+            self.drain_steering_inbox().await?;
             self.truncate_context_if_needed().await?;
             let completion = self.chat_completion().await?;
             self.write_line(json!({
@@ -383,7 +405,7 @@ impl Runner {
                 }))?;
                 self.post_event(json!({
                     "event": "turn_finished",
-                    "session_id": self.conversation_id,
+                    "session_id": self.mcp_session_id,
                     "conversation_id": self.conversation_id,
                     "model": self.registry.model_id,
                     "registry_name": self.registry.name,
@@ -401,7 +423,7 @@ impl Runner {
                         })?;
                     self.post_event(json!({
                         "event": "exited",
-                        "session_id": self.conversation_id,
+                        "session_id": self.mcp_session_id,
                         "conversation_id": self.conversation_id,
                         "model": self.registry.model_id,
                         "registry_name": self.registry.name,
@@ -416,6 +438,7 @@ impl Runner {
             used_any_tool = true;
             for call in completion.tool_calls {
                 self.execute_tool_call(call).await?;
+                self.drain_steering_inbox().await?;
             }
         }
         bail!(
@@ -437,7 +460,7 @@ impl Runner {
         }))?;
         self.post_event(json!({
             "event": "tool_call_started",
-            "session_id": self.conversation_id,
+            "session_id": self.mcp_session_id,
             "conversation_id": self.conversation_id,
             "model": self.registry.model_id,
             "registry_name": self.registry.name,
@@ -470,7 +493,7 @@ impl Runner {
                 }));
                 self.post_event(json!({
                     "event": "tool_call_finished",
-                    "session_id": self.conversation_id,
+                    "session_id": self.mcp_session_id,
                     "conversation_id": self.conversation_id,
                     "model": self.registry.model_id,
                     "registry_name": self.registry.name,
@@ -490,19 +513,8 @@ impl Runner {
                 return Ok(());
             }
         };
-        let client_info = ClientInfo::new(
-            ClientCapabilities::default(),
-            Implementation::new("synapse-local-model-agent", env!("CARGO_PKG_VERSION")),
-        );
-        let transport = StreamableHttpClientTransport::from_config(
-            StreamableHttpClientTransportConfig::with_uri(self.cli.mcp_url.clone())
-                .auth_header(self.token.clone()),
-        );
-        let mut mcp = client_info
-            .serve(transport)
-            .await
-            .context("initialize Synapse MCP session for tool call")?;
-        let result = match mcp
+        let result = match self
+            .mcp
             .peer()
             .call_tool(CallToolRequestParams::new(call.name.clone()).with_arguments(args))
             .await
@@ -511,7 +523,6 @@ impl Runner {
             Err(error) => {
                 let detail = format!("SYNAPSE_TOOL_CALL_FAILED: {}: {error}", call.name);
                 let result_value = json!({ "error": detail });
-                let _ = mcp.close().await;
                 self.messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call.id,
@@ -530,7 +541,7 @@ impl Runner {
                 }))?;
                 self.post_event(json!({
                     "event": "tool_call_finished",
-                    "session_id": self.conversation_id,
+                    "session_id": self.mcp_session_id,
                     "conversation_id": self.conversation_id,
                     "model": self.registry.model_id,
                     "registry_name": self.registry.name,
@@ -547,7 +558,6 @@ impl Runner {
         let is_error = result.is_error.unwrap_or(false);
         let result_value = tool_result_value(&result);
         let result_text = bounded_result_text(&result_value);
-        let _ = mcp.close().await;
         self.messages.push(json!({
             "role": "tool",
             "tool_call_id": call.id,
@@ -565,7 +575,7 @@ impl Runner {
         }))?;
         self.post_event(json!({
             "event": "tool_call_finished",
-            "session_id": self.conversation_id,
+            "session_id": self.mcp_session_id,
             "conversation_id": self.conversation_id,
             "model": self.registry.model_id,
             "registry_name": self.registry.name,
@@ -576,6 +586,74 @@ impl Runner {
             "error_code": if is_error { "SYNAPSE_TOOL_ERROR" } else { "" },
         }))
         .await?;
+        Ok(())
+    }
+
+    async fn drain_steering_inbox(&mut self) -> anyhow::Result<()> {
+        let mut args = Map::new();
+        args.insert("drain".to_owned(), Value::Bool(true));
+        args.insert("max_messages".to_owned(), Value::from(16));
+        let inbox = call_mcp_tool_json(self.mcp.peer(), "agent_inbox", args)
+            .await
+            .context("drain local-agent steering inbox")?;
+        let messages = inbox
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if messages.is_empty() {
+            return Ok(());
+        }
+        for message in messages {
+            let message_id = message
+                .get("message_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_owned();
+            let kind = message
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("message")
+                .trim()
+                .to_owned();
+            let payload = message.get("payload").cloned().unwrap_or(Value::Null);
+            let steering_text = steering_payload_text(&payload);
+            let content = format!(
+                "Synapse control message {message_id} kind={kind}:\n{}",
+                bounded_text(&steering_text, 8_000)
+            );
+            self.write_line(json!({
+                "type": "local.steering.received",
+                "session_id": self.mcp_session_id,
+                "conversation_id": self.conversation_id,
+                "model": self.registry.model_id,
+                "turn_index": self.turn_count,
+                "message_id": message_id,
+                "kind": kind,
+                "payload_summary": bounded_text(&steering_text, 2_000),
+            }))?;
+            self.post_event(json!({
+                "event": "state_changed",
+                "session_id": self.mcp_session_id,
+                "conversation_id": self.conversation_id,
+                "model": self.registry.model_id,
+                "registry_name": self.registry.name,
+                "state_to": "live",
+                "reason_code": "local_steering_received",
+                "message_id": message_id,
+                "message_kind": kind,
+            }))
+            .await?;
+            if steering_requests_shutdown(&kind, &payload) {
+                bail!(
+                    "LOCAL_AGENT_INTERRUPTED: control message {message_id} kind={kind} requested shutdown"
+                );
+            }
+            self.messages.push(json!({
+                "role": "user",
+                "content": content,
+            }));
+        }
         Ok(())
     }
 
@@ -639,7 +717,7 @@ impl Runner {
         }))?;
         self.post_event(json!({
             "event": "state_changed",
-            "session_id": self.conversation_id,
+            "session_id": self.mcp_session_id,
             "conversation_id": self.conversation_id,
             "model": self.registry.model_id,
             "registry_name": self.registry.name,
@@ -716,7 +794,7 @@ impl Runner {
         let _ = self
             .post_event(json!({
                 "event": "exited",
-                "session_id": self.conversation_id,
+                "session_id": self.mcp_session_id,
                 "conversation_id": self.conversation_id,
                 "model": self.registry.model_id,
                 "registry_name": self.registry.name,
@@ -744,6 +822,51 @@ impl Runner {
             }),
         )
     }
+}
+
+async fn current_mcp_session_id(
+    peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
+) -> anyhow::Result<String> {
+    let mut args = Map::new();
+    args.insert("drain".to_owned(), Value::Bool(false));
+    args.insert("max_messages".to_owned(), Value::from(1));
+    let inbox = call_mcp_tool_json(peer, "agent_inbox", args)
+        .await
+        .context("read local-agent MCP session id through agent_inbox")?;
+    let session_id = inbox
+        .get("this_session_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "HTTP_SESSION_INVALID: agent_inbox did not return this_session_id for local-agent session"
+            )
+        })?;
+    Ok(session_id.to_owned())
+}
+
+async fn bind_requested_target(
+    peer: &rmcp::service::Peer<rmcp::service::RoleClient>,
+    target_json: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(raw_target) = target_json.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    let target: Value = serde_json::from_str(raw_target)
+        .with_context(|| "TOOL_PARAMS_INVALID: --local-agent-target-json must be JSON")?;
+    let mut args = Map::new();
+    args.insert("target".to_owned(), target.clone());
+    call_mcp_tool_json(peer, "set_target", args)
+        .await
+        .context("bind local-agent target through set_target")?;
+    let readback = call_mcp_tool_json(peer, "get_target", Map::new())
+        .await
+        .context("read local-agent target through get_target")?;
+    let current = readback.get("current").cloned().unwrap_or(Value::Null);
+    if current != target {
+        bail!("TARGET_BIND_READBACK_MISMATCH: expected {target}, got {current}");
+    }
+    Ok(())
 }
 
 async fn call_mcp_tool_json(
@@ -1104,6 +1227,49 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
     }
 }
 
+fn steering_payload_text(payload: &Value) -> String {
+    if let Some(text) = payload.as_str() {
+        return text.to_owned();
+    }
+    for field in [
+        "text",
+        "message",
+        "content",
+        "prompt",
+        "instruction",
+        "instructions",
+        "body",
+        "command",
+    ] {
+        if let Some(text) = payload.get(field).and_then(Value::as_str) {
+            return text.to_owned();
+        }
+    }
+    payload.to_string()
+}
+
+fn steering_requests_shutdown(kind: &str, payload: &Value) -> bool {
+    let kind = kind.trim().to_ascii_lowercase();
+    if matches!(
+        kind.as_str(),
+        "kill" | "stop" | "cancel" | "interrupt" | "shutdown"
+    ) {
+        return true;
+    }
+    for field in ["command", "action", "control"] {
+        if let Some(value) = payload.get(field).and_then(Value::as_str) {
+            let value = value.trim().to_ascii_lowercase();
+            if matches!(
+                value.as_str(),
+                "kill" | "stop" | "cancel" | "interrupt" | "shutdown"
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn write_json_file(path: PathBuf, value: &Value) -> anyhow::Result<()> {
     let encoded = serde_json::to_vec_pretty(value).context("serialize local-agent JSON file")?;
     std::fs::write(&path, encoded).with_context(|| format!("write {}", path.display()))
@@ -1126,6 +1292,7 @@ fn error_code_from_detail(detail: &str) -> &str {
         "MODEL_ENDPOINT_UNREACHABLE",
         "MODEL_TOOLS_UNSUPPORTED",
         "LOCAL_AGENT_CONTEXT_OVERFLOW",
+        "LOCAL_AGENT_INTERRUPTED",
         "LOCAL_AGENT_TURN_LIMIT",
         "AGENT_EVENT_INGRESS_WRITE_FAILED",
         "LOCAL_MODEL_UNHEALTHY",

@@ -27,6 +27,8 @@ use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, new_reflex_id};
 
+use crate::m3::local_models::{LocalModelApiShape, LocalModelRegistryRow};
+
 use super::{
     m1_tools::validate_target_window,
     session_registry::{SpawnedAgentRead, unix_time_ms_now},
@@ -43,17 +45,20 @@ pub(crate) const AGENT_SPAWN_MANIFEST_VERSION: u32 = 1;
 /// Builds the per-spawn manifest JSON. Records the CLI and, when the operator
 /// pinned one, the model — the authoritative model source the transcript
 /// ingester reads (indispensable for Codex, whose stream omits it, #949).
-fn build_spawn_manifest(spawn_id: &str, params: &ActSpawnAgentParams) -> Value {
-    json!({
+fn build_spawn_manifest(spawn_id: &str, params: &ActSpawnAgentParams) -> Result<Value, ErrorData> {
+    let agent_kind = params.effective_cli()?;
+    Ok(json!({
         "version": AGENT_SPAWN_MANIFEST_VERSION,
         "spawn_id": spawn_id,
-        "cli": params.cli.as_str(),
-        "model": params.model,
+        "cli": agent_kind.as_str(),
+        "kind": agent_kind.as_str(),
+        "model": params.model_for_spawn_manifest(agent_kind),
+        "model_ref": params.local_model_ref(),
         "created_unix_ms": std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
-    })
+    }))
 }
 const AGENT_SPAWN_SHELL_ENV_VAR: &str = "SYNAPSE_AGENT_SPAWN_SHELL";
 const AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT: usize = 80;
@@ -597,7 +602,12 @@ impl SynapseService {
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = ACT_SPAWN_AGENT,
-            cli = params.0.cli.as_str(),
+            agent_kind = params
+                .0
+                .cli
+                .or(params.0.kind)
+                .map(ActSpawnAgentCli::as_str)
+                .unwrap_or("missing"),
             "tool.invocation kind=act_spawn_agent"
         );
         if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
@@ -755,6 +765,12 @@ impl SynapseService {
     ) -> Result<ActSpawnAgentResponse, ErrorData> {
         validate_agent_spawn_params(&params)?;
         validate_spawn_target(&params.target)?;
+        let agent_kind = params.effective_cli()?;
+        let local_model_row = if agent_kind.is_local_model() {
+            Some(self.require_spawn_local_model_row(&params)?)
+        } else {
+            None
+        };
 
         let orphan_recovery = recover_orphaned_agent_spawn_terminal_artifacts()?;
         if orphan_recovery.recovered_count > 0 {
@@ -804,8 +820,11 @@ impl SynapseService {
         env.insert("SYNAPSE_AGENT_SPAWN_ID".to_owned(), spawn_id.clone());
         env.insert(
             "SYNAPSE_AGENT_KIND".to_owned(),
-            params.cli.as_str().to_owned(),
+            agent_kind.as_str().to_owned(),
         );
+        if let Some(model_ref) = params.local_model_ref() {
+            env.insert("SYNAPSE_AGENT_MODEL_REF".to_owned(), model_ref.to_owned());
+        }
         env.insert(
             "SYNAPSE_AGENT_SPAWN_LAUNCH_TARGET".to_owned(),
             launch_host.target.clone(),
@@ -895,7 +914,7 @@ impl SynapseService {
                         "code": error_codes::ACTION_AGENT_SPAWN_FAILED,
                         "reason": "process_job_assign_failed",
                         "spawn_id": spawn_id,
-                        "cli": params.cli.as_str(),
+                        "cli": agent_kind.as_str(),
                         "launcher_process_id": launch_response.pid,
                         "log_dir": files.log_dir.display().to_string(),
                         "source_error": error.message,
@@ -926,7 +945,7 @@ impl SynapseService {
                     "code": error_codes::ACTION_AGENT_SPAWN_FAILED,
                     "reason": "process_history_record_failed",
                     "spawn_id": spawn_id,
-                    "cli": params.cli.as_str(),
+                    "cli": agent_kind.as_str(),
                     "launcher_process_id": launch_response.pid,
                     "log_dir": files.log_dir.display().to_string(),
                     "source_error": error.message,
@@ -939,6 +958,7 @@ impl SynapseService {
         let matched = match self
             .wait_for_spawned_agent_session(
                 &params,
+                agent_kind,
                 &before_session_ids,
                 launched_at_unix_ms,
                 launch_response.pid,
@@ -970,7 +990,7 @@ impl SynapseService {
                         "code": error_codes::ACTION_AGENT_SPAWN_SESSION_TIMEOUT,
                         "reason": "session_registry_readback_timeout",
                         "spawn_id": spawn_id,
-                        "cli": params.cli.as_str(),
+                        "cli": agent_kind.as_str(),
                         "launcher_process_id": launch_response.pid,
                         "mcp_url": params.mcp_url,
                         "wait_timeout_ms": params.wait_timeout_ms,
@@ -991,6 +1011,7 @@ impl SynapseService {
         let task_started = match self
             .wait_for_spawned_agent_task_started(
                 &params,
+                agent_kind,
                 &spawn_id,
                 &matched,
                 launch_response.pid,
@@ -1023,7 +1044,7 @@ impl SynapseService {
                         "code": error_codes::ACTION_AGENT_SPAWN_TASK_NOT_STARTED,
                         "reason": "task_start_readiness_readback_failed",
                         "spawn_id": spawn_id,
-                        "cli": params.cli.as_str(),
+                        "cli": agent_kind.as_str(),
                         "launcher_process_id": launch_response.pid,
                         "agent_process_id": matched.agent_process_id,
                         "session_id": matched.session_id,
@@ -1046,7 +1067,7 @@ impl SynapseService {
 
         let metadata = SpawnedAgentRead {
             spawn_id: spawn_id.clone(),
-            cli: params.cli.as_str().to_owned(),
+            cli: agent_kind.as_str().to_owned(),
             launcher_process_id: launch_response.pid,
             agent_process_id: matched.agent_process_id,
             started_by_session_id,
@@ -1076,7 +1097,7 @@ impl SynapseService {
                     "code": error_codes::ACTION_AGENT_SPAWN_FAILED,
                     "reason": "spawned_agent_metadata_record_failed",
                     "spawn_id": spawn_id,
-                    "cli": params.cli.as_str(),
+                    "cli": agent_kind.as_str(),
                     "launcher_process_id": launch_response.pid,
                     "agent_process_id": matched.agent_process_id,
                     "session_id": matched.session_id,
@@ -1096,7 +1117,7 @@ impl SynapseService {
                 launch_params.target.clone(),
                 process_job,
             )
-            .with_agent_cli(params.cli.as_str()),
+            .with_agent_cli(agent_kind.as_str()),
         ) {
             let cleanup = crate::m4::terminate_owned_process_tree(launch_response.pid);
             let completion_artifacts = write_agent_spawn_daemon_terminal_artifacts(
@@ -1119,7 +1140,7 @@ impl SynapseService {
                     "code": error_codes::ACTION_AGENT_SPAWN_FAILED,
                     "reason": "session_process_register_failed",
                     "spawn_id": spawn_id,
-                    "cli": params.cli.as_str(),
+                    "cli": agent_kind.as_str(),
                     "launcher_process_id": launch_response.pid,
                     "agent_process_id": matched.agent_process_id,
                     "session_id": matched.session_id,
@@ -1133,7 +1154,12 @@ impl SynapseService {
 
         Ok(ActSpawnAgentResponse {
             spawn_id,
-            cli: params.cli,
+            cli: agent_kind,
+            kind: agent_kind,
+            model_ref: local_model_row
+                .as_ref()
+                .map(|row| row.name.clone())
+                .or_else(|| params.local_model_ref().map(ToOwned::to_owned)),
             launcher_process_id: launch_response.pid,
             agent_process_id: matched.agent_process_id,
             session_id: matched.session_id,
@@ -1161,6 +1187,7 @@ impl SynapseService {
     async fn wait_for_spawned_agent_session(
         &self,
         params: &ActSpawnAgentParams,
+        agent_kind: ActSpawnAgentCli,
         before_session_ids: &BTreeSet<String>,
         launched_at_unix_ms: u64,
         launcher_pid: u32,
@@ -1187,7 +1214,8 @@ impl SynapseService {
             for summary in &list.sessions {
                 let readiness = spawn_session_candidate_readiness(
                     summary,
-                    params,
+                    agent_kind,
+                    params.target.as_ref(),
                     before_session_ids,
                     launched_at_unix_ms,
                 );
@@ -1203,7 +1231,7 @@ impl SynapseService {
                     matched_session = Some(MatchedSpawnSession {
                         session_id: summary.registry.session_id.clone(),
                         registered_at_unix_ms: unix_time_ms_now(),
-                        agent_process_id: discover_agent_process_id(launcher_pid, params.cli),
+                        agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
                     });
                 }
                 if reason != "session_existed_before_spawn"
@@ -1255,6 +1283,7 @@ impl SynapseService {
     async fn wait_for_spawned_agent_task_started(
         &self,
         params: &ActSpawnAgentParams,
+        agent_kind: ActSpawnAgentCli,
         spawn_id: &str,
         matched: &MatchedSpawnSession,
         launcher_pid: u32,
@@ -1266,7 +1295,9 @@ impl SynapseService {
             "task_started_path": files.task_started_path.display().to_string(),
         });
         while !agent_spawn_deadline_remaining(deadline).is_zero() {
-            match read_agent_spawn_task_start_artifact(files, params, spawn_id, matched)? {
+            match read_agent_spawn_task_start_artifact(
+                files, params, agent_kind, spawn_id, matched,
+            )? {
                 Some(read) => return Ok(read),
                 None => {
                     last_observed = json!({
@@ -1324,6 +1355,7 @@ impl SynapseService {
         params: &ActSpawnAgentParams,
         started_by_session_id: Option<&str>,
     ) -> Result<(), ErrorData> {
+        let agent_kind = params.effective_cli()?;
         let db = self.m3_storage()?;
         let mut record = synapse_core::AgentEventRecord::new(
             super::agent_events::unix_time_ns_now(),
@@ -1331,9 +1363,9 @@ impl SynapseService {
         );
         record.spawn_id = Some(spawn_id.to_owned());
         record.attributes.operation_name = Some(synapse_core::GenAiOperationName::CreateAgent);
-        record.attributes.agent_name = Some(params.cli.as_str().to_owned());
+        record.attributes.agent_name = Some(agent_kind.as_str().to_owned());
         record.attributes.provider_name =
-            super::agent_events::provider_for_agent_kind(params.cli.as_str());
+            super::agent_events::provider_for_agent_kind(agent_kind.as_str());
         // Prompt CONTENT stays out of the journal (OTel GenAI opt-in rule);
         // its length is enough for the dashboard to size the request.
         record.payload = json!({
@@ -1343,6 +1375,8 @@ impl SynapseService {
             "mcp_url": params.mcp_url,
             "wait_timeout_ms": params.wait_timeout_ms,
             "hold_open_ms": params.hold_open_ms,
+            "kind": agent_kind.as_str(),
+            "model_ref": params.local_model_ref(),
         });
         super::agent_events::record_agent_event(&db, &record)
             .map(|_readback| ())
@@ -1431,6 +1465,98 @@ impl SynapseService {
             );
         }
     }
+
+    fn require_spawn_local_model_row(
+        &self,
+        params: &ActSpawnAgentParams,
+    ) -> Result<LocalModelRegistryRow, ErrorData> {
+        let model_ref = params.local_model_ref().ok_or_else(|| {
+            local_model_spawn_refusal(
+                error_codes::TOOL_PARAMS_INVALID,
+                "local_model_model_ref_missing",
+                "act_spawn_agent local_model requires model_ref",
+                json!({
+                    "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
+                }),
+            )
+        })?;
+        let rows = self.local_model_registry_snapshot()?;
+        let row = rows
+            .into_iter()
+            .find(|row| row.name == model_ref)
+            .ok_or_else(|| {
+                local_model_spawn_refusal(
+                    error_codes::MODEL_REGISTRY_NOT_FOUND,
+                    "local_model_registry_row_missing",
+                    "act_spawn_agent local_model refused because the requested model_ref is not registered",
+                    json!({
+                        "model_ref": model_ref,
+                        "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
+                    }),
+                )
+            })?;
+        if !row.enabled {
+            return Err(local_model_spawn_refusal(
+                error_codes::MODEL_REGISTRY_DISABLED,
+                "local_model_registry_row_disabled",
+                "act_spawn_agent local_model refused because the registry row is disabled",
+                json!({
+                    "model_ref": model_ref,
+                    "row_key": row.row_key.clone(),
+                    "enabled": row.enabled,
+                    "last_probe": row.last_probe.clone(),
+                    "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
+                }),
+            ));
+        }
+        if row.api_shape != LocalModelApiShape::OpenAiChatCompletions {
+            return Err(local_model_spawn_refusal(
+                error_codes::MODEL_TOOLS_UNSUPPORTED,
+                "local_model_api_shape_unsupported",
+                "act_spawn_agent local_model refused because the registry row API shape is unsupported",
+                json!({
+                    "model_ref": model_ref,
+                    "row_key": row.row_key.clone(),
+                    "api_shape": row.api_shape,
+                    "supported_api_shape": "open_ai_chat_completions",
+                }),
+            ));
+        }
+        let Some(probe) = row.last_probe.as_ref() else {
+            return Err(local_model_spawn_refusal(
+                error_codes::MODEL_REGISTRY_UNPROBED,
+                "local_model_registry_row_unprobed",
+                "act_spawn_agent local_model refused because the registry row has no probe evidence",
+                json!({
+                    "model_ref": model_ref,
+                    "row_key": row.row_key.clone(),
+                    "last_probe": null,
+                    "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
+                }),
+            ));
+        };
+        if !probe.healthy {
+            let code = match probe.error_code.as_deref() {
+                Some(error_codes::MODEL_TOOLS_UNSUPPORTED) => error_codes::MODEL_TOOLS_UNSUPPORTED,
+                Some(error_codes::MODEL_ENDPOINT_UNREACHABLE) | None => {
+                    error_codes::MODEL_ENDPOINT_UNREACHABLE
+                }
+                Some(_) => error_codes::MODEL_ENDPOINT_UNREACHABLE,
+            };
+            return Err(local_model_spawn_refusal(
+                code,
+                "local_model_registry_row_unhealthy",
+                "act_spawn_agent local_model refused because the registry row's last probe is unhealthy",
+                json!({
+                    "model_ref": model_ref,
+                    "row_key": row.row_key.clone(),
+                    "last_probe": row.last_probe.clone(),
+                    "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
+                }),
+            ));
+        }
+        Ok(row)
+    }
 }
 
 #[derive(Debug)]
@@ -1463,6 +1589,8 @@ struct AgentSpawnFiles {
     /// Codex only: generated `notify` program POSTing turn-complete events
     /// to the same ingress (#899).
     notify_script_path: Option<PathBuf>,
+    /// Local-model only: marker file written by the #931 runner.
+    local_model_runner_path: Option<PathBuf>,
 }
 
 impl AgentSpawnFiles {
@@ -1492,6 +1620,10 @@ impl AgentSpawnFiles {
                 .notify_script_path
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            local_model_runner_path: self
+                .local_model_runner_path
+                .as_ref()
+                .map(|path| path.display().to_string()),
         }
     }
 }
@@ -1500,8 +1632,14 @@ fn agent_spawn_request_details(
     params: &ActSpawnAgentParams,
     started_by_session_id: Option<&str>,
 ) -> serde_json::Value {
+    let agent_kind = params
+        .effective_cli()
+        .map(ActSpawnAgentCli::as_str)
+        .unwrap_or("invalid");
     json!({
-        "cli": params.cli.as_str(),
+        "cli": agent_kind,
+        "kind": agent_kind,
+        "model_ref": params.local_model_ref(),
         "target": params.target,
         "working_dir": params.working_dir,
         "mcp_url": params.mcp_url,
@@ -1527,10 +1665,10 @@ struct AgentSpawnLaunchHost {
 impl AgentSpawnLaunchHost {
     fn to_json(&self) -> Value {
         json!({
-            "target": self.target,
-            "source": self.source,
-            "attempted": self.attempted,
-            "env_var": AGENT_SPAWN_SHELL_ENV_VAR,
+        "target": self.target,
+        "source": self.source,
+        "attempted": self.attempted,
+        "env_var": AGENT_SPAWN_SHELL_ENV_VAR,
         })
     }
 }
@@ -1819,13 +1957,21 @@ fn augment_agent_spawn_error_with_artifacts(
         }
         None => Map::new(),
     };
+    let agent_kind = params.effective_cli().ok();
     data.entry("code".to_owned())
         .or_insert_with(|| json!(error_codes::ACTION_AGENT_SPAWN_FAILED));
     data.entry("reason".to_owned())
         .or_insert_with(|| json!(failure_stage));
     data.insert("agent_spawn_failure_stage".to_owned(), json!(failure_stage));
     data.insert("spawn_id".to_owned(), json!(spawn_id));
-    data.insert("cli".to_owned(), json!(params.cli.as_str()));
+    data.insert(
+        "cli".to_owned(),
+        json!(
+            agent_kind
+                .map(ActSpawnAgentCli::as_str)
+                .unwrap_or("invalid")
+        ),
+    );
     data.insert("mcp_url".to_owned(), json!(params.mcp_url));
     data.insert(
         "log_dir".to_owned(),
@@ -1847,13 +1993,18 @@ fn write_agent_spawn_daemon_terminal_artifacts(
     error_message: &str,
     details: serde_json::Value,
 ) -> serde_json::Value {
+    let agent_kind = params.effective_cli().ok();
+    let agent_kind = agent_kind
+        .map(ActSpawnAgentCli::as_str)
+        .unwrap_or("invalid");
     let completed_at_unix_ms = unix_time_ms_now();
     let stdout_len = file_len(&files.stdout_path);
     let stderr_len = file_len(&files.stderr_path);
     let final_message = json!({
         "schema_version": 1,
         "spawn_id": spawn_id,
-        "cli": params.cli.as_str(),
+        "cli": agent_kind,
+        "kind": agent_kind,
         "status": status,
         "exit_code": null,
         "error_message": error_message,
@@ -1873,7 +2024,8 @@ fn write_agent_spawn_daemon_terminal_artifacts(
     let completion_status = json!({
         "schema_version": 1,
         "spawn_id": spawn_id,
-        "cli": params.cli.as_str(),
+        "cli": agent_kind,
+        "kind": agent_kind,
         "status": status,
         "exit_code": null,
         "error_message": error_message,
@@ -1914,6 +2066,24 @@ fn write_agent_spawn_daemon_terminal_artifacts(
         "task_started_path": files.task_started_path.display().to_string(),
         "task_started_bytes": file_len(&files.task_started_path),
     })
+}
+
+fn local_model_spawn_refusal(
+    code: &'static str,
+    reason: &'static str,
+    message: &'static str,
+    detail: Value,
+) -> ErrorData {
+    agent_spawn_tool_error(
+        code,
+        message,
+        json!({
+            "code": code,
+            "reason": reason,
+            "tool": ACT_SPAWN_AGENT,
+            "detail": detail,
+        }),
+    )
 }
 
 #[derive(Debug, Default)]
@@ -2414,6 +2584,7 @@ fn prepare_agent_spawn_files(
     params: &ActSpawnAgentParams,
     working_dir: &Path,
 ) -> Result<AgentSpawnFiles, ErrorData> {
+    let agent_kind = params.effective_cli()?;
     let root = agent_spawn_root_dir()?;
     let log_dir = root.join(spawn_id);
     fs::create_dir_all(&log_dir).map_err(|error| {
@@ -2433,13 +2604,16 @@ fn prepare_agent_spawn_files(
     let task_started_path = log_dir.join("task-started.json");
     let task_started_script_path = log_dir.join("write-task-started.ps1");
     let debug_path =
-        (params.cli == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-debug.log"));
+        (agent_kind == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-debug.log"));
     let mcp_config_path =
-        (params.cli == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-mcp-config.json"));
+        (agent_kind == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-mcp-config.json"));
     let hook_settings_path =
-        (params.cli == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-hook-settings.json"));
+        (agent_kind == ActSpawnAgentCli::Claude).then(|| log_dir.join("claude-hook-settings.json"));
     let notify_script_path =
-        (params.cli == ActSpawnAgentCli::Codex).then(|| log_dir.join("codex-notify.ps1"));
+        (agent_kind == ActSpawnAgentCli::Codex).then(|| log_dir.join("codex-notify.ps1"));
+    let local_model_runner_path = agent_kind
+        .is_local_model()
+        .then(|| log_dir.join("local-model-runner.json"));
 
     let task_started_script =
         build_agent_spawn_task_start_script(spawn_id, params, &task_started_path);
@@ -2534,7 +2708,7 @@ fn prepare_agent_spawn_files(
     // transcript ingester reads it to attribute cost — indispensable for Codex,
     // whose `exec --json` stream carries no model id (#949).
     let manifest_path = log_dir.join(AGENT_SPAWN_MANIFEST_FILENAME);
-    let manifest = build_spawn_manifest(spawn_id, params);
+    let manifest = build_spawn_manifest(spawn_id, params)?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
@@ -2564,6 +2738,7 @@ fn prepare_agent_spawn_files(
         mcp_config_path,
         hook_settings_path,
         notify_script_path,
+        local_model_runner_path,
     })
 }
 
@@ -2673,6 +2848,17 @@ fn build_agent_spawn_prompt(
     task_started_path: &Path,
     task_started_script_path: &Path,
 ) -> Result<String, ErrorData> {
+    let agent_kind = params.effective_cli()?;
+    if agent_kind.is_local_model() {
+        let assigned_prompt = params.prompt.as_deref().unwrap_or("").trim();
+        if assigned_prompt.is_empty() {
+            return Ok(
+                "Use the Synapse health tool once, then respond with a compact health_ok summary."
+                    .to_owned(),
+            );
+        }
+        return Ok(assigned_prompt.to_owned());
+    }
     let target_instruction = match &params.target {
         Some(target) => {
             let target_json = serde_json::to_string(target).map_err(|error| {
@@ -2735,7 +2921,7 @@ Mandatory provisioning checks:\n\
 {assigned_block}\n\
 \n\
 {hold_instruction}\n",
-        cli = params.cli.as_str(),
+        cli = agent_kind.as_str(),
         spawn_id = spawn_id,
         working_dir = working_dir.display(),
         target_instruction = target_instruction,
@@ -2752,8 +2938,12 @@ fn build_agent_spawn_task_start_script(
     params: &ActSpawnAgentParams,
     task_started_path: &Path,
 ) -> String {
+    let agent_kind = params.effective_cli().ok();
+    let agent_kind = agent_kind
+        .map(ActSpawnAgentCli::as_str)
+        .unwrap_or("invalid");
     let spawn_id = ps_single_quote(spawn_id);
-    let cli = ps_single_quote(params.cli.as_str());
+    let cli = ps_single_quote(agent_kind);
     let task_started_path = ps_single_quoted_path(task_started_path);
     let assigned_prompt_present = if params
         .prompt
@@ -2827,6 +3017,7 @@ fn agent_spawn_powershell_script(
     files: &AgentSpawnFiles,
     working_dir: &Path,
 ) -> Result<String, ErrorData> {
+    let agent_kind = params.effective_cli()?;
     let prompt_path = ps_single_quoted_path(&files.prompt_path);
     let stdout_path = ps_single_quoted_path(&files.stdout_path);
     let stderr_path = ps_single_quoted_path(&files.stderr_path);
@@ -2834,7 +3025,7 @@ fn agent_spawn_powershell_script(
     let completion_status_path = ps_single_quoted_path(&files.completion_status_path);
     let task_started_path = ps_single_quoted_path(&files.task_started_path);
     let working_dir = ps_single_quoted_path(working_dir);
-    let command_body = match params.cli {
+    let command_body = match agent_kind {
         ActSpawnAgentCli::Codex => {
             let Some(notify_script_path) = files.notify_script_path.as_ref() else {
                 return Err(mcp_error(
@@ -2911,6 +3102,59 @@ $prompt | & claude @claudeArgs 1> {stdout_path} 2> {stderr_path}\n\
                 stderr_path = stderr_path,
             )
         }
+        ActSpawnAgentCli::LocalModel => {
+            let exe = std::env::current_exe().map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "act_spawn_agent failed to resolve current synapse-mcp executable: {error}"
+                    ),
+                )
+            })?;
+            let model_ref = params.local_model_ref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "act_spawn_agent internal error: local_model command requested without model_ref",
+                )
+            })?;
+            let timeout_ms = params
+                .wait_timeout_ms
+                .saturating_add(params.hold_open_ms)
+                .max(120_000)
+                .min(MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS);
+            let mut local_args = format!(
+                "@('--mode','local-agent','--local-agent-model',{model_ref},'--local-agent-task-file',{prompt_path},'--local-agent-mcp-url',{mcp_url},'--local-agent-spawn-id',$spawnId,'--local-agent-log-dir',{log_dir},'--local-agent-timeout-ms','{timeout_ms}')",
+                model_ref = ps_single_quote(model_ref),
+                prompt_path = prompt_path,
+                mcp_url = ps_single_quote(&params.mcp_url),
+                log_dir = ps_single_quoted_path(&files.log_dir),
+                timeout_ms = timeout_ms,
+            );
+            if let Some(target) = &params.target {
+                let target_json = serde_json::to_string(target).map_err(|error| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "act_spawn_agent failed to encode local-model target JSON: {error}"
+                        ),
+                    )
+                })?;
+                local_args = format!(
+                    "$localArgs = {local_args}\n$localArgs += @('--local-agent-target-json',{target_json})",
+                    local_args = local_args,
+                    target_json = ps_single_quote(&target_json),
+                );
+            } else {
+                local_args = format!("$localArgs = {local_args}", local_args = local_args);
+            }
+            format!(
+                "{local_args}\n& {exe} @localArgs 1> {stdout_path} 2> {stderr_path}\n",
+                local_args = local_args,
+                exe = ps_single_quoted_path(&exe),
+                stdout_path = stdout_path,
+                stderr_path = stderr_path,
+            )
+        }
     };
     Ok(agent_spawn_wrapper_powershell(
         params,
@@ -2936,7 +3180,12 @@ fn agent_spawn_wrapper_powershell(
     working_dir: &str,
     command_body: &str,
 ) -> String {
-    let cli = ps_single_quote(params.cli.as_str());
+    let agent_kind = params.effective_cli().ok();
+    let cli = ps_single_quote(
+        agent_kind
+            .map(ActSpawnAgentCli::as_str)
+            .unwrap_or("invalid"),
+    );
     format!(
         "$ErrorActionPreference = 'Stop'\n\
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)\n\
@@ -3184,6 +3433,7 @@ async fn sleep_agent_spawn_poll(deadline: Instant) {
 fn read_agent_spawn_task_start_artifact(
     files: &AgentSpawnFiles,
     params: &ActSpawnAgentParams,
+    agent_kind: ActSpawnAgentCli,
     spawn_id: &str,
     matched: &MatchedSpawnSession,
 ) -> Result<Option<AgentSpawnTaskStartRead>, serde_json::Value> {
@@ -3234,7 +3484,7 @@ fn read_agent_spawn_task_start_artifact(
     if object.get("spawn_id").and_then(Value::as_str) != Some(spawn_id) {
         validation_errors.push("spawn_id mismatch");
     }
-    if object.get("cli").and_then(Value::as_str) != Some(params.cli.as_str()) {
+    if object.get("cli").and_then(Value::as_str) != Some(agent_kind.as_str()) {
         validation_errors.push("cli mismatch");
     }
     if object.get("session_id").and_then(Value::as_str) != Some(matched.session_id.as_str()) {
@@ -3322,7 +3572,8 @@ fn spawn_session_observation(
 
 fn spawn_session_candidate_readiness(
     summary: &super::session_tools::SessionSummary,
-    params: &ActSpawnAgentParams,
+    agent_kind: ActSpawnAgentCli,
+    target: Option<&ActSpawnAgentTarget>,
     before_session_ids: &BTreeSet<String>,
     launched_at_unix_ms: u64,
 ) -> Value {
@@ -3342,16 +3593,16 @@ fn spawn_session_candidate_readiness(
             "allowed_clock_skew_ms": 2000,
         });
     }
-    if !summary_matches_cli(summary, params.cli) {
+    if !summary_matches_cli(summary, agent_kind) {
         return json!({
             "ready": false,
             "reason": "session_cli_mismatch",
-            "expected_cli": params.cli.as_str(),
+            "expected_cli": agent_kind.as_str(),
             "agent_kind": summary.registry.agent_kind,
             "client_name": summary.registry.client_name,
         });
     }
-    if let Some(expected) = &params.target {
+    if let Some(expected) = target {
         if matches_target_wire(summary.active_target.as_ref(), expected) {
             json!({
                 "ready": true,
@@ -3509,8 +3760,10 @@ mod tests {
 
     fn test_spawn_params() -> ActSpawnAgentParams {
         ActSpawnAgentParams {
-            cli: ActSpawnAgentCli::Codex,
+            cli: Some(ActSpawnAgentCli::Codex),
+            kind: None,
             model: None,
+            model_ref: None,
             prompt: Some("write a report".to_owned()),
             target: None,
             working_dir: None,
@@ -3581,6 +3834,7 @@ mod tests {
             mcp_config_path: None,
             hook_settings_path: None,
             notify_script_path: None,
+            local_model_runner_path: None,
         };
         fs::write(
             &files.task_started_path,
@@ -3607,6 +3861,7 @@ mod tests {
         let error = read_agent_spawn_task_start_artifact(
             &files,
             &test_spawn_params(),
+            ActSpawnAgentCli::Codex,
             "agent-spawn-test",
             &matched,
         )
@@ -3642,6 +3897,7 @@ mod tests {
             mcp_config_path: None,
             hook_settings_path: None,
             notify_script_path: None,
+            local_model_runner_path: None,
         };
         fs::write(
             &files.task_started_path,
@@ -3668,6 +3924,7 @@ mod tests {
         let read = read_agent_spawn_task_start_artifact(
             &files,
             &test_spawn_params(),
+            ActSpawnAgentCli::Codex,
             "agent-spawn-test",
             &matched,
         )
@@ -3693,6 +3950,7 @@ mod tests {
             mcp_config_path: None,
             hook_settings_path: None,
             notify_script_path: Some(dir.path().join("codex-notify.ps1")),
+            local_model_runner_path: None,
         };
         let script = agent_spawn_powershell_script(&test_spawn_params(), &files, dir.path())
             .expect("build wrapper script");
@@ -3727,9 +3985,10 @@ mod tests {
             mcp_config_path: Some(dir.path().join("claude-mcp-config.json")),
             hook_settings_path: Some(dir.path().join("claude-hook-settings.json")),
             notify_script_path: None,
+            local_model_runner_path: None,
         };
         let mut params = test_spawn_params();
-        params.cli = ActSpawnAgentCli::Claude;
+        params.cli = Some(ActSpawnAgentCli::Claude);
         let script = agent_spawn_powershell_script(&params, &files, dir.path())
             .expect("build wrapper script");
         assert!(
@@ -3756,6 +4015,7 @@ mod tests {
             mcp_config_path: None,
             hook_settings_path: None,
             notify_script_path: Some(dir.path().join("codex-notify.ps1")),
+            local_model_runner_path: None,
         };
         let mut codex_params = test_spawn_params();
         codex_params.model = Some("gpt-5-codex".to_owned());
@@ -3767,8 +4027,9 @@ mod tests {
         );
 
         // Codex without a model: no `-m` arg appears.
-        let codex_no_model = agent_spawn_powershell_script(&test_spawn_params(), &codex_files, dir.path())
-            .expect("codex script");
+        let codex_no_model =
+            agent_spawn_powershell_script(&test_spawn_params(), &codex_files, dir.path())
+                .expect("codex script");
         assert!(
             codex_no_model.contains("@('exec','-C'"),
             "codex args must omit -m when no model is pinned: {codex_no_model}"
@@ -3789,12 +4050,14 @@ mod tests {
             mcp_config_path: Some(dir.path().join("claude-mcp-config.json")),
             hook_settings_path: Some(dir.path().join("claude-hook-settings.json")),
             notify_script_path: None,
+            local_model_runner_path: None,
         };
         let mut claude_params = test_spawn_params();
-        claude_params.cli = ActSpawnAgentCli::Claude;
+        claude_params.cli = Some(ActSpawnAgentCli::Claude);
         claude_params.model = Some("claude-fable-5".to_owned());
-        let claude_script = agent_spawn_powershell_script(&claude_params, &claude_files, dir.path())
-            .expect("claude script");
+        let claude_script =
+            agent_spawn_powershell_script(&claude_params, &claude_files, dir.path())
+                .expect("claude script");
         assert!(
             claude_script.contains("@('-p','--model','claude-fable-5','--verbose'"),
             "claude args must inject --model after -p: {claude_script}"
@@ -3806,7 +4069,8 @@ mod tests {
         // The manifest is the transcript ingester's authoritative model source.
         let mut params = test_spawn_params();
         params.model = Some("gpt-5-codex".to_owned());
-        let manifest = build_spawn_manifest("agent-spawn-manifest-fsv", &params);
+        let manifest = build_spawn_manifest("agent-spawn-manifest-fsv", &params)
+            .expect("build spawn manifest");
         assert_eq!(manifest["version"], AGENT_SPAWN_MANIFEST_VERSION);
         assert_eq!(manifest["spawn_id"], "agent-spawn-manifest-fsv");
         assert_eq!(manifest["cli"], "codex");
@@ -3815,8 +4079,63 @@ mod tests {
 
         // No pinned model -> manifest carries an explicit null, never a guess.
         params.model = None;
-        let manifest = build_spawn_manifest("agent-spawn-manifest-fsv", &params);
+        let manifest = build_spawn_manifest("agent-spawn-manifest-fsv", &params)
+            .expect("build spawn manifest");
         assert!(manifest["model"].is_null());
+    }
+
+    #[test]
+    fn local_model_spawn_script_uses_repo_runner_and_model_ref() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let files = AgentSpawnFiles {
+            log_dir: dir.path().to_path_buf(),
+            prompt_path: dir.path().join("prompt.txt"),
+            stdout_path: dir.path().join("stdout.jsonl"),
+            stderr_path: dir.path().join("stderr.log"),
+            final_message_path: dir.path().join("final-message.txt"),
+            completion_status_path: dir.path().join("completion-status.json"),
+            task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
+            debug_path: None,
+            mcp_config_path: None,
+            hook_settings_path: None,
+            notify_script_path: None,
+            local_model_runner_path: Some(dir.path().join("local-model-runner.json")),
+        };
+        let mut params = test_spawn_params();
+        params.cli = None;
+        params.kind = Some(ActSpawnAgentCli::LocalModel);
+        params.model_ref = Some("ollama-gemma4-e4b".to_owned());
+        params.prompt = Some("call health once".to_owned());
+
+        let prompt = build_agent_spawn_prompt(
+            "agent-spawn-test",
+            &params,
+            dir.path(),
+            &files.task_started_path,
+            &files.task_started_script_path,
+        )
+        .expect("local prompt");
+        assert_eq!(prompt, "call health once");
+
+        let script =
+            agent_spawn_powershell_script(&params, &files, dir.path()).expect("local script");
+        assert!(script.contains("--mode"));
+        assert!(script.contains("local-agent"));
+        assert!(script.contains("--local-agent-model"));
+        assert!(script.contains("ollama-gemma4-e4b"));
+        assert!(script.contains("--local-agent-task-file"));
+        assert!(script.contains("--local-agent-spawn-id"));
+        assert!(script.contains("--local-agent-log-dir"));
+        assert!(!script.contains("& codex"));
+        assert!(!script.contains("& claude"));
+
+        let manifest =
+            build_spawn_manifest("agent-spawn-manifest-local", &params).expect("manifest");
+        assert_eq!(manifest["cli"], "local-model");
+        assert_eq!(manifest["kind"], "local-model");
+        assert_eq!(manifest["model"], "ollama-gemma4-e4b");
+        assert_eq!(manifest["model_ref"], "ollama-gemma4-e4b");
     }
 
     #[test]
