@@ -1845,12 +1845,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-CcQpaB_L.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-BLlvdBzS.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-BhBZc0Rv.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-DEsmbRp9.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-CcQpaB_L.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-BLlvdBzS.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-BhBZc0Rv.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-DEsmbRp9.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

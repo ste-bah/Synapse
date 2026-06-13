@@ -441,6 +441,21 @@ The dashboard build is local-only. It writes hashed static assets to
 under `/dashboard`. Run `bun run check` as a supporting charter check before
 manual Synapse verification.
 
+Local Storybook/Playwright guardrails live under `dashboard/`:
+
+```bash
+cd dashboard
+bun run test:coverage
+bun run build:storybook
+bun run test:visual
+bun run test:a11y
+```
+
+Visual baselines are updated explicitly with `bun run test:visual:update`.
+The pinned reproducible runner image is
+`mcr.microsoft.com/playwright:v1.60.0-noble`; no Chromatic, SaaS, GitHub
+Actions, or hosted CI gate is used.
+
 ### Wire it up manually
 
 <details>
