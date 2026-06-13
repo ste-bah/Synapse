@@ -345,6 +345,7 @@ impl SynapseService {
         now_unix_ms: u64,
     ) -> Result<WorkspacePutResponse, ErrorData> {
         validate_session_id(writer_session_id)?;
+        let request_params = params.clone();
         let run_id = resolve_workspace_run_id(params.run_id.as_deref())?;
         let key = normalize_workspace_key(&params.key)?;
         let expected_version = params.expected_version;
@@ -388,6 +389,34 @@ impl SynapseService {
                 row.entry.version.saturating_add(1),
             )
         });
+        let command_payload = json!({
+            "run_id": &request_params.run_id,
+            "resolved_run_id": &run_id,
+            "key": &request_params.key,
+            "normalized_key": &key,
+            "expected_version": request_params.expected_version,
+            "value": &request_params.value,
+            "artifact": &request_params.artifact,
+            "ttl_ms": request_params.ttl_ms,
+        });
+        let command_before = json!({
+            "source_of_truth": cf::CF_KV,
+            "row_key": &row_key,
+            "had_existing_row": existing.is_some(),
+            "previous_version": previous_version,
+            "expired_rows_deleted_before": cleanup.expired_keys.len(),
+            "corrupt_rows_skipped_before": cleanup.corrupt_rows.len(),
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "workspace_put",
+            "plan_edit",
+            Some(writer_session_id.to_owned()),
+            Some(writer_session_id.to_owned()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
         let entry = WorkspaceEntry {
             schema_version: SCHEMA_VERSION,
             run_id: run_id.clone(),
@@ -411,7 +440,33 @@ impl SynapseService {
                 )
             })?;
         let storage_readback = readback_exact_workspace_row(&db, &row_key)?;
-        let event_publish_report = self.publish_workspace_put_event(&entry, &storage_readback)?;
+        let event_publish_report = match self.publish_workspace_put_event(&entry, &storage_readback)
+        {
+            Ok(report) => report,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "workspace_put",
+                        "plan_edit",
+                        Some(writer_session_id.to_owned()),
+                        Some(writer_session_id.to_owned()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": cf::CF_KV,
+                            "row_key": &row_key,
+                            "version": version,
+                            "storage_readback": &storage_readback,
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
 
         tracing::info!(
             code = "WORKSPACE_BLACKBOARD_PUT_COMMITTED",
@@ -428,7 +483,7 @@ impl SynapseService {
             "readback=workspace_blackboard edge=put_committed"
         );
 
-        Ok(WorkspacePutResponse {
+        let response = WorkspacePutResponse {
             ok: true,
             run_id,
             key,
@@ -444,7 +499,25 @@ impl SynapseService {
             artifact_readback,
             storage_readback,
             event_publish_report,
-        })
+        };
+        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+            "workspace_put",
+            "plan_edit",
+            Some(writer_session_id.to_owned()),
+            Some(writer_session_id.to_owned()),
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": cf::CF_KV,
+                "row_key": &response.row_key,
+                "version": response.version,
+                "previous_version": response.previous_version,
+                "storage_readback": &response.storage_readback,
+                "event_publish_report": &response.event_publish_report,
+            }),
+            "ok",
+        ))?;
+        Ok(response)
     }
 
     fn workspace_get_impl(
@@ -1303,6 +1376,84 @@ mod tests {
             .as_ref()
             .and_then(|data| data.get("detail_code"))
             .and_then(Value::as_str)
+    }
+
+    #[test]
+    fn put_records_command_audit_rows_readable_by_snapshot() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        let put = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-audit".to_owned()),
+                key: "plans/next-step".to_owned(),
+                expected_version: None,
+                value: Some(json!({"known": "audit-happy"})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-audit",
+            9_000,
+        )?;
+        assert_eq!(put.version, 1);
+
+        let snapshot = service.command_audit_snapshot()?;
+        assert!(
+            snapshot.rows.iter().any(|row| {
+                row.tool == "workspace_put"
+                    && row.verb == "plan_edit"
+                    && row.phase == "intent"
+                    && row.actor_session_id.as_deref() == Some("session-audit")
+            }),
+            "workspace_put intent row should be projected from CF_ACTION_LOG"
+        );
+        assert!(
+            snapshot.rows.iter().any(|row| {
+                row.tool == "workspace_put"
+                    && row.verb == "plan_edit"
+                    && row.phase == "final"
+                    && row.outcome == "ok"
+                    && row.actor_session_id.as_deref() == Some("session-audit")
+            }),
+            "workspace_put final row should be projected from CF_ACTION_LOG"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn put_fails_before_storage_write_when_command_audit_intent_fails() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        crate::server::command_audit::set_command_audit_force_fail_for_tests(true);
+        let result = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-audit-fail".to_owned()),
+                key: "plans/blocked".to_owned(),
+                expected_version: None,
+                value: Some(json!({"must_not_write": true})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-audit",
+            9_100,
+        );
+        crate::server::command_audit::set_command_audit_force_fail_for_tests(false);
+
+        let error = match result {
+            Ok(response) => anyhow::bail!("workspace_put unexpectedly succeeded: {response:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(error_code(&error), Some(error_codes::TOOL_INTERNAL_ERROR));
+        assert!(error.message.contains("command audit forced failure"));
+
+        let db = service.workspace_db()?;
+        assert!(
+            db.scan_cf_prefix(cf::CF_KV, workspace_run_prefix("run-audit-fail").as_bytes())?
+                .is_empty(),
+            "workspace row must not exist when command audit intent write fails"
+        );
+        Ok(())
     }
 
     #[test]

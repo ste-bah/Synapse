@@ -1266,6 +1266,7 @@ struct DashboardStateResponse {
     sessions: DashboardPanel,
     lease: DashboardPanel,
     storage: DashboardPanel,
+    command_audit: DashboardPanel,
     approvals: DashboardPanel,
     suggestions: DashboardPanel,
     armed_runs: DashboardPanel,
@@ -1431,6 +1432,7 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         sessions,
         lease,
         storage,
+        command_audit: command_audit_panel(&state),
         approvals: approval_panel(&state, &tool_names, None),
         suggestions: approval_panel(
             &state,
@@ -1624,6 +1626,13 @@ fn agent_transcript_panel(state: &HttpState) -> DashboardPanel {
     }
 }
 
+fn command_audit_panel(state: &HttpState) -> DashboardPanel {
+    match state.health_service.command_audit_snapshot() {
+        Ok(snapshot) => DashboardPanel::ok("CF_ACTION_LOG command_audit", snapshot),
+        Err(error) => DashboardPanel::error("CF_ACTION_LOG command_audit", format!("{error:?}")),
+    }
+}
+
 fn hygiene_panel(state: &HttpState, tool_names: &BTreeSet<&str>) -> DashboardPanel {
     if !tool_names.contains("hygiene_flags") {
         return deferred_panel("hygiene_flags", tool_names);
@@ -1711,6 +1720,7 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <a href="#daemonPanel">Daemon</a>
     <a href="#sessionsPanel">Sessions</a>
     <a href="#storagePanel">Storage</a>
+    <a href="#commandAuditPanel">Actions</a>
     <a href="#transcriptsPanel">Transcripts</a>
     <a href="#hygienePanel">Hygiene</a>
     <a href="#localModelsPanel">Models</a>
@@ -1731,6 +1741,10 @@ const DASHBOARD_HTML: &str = r##"<!doctype html>
     <section class="half" id="storagePanel">
       <header><h2>Storage</h2></header>
       <div class="body" id="storage"></div>
+    </section>
+    <section class="wide" id="commandAuditPanel">
+      <header><h2>Actions Taken</h2></header>
+      <div class="body" id="commandAudit"></div>
     </section>
     <section class="third">
       <header><h2>Approvals</h2></header>
@@ -1899,6 +1913,28 @@ th {
 .chip.danger { color: var(--danger); }
 .chip a { color: inherit; }
 .cell-text { overflow-wrap: anywhere; white-space: pre-wrap; }
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  margin: 8px 0 12px;
+}
+.filter {
+  display: grid;
+  gap: 4px;
+  min-width: 160px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.filter input {
+  width: 100%;
+  min-height: 30px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 4px 7px;
+  color: var(--fg);
+  background: var(--bg);
+}
 @media (max-width: 900px) {
   .page-header { align-items: flex-start; flex-direction: column; }
   main { padding: 12px; }
@@ -1911,6 +1947,7 @@ const DASHBOARD_JS: &str = r##""use strict";
 const MAX_TEXT_CHARS = 4096;
 const MAX_TOOL_CELL_CHARS = 4096;
 const byId = (id) => document.getElementById(id);
+const commandAuditFilters = { actor: "", verb: "", agent: "" };
 
 function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
@@ -2084,6 +2121,7 @@ function render(data) {
   renderQueue("approvals", data.approvals);
   renderQueue("suggestions", data.suggestions);
   renderQueue("armedRuns", data.armed_runs);
+  renderCommandAudit(data.command_audit);
   renderTranscripts(data.agent_transcripts);
   renderHygiene(data.hygiene);
   renderLocalModels(data.local_models);
@@ -2160,6 +2198,80 @@ function renderTranscripts(panel) {
       summarizeToolCalls(record.tool_calls || [])
     ];
   })));
+}
+
+function commandAuditTime(row) {
+  const ns = Number(row.ts_ns || 0);
+  if (!Number.isFinite(ns) || ns <= 0) return "";
+  return new Date(Math.floor(ns / 1000000)).toLocaleTimeString();
+}
+
+function commandAuditMatches(row) {
+  const actor = rawText(row.actor_session_id).toLowerCase();
+  const verb = [row.verb, row.tool].map(rawText).join(" ").toLowerCase();
+  const agent = rawText(row.target_session_id).toLowerCase();
+  return (!commandAuditFilters.actor || actor.includes(commandAuditFilters.actor))
+    && (!commandAuditFilters.verb || verb.includes(commandAuditFilters.verb))
+    && (!commandAuditFilters.agent || agent.includes(commandAuditFilters.agent));
+}
+
+function commandAuditFilter(label, key, redraw) {
+  const wrap = document.createElement("label");
+  wrap.className = "filter";
+  const text = document.createElement("span");
+  text.textContent = label;
+  const input = document.createElement("input");
+  input.type = "search";
+  input.value = commandAuditFilters[key];
+  input.addEventListener("input", () => {
+    commandAuditFilters[key] = input.value.toLowerCase();
+    redraw();
+  });
+  wrap.append(text, input);
+  return wrap;
+}
+
+function renderCommandAuditRows(container, rows) {
+  clear(container);
+  const filtered = rows.filter(commandAuditMatches);
+  container.appendChild(table(["Time", "Actor", "Verb", "Tool", "Channel", "Target", "Phase", "Outcome", "Payload", "Key"], filtered.map((row) => [
+    commandAuditTime(row),
+    row.actor_session_id || "",
+    row.verb || "",
+    row.tool || "",
+    row.channel || "",
+    row.target_session_id || "",
+    row.phase || "",
+    row.error_code ? (row.outcome || "error") + " " + row.error_code : row.outcome || "",
+    row.payload_sha256 || "",
+    row.key_hex || ""
+  ])));
+}
+
+function renderCommandAudit(panel) {
+  const node = byId("commandAudit"); clear(node);
+  if (!panel || panel.status !== "ok") {
+    renderUnavailable(node, panel);
+    return;
+  }
+  const data = panel.data || {};
+  const rows = data.rows || [];
+  node.append(
+    stat("SoT", data.source_of_truth || panel.source),
+    stat("Rows", data.row_count || rows.length),
+    stat("Scanned", data.scanned_rows || 0)
+  );
+  const filters = document.createElement("div");
+  filters.className = "filters";
+  const tableWrap = document.createElement("div");
+  const redraw = () => renderCommandAuditRows(tableWrap, rows);
+  filters.append(
+    commandAuditFilter("Actor", "actor", redraw),
+    commandAuditFilter("Verb", "verb", redraw),
+    commandAuditFilter("Agent", "agent", redraw)
+  );
+  node.append(filters, tableWrap);
+  redraw();
 }
 
 function renderHygiene(panel) {
@@ -2523,6 +2635,7 @@ mod tests {
         assert!(DASHBOARD_HTML.contains("/dashboard/assets/dashboard.css"));
         assert!(DASHBOARD_HTML.contains("/dashboard/assets/dashboard.js"));
         assert!(DASHBOARD_HTML.contains("section-nav"));
+        assert!(DASHBOARD_HTML.contains("commandAuditPanel"));
         assert!(!DASHBOARD_HTML.contains("<style"));
         assert!(!DASHBOARD_HTML.contains("<script>"));
     }
@@ -2560,6 +2673,7 @@ mod tests {
     fn dashboard_js_uses_safe_sinks_and_escape_guards() {
         assert!(DASHBOARD_JS.contains("textContent"));
         assert!(DASHBOARD_JS.contains("stripTerminalSequences"));
+        assert!(DASHBOARD_JS.contains("renderCommandAudit"));
         assert!(DASHBOARD_JS.contains("MAX_TEXT_CHARS"));
         assert!(!DASHBOARD_JS.contains("innerHTML"));
         assert!(!DASHBOARD_JS.contains("insertAdjacentHTML"));

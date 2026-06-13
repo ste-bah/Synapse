@@ -109,9 +109,26 @@ impl SynapseService {
         let session_id = require_shell_session_id(&request_context)?;
         let shell_context = shell_execution_context_for_session(&session_id)?;
         let params = prepare_run_shell_params_for_context(raw_params, &shell_context)?;
+        let command_payload =
+            run_shell_request_details(&params, self.m4_config.run_shell_inline_await_limit_ms());
+        let command_before = json!({
+            "source_of_truth": "durable shell registry/log files or inline child process",
+            "session_id": &session_id,
+            "execution_mode": params.execution_mode.as_str(),
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "act_run_shell",
+            "shell_run",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
         self.audit_action_started_with_details_for_session(
             "act_run_shell",
-            &run_shell_request_details(&params, self.m4_config.run_shell_inline_await_limit_ms()),
+            &command_payload,
             &session_id,
         )?;
         let result = match authorize_run_shell(&self.m4_config, &params) {
@@ -126,6 +143,38 @@ impl SynapseService {
                 .await
             }
             Err(error) => Err(error),
+        };
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell",
+                    "shell_run",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "durable shell registry/log files or inline child process",
+                        "response": response,
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell",
+                    "shell_run",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "durable shell registry/log files or inline child process",
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
         };
         self.audit_action_result_for_session("act_run_shell", &result, &session_id)?;
         result.map(Json)
@@ -153,9 +202,25 @@ impl SynapseService {
         let session_id = require_shell_session_id(&request_context)?;
         let shell_context = shell_execution_context_for_session(&session_id)?;
         let params = prepare_run_shell_start_params_for_context(raw_params, &shell_context)?;
+        let command_payload = run_shell_start_request_details(&params);
+        let command_before = json!({
+            "source_of_truth": "durable shell registry/log files/process table",
+            "session_id": &session_id,
+            "job_id": &params.job_id,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "act_run_shell_start",
+            "shell_spawn",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
         self.audit_action_started_with_details_for_session(
             "act_run_shell_start",
-            &run_shell_start_request_details(&params),
+            &command_payload,
             &session_id,
         )?;
         let result = match authorize_run_shell_start(&self.m4_config, &params) {
@@ -163,6 +228,40 @@ impl SynapseService {
                 start_authorized_shell_job(params, &authorization, Some(&shell_context))
             }
             Err(error) => Err(error),
+        };
+        match &result {
+            Ok(response) => {
+                self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell_start",
+                    "shell_spawn",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "durable shell registry/log files/process table",
+                        "response": response,
+                    }),
+                    "ok",
+                ))?
+            }
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell_start",
+                    "shell_spawn",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "durable shell registry/log files/process table",
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(error),
+                ),
+            )?,
         };
         self.audit_action_result_for_session("act_run_shell_start", &result, &session_id)?;
         result.map(Json)
@@ -222,15 +321,90 @@ impl SynapseService {
         }
         let params = params.0;
         let session_id = require_shell_session_id(&request_context)?;
+        let before_status = shell_job_status(
+            &ActRunShellStatusParams {
+                job_id: params.job_id.clone(),
+                tail_bytes: 1024,
+            },
+            Some(&session_id),
+        );
+        let command_payload = json!({
+            "job_id": &params.job_id,
+            "session_id": &session_id,
+        });
+        let command_before = json!({
+            "source_of_truth": "durable shell registry/log files/process table",
+            "status_readback": before_status.as_ref().ok(),
+            "status_error": before_status.as_ref().err().map(|error| json!({
+                "code": error.data.as_ref().and_then(|data| data.get("code")).and_then(Value::as_str),
+                "message": error.message.to_string(),
+            })),
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "act_run_shell_cancel",
+            "kill",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
         self.audit_action_started_with_details_for_session(
             "act_run_shell_cancel",
-            &json!({
-                "job_id": &params.job_id,
-                "session_id": &session_id,
-            }),
+            &command_payload,
             &session_id,
         )?;
         let result = cancel_shell_job(&params, Some(&session_id));
+        let after_status = shell_job_status(
+            &ActRunShellStatusParams {
+                job_id: params.job_id.clone(),
+                tail_bytes: 1024,
+            },
+            Some(&session_id),
+        );
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell_cancel",
+                    "kill",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "durable shell registry/log files/process table",
+                        "response": response,
+                        "status_readback": after_status.as_ref().ok(),
+                        "status_error": after_status.as_ref().err().map(|error| json!({
+                            "code": error.data.as_ref().and_then(|data| data.get("code")).and_then(Value::as_str),
+                            "message": error.message.to_string(),
+                        })),
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_run_shell_cancel",
+                    "kill",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "durable shell registry/log files/process table",
+                        "status_readback": after_status.as_ref().ok(),
+                        "status_error": after_status.as_ref().err().map(|error| json!({
+                            "code": error.data.as_ref().and_then(|data| data.get("code")).and_then(Value::as_str),
+                            "message": error.message.to_string(),
+                        })),
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
         self.audit_action_result_for_session("act_run_shell_cancel", &result, &session_id)?;
         result.map(Json)
     }
@@ -255,14 +429,29 @@ impl SynapseService {
         }
         let params = params.0;
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
+        let command_payload = launch_request_details(&params);
+        let command_before = json!({
+            "source_of_truth": "process table plus CF_PROCESS_HISTORY/session lifecycle resources",
+            "session_id": &session_id,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "act_launch",
+            "spawn",
+            session_id.clone(),
+            session_id.clone(),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
         if let Some(session_id) = session_id.as_deref() {
             self.audit_action_started_with_details_for_session(
                 "act_launch",
-                &launch_request_details(&params),
+                &command_payload,
                 session_id,
             )?;
         } else {
-            self.audit_action_started_with_details("act_launch", &launch_request_details(&params))?;
+            self.audit_action_started_with_details("act_launch", &command_payload)?;
         }
         let result = match launch_for_session(
             &self.m4_config,
@@ -335,6 +524,38 @@ impl SynapseService {
             }
             Err(error) => Err(error),
         };
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_launch",
+                    "spawn",
+                    session_id.clone(),
+                    session_id.clone(),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "process table plus CF_PROCESS_HISTORY/session lifecycle resources",
+                        "response": response,
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "act_launch",
+                    "spawn",
+                    session_id.clone(),
+                    session_id.clone(),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "process table plus CF_PROCESS_HISTORY/session lifecycle resources",
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
         if let Some(session_id) = session_id.as_deref() {
             self.audit_action_result_for_session("act_launch", &result, session_id)?;
         } else {
@@ -363,6 +584,7 @@ impl SynapseService {
         }
         let started_by_session_id =
             super::context::mcp_session_id_from_request_context(&request_context)?;
+        let actor_session_id_for_audit = started_by_session_id.clone();
         let params = params.0;
         self.audit_action_started_with_details_for_request(
             ACT_SPAWN_AGENT,
@@ -373,6 +595,23 @@ impl SynapseService {
         // event of this lifecycle (#897) shares one attribution anchor; a
         // spawn that cannot be journaled is refused before launching.
         let spawn_id = format!("agent-spawn-{}", new_reflex_id());
+        let command_payload =
+            agent_spawn_request_details(&params, started_by_session_id.as_deref());
+        let command_before = json!({
+            "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
+            "spawn_id": &spawn_id,
+            "before_session_ids": self.current_session_ids()?,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            ACT_SPAWN_AGENT,
+            "spawn",
+            started_by_session_id.clone(),
+            started_by_session_id.clone(),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
         self.journal_spawn_requested(&spawn_id, &params, started_by_session_id.as_deref())?;
         let result = self
             .act_spawn_agent_impl(params, started_by_session_id, spawn_id.clone())
@@ -385,6 +624,26 @@ impl SynapseService {
                         &Err(journal_error.clone()),
                         &request_context,
                     )?;
+                    self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            ACT_SPAWN_AGENT,
+                            "spawn",
+                            actor_session_id_for_audit.clone(),
+                            Some(response.session_id.clone()),
+                            command_payload.clone(),
+                            command_before.clone(),
+                            json!({
+                                "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
+                                "spawn_id": &spawn_id,
+                                "response": response,
+                                "after_session_ids": self.current_session_ids().unwrap_or_default(),
+                            }),
+                            "error",
+                        )
+                        .with_error(super::command_audit::command_audit_error_from_error_data(
+                            &journal_error,
+                        )),
+                    )?;
                     return Err(journal_error);
                 }
             }
@@ -394,6 +653,42 @@ impl SynapseService {
                 self.journal_spawn_failed(&spawn_id, error);
             }
         }
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    ACT_SPAWN_AGENT,
+                    "spawn",
+                    actor_session_id_for_audit.clone(),
+                    Some(response.session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
+                        "spawn_id": &spawn_id,
+                        "response": response,
+                        "after_session_ids": self.current_session_ids().unwrap_or_default(),
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    ACT_SPAWN_AGENT,
+                    "spawn",
+                    actor_session_id_for_audit.clone(),
+                    actor_session_id_for_audit.clone(),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
+                        "spawn_id": &spawn_id,
+                        "after_session_ids": self.current_session_ids().unwrap_or_default(),
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
         self.audit_action_result_for_request(ACT_SPAWN_AGENT, &result, &request_context)?;
         result.map(Json)
     }

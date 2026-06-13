@@ -20,7 +20,7 @@ use super::{
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use synapse_action::{LeaseOutcome, LeaseStatus, lease};
 use synapse_core::error_codes;
 
@@ -108,7 +108,46 @@ impl SynapseService {
         );
         let session_id = require_lease_session_id(&request_context)?;
         self.restore_session_lease_if_needed(&session_id)?;
-        let response = acquire_lease_for_session(&session_id, params.0.ttl_ms)?;
+        let params = params.0;
+        let command_payload = json!({ "ttl_ms": params.ttl_ms });
+        let command_before = json!({
+            "source_of_truth": "synapse_action::lease",
+            "caller": lease_status_for_session(&session_id),
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "control_lease_acquire",
+            "lease_acquire",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let response = match acquire_lease_for_session(&session_id, params.ttl_ms) {
+            Ok(response) => response,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "control_lease_acquire",
+                        "lease_acquire",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": "synapse_action::lease",
+                            "caller": lease_status_for_session(&session_id),
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
         let status = lease::status();
         if let Err(error) = self.persist_session_lease(&session_id, &status) {
             let released = lease::release_if_owner(&session_id);
@@ -119,6 +158,25 @@ impl SynapseService {
                 error = ?error,
                 "input lease acquire failed durability write; released in-memory lease before returning error"
             );
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "control_lease_acquire",
+                    "lease_acquire",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "synapse_action::lease",
+                        "released_after_persist_failure": released,
+                        "caller": lease_status_for_session(&session_id),
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&error),
+                ),
+            )?;
             return Err(error);
         }
         // Journal first-time acquisitions (#897); renewals happen on every
@@ -126,8 +184,12 @@ impl SynapseService {
         // An acquisition that cannot be journaled is rolled back the same
         // way as a persist failure: control-plane state must stay auditable.
         if response.outcome == "acquired"
-            && let Err(journal_error) =
-                self.journal_lease_event(synapse_core::AgentEventKind::LeaseAcquired, &session_id, None, status.ttl_ms)
+            && let Err(journal_error) = self.journal_lease_event(
+                synapse_core::AgentEventKind::LeaseAcquired,
+                &session_id,
+                None,
+                status.ttl_ms,
+            )
         {
             let released = lease::release_if_owner(&session_id);
             let persisted_row_deleted = self.delete_persisted_session_lease(&session_id).is_ok();
@@ -139,12 +201,47 @@ impl SynapseService {
                 error = ?journal_error,
                 "input lease acquire could not journal its agent event; rolled the acquisition back"
             );
-            return Err(super::agent_events::agent_event_tool_error(
+            let tool_error = super::agent_events::agent_event_tool_error(
                 "control_lease_acquire",
                 &journal_error,
                 false,
-            ));
+            );
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "control_lease_acquire",
+                    "lease_acquire",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "synapse_action::lease",
+                        "released_after_journal_failure": released,
+                        "persisted_row_deleted": persisted_row_deleted,
+                        "caller": lease_status_for_session(&session_id),
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&tool_error),
+                ),
+            )?;
+            return Err(tool_error);
         }
+        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+            "control_lease_acquire",
+            "lease_acquire",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": "synapse_action::lease",
+                "response": &response,
+                "caller": lease_status_for_session(&session_id),
+            }),
+            "ok",
+        ))?;
         Ok(Json(response))
     }
 
@@ -163,19 +260,112 @@ impl SynapseService {
         );
         let session_id = require_lease_session_id(&request_context)?;
         self.restore_session_lease_if_needed(&session_id)?;
-        let response = release_lease_for_session(&session_id)?;
-        self.delete_persisted_session_lease(&session_id)?;
+        let command_payload = json!({});
+        let command_before = json!({
+            "source_of_truth": "synapse_action::lease",
+            "caller": lease_status_for_session(&session_id),
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "control_lease_release",
+            "lease_release",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let response = match release_lease_for_session(&session_id) {
+            Ok(response) => response,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "control_lease_release",
+                        "lease_release",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": "synapse_action::lease",
+                            "caller": lease_status_for_session(&session_id),
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.delete_persisted_session_lease(&session_id) {
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "control_lease_release",
+                    "lease_release",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "synapse_action::lease",
+                        "response": &response,
+                        "caller": lease_status_for_session(&session_id),
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&error),
+                ),
+            )?;
+            return Err(error);
+        }
         // The release is already committed; a journal failure is surfaced
         // with that context instead of pretending the release failed.
-        self.journal_lease_event(
+        if let Err(error) = self.journal_lease_event(
             synapse_core::AgentEventKind::LeaseReleased,
             &session_id,
             None,
             None,
-        )
-        .map_err(|error| {
-            super::agent_events::agent_event_tool_error("control_lease_release", &error, true)
-        })?;
+        ) {
+            let tool_error =
+                super::agent_events::agent_event_tool_error("control_lease_release", &error, true);
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "control_lease_release",
+                    "lease_release",
+                    Some(session_id.clone()),
+                    Some(session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "synapse_action::lease",
+                        "response": &response,
+                        "caller": lease_status_for_session(&session_id),
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&tool_error),
+                ),
+            )?;
+            return Err(tool_error);
+        }
+        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+            "control_lease_release",
+            "lease_release",
+            Some(session_id.clone()),
+            Some(session_id.clone()),
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": "synapse_action::lease",
+                "response": &response,
+                "caller": lease_status_for_session(&session_id),
+            }),
+            "ok",
+        ))?;
         Ok(Json(response))
     }
 
@@ -194,9 +384,53 @@ impl SynapseService {
         );
         let session_id = require_lease_session_id(&request_context)?;
         self.restore_session_lease_if_needed(&session_id)?;
-        let to_session = params.0.to_session;
+        let params = params.0;
+        let to_session = params.to_session;
         self.ensure_handoff_recipient_live(&session_id, &to_session)?;
-        let handoff = handoff_lease_for_session(&session_id, &to_session, params.0.ttl_ms)?;
+        let command_payload = json!({
+            "to_session": &to_session,
+            "ttl_ms": params.ttl_ms,
+        });
+        let command_before = json!({
+            "source_of_truth": "synapse_action::lease",
+            "from": lease_status_for_session(&session_id),
+            "to": lease_status_for_session(&to_session),
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "control_lease_handoff",
+            "lease_handoff",
+            Some(session_id.clone()),
+            Some(to_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let handoff = match handoff_lease_for_session(&session_id, &to_session, params.ttl_ms) {
+            Ok(handoff) => handoff,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "control_lease_handoff",
+                        "lease_handoff",
+                        Some(session_id.clone()),
+                        Some(to_session.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": "synapse_action::lease",
+                            "from": lease_status_for_session(&session_id),
+                            "to": lease_status_for_session(&to_session),
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
         let response =
             ControlLeaseResponse::from_status("handed_off", session_id.clone(), &handoff.current);
         let persist_readback =
@@ -209,6 +443,25 @@ impl SynapseService {
                         &handoff.prior,
                         &error,
                     );
+                    self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            "control_lease_handoff",
+                            "lease_handoff",
+                            Some(session_id.clone()),
+                            Some(to_session.clone()),
+                            command_payload,
+                            command_before,
+                            json!({
+                                "source_of_truth": "synapse_action::lease",
+                                "from": lease_status_for_session(&session_id),
+                                "to": lease_status_for_session(&to_session),
+                            }),
+                            "error",
+                        )
+                        .with_error(
+                            super::command_audit::command_audit_error_from_error_data(&error),
+                        ),
+                    )?;
                     return Err(error);
                 }
             };
@@ -226,10 +479,48 @@ impl SynapseService {
         // Handoff = one released + one acquired event, both tagged with the
         // handoff reason so the journal reconstructs the transfer (#897).
         // The handoff is already committed; journal failure surfaces as such.
-        self.journal_lease_handoff_events(&session_id, &to_session, handoff.current.ttl_ms)
-            .map_err(|error| {
-                super::agent_events::agent_event_tool_error("control_lease_handoff", &error, true)
-            })?;
+        if let Err(error) =
+            self.journal_lease_handoff_events(&session_id, &to_session, handoff.current.ttl_ms)
+        {
+            let tool_error =
+                super::agent_events::agent_event_tool_error("control_lease_handoff", &error, true);
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "control_lease_handoff",
+                    "lease_handoff",
+                    Some(session_id.clone()),
+                    Some(to_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "synapse_action::lease",
+                        "response": &response,
+                        "from": lease_status_for_session(&session_id),
+                        "to": lease_status_for_session(&to_session),
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&tool_error),
+                ),
+            )?;
+            return Err(tool_error);
+        }
+        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+            "control_lease_handoff",
+            "lease_handoff",
+            Some(session_id.clone()),
+            Some(to_session.clone()),
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": "synapse_action::lease",
+                "response": &response,
+                "from": lease_status_for_session(&session_id),
+                "to": lease_status_for_session(&to_session),
+            }),
+            "ok",
+        ))?;
         Ok(Json(response))
     }
 
@@ -373,16 +664,14 @@ impl SynapseService {
         reason_code: Option<&str>,
         ttl_ms: Option<u64>,
     ) -> Result<(), synapse_storage::StorageError> {
-        let db = self.m3_storage().map_err(|error| {
-            synapse_storage::StorageError::WriteFailed {
+        let db = self
+            .m3_storage()
+            .map_err(|error| synapse_storage::StorageError::WriteFailed {
                 cf_name: synapse_storage::cf::CF_AGENT_EVENTS.to_owned(),
                 detail: format!("open storage for lease agent event: {}", error.message),
-            }
-        })?;
-        let mut record = synapse_core::AgentEventRecord::new(
-            super::agent_events::unix_time_ns_now(),
-            kind,
-        );
+            })?;
+        let mut record =
+            synapse_core::AgentEventRecord::new(super::agent_events::unix_time_ns_now(), kind);
         record.session_id = Some(session_id.to_owned());
         record.reason_code = reason_code.map(ToOwned::to_owned);
         record.attributes.conversation_id = Some(session_id.to_owned());
@@ -398,25 +687,24 @@ impl SynapseService {
         to_session_id: &str,
         ttl_ms: Option<u64>,
     ) -> Result<(), synapse_storage::StorageError> {
-        let db = self.m3_storage().map_err(|error| {
-            synapse_storage::StorageError::WriteFailed {
+        let db = self
+            .m3_storage()
+            .map_err(|error| synapse_storage::StorageError::WriteFailed {
                 cf_name: synapse_storage::cf::CF_AGENT_EVENTS.to_owned(),
-                detail: format!("open storage for lease handoff agent events: {}", error.message),
-            }
-        })?;
+                detail: format!(
+                    "open storage for lease handoff agent events: {}",
+                    error.message
+                ),
+            })?;
         let ts_ns = super::agent_events::unix_time_ns_now();
-        let mut released = synapse_core::AgentEventRecord::new(
-            ts_ns,
-            synapse_core::AgentEventKind::LeaseReleased,
-        );
+        let mut released =
+            synapse_core::AgentEventRecord::new(ts_ns, synapse_core::AgentEventKind::LeaseReleased);
         released.session_id = Some(from_session_id.to_owned());
         released.reason_code = Some("handoff".to_owned());
         released.attributes.conversation_id = Some(from_session_id.to_owned());
         released.payload = json!({ "to_session": to_session_id });
-        let mut acquired = synapse_core::AgentEventRecord::new(
-            ts_ns,
-            synapse_core::AgentEventKind::LeaseAcquired,
-        );
+        let mut acquired =
+            synapse_core::AgentEventRecord::new(ts_ns, synapse_core::AgentEventKind::LeaseAcquired);
         acquired.session_id = Some(to_session_id.to_owned());
         acquired.reason_code = Some("handoff".to_owned());
         acquired.attributes.conversation_id = Some(to_session_id.to_owned());

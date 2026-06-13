@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use chrono::Utc;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use synapse_core::{
     AccessibleNode, Action, AgentTranscriptRecord, ElementId, Event, EventSource, FocusedElement,
     ForegroundContext, Profile, ProfileUseScope, ReflexId,
@@ -417,7 +417,72 @@ impl SynapseService {
         by_session: &str,
     ) -> Result<crate::m3::approvals::ApprovalActivationDecisionResponse, ErrorData> {
         let db = self.m3_storage()?;
-        crate::m3::approvals::decide_approval_from_activation(&db, params, by_session)
+        let command_payload = json!({
+            "bind": &params.bind,
+            "approval_id": &params.approval_id,
+            "activation_id": &params.activation_id,
+            "token": &params.token,
+            "decision": &params.decision,
+            "snooze_ms": params.snooze_ms,
+        });
+        let command_before = json!({
+            "source_of_truth": "CF_KV approval queue rows plus approval activation/audit rows",
+            "approval_id": &params.approval_id,
+            "activation_id": &params.activation_id,
+        });
+        self.command_audit_intent(
+            super::command_audit::CommandAuditInput::mcp(
+                "approval_activate",
+                "approval_decision",
+                Some(by_session.to_owned()),
+                Some(by_session.to_owned()),
+                command_payload.clone(),
+                command_before.clone(),
+                Value::Null,
+                "pending",
+            )
+            .with_channel("dashboard"),
+        )?;
+        let result = crate::m3::approvals::decide_approval_from_activation(&db, params, by_session);
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "approval_activate",
+                    "approval_decision",
+                    Some(by_session.to_owned()),
+                    Some(by_session.to_owned()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV approval queue rows plus approval activation/audit rows",
+                        "approval_id": &response.decision.approval_id,
+                        "activation_id": &response.activation_id,
+                        "before_status": response.decision.before_status.as_str(),
+                        "after_status": response.decision.after_status.as_str(),
+                        "activation_row": &response.activation_row,
+                    }),
+                    "ok",
+                )
+                .with_channel("dashboard"),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "approval_activate",
+                    "approval_decision",
+                    Some(by_session.to_owned()),
+                    Some(by_session.to_owned()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV approval queue rows plus approval activation/audit rows",
+                    }),
+                    "error",
+                )
+                .with_channel("dashboard")
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
+        result
     }
 
     fn install_aim_track_target_source(

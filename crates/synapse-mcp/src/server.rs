@@ -171,6 +171,7 @@ mod agent_mailbox;
 pub(crate) mod agent_state;
 pub(crate) mod agent_transcripts;
 mod audit_context;
+pub(crate) mod command_audit;
 mod context;
 pub(crate) use context::AgentTranscriptSnapshotRow;
 pub(crate) mod drain;

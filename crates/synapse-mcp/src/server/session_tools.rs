@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use synapse_action::lease;
 use synapse_core::error_codes;
 
@@ -170,7 +170,9 @@ impl SynapseService {
                 "session_end requires an MCP session id",
             )
         })?;
-        let target_session_id = match params.0.session_id {
+        let params = params.0;
+        let requested_session_id = params.session_id.clone();
+        let target_session_id = match requested_session_id.clone() {
             Some(session_id) => {
                 validate_session_id(&session_id)?;
                 if session_id != current_session_id {
@@ -186,12 +188,69 @@ impl SynapseService {
                 }
                 session_id
             }
-            None => current_session_id,
+            None => current_session_id.clone(),
         };
+        let command_payload = json!({
+            "requested_session_id": &requested_session_id,
+            "target_session_id": &target_session_id,
+        });
+        let command_before = json!({
+            "source_of_truth": "session lifecycle registry, input lease, target/session-owned resources",
+            "target_session_id": &target_session_id,
+            "session_status": self.session_status_impl(&target_session_id).ok(),
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "session_end",
+            "kill",
+            Some(current_session_id.clone()),
+            Some(target_session_id.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
         let lifecycle = self.session_lifecycle_state()?;
-        let report = lifecycle
+        let report = match lifecycle
             .teardown_session(&target_session_id, "explicit_session_end")
-            .await?;
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "session_end",
+                        "kill",
+                        Some(current_session_id.clone()),
+                        Some(target_session_id.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": "session lifecycle registry, input lease, target/session-owned resources",
+                            "session_status": self.session_status_impl(&target_session_id).ok(),
+                        }),
+                        "error",
+                    )
+                    .with_error(super::command_audit::command_audit_error_from_error_data(
+                        &error,
+                    )),
+                )?;
+                return Err(error);
+            }
+        };
+        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+            "session_end",
+            "kill",
+            Some(current_session_id.clone()),
+            Some(target_session_id.clone()),
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": "session lifecycle registry, input lease, target/session-owned resources",
+                "report": &report,
+                "session_status": self.session_status_impl(&target_session_id).ok(),
+            }),
+            "ok",
+        ))?;
         Ok(Json(SessionEndResponse { report }))
     }
 }

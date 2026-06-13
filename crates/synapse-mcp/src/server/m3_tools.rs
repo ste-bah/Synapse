@@ -51,6 +51,7 @@ use super::{
     update_approval_toast_state, update_local_model, update_routine, update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 fn approval_toast_activation_callback(
@@ -690,7 +691,55 @@ impl SynapseService {
         let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
             .unwrap_or_else(|| "stdio".to_owned());
         let db = self.m3_storage()?;
-        let mut response = request_approval(&db, &params, &by_session)?;
+        let command_payload = json!({
+            "kind": &params.kind,
+            "title": &params.title,
+            "body": &params.body,
+            "payload_json": &params.payload_json,
+            "dedupe_key": &params.dedupe_key,
+            "destructive": params.destructive,
+            "notify": params.notify,
+            "suppress_popup": params.suppress_popup,
+            "timeout_ms": params.timeout_ms,
+            "timeout_decision": &params.timeout_decision,
+        });
+        let command_before = json!({
+            "source_of_truth": "CF_KV approval queue rows plus approval audit rows",
+            "by_session": &by_session,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "approval_request",
+            "approval_request",
+            Some(by_session.clone()),
+            Some(by_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let mut response = match request_approval(&db, &params, &by_session) {
+            Ok(response) => response,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "approval_request",
+                        "approval_request",
+                        Some(by_session.clone()),
+                        Some(by_session.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": "CF_KV approval queue rows plus approval audit rows",
+                        }),
+                        "error",
+                    )
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
         if params.notify && !response.deduped {
             let (delivery, toast_audit_row) =
                 match crate::approval_protocol::ensure_protocol_handler_registered() {
@@ -757,12 +806,38 @@ impl SynapseService {
                                             verified_in_history: Some(toast.verified_in_history),
                                         };
                                         let (item, item_row, audit_row) =
-                                            update_approval_toast_state(
+                                            match update_approval_toast_state(
                                                 &db,
                                                 &response.item.approval_id,
                                                 delivery.clone(),
                                                 &by_session,
-                                            )?;
+                                            ) {
+                                                Ok(readback) => readback,
+                                                Err(error) => {
+                                                    self.command_audit_final(
+                                                    super::command_audit::CommandAuditInput::mcp(
+                                                        "approval_request",
+                                                        "approval_request",
+                                                        Some(by_session.clone()),
+                                                        Some(by_session.clone()),
+                                                        command_payload.clone(),
+                                                        command_before.clone(),
+                                                        json!({
+                                                            "source_of_truth": "CF_KV approval queue rows plus approval audit rows",
+                                                            "approval_id": &response.item.approval_id,
+                                                            "deduped": response.deduped,
+                                                            "item_row": &response.item_row,
+                                                            "audit_row": &response.audit_row,
+                                                        }),
+                                                        "error",
+                                                    )
+                                                    .with_error(
+                                                        super::command_audit::command_audit_error_from_error_data(&error),
+                                                    ),
+                                                )?;
+                                                    return Err(error);
+                                                }
+                                            };
                                         response.item = item;
                                         response.item_row = item_row;
                                         (delivery, Some(audit_row))
@@ -784,12 +859,38 @@ impl SynapseService {
                                             verified_in_history: Some(false),
                                         };
                                         let (item, item_row, audit_row) =
-                                            update_approval_toast_state(
+                                            match update_approval_toast_state(
                                                 &db,
                                                 &response.item.approval_id,
                                                 delivery.clone(),
                                                 &by_session,
-                                            )?;
+                                            ) {
+                                                Ok(readback) => readback,
+                                                Err(error) => {
+                                                    self.command_audit_final(
+                                                    super::command_audit::CommandAuditInput::mcp(
+                                                        "approval_request",
+                                                        "approval_request",
+                                                        Some(by_session.clone()),
+                                                        Some(by_session.clone()),
+                                                        command_payload.clone(),
+                                                        command_before.clone(),
+                                                        json!({
+                                                            "source_of_truth": "CF_KV approval queue rows plus approval audit rows",
+                                                            "approval_id": &response.item.approval_id,
+                                                            "deduped": response.deduped,
+                                                            "item_row": &response.item_row,
+                                                            "audit_row": &response.audit_row,
+                                                        }),
+                                                        "error",
+                                                    )
+                                                    .with_error(
+                                                        super::command_audit::command_audit_error_from_error_data(&error),
+                                                    ),
+                                                )?;
+                                                    return Err(error);
+                                                }
+                                            };
                                         response.item = item;
                                         response.item_row = item_row;
                                         (delivery, Some(audit_row))
@@ -812,12 +913,38 @@ impl SynapseService {
                                     notification_setting: None,
                                     verified_in_history: Some(false),
                                 };
-                                let (item, item_row, audit_row) = update_approval_toast_state(
+                                let (item, item_row, audit_row) = match update_approval_toast_state(
                                     &db,
                                     &response.item.approval_id,
                                     delivery.clone(),
                                     &by_session,
-                                )?;
+                                ) {
+                                    Ok(readback) => readback,
+                                    Err(error) => {
+                                        self.command_audit_final(
+                                            super::command_audit::CommandAuditInput::mcp(
+                                                "approval_request",
+                                                "approval_request",
+                                                Some(by_session.clone()),
+                                                Some(by_session.clone()),
+                                                command_payload.clone(),
+                                                command_before.clone(),
+                                                json!({
+                                                    "source_of_truth": "CF_KV approval queue rows plus approval audit rows",
+                                                    "approval_id": &response.item.approval_id,
+                                                    "deduped": response.deduped,
+                                                    "item_row": &response.item_row,
+                                                    "audit_row": &response.audit_row,
+                                                }),
+                                                "error",
+                                            )
+                                            .with_error(
+                                                super::command_audit::command_audit_error_from_error_data(&error),
+                                            ),
+                                        )?;
+                                        return Err(error);
+                                    }
+                                };
                                 response.item = item;
                                 response.item_row = item_row;
                                 (delivery, Some(audit_row))
@@ -839,12 +966,38 @@ impl SynapseService {
                             notification_setting: None,
                             verified_in_history: Some(false),
                         };
-                        let (item, item_row, audit_row) = update_approval_toast_state(
+                        let (item, item_row, audit_row) = match update_approval_toast_state(
                             &db,
                             &response.item.approval_id,
                             delivery.clone(),
                             &by_session,
-                        )?;
+                        ) {
+                            Ok(readback) => readback,
+                            Err(error) => {
+                                self.command_audit_final(
+                                    super::command_audit::CommandAuditInput::mcp(
+                                        "approval_request",
+                                        "approval_request",
+                                        Some(by_session.clone()),
+                                        Some(by_session.clone()),
+                                        command_payload.clone(),
+                                        command_before.clone(),
+                                        json!({
+                                            "source_of_truth": "CF_KV approval queue rows plus approval audit rows",
+                                            "approval_id": &response.item.approval_id,
+                                            "deduped": response.deduped,
+                                            "item_row": &response.item_row,
+                                            "audit_row": &response.audit_row,
+                                        }),
+                                        "error",
+                                    )
+                                    .with_error(
+                                        super::command_audit::command_audit_error_from_error_data(&error),
+                                    ),
+                                )?;
+                                return Err(error);
+                            }
+                        };
                         response.item = item;
                         response.item_row = item_row;
                         (delivery, Some(audit_row))
@@ -859,6 +1012,23 @@ impl SynapseService {
             );
             response.toast_audit_row = toast_audit_row;
         }
+        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+            "approval_request",
+            "approval_request",
+            Some(by_session.clone()),
+            Some(by_session.clone()),
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": "CF_KV approval queue rows plus approval audit rows",
+                "approval_id": &response.item.approval_id,
+                "deduped": response.deduped,
+                "item_row": &response.item_row,
+                "audit_row": &response.audit_row,
+                "toast_audit_row": &response.toast_audit_row,
+            }),
+            "ok",
+        ))?;
         Ok(Json(response))
     }
 
@@ -909,7 +1079,65 @@ impl SynapseService {
         let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
             .unwrap_or_else(|| "stdio".to_owned());
         let db = self.m3_storage()?;
-        decide_approval(&db, &params.0, &by_session).map(Json)
+        let params = params.0;
+        let command_payload = json!({
+            "approval_id": &params.approval_id,
+            "decision": params.decision.as_str(),
+            "note_present": params.note.is_some(),
+            "snooze_ms": params.snooze_ms,
+        });
+        let command_before = json!({
+            "source_of_truth": "CF_KV approval queue rows plus approval transition audit rows",
+            "approval_id": &params.approval_id,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "approval_decide",
+            "approval_decision",
+            Some(by_session.clone()),
+            Some(by_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let result = decide_approval(&db, &params, &by_session);
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "approval_decide",
+                    "approval_decision",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV approval queue rows plus approval transition audit rows",
+                        "approval_id": &response.approval_id,
+                        "before_status": response.before_status.as_str(),
+                        "after_status": response.after_status.as_str(),
+                        "item_row": &response.item_row,
+                        "audit_row": &response.audit_row,
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "approval_decide",
+                    "approval_decision",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV approval queue rows plus approval transition audit rows",
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
+        result.map(Json)
     }
 
     #[tool(
@@ -1164,7 +1392,55 @@ impl SynapseService {
         )?;
         let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
             .unwrap_or_else(|| "stdio".to_owned());
-        pause_timeline(&self.m3_state, &params.0, &by_session).map(Json)
+        let params = params.0;
+        let command_payload = json!({ "duration_ms": params.duration_ms });
+        let command_before = json!({
+            "source_of_truth": "CF_KV timeline/control/v1 plus CF_TIMELINE boundary rows",
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "timeline_pause",
+            "pause",
+            Some(by_session.clone()),
+            Some(by_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let result = pause_timeline(&self.m3_state, &params, &by_session);
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "timeline_pause",
+                    "pause",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV timeline/control/v1 plus CF_TIMELINE boundary rows",
+                        "response": response,
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "timeline_pause",
+                    "pause",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV timeline/control/v1 plus CF_TIMELINE boundary rows",
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
+        result.map(Json)
     }
 
     #[tool(
@@ -1186,7 +1462,55 @@ impl SynapseService {
         )?;
         let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
             .unwrap_or_else(|| "stdio".to_owned());
-        resume_timeline(&self.m3_state, &params.0, &by_session).map(Json)
+        let params = params.0;
+        let command_payload = json!({});
+        let command_before = json!({
+            "source_of_truth": "CF_KV timeline/control/v1 plus CF_TIMELINE boundary rows",
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "timeline_resume",
+            "resume",
+            Some(by_session.clone()),
+            Some(by_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let result = resume_timeline(&self.m3_state, &params, &by_session);
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "timeline_resume",
+                    "resume",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV timeline/control/v1 plus CF_TIMELINE boundary rows",
+                        "response": response,
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "timeline_resume",
+                    "resume",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV timeline/control/v1 plus CF_TIMELINE boundary rows",
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
+        result.map(Json)
     }
 
     #[tool(
@@ -1210,7 +1534,59 @@ impl SynapseService {
         )?;
         let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
             .unwrap_or_else(|| "stdio".to_owned());
-        update_timeline_exclusions(&self.m3_state, &params.0, &by_session).map(Json)
+        let params = params.0;
+        let command_payload = json!({
+            "add": &params.add,
+            "remove": &params.remove,
+        });
+        let command_before = json!({
+            "source_of_truth": "timeline control runtime exclusion set plus CF_KV timeline control rows",
+            "by_session": &by_session,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "timeline_exclusions",
+            "timeline_exclusions",
+            Some(by_session.clone()),
+            Some(by_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let result = update_timeline_exclusions(&self.m3_state, &params, &by_session);
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "timeline_exclusions",
+                    "timeline_exclusions",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "timeline control runtime exclusion set plus CF_KV timeline control rows",
+                        "response": response,
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "timeline_exclusions",
+                    "timeline_exclusions",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "timeline control runtime exclusion set plus CF_KV timeline control rows",
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
+        result.map(Json)
     }
 
     #[tool(
@@ -1237,7 +1613,67 @@ impl SynapseService {
         let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
             .unwrap_or_else(|| "stdio".to_owned());
         let runtime = self.reflex_runtime()?;
-        purge_timeline(&runtime, &params.0, &by_session).map(Json)
+        let params = params.0;
+        let command_payload = json!({
+            "start_ts_ns": params.start_ts_ns,
+            "end_ts_ns": params.end_ts_ns,
+            "apps": &params.apps,
+            "text_present": params.text.is_some(),
+            "kinds": &params.kinds,
+            "actor": &params.actor,
+            "all": params.all,
+            "dry_run": params.dry_run,
+            "cursor": &params.cursor,
+        });
+        let command_before = json!({
+            "source_of_truth": "CF_TIMELINE rows plus CF_TIMELINE purge audit row",
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "timeline_purge",
+            "purge",
+            Some(by_session.clone()),
+            Some(by_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let result = purge_timeline(&runtime, &params, &by_session);
+        match &result {
+            Ok(response) => {
+                self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+                    "timeline_purge",
+                    "purge",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_TIMELINE rows plus CF_TIMELINE purge audit row",
+                        "response": response,
+                    }),
+                    "ok",
+                ))?
+            }
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "timeline_purge",
+                    "purge",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_TIMELINE rows plus CF_TIMELINE purge audit row",
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(error),
+                ),
+            )?,
+        };
+        result.map(Json)
     }
 
     #[tool(

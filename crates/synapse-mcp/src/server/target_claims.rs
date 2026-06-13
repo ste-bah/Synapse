@@ -13,7 +13,7 @@ use std::{
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 use synapse_core::error_codes;
 
 use super::{
@@ -205,8 +205,60 @@ impl SynapseService {
         let live_sessions = self.live_target_claim_sessions(now, Some(&session_id))?;
         let mut guard = self.lock_target_claims()?;
         guard.prune_inactive(now, &live_sessions);
+        let target_key = target_key(&target);
+        let target_wire = target_wire(&target);
+        let command_payload = json!({
+            "target_key": &target_key,
+            "target": &target_wire,
+            "ttl_ms": params.0.ttl_ms,
+        });
+        let command_before = json!({
+            "source_of_truth": source_of_truth(),
+            "claims": guard.reads(now),
+        });
+        self.command_audit_intent(
+            super::command_audit::CommandAuditInput::mcp(
+                "target_claim",
+                "target_claim",
+                Some(session_id.clone()),
+                Some(session_id.clone()),
+                command_payload.clone(),
+                command_before.clone(),
+                Value::Null,
+                "pending",
+            )
+            .with_target(json!({
+                "target_key": &target_key,
+                "target": &target_wire,
+            })),
+        )?;
         match guard.claim(&session_id, target, params.0.ttl_ms, now, &live_sessions) {
             Ok((entry, outcome)) => {
+                let response = TargetClaimResponse {
+                    session_id: session_id.clone(),
+                    outcome: outcome.to_owned(),
+                    claim: entry.read(now),
+                };
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "target_claim",
+                        "target_claim",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": source_of_truth(),
+                            "response": &response,
+                            "claims": guard.reads(now),
+                        }),
+                        "ok",
+                    )
+                    .with_target(json!({
+                        "target_key": &target_key,
+                        "target": &target_wire,
+                    })),
+                )?;
                 tracing::info!(
                     code = "TARGET_CLAIM_SET",
                     session_id = %session_id,
@@ -215,18 +267,34 @@ impl SynapseService {
                     expires_at_unix_ms = entry.expires_at_unix_ms,
                     "readback=target_claim outcome={outcome}"
                 );
-                Ok(Json(TargetClaimResponse {
-                    session_id,
-                    outcome: outcome.to_owned(),
-                    claim: entry.read(now),
-                }))
+                Ok(Json(response))
             }
-            Err(conflict) => Err(conflict_error(
-                "target_claim",
-                &session_id,
-                &conflict,
-                "target_claim",
-            )),
+            Err(conflict) => {
+                let error = conflict_error("target_claim", &session_id, &conflict, "target_claim");
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "target_claim",
+                        "target_claim",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": source_of_truth(),
+                            "claims": guard.reads(now),
+                        }),
+                        "error",
+                    )
+                    .with_target(json!({
+                        "target_key": &target_key,
+                        "target": &target_wire,
+                    }))
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                Err(error)
+            }
         }
     }
 
@@ -282,11 +350,66 @@ impl SynapseService {
         let prior_claim = prior_entry.read(now);
         let (_requester, _owner, owner_in_flight_before) =
             self.ensure_same_agent_adoption_allowed(&session_id, &owner_session_id, now)?;
+        let command_payload = json!({
+            "owner_session_id": &owner_session_id,
+            "target_key": &prior_claim.target_key,
+            "target": &prior_claim.target,
+            "ttl_ms": ttl_ms,
+        });
+        let command_before = json!({
+            "source_of_truth": source_of_truth(),
+            "prior_claim": &prior_claim,
+            "owner_in_flight_before": owner_in_flight_before,
+        });
+        self.command_audit_intent(
+            super::command_audit::CommandAuditInput::mcp(
+                "target_claim_adopt",
+                "target_claim_adopt",
+                Some(session_id.clone()),
+                Some(owner_session_id.clone()),
+                command_payload.clone(),
+                command_before.clone(),
+                Value::Null,
+                "pending",
+            )
+            .with_target(json!({
+                "target_key": &prior_claim.target_key,
+                "target": &prior_claim.target,
+            })),
+        )?;
 
         let lifecycle = self.session_lifecycle_state()?;
-        let owner_teardown_report = lifecycle
+        let owner_teardown_report = match lifecycle
             .teardown_session(&owner_session_id, "target_claim_adopt")
-            .await?;
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "target_claim_adopt",
+                        "target_claim_adopt",
+                        Some(session_id.clone()),
+                        Some(owner_session_id.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": source_of_truth(),
+                            "claims": self.lock_target_claims()?.reads(unix_time_ms_now()),
+                        }),
+                        "error",
+                    )
+                    .with_target(json!({
+                        "target_key": &prior_claim.target_key,
+                        "target": &prior_claim.target,
+                    }))
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
+        };
 
         let now_after = unix_time_ms_now();
         let live_sessions_after = self.live_target_claim_sessions(now_after, Some(&session_id))?;
@@ -296,14 +419,68 @@ impl SynapseService {
             match guard.claim(&session_id, target, ttl_ms, now_after, &live_sessions_after) {
                 Ok(result) => result,
                 Err(conflict) => {
-                    return Err(conflict_error(
+                    let error = conflict_error(
                         "target_claim_adopt",
                         &session_id,
                         &conflict,
                         "adopt_after_owner_teardown",
-                    ));
+                    );
+                    self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            "target_claim_adopt",
+                            "target_claim_adopt",
+                            Some(session_id.clone()),
+                            Some(owner_session_id.clone()),
+                            command_payload,
+                            command_before,
+                            json!({
+                                "source_of_truth": source_of_truth(),
+                                "owner_teardown_report": &owner_teardown_report,
+                                "claims": guard.reads(now_after),
+                            }),
+                            "error",
+                        )
+                        .with_target(json!({
+                            "target_key": &prior_claim.target_key,
+                            "target": &prior_claim.target,
+                        }))
+                        .with_error(
+                            super::command_audit::command_audit_error_from_error_data(&error),
+                        ),
+                    )?;
+                    return Err(error);
                 }
             };
+        let response = TargetClaimAdoptResponse {
+            session_id: session_id.clone(),
+            adopted_from_session_id: owner_session_id.clone(),
+            outcome: "adopted".to_owned(),
+            prior_claim,
+            claim: entry.read(now_after),
+            owner_in_flight_before,
+            owner_teardown_report,
+            source_of_truth: source_of_truth(),
+        };
+        self.command_audit_final(
+            super::command_audit::CommandAuditInput::mcp(
+                "target_claim_adopt",
+                "target_claim_adopt",
+                Some(session_id.clone()),
+                Some(owner_session_id.clone()),
+                command_payload,
+                command_before,
+                json!({
+                    "source_of_truth": source_of_truth(),
+                    "response": &response,
+                    "claims": guard.reads(now_after),
+                }),
+                "ok",
+            )
+            .with_target(json!({
+                "target_key": &response.claim.target_key,
+                "target": &response.claim.target,
+            })),
+        )?;
         tracing::info!(
             code = "TARGET_CLAIM_ADOPTED",
             session_id = %session_id,
@@ -313,16 +490,7 @@ impl SynapseService {
             prior_generation = prior_entry.generation,
             "readback=target_claim_adopt outcome=adopted"
         );
-        Ok(Json(TargetClaimAdoptResponse {
-            session_id,
-            adopted_from_session_id: owner_session_id,
-            outcome: "adopted".to_owned(),
-            prior_claim,
-            claim: entry.read(now_after),
-            owner_in_flight_before,
-            owner_teardown_report,
-            source_of_truth: source_of_truth(),
-        }))
+        Ok(Json(response))
     }
 
     #[tool(
@@ -346,9 +514,62 @@ impl SynapseService {
         let live_sessions = self.live_target_claim_sessions(now, Some(&session_id))?;
         let mut guard = self.lock_target_claims()?;
         guard.prune_inactive(now, &live_sessions);
+        let target_wire = target_wire(&target);
+        let command_payload = json!({
+            "target_key": &target_key,
+            "target": &target_wire,
+        });
+        let command_before = json!({
+            "source_of_truth": source_of_truth(),
+            "claims": guard.reads(now),
+        });
+        self.command_audit_intent(
+            super::command_audit::CommandAuditInput::mcp(
+                "target_release",
+                "target_release",
+                Some(session_id.clone()),
+                Some(session_id.clone()),
+                command_payload.clone(),
+                command_before.clone(),
+                Value::Null,
+                "pending",
+            )
+            .with_target(json!({
+                "target_key": &target_key,
+                "target": &target_wire,
+            })),
+        )?;
         match guard.release(&session_id, &target_key) {
             Ok(released) => {
                 let released_claim = released.as_ref().map(|entry| entry.read(now));
+                let response = TargetReleaseResponse {
+                    session_id: session_id.clone(),
+                    target_key: target_key.clone(),
+                    target: target_wire.clone(),
+                    released: released.is_some(),
+                    released_claim,
+                    source_of_truth: source_of_truth(),
+                };
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "target_release",
+                        "target_release",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": source_of_truth(),
+                            "response": &response,
+                            "claims": guard.reads(now),
+                        }),
+                        "ok",
+                    )
+                    .with_target(json!({
+                        "target_key": &target_key,
+                        "target": &target_wire,
+                    })),
+                )?;
                 tracing::info!(
                     code = "TARGET_CLAIM_RELEASED",
                     session_id = %session_id,
@@ -356,21 +577,35 @@ impl SynapseService {
                     released = released.is_some(),
                     "readback=target_release"
                 );
-                Ok(Json(TargetReleaseResponse {
-                    session_id,
-                    target_key,
-                    target: target_wire(&target),
-                    released: released.is_some(),
-                    released_claim,
-                    source_of_truth: source_of_truth(),
-                }))
+                Ok(Json(response))
             }
-            Err(conflict) => Err(conflict_error(
-                "target_release",
-                &session_id,
-                &conflict,
-                "target_release",
-            )),
+            Err(conflict) => {
+                let error =
+                    conflict_error("target_release", &session_id, &conflict, "target_release");
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "target_release",
+                        "target_release",
+                        Some(session_id.clone()),
+                        Some(session_id.clone()),
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": source_of_truth(),
+                            "claims": guard.reads(now),
+                        }),
+                        "error",
+                    )
+                    .with_target(json!({
+                        "target_key": &target_key,
+                        "target": &target_wire,
+                    }))
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                Err(error)
+            }
         }
     }
 

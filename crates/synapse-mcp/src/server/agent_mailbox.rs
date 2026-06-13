@@ -256,6 +256,29 @@ impl SynapseService {
                 depth_before,
             ));
         }
+        let command_payload = json!({
+            "to_session": &params.to_session,
+            "kind": &params.kind,
+            "payload": &params.payload,
+            "artifact_handle": &params.artifact_handle,
+            "ttl_ms": params.ttl_ms,
+        });
+        let command_before = json!({
+            "source_of_truth": cf::CF_KV,
+            "recipient_lifecycle": &recipient.lifecycle,
+            "queue_depth_before": depth_before,
+            "expired_rows_deleted_before": expired_rows_deleted_before,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "agent_send",
+            "steer",
+            Some(from_session.to_owned()),
+            Some(params.to_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
 
         let seq = NEXT_MAILBOX_SEQ.fetch_add(1, Ordering::Relaxed);
         let message_id = format!("agentmsg-{now_unix_ms:020}-{seq:020}");
@@ -301,9 +324,32 @@ impl SynapseService {
             "value_sha256": &storage_readback.value_sha256,
             "expires_at_unix_ms": message.expires_at_unix_ms,
         });
-        super::agent_events::record_agent_event(&db, &journal_record).map_err(|error| {
-            super::agent_events::agent_event_tool_error("agent_send", &error, true)
-        })?;
+        if let Err(error) = super::agent_events::record_agent_event(&db, &journal_record) {
+            let tool_error =
+                super::agent_events::agent_event_tool_error("agent_send", &error, true);
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "agent_send",
+                    "steer",
+                    Some(from_session.to_owned()),
+                    Some(message.to_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": cf::CF_KV,
+                        "message_id": &message_id,
+                        "row_key": &row_key,
+                        "queue_depth_after": queue_depth_after,
+                        "storage_readback": &storage_readback,
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&tool_error),
+                ),
+            )?;
+            return Err(tool_error);
+        }
 
         tracing::info!(
             code = "AGENT_MAILBOX_SEND_COMMITTED",
@@ -318,7 +364,7 @@ impl SynapseService {
             "readback=agent_mailbox edge=send_committed"
         );
 
-        Ok(AgentSendResponse {
+        let response = AgentSendResponse {
             ok: true,
             message_id,
             from_session: from_session.to_owned(),
@@ -329,7 +375,24 @@ impl SynapseService {
             expires_at_unix_ms: message.expires_at_unix_ms,
             queue_depth_after,
             storage_readback,
-        })
+        };
+        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+            "agent_send",
+            "steer",
+            Some(from_session.to_owned()),
+            Some(response.to_session.clone()),
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": cf::CF_KV,
+                "message_id": &response.message_id,
+                "row_key": &response.row_key,
+                "queue_depth_after": response.queue_depth_after,
+                "storage_readback": &response.storage_readback,
+            }),
+            "ok",
+        ))?;
+        Ok(response)
     }
 
     fn agent_inbox_impl(
