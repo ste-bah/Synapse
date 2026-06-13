@@ -2456,7 +2456,17 @@ impl Drop for ActivityRecorder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::sync::LazyLock;
+    #[cfg(windows)]
+    use synapse_a11y::ForegroundActivationIntent;
     use synapse_core::types::Rect;
+    #[cfg(windows)]
+    use synapse_test_utils::fixtures::{NotepadHandle, launch_notepad};
+
+    #[cfg(windows)]
+    static ACTIVITY_RECORDER_LIVE_WINDOW_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     fn snapshot(hwnd: i64, pid: u32, title: &str) -> ForegroundSnapshot {
         ForegroundSnapshot {
@@ -2587,6 +2597,91 @@ mod tests {
             idle_probe: Mutex::new(None),
             interaction_hook: Mutex::new(None),
             interaction_bridge: Mutex::new(None),
+        }
+    }
+
+    #[cfg(windows)]
+    async fn focus_owned_notepad(
+        handle: &NotepadHandle,
+        caller: &'static str,
+    ) -> synapse_core::ForegroundContext {
+        synapse_a11y::focus_window_with_intent(
+            handle.hwnd(),
+            ForegroundActivationIntent::OperatorRequested { caller },
+        )
+        .unwrap_or_else(|error| panic!("focus owned Notepad hwnd 0x{:x}: {error}", handle.hwnd()));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match synapse_a11y::current_foreground_context() {
+                Ok(context) if context.hwnd == handle.hwnd() => return context,
+                Ok(context) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned Notepad hwnd 0x{:x} did not become foreground; current hwnd=0x{:x} process={} title={:?}",
+                        handle.hwnd(),
+                        context.hwnd,
+                        context.process_name,
+                        context.window_title
+                    );
+                }
+                Err(error) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "owned Notepad hwnd 0x{:x} did not become foreground; current foreground read failed: {error}",
+                        handle.hwnd()
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[cfg(windows)]
+    fn foreground_event(
+        seq: u64,
+        at_ms: u64,
+        context: &synapse_core::ForegroundContext,
+    ) -> AccessibleEvent {
+        AccessibleEvent {
+            seq,
+            at_ms,
+            window_id: context.hwnd,
+            element_id: None,
+            kind: AccessibleEventKind::ForegroundChanged,
+            name: None,
+            value: None,
+        }
+    }
+
+    #[cfg(windows)]
+    struct TestLeaseGuard {
+        session_id: String,
+    }
+
+    #[cfg(windows)]
+    impl Drop for TestLeaseGuard {
+        fn drop(&mut self) {
+            let _ = synapse_action::lease::release(&self.session_id);
+        }
+    }
+
+    #[cfg(windows)]
+    async fn acquire_test_lease(session_id: String) -> TestLeaseGuard {
+        let acquire_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let outcome = synapse_action::lease::try_acquire(&session_id, Duration::from_secs(30));
+            match outcome {
+                synapse_action::LeaseOutcome::Acquired(_)
+                | synapse_action::LeaseOutcome::Renewed(_) => return TestLeaseGuard { session_id },
+                other => {
+                    assert!(
+                        std::time::Instant::now() < acquire_deadline,
+                        "real-input lease must be acquirable for the attribution edge: {other:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
         }
     }
 
@@ -3197,10 +3292,20 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn recorder_writes_real_foreground_rows_into_cf_timeline() {
+        let _live_window_lock = ACTIVITY_RECORDER_LIVE_WINDOW_LOCK.lock().await;
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
             .with_test_writer()
             .try_init();
+        let primary_window =
+            launch_notepad().unwrap_or_else(|error| panic!("launch primary Notepad: {error:#}"));
+        let secondary_window =
+            launch_notepad().unwrap_or_else(|error| panic!("launch secondary Notepad: {error:#}"));
+        let context = focus_owned_notepad(
+            &primary_window,
+            "activity_recorder_real_rows_primary_window",
+        )
+        .await;
         let temp = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
         let db = Arc::new(
             Db::open(temp.path(), synapse_core::SCHEMA_VERSION)
@@ -3222,18 +3327,9 @@ mod tests {
             "session_start must be written synchronously"
         );
 
-        // Real foreground window: the event the WinEvent hook would deliver.
-        let context = synapse_a11y::current_foreground_context()
-            .unwrap_or_else(|error| panic!("real foreground context: {error}"));
-        let event = AccessibleEvent {
-            seq: 1,
-            at_ms: 1,
-            window_id: context.hwnd,
-            element_id: None,
-            kind: AccessibleEventKind::ForegroundChanged,
-            name: None,
-            value: None,
-        };
+        // Owned real foreground window: the event the WinEvent hook would
+        // deliver, without depending on ambient user/agent desktop churn.
+        let event = foreground_event(1, 1, &context);
         println!(
             "readback=cf_timeline edge=real_foreground before=rows:{} foreground:{}",
             recorder.readback().0,
@@ -3247,6 +3343,11 @@ mod tests {
         // Edge: a vanished/invalid event hwnd re-resolves to the real
         // foreground (already recorded), so it dedups to no row — and must
         // never crash.
+        let _ = focus_owned_notepad(
+            &primary_window,
+            "activity_recorder_real_rows_vanished_event_dedup_window",
+        )
+        .await;
         let vanished = AccessibleEvent {
             window_id: 0x000d_ead0,
             ..event.clone()
@@ -3261,46 +3362,22 @@ mod tests {
 
         // Agent attribution: while a session holds the real-input lease, a
         // foreground change must be tagged agent{session_id}. Uses the real
-        // lease registry and a second real visible window.
-        let other_window = synapse_a11y::visible_top_level_window_contexts()
-            .unwrap_or_else(|error| panic!("enumerate windows: {error}"))
-            .into_iter()
-            .find(|candidate| candidate.hwnd != context.hwnd);
-        if let Some(other) = other_window {
-            let lease_session = format!("fsv-agent-{}", std::process::id());
-            // The lease registry is process-global and other tests in this
-            // binary exercise it; retry briefly instead of flaking on overlap.
-            let acquire_deadline = std::time::Instant::now() + Duration::from_secs(5);
-            loop {
-                let outcome =
-                    synapse_action::lease::try_acquire(&lease_session, Duration::from_secs(30));
-                match outcome {
-                    synapse_action::LeaseOutcome::Acquired(_)
-                    | synapse_action::LeaseOutcome::Renewed(_) => break,
-                    other => {
-                        assert!(
-                            std::time::Instant::now() < acquire_deadline,
-                            "real-input lease must be acquirable for the attribution edge: {other:?}"
-                        );
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-            println!(
-                "readback=cf_timeline edge=agent_attribution before=lease_held_by:{lease_session} window:{}",
-                other.process_name
-            );
-            let agent_event = AccessibleEvent {
-                window_id: other.hwnd,
-                ..event.clone()
-            };
-            recorder.record_accessible_event(&agent_event);
-            wait_for_rows(&recorder, 3).await;
-            synapse_action::lease::release(&lease_session)
-                .unwrap_or_else(|error| panic!("release lease: {error:?}"));
-        } else {
-            panic!("attribution edge needs a second visible window; none found");
-        }
+        // lease registry and a second owned real visible window.
+        let lease_session = format!("activity-recorder-agent-{}", std::process::id());
+        let lease_guard = acquire_test_lease(lease_session.clone()).await;
+        let other = focus_owned_notepad(
+            &secondary_window,
+            "activity_recorder_real_rows_secondary_window",
+        )
+        .await;
+        println!(
+            "readback=cf_timeline edge=agent_attribution before=lease_held_by:{lease_session} window:{}",
+            other.process_name
+        );
+        let agent_event = foreground_event(2, 2, &other);
+        recorder.record_accessible_event(&agent_event);
+        wait_for_rows(&recorder, 3).await;
+        drop(lease_guard);
 
         recorder.shutdown().await;
         println!(
@@ -3347,7 +3424,7 @@ mod tests {
             TimelineActor::Human,
             "unleased foreground change must be attributed to the human"
         );
-        let expected_session = format!("fsv-agent-{}", std::process::id());
+        let expected_session = format!("activity-recorder-agent-{}", std::process::id());
         assert_eq!(
             primary_records[2].actor,
             TimelineActor::Agent {
@@ -3366,10 +3443,20 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test]
     async fn pause_and_exclusion_gates_suppress_real_rows() {
+        let _live_window_lock = ACTIVITY_RECORDER_LIVE_WINDOW_LOCK.lock().await;
         let _ = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::DEBUG)
             .with_test_writer()
             .try_init();
+        let primary_window =
+            launch_notepad().unwrap_or_else(|error| panic!("launch primary Notepad: {error:#}"));
+        let secondary_window =
+            launch_notepad().unwrap_or_else(|error| panic!("launch secondary Notepad: {error:#}"));
+        let context = focus_owned_notepad(
+            &primary_window,
+            "activity_recorder_pause_exclusion_primary_window",
+        )
+        .await;
         let temp = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
         let db = Arc::new(
             Db::open(temp.path(), synapse_core::SCHEMA_VERSION)
@@ -3390,17 +3477,7 @@ mod tests {
         .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
         assert_eq!(recorder.readback().0, 1, "session_start");
 
-        let context = synapse_a11y::current_foreground_context()
-            .unwrap_or_else(|error| panic!("real foreground context: {error}"));
-        let event = AccessibleEvent {
-            seq: 1,
-            at_ms: 1,
-            window_id: context.hwnd,
-            element_id: None,
-            kind: AccessibleEventKind::ForegroundChanged,
-            name: None,
-            value: None,
-        };
+        let event = foreground_event(1, 1, &context);
 
         // Pause: boundary row written while still recording, then silence.
         println!(
@@ -3475,7 +3552,8 @@ mod tests {
             recorder.suppressed_counters()
         );
 
-        // Removing the exclusion restores recording for a different window.
+        // Removing the exclusion restores recording for another owned real
+        // window instead of relying on an unrelated ambient desktop window.
         control
             .persist_exclusion_update(
                 &db,
@@ -3485,22 +3563,14 @@ mod tests {
                 "fsv-exclude",
             )
             .unwrap_or_else(|error| panic!("un-exclude: {error:#}"));
-        let other_window = synapse_a11y::visible_top_level_window_contexts()
-            .unwrap_or_else(|error| panic!("enumerate windows: {error}"))
-            .into_iter()
-            .find(|candidate| {
-                candidate.hwnd != context.hwnd && candidate.process_name != context.process_name
-            });
-        if let Some(other) = other_window {
-            let other_event = AccessibleEvent {
-                window_id: other.hwnd,
-                ..event.clone()
-            };
-            recorder.record_accessible_event(&other_event);
-            wait_for_rows(&recorder, 5).await;
-        } else {
-            println!("readback=cf_timeline edge=unexclude skipped=no_second_window");
-        }
+        let restored_context = focus_owned_notepad(
+            &secondary_window,
+            "activity_recorder_pause_exclusion_secondary_window",
+        )
+        .await;
+        let other_event = foreground_event(2, 2, &restored_context);
+        recorder.record_accessible_event(&other_event);
+        wait_for_rows(&recorder, 5).await;
 
         recorder.shutdown().await;
         let rows = db
@@ -3513,23 +3583,33 @@ mod tests {
             })
             .collect();
         let kinds: Vec<TimelineKind> = records.iter().map(|record| record.kind).collect();
+        let primary_records: Vec<&TimelineRecord> = records
+            .iter()
+            .filter(|record| record.kind != TimelineKind::InteractionSummary)
+            .collect();
         println!("readback=cf_timeline edge=physical_sot kinds={kinds:?}");
-        assert_eq!(records[0].kind, TimelineKind::SessionStart);
-        assert_eq!(records[1].kind, TimelineKind::SessionEnd);
         assert_eq!(
-            records[1].payload["edge"], "pause",
+            primary_records.len(),
+            6,
+            "session_start + pause end + resume start + pre-exclusion focus + post-unexclude focus + shutdown; all rows={records:?}"
+        );
+        assert_eq!(primary_records[0].kind, TimelineKind::SessionStart);
+        assert_eq!(primary_records[1].kind, TimelineKind::SessionEnd);
+        assert_eq!(
+            primary_records[1].payload["edge"], "pause",
             "pause boundary row must carry edge=pause: {:?}",
-            records[1].payload
+            primary_records[1].payload
         );
-        assert_eq!(records[2].kind, TimelineKind::SessionStart);
+        assert_eq!(primary_records[2].kind, TimelineKind::SessionStart);
         assert_eq!(
-            records[2].payload["edge"], "resume",
+            primary_records[2].payload["edge"], "resume",
             "resume boundary row must carry edge=resume: {:?}",
-            records[2].payload
+            primary_records[2].payload
         );
-        assert_eq!(records[3].kind, TimelineKind::FocusChange);
+        assert_eq!(primary_records[3].kind, TimelineKind::FocusChange);
+        assert_eq!(primary_records[4].kind, TimelineKind::FocusChange);
         assert_eq!(
-            records.last().map(|record| record.kind),
+            primary_records.last().map(|record| record.kind),
             Some(TimelineKind::SessionEnd),
             "shutdown must close the session"
         );
@@ -3540,17 +3620,29 @@ mod tests {
             !kinds.contains(&TimelineKind::TitleChange),
             "excluded-window title event must not produce a row: {records:?}"
         );
-        let focus_rows_for_excluded = records
+        let focus_rows_for_excluded_hwnd = records
             .iter()
             .filter(|record| {
                 record.kind == TimelineKind::FocusChange
-                    && record.app.as_deref() == Some(context.process_name.as_str())
+                    && record.payload["hwnd"].as_i64() == Some(context.hwnd)
             })
             .count();
         assert_eq!(
-            focus_rows_for_excluded, 1,
-            "only the pre-exclusion focus row may exist for {}: {records:?}",
-            context.process_name
+            focus_rows_for_excluded_hwnd, 1,
+            "only the pre-exclusion focus row may exist for hwnd 0x{:x}: {records:?}",
+            context.hwnd
+        );
+        let focus_rows_after_unexclude = records
+            .iter()
+            .filter(|record| {
+                record.kind == TimelineKind::FocusChange
+                    && record.payload["hwnd"].as_i64() == Some(restored_context.hwnd)
+            })
+            .count();
+        assert_eq!(
+            focus_rows_after_unexclude, 1,
+            "the owned post-unexclude window must record exactly one focus row for hwnd 0x{:x}: {records:?}",
+            restored_context.hwnd
         );
     }
 
