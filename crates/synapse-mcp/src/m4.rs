@@ -4897,6 +4897,17 @@ fn select_launch_window<'a>(
         })
         .or_else(|| {
             contexts.iter().find(|context| {
+                !excluded_hwnds.contains(&context.hwnd)
+                    && launch_target_matches_brokered_window(
+                        launch_target_name,
+                        launch_args,
+                        context,
+                    )
+                    && title_regex.is_match(&context.window_title)
+            })
+        })
+        .or_else(|| {
+            contexts.iter().find(|context| {
                 excluded_hwnds.contains(&context.hwnd)
                     && launch_target_matches_existing_window(
                         launch_target_name,
@@ -4906,6 +4917,31 @@ fn select_launch_window<'a>(
                     && title_regex.is_match(&context.window_title)
             })
         })
+}
+
+fn launch_target_matches_brokered_window(
+    target_name: &str,
+    launch_args: &[String],
+    context: &ForegroundContext,
+) -> bool {
+    let target_name = target_name.to_ascii_lowercase();
+    let process_name = context.process_name.to_ascii_lowercase();
+    if target_name == process_name {
+        return false;
+    }
+    launch_target_matches_shell_activation(&target_name, launch_args, &process_name)
+        || matches!(
+            (target_name.as_str(), process_name.as_str()),
+            ("wt.exe", "windowsterminal.exe")
+                | (
+                    "calc.exe",
+                    "calculatorapp.exe" | "calculator.exe" | "applicationframehost.exe",
+                )
+                | (
+                    "cmd.exe" | "powershell.exe" | "pwsh.exe",
+                    "windowsterminal.exe" | "openconsole.exe" | "conhost.exe",
+                )
+        )
 }
 
 fn launch_target_matches_existing_window(
@@ -8685,6 +8721,23 @@ mod tests {
             selected.is_none(),
             "a matching title from an unrelated PID must not satisfy launch wait"
         );
+    }
+
+    #[test]
+    fn launch_window_selection_accepts_new_brokered_windows_terminal_window() {
+        let contexts = vec![foreground_for_launch_selection(
+            11,
+            200,
+            "WindowsTerminal.exe",
+            "Calyx #559 FSV",
+        )];
+        let excluded = HashSet::new();
+        let title_regex = regex::Regex::new("^Calyx #559 FSV$").expect("synthetic regex compiles");
+
+        let selected = select_launch_window(&contexts, 999, &title_regex, &excluded, "wt.exe", &[])
+            .expect("new brokered Windows Terminal window should satisfy launch wait");
+
+        assert_eq!(selected.hwnd, 11);
     }
 
     #[test]
