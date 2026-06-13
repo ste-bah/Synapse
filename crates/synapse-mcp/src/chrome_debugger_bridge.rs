@@ -1142,15 +1142,15 @@ impl ChromeDebuggerBridge {
     }
 
     fn drop_pending(&self, id: &str) {
-        if let Ok(mut inner) = self.inner.lock() {
-            if let Some(pending) = inner.pending.remove(id) {
-                tracing::warn!(
-                    code = "CHROME_DEBUGGER_PENDING_DROPPED",
-                    command_id = %id,
-                    command_kind = %pending.kind,
-                    "Chrome debugger pending command removed"
-                );
-            }
+        if let Ok(mut inner) = self.inner.lock()
+            && let Some(pending) = inner.pending.remove(id)
+        {
+            tracing::warn!(
+                code = "CHROME_DEBUGGER_PENDING_DROPPED",
+                command_id = %id,
+                command_kind = %pending.kind,
+                "Chrome debugger pending command removed"
+            );
         }
     }
 
@@ -1567,18 +1567,18 @@ pub(crate) fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: 
 }
 
 pub(crate) async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Response {
-    if request.transport.as_deref() == Some("direct_http") {
-        if let Err(error) = ensure_normal_bridge_registration_popup_safe() {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "ok": false,
-                    "code": error.code(),
-                    "detail": error.detail(),
-                })),
-            )
-                .into_response();
-        }
+    if request.transport.as_deref() == Some("direct_http")
+        && let Err(error) = ensure_normal_bridge_registration_popup_safe()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "code": error.code(),
+                "detail": error.detail(),
+            })),
+        )
+            .into_response();
     }
     match bridge().register(request) {
         Ok(response) => Json(response).into_response(),
@@ -1810,7 +1810,7 @@ async fn register_native_host(
     };
     let response = client
         .post(format!("{base_url}/chrome-debugger/native/register"))
-        .bearer_auth(&token)
+        .bearer_auth(token)
         .json(&register)
         .send()
         .await
@@ -1875,6 +1875,13 @@ async fn read_native_messages(
     host_id: Arc<RwLock<String>>,
 ) -> anyhow::Result<()> {
     let mut stdin = tokio::io::stdin();
+    let registration = NativeHostRegistrationContext {
+        client: &client,
+        base_url: &base_url,
+        token: &token,
+        invocation: &invocation,
+        pid,
+    };
     loop {
         let Some(message) = read_native_frame(&mut stdin).await? else {
             let current_host_id = host_id.read().await.clone();
@@ -1905,11 +1912,7 @@ async fn read_native_messages(
             Ok(()) => {}
             Err(error) if is_unknown_native_host_error(&error) => {
                 reregister_native_host_until_available(
-                    &client,
-                    &base_url,
-                    &token,
-                    &invocation,
-                    pid,
+                    &registration,
                     &host_id,
                     &current_host_id,
                     "message_unknown_host_id",
@@ -1932,6 +1935,13 @@ async fn poll_commands_to_chrome(
     host_id: Arc<RwLock<String>>,
 ) -> anyhow::Result<ExitCode> {
     let mut stdout = tokio::io::stdout();
+    let registration = NativeHostRegistrationContext {
+        client: &client,
+        base_url: &base_url,
+        token: &token,
+        invocation: &invocation,
+        pid,
+    };
     loop {
         let current_host_id = host_id.read().await.clone();
         let response = match client
@@ -1960,11 +1970,7 @@ async fn poll_commands_to_chrome(
             let detail = response.text().await.unwrap_or_default();
             if is_unknown_native_host_detail(&detail) {
                 reregister_native_host_until_available(
-                    &client,
-                    &base_url,
-                    &token,
-                    &invocation,
-                    pid,
+                    &registration,
                     &host_id,
                     &current_host_id,
                     "poll_unknown_host_id",
@@ -1984,12 +1990,16 @@ async fn poll_commands_to_chrome(
     }
 }
 
-async fn reregister_native_host_until_available(
-    client: &reqwest::Client,
-    base_url: &str,
-    token: &str,
-    invocation: &NativeHostInvocation,
+struct NativeHostRegistrationContext<'a> {
+    client: &'a reqwest::Client,
+    base_url: &'a str,
+    token: &'a str,
+    invocation: &'a NativeHostInvocation,
     pid: u32,
+}
+
+async fn reregister_native_host_until_available(
+    registration: &NativeHostRegistrationContext<'_>,
     host_id: &Arc<RwLock<String>>,
     observed_host_id: &str,
     reason: &'static str,
@@ -1998,7 +2008,16 @@ async fn reregister_native_host_until_available(
         return Ok(());
     }
     loop {
-        match register_native_host(client, base_url, token, invocation, pid, reason).await {
+        match register_native_host(
+            registration.client,
+            registration.base_url,
+            registration.token,
+            registration.invocation,
+            registration.pid,
+            reason,
+        )
+        .await
+        {
             Ok(registered) => {
                 tracing::warn!(
                     code = "CHROME_DEBUGGER_NATIVE_HOST_REREGISTERED",

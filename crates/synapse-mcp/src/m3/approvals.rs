@@ -114,17 +114,12 @@ impl ApprovalDecision {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalTimeoutDecision {
+    #[default]
     Ignored,
     Declined,
-}
-
-impl Default for ApprovalTimeoutDecision {
-    fn default() -> Self {
-        Self::Ignored
-    }
 }
 
 impl ApprovalTimeoutDecision {
