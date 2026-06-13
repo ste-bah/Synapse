@@ -4,7 +4,7 @@ use anyhow::{Context, ensure};
 use serde_json::{Value, json};
 use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 
-const EXPECTED_TOOLS: [&str; 126] = [
+const EXPECTED_TOOLS: [&str; 139] = [
     "act_click",
     "act_clipboard",
     "act_combo",
@@ -25,9 +25,17 @@ const EXPECTED_TOOLS: [&str; 126] = [
     "act_type",
     "action_diagnostic_queue_full_setup",
     "action_diagnostic_rate_limit_override",
+    "agent_cost",
+    "agent_cost_price_delete",
+    "agent_cost_price_list",
+    "agent_cost_price_put",
     "agent_inbox",
     "agent_send",
+    "agent_stats",
     "agent_wait",
+    "approval_decide",
+    "approval_list",
+    "approval_request",
     "audio_tail",
     "audio_transcribe",
     "audit_export_bundle",
@@ -76,6 +84,11 @@ const EXPECTED_TOOLS: [&str; 126] = [
     "hygiene_flags",
     "hygiene_scan_storage",
     "hygiene_scan_text",
+    "local_model_list",
+    "local_model_probe",
+    "local_model_register",
+    "local_model_remove",
+    "local_model_update",
     "notify_human",
     "observe",
     "observe_delta",

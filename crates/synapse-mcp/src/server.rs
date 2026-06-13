@@ -170,6 +170,7 @@ pub(crate) mod agent_event_ingress;
 pub(crate) mod agent_events;
 mod agent_mailbox;
 pub(crate) mod agent_state;
+pub(crate) mod agent_stats;
 pub(crate) mod agent_transcripts;
 mod audit_context;
 pub(crate) mod command_audit;
@@ -527,6 +528,7 @@ impl SynapseService {
             + Self::session_tool_router()
             + Self::agent_mailbox_tool_router()
             + Self::agent_cost_tool_router()
+            + Self::agent_stats_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()
