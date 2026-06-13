@@ -1564,6 +1564,9 @@ fn dashboard_local_model_spawn_params(
         hold_open_ms: request
             .hold_open_ms
             .unwrap_or_else(crate::m4::default_agent_spawn_hold_open_ms),
+        template_id: None,
+        template_version: None,
+        template_config_hash: None,
     })
 }
 

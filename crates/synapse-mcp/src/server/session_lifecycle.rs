@@ -170,7 +170,7 @@ pub struct SessionInputCleanupReport {
 #[serde(deny_unknown_fields)]
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "shutdown FSV readback reports exact before/after lease row booleans"
+    reason = "shutdown cleanup reports exact before/after lease row booleans"
 )]
 pub struct SessionShutdownInputCleanupReport {
     pub session_id: String,
@@ -1696,6 +1696,8 @@ mod tests {
                 launched_at_unix_ms: 999,
                 launch_target: "pwsh.exe".to_owned(),
                 log_dir: r"C:\temp\spawn-test".to_owned(),
+                template_id: None,
+                template_version: None,
             }),
         }
     }
