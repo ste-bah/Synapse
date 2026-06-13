@@ -165,6 +165,7 @@ use crate::{
 
 mod action_audit;
 mod action_preflight;
+pub(crate) mod agent_control;
 pub(crate) mod agent_cost;
 pub(crate) mod agent_event_ingress;
 pub(crate) mod agent_events;
@@ -533,6 +534,7 @@ impl SynapseService {
             + Self::agent_cost_tool_router()
             + Self::agent_stats_tool_router()
             + Self::agent_query_tool_router()
+            + Self::agent_control_tool_router()
             + Self::agent_template_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
