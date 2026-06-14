@@ -507,6 +507,26 @@ impl SynapseService {
         self.restore_session_target_if_needed(session_id)
     }
 
+    /// Resolves the effective target for an ACTION call (#984): an explicit
+    /// per-call `window_hwnd` / `cdp_target_id` override wins over the session's
+    /// bound target, mirroring how `observe` / `capture_screenshot` accept an
+    /// explicit `window_hwnd`. This makes multi-window / multi-agent action
+    /// routing deterministic instead of depending on per-session `set_target`
+    /// state that may not persist across reconnects. `cdp_target_id` requires
+    /// `window_hwnd` (the browser window whose CDP endpoint owns the target) and
+    /// gives a stable routing handle that survives window-handle recycling.
+    pub(crate) fn action_session_target_override(
+        &self,
+        explicit_window_hwnd: Option<i64>,
+        explicit_cdp_target_id: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<Option<SessionTarget>, ErrorData> {
+        match explicit_action_target(explicit_window_hwnd, explicit_cdp_target_id)? {
+            Some(target) => Ok(Some(target)),
+            None => self.session_target(session_id),
+        }
+    }
+
     /// Resolves the session's active **window** target to an HWND, if any. The
     /// map guard is dropped before returning (a copied `i64`), so it is never
     /// held across the non-`Send` perception path or an `.await`.
@@ -587,6 +607,34 @@ impl SynapseService {
             router.remove_route("storage_pressure_sample");
         }
         router
+    }
+}
+
+/// Pure decision for [`SynapseService::action_session_target_override`] (#984):
+/// maps explicit per-call routing params to a [`SessionTarget`], or `Ok(None)`
+/// when neither is supplied (caller should fall back to the bound session
+/// target). A `cdp_target_id` without a `window_hwnd` is rejected because the
+/// browser window's HWND is needed to reach the CDP endpoint that owns the
+/// target. Extracted as a free function so the routing precedence is unit-tested
+/// without standing up a full service.
+pub(crate) fn explicit_action_target(
+    explicit_window_hwnd: Option<i64>,
+    explicit_cdp_target_id: Option<&str>,
+) -> Result<Option<SessionTarget>, ErrorData> {
+    let explicit_cdp_target_id = explicit_cdp_target_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (explicit_window_hwnd, explicit_cdp_target_id) {
+        (Some(window_hwnd), Some(cdp_target_id)) => Ok(Some(SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id: cdp_target_id.to_owned(),
+        })),
+        (Some(hwnd), None) => Ok(Some(SessionTarget::Window { hwnd })),
+        (None, Some(_)) => Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "cdp_target_id requires window_hwnd (the browser window whose CDP endpoint owns the target)",
+        )),
+        (None, None) => Ok(None),
     }
 }
 

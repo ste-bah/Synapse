@@ -488,8 +488,14 @@ struct CdpFrameDescriptor {
     frame_id_wire: Option<String>,
 }
 
+/// Turns on flat (sessionId-routed) auto-attach for child `iframe` targets of
+/// `page`. Sharing this with the action layer (`cdp_action`) lets a write/click
+/// resolve an out-of-process iframe child target the same way `observe`
+/// enumerated it, instead of failing once the element id names a child target.
 #[cfg(windows)]
-async fn enable_flat_iframe_auto_attach(page: &chromiumoxide::Page) -> Result<(), String> {
+pub(crate) async fn enable_flat_iframe_auto_attach(
+    page: &chromiumoxide::Page,
+) -> Result<(), String> {
     use chromiumoxide::cdp::browser_protocol::target::{
         FilterEntry, SetAutoAttachParams, TargetFilter,
     };

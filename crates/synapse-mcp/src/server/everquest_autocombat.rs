@@ -717,6 +717,8 @@ impl SynapseService {
             alias: alias.to_owned(),
             hold_ms: KEY_HOLD_MS,
             backend: PressBackend::Auto,
+            window_hwnd: None,
+            cdp_target_id: None,
         };
         act_keymap_with_handle(handle, recording, cancel, profile, params)
             .await

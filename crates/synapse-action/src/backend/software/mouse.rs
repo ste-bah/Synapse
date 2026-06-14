@@ -1072,6 +1072,40 @@ mod tests {
     }
 
     #[test]
+    fn absolute_mouse_input_sets_virtualdesk_flag_for_multi_monitor() {
+        // Regression for #983: a secondary-monitor / virtual-desktop click only
+        // lands when the absolute packet is normalized against the VIRTUAL
+        // desktop AND carries MOUSEEVENTF_VIRTUALDESK. Without VIRTUALDESK,
+        // Windows maps the 0..65535 absolute coordinate onto the PRIMARY monitor
+        // and the click lands on the wrong physical pixel. Lock the exact flag
+        // set so this can never silently regress.
+        let desktop = VirtualDesktop::new(0, 302, 10240, 1440)
+            .unwrap_or_else(|| panic!("non-degenerate multi-monitor virtual desktop"));
+        let point = Point { x: 8076, y: 968 }; // a point on a far secondary monitor
+        let input = absolute_mouse_input_for_desktop(point, desktop);
+        let mi = unsafe { input.Anonymous.mi };
+        println!(
+            "readback=absolute_mouse_input_flags desktop={desktop:?} point={point:?} dwFlags={:?} dx={} dy={}",
+            mi.dwFlags, mi.dx, mi.dy
+        );
+        assert!(
+            mi.dwFlags.contains(MOUSEEVENTF_ABSOLUTE),
+            "absolute move must set MOUSEEVENTF_ABSOLUTE"
+        );
+        assert!(
+            mi.dwFlags.contains(MOUSEEVENTF_VIRTUALDESK),
+            "absolute move must set MOUSEEVENTF_VIRTUALDESK so secondary-monitor coordinates are normalized against the whole virtual desktop, not the primary monitor"
+        );
+        assert!(
+            mi.dwFlags.contains(MOUSEEVENTF_MOVE),
+            "absolute move must set MOUSEEVENTF_MOVE"
+        );
+        // The normalized coordinate must be inside the absolute 0..=65535 range.
+        assert!((0..=65_535).contains(&mi.dx));
+        assert!((0..=65_535).contains(&mi.dy));
+    }
+
+    #[test]
     fn dpi_compensation_scales_requested_cursor_point_to_monitor_dpi() {
         let requested = Point { x: 2905, y: 1165 };
         let adjusted = scale_point_for_dpi(requested, 144, 144);

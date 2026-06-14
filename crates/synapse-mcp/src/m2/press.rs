@@ -203,6 +203,8 @@ pub(crate) fn resolve_keymap_press(
         expected_foreground_process_regex: None,
         expected_foreground_title_regex: None,
         verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
+        window_hwnd: params.window_hwnd,
+        cdp_target_id: params.cdp_target_id.clone(),
     };
     Ok(ResolvedKeymapPress {
         alias,

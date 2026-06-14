@@ -42,6 +42,18 @@ pub struct ActPressParams {
     #[serde(default = "default_verify_timeout_ms")]
     #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
     pub verify_timeout_ms: u32,
+    #[serde(default)]
+    #[schemars(
+        default,
+        description = "Explicit per-call routing override (HWND). Routes keyboard input to this window's background CDP/PostMessage tier instead of the session's bound target, making multi-window / multi-agent automation deterministic (mirrors observe.window_hwnd). With cdp_target_id, the browser window that owns the CDP endpoint."
+    )]
+    pub window_hwnd: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        default,
+        description = "Explicit per-call CDP target id to route keyboard input to a specific browser tab. Requires window_hwnd. A CDP targetId is a stable routing handle that survives window-handle recycling across multi-agent use."
+    )]
+    pub cdp_target_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -54,6 +66,18 @@ pub struct ActKeymapParams {
     #[serde(default = "default_press_backend")]
     #[schemars(default = "default_press_backend")]
     pub backend: PressBackend,
+    #[serde(default)]
+    #[schemars(
+        default,
+        description = "Explicit per-call routing override (HWND); see act_press.window_hwnd."
+    )]
+    pub window_hwnd: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        default,
+        description = "Explicit per-call CDP target id; see act_press.cdp_target_id. Requires window_hwnd."
+    )]
+    pub cdp_target_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]

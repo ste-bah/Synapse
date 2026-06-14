@@ -3000,12 +3000,13 @@ impl SynapseService {
         if !press_background_target_candidate(&params, recording_active) {
             return Ok(None);
         }
-        let Some(session_id) =
-            super::context::mcp_session_id_from_request_context(request_context)?
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
+        let Some(target) = self.action_session_target_override(
+            params.window_hwnd,
+            params.cdp_target_id.as_deref(),
+            session_id.as_deref(),
+        )?
         else {
-            return Ok(None);
-        };
-        let Some(target) = self.session_target(Some(&session_id))? else {
             return Ok(None);
         };
         match target {
@@ -7106,6 +7107,8 @@ mod tests {
             expected_foreground_process_regex: expected_process_regex.map(str::to_owned),
             expected_foreground_title_regex: expected_title_regex.map(str::to_owned),
             verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
+            window_hwnd: None,
+            cdp_target_id: None,
         }
     }
 

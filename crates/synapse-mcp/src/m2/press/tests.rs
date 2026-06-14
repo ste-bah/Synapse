@@ -30,6 +30,8 @@ async fn recording_backend_readback_orders_chord_and_default_hold() {
         expected_foreground_process_regex: None,
         expected_foreground_title_regex: None,
         verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
+        window_hwnd: None,
+        cdp_target_id: None,
     };
     let before = recording.events();
     println!("readback=act_press_recording edge=ordered_chord before={before:?}");
@@ -61,6 +63,8 @@ async fn keymap_alias_resolves_profile_binding_and_records_chord() {
         alias: " SpellBook ".to_owned(),
         hold_ms: default_hold_ms(),
         backend: default_press_backend(),
+        window_hwnd: None,
+        cdp_target_id: None,
     };
     let before = recording.events();
     println!("readback=act_keymap_recording edge=alias_chord before={before:?}");
@@ -94,6 +98,8 @@ async fn keymap_alias_missing_fails_closed() {
         alias: "target_nearest_npc".to_owned(),
         hold_ms: default_hold_ms(),
         backend: default_press_backend(),
+        window_hwnd: None,
+        cdp_target_id: None,
     };
     let before = recording.events();
     println!("readback=act_keymap_recording edge=missing_alias before={before:?}");

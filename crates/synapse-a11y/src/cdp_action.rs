@@ -1574,6 +1574,66 @@ where
     result
 }
 
+/// Resolves a CDP target id to its [`chromiumoxide::Page`], tolerating the
+/// asynchronous target discovery that follows every fresh `Browser::connect`.
+///
+/// Root cause of #982: each action opens a fresh CDP connection, and a freshly
+/// connected browser populates its target map from
+/// `Target.targetCreated`/`attachedToTarget` events processed on the handler
+/// task. The FIRST `get_page` after connect therefore routinely races ahead of
+/// discovery and returns `NotFound`, surfacing as
+/// "selected target … is no longer present for backendNodeId N" for EVERY CDP
+/// web element — top-level or iframe — not just nested frames. `observe` never
+/// hit this because it waits via [`wait_for_pages`] and retries `get_page`
+/// (`wait_for_page_target`); the action path did a single unguarded `get_page`.
+///
+/// This mirrors observe: prime discovery with [`wait_for_pages`], then retry
+/// `get_page` on a bounded schedule. If the target id names an out-of-process
+/// iframe child target (its own `targetId`), a plain `get_page` never resolves
+/// until flat auto-attach exposes a callable session, so after a few failed
+/// attempts we enable flat iframe auto-attach on the discovered pages — exactly
+/// what observe does before reading OOPIF DOM.
+async fn get_page_with_discovery(
+    browser: &chromiumoxide::Browser,
+    target_id: &str,
+    backend_node_id: i64,
+) -> A11yResult<chromiumoxide::Page> {
+    // Block until target discovery surfaces at least one page (or the endpoint
+    // is unreachable) so the retry loop below is not racing an empty map.
+    let pages = wait_for_pages(browser).await?;
+    let mut last_error: Option<String> = None;
+    let mut auto_attach_enabled = false;
+    for attempt in 0..30u32 {
+        match browser.get_page(TargetId::new(target_id.to_owned())).await {
+            Ok(page) => return Ok(page),
+            Err(error) => last_error = Some(error.to_string()),
+        }
+        // The common in-process case (target id == page target) resolves on an
+        // early attempt once discovery lands. If it has not resolved after a few
+        // tries the id likely names an OOPIF child target that needs flat
+        // auto-attach to expose a session; enable it once, then keep retrying.
+        if attempt == 4 && !auto_attach_enabled {
+            for page in &pages {
+                let _ = crate::cdp_dom::enable_flat_iframe_auto_attach(page).await;
+            }
+            auto_attach_enabled = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let discovered = pages
+        .iter()
+        .map(|page| page.target_id().inner().clone())
+        .collect::<Vec<_>>()
+        .join(",");
+    Err(A11yError::CdpAxtreeFailed {
+        detail: format!(
+            "selected target {target_id} is no longer present for backendNodeId {backend_node_id} after waiting for CDP target discovery (auto_attach_enabled={auto_attach_enabled}; {} page target(s) discovered: [{discovered}]); last get_page error: {}",
+            pages.len(),
+            last_error.unwrap_or_else(|| "none".to_owned())
+        ),
+    })
+}
+
 /// Finds the attached page that owns `backend_node_id`, priming each candidate's
 /// DOM and confirming ownership by scrolling the node into view.
 ///
@@ -1590,15 +1650,7 @@ async fn resolve_owning_page(
 ) -> A11yResult<chromiumoxide::Page> {
     if let Some(target_id_hint) = target_id_hint.filter(|hint| !hint.trim().is_empty()) {
         let target_id_hint = target_id_hint.trim();
-        let page =
-            browser
-                .get_page(TargetId::new(target_id_hint.to_owned()))
-                .await
-                .map_err(|error| A11yError::CdpAxtreeFailed {
-                    detail: format!(
-                        "selected target {target_id_hint} is no longer present for backendNodeId {backend_node_id}: {error}"
-                    ),
-                })?;
+        let page = get_page_with_discovery(browser, target_id_hint, backend_node_id).await?;
         return if page_owns_backend_node(&page, backend_node_id).await {
             Ok(page)
         } else {
