@@ -36,7 +36,7 @@ use serde_json::json;
 
 use crate::{A11yError, A11yResult, cdp_dom::rect_from_quad};
 
-const CDP_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const CDP_INPUT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Where a CDP action landed, in viewport CSS coordinates (diagnostics).
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -1162,7 +1162,7 @@ async fn dispatch_cdp_mouse_stroke(
         mouse_event(
             DispatchMouseEventType::MouseMoved,
             first_point,
-            MouseButton::None,
+            button.clone(),
             0,
         ),
         "pre_press_move",
