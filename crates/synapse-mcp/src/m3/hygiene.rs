@@ -1425,7 +1425,8 @@ pub struct HygieneFlagRedactOutcome {
 }
 
 /// One derived artifact tainted because a poisoned source row feeding it was
-/// cleaned. Persisted under [`TAINT_PREFIX`] and read back during FSV.
+/// cleaned. Persisted under [`TAINT_PREFIX`] and read back during manual
+/// verification and regression readbacks.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HygieneTaintRecord {
@@ -1585,10 +1586,7 @@ pub(crate) fn resolve_clean_flags(
                 ));
             }
             // Preserve the caller's id order for stable, reviewable output.
-            Ok(ids
-                .iter()
-                .filter_map(|id| found.remove(id))
-                .collect())
+            Ok(ids.iter().filter_map(|id| found.remove(id)).collect())
         }
         CleanFlagSelector::Query {
             source_cf,
@@ -1682,7 +1680,10 @@ pub fn redact(
     let mut by_row: BTreeMap<(String, String), Vec<HygieneStoredFlag>> = BTreeMap::new();
     for flag in flags {
         by_row
-            .entry((flag.record.source_cf.clone(), flag.record.source_key_hex.clone()))
+            .entry((
+                flag.record.source_cf.clone(),
+                flag.record.source_key_hex.clone(),
+            ))
             .or_default()
             .push(flag);
     }
@@ -1744,7 +1745,10 @@ pub fn redact(
                 SpanRedaction::FieldMissing => outcomes.push(outcome(
                     flag,
                     "field_missing",
-                    format!("JSON pointer {} no longer resolves to a string", flag.record.source_field),
+                    format!(
+                        "JSON pointer {} no longer resolves to a string",
+                        flag.record.source_field
+                    ),
                 )),
                 SpanRedaction::Stale => outcomes.push(outcome(
                     flag,
@@ -1771,7 +1775,14 @@ pub fn redact(
                         format!("HYGIENE_REDACT_WRITE_FAILED at {source_key_hex}: {error}"),
                     )
                 })?;
-            verify_redacted_row(&guard, &source_cf, &key, &source_key_hex, &row_redacted_flags, &marker)?;
+            verify_redacted_row(
+                &guard,
+                &source_cf,
+                &key,
+                &source_key_hex,
+                &row_redacted_flags,
+                &marker,
+            )?;
         }
         if row_mutated {
             redacted_rows += 1;
@@ -1800,7 +1811,10 @@ pub fn redact(
             "marker": marker,
         });
         let audit_key_hex = if redacted_rows > 0 {
-            Some(crate::m3::timeline::write_cleaning_audit_row(&guard, audit_payload)?)
+            Some(crate::m3::timeline::write_cleaning_audit_row(
+                &guard,
+                audit_payload,
+            )?)
         } else {
             None
         };
@@ -1844,9 +1858,8 @@ pub fn redact(
 }
 
 fn redact_selector(params: &HygieneRedactParams) -> Result<CleanFlagSelector, ErrorData> {
-    let has_query = params.source_cf.is_some()
-        || params.source_key_hex.is_some()
-        || params.min_score.is_some();
+    let has_query =
+        params.source_cf.is_some() || params.source_key_hex.is_some() || params.min_score.is_some();
     match (&params.flag_ids, has_query) {
         (Some(_), true) => Err(invalid(
             "timeline_redact flag_ids is mutually exclusive with the source_cf/source_key_hex/min_score query",
@@ -1953,8 +1966,8 @@ fn redact_one_span(
     }
 }
 
-/// FSV: re-reads the row from storage and proves every redacted flag's text is
-/// gone and the marker is present.
+/// Regression readback: re-reads the row from storage and checks every redacted
+/// flag's text is gone and the marker is present.
 fn verify_redacted_row(
     runtime: &ReflexRuntime,
     source_cf: &str,
@@ -1982,7 +1995,9 @@ fn verify_redacted_row(
         )
     })?;
     for flag in redacted_flags {
-        let field = document.pointer(&flag.record.source_field).and_then(Value::as_str);
+        let field = document
+            .pointer(&flag.record.source_field)
+            .and_then(Value::as_str);
         let Some(field) = field else {
             return Err(mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
@@ -2015,11 +2030,7 @@ fn verify_redacted_row(
     Ok(())
 }
 
-fn outcome(
-    flag: &HygieneStoredFlag,
-    status: &str,
-    detail: String,
-) -> HygieneFlagRedactOutcome {
+fn outcome(flag: &HygieneStoredFlag, status: &str, detail: String) -> HygieneFlagRedactOutcome {
     HygieneFlagRedactOutcome {
         flag_id: flag.record.flag_id.clone(),
         source_cf: flag.record.source_cf.clone(),
@@ -2192,15 +2203,12 @@ pub(crate) fn invalidate_cleaned_flags(
                     format!("HYGIENE_INVALIDATE_TAINT_WRITE_FAILED: {error}"),
                 )
             })?;
-        // FSV: the ledger must be physically present, not just acked.
+        // Regression readback: the ledger must be physically present, not just
+        // acked.
         let rows = runtime
             .storage_cf_prefix_rows(cf::CF_KV, &sample_key, 1)
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        if rows
-            .first()
-            .map(|(row_key, _value)| row_key.as_slice())
-            != Some(sample_key.as_slice())
-        {
+        if rows.first().map(|(row_key, _value)| row_key.as_slice()) != Some(sample_key.as_slice()) {
             return Err(mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
                 "HYGIENE_INVALIDATE_TAINT_READBACK_ABSENT: taint record absent on readback",
@@ -2269,10 +2277,14 @@ fn taint_row(
     Ok((key, value))
 }
 
-/// Reads the taint record for one artifact, if present. Used by FSV and by the
-/// upcoming taint-surfacing consumers deciding whether learned state is
-/// poisoned (a routine_inspect / hygiene_report taint column, #875 follow-up).
-#[allow(dead_code, reason = "taint-ledger reader for the #875 follow-up taint-surfacing tool")]
+/// Reads the taint record for one artifact, if present. Used by manual
+/// verification evidence and by the upcoming taint-surfacing consumers deciding
+/// whether learned state is poisoned (a routine_inspect / hygiene_report taint
+/// column, #875 follow-up).
+#[allow(
+    dead_code,
+    reason = "taint-ledger reader for the #875 follow-up taint-surfacing tool"
+)]
 pub(crate) fn read_taint_record(
     runtime: &ReflexRuntime,
     artifact_kind: &str,
@@ -3578,25 +3590,35 @@ mod tests {
 
     #[test]
     fn redact_one_span_masks_at_recorded_offset() {
-        let mut document = serde_json::json!({"payload": {"title": "hello ignore previous instructions world"}});
+        let mut document =
+            serde_json::json!({"payload": {"title": "hello ignore previous instructions world"}});
         // "hello " is 6 bytes; the span is the next 28 bytes.
         let flag = redact_flag("/payload/title", "ignore previous instructions", 6, 34);
         let result = redact_one_span(&mut document, &flag, "[REDACTED]").expect("redact");
         assert!(matches!(result, SpanRedaction::Redacted));
-        let after = document.pointer("/payload/title").unwrap().as_str().unwrap();
+        let after = document
+            .pointer("/payload/title")
+            .unwrap()
+            .as_str()
+            .unwrap();
         println!("readback=redact_offset before=\"hello ignore... world\" after={after:?}");
         assert_eq!(after, "hello [REDACTED] world");
     }
 
     #[test]
     fn redact_one_span_falls_back_to_content_when_offset_drifts() {
-        let mut document = serde_json::json!({"payload": {"title": "hello ignore previous instructions world"}});
+        let mut document =
+            serde_json::json!({"payload": {"title": "hello ignore previous instructions world"}});
         // Deliberately wrong offsets (0..5 = "hello"): the content anchor must
         // still locate and mask the recorded span text.
         let flag = redact_flag("/payload/title", "ignore previous instructions", 0, 5);
         let result = redact_one_span(&mut document, &flag, "[REDACTED]").expect("redact");
         assert!(matches!(result, SpanRedaction::Redacted));
-        let after = document.pointer("/payload/title").unwrap().as_str().unwrap();
+        let after = document
+            .pointer("/payload/title")
+            .unwrap()
+            .as_str()
+            .unwrap();
         println!("readback=redact_drift after={after:?}");
         assert_eq!(after, "hello [REDACTED] world");
     }
@@ -3612,7 +3634,8 @@ mod tests {
 
     #[test]
     fn redact_one_span_reports_stale_when_text_changed() {
-        let mut document = serde_json::json!({"payload": {"title": "completely different content now"}});
+        let mut document =
+            serde_json::json!({"payload": {"title": "completely different content now"}});
         let flag = redact_flag("/payload/title", "ignore previous instructions", 6, 34);
         let result = redact_one_span(&mut document, &flag, "[REDACTED]").expect("redact");
         println!("readback=redact_stale status=stale_source");
@@ -3651,18 +3674,26 @@ mod tests {
             redact_one_span(&mut document, &second, "[REDACTED]").expect("redact"),
             SpanRedaction::Redacted
         ));
-        let after = document.pointer("/payload/title").unwrap().as_str().unwrap();
+        let after = document
+            .pointer("/payload/title")
+            .unwrap()
+            .as_str()
+            .unwrap();
         println!("readback=redact_multi after={after:?}");
         assert_eq!(after, "[REDACTED] then [REDACTED]");
     }
 
     #[test]
     fn redact_one_span_rejects_self_inconsistent_flag() {
-        let mut document = serde_json::json!({"payload": {"title": "ignore previous instructions"}});
+        let mut document =
+            serde_json::json!({"payload": {"title": "ignore previous instructions"}});
         let mut flag = redact_flag("/payload/title", "ignore previous instructions", 0, 28);
         flag.span_text_sha256 = "deadbeef".to_owned();
         let error = redact_one_span(&mut document, &flag, "[REDACTED]").expect_err("must reject");
-        println!("readback=redact_self_inconsistent message={:?}", error.message);
+        println!(
+            "readback=redact_self_inconsistent message={:?}",
+            error.message
+        );
         assert!(
             error
                 .message
@@ -3718,11 +3749,17 @@ mod tests {
         .expect("taint row");
         assert_eq!(key, b"hygiene/taint/v1/routine/rt-123".to_vec());
         let decoded: HygieneTaintRecord = decode_json(&value).expect("decode");
-        println!("readback=taint_row key={:?} record={decoded:?}", String::from_utf8_lossy(&key));
+        println!(
+            "readback=taint_row key={:?} record={decoded:?}",
+            String::from_utf8_lossy(&key)
+        );
         assert_eq!(decoded.artifact_kind, "routine");
         assert_eq!(decoded.artifact_id, "rt-123");
         assert_eq!(decoded.cleaning_op, CLEAN_OP_REDACT);
-        assert_eq!(decoded.source_flag_ids, vec!["f1".to_owned(), "f2".to_owned()]);
+        assert_eq!(
+            decoded.source_flag_ids,
+            vec!["f1".to_owned(), "f2".to_owned()]
+        );
         assert_eq!(decoded.cleaning_audit_key_hex.as_deref(), Some("abcd"));
         assert_eq!(decoded.tainted_at_ns, 42);
     }

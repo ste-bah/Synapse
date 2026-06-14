@@ -981,8 +981,8 @@ pub(crate) fn write_cleaning_audit_row(
             format!("rows were purged but flushing the purge audit row failed: {error}"),
         )
     })?;
-    // Full-state verification inside the tool: the audit row must be
-    // physically present, not just acked.
+    // Internal consistency readback: the audit row must be physically present,
+    // not just acked.
     let (rows, _more) = runtime
         .storage_cf_rows_from(cf::CF_TIMELINE, &key, 1)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -1326,12 +1326,12 @@ mod tests {
 }
 
 #[cfg(test)]
-mod fsv_tests {
-    //! Full-state verification for timeline_get / timeline_stats (#842) against a
-    //! REAL `ReflexRuntime` over a real RocksDB `CF_TIMELINE` — synthetic rows are
-    //! written physically, then every output is cross-checked against the rows
-    //! that actually reside in storage. Recorder status is verified by toggling
-    //! the real `RecorderControl` gate and re-reading.
+mod regression_tests {
+    //! Regression coverage for timeline_get / timeline_stats (#842) against a
+    //! real `ReflexRuntime` over a real RocksDB `CF_TIMELINE`: synthetic rows
+    //! are written physically, then outputs are cross-checked against the rows
+    //! in storage. Recorder status is checked by toggling the real
+    //! `RecorderControl` gate and re-reading.
 
     use std::sync::{Arc, Mutex};
 
@@ -1420,9 +1420,29 @@ mod fsv_tests {
     fn timeline_get_returns_ordered_rows_and_filters_by_kind_actor() {
         let mut h = Harness::new();
         // Out-of-order writes; storage orders by (ts_ns, seq).
-        h.write(30, TimelineKind::BrowserNav, TimelineActor::Human, "chrome.exe", json!({"url": "b"}));
-        h.write(10, TimelineKind::FocusChange, TimelineActor::Human, "excel.exe", json!({}));
-        h.write(20, TimelineKind::FocusChange, TimelineActor::Agent { session_id: "s1".to_owned() }, "code.exe", json!({}));
+        h.write(
+            30,
+            TimelineKind::BrowserNav,
+            TimelineActor::Human,
+            "chrome.exe",
+            json!({"url": "b"}),
+        );
+        h.write(
+            10,
+            TimelineKind::FocusChange,
+            TimelineActor::Human,
+            "excel.exe",
+            json!({}),
+        );
+        h.write(
+            20,
+            TimelineKind::FocusChange,
+            TimelineActor::Agent {
+                session_id: "s1".to_owned(),
+            },
+            "code.exe",
+            json!({}),
+        );
 
         let all = h.get(TimelineGetParams::default());
         let got_ts: Vec<u64> = all.rows.iter().map(|r| r.ts_ns).collect();
@@ -1444,14 +1464,20 @@ mod fsv_tests {
         assert_eq!(agent.rows.len(), 1);
         assert_eq!(agent.rows[0].ts_ns, 20);
         assert_eq!(agent.rows[0].actor, "agent:s1");
-        println!("FSV[timeline_get] all_ts={got_ts:?} focus_ts={focus_ts:?} agent=ts20");
+        println!("regression[timeline_get] all_ts={got_ts:?} focus_ts={focus_ts:?} agent=ts20");
     }
 
     #[test]
     fn timeline_get_time_range_excludes_out_of_window() {
         let mut h = Harness::new();
         for ts in [5_u64, 15, 25, 35] {
-            h.write(ts, TimelineKind::FocusChange, TimelineActor::Human, "a.exe", json!({}));
+            h.write(
+                ts,
+                TimelineKind::FocusChange,
+                TimelineActor::Human,
+                "a.exe",
+                json!({}),
+            );
         }
         let windowed = h.get(TimelineGetParams {
             start_ts_ns: Some(15),
@@ -1465,18 +1491,45 @@ mod fsv_tests {
     #[test]
     fn timeline_get_cursor_pages_stably_across_concurrent_writes() {
         let mut h = Harness::new();
-        h.write(10, TimelineKind::FocusChange, TimelineActor::Human, "a.exe", json!({}));
-        h.write(20, TimelineKind::FocusChange, TimelineActor::Human, "a.exe", json!({}));
-        h.write(30, TimelineKind::FocusChange, TimelineActor::Human, "a.exe", json!({}));
+        h.write(
+            10,
+            TimelineKind::FocusChange,
+            TimelineActor::Human,
+            "a.exe",
+            json!({}),
+        );
+        h.write(
+            20,
+            TimelineKind::FocusChange,
+            TimelineActor::Human,
+            "a.exe",
+            json!({}),
+        );
+        h.write(
+            30,
+            TimelineKind::FocusChange,
+            TimelineActor::Human,
+            "a.exe",
+            json!({}),
+        );
 
-        let page1 = h.get(TimelineGetParams { limit: Some(2), ..TimelineGetParams::default() });
+        let page1 = h.get(TimelineGetParams {
+            limit: Some(2),
+            ..TimelineGetParams::default()
+        });
         let page1_ts: Vec<u64> = page1.rows.iter().map(|r| r.ts_ns).collect();
         assert_eq!(page1_ts, vec![10, 20]);
         assert_eq!(page1.stopped_because, "limit_reached");
         let cursor = page1.next_cursor.clone().expect("cursor after limit");
 
         // Concurrent forward write (the recorder appends rows in increasing ts).
-        h.write(40, TimelineKind::FocusChange, TimelineActor::Human, "a.exe", json!({}));
+        h.write(
+            40,
+            TimelineKind::FocusChange,
+            TimelineActor::Human,
+            "a.exe",
+            json!({}),
+        );
 
         let page2 = h.get(TimelineGetParams {
             limit: Some(2),
@@ -1484,19 +1537,52 @@ mod fsv_tests {
             ..TimelineGetParams::default()
         });
         let page2_ts: Vec<u64> = page2.rows.iter().map(|r| r.ts_ns).collect();
-        assert_eq!(page2_ts, vec![30, 40], "page 2 resumes past cursor, includes concurrent write");
-        assert!(page1_ts.iter().all(|t| !page2_ts.contains(t)), "no row returned twice");
-        println!("FSV[timeline_get paging] page1={page1_ts:?} page2={page2_ts:?} (stable, no dup)");
+        assert_eq!(
+            page2_ts,
+            vec![30, 40],
+            "page 2 resumes past cursor, includes concurrent write"
+        );
+        assert!(
+            page1_ts.iter().all(|t| !page2_ts.contains(t)),
+            "no row returned twice"
+        );
+        println!(
+            "regression[timeline_get paging] page1={page1_ts:?} page2={page2_ts:?} (stable, no dup)"
+        );
     }
 
     #[test]
     fn timeline_stats_counts_by_kind_and_day_match_physical_rows() {
         let mut h = Harness::new();
         // Day 0 (1970-01-01): 2 focus + 1 browser_nav. Day 1 (1970-01-02): 1 focus.
-        h.write(1, TimelineKind::FocusChange, TimelineActor::Human, "a.exe", json!({}));
-        h.write(2, TimelineKind::FocusChange, TimelineActor::Human, "a.exe", json!({}));
-        h.write(3, TimelineKind::BrowserNav, TimelineActor::Human, "chrome.exe", json!({"url": "x"}));
-        h.write(NS_PER_DAY + 5, TimelineKind::FocusChange, TimelineActor::Human, "a.exe", json!({}));
+        h.write(
+            1,
+            TimelineKind::FocusChange,
+            TimelineActor::Human,
+            "a.exe",
+            json!({}),
+        );
+        h.write(
+            2,
+            TimelineKind::FocusChange,
+            TimelineActor::Human,
+            "a.exe",
+            json!({}),
+        );
+        h.write(
+            3,
+            TimelineKind::BrowserNav,
+            TimelineActor::Human,
+            "chrome.exe",
+            json!({"url": "x"}),
+        );
+        h.write(
+            NS_PER_DAY + 5,
+            TimelineKind::FocusChange,
+            TimelineActor::Human,
+            "a.exe",
+            json!({}),
+        );
 
         let stats = timeline_stats_data(&h.runtime, unpaused(), &TimelineStatsParams::default())
             .expect("stats");
@@ -1510,9 +1596,12 @@ mod fsv_tests {
         assert_eq!(stats.oldest_ts_ns, Some(1));
         assert_eq!(stats.newest_ts_ns, Some(NS_PER_DAY + 5));
         let summed: u64 = stats.rows_by_kind.values().sum();
-        assert_eq!(summed, stats.total_rows, "by_kind must reconcile with total");
+        assert_eq!(
+            summed, stats.total_rows,
+            "by_kind must reconcile with total"
+        );
         println!(
-            "FSV[timeline_stats] by_kind={:?} by_day={:?} total={}",
+            "regression[timeline_stats] by_kind={:?} by_day={:?} total={}",
             stats.rows_by_kind, stats.rows_by_day_utc, stats.total_rows
         );
     }
@@ -1521,12 +1610,21 @@ mod fsv_tests {
     fn timeline_stats_time_window_scopes_counts() {
         let mut h = Harness::new();
         for ts in [1_u64, 2, NS_PER_DAY + 1, NS_PER_DAY + 2] {
-            h.write(ts, TimelineKind::FocusChange, TimelineActor::Human, "a.exe", json!({}));
+            h.write(
+                ts,
+                TimelineKind::FocusChange,
+                TimelineActor::Human,
+                "a.exe",
+                json!({}),
+            );
         }
         let stats = timeline_stats_data(
             &h.runtime,
             unpaused(),
-            &TimelineStatsParams { start_ts_ns: Some(NS_PER_DAY), end_ts_ns: None },
+            &TimelineStatsParams {
+                start_ts_ns: Some(NS_PER_DAY),
+                end_ts_ns: None,
+            },
         )
         .expect("stats");
         assert_eq!(stats.total_rows, 2, "only day-1 rows counted");
@@ -1560,14 +1658,21 @@ mod fsv_tests {
         assert_eq!(before.paused_until_ns, None);
 
         control
-            .persist_pause(&db, Some(9_999), 1_000, "fsv-test")
+            .persist_pause(&db, Some(9_999), 1_000, "regression-test")
             .expect("persist pause");
 
         let after = RecorderStatus::from_control(&control);
-        assert!(after.paused, "status must report paused after persist_pause");
-        assert_eq!(after.paused_until_ns, Some(9_999), "auto-resume deadline surfaced");
+        assert!(
+            after.paused,
+            "status must report paused after persist_pause"
+        );
+        assert_eq!(
+            after.paused_until_ns,
+            Some(9_999),
+            "auto-resume deadline surfaced"
+        );
         println!(
-            "FSV[recorder_status] before.paused={} after.paused={} until={:?}",
+            "regression[recorder_status] before.paused={} after.paused={} until={:?}",
             before.paused, after.paused, after.paused_until_ns
         );
     }
