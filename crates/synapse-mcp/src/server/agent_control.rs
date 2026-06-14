@@ -37,6 +37,7 @@
 //! force-kill of the process tree and releases all of the agent's resources.
 
 use std::{
+    collections::BTreeSet,
     fs,
     path::PathBuf,
     process::{Command, Output, Stdio},
@@ -189,6 +190,7 @@ pub struct AgentInterruptResponse {
     pub spawn_id: Option<String>,
     pub agent_kind: String,
     pub lifecycle: String,
+    pub resolution_source: String,
     /// True when at least one channel actually delivered the interrupt.
     pub delivered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,6 +213,7 @@ pub struct AgentKillResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spawn_id: Option<String>,
     pub agent_kind: String,
+    pub resolution_source: String,
     /// True when the process tree was already gone before this call acted —
     /// makes double-kill idempotent (the second call reports `already_dead`).
     pub already_dead: bool,
@@ -227,6 +230,14 @@ pub struct AgentKillResponse {
     pub orphan_process_ids: Vec<u32>,
     /// True iff zero orphan processes remain (the OS process table is the SoT).
     pub killed: bool,
+    /// Exact-PID fallback used when no live teardown job handle exists, such as
+    /// after daemon restart handoff.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_teardown_force_termination: Option<crate::m4::OwnedProcessTerminationReadback>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_artifact_cleanup_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_artifact_cleanup_error: Option<String>,
     /// The `killed` journal row, written before teardown when a force-kill was
     /// actually required.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -284,7 +295,10 @@ struct ResolvedAgent {
     spawn_id: Option<String>,
     agent_kind: String,
     lifecycle: String,
+    resolution_source: String,
+    dead: bool,
     launcher_process_id: u32,
+    agent_process_id: Option<u32>,
     log_dir: String,
     control: Option<SpawnedAgentControlRead>,
 }
@@ -364,7 +378,7 @@ impl SynapseService {
     ) -> Result<AgentInterruptResponse, ErrorData> {
         let lookup = validate_lookup_id(&params.session_id, TOOL_AGENT_INTERRUPT)?;
         let target = self.resolve_spawned_agent(&lookup, TOOL_AGENT_INTERRUPT)?;
-        if target.lifecycle == "closed" {
+        if target.dead {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
                 format!(
@@ -373,7 +387,7 @@ impl SynapseService {
                 ),
             ));
         }
-        let process = process_readback(target.launcher_process_id);
+        let process = process_readback_for_target(&target);
 
         let payload = json!({
             "reason": "operator_interrupt",
@@ -438,7 +452,7 @@ impl SynapseService {
         target: &ResolvedAgent,
         caller_session: Option<&str>,
     ) -> Result<AgentInterruptResponse, ErrorData> {
-        let process = process_readback(target.launcher_process_id);
+        let process = process_readback_for_target(target);
         let (channels, delivered_via, _send_row) =
             self.attempt_interrupt_channels(target, caller_session);
         let delivered = delivered_via.is_some();
@@ -461,6 +475,7 @@ impl SynapseService {
             spawn_id: target.spawn_id.clone(),
             agent_kind: target.agent_kind.clone(),
             lifecycle: target.lifecycle.clone(),
+            resolution_source: target.resolution_source.clone(),
             delivered,
             delivered_via,
             channels,
@@ -749,7 +764,7 @@ impl SynapseService {
             ));
         }
         let target = self.resolve_spawned_agent(&lookup, TOOL_AGENT_KILL)?;
-        let process_before = process_readback(target.launcher_process_id);
+        let process_before = process_readback_for_target(&target);
         let already_dead = process_before.live_process_ids.is_empty();
 
         let payload = json!({
@@ -783,8 +798,8 @@ impl SynapseService {
             None
         };
         let natural_exit = if !already_dead && params.grace_ms > 0 {
-            let tree = crate::m4::owned_process_tree_ids(target.launcher_process_id);
-            let (remaining, _waited) = wait_for_tree_exit_async(&tree, params.grace_ms).await;
+            let (remaining, _waited) =
+                wait_for_tree_exit_async(&process_before.process_tree_ids, params.grace_ms).await;
             remaining.is_empty()
         } else {
             false
@@ -832,15 +847,41 @@ impl SynapseService {
         };
 
         // Source of truth for "is it dead": re-read the OS process table.
-        let process_after = process_readback(target.launcher_process_id);
-        let orphan_process_ids = process_after.live_process_ids.clone();
+        let mut process_after = process_readback_for_target(&target);
+        let mut orphan_process_ids =
+            merged_live_process_ids(&process_before.process_tree_ids, &process_after);
+        let post_teardown_force_termination = if !orphan_process_ids.is_empty() {
+            Some(crate::m4::terminate_owned_process_ids(&orphan_process_ids))
+        } else {
+            None
+        };
+        if post_teardown_force_termination.is_some() {
+            process_after = process_readback_for_target(&target);
+            orphan_process_ids =
+                merged_live_process_ids(&process_before.process_tree_ids, &process_after);
+        }
         let killed = orphan_process_ids.is_empty();
+        let (completion_artifact_cleanup_status, completion_artifact_cleanup_error) =
+            if killed && post_teardown_force_termination.is_some() {
+                match write_agent_kill_restart_completion_artifact(
+                    &target,
+                    &process_before,
+                    &orphan_process_ids,
+                    post_teardown_force_termination.as_ref(),
+                ) {
+                    Ok(status) => (Some(status), None),
+                    Err(error) => (None, Some(error)),
+                }
+            } else {
+                (None, None)
+            };
 
         let response = AgentKillResponse {
             requested_id: lookup,
             session_id: target.session_id.clone(),
             spawn_id: target.spawn_id.clone(),
             agent_kind: target.agent_kind.clone(),
+            resolution_source: target.resolution_source.clone(),
             already_dead,
             interrupt,
             grace_ms: params.grace_ms,
@@ -849,6 +890,9 @@ impl SynapseService {
             process_after,
             orphan_process_ids,
             killed,
+            post_teardown_force_termination,
+            completion_artifact_cleanup_status,
+            completion_artifact_cleanup_error,
             journal_killed_event,
             teardown,
             teardown_error,
@@ -860,7 +904,11 @@ impl SynapseService {
             "natural_exit": response.natural_exit,
             "orphan_process_ids": response.orphan_process_ids,
             "process_after": response.process_after,
+            "resolution_source": response.resolution_source,
             "teardown_error": response.teardown_error,
+            "post_teardown_force_termination": response.post_teardown_force_termination,
+            "completion_artifact_cleanup_status": response.completion_artifact_cleanup_status,
+            "completion_artifact_cleanup_error": response.completion_artifact_cleanup_error,
         });
         self.command_audit_final(
             CommandAuditInput::mcp(
@@ -1085,7 +1133,7 @@ impl SynapseService {
                 "session registry lock poisoned while enumerating the live fleet",
             )
         })?;
-        let mut sessions = Vec::new();
+        let mut sessions = BTreeSet::new();
         for read in registry.reads(now) {
             if read.spawned_agent.is_none() || read.lifecycle == "closed" {
                 continue;
@@ -1093,9 +1141,25 @@ impl SynapseService {
             if !agent_kinds.is_empty() && !agent_kinds.iter().any(|kind| kind == &read.agent_kind) {
                 continue;
             }
-            sessions.push(read.session_id.clone());
+            sessions.insert(read.session_id.clone());
         }
-        Ok(sessions)
+        drop(registry);
+        for read in super::agent_state::reads(now) {
+            if read.spawn_id.is_none()
+                || read.state == super::agent_state::AgentLifecycleState::Dead
+            {
+                continue;
+            }
+            let Some(session_id) = read.session_id else {
+                continue;
+            };
+            let agent_kind = read.agent_kind.unwrap_or_else(|| "unknown".to_owned());
+            if !agent_kinds.is_empty() && !agent_kinds.iter().any(|kind| kind == &agent_kind) {
+                continue;
+            }
+            sessions.insert(session_id);
+        }
+        Ok(sessions.into_iter().collect())
     }
 
     // ------------------------------------------------------------------
@@ -1128,7 +1192,10 @@ impl SynapseService {
                     spawn_id: Some(spawned.spawn_id.clone()),
                     agent_kind: read.agent_kind.clone(),
                     lifecycle: read.lifecycle.clone(),
+                    resolution_source: "session_registry".to_owned(),
+                    dead: read.lifecycle == "closed",
                     launcher_process_id: spawned.launcher_process_id,
+                    agent_process_id: spawned.agent_process_id,
                     log_dir: spawned.log_dir.clone(),
                     control: spawned.control.clone(),
                 });
@@ -1139,6 +1206,13 @@ impl SynapseService {
 
         if let Some(resolved) = session_match {
             return Ok(resolved);
+        }
+        if let Some(state_read) = super::agent_state::read_for_session(lookup, now) {
+            if let Some(resolved) =
+                resolved_agent_from_durable_state_read(lookup, tool, state_read)?
+            {
+                return Ok(resolved);
+            }
         }
         if non_spawned_session_hit {
             return Err(mcp_error(
@@ -1203,14 +1277,271 @@ impl SynapseService {
     }
 }
 
-fn process_readback(launcher_pid: u32) -> ProcessReadback {
-    let process_tree_ids = crate::m4::owned_process_tree_ids(launcher_pid);
+fn process_readback_for_target(target: &ResolvedAgent) -> ProcessReadback {
+    let mut process_tree_ids = crate::m4::owned_process_tree_ids(target.launcher_process_id);
+    if let Some(agent_pid) = target.agent_process_id {
+        process_tree_ids.extend(crate::m4::owned_process_tree_ids(agent_pid));
+    }
+    process_tree_ids.sort_unstable();
+    process_tree_ids.dedup();
     let live_process_ids = crate::m4::owned_live_process_ids(&process_tree_ids);
     ProcessReadback {
-        launcher_process_id: launcher_pid,
+        launcher_process_id: target.launcher_process_id,
         process_tree_ids,
         live_process_ids,
     }
+}
+
+fn merged_live_process_ids(before_ids: &[u32], after: &ProcessReadback) -> Vec<u32> {
+    let mut ids = before_ids.to_vec();
+    ids.extend(after.process_tree_ids.iter().copied());
+    ids.sort_unstable();
+    ids.dedup();
+    crate::m4::owned_live_process_ids(&ids)
+}
+
+fn resolved_agent_from_durable_state_read(
+    lookup: &str,
+    tool: &str,
+    read: super::agent_state::AgentStateRead,
+) -> Result<Option<ResolvedAgent>, ErrorData> {
+    let Some(spawn_id) = read.spawn_id.clone() else {
+        return Ok(None);
+    };
+    let session_matches = read.session_id.as_deref() == Some(lookup);
+    let spawn_matches = spawn_id == lookup || read.anchor == lookup;
+    if !session_matches && !spawn_matches {
+        return Ok(None);
+    }
+    let Some(session_id) = read.session_id.clone() else {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "AGENT_NOT_READY: {tool} resolved spawn {spawn_id} from durable agent state but no MCP session id is linked yet"
+            ),
+        ));
+    };
+    let Some(launcher_process_id) = read.launcher_process_id else {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "AGENT_PROCESS_UNAVAILABLE: {tool} resolved spawn {spawn_id} from durable agent state but no launcher process id is recorded"
+            ),
+        ));
+    };
+    let log_dir = read.log_dir.clone().unwrap_or_else(|| {
+        super::m4_tools::agent_spawn_root_dir()
+            .ok()
+            .map(|root| root.join(&spawn_id).display().to_string())
+            .unwrap_or_default()
+    });
+    Ok(Some(ResolvedAgent {
+        session_id,
+        spawn_id: Some(spawn_id),
+        agent_kind: read.agent_kind.unwrap_or_else(|| "unknown".to_owned()),
+        lifecycle: format!("agent_state:{}", read.state.as_str()),
+        resolution_source: "durable_agent_state".to_owned(),
+        dead: read.state == super::agent_state::AgentLifecycleState::Dead,
+        launcher_process_id,
+        agent_process_id: read.agent_process_id,
+        log_dir,
+        control: None,
+    }))
+}
+
+fn write_agent_kill_restart_completion_artifact(
+    target: &ResolvedAgent,
+    process_before: &ProcessReadback,
+    remaining_process_ids_after: &[u32],
+    termination: Option<&crate::m4::OwnedProcessTerminationReadback>,
+) -> Result<String, String> {
+    let Some(spawn_id) = target.spawn_id.as_deref() else {
+        return Ok("not_spawned_agent".to_owned());
+    };
+    let log_dir = if target.log_dir.trim().is_empty() {
+        super::m4_tools::agent_spawn_root_dir()
+            .map_err(|error| {
+                format!(
+                    "failed to resolve agent spawn root for restart artifact: {}",
+                    error.message
+                )
+            })?
+            .join(spawn_id)
+    } else {
+        PathBuf::from(&target.log_dir)
+    };
+    fs::create_dir_all(&log_dir).map_err(|error| {
+        format!(
+            "failed to create restart artifact log dir {}: {error}",
+            log_dir.display()
+        )
+    })?;
+    let stdout_path = log_dir.join("stdout.jsonl");
+    let stderr_path = log_dir.join("stderr.log");
+    let final_message_path = log_dir.join("final-message.txt");
+    let completion_status_path = log_dir.join("completion-status.json");
+    let completion_status_before_cleanup = spawn_completion_status_value(&completion_status_path);
+    let completion_status_before_cleanup_status = completion_status_before_cleanup
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let overwrite_wrapper_fallback = completion_status_before_cleanup
+        .as_ref()
+        .is_some_and(|value| restart_kill_can_overwrite_wrapper_fallback_status(value));
+    if completion_status_before_cleanup_status
+        .as_deref()
+        .is_some_and(|status| status != "running")
+        && !overwrite_wrapper_fallback
+    {
+        return Ok("already_terminal".to_owned());
+    }
+    let final_message_len_before = spawn_file_len(&final_message_path);
+    let stdout_len = spawn_file_len(&stdout_path);
+    let stderr_len = spawn_file_len(&stderr_path);
+    let (stdout_line_count, last_stdout_event_type) = spawn_stdout_summary(&stdout_path);
+    let status = "agent_kill_forced_after_daemon_restart";
+    let error_message =
+        "spawned agent was force-killed after daemon restart without a live process job handle";
+    let details = json!({
+        "reason": "agent_kill_restart_fallback_without_process_job",
+        "session_id": target.session_id,
+        "spawn_id": spawn_id,
+        "agent_kind": target.agent_kind,
+        "resolution_source": target.resolution_source,
+        "launcher_process_id": target.launcher_process_id,
+        "agent_process_id": target.agent_process_id,
+        "process_before": process_before,
+        "remaining_process_ids_after": remaining_process_ids_after,
+        "post_teardown_force_termination": termination,
+        "completion_status_before_cleanup": completion_status_before_cleanup,
+    });
+    let write_final_message = final_message_len_before == 0 || overwrite_wrapper_fallback;
+    if write_final_message {
+        let final_message = json!({
+            "schema_version": 1,
+            "spawn_id": spawn_id,
+            "cli": target.agent_kind,
+            "status": status,
+            "exit_code": null,
+            "error_message": error_message,
+            "message": "Synapse agent_kill wrote this terminal artifact after reclaiming a daemon-restart-handoff spawn without a live process job handle.",
+            "stdout_path": stdout_path.display().to_string(),
+            "stderr_path": stderr_path.display().to_string(),
+            "completion_status_path": completion_status_path.display().to_string(),
+            "details": details,
+        });
+        let bytes = serde_json::to_vec_pretty(&final_message)
+            .map_err(|error| format!("failed to encode restart final-message artifact: {error}"))?;
+        fs::write(&final_message_path, bytes).map_err(|error| {
+            format!(
+                "failed to write restart final-message artifact {}: {error}",
+                final_message_path.display()
+            )
+        })?;
+    }
+    let final_message_len_after = spawn_file_len(&final_message_path);
+    let completion_status = json!({
+        "schema_version": 1,
+        "spawn_id": spawn_id,
+        "cli": target.agent_kind,
+        "status": status,
+        "exit_code": null,
+        "error_message": error_message,
+        "wrapper_started_at_unix_ms": null,
+        "completed_at_unix_ms": unix_time_ms_now(),
+        "elapsed_ms": null,
+        "requested_hold_open_ms": null,
+        "hold_open_elapsed_ms_met": false,
+        "final_message_path": final_message_path.display().to_string(),
+        "final_message_bytes": final_message_len_after,
+        "final_message_present": final_message_len_after > 0,
+        "final_message_source": if write_final_message {
+            "agent_kill_restart_artifact_json"
+        } else {
+            "preexisting_final_message_without_terminal_status"
+        },
+        "recovered_final_message_written": false,
+        "fallback_final_message_written": write_final_message,
+        "stdout_path": stdout_path.display().to_string(),
+        "stdout_line_count": stdout_line_count,
+        "last_stdout_event_type": last_stdout_event_type,
+        "stdout_bytes": stdout_len,
+        "stderr_path": stderr_path.display().to_string(),
+        "stderr_bytes": stderr_len,
+        "daemon_terminal_artifact": true,
+        "agent_kill_restart_artifact": true,
+        "completion_status_source": "agent_kill_restart_artifact_json",
+        "completion_status_before_cleanup": completion_status_before_cleanup,
+        "log_dir": log_dir.display().to_string(),
+        "details": details,
+    });
+    let bytes = serde_json::to_vec_pretty(&completion_status)
+        .map_err(|error| format!("failed to encode restart completion-status artifact: {error}"))?;
+    fs::write(&completion_status_path, bytes).map_err(|error| {
+        format!(
+            "failed to write restart completion-status artifact {}: {error}",
+            completion_status_path.display()
+        )
+    })?;
+    Ok(status.to_owned())
+}
+
+fn spawn_completion_status_value(path: &PathBuf) -> Option<Value> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice::<Value>(&bytes).ok()
+}
+
+fn restart_kill_can_overwrite_wrapper_fallback_status(value: &Value) -> bool {
+    let Some(status) = value.get("status").and_then(Value::as_str) else {
+        return false;
+    };
+    if !matches!(
+        status,
+        "failed" | "missing_final_response" | "wrapper_error"
+    ) {
+        return false;
+    }
+    let final_message_source = value
+        .get("final_message_source")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let fallback_final_message_written = value
+        .get("fallback_final_message_written")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    final_message_source == "wrapper_fallback_json" || fallback_final_message_written
+}
+
+fn spawn_file_len(path: &PathBuf) -> u64 {
+    fs::metadata(path).map_or(0, |metadata| metadata.len())
+}
+
+fn spawn_stdout_summary(path: &PathBuf) -> (u64, Option<String>) {
+    let Ok(stdout) = fs::read(path) else {
+        return (0, None);
+    };
+    let stdout = String::from_utf8_lossy(&stdout);
+    let mut line_count = 0;
+    let mut last_event_type = None;
+    for line in stdout.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        line_count += 1;
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            if let Some(event_type) = value.get("type").and_then(Value::as_str) {
+                last_event_type = Some(event_type.to_owned());
+            } else if let Some(event_type) = value
+                .get("item")
+                .and_then(|item| item.get("type"))
+                .and_then(Value::as_str)
+            {
+                last_event_type = Some(event_type.to_owned());
+            }
+        }
+    }
+    (line_count, last_event_type)
 }
 
 fn run_codex_interrupt_helper(

@@ -75,7 +75,19 @@ fn interrupt_params_reject_unknown_fields() {
 fn process_readback_of_dead_pid_reports_no_live_processes() {
     // An impossible pid owns no live process tree — the OS process table (the
     // source of truth) backs this, so `live_process_ids` must be empty.
-    let readback = process_readback(0xFFFF_FFFE);
+    let target = ResolvedAgent {
+        session_id: "session-dead-pid".to_owned(),
+        spawn_id: Some("agent-spawn-dead-pid".to_owned()),
+        agent_kind: "local-model".to_owned(),
+        lifecycle: "test".to_owned(),
+        resolution_source: "test".to_owned(),
+        dead: false,
+        launcher_process_id: 0xFFFF_FFFE,
+        agent_process_id: None,
+        log_dir: String::new(),
+        control: None,
+    };
+    let readback = process_readback_for_target(&target);
     assert!(
         readback.live_process_ids.is_empty(),
         "a non-existent pid must have zero live processes, got {:?}",
@@ -185,6 +197,16 @@ fn spawn_victim() -> u32 {
     child.id()
 }
 
+struct VictimGuard {
+    pid: u32,
+}
+
+impl Drop for VictimGuard {
+    fn drop(&mut self) {
+        let _ = crate::m4::terminate_owned_process_tree(self.pid);
+    }
+}
+
 /// Registers a spawned agent (registry row + owned process resource) exactly the
 /// way act_spawn_agent does, keyed by the agent's own session id.
 fn register_spawned_victim(
@@ -234,6 +256,30 @@ fn register_spawned_victim(
             .with_agent_cli(kind),
         )
         .expect("register session process resource");
+}
+
+fn journal_spawn_ready_only(
+    service: &SynapseService,
+    session_id: &str,
+    spawn_id: &str,
+    pid: u32,
+    kind: &str,
+    log_dir: &Path,
+) {
+    let db = service.agent_control_db().expect("open storage");
+    let mut record = AgentEventRecord::new(
+        crate::server::agent_events::unix_time_ns_now(),
+        AgentEventKind::SpawnReady,
+    );
+    record.spawn_id = Some(spawn_id.to_owned());
+    record.session_id = Some(session_id.to_owned());
+    record.attributes.agent_name = Some(kind.to_owned());
+    record.payload = json!({
+        "launcher_process_id": pid,
+        "agent_process_id": pid,
+        "log_dir": log_dir.display().to_string(),
+    });
+    crate::server::agent_events::record_agent_event(&db, &record).expect("journal spawn_ready");
 }
 
 fn journal_count_kind(db: &Db, session_id: &str, kind: AgentEventKind) -> usize {
@@ -323,6 +369,181 @@ async fn agent_kill_terminates_real_process_tree_and_journals_killed() {
     assert!(
         kill_rows >= 2,
         "expected intent+final agent_kill audit rows, found {kill_rows}"
+    );
+}
+
+#[tokio::test]
+async fn agent_kill_resolves_restart_rebuilt_spawn_from_agent_state() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let session = "session-regression-kill-restart-rebuilt";
+    let spawn = "agent-spawn-regression-kill-restart-rebuilt";
+    let pid = spawn_victim();
+    let _guard = VictimGuard { pid };
+    let log_dir = temp.path().join(spawn);
+    std::fs::create_dir_all(&log_dir).expect("create spawn log dir");
+    std::fs::write(
+        log_dir.join("completion-status.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "spawn_id": spawn,
+            "cli": "local-model",
+            "status": "running"
+        }))
+        .expect("encode running completion status"),
+    )
+    .expect("write running completion status");
+
+    // Simulate a daemon restart: the durable journal rebuilt agent_state, but
+    // the volatile session registry/process-resource job ledger has no spawned
+    // metadata or job handle for the reconnected MCP session.
+    journal_spawn_ready_only(&service, session, spawn, pid, "local-model", &log_dir);
+    {
+        let mut registry = service
+            .session_registry_ref()
+            .lock()
+            .expect("registry lock");
+        registry.record_seen(
+            session,
+            Some("tools/call:health".to_owned()),
+            unix_time_ms_now(),
+        );
+    }
+    assert!(
+        crate::m4::process_exists(pid),
+        "precondition: victim pid {pid} must be alive before the fallback kill"
+    );
+
+    let response = service
+        .agent_kill_impl(
+            AgentKillParams {
+                session_id: session.to_owned(),
+                grace_ms: 0,
+                interrupt_first: false,
+            },
+            Some("operator-regression"),
+        )
+        .await
+        .expect("agent_kill must resolve the durable state row");
+
+    assert_eq!(response.session_id, session);
+    assert_eq!(response.spawn_id.as_deref(), Some(spawn));
+    assert_eq!(response.resolution_source, "durable_agent_state");
+    assert!(
+        response
+            .post_teardown_force_termination
+            .as_ref()
+            .is_some_and(|read| read.attempted),
+        "restart fallback must perform an exact process-tree termination"
+    );
+    assert!(
+        response
+            .teardown
+            .as_ref()
+            .is_some_and(|report| report.processes.owned_before == 0),
+        "restart simulation must have no live process-resource job ledger"
+    );
+    assert!(response.killed, "agent_kill must report killed=true");
+    assert!(
+        response.orphan_process_ids.is_empty(),
+        "no orphan processes may remain: {:?}",
+        response.orphan_process_ids
+    );
+    assert!(
+        !crate::m4::process_exists(pid),
+        "victim pid {pid} must be gone from the OS process table after fallback kill"
+    );
+    let completion_status: Value = serde_json::from_slice(
+        &std::fs::read(log_dir.join("completion-status.json"))
+            .expect("read completion status after kill"),
+    )
+    .expect("decode completion status after kill");
+    assert_eq!(
+        completion_status.get("status").and_then(Value::as_str),
+        Some("agent_kill_forced_after_daemon_restart")
+    );
+    assert_eq!(
+        response.completion_artifact_cleanup_status.as_deref(),
+        Some("agent_kill_forced_after_daemon_restart")
+    );
+}
+
+#[test]
+fn restart_kill_completion_artifact_overwrites_wrapper_fallback_race() {
+    let temp = TempDir::new().expect("temp dir");
+    let spawn = "agent-spawn-regression-wrapper-fallback-race";
+    let log_dir = temp.path().join(spawn);
+    std::fs::create_dir_all(&log_dir).expect("create spawn log dir");
+    std::fs::write(
+        log_dir.join("final-message.txt"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "spawn_id": spawn,
+            "status": "failed",
+            "message": "wrapper fallback"
+        }))
+        .expect("encode wrapper final message"),
+    )
+    .expect("write wrapper final message");
+    std::fs::write(
+        log_dir.join("completion-status.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema_version": 1,
+            "spawn_id": spawn,
+            "cli": "claude",
+            "status": "failed",
+            "exit_code": 1,
+            "error_message": "spawned agent CLI exited with code 1",
+            "final_message_source": "wrapper_fallback_json",
+            "fallback_final_message_written": true
+        }))
+        .expect("encode wrapper completion status"),
+    )
+    .expect("write wrapper completion status");
+    let target = ResolvedAgent {
+        session_id: "session-regression-wrapper-fallback-race".to_owned(),
+        spawn_id: Some(spawn.to_owned()),
+        agent_kind: "claude".to_owned(),
+        lifecycle: "agent_state:stuck".to_owned(),
+        resolution_source: "durable_agent_state".to_owned(),
+        dead: false,
+        launcher_process_id: 1234,
+        agent_process_id: Some(5678),
+        log_dir: log_dir.display().to_string(),
+        control: None,
+    };
+    let process_before = ProcessReadback {
+        launcher_process_id: 1234,
+        process_tree_ids: vec![1234, 5678],
+        live_process_ids: vec![1234, 5678],
+    };
+
+    let status = write_agent_kill_restart_completion_artifact(&target, &process_before, &[], None)
+        .expect("restart kill artifact rewrite succeeds");
+
+    assert_eq!(status, "agent_kill_forced_after_daemon_restart");
+    let completion_status: Value = serde_json::from_slice(
+        &std::fs::read(log_dir.join("completion-status.json"))
+            .expect("read rewritten completion status"),
+    )
+    .expect("decode rewritten completion status");
+    assert_eq!(
+        completion_status.get("status").and_then(Value::as_str),
+        Some("agent_kill_forced_after_daemon_restart")
+    );
+    assert_eq!(
+        completion_status
+            .get("final_message_source")
+            .and_then(Value::as_str),
+        Some("agent_kill_restart_artifact_json")
+    );
+    let final_message: Value = serde_json::from_slice(
+        &std::fs::read(log_dir.join("final-message.txt")).expect("read rewritten final message"),
+    )
+    .expect("decode rewritten final message");
+    assert_eq!(
+        final_message.get("status").and_then(Value::as_str),
+        Some("agent_kill_forced_after_daemon_restart")
     );
 }
 

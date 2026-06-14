@@ -3407,6 +3407,14 @@ fn build_agent_spawn_task_start_script(
 )\n\
 $ErrorActionPreference = 'Stop'\n\
 Set-StrictMode -Version Latest\n\
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)\n\
+function Write-TextNoBom {{\n\
+    param(\n\
+        [Parameter(Mandatory = $true)][string]$Path,\n\
+        [Parameter(Mandatory = $true)][string]$Text\n\
+    )\n\
+    [System.IO.File]::WriteAllText($Path, $Text, $Utf8NoBom)\n\
+}}\n\
 $taskStartedPath = {task_started_path}\n\
 $taskStartedTempPath = \"$taskStartedPath.tmp.$PID\"\n\
 $taskStarted = [ordered]@{{\n\
@@ -3422,7 +3430,8 @@ $taskStarted = [ordered]@{{\n\
     started_at_unix_ms = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\n\
 }}\n\
 [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($taskStartedPath)) | Out-Null\n\
-$taskStarted | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $taskStartedTempPath -Encoding UTF8\n\
+$taskStartedJson = $taskStarted | ConvertTo-Json -Depth 8\n\
+Write-TextNoBom -Path $taskStartedTempPath -Text $taskStartedJson\n\
 Move-Item -LiteralPath $taskStartedTempPath -Destination $taskStartedPath -Force\n\
 \n\
 $readBack = Get-Content -LiteralPath $taskStartedPath -Raw -Encoding UTF8 | ConvertFrom-Json\n\
@@ -3922,7 +3931,10 @@ fn read_agent_spawn_task_start_artifact(
             "task_started_path": files.task_started_path.display().to_string(),
         }));
     }
-    let value = serde_json::from_slice::<Value>(&bytes).map_err(|error| {
+    let json_bytes = bytes
+        .strip_prefix(&[0xEF, 0xBB, 0xBF])
+        .unwrap_or(bytes.as_slice());
+    let value = serde_json::from_slice::<Value>(json_bytes).map_err(|error| {
         json!({
             "reason": "task_start_artifact_json_invalid",
             "task_started_path": files.task_started_path.display().to_string(),
@@ -4458,6 +4470,9 @@ mod tests {
         assert!(script.contains("-f $key, $expectedValue, $actual"));
         assert!(!script.contains("$key:"));
         assert!(script.contains("assigned_prompt_present = $true"));
+        assert!(script.contains("$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)"));
+        assert!(script.contains("Write-TextNoBom -Path $taskStartedTempPath"));
+        assert!(!script.contains("Set-Content -LiteralPath $taskStartedTempPath -Encoding UTF8"));
     }
 
     #[test]
@@ -4580,6 +4595,64 @@ mod tests {
             .expect("encode task start"),
         )
         .expect("write task start");
+        let matched = MatchedSpawnSession {
+            session_id: "expected-session".to_owned(),
+            registered_at_unix_ms: 1000,
+            agent_process_id: Some(42),
+        };
+        let read = read_agent_spawn_task_start_artifact(
+            &files,
+            &test_spawn_params(),
+            ActSpawnAgentCli::Codex,
+            "agent-spawn-test",
+            &matched,
+        )
+        .expect("read task start")
+        .expect("task start present");
+
+        assert_eq!(read.started_at_unix_ms, 1234);
+    }
+
+    #[test]
+    fn task_start_artifact_validation_accepts_bom_prefixed_artifact() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let files = AgentSpawnFiles {
+            log_dir: dir.path().to_path_buf(),
+            prompt_path: dir.path().join("prompt.txt"),
+            stdout_path: dir.path().join("stdout.jsonl"),
+            stderr_path: dir.path().join("stderr.log"),
+            final_message_path: dir.path().join("final-message.txt"),
+            completion_status_path: dir.path().join("completion-status.json"),
+            task_started_path: dir.path().join("task-started.json"),
+            task_started_script_path: dir.path().join("write-task-started.ps1"),
+            debug_path: None,
+            mcp_config_path: None,
+            hook_settings_path: None,
+            notify_script_path: None,
+            codex_app_server_runner_path: None,
+            codex_app_server_control_path: None,
+            codex_app_server_events_path: None,
+            codex_app_server_stdout_path: None,
+            codex_app_server_stderr_path: None,
+            local_model_runner_path: None,
+        };
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend(
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "spawn_id": "agent-spawn-test",
+                "cli": "codex",
+                "session_id": "expected-session",
+                "status": "started",
+                "health_ok": true,
+                "target_ok": true,
+                "assigned_prompt_present": true,
+                "task_started_path": files.task_started_path.display().to_string(),
+                "started_at_unix_ms": 1234
+            }))
+            .expect("encode task start"),
+        );
+        fs::write(&files.task_started_path, bytes).expect("write task start");
         let matched = MatchedSpawnSession {
             session_id: "expected-session".to_owned(),
             registered_at_unix_ms: 1000,

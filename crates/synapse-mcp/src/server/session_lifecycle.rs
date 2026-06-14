@@ -196,11 +196,35 @@ pub struct SessionInputCleanupReport {
 pub struct SessionShutdownInputCleanupReport {
     pub session_id: String,
     pub reason: String,
+    pub process_jobs: SessionProcessRestartHandoffReport,
     pub input: SessionInputCleanupReport,
     pub lease_row_existed_before: bool,
     pub lease_row_deleted: bool,
     pub lease_row_exists_after: bool,
     pub failed: bool,
+    pub error_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionProcessRestartHandoffReport {
+    pub owned_before: usize,
+    pub job_handles_before: usize,
+    pub kill_on_close_disarmed: usize,
+    pub failed: usize,
+    pub items: Vec<SessionProcessRestartHandoffItem>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionProcessRestartHandoffItem {
+    pub tool: String,
+    pub pid: u32,
+    pub resource_id: Option<String>,
+    pub launch_target: String,
+    pub agent_cli: Option<String>,
+    pub registered_at_unix_ms: u64,
+    pub status: String,
     pub error_message: Option<String>,
 }
 
@@ -822,6 +846,8 @@ impl SessionLifecycleState {
             report.error_message = Some(error.message.to_string());
             return report;
         }
+        report.process_jobs =
+            self.disarm_owned_process_jobs_for_daemon_shutdown(session_id, reason);
         report.input = self.cleanup_inputs_and_lease(session_id).await;
         match super::session_continuity::delete_persisted_session_lease_row(
             &self.m3_state,
@@ -840,12 +866,91 @@ impl SessionLifecycleState {
         if report.input.failed {
             report.failed = true;
         }
+        if report.process_jobs.failed > 0 {
+            report.failed = true;
+            if report.error_message.is_none() {
+                report.error_message = Some(format!(
+                    "{} owned process job(s) could not disarm kill-on-close before daemon shutdown",
+                    report.process_jobs.failed
+                ));
+            }
+        }
         tracing::info!(
             code = "MCP_SESSION_SHUTDOWN_INPUT_CLEANUP",
             session_id,
             reason,
             report = ?report,
             "readback=session_input_ownership edge=daemon_shutdown after_cleanup"
+        );
+        report
+    }
+
+    fn disarm_owned_process_jobs_for_daemon_shutdown(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> SessionProcessRestartHandoffReport {
+        let mut guard = match self.session_processes.lock() {
+            Ok(guard) => guard,
+            Err(_error) => {
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    session_id,
+                    reason,
+                    "session lifecycle could not lock process resources for daemon restart handoff"
+                );
+                return SessionProcessRestartHandoffReport {
+                    failed: 1,
+                    ..SessionProcessRestartHandoffReport::default()
+                };
+            }
+        };
+        let Some(resources) = guard.get_mut(session_id) else {
+            return SessionProcessRestartHandoffReport::default();
+        };
+        let mut report = SessionProcessRestartHandoffReport {
+            owned_before: resources.len(),
+            ..SessionProcessRestartHandoffReport::default()
+        };
+        for resource in resources.values_mut() {
+            let mut status = "no_job_handle".to_owned();
+            let mut error_message = None;
+            if let Some(process_job) = resource.process_job.as_mut() {
+                report.job_handles_before = report.job_handles_before.saturating_add(1);
+                match process_job.disarm_kill_on_close(
+                    resource.tool,
+                    resource.pid,
+                    resource.resource_id.as_deref(),
+                ) {
+                    Ok(()) => {
+                        report.kill_on_close_disarmed =
+                            report.kill_on_close_disarmed.saturating_add(1);
+                        status = "kill_on_close_disarmed".to_owned();
+                    }
+                    Err(error) => {
+                        report.failed = report.failed.saturating_add(1);
+                        status = "disarm_failed".to_owned();
+                        error_message = Some(error.message.to_string());
+                    }
+                }
+            }
+            report.items.push(SessionProcessRestartHandoffItem {
+                tool: resource.tool.to_owned(),
+                pid: resource.pid,
+                resource_id: resource.resource_id.clone(),
+                launch_target: resource.launch_target.clone(),
+                agent_cli: resource.agent_cli.clone(),
+                registered_at_unix_ms: resource.registered_at_unix_ms,
+                status,
+                error_message,
+            });
+        }
+        tracing::info!(
+            code = "MCP_SESSION_PROCESS_RESTART_HANDOFF",
+            session_id,
+            reason,
+            report = ?report,
+            "readback=session_process_ledger edge=daemon_shutdown after=kill_on_close_disarmed"
         );
         report
     }

@@ -7832,6 +7832,69 @@ impl Drop for OwnedProcessJob {
 unsafe impl Send for OwnedProcessJob {}
 
 #[cfg(windows)]
+impl OwnedProcessJob {
+    pub(crate) fn disarm_kill_on_close(
+        &mut self,
+        tool_name: &'static str,
+        pid: u32,
+        resource_id: Option<&str>,
+    ) -> Result<(), ErrorData> {
+        use windows::Win32::System::JobObjects::{
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = Default::default();
+        let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+            .map_err(|error| {
+                shell_tool_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("{tool_name} failed to size Windows job object limits: {error}"),
+                    json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "pid": pid,
+                        "resource_id": resource_id,
+                        "reason": "job_object_limit_size_failed",
+                    }),
+                )
+            })?;
+        unsafe {
+            SetInformationJobObject(
+                self.handle,
+                JobObjectExtendedLimitInformation,
+                &raw const limits as *const _,
+                limit_size,
+            )
+        }
+        .map_err(|error| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("{tool_name} failed to disarm Windows job object kill-on-close: {error}"),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "pid": pid,
+                    "resource_id": resource_id,
+                    "reason": "job_object_kill_on_close_disarm_failed",
+                }),
+            )
+        })
+    }
+}
+
+#[cfg(not(windows))]
+impl OwnedProcessJob {
+    pub(crate) fn disarm_kill_on_close(
+        &mut self,
+        _tool_name: &'static str,
+        _pid: u32,
+        _resource_id: Option<&str>,
+    ) -> Result<(), ErrorData> {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
 pub(crate) fn assign_owned_process_job(
     pid: u32,
     tool_name: &'static str,

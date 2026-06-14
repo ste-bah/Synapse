@@ -172,6 +172,8 @@ pub(crate) struct AgentStateRead {
     pub launcher_process_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_process_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_dir: Option<String>,
 }
 
 /// One emitted transition, journaled as an authoritative `state_changed` row
@@ -206,6 +208,7 @@ struct AgentEntry {
     identical_tool_calls: u32,
     launcher_process_id: Option<u32>,
     agent_process_id: Option<u32>,
+    log_dir: Option<String>,
 }
 
 impl AgentEntry {
@@ -230,6 +233,7 @@ impl AgentEntry {
                 .map(|(tool, _digest)| tool.clone()),
             launcher_process_id: self.launcher_process_id,
             agent_process_id: self.agent_process_id,
+            log_dir: self.log_dir.clone(),
         }
     }
 
@@ -356,6 +360,7 @@ impl AgentStateTracker {
         if record.kind == AgentEventKind::SpawnReady {
             entry.launcher_process_id = payload_u32(&record.payload, "launcher_process_id");
             entry.agent_process_id = payload_u32(&record.payload, "agent_process_id");
+            entry.log_dir = payload_string(&record.payload, "log_dir");
         }
         entry.last_event_unix_ms = entry.last_event_unix_ms.max(event_unix_ms);
         entry.last_event_kind = record.kind;
@@ -426,6 +431,7 @@ impl AgentStateTracker {
                 identical_tool_calls: 0,
                 launcher_process_id: None,
                 agent_process_id: None,
+                log_dir: None,
             });
         entry.state = state;
         entry.reason_code.clone_from(&record.reason_code);
@@ -545,6 +551,13 @@ impl AgentStateTracker {
             .cloned()
             .unwrap_or_else(|| session_id.to_owned());
         self.agents.get(&key).map(|entry| entry.read(now_unix_ms))
+    }
+
+    pub(crate) fn reads(&self, now_unix_ms: u64) -> Vec<AgentStateRead> {
+        self.agents
+            .values()
+            .map(|entry| entry.read(now_unix_ms))
+            .collect()
     }
 
     /// Agents not (yet) linked to any MCP session: in-flight spawns and
@@ -829,6 +842,11 @@ fn initial_entry(
         },
         agent_process_id: if record.kind == Kind::SpawnReady {
             payload_u32(&record.payload, "agent_process_id")
+        } else {
+            None
+        },
+        log_dir: if record.kind == Kind::SpawnReady {
+            payload_string(&record.payload, "log_dir")
         } else {
             None
         },
@@ -1117,6 +1135,21 @@ pub(crate) fn read_for_session(session_id: &str, now_unix_ms: u64) -> Option<Age
         .lock()
         .ok()?
         .read_for_session(session_id, now_unix_ms)
+}
+
+fn payload_string(payload: &Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+}
+
+pub(crate) fn reads(now_unix_ms: u64) -> Vec<AgentStateRead> {
+    tracker()
+        .lock()
+        .map(|guard| guard.reads(now_unix_ms))
+        .unwrap_or_default()
 }
 
 /// Agents with no MCP session yet (or ever) — in-flight or failed spawns.
