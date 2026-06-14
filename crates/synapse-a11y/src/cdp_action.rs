@@ -1605,13 +1605,7 @@ where
     let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
     let result = async {
-        let pages = wait_for_pages(&browser).await?;
-        let page = pages
-            .into_iter()
-            .find(|page| page.target_id().inner().eq_ignore_ascii_case(target_id))
-            .ok_or_else(|| A11yError::CdpAttachFailed {
-                detail: format!("CDP target {target_id:?} is no longer present"),
-            })?;
+        let page = get_target_page_with_discovery(&browser, target_id).await?;
         action(page).await
     }
     .await;
@@ -1644,6 +1638,20 @@ async fn get_page_with_discovery(
     target_id: &str,
     backend_node_id: i64,
 ) -> A11yResult<chromiumoxide::Page> {
+    get_target_page_with_discovery(browser, target_id)
+        .await
+        .map_err(|error| match error {
+            A11yError::CdpAxtreeFailed { detail } => A11yError::CdpAxtreeFailed {
+                detail: format!("{detail} for backendNodeId {backend_node_id}"),
+            },
+            other => other,
+        })
+}
+
+async fn get_target_page_with_discovery(
+    browser: &chromiumoxide::Browser,
+    target_id: &str,
+) -> A11yResult<chromiumoxide::Page> {
     // Block until target discovery surfaces at least one page (or the endpoint
     // is unreachable) so the retry loop below is not racing an empty map.
     let pages = wait_for_pages(browser).await?;
@@ -1673,7 +1681,7 @@ async fn get_page_with_discovery(
         .join(",");
     Err(A11yError::CdpAxtreeFailed {
         detail: format!(
-            "selected target {target_id} is no longer present for backendNodeId {backend_node_id} after waiting for CDP target discovery (auto_attach_enabled={auto_attach_enabled}; {} page target(s) discovered: [{discovered}]); last get_page error: {}",
+            "selected target {target_id} is no longer present after waiting for CDP target discovery (auto_attach_enabled={auto_attach_enabled}; {} page target(s) discovered: [{discovered}]); last get_page error: {}",
             pages.len(),
             last_error.unwrap_or_else(|| "none".to_owned())
         ),
