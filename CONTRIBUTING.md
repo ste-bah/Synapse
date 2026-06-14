@@ -45,13 +45,21 @@ the roadmap (see the README "What's left on the docket" section).
    cargo clippy --workspace --all-targets
    cargo test --workspace
    ```
-3. Synapse is **Windows-native** for its real perception/action paths (Win32
+3. **Iterate with fast builds.** Use `cargo check` (~15 s) or `cargo build`
+   (dev, ~45 s incremental) for the edit loop. Run `cargo build --release` ONLY
+   to ship/run the real `synapse-mcp.exe` daemon — never as compile feedback.
+   See [docs/BUILD-AND-MAINTENANCE.md](docs/BUILD-AND-MAINTENANCE.md) for the
+   tuned profiles (rust-lld, thin-LTO release, `--profile release-max` for the
+   max-runtime binary) and the worktree/`target` disk-hygiene tooling
+   (`scripts/repo-maintenance.ps1`) — don't leave throwaway worktrees with their
+   own multi-GB `target/` lying around.
+4. Synapse is **Windows-native** for its real perception/action paths (Win32
    `SendInput`, UI Automation, WGC/DXGI). Behavior that touches those
    surfaces should be verified on Windows — the project uses manual Full State
    Verification (FSV) on the configured Windows host as the shipping gate (see the
    README "Agent Doctrine" section). Automated tests are supporting evidence, not a
    substitute for verifying real behavior.
-4. Keep commits focused and write clear messages. Reference the issue number
+5. Keep commits focused and write clear messages. Reference the issue number
    where applicable.
 
 ## Pull requests
