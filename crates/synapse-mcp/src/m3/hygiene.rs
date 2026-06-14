@@ -830,154 +830,14 @@ pub fn report(
         }
     }
 
-    // 3. One bounded CF_EPISODES scan: an episode is impacted iff its time
-    //    window contains a flagged timestamp. Bounded below by DAY_NS (no
-    //    episode spans a local-day boundary) and above by the largest ts.
-    let mut scanned_episode_rows = 0_u64;
-    let mut ts_to_episode_ids: BTreeMap<u64, Vec<String>> = BTreeMap::new();
-    let mut episodes_by_id: BTreeMap<String, HygieneImpactedEpisode> = BTreeMap::new();
-    if let (Some(&min_ts), Some(&max_ts)) = (ts_set.iter().next(), ts_set.iter().next_back()) {
-        let mut start = episode_codec::episode_scan_start(min_ts.saturating_sub(DAY_NS));
-        'episodes: loop {
-            if usize::try_from(scanned_episode_rows).unwrap_or(usize::MAX)
-                >= MAX_REPORT_EPISODE_SCAN_ROWS
-            {
-                return Err(mcp_error(
-                    error_codes::STORAGE_READ_FAILED,
-                    format!(
-                        "HYGIENE_REPORT_EPISODE_SCAN_BUDGET_EXHAUSTED after \
-                         {MAX_REPORT_EPISODE_SCAN_ROWS} CF_EPISODES rows; narrow source_key_hex or \
-                         time_range — a truncated derivation would under-report poisoned state"
-                    ),
-                ));
-            }
-            let (rows, more) = runtime
-                .storage_cf_rows_from(cf::CF_EPISODES, &start, STORAGE_SCAN_CHUNK_ROWS)
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-            if rows.is_empty() {
-                break;
-            }
-            let mut last = None;
-            for (key, value) in &rows {
-                scanned_episode_rows += 1;
-                last = Some(key.clone());
-                let (_key_ts_ns, _ordinal, record) = decode_episode_row(key, value)?;
-                // Episodes are key-ordered by start_ts_ns; once start passes the
-                // largest flag ts, no later episode can contain any flag ts.
-                if record.start_ts_ns > max_ts {
-                    break 'episodes;
-                }
-                let contained: Vec<u64> = ts_set
-                    .range(record.start_ts_ns..=record.end_ts_ns)
-                    .copied()
-                    .collect();
-                if contained.is_empty() {
-                    continue;
-                }
-                for ts in contained {
-                    ts_to_episode_ids
-                        .entry(ts)
-                        .or_default()
-                        .push(record.episode_id.clone());
-                }
-                episodes_by_id
-                    .entry(record.episode_id.clone())
-                    .or_insert_with(|| HygieneImpactedEpisode {
-                        episode_id: record.episode_id.clone(),
-                        start_ts_ns: record.start_ts_ns,
-                        end_ts_ns: record.end_ts_ns,
-                        actor: actor_label(&record.actor),
-                        app: record.app.clone(),
-                        document: record.document.clone(),
-                    });
-            }
-            if !more {
-                break;
-            }
-            let Some(last) = last else {
-                break;
-            };
-            start = key_after(&last);
-        }
-    }
+    // 3. Bounded CF_EPISODES scan shared with cleaning invalidation.
+    let (ts_to_episode_ids, episodes_by_id, scanned_episode_rows) =
+        scan_impacted_episodes(&runtime, &ts_set, ImpactScanCaller::Report)?;
 
-    // 4. One bounded CF_ROUTINES scan: a routine is impacted iff its evidence
-    //    episode ids intersect the impacted episode ids. Build episode → routine.
+    // 4. Bounded CF_ROUTINES scan shared with cleaning invalidation.
     let impacted_episode_ids: BTreeSet<String> = episodes_by_id.keys().cloned().collect();
-    let mut scanned_routine_rows = 0_u64;
-    let mut routines_by_id: BTreeMap<String, RoutineRecord> = BTreeMap::new();
-    let mut episode_to_routine_ids: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    if !impacted_episode_ids.is_empty() {
-        let mut start: Vec<u8> = Vec::new();
-        loop {
-            if usize::try_from(scanned_routine_rows).unwrap_or(usize::MAX)
-                >= MAX_REPORT_ROUTINE_SCAN_ROWS
-            {
-                return Err(mcp_error(
-                    error_codes::STORAGE_READ_FAILED,
-                    format!(
-                        "HYGIENE_REPORT_ROUTINE_SCAN_BUDGET_EXHAUSTED after \
-                         {MAX_REPORT_ROUTINE_SCAN_ROWS} CF_ROUTINES rows; the routine store should \
-                         hold at most a few hundred rows — inspect CF_ROUTINES"
-                    ),
-                ));
-            }
-            let (rows, more) = runtime
-                .storage_cf_rows_from(cf::CF_ROUTINES, &start, STORAGE_SCAN_CHUNK_ROWS)
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-            if rows.is_empty() {
-                break;
-            }
-            let mut last = None;
-            for (key, value) in &rows {
-                scanned_routine_rows += 1;
-                last = Some(key.clone());
-                routine_codec::decode_routine_key(key).map_err(|error| {
-                    mcp_error(
-                        error_codes::STORAGE_READ_FAILED,
-                        format!(
-                            "HYGIENE_REPORT_ROUTINE_KEY_INVALID in CF_ROUTINES at {}: {error}",
-                            hex_encode(key)
-                        ),
-                    )
-                })?;
-                let record = decode_json::<RoutineRecord>(value).map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!(
-                            "HYGIENE_REPORT_ROUTINE_ROW_DECODE_FAILED in CF_ROUTINES at {}: {error}",
-                            hex_encode(key)
-                        ),
-                    )
-                })?;
-                let mut linked: BTreeSet<String> = BTreeSet::new();
-                for evidence in &record.evidence {
-                    for episode_id in &evidence.episode_ids {
-                        if impacted_episode_ids.contains(episode_id) {
-                            linked.insert(episode_id.clone());
-                        }
-                    }
-                }
-                if linked.is_empty() {
-                    continue;
-                }
-                for episode_id in &linked {
-                    episode_to_routine_ids
-                        .entry(episode_id.clone())
-                        .or_default()
-                        .insert(record.routine_id.clone());
-                }
-                routines_by_id.insert(record.routine_id.clone(), record);
-            }
-            if !more {
-                break;
-            }
-            let Some(last) = last else {
-                break;
-            };
-            start = key_after(&last);
-        }
-    }
+    let (episode_to_routine_ids, routines_by_id, scanned_routine_rows) =
+        scan_impacted_routines(&runtime, &impacted_episode_ids, ImpactScanCaller::Report)?;
 
     // 5. Point-lookup operator lifecycle for each impacted routine.
     let mut routine_state: BTreeMap<String, (String, Option<String>)> = BTreeMap::new();
@@ -1005,110 +865,20 @@ pub fn report(
         }
     }
 
-    // 6. Scan generated profile-authoring candidates and reverse-index the
-    //    installable artifacts that reference impacted routines or episodes.
+    // 6. Bounded profile-authoring candidate scan shared with cleaning
+    //    invalidation.
     let impacted_routine_ids: BTreeSet<String> = routines_by_id.keys().cloned().collect();
-    let mut scanned_authoring_candidate_rows = 0_u64;
-    let mut authoring_candidates_by_id: BTreeMap<String, HygieneImpactedAuthoringCandidate> =
-        BTreeMap::new();
-    let mut routine_to_authoring_candidate_ids: BTreeMap<String, BTreeSet<String>> =
-        BTreeMap::new();
-    let mut episode_to_authoring_candidate_ids: BTreeMap<String, BTreeSet<String>> =
-        BTreeMap::new();
-    if !impacted_routine_ids.is_empty() || !impacted_episode_ids.is_empty() {
-        let prefix = PROFILE_AUTHORING_CANDIDATE_PREFIX.as_bytes();
-        let mut start = prefix.to_vec();
-        loop {
-            if usize::try_from(scanned_authoring_candidate_rows).unwrap_or(usize::MAX)
-                >= MAX_REPORT_AUTHORING_CANDIDATE_SCAN_ROWS
-            {
-                return Err(mcp_error(
-                    error_codes::STORAGE_READ_FAILED,
-                    format!(
-                        "HYGIENE_REPORT_AUTHORING_CANDIDATE_SCAN_BUDGET_EXHAUSTED after \
-                         {MAX_REPORT_AUTHORING_CANDIDATE_SCAN_ROWS} CF_PROFILES candidate rows; \
-                         a truncated derivation would hide poisoned installable artifacts"
-                    ),
-                ));
-            }
-            let rows = runtime
-                .storage_cf_prefix_rows_from(
-                    cf::CF_PROFILES,
-                    prefix,
-                    &start,
-                    STORAGE_SCAN_CHUNK_ROWS,
-                )
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-            if rows.is_empty() {
-                break;
-            }
-            let rows_len = rows.len();
-            let mut last = None;
-            for (key, value) in rows {
-                scanned_authoring_candidate_rows += 1;
-                last = Some(key.clone());
-                let candidate =
-                    decode_json::<ProfileAuthoringCandidate>(&value).map_err(|error| {
-                        mcp_error(
-                            error.code(),
-                            format!(
-                                "HYGIENE_REPORT_AUTHORING_CANDIDATE_ROW_DECODE_FAILED in \
-                                 CF_PROFILES at {}: {error}",
-                                hex_encode(&key)
-                            ),
-                        )
-                    })?;
-                let references = candidate_reference_strings(&candidate)?;
-                let via_routine_ids: Vec<String> = impacted_routine_ids
-                    .iter()
-                    .filter(|routine_id| references.contains(*routine_id))
-                    .cloned()
-                    .collect();
-                let via_episode_ids: Vec<String> = impacted_episode_ids
-                    .iter()
-                    .filter(|episode_id| references.contains(*episode_id))
-                    .cloned()
-                    .collect();
-                if via_routine_ids.is_empty() && via_episode_ids.is_empty() {
-                    continue;
-                }
-                let candidate_id = candidate.candidate_id.clone();
-                for routine_id in &via_routine_ids {
-                    routine_to_authoring_candidate_ids
-                        .entry(routine_id.clone())
-                        .or_default()
-                        .insert(candidate_id.clone());
-                }
-                for episode_id in &via_episode_ids {
-                    episode_to_authoring_candidate_ids
-                        .entry(episode_id.clone())
-                        .or_default()
-                        .insert(candidate_id.clone());
-                }
-                authoring_candidates_by_id.insert(
-                    candidate_id,
-                    HygieneImpactedAuthoringCandidate {
-                        candidate_id: candidate.candidate_id,
-                        profile_id: candidate.profile_id,
-                        state: candidate.state,
-                        generated_at_ns: candidate.generated_at_ns,
-                        updated_at_ns: candidate.updated_at_ns,
-                        accepted_at_ns: candidate.accepted_at_ns,
-                        rejected_at_ns: candidate.rejected_at_ns,
-                        via_routine_ids,
-                        via_episode_ids,
-                    },
-                );
-            }
-            if rows_len < STORAGE_SCAN_CHUNK_ROWS {
-                break;
-            }
-            let Some(last) = last else {
-                break;
-            };
-            start = key_after(&last);
-        }
-    }
+    let (
+        authoring_candidates_by_id,
+        routine_to_authoring_candidate_ids,
+        episode_to_authoring_candidate_ids,
+        scanned_authoring_candidate_rows,
+    ) = scan_impacted_candidates(
+        &runtime,
+        &impacted_routine_ids,
+        &impacted_episode_ids,
+        ImpactScanCaller::Report,
+    )?;
 
     // 7. Assemble each flag's impact from the maps.
     let mut flags_with_downstream_impact = 0_u64;
@@ -2093,17 +1863,24 @@ pub(crate) fn invalidate_cleaned_flags(
 
     // 2. Impacted episodes (time-window containment) — same join as hygiene_report.
     let (ts_to_episode_ids, episodes_by_id, scanned_episode_rows) =
-        scan_impacted_episodes(runtime, &ts_set)?;
+        scan_impacted_episodes(runtime, &ts_set, ImpactScanCaller::Invalidate)?;
     let impacted_episode_ids: BTreeSet<String> = episodes_by_id.keys().cloned().collect();
 
     // 3. Impacted routines (evidence episode-id intersection).
     let (episode_to_routine_ids, routines_by_id, scanned_routine_rows) =
-        scan_impacted_routines(runtime, &impacted_episode_ids)?;
+        scan_impacted_routines(runtime, &impacted_episode_ids, ImpactScanCaller::Invalidate)?;
     let impacted_routine_ids: BTreeSet<String> = routines_by_id.keys().cloned().collect();
 
     // 4. Impacted authoring candidates (reference impacted routine/episode ids).
-    let (impacted_candidate_ids, scanned_authoring_candidate_rows) =
-        scan_impacted_candidate_ids(runtime, &impacted_routine_ids, &impacted_episode_ids)?;
+    let (authoring_candidates_by_id, _, _, scanned_authoring_candidate_rows) =
+        scan_impacted_candidates(
+            runtime,
+            &impacted_routine_ids,
+            &impacted_episode_ids,
+            ImpactScanCaller::Invalidate,
+        )?;
+    let impacted_candidate_ids: BTreeSet<String> =
+        authoring_candidates_by_id.keys().cloned().collect();
 
     // Map each impacted artifact back to the flag ids that poisoned it so the
     // taint record carries an honest provenance trail.
@@ -2320,11 +2097,127 @@ type RoutineImpactIndex = (
     u64,
 );
 
+/// `(impacted candidates by id, routine id → candidate ids, episode id →
+/// candidate ids, rows scanned)`.
+type CandidateImpactIndex = (
+    BTreeMap<String, HygieneImpactedAuthoringCandidate>,
+    BTreeMap<String, BTreeSet<String>>,
+    BTreeMap<String, BTreeSet<String>>,
+    u64,
+);
+
+#[derive(Clone, Copy)]
+enum ImpactScanCaller {
+    Report,
+    Invalidate,
+}
+
+impl ImpactScanCaller {
+    fn episode_budget_error(self) -> ErrorData {
+        let message = match self {
+            Self::Report => format!(
+                "HYGIENE_REPORT_EPISODE_SCAN_BUDGET_EXHAUSTED after \
+                 {MAX_REPORT_EPISODE_SCAN_ROWS} CF_EPISODES rows; narrow source_key_hex or \
+                 time_range — a truncated derivation would under-report poisoned state"
+            ),
+            Self::Invalidate => format!(
+                "HYGIENE_INVALIDATE_EPISODE_SCAN_BUDGET_EXHAUSTED after \
+                 {MAX_REPORT_EPISODE_SCAN_ROWS} CF_EPISODES rows; a truncated derivation would \
+                 under-taint poisoned state"
+            ),
+        };
+        mcp_error(error_codes::STORAGE_READ_FAILED, message)
+    }
+
+    fn routine_budget_error(self) -> ErrorData {
+        let message = match self {
+            Self::Report => format!(
+                "HYGIENE_REPORT_ROUTINE_SCAN_BUDGET_EXHAUSTED after \
+                 {MAX_REPORT_ROUTINE_SCAN_ROWS} CF_ROUTINES rows; the routine store should \
+                 hold at most a few hundred rows — inspect CF_ROUTINES"
+            ),
+            Self::Invalidate => format!(
+                "HYGIENE_INVALIDATE_ROUTINE_SCAN_BUDGET_EXHAUSTED after \
+                 {MAX_REPORT_ROUTINE_SCAN_ROWS} CF_ROUTINES rows"
+            ),
+        };
+        mcp_error(error_codes::STORAGE_READ_FAILED, message)
+    }
+
+    fn routine_key_error(self, key: &[u8], error: impl std::fmt::Display) -> ErrorData {
+        let message = match self {
+            Self::Report => format!(
+                "HYGIENE_REPORT_ROUTINE_KEY_INVALID in CF_ROUTINES at {}: {error}",
+                hex_encode(key)
+            ),
+            Self::Invalidate => format!(
+                "HYGIENE_INVALIDATE_ROUTINE_KEY_INVALID in CF_ROUTINES at {}: {error}",
+                hex_encode(key)
+            ),
+        };
+        mcp_error(error_codes::STORAGE_READ_FAILED, message)
+    }
+
+    fn routine_decode_error(
+        self,
+        key: &[u8],
+        code: &'static str,
+        error: impl std::fmt::Display,
+    ) -> ErrorData {
+        let message = match self {
+            Self::Report => format!(
+                "HYGIENE_REPORT_ROUTINE_ROW_DECODE_FAILED in CF_ROUTINES at {}: {error}",
+                hex_encode(key)
+            ),
+            Self::Invalidate => format!(
+                "HYGIENE_INVALIDATE_ROUTINE_ROW_DECODE_FAILED in CF_ROUTINES at {}: {error}",
+                hex_encode(key)
+            ),
+        };
+        mcp_error(code, message)
+    }
+
+    fn authoring_budget_error(self) -> ErrorData {
+        let message = match self {
+            Self::Report => format!(
+                "HYGIENE_REPORT_AUTHORING_CANDIDATE_SCAN_BUDGET_EXHAUSTED after \
+                 {MAX_REPORT_AUTHORING_CANDIDATE_SCAN_ROWS} CF_PROFILES candidate rows; \
+                 a truncated derivation would hide poisoned installable artifacts"
+            ),
+            Self::Invalidate => format!(
+                "HYGIENE_INVALIDATE_AUTHORING_CANDIDATE_SCAN_BUDGET_EXHAUSTED after \
+                 {MAX_REPORT_AUTHORING_CANDIDATE_SCAN_ROWS} CF_PROFILES candidate rows"
+            ),
+        };
+        mcp_error(error_codes::STORAGE_READ_FAILED, message)
+    }
+
+    fn authoring_decode_error(
+        self,
+        key: &[u8],
+        code: &'static str,
+        error: impl std::fmt::Display,
+    ) -> ErrorData {
+        let message = match self {
+            Self::Report => format!(
+                "HYGIENE_REPORT_AUTHORING_CANDIDATE_ROW_DECODE_FAILED in CF_PROFILES at {}: {error}",
+                hex_encode(key)
+            ),
+            Self::Invalidate => format!(
+                "HYGIENE_INVALIDATE_AUTHORING_CANDIDATE_ROW_DECODE_FAILED in CF_PROFILES at {}: {error}",
+                hex_encode(key)
+            ),
+        };
+        mcp_error(code, message)
+    }
+}
+
 /// One bounded `CF_EPISODES` scan: an episode is impacted iff its inclusive time
-/// window contains a flagged timestamp. Mirrors `hygiene_report` step 3.
+/// window contains a flagged timestamp.
 fn scan_impacted_episodes(
     runtime: &ReflexRuntime,
     ts_set: &BTreeSet<u64>,
+    caller: ImpactScanCaller,
 ) -> Result<EpisodeImpactIndex, ErrorData> {
     let mut scanned = 0_u64;
     let mut ts_to_episode_ids: BTreeMap<u64, Vec<String>> = BTreeMap::new();
@@ -2335,14 +2228,7 @@ fn scan_impacted_episodes(
     let mut start = episode_codec::episode_scan_start(min_ts.saturating_sub(DAY_NS));
     'episodes: loop {
         if usize::try_from(scanned).unwrap_or(usize::MAX) >= MAX_REPORT_EPISODE_SCAN_ROWS {
-            return Err(mcp_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "HYGIENE_INVALIDATE_EPISODE_SCAN_BUDGET_EXHAUSTED after \
-                     {MAX_REPORT_EPISODE_SCAN_ROWS} CF_EPISODES rows; a truncated derivation would \
-                     under-taint poisoned state"
-                ),
-            ));
+            return Err(caller.episode_budget_error());
         }
         let (rows, more) = runtime
             .storage_cf_rows_from(cf::CF_EPISODES, &start, STORAGE_SCAN_CHUNK_ROWS)
@@ -2392,11 +2278,11 @@ fn scan_impacted_episodes(
 }
 
 /// One bounded `CF_ROUTINES` scan: a routine is impacted iff its evidence
-/// episode ids intersect the impacted episode ids. Mirrors `hygiene_report`
-/// step 4.
+/// episode ids intersect the impacted episode ids.
 fn scan_impacted_routines(
     runtime: &ReflexRuntime,
     impacted_episode_ids: &BTreeSet<String>,
+    caller: ImpactScanCaller,
 ) -> Result<RoutineImpactIndex, ErrorData> {
     let mut scanned = 0_u64;
     let mut routines_by_id: BTreeMap<String, RoutineRecord> = BTreeMap::new();
@@ -2407,13 +2293,7 @@ fn scan_impacted_routines(
     let mut start: Vec<u8> = Vec::new();
     loop {
         if usize::try_from(scanned).unwrap_or(usize::MAX) >= MAX_REPORT_ROUTINE_SCAN_ROWS {
-            return Err(mcp_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "HYGIENE_INVALIDATE_ROUTINE_SCAN_BUDGET_EXHAUSTED after \
-                     {MAX_REPORT_ROUTINE_SCAN_ROWS} CF_ROUTINES rows"
-                ),
-            ));
+            return Err(caller.routine_budget_error());
         }
         let (rows, more) = runtime
             .storage_cf_rows_from(cf::CF_ROUTINES, &start, STORAGE_SCAN_CHUNK_ROWS)
@@ -2425,23 +2305,11 @@ fn scan_impacted_routines(
         for (key, value) in &rows {
             scanned += 1;
             last = Some(key.clone());
-            routine_codec::decode_routine_key(key).map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_READ_FAILED,
-                    format!(
-                        "HYGIENE_INVALIDATE_ROUTINE_KEY_INVALID in CF_ROUTINES at {}: {error}",
-                        hex_encode(key)
-                    ),
-                )
-            })?;
+            routine_codec::decode_routine_key(key)
+                .map_err(|error| caller.routine_key_error(key, error))?;
             let record = decode_json::<RoutineRecord>(value).map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "HYGIENE_INVALIDATE_ROUTINE_ROW_DECODE_FAILED in CF_ROUTINES at {}: {error}",
-                        hex_encode(key)
-                    ),
-                )
+                let code = error.code();
+                caller.routine_decode_error(key, code, error)
             })?;
             let mut linked: BTreeSet<String> = BTreeSet::new();
             for evidence in &record.evidence {
@@ -2472,17 +2340,27 @@ fn scan_impacted_routines(
 }
 
 /// One bounded `CF_PROFILES` candidate scan: a candidate is impacted iff its
-/// JSON references an impacted routine or episode id. Mirrors `hygiene_report`
-/// step 6 but returns only the impacted ids.
-fn scan_impacted_candidate_ids(
+/// JSON references an impacted routine or episode id.
+fn scan_impacted_candidates(
     runtime: &ReflexRuntime,
     impacted_routine_ids: &BTreeSet<String>,
     impacted_episode_ids: &BTreeSet<String>,
-) -> Result<(BTreeSet<String>, u64), ErrorData> {
+    caller: ImpactScanCaller,
+) -> Result<CandidateImpactIndex, ErrorData> {
     let mut scanned = 0_u64;
-    let mut impacted: BTreeSet<String> = BTreeSet::new();
+    let mut authoring_candidates_by_id: BTreeMap<String, HygieneImpactedAuthoringCandidate> =
+        BTreeMap::new();
+    let mut routine_to_authoring_candidate_ids: BTreeMap<String, BTreeSet<String>> =
+        BTreeMap::new();
+    let mut episode_to_authoring_candidate_ids: BTreeMap<String, BTreeSet<String>> =
+        BTreeMap::new();
     if impacted_routine_ids.is_empty() && impacted_episode_ids.is_empty() {
-        return Ok((impacted, scanned));
+        return Ok((
+            authoring_candidates_by_id,
+            routine_to_authoring_candidate_ids,
+            episode_to_authoring_candidate_ids,
+            scanned,
+        ));
     }
     let prefix = PROFILE_AUTHORING_CANDIDATE_PREFIX.as_bytes();
     let mut start = prefix.to_vec();
@@ -2490,13 +2368,7 @@ fn scan_impacted_candidate_ids(
         if usize::try_from(scanned).unwrap_or(usize::MAX)
             >= MAX_REPORT_AUTHORING_CANDIDATE_SCAN_ROWS
         {
-            return Err(mcp_error(
-                error_codes::STORAGE_READ_FAILED,
-                format!(
-                    "HYGIENE_INVALIDATE_AUTHORING_CANDIDATE_SCAN_BUDGET_EXHAUSTED after \
-                     {MAX_REPORT_AUTHORING_CANDIDATE_SCAN_ROWS} CF_PROFILES candidate rows"
-                ),
-            ));
+            return Err(caller.authoring_budget_error());
         }
         let rows = runtime
             .storage_cf_prefix_rows_from(cf::CF_PROFILES, prefix, &start, STORAGE_SCAN_CHUNK_ROWS)
@@ -2510,25 +2382,50 @@ fn scan_impacted_candidate_ids(
             scanned += 1;
             last = Some(key.clone());
             let candidate = decode_json::<ProfileAuthoringCandidate>(&value).map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "HYGIENE_INVALIDATE_AUTHORING_CANDIDATE_ROW_DECODE_FAILED in CF_PROFILES \
-                         at {}: {error}",
-                        hex_encode(&key)
-                    ),
-                )
+                let code = error.code();
+                caller.authoring_decode_error(&key, code, error)
             })?;
             let references = candidate_reference_strings(&candidate)?;
-            let referenced = impacted_routine_ids
+            let via_routine_ids: Vec<String> = impacted_routine_ids
                 .iter()
-                .any(|routine_id| references.contains(routine_id))
-                || impacted_episode_ids
-                    .iter()
-                    .any(|episode_id| references.contains(episode_id));
-            if referenced {
-                impacted.insert(candidate.candidate_id);
+                .filter(|routine_id| references.contains(*routine_id))
+                .cloned()
+                .collect();
+            let via_episode_ids: Vec<String> = impacted_episode_ids
+                .iter()
+                .filter(|episode_id| references.contains(*episode_id))
+                .cloned()
+                .collect();
+            if via_routine_ids.is_empty() && via_episode_ids.is_empty() {
+                continue;
             }
+            let candidate_id = candidate.candidate_id.clone();
+            for routine_id in &via_routine_ids {
+                routine_to_authoring_candidate_ids
+                    .entry(routine_id.clone())
+                    .or_default()
+                    .insert(candidate_id.clone());
+            }
+            for episode_id in &via_episode_ids {
+                episode_to_authoring_candidate_ids
+                    .entry(episode_id.clone())
+                    .or_default()
+                    .insert(candidate_id.clone());
+            }
+            authoring_candidates_by_id.insert(
+                candidate_id,
+                HygieneImpactedAuthoringCandidate {
+                    candidate_id: candidate.candidate_id,
+                    profile_id: candidate.profile_id,
+                    state: candidate.state,
+                    generated_at_ns: candidate.generated_at_ns,
+                    updated_at_ns: candidate.updated_at_ns,
+                    accepted_at_ns: candidate.accepted_at_ns,
+                    rejected_at_ns: candidate.rejected_at_ns,
+                    via_routine_ids,
+                    via_episode_ids,
+                },
+            );
         }
         if rows_len < STORAGE_SCAN_CHUNK_ROWS {
             break;
@@ -2536,7 +2433,12 @@ fn scan_impacted_candidate_ids(
         let Some(last) = last else { break };
         start = key_after(&last);
     }
-    Ok((impacted, scanned))
+    Ok((
+        authoring_candidates_by_id,
+        routine_to_authoring_candidate_ids,
+        episode_to_authoring_candidate_ids,
+        scanned,
+    ))
 }
 
 fn now_ns() -> u64 {
