@@ -1504,9 +1504,8 @@ struct DashboardTranscriptSurface {
 struct DashboardHygieneSurface {
     tool: &'static str,
     available: bool,
-    scanned_rows: u64,
-    next_cursor: Option<String>,
-    rows: Vec<crate::m3::hygiene::HygieneStoredFlag>,
+    source_of_truth: &'static str,
+    report: crate::m3::hygiene::HygieneReportResponse,
 }
 
 async fn dashboard_index(State(state): State<HttpState>, headers: HeaderMap) -> Response {
@@ -2116,21 +2115,20 @@ fn command_audit_panel(state: &HttpState) -> DashboardPanel {
 }
 
 fn hygiene_panel(state: &HttpState, tool_names: &BTreeSet<&str>) -> DashboardPanel {
-    if !tool_names.contains("hygiene_flags") {
-        return deferred_panel("hygiene_flags", tool_names);
+    if !tool_names.contains("hygiene_report") {
+        return deferred_panel("hygiene_report", tool_names);
     }
-    match state.health_service.hygiene_flags_snapshot(100) {
+    match state.health_service.hygiene_report_snapshot(100) {
         Ok(response) => DashboardPanel::ok(
-            "hygiene_flags",
+            "hygiene_report",
             DashboardHygieneSurface {
-                tool: "hygiene_flags",
+                tool: "hygiene_report",
                 available: true,
-                scanned_rows: response.scanned_rows,
-                next_cursor: response.next_cursor,
-                rows: response.flags,
+                source_of_truth: "CF_KV hygiene/flag/v1 plus CF_EPISODES/CF_ROUTINES/CF_PROFILES joins",
+                report: response,
             },
         ),
-        Err(error) => DashboardPanel::error("hygiene_flags", format!("{error:?}")),
+        Err(error) => DashboardPanel::error("hygiene_report", format!("{error:?}")),
     }
 }
 

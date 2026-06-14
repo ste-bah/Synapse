@@ -410,19 +410,16 @@ impl SynapseService {
         Ok(decoded)
     }
 
-    pub(crate) fn hygiene_flags_snapshot(
+    pub(crate) fn hygiene_report_snapshot(
         &self,
         limit: u32,
-    ) -> Result<crate::m3::hygiene::HygieneFlagsResponse, ErrorData> {
+    ) -> Result<crate::m3::hygiene::HygieneReportResponse, ErrorData> {
         let runtime = self.reflex_runtime()?;
-        crate::m3::hygiene::query_flags(
+        crate::m3::hygiene::report(
             &runtime,
-            &crate::m3::hygiene::HygieneFlagsParams {
-                source_cf: None,
-                source_key_hex: None,
-                min_score: Some(0),
+            &crate::m3::hygiene::HygieneReportParams {
                 limit: Some(limit),
-                cursor: None,
+                ..Default::default()
             },
         )
     }
