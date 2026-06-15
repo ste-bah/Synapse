@@ -65,6 +65,7 @@ mod m2;
 mod m3;
 mod m4;
 mod safety;
+mod secret_crypto;
 mod server;
 mod single_instance;
 mod stdio_eof;
@@ -216,7 +217,12 @@ struct Cli {
     local_agent_log_dir: Option<PathBuf>,
     #[arg(long, env = "SYNAPSE_LOCAL_AGENT_TARGET_JSON", value_name = "JSON")]
     local_agent_target_json: Option<String>,
-    #[arg(long, env = "SYNAPSE_LOCAL_AGENT_MAX_TURNS", default_value_t = 8)]
+    // Computer-use tasks (open an app, take several actions, verify) need many
+    // model turns; 8 was far too few to finish anything beyond a single action.
+    // The per-turn wall-clock `--local-agent-timeout-ms` guard is the real
+    // safety bound, so a generous turn budget is safe. Override per-run with
+    // SYNAPSE_LOCAL_AGENT_MAX_TURNS.
+    #[arg(long, env = "SYNAPSE_LOCAL_AGENT_MAX_TURNS", default_value_t = 40)]
     local_agent_max_turns: u32,
     #[arg(
         long,

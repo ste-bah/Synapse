@@ -1478,6 +1478,10 @@ struct DashboardApiModelRegisterRequest {
     #[serde(default)]
     runtime_preset: crate::m3::local_models::LocalModelRuntimePreset,
     api_key_env_var: String,
+    /// Optional plaintext API key entered by the operator. DPAPI-encrypted at
+    /// rest by the daemon; never stored or returned in plaintext.
+    #[serde(default)]
+    api_key: Option<String>,
     #[serde(default)]
     context_length: Option<u32>,
     #[serde(default)]
@@ -2286,6 +2290,10 @@ fn dashboard_api_model_register_params(
         enabled: true,
         allow_non_loopback: true,
         api_key_env_var: Some(api_key_env_var),
+        // Optional plaintext key entered in the dashboard form. When present it
+        // is DPAPI-encrypted at rest by register_local_model; never persisted in
+        // plaintext and never echoed back.
+        api_key: request.api_key.and_then(|value| trim_optional_non_empty(&value)),
         probe_timeout_ms: request.probe_timeout_ms,
     })
 }
@@ -2598,12 +2606,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-CzYgyrqI.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-4twapC-e.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-BrDFDcar.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-ChJOpVXE.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-CzYgyrqI.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-4twapC-e.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-BrDFDcar.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-ChJOpVXE.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

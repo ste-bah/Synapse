@@ -942,6 +942,7 @@ const deepSeekPresets = {
     model_id: "deepseek-v4-flash",
     runtime_preset: "deepseek_v4_flash_non_thinking",
     api_key_env_var: "DEEPSEEK_API_KEY",
+    api_key: "",
     context_length: "1000000",
     max_tools: "128",
     notes: "DeepSeek V4 Flash non-thinking API agent"
@@ -953,6 +954,7 @@ const deepSeekPresets = {
     model_id: "deepseek-v4-flash",
     runtime_preset: "deepseek_v4_reasoning",
     api_key_env_var: "DEEPSEEK_API_KEY",
+    api_key: "",
     context_length: "1000000",
     max_tools: "128",
     notes: "DeepSeek V4 Flash reasoning API agent"
@@ -995,6 +997,7 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
         model_id: registerForm.model_id,
         runtime_preset: registerForm.runtime_preset,
         api_key_env_var: registerForm.api_key_env_var,
+        api_key: registerForm.api_key.trim() ? registerForm.api_key : undefined,
         context_length: parsePositiveInteger(registerForm.context_length, "context_length"),
         max_tools: parsePositiveInteger(registerForm.max_tools, "max_tools"),
         notes: registerForm.notes,
@@ -1072,6 +1075,18 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
                   id: "env",
                   header: "Key env",
                   cell: ({ row }) => <span className="font-mono">{row.original.api_key_env_var || "none"}</span>
+                },
+                {
+                  id: "key",
+                  header: "API key",
+                  cell: ({ row }) =>
+                    row.original.has_api_key_secret ? (
+                      <span className="font-mono text-success" title="Encrypted API key stored at rest (DPAPI)">🔑 stored</span>
+                    ) : row.original.api_key_env_var ? (
+                      <span className="font-mono text-warning" title="No stored key; resolves from daemon environment">env only</span>
+                    ) : (
+                      <span className="font-mono text-muted">none</span>
+                    )
                 }
               ]}
             />
@@ -1157,6 +1172,15 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
             <TextField label="Model" value={registerForm.model_id} onChange={(value) => setRegisterForm((form) => ({ ...form, model_id: value }))} />
             <TextField label="Base URL" value={registerForm.base_url} onChange={(value) => setRegisterForm((form) => ({ ...form, base_url: value }))} mono />
             <TextField label="Key env" value={registerForm.api_key_env_var} onChange={(value) => setRegisterForm((form) => ({ ...form, api_key_env_var: value }))} mono />
+            <TextField
+              label="API key (stored encrypted)"
+              value={registerForm.api_key}
+              onChange={(value) => setRegisterForm((form) => ({ ...form, api_key: value }))}
+              type="password"
+              autoComplete="off"
+              placeholder="sk-… (encrypted at rest via Windows DPAPI)"
+              mono
+            />
             <TextField label="Context" value={registerForm.context_length} onChange={(value) => setRegisterForm((form) => ({ ...form, context_length: value }))} mono />
             <TextField label="Max tools" value={registerForm.max_tools} onChange={(value) => setRegisterForm((form) => ({ ...form, max_tools: value }))} mono />
           </div>
@@ -1180,18 +1204,27 @@ function TextField({
   label,
   value,
   onChange,
-  mono = false
+  mono = false,
+  type = "text",
+  placeholder,
+  autoComplete
 }: {
   label: string;
   value: string;
   onChange: (value: string) => void;
   mono?: boolean;
+  type?: "text" | "password";
+  placeholder?: string;
+  autoComplete?: string;
 }) {
   return (
     <label className="mt-3 block text-sm text-secondary">
       <span className="mb-1 block text-label font-medium uppercase text-muted">{label}</span>
       <input
         className={`h-10 w-full rounded-md border border-border bg-surface-2 px-3 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring ${mono ? "font-mono" : ""}`}
+        type={type}
+        placeholder={placeholder}
+        autoComplete={autoComplete}
         value={value}
         onChange={(event) => onChange(event.target.value)}
       />

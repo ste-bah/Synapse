@@ -27,7 +27,7 @@ use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, new_reflex_id};
 
-use crate::m3::local_models::{LocalModelApiShape, LocalModelRegistryRow};
+use crate::m3::local_models::{LocalModelApiShape, LocalModelRegistryRow, ResolvedApiKey};
 
 use super::{
     m1_tools::validate_target_window,
@@ -1151,7 +1151,8 @@ impl SynapseService {
         // launched agent has already started burning a turn. Only the value is
         // forwarded into the child process env (never persisted): the process
         // history row records env keys only (m4::launch_process_history_row).
-        if let Some((env_var, value)) = resolve_spawn_local_model_api_key(local_model_row.as_ref())?
+        if let Some((env_var, value)) =
+            resolve_spawn_local_model_api_key(&self.m3_storage()?, local_model_row.as_ref())?
         {
             env.insert(env_var, value);
         }
@@ -2474,29 +2475,63 @@ fn write_agent_spawn_daemon_terminal_artifacts(
 ///   `api_key_env_var` the daemon does not have, so the spawn is refused loudly
 ///   instead of launching an agent that will 401 on its first model call.
 fn resolve_spawn_local_model_api_key(
+    db: &std::sync::Arc<synapse_storage::Db>,
     local_model_row: Option<&LocalModelRegistryRow>,
 ) -> Result<Option<(String, String)>, ErrorData> {
     let Some(row) = local_model_row else {
         return Ok(None);
     };
-    let Some(env_var) = row.api_key_env_var.as_deref() else {
-        return Ok(None);
-    };
-    match std::env::var(env_var) {
-        Ok(value) if !value.trim().is_empty() => Ok(Some((env_var.to_owned(), value))),
-        Ok(_) | Err(_) => Err(local_model_spawn_refusal(
-            error_codes::MODEL_API_KEY_MISSING,
-            "local_model_api_key_missing",
-            "act_spawn_agent local_model refused because the registry row requires an API key env var the daemon does not have set to a non-empty value",
-            json!({
-                "model_ref": row.name,
-                "api_key_env_var": env_var,
-                "remediation": format!(
-                    "start the Synapse daemon with {env_var} present in its environment (e.g. inject it from your secret manager) so spawned agents inherit the credential"
+    // Single resolution point shared with probing: encrypted DPAPI secret store
+    // first, then the daemon process environment, else a loud refusal. Only the
+    // resolved value is forwarded into the child env (never persisted).
+    match crate::m3::local_models::resolve_local_model_api_key(db, row) {
+        Ok(ResolvedApiKey::NotRequired) => Ok(None),
+        Ok(ResolvedApiKey::Resolved {
+            env_var,
+            value,
+            source,
+        }) => {
+            // Audit which credential source authenticated the spawn (never the
+            // value). "dpapi_secret_store" means the encrypted at-rest key was
+            // used; "process_env" means the daemon environment fallback.
+            tracing::info!(
+                model = %row.name,
+                env_var = %env_var,
+                source,
+                "resolved local-model API key for spawn"
+            );
+            Ok(Some((env_var, value)))
+        }
+        Err(error) => {
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            let (refusal_code, reason): (&'static str, &'static str) = match code {
+                Some(error_codes::MODEL_API_KEY_DECRYPT_FAILED) => (
+                    error_codes::MODEL_API_KEY_DECRYPT_FAILED,
+                    "local_model_api_key_decrypt_failed",
                 ),
-                "source_of_truth": "daemon process environment + CF_KV prefix local_model_registry/v1/model/name_hex/",
-            }),
-        )),
+                _ => (
+                    error_codes::MODEL_API_KEY_MISSING,
+                    "local_model_api_key_missing",
+                ),
+            };
+            Err(local_model_spawn_refusal(
+                refusal_code,
+                reason,
+                "act_spawn_agent local_model refused because no API key could be resolved for the model from the encrypted secret store or the daemon environment",
+                json!({
+                    "model_ref": row.name,
+                    "api_key_env_var": row.api_key_env_var,
+                    "resolver_error": error.message,
+                    "resolver_data": error.data,
+                    "remediation": "store the key on this Windows account via the dashboard Add/Edit API Model form or local_model_update { name, api_key }, or set the environment variable before launching the daemon",
+                    "source_of_truth": "DPAPI secret store (CF_KV local_model_secret/v1) + daemon process environment",
+                }),
+            ))
+        }
     }
 }
 
@@ -4386,21 +4421,32 @@ mod tests {
             created_by_session: "session-test".to_owned(),
             updated_by_session: "session-test".to_owned(),
             last_probe: None,
+            has_api_key_secret: false,
         }
+    }
+
+    fn resolver_test_db() -> (tempfile::TempDir, std::sync::Arc<synapse_storage::Db>) {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let db = std::sync::Arc::new(
+            synapse_storage::Db::open(dir.path(), synapse_core::SCHEMA_VERSION)
+                .expect("open temp db"),
+        );
+        (dir, db)
     }
 
     #[test]
     fn resolve_spawn_api_key_none_when_row_absent_or_keyless() {
+        let (_dir, db) = resolver_test_db();
         // Non-local-model spawn: nothing to resolve.
         assert!(
-            resolve_spawn_local_model_api_key(None)
+            resolve_spawn_local_model_api_key(&db, None)
                 .expect("no row resolves cleanly")
                 .is_none()
         );
         // Loopback model with no declared key (e.g. Ollama): nothing to forward.
         let row = test_local_model_row(None);
         assert!(
-            resolve_spawn_local_model_api_key(Some(&row))
+            resolve_spawn_local_model_api_key(&db, Some(&row))
                 .expect("keyless row resolves cleanly")
                 .is_none()
         );
@@ -4408,12 +4454,13 @@ mod tests {
 
     #[test]
     fn resolve_spawn_api_key_forwards_value_when_present() {
+        let (_dir, db) = resolver_test_db();
         // Unique env var name so parallel tests never collide on process env.
         let env_var = "SYNAPSE_TEST_DEEPSEEK_KEY_PRESENT";
         // SAFETY: single-threaded within this test; unique key avoids races.
         unsafe { std::env::set_var(env_var, "sk-secret-value") };
         let row = test_local_model_row(Some(env_var));
-        let resolved = resolve_spawn_local_model_api_key(Some(&row))
+        let resolved = resolve_spawn_local_model_api_key(&db, Some(&row))
             .expect("present key resolves")
             .expect("present key yields a value");
         assert_eq!(resolved.0, env_var);
@@ -4421,31 +4468,56 @@ mod tests {
         unsafe { std::env::remove_var(env_var) };
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn resolve_spawn_api_key_prefers_encrypted_secret_store_over_env() {
+        // FSV: a DPAPI-encrypted stored key takes priority over the process env
+        // and round-trips through CryptProtectData/CryptUnprotectData.
+        let (_dir, db) = resolver_test_db();
+        let env_var = "SYNAPSE_TEST_DEEPSEEK_KEY_PRECEDENCE";
+        unsafe { std::env::set_var(env_var, "env-fallback-value") };
+        let row = test_local_model_row(Some(env_var));
+        crate::m3::local_models::put_model_secret(&db, &row.name, "stored-secret-value", "test")
+            .expect("store secret");
+        let resolved = resolve_spawn_local_model_api_key(&db, Some(&row))
+            .expect("secret resolves")
+            .expect("secret yields a value");
+        assert_eq!(resolved.0, env_var);
+        assert_eq!(
+            resolved.1, "stored-secret-value",
+            "stored secret must win over the env var"
+        );
+        unsafe { std::env::remove_var(env_var) };
+    }
+
     #[test]
     fn resolve_spawn_api_key_refuses_loudly_when_missing() {
+        let (_dir, db) = resolver_test_db();
         let env_var = "SYNAPSE_TEST_DEEPSEEK_KEY_MISSING";
         unsafe { std::env::remove_var(env_var) };
         let row = test_local_model_row(Some(env_var));
-        let err = resolve_spawn_local_model_api_key(Some(&row))
+        let err = resolve_spawn_local_model_api_key(&db, Some(&row))
             .expect_err("missing key must refuse the spawn loudly");
         let data = err.data.expect("refusal carries structured detail");
         assert_eq!(data["code"], error_codes::MODEL_API_KEY_MISSING);
+        assert_eq!(data["reason"], "local_model_api_key_missing");
         assert_eq!(data["detail"]["api_key_env_var"], env_var);
         assert!(
-            data["detail"]["remediation"]
+            data["detail"]["resolver_data"]["api_key_env_var"]
                 .as_str()
                 .unwrap_or_default()
                 .contains(env_var),
-            "remediation names the missing env var"
+            "resolver detail names the missing env var"
         );
     }
 
     #[test]
     fn resolve_spawn_api_key_refuses_when_value_blank() {
+        let (_dir, db) = resolver_test_db();
         let env_var = "SYNAPSE_TEST_DEEPSEEK_KEY_BLANK";
         unsafe { std::env::set_var(env_var, "   ") };
         let row = test_local_model_row(Some(env_var));
-        let err = resolve_spawn_local_model_api_key(Some(&row))
+        let err = resolve_spawn_local_model_api_key(&db, Some(&row))
             .expect_err("blank key is treated as missing");
         let data = err.data.expect("refusal carries structured detail");
         assert_eq!(data["code"], error_codes::MODEL_API_KEY_MISSING);

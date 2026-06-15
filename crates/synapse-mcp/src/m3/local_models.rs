@@ -22,6 +22,10 @@ use super::{
 
 const REGISTRY_PREFIX: &str = "local_model_registry/v1/model/name_hex/";
 const PROBE_EVIDENCE_PREFIX: &str = "local_model_registry/v1/probe/name_hex/";
+/// CF_KV prefix for DPAPI-encrypted API-key secrets, keyed by model name. The
+/// value is ciphertext only — the plaintext key is never persisted.
+const SECRET_PREFIX: &str = "local_model_secret/v1/name_hex/";
+const MAX_API_KEY_CHARS: usize = 8192;
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 1000;
 const MAX_NAME_CHARS: usize = 100;
@@ -82,6 +86,12 @@ pub struct LocalModelRegisterParams {
     pub allow_non_loopback: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env_var: Option<String>,
+    /// Plaintext API key. When present and non-empty it is encrypted with
+    /// Windows DPAPI (CurrentUser) and stored at rest; the plaintext is never
+    /// persisted or echoed back. Requires `api_key_env_var` to name the
+    /// environment variable the key is injected under at spawn/probe time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 120000))]
     pub probe_timeout_ms: Option<u64>,
@@ -135,6 +145,13 @@ pub struct LocalModelUpdateParams {
     pub api_key_env_var: Option<String>,
     #[serde(default)]
     pub clear_api_key_env_var: bool,
+    /// Plaintext API key to (re)store, DPAPI-encrypted at rest. Empty/whitespace
+    /// is rejected; use `clear_api_key` to remove a stored secret instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Delete the stored encrypted API key for this model.
+    #[serde(default)]
+    pub clear_api_key: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 120000))]
     pub probe_timeout_ms: Option<u64>,
@@ -177,6 +194,12 @@ pub struct LocalModelRegistryRow {
     pub created_by_session: String,
     pub updated_by_session: String,
     pub last_probe: Option<LocalModelProbeReport>,
+    /// Whether an encrypted API key is stored for this model in the DPAPI
+    /// secret store. Computed at read time from the secret CF_KV rows — the
+    /// secret store is the source of truth, not this persisted snapshot (the
+    /// stored row always serializes `false`). Never carries the key itself.
+    #[serde(default)]
+    pub has_api_key_secret: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -360,11 +383,27 @@ pub async fn register_local_model(
         created_by_session: by_session.to_owned(),
         updated_by_session: by_session.to_owned(),
         last_probe: None,
+        has_api_key_secret: false,
     };
 
-    let probe = probe_row(&row, params.probe_timeout_ms).await;
+    // Persist the encrypted key (if supplied) BEFORE probing so the probe
+    // authenticates with the real credential. On probe failure we remove the
+    // orphan secret so a rejected registration leaves no stored key behind.
+    if let Some(api_key) = params.api_key.as_deref() {
+        if row.api_key_env_var.is_none() {
+            return Err(invalid(
+                "api_key requires api_key_env_var to name the environment variable the key is injected under at spawn/probe time",
+            ));
+        }
+        put_model_secret(db, &row.name, api_key, by_session)?;
+    }
+
+    let probe = probe_row(db, &row, params.probe_timeout_ms).await;
     row.last_probe = Some(probe.clone());
     if !probe.healthy {
+        if params.api_key.is_some() {
+            let _ = delete_model_secret(db, &row.name);
+        }
         let evidence = write_probe_evidence(db, &row, &probe, "register_rejected", by_session)?;
         return Err(probe_error_with_evidence(&probe, Some(&evidence)));
     }
@@ -373,6 +412,7 @@ pub async fn register_local_model(
     db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
         .map_err(storage_error)?;
     let storage_readback = readback_exact_row(db, &row_key)?;
+    row.has_api_key_secret = model_secret_present(db, &row.name)?;
     Ok(LocalModelRegisterResponse {
         row,
         probe,
@@ -406,11 +446,14 @@ pub fn list_local_models(
     };
 
     let scanned_rows = rows.len() + corrupt_rows.len();
-    let rows = rows
+    let mut rows = rows
         .into_iter()
         .filter(|row| params.include_disabled || row.enabled)
         .take(params.limit)
         .collect::<Vec<_>>();
+    for row in &mut rows {
+        row.has_api_key_secret = model_secret_present(db, &row.name)?;
+    }
     Ok(LocalModelListResponse {
         schema_version: SCHEMA_VERSION,
         source_of_truth: format!("{} prefix {REGISTRY_PREFIX}", cf::CF_KV),
@@ -497,10 +540,69 @@ pub async fn update_local_model(
     row.updated_at_unix_ms = unix_time_ms_now();
     row.updated_by_session = by_session.to_owned();
 
+    // Secret-store mutation. The secret is keyed by model name, so a rename
+    // carries it to the new key. We snapshot the affected secret rows so a
+    // failed probe can be rolled back to leave no partial credential state.
+    let old_name = before_row.name.clone();
+    let new_name = row.name.clone();
+    let old_secret_key = secret_row_key(&old_name)?;
+    let new_secret_key = secret_row_key(&new_name)?;
+    let snap_old = scan_exact_row(db, &old_secret_key)?.map(|(_, value)| value);
+    let snap_new = if new_secret_key == old_secret_key {
+        snap_old.clone()
+    } else {
+        scan_exact_row(db, &new_secret_key)?.map(|(_, value)| value)
+    };
+
+    if params.api_key.is_some() && params.clear_api_key {
+        return Err(invalid(
+            "api_key and clear_api_key are mutually exclusive",
+        ));
+    }
+    if params.api_key.is_some() && row.api_key_env_var.is_none() {
+        return Err(invalid(
+            "api_key requires api_key_env_var to name the environment variable the key is injected under",
+        ));
+    }
+    let mut secret_mutated = false;
+    if params.clear_api_key {
+        delete_model_secret(db, &old_name)?;
+        if new_secret_key != old_secret_key {
+            delete_model_secret(db, &new_name)?;
+        }
+        secret_mutated = true;
+        probe_required = true;
+    } else if let Some(api_key) = params.api_key.as_deref() {
+        put_model_secret(db, &new_name, api_key, by_session)?;
+        if new_secret_key != old_secret_key {
+            delete_model_secret(db, &old_name)?;
+        }
+        secret_mutated = true;
+        probe_required = true;
+    } else if new_secret_key != old_secret_key {
+        // Pure rename: move any existing secret to the new name key.
+        if let Some(secret) = read_model_secret(db, &old_name)? {
+            put_model_secret(db, &new_name, &secret, by_session)?;
+            delete_model_secret(db, &old_name)?;
+            secret_mutated = true;
+        }
+    }
+
+    let rollback_secret = |db: &Arc<Db>| -> Result<(), ErrorData> {
+        if secret_mutated {
+            restore_secret_raw(db, &old_secret_key, snap_old.clone())?;
+            if new_secret_key != old_secret_key {
+                restore_secret_raw(db, &new_secret_key, snap_new.clone())?;
+            }
+        }
+        Ok(())
+    };
+
     let probe = if probe_required {
-        let probe = probe_row(&row, params.probe_timeout_ms).await;
+        let probe = probe_row(db, &row, params.probe_timeout_ms).await;
         row.last_probe = Some(probe.clone());
         if !probe.healthy {
+            rollback_secret(db)?;
             let evidence = write_probe_evidence(db, &row, &probe, "update_rejected", by_session)?;
             return Err(probe_error_with_evidence(&probe, Some(&evidence)));
         }
@@ -515,13 +617,18 @@ pub async fn update_local_model(
     } else {
         vec![old_row_key.as_bytes().to_vec()]
     };
-    db.mutate_batch_pressure_bypass(
+    if let Err(error) = db.mutate_batch_pressure_bypass(
         cf::CF_KV,
         deletes,
         [(row.row_key.as_bytes().to_vec(), encoded)],
-    )
-    .map_err(storage_error)?;
+    ) {
+        // The row write failed after the secret store was already mutated; undo
+        // the secret change so the two stay consistent.
+        rollback_secret(db)?;
+        return Err(storage_error(error));
+    }
     let storage_readback = readback_exact_row(db, &row.row_key)?;
+    row.has_api_key_secret = model_secret_present(db, &row.name)?;
     Ok(LocalModelUpdateResponse {
         before_row,
         row,
@@ -540,6 +647,9 @@ pub fn remove_local_model(
     let removed_readback = readback_exact_row(db, &row_key)?;
     db.delete_batch(cf::CF_KV, [row_key.as_bytes().to_vec()])
         .map_err(storage_error)?;
+    // Remove any stored encrypted API key so a removed model leaves no orphan
+    // credential at rest.
+    delete_model_secret(db, &params.name)?;
     let after_row_present = scan_exact_row(db, &row_key)?.is_some();
     Ok(LocalModelRemoveResponse {
         removed_row,
@@ -556,7 +666,7 @@ pub async fn probe_local_model(
     validate_probe_params(params)?;
     let row_key = registry_row_key(&params.name)?;
     let mut row = read_model_row_required(db, &row_key)?;
-    let probe = probe_row(&row, params.timeout_ms).await;
+    let probe = probe_row(db, &row, params.timeout_ms).await;
     row.last_probe = Some(probe.clone());
     row.updated_at_unix_ms = unix_time_ms_now();
     row.updated_by_session = by_session.to_owned();
@@ -564,6 +674,7 @@ pub async fn probe_local_model(
     db.put_batch_pressure_bypass(cf::CF_KV, [(row.row_key.as_bytes().to_vec(), encoded)])
         .map_err(storage_error)?;
     let storage_readback = readback_exact_row(db, &row.row_key)?;
+    row.has_api_key_secret = model_secret_present(db, &row.name)?;
     Ok(LocalModelProbeResponse {
         row,
         probe,
@@ -572,11 +683,213 @@ pub async fn probe_local_model(
 }
 
 pub fn local_model_snapshot(db: &Arc<Db>) -> Result<Vec<LocalModelRegistryRow>, ErrorData> {
-    let (rows, _corrupt_rows) = scan_model_rows(db)?;
+    let (mut rows, _corrupt_rows) = scan_model_rows(db)?;
+    for row in &mut rows {
+        row.has_api_key_secret = model_secret_present(db, &row.name)?;
+    }
     Ok(rows)
 }
 
-async fn probe_row(row: &LocalModelRegistryRow, timeout_ms: Option<u64>) -> LocalModelProbeReport {
+/// CF_KV row holding the DPAPI-encrypted API key for one model. The ciphertext
+/// is opaque and bound to the current Windows user; the plaintext never lands
+/// here.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LocalModelSecretRow {
+    schema_version: u32,
+    row_key: String,
+    name: String,
+    /// Hex-encoded DPAPI (CurrentUser) ciphertext of the API key.
+    ciphertext_hex: String,
+    created_at_unix_ms: u64,
+    updated_at_unix_ms: u64,
+    updated_by_session: String,
+}
+
+/// How an API key was resolved for a probe or spawn.
+pub enum ResolvedApiKey {
+    /// The model has no `api_key_env_var`; no bearer auth is used.
+    NotRequired,
+    /// A non-empty key was found. `source` records where (audit-friendly).
+    Resolved {
+        env_var: String,
+        value: String,
+        source: &'static str,
+    },
+}
+
+fn secret_row_key(name: &str) -> Result<String, ErrorData> {
+    let name = normalize_name(name)?;
+    Ok(format!("{SECRET_PREFIX}{}", hex_lower(name.as_bytes())))
+}
+
+fn read_secret_row_optional(
+    db: &Arc<Db>,
+    row_key: &str,
+) -> Result<Option<LocalModelSecretRow>, ErrorData> {
+    match scan_exact_row(db, row_key)? {
+        Some((_key, value)) => serde_json::from_slice(&value)
+            .map(Some)
+            .map_err(|error| invalid(format!("decode local model secret row failed: {error}"))),
+        None => Ok(None),
+    }
+}
+
+/// Returns whether an encrypted API key is stored for `name` without decrypting
+/// it. Used to surface `has_api_key_secret` to the dashboard.
+pub fn model_secret_present(db: &Arc<Db>, name: &str) -> Result<bool, ErrorData> {
+    Ok(read_secret_row_optional(db, &secret_row_key(name)?)?.is_some())
+}
+
+/// Restores a secret row to an exact prior state (the raw stored bytes, or
+/// absent). Used to roll back the secret store if an update's probe fails after
+/// the secret was already mutated, so a rejected update leaves no partial state.
+fn restore_secret_raw(
+    db: &Arc<Db>,
+    row_key: &str,
+    snapshot: Option<Vec<u8>>,
+) -> Result<(), ErrorData> {
+    match snapshot {
+        Some(bytes) => db
+            .put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), bytes)])
+            .map_err(storage_error)?,
+        None => db
+            .delete_batch(cf::CF_KV, [row_key.as_bytes().to_vec()])
+            .map_err(storage_error)?,
+    }
+    db.flush().map_err(storage_error)
+}
+
+/// Encrypts `plaintext` with DPAPI and stores it keyed by model name,
+/// overwriting any prior secret. Flushes so the credential is durable before
+/// returning (read-after-write correctness for an immediate spawn/probe).
+pub fn put_model_secret(
+    db: &Arc<Db>,
+    name: &str,
+    plaintext: &str,
+    by_session: &str,
+) -> Result<(), ErrorData> {
+    let trimmed = plaintext.trim();
+    if trimmed.is_empty() {
+        return Err(invalid("api_key must not be empty or whitespace"));
+    }
+    if plaintext.chars().count() > MAX_API_KEY_CHARS {
+        return Err(invalid(format!(
+            "api_key exceeds {MAX_API_KEY_CHARS} characters"
+        )));
+    }
+    let row_key = secret_row_key(name)?;
+    let ciphertext = crate::secret_crypto::protect(plaintext.as_bytes()).map_err(|error| {
+        model_registry_error(
+            error_codes::MODEL_API_KEY_STORE_FAILED,
+            format!("failed to DPAPI-encrypt API key for {name:?}: {error}"),
+            json!({ "model": name }),
+        )
+    })?;
+    let now = unix_time_ms_now();
+    let created_at_unix_ms = read_secret_row_optional(db, &row_key)?
+        .map_or(now, |existing| existing.created_at_unix_ms);
+    let row = LocalModelSecretRow {
+        schema_version: SCHEMA_VERSION,
+        row_key: row_key.clone(),
+        name: normalize_name(name)?,
+        ciphertext_hex: hex_lower(&ciphertext),
+        created_at_unix_ms,
+        updated_at_unix_ms: now,
+        updated_by_session: by_session.to_owned(),
+    };
+    let encoded = encode_json_row(&row)?;
+    db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
+        .map_err(storage_error)?;
+    db.flush().map_err(storage_error)?;
+    Ok(())
+}
+
+/// Deletes the stored encrypted API key for `name`. Returns whether a secret
+/// was present. Flushes so the deletion is durable.
+pub fn delete_model_secret(db: &Arc<Db>, name: &str) -> Result<bool, ErrorData> {
+    let row_key = secret_row_key(name)?;
+    let present = read_secret_row_optional(db, &row_key)?.is_some();
+    if present {
+        db.delete_batch(cf::CF_KV, [row_key.as_bytes().to_vec()])
+            .map_err(storage_error)?;
+        db.flush().map_err(storage_error)?;
+    }
+    Ok(present)
+}
+
+/// Decrypts and returns the stored API key for `name`, or `None` if no secret
+/// is stored. A decrypt failure is surfaced loudly (wrong user / copied DB /
+/// tampered bytes), never swallowed.
+pub fn read_model_secret(db: &Arc<Db>, name: &str) -> Result<Option<String>, ErrorData> {
+    let Some(row) = read_secret_row_optional(db, &secret_row_key(name)?)? else {
+        return Ok(None);
+    };
+    let ciphertext = hex_decode(&row.ciphertext_hex)?;
+    let plaintext = crate::secret_crypto::unprotect(&ciphertext).map_err(|error| {
+        model_registry_error(
+            error_codes::MODEL_API_KEY_DECRYPT_FAILED,
+            format!("failed to DPAPI-decrypt stored API key for {name:?}: {error}"),
+            json!({
+                "model": name,
+                "remediation": "re-enter the API key on this Windows user account; DPAPI ciphertext is bound to the user that stored it and cannot move between accounts or machines",
+            }),
+        )
+    })?;
+    let value = String::from_utf8(plaintext)
+        .map_err(|error| invalid(format!("decrypted API key was not valid UTF-8: {error}")))?;
+    Ok(Some(value))
+}
+
+/// Resolves the API key for `row`: the encrypted secret store first, then the
+/// process environment, else a loud `MODEL_API_KEY_MISSING` naming both sources
+/// checked. This is the single resolution point shared by probe and spawn.
+pub fn resolve_local_model_api_key(
+    db: &Arc<Db>,
+    row: &LocalModelRegistryRow,
+) -> Result<ResolvedApiKey, ErrorData> {
+    let Some(env_var) = row.api_key_env_var.as_deref() else {
+        return Ok(ResolvedApiKey::NotRequired);
+    };
+    if let Some(secret) = read_model_secret(db, &row.name)? {
+        if !secret.trim().is_empty() {
+            return Ok(ResolvedApiKey::Resolved {
+                env_var: env_var.to_owned(),
+                value: secret,
+                source: "dpapi_secret_store",
+            });
+        }
+    }
+    if let Ok(value) = std::env::var(env_var) {
+        if !value.trim().is_empty() {
+            return Ok(ResolvedApiKey::Resolved {
+                env_var: env_var.to_owned(),
+                value,
+                source: "process_env",
+            });
+        }
+    }
+    Err(model_registry_error(
+        error_codes::MODEL_API_KEY_MISSING,
+        format!(
+            "no API key available for local model {:?}: neither the encrypted secret store nor the process environment variable {env_var:?} held a non-empty value",
+            row.name
+        ),
+        json!({
+            "model": row.name,
+            "api_key_env_var": env_var,
+            "sources_checked": ["dpapi_secret_store", "process_env"],
+            "remediation": "store a key via local_model_update { name, api_key } or the dashboard Add/Edit API Model form, or set the environment variable before launching the daemon",
+            "source_of_truth": cf::CF_KV,
+        }),
+    ))
+}
+
+async fn probe_row(
+    db: &Arc<Db>,
+    row: &LocalModelRegistryRow,
+    timeout_ms: Option<u64>,
+) -> LocalModelProbeReport {
     let observed_at_unix_ms = unix_time_ms_now();
     let started = std::time::Instant::now();
     let endpoint = match chat_completions_endpoint(row) {
@@ -626,21 +939,31 @@ async fn probe_row(row: &LocalModelRegistryRow, timeout_ms: Option<u64>) -> Loca
     let mut body = probe_request(&row.model_id, &nonce);
     apply_runtime_preset(row, &mut body);
     let mut request = client.post(endpoint.clone()).json(&body);
-    if let Some(env_var) = row.api_key_env_var.as_deref() {
-        match std::env::var(env_var) {
-            Ok(token) if !token.trim().is_empty() => {
-                request = request.bearer_auth(token);
-            }
-            Ok(_) | Err(_) => {
-                return probe_report_error(
-                    observed_at_unix_ms,
-                    endpoint.as_str(),
-                    started.elapsed(),
-                    error_codes::MODEL_API_KEY_MISSING,
-                    format!("api_key_env_var {env_var:?} is not set to a non-empty value"),
-                    None,
-                );
-            }
+    match resolve_local_model_api_key(db, row) {
+        Ok(ResolvedApiKey::NotRequired) => {}
+        Ok(ResolvedApiKey::Resolved { value, .. }) => {
+            request = request.bearer_auth(value);
+        }
+        Err(error) => {
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            let code = match code {
+                Some(error_codes::MODEL_API_KEY_DECRYPT_FAILED) => {
+                    error_codes::MODEL_API_KEY_DECRYPT_FAILED
+                }
+                _ => error_codes::MODEL_API_KEY_MISSING,
+            };
+            return probe_report_error(
+                observed_at_unix_ms,
+                endpoint.as_str(),
+                started.elapsed(),
+                code,
+                error.message.to_string(),
+                None,
+            );
         }
     }
     request = request.header(header::ACCEPT, "application/json");
@@ -1354,6 +1677,19 @@ fn hex_lower(value: &[u8]) -> String {
     value.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn hex_decode(value: &str) -> Result<Vec<u8>, ErrorData> {
+    if !value.len().is_multiple_of(2) {
+        return Err(invalid("stored ciphertext hex has an odd length"));
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&value[index..index + 2], 16)
+                .map_err(|error| invalid(format!("stored ciphertext hex is invalid: {error}")))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1442,6 +1778,7 @@ mod tests {
             created_by_session: "test".to_owned(),
             updated_by_session: "test".to_owned(),
             last_probe: None,
+            has_api_key_secret: false,
         })
     }
 
@@ -1517,9 +1854,11 @@ mod tests {
             created_by_session: "test".to_owned(),
             updated_by_session: "test".to_owned(),
             last_probe: None,
+            has_api_key_secret: false,
         };
+        let (_dir, db) = temp_db()?;
         println!("readback=local_model_probe_missing_key before=env:{env_var}:missing");
-        let probe = probe_row(&row, Some(1000)).await;
+        let probe = probe_row(&db, &row, Some(1000)).await;
         println!(
             "readback=local_model_probe_missing_key after=healthy:{} code:{:?} detail:{:?}",
             probe.healthy, probe.error_code, probe.error_detail
@@ -1553,7 +1892,8 @@ mod tests {
             "readback=local_model_tool_env_probe before=endpoint:{} model:{}",
             row.base_url, row.model_id
         );
-        let probe = probe_row(&row, Some(timeout_ms)).await;
+        let (_dir, db) = temp_db().expect("temp db");
+        let probe = probe_row(&db, &row, Some(timeout_ms)).await;
         println!(
             "readback=local_model_tool_env_probe after=healthy:{} code:{:?} detail:{:?}",
             probe.healthy, probe.error_code, probe.error_detail
@@ -1577,7 +1917,8 @@ mod tests {
             "readback=local_model_non_tool_env_probe before=endpoint:{} model:{}",
             row.base_url, row.model_id
         );
-        let probe = probe_row(&row, Some(timeout_ms)).await;
+        let (_dir, db) = temp_db().expect("temp db");
+        let probe = probe_row(&db, &row, Some(timeout_ms)).await;
         println!(
             "readback=local_model_non_tool_env_probe after=healthy:{} code:{:?} detail:{:?}",
             probe.healthy, probe.error_code, probe.error_detail
@@ -1626,6 +1967,7 @@ mod tests {
                 },
                 &healthy_response("nonce"),
             )),
+            has_api_key_secret: false,
         };
         let encoded = encode_json_row(&row)?;
         db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])?;
@@ -1659,6 +2001,45 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn api_key_secret_round_trips_and_is_ciphertext_at_rest() -> anyhow::Result<()> {
+        // FSV: the plaintext key must never appear in the stored CF_KV bytes,
+        // yet read_model_secret must recover it exactly, and model_secret_present
+        // must reflect existence. Source of truth = the raw CF_KV secret row.
+        let (_dir, db) = temp_db()?;
+        let model = "deepseek-secret-fsv";
+        let plaintext = "sk-deepseek-FSV-PLAINTEXT-should-not-persist-9f8e7d";
+
+        assert!(!model_secret_present(&db, model)?, "no secret before store");
+        put_model_secret(&db, model, plaintext, "session-fsv")?;
+        assert!(model_secret_present(&db, model)?, "secret present after store");
+
+        // Inspect the physical stored bytes: plaintext must be absent.
+        let row_key = secret_row_key(model)?;
+        let (_key, stored) = scan_exact_row(&db, &row_key)?.expect("secret row physically present");
+        let stored_str = String::from_utf8_lossy(&stored);
+        println!(
+            "readback=api_key_secret stored_bytes={} contains_plaintext={}",
+            stored.len(),
+            stored_str.contains(plaintext)
+        );
+        assert!(
+            !stored_str.contains(plaintext),
+            "plaintext API key must never be persisted in CF_KV"
+        );
+
+        // Decrypt round-trip recovers the exact key.
+        let recovered = read_model_secret(&db, model)?.expect("secret decrypts");
+        assert_eq!(recovered, plaintext, "decrypted key matches original");
+
+        // Delete removes it.
+        assert!(delete_model_secret(&db, model)?, "delete reports present");
+        assert!(!model_secret_present(&db, model)?, "secret gone after delete");
+        assert!(read_model_secret(&db, model)?.is_none(), "no key after delete");
+        Ok(())
+    }
+
     #[test]
     fn registry_validates_loopback_and_name_edges() {
         let blank = registry_row_key("   ");
@@ -1687,6 +2068,7 @@ mod tests {
             created_by_session: "test".to_owned(),
             updated_by_session: "test".to_owned(),
             last_probe: None,
+            has_api_key_secret: false,
         };
         let remote = chat_completions_endpoint(&row);
         println!("readback=local_model_registry_remote after={remote:?}");

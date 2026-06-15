@@ -175,6 +175,8 @@ export interface ModelRow {
   api_key_env_var?: string | null;
   context_length?: number | null;
   max_tools?: number | null;
+  /** Whether an encrypted API key is stored at rest for this model. */
+  has_api_key_secret?: boolean;
   last_probe?: { healthy?: boolean; status?: string; latency_ms?: number } | null;
 }
 
@@ -184,6 +186,8 @@ export interface RegisterApiModelRequest {
   model_id: string;
   runtime_preset: string;
   api_key_env_var: string;
+  /** Plaintext API key; encrypted at rest (DPAPI) by the daemon. Never stored or returned in plaintext. */
+  api_key?: string;
   context_length?: number;
   max_tools?: number;
   notes?: string;

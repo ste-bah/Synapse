@@ -16,7 +16,7 @@ use rmcp::{
         CallToolRequestParams, ClientCapabilities, ClientInfo, Content, Implementation, JsonObject,
         Tool,
     },
-    service::RunningService,
+    service::{RunningService, ServiceError},
     transport::streamable_http_client::{
         StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
     },
@@ -144,6 +144,7 @@ struct Runner {
     turn_count: u32,
     tool_call_count: u64,
     parse_error_count: u32,
+    tool_call_error_count: u32,
     truncated_context_count: u32,
     http: reqwest::Client,
 }
@@ -359,6 +360,7 @@ impl Runner {
             turn_count: 0,
             tool_call_count: 0,
             parse_error_count: 0,
+            tool_call_error_count: 0,
             truncated_context_count: 0,
             http,
         };
@@ -579,12 +581,36 @@ impl Runner {
         {
             Ok(result) => result,
             Err(error) => {
+                // A single failed tool call MUST NOT crash the agent. The
+                // canonical tool-calling reliability pattern is to feed the
+                // error back to the model as a tool result so it can
+                // self-correct (retry with fixed arguments, pick a different
+                // tool, or explain the limitation). Only a genuinely dead
+                // transport is terminal. Crashing here previously killed agents
+                // on the first recoverable error (e.g. a missing required
+                // parameter), tearing down any process the agent had launched.
+                let fatal = tool_call_error_is_terminal(&error);
                 let detail = format!("SYNAPSE_TOOL_CALL_FAILED: {tool_name}: {error}");
+                self.tool_call_error_count = self.tool_call_error_count.saturating_add(1);
+                // Structured, actionable feedback for the model (not a bare
+                // exception string): names the tool, the failure, and the next
+                // step the model should take.
+                let model_feedback = json!({
+                    "error": "SYNAPSE_TOOL_CALL_FAILED",
+                    "tool": tool_name,
+                    "message": error.to_string(),
+                    "recoverable": !fatal,
+                    "suggestion": if fatal {
+                        "The connection to the Synapse tool server was lost; the run is ending."
+                    } else {
+                        "The tool call failed. Read the message, re-check the tool's input schema with synapse_tool_catalog, then retry with corrected arguments or choose a different tool."
+                    },
+                });
                 let result_value = json!({ "error": detail });
                 self.messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call.id,
-                    "content": detail,
+                    "content": model_feedback.to_string(),
                 }));
                 self.write_line(json!({
                     "type": "local.tool_call.finished",
@@ -596,6 +622,7 @@ impl Runner {
                     "tool_call_id": call.id,
                     "status": "error",
                     "error_code": "SYNAPSE_TOOL_CALL_FAILED",
+                    "terminal": fatal,
                     "result": result_value,
                     "tool_exposure": self.tool_exposure.as_str(),
                 }))?;
@@ -614,7 +641,14 @@ impl Runner {
                     "tool_exposure": self.tool_exposure.as_str(),
                 }))
                 .await?;
-                bail!("{detail}");
+                if fatal {
+                    // Transport is gone: every further call would fail the same
+                    // way. Fail loudly with the exact cause.
+                    bail!("{detail}");
+                }
+                // Recoverable: the model now has the error in context and the
+                // loop continues. The overall run stays bounded by max_turns.
+                return Ok(());
             }
         };
         let is_error = result.is_error.unwrap_or(false);
@@ -985,6 +1019,7 @@ impl Runner {
                 "turn_count": self.turn_count,
                 "tool_call_count": self.tool_call_count,
                 "parse_error_count": self.parse_error_count,
+                "tool_call_error_count": self.tool_call_error_count,
                 "truncated_context_count": self.truncated_context_count,
                 "usage": self.total_usage,
                 "completed_at_unix_ms": unix_time_ms_now(),
@@ -1026,6 +1061,7 @@ impl Runner {
                 "turn_count": self.turn_count,
                 "tool_call_count": self.tool_call_count,
                 "parse_error_count": self.parse_error_count,
+                "tool_call_error_count": self.tool_call_error_count,
                 "truncated_context_count": self.truncated_context_count,
                 "usage": self.total_usage,
                 "completed_at_unix_ms": unix_time_ms_now(),
@@ -1189,6 +1225,20 @@ fn resolve_tool_exposure(row: &LocalModelRegistryRow, tool_count: usize) -> Tool
         Some(max_tools) if tool_count > max_tools => ToolExposure::Routed,
         _ => ToolExposure::Direct,
     }
+}
+
+/// Classifies an rmcp `call_tool` failure as terminal (the transport is gone,
+/// so every subsequent call would fail identically) versus recoverable (the
+/// server responded with an error, timed out, or returned an unexpected shape —
+/// the model can be told and can try again). A recoverable error is fed back to
+/// the model instead of crashing the agent.
+fn tool_call_error_is_terminal(error: &ServiceError) -> bool {
+    matches!(
+        error,
+        ServiceError::TransportClosed
+            | ServiceError::TransportSend(_)
+            | ServiceError::Cancelled { .. }
+    )
 }
 
 fn parse_routed_tool_call(raw: &str) -> anyhow::Result<(String, JsonObject)> {
@@ -1769,6 +1819,39 @@ mod tests {
             shutdown_message_from_tool_result("agent_wait", &result),
             None
         );
+    }
+
+    #[test]
+    fn tool_call_server_error_is_recoverable_not_terminal() {
+        // The paint-death case: gemma called capture_screenshot without the
+        // required `path`, so the server answered with a JSON-RPC error
+        // (-32099 / invalid params). That is an McpError — the transport is
+        // fine and the model can be told and retry. It MUST NOT be terminal.
+        let server_error = ServiceError::McpError(rmcp::model::ErrorData::invalid_params(
+            "missing field `path`",
+            None,
+        ));
+        assert!(
+            !tool_call_error_is_terminal(&server_error),
+            "a server-side invalid-params error is recoverable; the agent must feed it back and continue"
+        );
+
+        // Timeouts and unexpected responses are also recoverable retries.
+        assert!(!tool_call_error_is_terminal(&ServiceError::Timeout {
+            timeout: std::time::Duration::from_millis(1),
+        }));
+        assert!(!tool_call_error_is_terminal(
+            &ServiceError::UnexpectedResponse
+        ));
+    }
+
+    #[test]
+    fn tool_call_transport_loss_is_terminal() {
+        // A dead pipe cannot recover; every further call would fail identically.
+        assert!(tool_call_error_is_terminal(&ServiceError::TransportClosed));
+        assert!(tool_call_error_is_terminal(&ServiceError::Cancelled {
+            reason: Some("peer gone".to_owned()),
+        }));
     }
 
     #[test]
