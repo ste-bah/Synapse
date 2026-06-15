@@ -73,6 +73,31 @@ export interface DashboardAuthStatus {
   source_of_truth: string;
 }
 
+export interface DashboardSavedView {
+  schema_version: number;
+  view_id: string;
+  row_key: string;
+  name: string;
+  route: string;
+  filters: Record<string, unknown>;
+  created_unix_ms: number;
+  updated_unix_ms: number;
+}
+
+export interface DashboardSavedViewsResponse {
+  ok: boolean;
+  source_of_truth: string;
+  views: DashboardSavedView[];
+  corrupt_row_count: number;
+}
+
+export interface SaveDashboardViewRequest {
+  view_id?: string;
+  name: string;
+  route: string;
+  filters: Record<string, unknown>;
+}
+
 let csrfToken: string | null = null;
 
 export function dashboardCsrfToken() {
@@ -204,6 +229,54 @@ export async function fetchModels(): Promise<ModelRow[]> {
   const body = await readJsonOrThrow(response);
   const list = (body.list ?? {}) as { rows?: ModelRow[] };
   return list.rows ?? [];
+}
+
+export async function fetchSavedViews(): Promise<DashboardSavedViewsResponse> {
+  const response = await fetch("/dashboard/saved-views", {
+    cache: "no-store",
+    credentials: "same-origin"
+  });
+  const body = await readJsonOrThrow(response);
+  return {
+    ok: body.ok === true,
+    source_of_truth: rawText(body.source_of_truth),
+    views: asArray<DashboardSavedView>(body.views),
+    corrupt_row_count: Number(body.corrupt_row_count || 0)
+  };
+}
+
+export async function saveDashboardView(
+  request: SaveDashboardViewRequest
+): Promise<{ ok: boolean; row_key: string; source_of_truth: string; view: DashboardSavedView }> {
+  const response = await fetch("/dashboard/saved-views", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: csrfHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return {
+    ok: body.ok === true,
+    row_key: rawText(body.row_key),
+    source_of_truth: rawText(body.source_of_truth),
+    view: body.view as DashboardSavedView
+  };
+}
+
+export async function deleteDashboardView(viewId: string): Promise<{ ok: boolean; deleted_row_key: string; source_of_truth: string }> {
+  const response = await fetch(`/dashboard/saved-views/${encodeURIComponent(viewId)}`, {
+    method: "DELETE",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: csrfHeaders()
+  });
+  const body = await readJsonOrThrow(response);
+  return {
+    ok: body.ok === true,
+    deleted_row_key: rawText(body.deleted_row_key),
+    source_of_truth: rawText(body.source_of_truth)
+  };
 }
 
 export async function registerApiModel(

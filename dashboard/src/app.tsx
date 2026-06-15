@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip as ChartTooltip, XAxis, YAxis } from "recharts";
 import {
+  BarChart3,
   Bell,
   CheckCircle2,
+  ClipboardList,
+  Command,
   Gauge,
-  LayoutDashboard,
   LogIn,
   LogOut,
   Moon,
@@ -13,9 +15,19 @@ import {
   RefreshCw,
   Rocket,
   Rows3,
+  Save,
+  Search,
+  ServerCog,
+  ShieldCheck,
   Sun,
-  TerminalSquare
+  Trash2,
+  UserRound,
+  X,
+  type LucideIcon
 } from "lucide-react";
+import commandMarkUrl from "@/assets/synapse-command-mark.png";
+import emptyStateUrl from "@/assets/synapse-empty-state.webp";
+import statusIconsUrl from "@/assets/synapse-status-icons.webp";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -37,31 +49,62 @@ import {
 import {
   buildAgents,
   buildToolCalls,
+  deleteDashboardView,
   fetchDashboardAuthStatus,
   fetchDashboardState,
   fetchModels,
+  fetchSavedViews,
   loginDashboard,
   logoutDashboard,
   panelData,
   registerApiModel,
+  saveDashboardView,
   spawnLocalModelAgent,
   type AgentSummary,
   type DashboardAuthStatus,
   type DashboardRouteReadback,
+  type DashboardSavedView,
   type DashboardState,
   type FleetStatus,
   type ModelRow
 } from "@/lib/dashboard-state";
-import { asArray, asRecord, nsToTime, rawText, timeAgo, unixMsToTime } from "@/lib/utils";
-import { useUiStore } from "@/store/ui-store";
+import { asArray, asRecord, cn, rawText, timeAgo, unixMsToTime } from "@/lib/utils";
+import { useUiStore, type DashboardRouteId, type Density, type Theme } from "@/store/ui-store";
+
+type RouteDefinition = {
+  id: DashboardRouteId;
+  label: string;
+  title: string;
+  icon: LucideIcon;
+};
+
+const routeDefinitions: RouteDefinition[] = [
+  { id: "fleet", label: "Fleet", title: "Fleet Overview", icon: Gauge },
+  { id: "agent", label: "Agent", title: "Agent Detail", icon: UserRound },
+  { id: "tasks", label: "Tasks", title: "Task Board", icon: ClipboardList },
+  { id: "approvals", label: "Approvals", title: "Approvals Inbox", icon: CheckCircle2 },
+  { id: "analytics", label: "Analytics", title: "Cost & Token Analytics", icon: BarChart3 },
+  { id: "timeline", label: "Timeline", title: "Timeline", icon: Rows3 },
+  { id: "system", label: "System", title: "System Status", icon: ServerCog },
+  { id: "audit", label: "Audit", title: "Audit Explorer", icon: ShieldCheck }
+];
 
 export function App() {
   const density = useUiStore((state) => state.density);
   const setDensity = useUiStore((state) => state.setDensity);
   const theme = useUiStore((state) => state.theme);
   const setTheme = useUiStore((state) => state.setTheme);
+  const route = useUiStore((state) => state.route);
+  const setRoute = useUiStore((state) => state.setRoute);
+  const savedViewId = useUiStore((state) => state.savedViewId);
+  const setSavedViewId = useUiStore((state) => state.setSavedViewId);
   const selectedAgentId = useUiStore((state) => state.selectedAgentId);
   const setSelectedAgentId = useUiStore((state) => state.setSelectedAgentId);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [hashRouteReady, setHashRouteReady] = useState(false);
+  const [savedViewName, setSavedViewName] = useState("");
+  const [savedViewError, setSavedViewError] = useState("");
+
   const authQuery = useQuery({
     queryKey: ["dashboard-auth"],
     queryFn: fetchDashboardAuthStatus,
@@ -72,11 +115,49 @@ export function App() {
     queryFn: fetchDashboardState,
     enabled: authQuery.data?.authenticated === true
   });
+  const savedViewsQuery = useQuery({
+    queryKey: ["dashboard-saved-views"],
+    queryFn: fetchSavedViews,
+    enabled: authQuery.data?.authenticated === true
+  });
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.documentElement.dataset.density = density;
   }, [theme, density]);
+
+  useEffect(() => {
+    const syncFromHash = () => {
+      const hashRoute = routeFromHash(window.location.hash);
+      if (hashRoute && useUiStore.getState().route !== hashRoute) {
+        setRoute(hashRoute);
+      }
+    };
+    syncFromHash();
+    setHashRouteReady(true);
+    window.addEventListener("hashchange", syncFromHash);
+    return () => window.removeEventListener("hashchange", syncFromHash);
+  }, [setRoute]);
+
+  useEffect(() => {
+    if (!hashRouteReady) return;
+    const expected = `#/${route}`;
+    if (window.location.hash !== expected) {
+      window.history.replaceState(null, "", expected);
+    }
+  }, [hashRouteReady, route]);
+
+  useEffect(() => {
+    let icon = document.querySelector<HTMLLinkElement>('link[rel="icon"][data-synapse-generated="true"]');
+    if (!icon) {
+      icon = document.createElement("link");
+      icon.rel = "icon";
+      icon.type = "image/png";
+      icon.dataset.synapseGenerated = "true";
+      document.head.appendChild(icon);
+    }
+    icon.href = commandMarkUrl;
+  }, []);
 
   const agents = useMemo(() => buildAgents(query.data), [query.data]);
   const toolCalls = useMemo(() => buildToolCalls(query.data), [query.data]);
@@ -92,36 +173,155 @@ export function App() {
     }
   }, [selectedAgentId, selectedAgent, setSelectedAgentId]);
 
+  const attentionCount = attentionAgents.length;
+  useEffect(() => {
+    document.title = attentionCount ? `${attentionCount} awaiting input - Synapse Command Center` : "Synapse Command Center";
+  }, [attentionCount]);
+
   const advanceAttention = () => {
     if (attentionAgents.length === 0) return;
     const current = attentionAgents.findIndex((agent) => agent.id === selectedAgent?.id);
     const next = attentionAgents[(current + 1 + attentionAgents.length) % attentionAgents.length];
     setSelectedAgentId(next.id);
+    setRoute("agent");
   };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (isEditableShortcutTarget(event.target)) return;
+      const key = event.key.toLowerCase();
+      const plainKey = !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey;
+      if (((event.ctrlKey || event.metaKey) && key === "k") || (plainKey && (key === "/" || key === "p"))) {
+        event.preventDefault();
+        setPaletteOpen(true);
+      }
+      if ((event.altKey && key === "n") || (plainKey && key === "n")) {
+        event.preventDefault();
+        advanceAttention();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
 
   const state = query.data;
   const freshnessMs = state ? Date.now() - state.generated_at_unix_ms : undefined;
   const stale = query.isError || (freshnessMs !== undefined && freshnessMs > 10000);
+  const activeRoute = routeDefinitions.find((item) => item.id === route) ?? routeDefinitions[0];
+
+  const commands = useMemo(
+    () => [
+      ...routeDefinitions.map((item) => ({
+        id: `route-${item.id}`,
+        label: item.title,
+        group: "Views",
+        icon: item.icon,
+        action: () => setRoute(item.id)
+      })),
+      {
+        id: "attention-next",
+        label: "Next attention",
+        group: "Controls",
+        icon: Bell,
+        action: advanceAttention
+      },
+      {
+        id: "refresh",
+        label: "Refresh dashboard state",
+        group: "Controls",
+        icon: RefreshCw,
+        action: () => {
+          query.refetch();
+          savedViewsQuery.refetch();
+        }
+      },
+      ...agents.slice(0, 8).map((agent) => ({
+        id: `agent-${agent.id}`,
+        label: agent.id,
+        group: "Agents",
+        icon: UserRound,
+        action: () => {
+          setSelectedAgentId(agent.id);
+          setRoute("agent");
+        }
+      }))
+    ],
+    [agents, query, savedViewsQuery, setRoute, setSelectedAgentId]
+  );
 
   if (authQuery.data?.authenticated !== true) {
     return (
-      <AppShell sidebar={<Sidebar state={state} auth={authQuery.data} />}>
+      <AppShell sidebar={<Sidebar route={route} setRoute={setRoute} state={state} auth={authQuery.data} />}>
         <LoginView
           auth={authQuery.data}
           pending={authQuery.isLoading}
           onAuthenticated={() => {
             authQuery.refetch();
             query.refetch();
+            savedViewsQuery.refetch();
           }}
         />
       </AppShell>
     );
   }
 
+  const applySavedView = (view?: DashboardSavedView) => {
+    setSavedViewError("");
+    if (!view) {
+      setSavedViewId(null);
+      setSavedViewName("");
+      return;
+    }
+    setSavedViewId(view.view_id);
+    setSavedViewName(view.name);
+    if (isDashboardRouteId(view.route)) setRoute(view.route);
+    const filters = asRecord(view.filters);
+    const agentId = rawText(filters.selectedAgentId);
+    if (agentId) setSelectedAgentId(agentId);
+    if (isDensity(filters.density)) setDensity(filters.density);
+    if (isTheme(filters.theme)) setTheme(filters.theme);
+  };
+
+  const saveCurrentView = async () => {
+    const name = savedViewName.trim();
+    if (!name) return;
+    setSavedViewError("");
+    try {
+      const saved = await saveDashboardView({
+        view_id: savedViewId || undefined,
+        name,
+        route,
+        filters: {
+          selectedAgentId,
+          density,
+          theme
+        }
+      });
+      setSavedViewId(saved.view.view_id);
+      setSavedViewName(saved.view.name);
+      await savedViewsQuery.refetch();
+    } catch (error) {
+      setSavedViewError(rawText(error) || "Saved view write failed");
+    }
+  };
+
+  const deleteCurrentView = async () => {
+    if (!savedViewId) return;
+    setSavedViewError("");
+    try {
+      await deleteDashboardView(savedViewId);
+      setSavedViewId(null);
+      setSavedViewName("");
+      await savedViewsQuery.refetch();
+    } catch (error) {
+      setSavedViewError(rawText(error) || "Saved view delete failed");
+    }
+  };
+
   return (
-    <AppShell sidebar={<Sidebar state={state} auth={authQuery.data} />}>
+    <AppShell sidebar={<Sidebar route={route} setRoute={setRoute} state={state} auth={authQuery.data} />}>
       <PageHeader
-        title="Fleet Overview"
+        title={activeRoute.title}
         subtitle={
           <span className={stale ? "text-warning-fg" : "text-secondary"}>
             {query.isError ? rawText(query.error) : `Updated ${freshnessMs === undefined ? "pending" : timeAgo(freshnessMs)} ago`}
@@ -129,6 +329,25 @@ export function App() {
         }
         actions={
           <>
+            <SavedViewControls
+              views={savedViewsQuery.data?.views ?? []}
+              selectedId={savedViewId}
+              name={savedViewName}
+              error={savedViewError}
+              onNameChange={setSavedViewName}
+              onSelect={applySavedView}
+              onSave={saveCurrentView}
+              onDelete={deleteCurrentView}
+              saving={savedViewsQuery.isFetching}
+            />
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button size="icon" variant="ghost" onClick={() => setPaletteOpen(true)} aria-label="Open command palette" aria-keyshortcuts="/ P Control+K">
+                  <Command aria-hidden="true" className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Command palette</TooltipContent>
+            </Tooltip>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button size="icon" variant="ghost" onClick={() => query.refetch()} aria-label="Refresh dashboard state">
@@ -163,111 +382,29 @@ export function App() {
         }
       />
 
-      <OverviewBand state={state} agents={agents} attentionCount={attentionAgents.length} stale={stale} />
+      {route === "fleet" ? (
+        <FleetView
+          state={state}
+          agents={agents}
+          attentionAgents={attentionAgents}
+          selectedAgent={selectedAgent}
+          setSelectedAgentId={setSelectedAgentId}
+          attentionCount={attentionCount}
+          stale={stale}
+          toolCalls={toolCalls}
+          advanceAttention={advanceAttention}
+          onSpawned={() => query.refetch()}
+        />
+      ) : null}
+      {route === "agent" ? <AgentView state={state} selectedAgent={selectedAgent} toolCalls={toolCalls} /> : null}
+      {route === "tasks" ? <TasksView agents={agents} attentionCount={attentionCount} /> : null}
+      {route === "approvals" ? <ApprovalsView state={state} /> : null}
+      {route === "analytics" ? <AnalyticsView state={state} agents={agents} attentionCount={attentionCount} stale={stale} /> : null}
+      {route === "timeline" ? <TimelineView state={state} toolCalls={toolCalls} /> : null}
+      {route === "system" ? <SystemView state={state} stale={stale} /> : null}
+      {route === "audit" ? <AuditView state={state} toolCalls={toolCalls} /> : null}
 
-      <Section
-        title="Spawn Console"
-        tier="triage"
-        questions={[
-          "Which models can I launch right now?",
-          "How do I add a cloud API model like DeepSeek?",
-          "Did the spawn succeed, step by step?"
-        ]}
-      >
-        <SpawnConsole onSpawned={() => query.refetch()} />
-      </Section>
-
-      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,0.42fr)]">
-        <div className="min-w-0">
-          <Section
-            title="Attention Groups"
-            tier="triage"
-            questions={[
-              "Which agents need a human now?",
-              "Which session should I inspect first?",
-              "What changed since the last refresh?"
-            ]}
-            actions={
-              <Button variant="secondary" size="sm" onClick={advanceAttention} disabled={attentionAgents.length === 0}>
-                <Bell aria-hidden="true" className="h-4 w-4" />
-                Next
-              </Button>
-            }
-          >
-            <FleetList agents={attentionAgents.length ? attentionAgents : agents} selectedId={selectedAgent?.id} onSelect={setSelectedAgentId} />
-          </Section>
-
-          <Section
-            title="Tool Activity"
-            tier="triage"
-            questions={[
-              "Which tools are still running?",
-              "Which calls failed?",
-              "Where is the verification detail?"
-            ]}
-          >
-            {toolCalls.length ? (
-              <div className="grid gap-3 lg:grid-cols-2">
-                {toolCalls.slice(0, 6).map((call) => (
-                  <ToolCallCard call={call} key={call.id} />
-                ))}
-              </div>
-            ) : (
-              <EmptyState title="No command audit rows" />
-            )}
-          </Section>
-
-          <Section
-            title="Fleet Table"
-            tier="drill-down"
-            questions={[
-              "Which sessions are live?",
-              "Which rows are stale?",
-              "Which row links to detail?"
-            ]}
-          >
-            <FleetTable agents={agents} onSelect={setSelectedAgentId} />
-          </Section>
-        </div>
-
-        <aside className="min-w-0">
-          <Section
-            title="Peek Panel"
-            tier="drill-down"
-            questions={[
-              "Why is this agent in its current state?",
-              "Which detail surface proves it?",
-              "Is raw verification available without flooding the page?"
-            ]}
-          >
-            <AgentPeek agent={selectedAgent} />
-          </Section>
-
-          <Section
-            title="System Shape"
-            tier="overview"
-            questions={[
-              "Is storage pressure rising?",
-              "Which column family is largest?",
-              "Is the daemon still local?"
-            ]}
-          >
-            <SystemShape state={state} />
-          </Section>
-        </aside>
-      </div>
-
-      <Section
-        title="Transcript Samples"
-        tier="drill-down"
-        questions={[
-          "What did recent agents say?",
-          "Was output sanitized before render?",
-          "Where is the source row?"
-        ]}
-      >
-        <TranscriptSamples state={state} />
-      </Section>
+      <CommandPalette open={paletteOpen} commands={commands} onClose={() => setPaletteOpen(false)} />
     </AppShell>
   );
 }
@@ -308,11 +445,7 @@ function LoginView({
       <Section
         title="Unlock"
         tier="overview"
-        questions={[
-          "Is a dashboard session active?",
-          "Can the operator mint a cookie session?",
-          "Did the login fail closed?"
-        ]}
+        questions={["Is a dashboard session active?", "Can the operator mint a cookie session?", "Did the login fail closed?"]}
       >
         <form className="max-w-md space-y-3" onSubmit={submit}>
           <label className="block text-sm text-secondary">
@@ -336,24 +469,31 @@ function LoginView({
   );
 }
 
-function Sidebar({ state, auth }: { state?: DashboardState; auth?: DashboardAuthStatus }) {
+function Sidebar({
+  route,
+  setRoute,
+  state,
+  auth
+}: {
+  route: DashboardRouteId;
+  setRoute: (route: DashboardRouteId) => void;
+  state?: DashboardState;
+  auth?: DashboardAuthStatus;
+}) {
   const health = asRecord(panelData(state?.daemon));
   return (
     <nav className="space-y-4" aria-label="Dashboard">
-      <div className="flex items-center gap-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-border bg-surface-2">
-          <LayoutDashboard aria-hidden="true" className="h-5 w-5 text-accent" />
-        </div>
-        <div>
-          <div className="text-md font-semibold text-primary">Synapse</div>
-          <div className="text-xs text-muted">{rawText(health.version || "dashboard")}</div>
-        </div>
-      </div>
-      <div className="grid gap-2">
-        <SidebarItem icon={<Gauge aria-hidden="true" />} label="Fleet" active />
-        <SidebarItem icon={<Rows3 aria-hidden="true" />} label="Actions" />
-        <SidebarItem icon={<TerminalSquare aria-hidden="true" />} label="Terminal" />
-        <SidebarItem icon={<CheckCircle2 aria-hidden="true" />} label="Approvals" />
+      <button type="button" className="flex w-full items-center gap-3 text-left" onClick={() => setRoute("fleet")}>
+        <img src={commandMarkUrl} alt="" className="h-10 w-10 rounded-lg border border-border bg-surface-2 object-cover" />
+        <span className="min-w-0">
+          <span className="block text-md font-semibold text-primary">Synapse</span>
+          <span className="block truncate text-xs text-muted">{rawText(health.version || "dashboard")}</span>
+        </span>
+      </button>
+      <div className="grid gap-1">
+        {routeDefinitions.map((item) => (
+          <SidebarItem key={item.id} item={item} active={route === item.id} onSelect={() => setRoute(item.id)} />
+        ))}
       </div>
       <div className="rounded-lg border border-border bg-surface-2 p-3">
         <div className="text-label font-medium uppercase text-muted">Loopback</div>
@@ -363,19 +503,95 @@ function Sidebar({ state, auth }: { state?: DashboardState; auth?: DashboardAuth
         <div className="text-label font-medium uppercase text-muted">Auth</div>
         <div className="mt-1 truncate font-mono text-sm text-primary">{auth?.authenticated ? auth.method : "locked"}</div>
       </div>
+      <img src={statusIconsUrl} alt="" className="w-full rounded-lg border border-border bg-surface-2 object-cover" />
     </nav>
   );
 }
 
-function SidebarItem({ icon, label, active = false }: { icon: ReactNode; label: string; active?: boolean }) {
+function SidebarItem({ item, active, onSelect }: { item: RouteDefinition; active: boolean; onSelect: () => void }) {
+  const Icon = item.icon;
   return (
-    <a
-      href="#"
-      className={`flex min-h-10 items-center gap-2 rounded-md px-3 text-sm ${active ? "bg-surface-2 text-primary" : "text-secondary hover:bg-surface-2 hover:text-primary"}`}
+    <button
+      type="button"
+      onClick={onSelect}
+      className={cn(
+        "flex min-h-10 w-full items-center gap-2 rounded-md px-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
+        active ? "bg-surface-2 text-primary" : "text-secondary hover:bg-surface-2 hover:text-primary"
+      )}
     >
-      <span className="h-4 w-4">{icon}</span>
-      {label}
-    </a>
+      <Icon aria-hidden="true" className="h-4 w-4" />
+      {item.label}
+    </button>
+  );
+}
+
+function SavedViewControls({
+  views,
+  selectedId,
+  name,
+  error,
+  onNameChange,
+  onSelect,
+  onSave,
+  onDelete,
+  saving
+}: {
+  views: DashboardSavedView[];
+  selectedId: string | null;
+  name: string;
+  error: string;
+  onNameChange: (value: string) => void;
+  onSelect: (view?: DashboardSavedView) => void;
+  onSave: () => void;
+  onDelete: () => void;
+  saving: boolean;
+}) {
+  return (
+    <div className="flex max-w-full flex-wrap items-center gap-2">
+      <label className="sr-only" htmlFor="saved-view-select">
+        Saved view
+      </label>
+      <select
+        id="saved-view-select"
+        className="h-9 min-w-36 rounded-md border border-border bg-surface-1 px-2 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+        value={selectedId ?? ""}
+        onChange={(event) => onSelect(views.find((view) => view.view_id === event.target.value))}
+      >
+        <option value="">Default view</option>
+        {views.map((view) => (
+          <option key={view.view_id} value={view.view_id}>
+            {view.name}
+          </option>
+        ))}
+      </select>
+      <label className="sr-only" htmlFor="saved-view-name">
+        View name
+      </label>
+      <input
+        id="saved-view-name"
+        className="h-9 w-36 rounded-md border border-border bg-surface-1 px-2 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+        value={name}
+        placeholder="View name"
+        onChange={(event) => onNameChange(event.target.value)}
+      />
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button size="icon" variant="ghost" onClick={onSave} disabled={!name.trim() || saving} aria-label="Save view">
+            <Save aria-hidden="true" className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Save view</TooltipContent>
+      </Tooltip>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Button size="icon" variant="ghost" onClick={onDelete} disabled={!selectedId || saving} aria-label="Delete view">
+            <Trash2 aria-hidden="true" className="h-4 w-4" />
+          </Button>
+        </TooltipTrigger>
+        <TooltipContent>Delete view</TooltipContent>
+      </Tooltip>
+      {error ? <span className="max-w-56 truncate text-xs text-danger-fg">{error}</span> : null}
+    </div>
   );
 }
 
@@ -383,8 +599,8 @@ function DensityControl({
   density,
   setDensity
 }: {
-  density: "comfortable" | "compact";
-  setDensity: (density: "comfortable" | "compact") => void;
+  density: Density;
+  setDensity: (density: Density) => void;
 }) {
   return (
     <div className="inline-flex rounded-lg border border-border bg-surface-1 p-1" aria-label="Density">
@@ -399,6 +615,294 @@ function DensityControl({
         </button>
       ))}
     </div>
+  );
+}
+
+function CommandPalette({
+  open,
+  commands,
+  onClose
+}: {
+  open: boolean;
+  commands: Array<{ id: string; label: string; group: string; icon: LucideIcon; action: () => void }>;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  useEffect(() => {
+    if (open) {
+      setQuery("");
+      requestAnimationFrame(() => inputRef.current?.focus());
+    }
+  }, [open]);
+  if (!open) return null;
+  const filtered = commands.filter((command) => `${command.group} ${command.label}`.toLowerCase().includes(query.toLowerCase())).slice(0, 12);
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 p-4" role="dialog" aria-modal="true" aria-label="Command palette" onMouseDown={onClose}>
+      <div className="mx-auto mt-16 max-w-2xl rounded-lg border border-border bg-surface-1 shadow-xl" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+          <Search aria-hidden="true" className="h-4 w-4 text-muted" />
+          <input
+            ref={inputRef}
+            className="h-10 min-w-0 flex-1 bg-transparent text-sm text-primary outline-none"
+            value={query}
+            placeholder="Search commands"
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") onClose();
+              if (event.key === "Enter" && filtered[0]) {
+                filtered[0].action();
+                onClose();
+              }
+            }}
+          />
+          <Button size="icon" variant="ghost" onClick={onClose} aria-label="Close command palette">
+            <X aria-hidden="true" className="h-4 w-4" />
+          </Button>
+        </div>
+        <div className="max-h-[60vh] overflow-auto p-2">
+          {filtered.length ? (
+            filtered.map((command) => {
+              const Icon = command.icon;
+              return (
+                <button
+                  key={command.id}
+                  type="button"
+                  className="flex min-h-11 w-full items-center gap-3 rounded-md px-3 text-left text-sm text-secondary hover:bg-surface-2 hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring"
+                  onClick={() => {
+                    command.action();
+                    onClose();
+                  }}
+                >
+                  <Icon aria-hidden="true" className="h-4 w-4 text-info" />
+                  <span className="min-w-0 flex-1 truncate">{command.label}</span>
+                  <span className="text-label uppercase text-muted">{command.group}</span>
+                </button>
+              );
+            })
+          ) : (
+            <EmptyState title="No matching commands" />
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FleetView({
+  state,
+  agents,
+  attentionAgents,
+  selectedAgent,
+  setSelectedAgentId,
+  attentionCount,
+  stale,
+  toolCalls,
+  advanceAttention,
+  onSpawned
+}: {
+  state?: DashboardState;
+  agents: AgentSummary[];
+  attentionAgents: AgentSummary[];
+  selectedAgent?: AgentSummary;
+  setSelectedAgentId: (id: string) => void;
+  attentionCount: number;
+  stale: boolean;
+  toolCalls: ReturnType<typeof buildToolCalls>;
+  advanceAttention: () => void;
+  onSpawned: () => void;
+}) {
+  return (
+    <>
+      <OverviewBand state={state} agents={agents} attentionCount={attentionCount} stale={stale} />
+      <Section
+        title="Spawn Console"
+        tier="triage"
+        questions={["Which models can I launch right now?", "How do I add a cloud API model like DeepSeek?", "Did the spawn succeed, step by step?"]}
+      >
+        <SpawnConsole onSpawned={onSpawned} />
+      </Section>
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,0.42fr)]">
+        <div className="min-w-0">
+          <Section
+            title="Attention Groups"
+            tier="triage"
+            questions={["Which agents need a human now?", "Which session should I inspect first?", "What changed since the last refresh?"]}
+            actions={
+              <Button variant="secondary" size="sm" onClick={advanceAttention} disabled={attentionAgents.length === 0} aria-keyshortcuts="N Alt+N">
+                <Bell aria-hidden="true" className="h-4 w-4" />
+                Next
+              </Button>
+            }
+          >
+            <FleetList agents={attentionAgents.length ? attentionAgents : agents} selectedId={selectedAgent?.id} onSelect={setSelectedAgentId} />
+          </Section>
+          <ToolActivity toolCalls={toolCalls} />
+          <Section
+            title="Fleet Table"
+            tier="drill-down"
+            questions={["Which sessions are live?", "Which rows are stale?", "Which row links to detail?"]}
+          >
+            <FleetTable agents={agents} onSelect={setSelectedAgentId} />
+          </Section>
+        </div>
+        <aside className="min-w-0">
+          <Section
+            title="Peek Panel"
+            tier="drill-down"
+            questions={["Why is this agent in its current state?", "Which detail surface proves it?", "Is raw verification available without flooding the page?"]}
+          >
+            <AgentPeek agent={selectedAgent} />
+          </Section>
+          <Section
+            title="System Shape"
+            tier="overview"
+            questions={["Is storage pressure rising?", "Which column family is largest?", "Is the daemon still local?"]}
+          >
+            <SystemShape state={state} />
+          </Section>
+        </aside>
+      </div>
+      <TranscriptSamples state={state} />
+    </>
+  );
+}
+
+function AgentView({ state, selectedAgent, toolCalls }: { state?: DashboardState; selectedAgent?: AgentSummary; toolCalls: ReturnType<typeof buildToolCalls> }) {
+  return (
+    <div className="grid gap-6 xl:grid-cols-[minmax(0,0.42fr)_minmax(0,1fr)]">
+      <Section
+        title="Agent Surfaces"
+        tier="drill-down"
+        questions={["Which agent is selected?", "Which state explains the current badge?", "Can raw verification stay collapsed?"]}
+      >
+        <AgentPeek agent={selectedAgent} />
+      </Section>
+      <div className="min-w-0">
+        <ToolActivity toolCalls={toolCalls} />
+        <TranscriptSamples state={state} />
+      </div>
+    </div>
+  );
+}
+
+function TasksView({ agents, attentionCount }: { agents: AgentSummary[]; attentionCount: number }) {
+  const reviewAgents = agents.filter((agent) => agent.status === "ready_for_review").length;
+  return (
+    <>
+      <Section
+        title="Task Queue"
+        tier="overview"
+        questions={["How many review items need action?", "Which rows are attention candidates?", "Is the shell route stable for #924?"]}
+      >
+        <div className="grid gap-4 md:grid-cols-3">
+          <StatCard label="Attention" value={attentionCount} status={attentionCount ? "needs_input" : "done"} />
+          <StatCard label="Review" value={reviewAgents} status={reviewAgents ? "ready_for_review" : "idle"} />
+          <StatCard label="Shell" value="ready" status="working" />
+        </div>
+      </Section>
+      <Section
+        title="Board"
+        tier="triage"
+        questions={["Which task lane is populated?", "Which attempt needs review?", "Where will queue transitions appear?"]}
+      >
+        <EmptyStateArt title="No task board rows in this shell feed" />
+      </Section>
+    </>
+  );
+}
+
+function ApprovalsView({ state }: { state?: DashboardState }) {
+  return (
+    <div className="grid gap-6 xl:grid-cols-3">
+      <ApprovalPanel title="Approvals" panel={state?.approvals} />
+      <ApprovalPanel title="Suggestions" panel={state?.suggestions} />
+      <ApprovalPanel title="Armed Runs" panel={state?.armed_runs} />
+    </div>
+  );
+}
+
+function ApprovalPanel({ title, panel }: { title: string; panel?: DashboardState["approvals"] }) {
+  const data = asRecord(panelData(panel));
+  const rows = asArray<Record<string, unknown>>(data.rows);
+  return (
+    <Section
+      title={title}
+      tier="triage"
+      questions={["Which approvals are pending?", "What source row backs this list?", "Does raw detail stay collapsed?"]}
+    >
+      <div className="space-y-3">
+        <StatCard label="Rows" value={rows.length} status={rows.length ? "awaiting_approval" : "done"} delta={rawText(data.tool || panel?.source)} />
+        {rows.length ? rows.slice(0, 4).map((row, index) => <RawValue key={index} value={row} label="Approval row" />) : <EmptyStateArt title="No approval rows" />}
+      </div>
+    </Section>
+  );
+}
+
+function AnalyticsView({ state, agents, attentionCount, stale }: { state?: DashboardState; agents: AgentSummary[]; attentionCount: number; stale: boolean }) {
+  return (
+    <>
+      <OverviewBand state={state} agents={agents} attentionCount={attentionCount} stale={stale} />
+      <Section
+        title="Storage Distribution"
+        tier="triage"
+        questions={["Which store has the most rows?", "Is pressure elevated?", "Which counters changed since refresh?"]}
+      >
+        <SystemShape state={state} />
+      </Section>
+    </>
+  );
+}
+
+function TimelineView({ state, toolCalls }: { state?: DashboardState; toolCalls: ReturnType<typeof buildToolCalls> }) {
+  return (
+    <>
+      <ToolActivity toolCalls={toolCalls} />
+      <TranscriptSamples state={state} />
+    </>
+  );
+}
+
+function SystemView({ state, stale }: { state?: DashboardState; stale: boolean }) {
+  return (
+    <>
+      <Section
+        title="Daemon"
+        tier="overview"
+        questions={["Is the daemon healthy?", "Is the dashboard stale?", "Which process owns the server?"]}
+      >
+        <div className="grid gap-4 md:grid-cols-3">
+          <StatCard label="Freshness" value={stale ? "stale" : "live"} status={stale ? "stuck" : "working"} />
+          <StatCard label="Bind" value={state?.bind_addr || "pending"} status="working" />
+          <StatCard label="Auth" value={rawText(asRecord(panelData(state?.auth)).active_session_count || 0)} status="done" />
+        </div>
+      </Section>
+      <Section
+        title="System Shape"
+        tier="triage"
+        questions={["Which resource is largest?", "Which counters support that read?", "Can the raw readback be inspected?"]}
+      >
+        <SystemShape state={state} />
+        <div className="mt-3">
+          <RawValue value={{ daemon: state?.daemon, storage: state?.storage, lease: state?.lease }} label="System readback" />
+        </div>
+      </Section>
+    </>
+  );
+}
+
+function AuditView({ state, toolCalls }: { state?: DashboardState; toolCalls: ReturnType<typeof buildToolCalls> }) {
+  return (
+    <>
+      <ToolActivity toolCalls={toolCalls} />
+      <Section
+        title="Command Audit"
+        tier="drill-down"
+        questions={["Which audit rows are visible?", "Which row source backs the panel?", "Does raw detail stay collapsed?"]}
+      >
+        <RawValue value={state?.command_audit} label="Command audit readback" />
+      </Section>
+    </>
   );
 }
 
@@ -419,15 +923,7 @@ function OverviewBand({
   const liveAgents = agents.filter((agent) => agent.lifecycle === "live").length;
   const toolCount = Number(health.tool_count || 0);
   return (
-    <Section
-      title="Overview"
-      tier="overview"
-      questions={[
-        "Is anything wrong?",
-        "How many agents are live?",
-        "Is the daemon stale?"
-      ]}
-    >
+    <Section title="Overview" tier="overview" questions={["Is anything wrong?", "How many agents are live?", "Is the daemon stale?"]}>
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Attention" value={attentionCount} status={attentionCount ? "needs_input" : "done"} delta={attentionCount ? "human review queued" : "quiet"} />
         <StatCard label="Live Agents" value={liveAgents} status={liveAgents ? "working" : "idle"} delta={`${agents.length} total rows`} />
@@ -442,7 +938,7 @@ const deepSeekPresets = {
   flash: {
     label: "DeepSeek Flash",
     name: "deepseek-flash",
-    base_url: "https://api.deepseek.com",
+    base_url: "",
     model_id: "deepseek-v4-flash",
     runtime_preset: "deepseek_v4_flash_non_thinking",
     api_key_env_var: "DEEPSEEK_API_KEY",
@@ -453,7 +949,7 @@ const deepSeekPresets = {
   reasoning: {
     label: "DeepSeek Reasoning",
     name: "deepseek-reasoning",
-    base_url: "https://api.deepseek.com",
+    base_url: "",
     model_id: "deepseek-v4-flash",
     runtime_preset: "deepseek_v4_reasoning",
     api_key_env_var: "DEEPSEEK_API_KEY",
@@ -470,7 +966,7 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
   });
   const models = modelsQuery.data ?? [];
   const [selectedModel, setSelectedModel] = useState("");
-  const [prompt, setPrompt] = useState("Use workspace_put with key issue985-deepseek-smoke and value {\"ok\":true}.");
+  const [prompt, setPrompt] = useState('Use workspace_put with key issue985-deepseek-smoke and value {"ok":true}.');
   const [workingDir, setWorkingDir] = useState("C:\\code\\Synapse");
   const [registerForm, setRegisterForm] = useState(deepSeekPresets.flash);
   const [pendingAction, setPendingAction] = useState<"register" | "spawn" | "">("");
@@ -580,7 +1076,7 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
               ]}
             />
           ) : (
-            <EmptyState title={modelsQuery.isError ? rawText(modelsQuery.error) || "Model registry unavailable" : "No model rows"} />
+            <EmptyStateArt title={modelsQuery.isError ? rawText(modelsQuery.error) || "Model registry unavailable" : "No model rows"} />
           )}
         </div>
 
@@ -672,9 +1168,7 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
             </Button>
           </div>
         </form>
-
         {error ? <div className="rounded-lg border border-danger-border bg-danger-bg p-3 text-sm text-danger-fg">{error}</div> : null}
-
         {lastRegister ? <RawValue value={lastRegister} label="Register readback" /> : null}
         {lastSpawn ? <RawValue value={lastSpawn} label="Spawn readback" /> : null}
       </div>
@@ -731,7 +1225,7 @@ function FleetList({
   selectedId?: string;
   onSelect: (id: string) => void;
 }) {
-  if (agents.length === 0) return <EmptyState title="No agent rows" />;
+  if (agents.length === 0) return <EmptyStateArt title="No agent rows" />;
   return (
     <div className="rounded-lg border border-border bg-surface-1">
       {agents.map((agent) => (
@@ -742,7 +1236,7 @@ function FleetList({
 }
 
 function FleetTable({ agents, onSelect }: { agents: AgentSummary[]; onSelect: (id: string) => void }) {
-  if (agents.length === 0) return <EmptyState title="No fleet rows" />;
+  if (agents.length === 0) return <EmptyStateArt title="No fleet rows" />;
   return (
     <DataTable
       data={agents}
@@ -779,6 +1273,22 @@ function FleetTable({ agents, onSelect }: { agents: AgentSummary[]; onSelect: (i
   );
 }
 
+function ToolActivity({ toolCalls }: { toolCalls: ReturnType<typeof buildToolCalls> }) {
+  return (
+    <Section title="Tool Activity" tier="triage" questions={["Which tools are still running?", "Which calls failed?", "Where is the verification detail?"]}>
+      {toolCalls.length ? (
+        <div className="grid gap-3 lg:grid-cols-2">
+          {toolCalls.slice(0, 6).map((call) => (
+            <ToolCallCard call={call} key={call.id} />
+          ))}
+        </div>
+      ) : (
+        <EmptyStateArt title="No command audit rows" />
+      )}
+    </Section>
+  );
+}
+
 function SystemShape({ state }: { state?: DashboardState }) {
   const storage = asRecord(panelData(state?.storage));
   const counts = asRecord(storage.cf_row_counts);
@@ -786,7 +1296,7 @@ function SystemShape({ state }: { state?: DashboardState }) {
     .map(([name, value]) => ({ name: name.replace("CF_", ""), rows: Number(value) || 0 }))
     .sort((a, b) => b.rows - a.rows)
     .slice(0, 8);
-  if (!chartData.length) return <EmptyState title="No storage rows" />;
+  if (!chartData.length) return <EmptyStateArt title="No storage rows" />;
   return (
     <div className="space-y-4">
       <div className="h-64 rounded-lg border border-border bg-surface-1 p-3">
@@ -811,12 +1321,52 @@ function SystemShape({ state }: { state?: DashboardState }) {
 
 function TranscriptSamples({ state }: { state?: DashboardState }) {
   const rows = asArray<Record<string, unknown>>(asRecord(panelData(state?.agent_transcripts)).rows).slice(0, 4);
-  if (!rows.length) return <EmptyState title="No transcript rows" />;
   return (
-    <div className="grid gap-3 lg:grid-cols-2">
-      {rows.map((row, index) => (
-        <TranscriptTurn key={`${rawText(row.spawn_id)}-${rawText(row.line_no)}-${index}`} row={row} />
-      ))}
+    <Section title="Transcript Samples" tier="drill-down" questions={["What did recent agents say?", "Was output sanitized before render?", "Where is the source row?"]}>
+      {rows.length ? (
+        <div className="grid gap-3 lg:grid-cols-2">
+          {rows.map((row, index) => (
+            <TranscriptTurn key={`${rawText(row.spawn_id)}-${rawText(row.line_no)}-${index}`} row={row} />
+          ))}
+        </div>
+      ) : (
+        <EmptyStateArt title="No transcript rows" />
+      )}
+    </Section>
+  );
+}
+
+function EmptyStateArt({ title }: { title: string }) {
+  return (
+    <div className="overflow-hidden rounded-lg border border-border bg-surface-1">
+      <img src={emptyStateUrl} alt="" className="h-32 w-full object-cover opacity-80" />
+      <div className="border-t border-border-subtle p-3">
+        <EmptyState title={title} />
+      </div>
     </div>
   );
+}
+
+function routeFromHash(hash: string): DashboardRouteId | null {
+  const raw = hash.replace(/^#\/?/, "").split(/[/?]/)[0];
+  return isDashboardRouteId(raw) ? raw : null;
+}
+
+function isEditableShortcutTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (target.isContentEditable) return true;
+  const tagName = target.tagName.toLowerCase();
+  return tagName === "input" || tagName === "textarea" || tagName === "select";
+}
+
+function isDashboardRouteId(value: unknown): value is DashboardRouteId {
+  return typeof value === "string" && routeDefinitions.some((item) => item.id === value);
+}
+
+function isDensity(value: unknown): value is Density {
+  return value === "comfortable" || value === "compact";
+}
+
+function isTheme(value: unknown): value is Theme {
+  return value === "dark" || value === "light";
 }

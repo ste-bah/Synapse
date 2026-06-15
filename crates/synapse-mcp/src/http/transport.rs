@@ -15,7 +15,7 @@ use axum::{
     http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode, header},
     middleware,
     response::{Html, IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
@@ -48,6 +48,7 @@ const STALE_SESSION_INPUT_CLEANUP_INTERVAL: Duration = Duration::from_millis(250
 const M2_EMITTER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const DRAIN_RESPONSE_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
 const DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES: usize = 256 * 1024;
+const DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct HttpState {
@@ -500,6 +501,16 @@ fn router(
         .route("/dashboard/auth/logout", post(dashboard_auth_logout))
         .route("/dashboard/auth/failures", get(dashboard_auth_failures))
         .route("/dashboard/state.json", get(dashboard_state))
+        .route(
+            "/dashboard/saved-views",
+            get(dashboard_saved_views)
+                .post(dashboard_saved_view_upsert)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/saved-views/{view_id}",
+            delete(dashboard_saved_view_delete),
+        )
         .route(
             "/dashboard/local-model-spawn",
             post(dashboard_local_model_spawn).layer(DefaultBodyLimit::max(
@@ -1508,6 +1519,62 @@ struct DashboardHygieneSurface {
     report: crate::m3::hygiene::HygieneReportResponse,
 }
 
+const DASHBOARD_SAVED_VIEW_SCHEMA_VERSION: u32 = 1;
+const DASHBOARD_SAVED_VIEW_PREFIX: &str = "dashboard-saved-view/v1/view/";
+const DASHBOARD_SAVED_VIEW_SOURCE_OF_TRUTH: &str = "CF_KV dashboard-saved-view/v1";
+const DASHBOARD_SAVED_VIEW_MAX_NAME_CHARS: usize = 80;
+const DASHBOARD_SAVED_VIEW_MAX_ID_CHARS: usize = 96;
+const DASHBOARD_SAVED_VIEW_MAX_ROUTE_CHARS: usize = 32;
+const DASHBOARD_SAVED_VIEW_MAX_FILTER_BYTES: usize = 16 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardSavedViewRow {
+    schema_version: u32,
+    view_id: String,
+    row_key: String,
+    name: String,
+    route: String,
+    filters: serde_json::Value,
+    created_unix_ms: u64,
+    updated_unix_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardSavedViewUpsertRequest {
+    #[serde(default)]
+    view_id: Option<String>,
+    name: String,
+    route: String,
+    filters: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct DashboardSavedViewsResponse {
+    ok: bool,
+    source_of_truth: &'static str,
+    views: Vec<DashboardSavedViewRow>,
+    corrupt_row_count: usize,
+}
+
+#[derive(Serialize)]
+struct DashboardSavedViewUpsertResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    row_key: String,
+    view: DashboardSavedViewRow,
+}
+
+#[derive(Serialize)]
+struct DashboardSavedViewDeleteResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    deleted_row_key: String,
+}
+
 async fn dashboard_index(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return with_dashboard_security_headers(response);
@@ -1630,6 +1697,95 @@ async fn dashboard_auth_failures(State(state): State<HttpState>, headers: Header
     with_dashboard_security_headers(Json(state.dashboard_auth.snapshot()).into_response())
 }
 
+async fn dashboard_saved_views(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if let Err(response) = state.dashboard_auth.authenticate(
+        &headers,
+        "GET",
+        "/dashboard/saved-views",
+        CsrfPolicy::NotRequired,
+    ) {
+        return with_dashboard_security_headers(response);
+    }
+    match dashboard_saved_view_rows(&state.agent_events_db) {
+        Ok((views, corrupt_row_count)) => with_dashboard_security_headers(
+            Json(DashboardSavedViewsResponse {
+                ok: true,
+                source_of_truth: DASHBOARD_SAVED_VIEW_SOURCE_OF_TRUTH,
+                views,
+                corrupt_row_count,
+            })
+            .into_response(),
+        ),
+        Err(response) => with_dashboard_security_headers(response),
+    }
+}
+
+async fn dashboard_saved_view_upsert(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardSavedViewUpsertRequest>,
+) -> Response {
+    if let Err(response) = state.dashboard_auth.authenticate(
+        &headers,
+        "POST",
+        "/dashboard/saved-views",
+        CsrfPolicy::Required,
+    ) {
+        return with_dashboard_security_headers(response);
+    }
+    match dashboard_save_view_row(&state.agent_events_db, request) {
+        Ok(view) => with_dashboard_security_headers(
+            Json(DashboardSavedViewUpsertResponse {
+                ok: true,
+                trigger: "dashboard.saved_view_upsert",
+                source_of_truth: DASHBOARD_SAVED_VIEW_SOURCE_OF_TRUTH,
+                row_key: view.row_key.clone(),
+                view,
+            })
+            .into_response(),
+        ),
+        Err(response) => with_dashboard_security_headers(response),
+    }
+}
+
+async fn dashboard_saved_view_delete(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(view_id): Path<String>,
+) -> Response {
+    if let Err(response) = state.dashboard_auth.authenticate(
+        &headers,
+        "DELETE",
+        "/dashboard/saved-views/{view_id}",
+        CsrfPolicy::Required,
+    ) {
+        return with_dashboard_security_headers(response);
+    }
+    let view_id = match dashboard_validate_saved_view_id(&view_id) {
+        Ok(view_id) => view_id,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    let row_key = dashboard_saved_view_row_key(&view_id);
+    match state
+        .agent_events_db
+        .delete_batch(cf::CF_KV, [row_key.as_bytes().to_vec()])
+    {
+        Ok(()) => with_dashboard_security_headers(
+            Json(DashboardSavedViewDeleteResponse {
+                ok: true,
+                trigger: "dashboard.saved_view_delete",
+                source_of_truth: DASHBOARD_SAVED_VIEW_SOURCE_OF_TRUTH,
+                deleted_row_key: row_key,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_storage_error_response(
+            "dashboard saved view delete failed",
+            error,
+        )),
+    }
+}
+
 async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if let Err(response) = state.dashboard_auth.authenticate(
         &headers,
@@ -1694,6 +1850,249 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         local_models: local_model_panel(&state, &tool_names),
     };
     with_dashboard_security_headers(Json(response).into_response())
+}
+
+fn dashboard_saved_view_rows(db: &Db) -> Result<(Vec<DashboardSavedViewRow>, usize), Response> {
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, DASHBOARD_SAVED_VIEW_PREFIX.as_bytes())
+        .map_err(|error| {
+            dashboard_storage_error_response("dashboard saved views read failed", error)
+        })?;
+    let mut views = Vec::new();
+    let mut corrupt_row_count = 0;
+    for (key, value) in rows {
+        match serde_json::from_slice::<DashboardSavedViewRow>(&value) {
+            Ok(row) if key == row.row_key.as_bytes() => views.push(row),
+            Ok(_row) => corrupt_row_count += 1,
+            Err(error) => {
+                corrupt_row_count += 1;
+                tracing::warn!(
+                    code = synapse_core::error_codes::STORAGE_CORRUPTED,
+                    row_key = %String::from_utf8_lossy(&key),
+                    detail = %error,
+                    "dashboard saved view row decode failed"
+                );
+            }
+        }
+    }
+    views.sort_by(|left, right| {
+        right
+            .updated_unix_ms
+            .cmp(&left.updated_unix_ms)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    Ok((views, corrupt_row_count))
+}
+
+fn dashboard_save_view_row(
+    db: &Db,
+    request: DashboardSavedViewUpsertRequest,
+) -> Result<DashboardSavedViewRow, Response> {
+    let now = dashboard_unix_time_ms();
+    let name = dashboard_validate_saved_view_name(&request.name)?;
+    let route = dashboard_validate_saved_view_route(&request.route)?;
+    let filters = dashboard_validate_saved_view_filters(request.filters)?;
+    let view_id = match request.view_id {
+        Some(value) => dashboard_validate_saved_view_id(&value)?,
+        None => dashboard_saved_view_id_from_name(&name, now),
+    };
+    let row_key = dashboard_saved_view_row_key(&view_id);
+    let created_unix_ms = dashboard_read_saved_view_by_key(db, &row_key)?
+        .map(|row| row.created_unix_ms)
+        .unwrap_or(now);
+    let row = DashboardSavedViewRow {
+        schema_version: DASHBOARD_SAVED_VIEW_SCHEMA_VERSION,
+        view_id,
+        row_key: row_key.clone(),
+        name,
+        route,
+        filters,
+        created_unix_ms,
+        updated_unix_ms: now,
+    };
+    let encoded = serde_json::to_vec(&row).map_err(|error| {
+        tracing::error!(
+            code = synapse_core::error_codes::STORAGE_WRITE_FAILED,
+            row_key,
+            detail = %error,
+            "dashboard saved view row encode failed"
+        );
+        dashboard_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            synapse_core::error_codes::STORAGE_WRITE_FAILED,
+            "dashboard saved view row encode failed",
+            None,
+        )
+    })?;
+    db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
+        .map_err(|error| {
+            dashboard_storage_error_response("dashboard saved view write failed", error)
+        })?;
+    tracing::info!(
+        code = "DASHBOARD_SAVED_VIEW_WRITTEN",
+        row_key,
+        source_of_truth = DASHBOARD_SAVED_VIEW_SOURCE_OF_TRUTH,
+        "dashboard saved view row written"
+    );
+    Ok(row)
+}
+
+fn dashboard_read_saved_view_by_key(
+    db: &Db,
+    row_key: &str,
+) -> Result<Option<DashboardSavedViewRow>, Response> {
+    let rows = db
+        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
+        .map_err(|error| {
+            dashboard_storage_error_response("dashboard saved view read failed", error)
+        })?;
+    let Some((_key, value)) = rows
+        .into_iter()
+        .find(|(key, _value)| key == row_key.as_bytes())
+    else {
+        return Ok(None);
+    };
+    let row = serde_json::from_slice::<DashboardSavedViewRow>(&value).map_err(|error| {
+        tracing::error!(
+            code = synapse_core::error_codes::STORAGE_CORRUPTED,
+            row_key,
+            detail = %error,
+            "dashboard saved view row corrupt"
+        );
+        dashboard_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            synapse_core::error_codes::STORAGE_CORRUPTED,
+            "dashboard saved view row corrupt",
+            None,
+        )
+    })?;
+    Ok(Some(row))
+}
+
+fn dashboard_validate_saved_view_name(value: &str) -> Result<String, Response> {
+    let trimmed = value.trim();
+    let char_count = trimmed.chars().count();
+    if trimmed.is_empty() {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard saved view requires name",
+            None,
+        ));
+    }
+    if char_count > DASHBOARD_SAVED_VIEW_MAX_NAME_CHARS {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard saved view name is too long",
+            None,
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn dashboard_validate_saved_view_id(value: &str) -> Result<String, Response> {
+    let trimmed = value.trim();
+    let char_count = trimmed.chars().count();
+    if trimmed.is_empty()
+        || char_count > DASHBOARD_SAVED_VIEW_MAX_ID_CHARS
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard saved view id must be ascii alphanumeric plus ._-",
+            None,
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn dashboard_validate_saved_view_route(value: &str) -> Result<String, Response> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > DASHBOARD_SAVED_VIEW_MAX_ROUTE_CHARS {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard saved view route is invalid",
+            None,
+        ));
+    }
+    match trimmed {
+        "fleet" | "agent" | "tasks" | "approvals" | "analytics" | "timeline" | "system"
+        | "audit" => Ok(trimmed.to_owned()),
+        _ => Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard saved view route is not supported",
+            None,
+        )),
+    }
+}
+
+fn dashboard_validate_saved_view_filters(
+    value: serde_json::Value,
+) -> Result<serde_json::Value, Response> {
+    if !value.is_object() {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard saved view filters must be an object",
+            None,
+        ));
+    }
+    let encoded = serde_json::to_vec(&value).map_err(|error| {
+        tracing::error!(
+            code = synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            detail = %error,
+            "dashboard saved view filters encode failed"
+        );
+        dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard saved view filters are invalid",
+            None,
+        )
+    })?;
+    if encoded.len() > DASHBOARD_SAVED_VIEW_MAX_FILTER_BYTES {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "dashboard saved view filters are too large",
+            None,
+        ));
+    }
+    Ok(value)
+}
+
+fn dashboard_saved_view_id_from_name(name: &str, now_unix_ms: u64) -> String {
+    let mut slug = String::with_capacity(name.len().min(40));
+    let mut previous_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+        if slug.len() >= 48 {
+            break;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        slug.push_str("view");
+    }
+    format!("{slug}-{now_unix_ms}")
+}
+
+fn dashboard_saved_view_row_key(view_id: &str) -> String {
+    format!("{DASHBOARD_SAVED_VIEW_PREFIX}{view_id}")
 }
 
 async fn dashboard_local_model_spawn(
@@ -1929,6 +2328,23 @@ fn dashboard_error_code(error: &rmcp::ErrorData) -> String {
         .and_then(serde_json::Value::as_str)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| format!("{:?}", error.code))
+}
+
+fn dashboard_storage_error_response(
+    message: &str,
+    error: synapse_storage::StorageError,
+) -> Response {
+    tracing::error!(
+        code = synapse_core::error_codes::STORAGE_READ_FAILED,
+        detail = %error,
+        "dashboard storage operation failed"
+    );
+    dashboard_error_response(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        synapse_core::error_codes::STORAGE_READ_FAILED,
+        message,
+        None,
+    )
 }
 
 async fn approval_activate(
@@ -2182,12 +2598,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-C-punbR7.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-BJJmD3fP.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-CzYgyrqI.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-4twapC-e.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-C-punbR7.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-BJJmD3fP.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-CzYgyrqI.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-4twapC-e.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]
