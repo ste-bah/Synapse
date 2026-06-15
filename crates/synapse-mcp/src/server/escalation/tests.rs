@@ -79,6 +79,35 @@ fn approval_audit_events(db: &Db, approval_id: &str) -> Vec<ApprovalAuditRecord>
         .collect()
 }
 
+fn assert_linked_approval_ignored(
+    db: &Db,
+    item: &EscalationItem,
+    expected_audit_event: &str,
+) -> ApprovalItemRecord {
+    let approval = linked_approval(db, item);
+    assert_eq!(approval.status, ApprovalStatus::Ignored);
+    assert_eq!(
+        approval.decided_by_session.as_deref(),
+        Some("agent_attention_escalation")
+    );
+    assert!(
+        approval
+            .decision_note
+            .as_deref()
+            .is_some_and(|note| note.contains(&item.escalation_id)),
+        "decision note must name linked escalation"
+    );
+    assert!(
+        approval_audit_events(db, &approval.approval_id)
+            .iter()
+            .any(|audit| audit.event == expected_audit_event
+                && audit.before_status == Some(ApprovalStatus::Pending)
+                && audit.after_status == ApprovalStatus::Ignored),
+        "linked approval must have {expected_audit_event} audit row"
+    );
+    approval
+}
+
 // ---------------------------------------------------------------------------
 // Minimal real HTTP listener for Tier 1 webhook regression coverage
 // ---------------------------------------------------------------------------
@@ -290,7 +319,8 @@ fn resolves_on_state_change_out_of_attention() {
         &transition("agent-c", AgentLifecycleState::NeedsInput),
         100,
     );
-    let opened = only_open(&db, "agent-c").escalation_id;
+    let opened_item = only_open(&db, "agent-c");
+    let opened = opened_item.escalation_id.clone();
 
     // Agent resumes work → escalation auto-resolves.
     note_transition(
@@ -306,6 +336,7 @@ fn resolves_on_state_change_out_of_attention() {
         resolved.closed_reason.as_deref(),
         Some("state_change:working")
     );
+    assert_linked_approval_ignored(&db, &resolved, "linked_escalation_resolved");
 }
 
 #[test]
@@ -355,6 +386,7 @@ async fn process_pending_resolves_terminal_anchor_before_toast() {
 
     let report = process_pending(&db, 301).await.expect("sweep");
     assert_eq!(report.terminal_resolved, 1);
+    assert_eq!(report.linked_approvals_closed, 1);
     assert_eq!(report.tier0_fired, 0, "terminal anchors must not toast");
 
     let readback = read_item(&db, &item.escalation_id)
@@ -365,6 +397,65 @@ async fn process_pending_resolves_terminal_anchor_before_toast() {
         readback.closed_reason.as_deref(),
         Some("terminal_agent_state:dead:local_model_registry_row_missing")
     );
+    assert_linked_approval_ignored(&db, &readback, "linked_escalation_resolved");
+}
+
+#[tokio::test]
+async fn process_pending_closes_approval_for_already_resolved_escalation() {
+    let db = db();
+    note_transition(
+        &db,
+        &transition("legacy-resolved-agent", AgentLifecycleState::NeedsInput),
+        100,
+    );
+    let mut item = only_open(&db, "legacy-resolved-agent");
+    item.status = EscalationStatus::Resolved;
+    item.updated_at_unix_ms = 200;
+    item.next_escalate_at_unix_ms = None;
+    item.closed_reason = Some("legacy_resolved_without_approval_sync".to_owned());
+    write_item_and_audit(
+        &db,
+        &item,
+        "resolved",
+        json!({ "reason": "legacy_test_without_approval_sync" }),
+    )
+    .expect("legacy resolved write");
+    assert_eq!(linked_approval(&db, &item).status, ApprovalStatus::Pending);
+
+    let report = process_pending(&db, 300).await.expect("sweep");
+    assert_eq!(report.linked_approvals_closed, 1);
+    let readback = read_item(&db, &item.escalation_id)
+        .unwrap()
+        .expect("item readback");
+    assert_eq!(readback.status, EscalationStatus::Resolved);
+    assert_linked_approval_ignored(&db, &readback, "linked_escalation_already_closed");
+}
+
+#[tokio::test]
+async fn ttl_expiry_closes_linked_approval() {
+    let db = db();
+    let policy = EscalationPolicy {
+        ttl_sensitive_ms: 10,
+        ..EscalationPolicy::default()
+    };
+    let item = open_escalation(
+        &db,
+        &transition("ttl-agent", AgentLifecycleState::Stuck),
+        Severity::Critical,
+        &policy,
+        100,
+    )
+    .expect("open");
+    assert_eq!(linked_approval(&db, &item).status, ApprovalStatus::Pending);
+
+    let report = process_pending(&db, 111).await.expect("sweep");
+    assert_eq!(report.expired, 1);
+    assert_eq!(report.linked_approvals_closed, 1);
+    let expired = read_item(&db, &item.escalation_id)
+        .unwrap()
+        .expect("item readback");
+    assert_eq!(expired.status, EscalationStatus::Expired);
+    assert_linked_approval_ignored(&db, &expired, "linked_escalation_expired");
 }
 
 // ---------------------------------------------------------------------------

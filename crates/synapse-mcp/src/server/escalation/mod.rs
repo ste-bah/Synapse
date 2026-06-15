@@ -675,6 +675,86 @@ fn approval_rows_for_opened_escalation(
     ])
 }
 
+fn approval_status_is_terminal(status: ApprovalStatus) -> bool {
+    matches!(
+        status,
+        ApprovalStatus::Accepted | ApprovalStatus::Declined | ApprovalStatus::Ignored
+    )
+}
+
+fn linked_approval_terminal_rows(
+    db: &Db,
+    item: &EscalationItem,
+    event: &str,
+    note: String,
+) -> Result<CfKvRows, ErrorData> {
+    let approval_key = approval_item_key(&item.approval_id);
+    let Some(value) = read_exact_row(db, &approval_key)? else {
+        return Ok(Vec::new());
+    };
+    let mut approval = decode_json::<ApprovalItemRecord>(&value).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "linked approval item decode failed for escalation {} approval {}: {error}",
+                item.escalation_id, item.approval_id
+            ),
+        )
+    })?;
+    if approval.kind != ApprovalKind::AgentEscalation
+        || approval_status_is_terminal(approval.status)
+    {
+        return Ok(Vec::new());
+    }
+    let before_status = approval.status;
+    approval.status = ApprovalStatus::Ignored;
+    approval.updated_at_unix_ms = item.updated_at_unix_ms;
+    approval.expires_at_unix_ms = None;
+    approval.decided_by_session = Some("agent_attention_escalation".to_owned());
+    approval.decided_at_unix_ms = Some(item.updated_at_unix_ms);
+    approval.decision_note = Some(note);
+
+    let audit_event_id = Uuid::now_v7().simple().to_string();
+    let audit = ApprovalAuditRecord {
+        schema_version: SCHEMA_VERSION,
+        approval_id: approval.approval_id.clone(),
+        event_id: audit_event_id.clone(),
+        event: event.to_owned(),
+        at_unix_ms: item.updated_at_unix_ms,
+        by_session: "agent_attention_escalation".to_owned(),
+        before_status: Some(before_status),
+        after_status: ApprovalStatus::Ignored,
+        note: approval.decision_note.clone(),
+    };
+    let approval_value = encode_json(&approval).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "linked approval item encode failed for escalation {} approval {}: {error}",
+                item.escalation_id, item.approval_id
+            ),
+        )
+    })?;
+    let audit_key = approval_audit_key(
+        &approval.approval_id,
+        item.updated_at_unix_ms,
+        &audit_event_id,
+    );
+    let audit_value = encode_json(&audit).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "linked approval audit encode failed for escalation {} approval {}: {error}",
+                item.escalation_id, item.approval_id
+            ),
+        )
+    })?;
+    Ok(vec![
+        (approval_key, approval_value),
+        (audit_key, audit_value),
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // Quiet hours
 // ---------------------------------------------------------------------------
@@ -741,11 +821,21 @@ fn note_transition_inner(
         item.updated_at_unix_ms = now_unix_ms;
         item.next_escalate_at_unix_ms = None;
         item.closed_reason = Some(format!("state_change:{new_state}"));
-        write_item_and_audit(
+        let approval_rows = linked_approval_terminal_rows(
+            db,
+            &item,
+            "linked_escalation_resolved",
+            format!(
+                "linked escalation {} resolved by state_change:{new_state}",
+                item.escalation_id
+            ),
+        )?;
+        write_item_and_audit_with_extra_rows(
             db,
             &item,
             "resolved",
             json!({ "reason": "state_change", "new_state": new_state }),
+            approval_rows,
         )?;
         superseded = true;
         tracing::info!(
@@ -996,6 +1086,7 @@ pub(crate) struct ProcessReport {
     pub tier1_failed: usize,
     pub expired: usize,
     pub terminal_resolved: usize,
+    pub linked_approvals_closed: usize,
     pub scanned: usize,
 }
 
@@ -1016,6 +1107,36 @@ pub(crate) async fn process_pending(
     report.scanned = items.len();
     for mut item in items {
         if !item.status.is_open() {
+            if matches!(
+                item.status,
+                EscalationStatus::Resolved | EscalationStatus::Expired
+            ) {
+                let approval_rows = linked_approval_terminal_rows(
+                    db,
+                    &item,
+                    "linked_escalation_already_closed",
+                    format!(
+                        "linked escalation {} is already {}",
+                        item.escalation_id,
+                        item.status.as_str()
+                    ),
+                )?;
+                if !approval_rows.is_empty() {
+                    item.updated_at_unix_ms = now_unix_ms;
+                    write_item_and_audit_with_extra_rows(
+                        db,
+                        &item,
+                        "linked_approval_closed",
+                        json!({
+                            "reason": "linked_escalation_already_closed",
+                            "status": item.status.as_str(),
+                            "approval_id": &item.approval_id,
+                        }),
+                        approval_rows,
+                    )?;
+                    report.linked_approvals_closed += 1;
+                }
+            }
             continue;
         }
         if let Some(agent_state) = terminal_agent_read_for_item(&terminal_agent_reads, &item) {
@@ -1024,7 +1145,19 @@ pub(crate) async fn process_pending(
             item.next_escalate_at_unix_ms = None;
             let reason = agent_state.reason_code.as_deref().unwrap_or("dead");
             item.closed_reason = Some(format!("terminal_agent_state:dead:{reason}"));
-            write_item_and_audit(
+            let approval_rows = linked_approval_terminal_rows(
+                db,
+                &item,
+                "linked_escalation_resolved",
+                format!(
+                    "linked escalation {} resolved because anchor is terminal dead:{reason}",
+                    item.escalation_id
+                ),
+            )?;
+            if !approval_rows.is_empty() {
+                report.linked_approvals_closed += 1;
+            }
+            write_item_and_audit_with_extra_rows(
                 db,
                 &item,
                 "resolved",
@@ -1032,6 +1165,7 @@ pub(crate) async fn process_pending(
                     "reason": "terminal_agent_state",
                     "agent_state": agent_state,
                 }),
+                approval_rows,
             )?;
             report.terminal_resolved += 1;
             tracing::info!(
@@ -1049,11 +1183,21 @@ pub(crate) async fn process_pending(
             item.updated_at_unix_ms = now_unix_ms;
             item.next_escalate_at_unix_ms = None;
             item.closed_reason = Some("ttl_expired".to_owned());
-            write_item_and_audit(
+            let approval_rows = linked_approval_terminal_rows(
+                db,
+                &item,
+                "linked_escalation_expired",
+                format!("linked escalation {} expired by ttl", item.escalation_id),
+            )?;
+            if !approval_rows.is_empty() {
+                report.linked_approvals_closed += 1;
+            }
+            write_item_and_audit_with_extra_rows(
                 db,
                 &item,
                 "expired",
                 json!({ "ttl_ms": item.expires_at_unix_ms }),
+                approval_rows,
             )?;
             report.expired += 1;
             tracing::warn!(
