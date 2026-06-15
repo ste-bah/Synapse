@@ -60,6 +60,7 @@ import {
 import {
   buildAgents,
   buildToolCalls,
+  decideApproval,
   deleteDashboardView,
   fetchAuditQuery,
   fetchTemplates,
@@ -492,7 +493,7 @@ export function App() {
       ) : null}
       {normalizedRoute === "agent" ? <AgentView state={state} selectedAgent={selectedAgent} toolCalls={toolCalls} onAuditKeySelect={focusAuditKey} /> : null}
       {normalizedRoute === "tasks" ? <TasksView agents={agents} attentionCount={attentionCount} /> : null}
-      {normalizedRoute === "approvals" ? <ApprovalsView state={state} /> : null}
+      {normalizedRoute === "approvals" ? <ApprovalsView state={state} onDecided={() => query.refetch()} /> : null}
       {normalizedRoute === "system" ? (
         <SystemView state={state} agents={agents} attentionCount={attentionCount} toolCalls={toolCalls} stale={stale} onRefresh={() => query.refetch()} />
       ) : null}
@@ -951,30 +952,318 @@ function TasksView({ agents, attentionCount }: { agents: AgentSummary[]; attenti
   );
 }
 
-function ApprovalsView({ state }: { state?: DashboardState }) {
+interface ApprovalRow {
+  approvalId: string;
+  kind: string;
+  status: string;
+  title: string;
+  body: string;
+  destructive: boolean;
+  createdMs: number;
+  updatedMs: number;
+  expiresMs?: number;
+  toolName?: string;
+  spawnId?: string;
+  command?: string;
+  inputPretty?: string;
+  raw: Record<string, unknown>;
+}
+
+function parseApprovalRows(panel?: DashboardState["approvals"]): ApprovalRow[] {
+  const data = asRecord(panelData(panel));
+  const rows = asArray<Record<string, unknown>>(data.rows);
+  return rows
+    .map((row): ApprovalRow | null => {
+      const item = asRecord(row.item);
+      const approvalId = rawText(item.approval_id);
+      if (!approvalId) return null;
+      let payload: Record<string, unknown> = {};
+      const payloadJson = item.payload_json;
+      if (typeof payloadJson === "string" && payloadJson.length) {
+        try {
+          payload = asRecord(JSON.parse(payloadJson));
+        } catch {
+          /* leave payload empty; raw stays available below */
+        }
+      }
+      const input = payload.input;
+      const command =
+        asRecord(input).command && typeof asRecord(input).command === "string"
+          ? (asRecord(input).command as string)
+          : undefined;
+      const inputPretty =
+        input === undefined || input === null
+          ? undefined
+          : JSON.stringify(input, null, 2);
+      return {
+        approvalId,
+        kind: rawText(item.kind) || "unknown",
+        status: rawText(item.status) || "pending",
+        title: rawText(item.title) || approvalId,
+        body: rawText(item.body),
+        destructive: item.destructive === true,
+        createdMs: Number(item.created_at_unix_ms) || 0,
+        updatedMs: Number(item.updated_at_unix_ms) || 0,
+        expiresMs:
+          item.expires_at_unix_ms == null ? undefined : Number(item.expires_at_unix_ms),
+        toolName: rawText(payload.tool_name) || undefined,
+        spawnId: rawText(payload.spawn_id) || undefined,
+        command,
+        inputPretty,
+        raw: item
+      };
+    })
+    .filter((row): row is ApprovalRow => row !== null);
+}
+
+const APPROVAL_KIND_LABEL: Record<string, string> = {
+  agent_permission: "Agent permission",
+  agent_escalation: "Agent escalation",
+  suggestion: "Suggestion",
+  armed_run_review: "Armed run"
+};
+
+function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided?: () => void }) {
+  const rows = useMemo(() => parseApprovalRows(state?.approvals), [state]);
+  const agentRows = useMemo(
+    () => rows.filter((row) => row.kind === "agent_permission" || row.kind === "agent_escalation"),
+    [rows]
+  );
+  const otherRows = useMemo(
+    () => rows.filter((row) => row.kind !== "agent_permission" && row.kind !== "agent_escalation"),
+    [rows]
+  );
+
+  const [busy, setBusy] = useState<Record<string, boolean>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [notes, setNotes] = useState<Record<string, string>>({});
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  async function decide(approvalId: string, decision: "approve" | "deny") {
+    setBusy((prev) => ({ ...prev, [approvalId]: true }));
+    setErrors((prev) => {
+      const next = { ...prev };
+      delete next[approvalId];
+      return next;
+    });
+    try {
+      const note = notes[approvalId]?.trim();
+      await decideApproval({ approval_id: approvalId, decision, note: note || undefined });
+      setSelected((prev) => {
+        const next = new Set(prev);
+        next.delete(approvalId);
+        return next;
+      });
+      onDecided?.();
+    } catch (err) {
+      setErrors((prev) => ({
+        ...prev,
+        [approvalId]: err instanceof Error ? err.message : String(err)
+      }));
+    } finally {
+      setBusy((prev) => ({ ...prev, [approvalId]: false }));
+    }
+  }
+
+  async function decideSelected(decision: "approve" | "deny") {
+    for (const id of Array.from(selected)) {
+      // Sequential so one failure surfaces against its own card without
+      // racing the shared refetch.
+      // eslint-disable-next-line no-await-in-loop
+      await decide(id, decision);
+    }
+  }
+
+  function toggleSelected(approvalId: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(approvalId)) next.delete(approvalId);
+      else next.add(approvalId);
+      return next;
+    });
+  }
+
+  const selectedCount = selected.size;
+
   return (
-    <div className="grid gap-6 xl:grid-cols-3">
-      <ApprovalPanel title="Approvals" panel={state?.approvals} />
-      <ApprovalPanel title="Suggestions" panel={state?.suggestions} />
-      <ApprovalPanel title="Armed Runs" panel={state?.armed_runs} />
+    <div className="space-y-6">
+      <Section
+        title="Agents awaiting your decision"
+        tier="triage"
+        questions={[
+          "Which agents are paused waiting on a human?",
+          "What exact action does each want to run?",
+          "Does approving here resume the blocked agent?"
+        ]}
+        actions={
+          selectedCount ? (
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-secondary">{selectedCount} selected</span>
+              <Button size="sm" variant="secondary" onClick={() => void decideSelected("approve")}>
+                <CheckCircle2 className="size-4" /> Approve selected
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => void decideSelected("deny")}>
+                <X className="size-4" /> Deny selected
+              </Button>
+            </div>
+          ) : undefined
+        }
+      >
+        <div className="mb-3 flex items-center gap-3">
+          <StatCard
+            label="Pending"
+            value={agentRows.length}
+            status={agentRows.length ? "awaiting_approval" : "done"}
+            delta={agentRows.length ? "blocking agents" : "fleet unblocked"}
+          />
+        </div>
+        {agentRows.length ? (
+          <div className="space-y-3">
+            {agentRows.map((row) => (
+              <ApprovalCard
+                key={row.approvalId}
+                row={row}
+                busy={!!busy[row.approvalId]}
+                error={errors[row.approvalId]}
+                note={notes[row.approvalId] ?? ""}
+                selected={selected.has(row.approvalId)}
+                onToggleSelected={() => toggleSelected(row.approvalId)}
+                onNote={(value) => setNotes((prev) => ({ ...prev, [row.approvalId]: value }))}
+                onApprove={() => void decide(row.approvalId, "approve")}
+                onDeny={() => void decide(row.approvalId, "deny")}
+              />
+            ))}
+          </div>
+        ) : (
+          <EmptyStateArt title="No agents are waiting for approval" />
+        )}
+      </Section>
+
+      {otherRows.length ? (
+        <Section
+          title="Suggestions & armed runs"
+          tier="triage"
+          questions={["Which non-blocking proposals are queued?", "Do any need a decision before they expire?"]}
+        >
+          <div className="space-y-3">
+            {otherRows.map((row) => (
+              <ApprovalCard
+                key={row.approvalId}
+                row={row}
+                busy={!!busy[row.approvalId]}
+                error={errors[row.approvalId]}
+                note={notes[row.approvalId] ?? ""}
+                selected={selected.has(row.approvalId)}
+                onToggleSelected={() => toggleSelected(row.approvalId)}
+                onNote={(value) => setNotes((prev) => ({ ...prev, [row.approvalId]: value }))}
+                onApprove={() => void decide(row.approvalId, "approve")}
+                onDeny={() => void decide(row.approvalId, "deny")}
+              />
+            ))}
+          </div>
+        </Section>
+      ) : null}
     </div>
   );
 }
 
-function ApprovalPanel({ title, panel }: { title: string; panel?: DashboardState["approvals"] }) {
-  const data = asRecord(panelData(panel));
-  const rows = asArray<Record<string, unknown>>(data.rows);
+function ApprovalCard({
+  row,
+  busy,
+  error,
+  note,
+  selected,
+  onToggleSelected,
+  onNote,
+  onApprove,
+  onDeny
+}: {
+  row: ApprovalRow;
+  busy: boolean;
+  error?: string;
+  note: string;
+  selected: boolean;
+  onToggleSelected: () => void;
+  onNote: (value: string) => void;
+  onApprove: () => void;
+  onDeny: () => void;
+}) {
+  const kindLabel = APPROVAL_KIND_LABEL[row.kind] ?? row.kind;
+  const expiresInMs = row.expiresMs ? row.expiresMs - Date.now() : undefined;
+  const expiresLabel =
+    expiresInMs === undefined
+      ? undefined
+      : expiresInMs <= 0
+        ? "expired"
+        : `expires in ${Math.max(1, Math.round(expiresInMs / 60000))}m`;
+
   return (
-    <Section
-      title={title}
-      tier="triage"
-      questions={["Which approvals are pending?", "What source row backs this list?", "Does raw detail stay collapsed?"]}
-    >
-      <div className="space-y-3">
-        <StatCard label="Rows" value={rows.length} status={rows.length ? "awaiting_approval" : "done"} delta={rawText(data.tool || panel?.source)} />
-        {rows.length ? rows.slice(0, 4).map((row, index) => <RawValue key={index} value={row} label="Approval row" />) : <EmptyStateArt title="No approval rows" />}
+    <div className="rounded-lg border border-border bg-surface p-[var(--density-card-padding)]">
+      <div className="flex items-start gap-3">
+        <input
+          type="checkbox"
+          aria-label="Select approval"
+          checked={selected}
+          onChange={onToggleSelected}
+          className="mt-1 size-4 accent-[var(--accent)]"
+        />
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="rounded bg-canvas px-2 py-0.5 font-mono text-[11px] uppercase tracking-wide text-secondary">
+              {kindLabel}
+            </span>
+            {row.destructive ? (
+              <span className="rounded bg-[var(--danger-surface,#3a1f1f)] px-2 py-0.5 text-[11px] font-semibold text-[var(--danger,#ff6b6b)]">
+                destructive
+              </span>
+            ) : null}
+            {row.toolName ? (
+              <span className="font-mono text-xs text-primary">{row.toolName}</span>
+            ) : null}
+            <span className="ml-auto text-[11px] text-tertiary">
+              {row.createdMs ? timeAgo(row.createdMs) : ""}
+              {expiresLabel ? ` · ${expiresLabel}` : ""}
+            </span>
+          </div>
+
+          <div className="mt-1 text-sm font-medium text-primary">{row.title}</div>
+          {row.spawnId ? (
+            <div className="mt-0.5 font-mono text-[11px] text-tertiary">agent: {row.spawnId}</div>
+          ) : null}
+
+          {row.command ? (
+            <pre className="mt-2 overflow-x-auto rounded bg-canvas p-2 font-mono text-xs text-primary">
+              {row.command}
+            </pre>
+          ) : row.inputPretty ? (
+            <pre className="mt-2 max-h-48 overflow-auto rounded bg-canvas p-2 font-mono text-[11px] text-secondary">
+              {row.inputPretty}
+            </pre>
+          ) : (
+            <div className="mt-2 text-xs text-secondary">{row.body}</div>
+          )}
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <input
+              type="text"
+              value={note}
+              onChange={(event) => onNote(event.target.value)}
+              placeholder="Optional note / reason…"
+              className="h-8 min-w-[12rem] flex-1 rounded border border-border bg-canvas px-2 text-xs text-primary placeholder:text-tertiary"
+            />
+            <Button size="sm" variant="secondary" disabled={busy} onClick={onApprove}>
+              <CheckCircle2 className="size-4" /> {busy ? "…" : "Approve"}
+            </Button>
+            <Button size="sm" variant="ghost" disabled={busy} onClick={onDeny}>
+              <X className="size-4" /> Deny
+            </Button>
+          </div>
+          {error ? (
+            <div className="mt-2 text-xs text-[var(--danger,#ff6b6b)]">{error}</div>
+          ) : null}
+        </div>
       </div>
-    </Section>
+    </div>
   );
 }
 

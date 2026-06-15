@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 169,
+  "count": 170,
   "m4_defaults": [
     {
       "actual": 33,
@@ -247,6 +247,7 @@ expression: snapshot
     "agent_template_put",
     "agent_wait",
     "approval_decide",
+    "approval_gate",
     "approval_list",
     "approval_request",
     "audio_tail",

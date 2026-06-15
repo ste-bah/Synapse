@@ -152,7 +152,31 @@ impl SynapseService {
             .unwrap_or_else(|| "stdio".to_owned());
         let spawn_id = header_value(&request_context, SPAWN_ID_HEADER);
 
-        let decision = permission_policy::classify(&tool_name, &input);
+        self.run_gate(
+            &tool_name,
+            &input,
+            params.tool_use_id.as_deref(),
+            &by_session,
+            spawn_id.as_deref(),
+        )
+        .await
+    }
+}
+
+impl SynapseService {
+    /// Core gate logic, decoupled from the MCP `RequestContext` so it is
+    /// directly testable in-process (mirrors the `*_without_request_context`
+    /// convention). Classifies the call, auto-allows safe ones, or creates a
+    /// Pending approval and blocks until a human decides / the deadline.
+    pub(crate) async fn run_gate(
+        &self,
+        tool_name: &str,
+        input: &Value,
+        tool_use_id: Option<&str>,
+        by_session: &str,
+        spawn_id: Option<&str>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let decision = permission_policy::classify(tool_name, input);
         if !decision.is_gate() {
             tracing::info!(
                 code = "APPROVAL_GATE_AUTO_ALLOW",
@@ -160,19 +184,13 @@ impl SynapseService {
                 spawn_id = ?spawn_id,
                 "approval_gate auto-allowed a low-consequence tool call"
             );
-            return Ok(allow_result(&input));
+            return Ok(allow_result(input));
         }
 
         let db = self.m3_storage()?;
         let now = now_unix_ms();
-        let request = build_request(
-            &tool_name,
-            &input,
-            params.tool_use_id.as_deref(),
-            spawn_id.as_deref(),
-            decision,
-        )?;
-        let created = approvals::request_approval(&db, &request, &by_session)?;
+        let request = build_request(tool_name, input, tool_use_id, spawn_id, decision)?;
+        let created = approvals::request_approval(&db, &request, by_session)?;
         let approval_id = created.item.approval_id.clone();
         tracing::warn!(
             code = "APPROVAL_GATE_PENDING",
@@ -184,12 +202,10 @@ impl SynapseService {
             "approval_gate is blocking on a human decision"
         );
 
-        let outcome = self.block_for_decision(&db, &approval_id, &input, now).await?;
-        Ok(outcome)
+        self.block_for_decision(&db, &approval_id, input, now).await
     }
-}
 
-impl SynapseService {
+
     async fn block_for_decision(
         &self,
         db: &Arc<synapse_storage::Db>,
@@ -302,17 +318,29 @@ fn build_request(
 }
 
 fn build_body(tool_name: &str, input: &Value) -> String {
+    // The approvals store rejects control characters in title/body (they must
+    // be single-line display strings); the full, exact input — including any
+    // newlines — is preserved losslessly in payload_json for the UI to render.
     let mut body = if tool_name == "Bash" {
         match input.get("command").and_then(Value::as_str) {
-            Some(command) => format!("Run shell command:\n{command}"),
+            Some(command) => format!("Run shell command: {}", single_line(command)),
             None => format!("Agent wants to use {tool_name}."),
         }
     } else {
-        let rendered = serde_json::to_string_pretty(input).unwrap_or_else(|_| "{}".to_owned());
-        format!("Agent wants to use {tool_name} with input:\n{rendered}")
+        let rendered = serde_json::to_string(input).unwrap_or_else(|_| "{}".to_owned());
+        format!("Agent wants to use {tool_name} with input: {}", single_line(&rendered))
     };
     body.truncate(4_000);
     body
+}
+
+/// Collapse control characters (newlines/tabs/etc.) to spaces so the string is
+/// a valid single-line approval title/body.
+fn single_line(value: &str) -> String {
+    value
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
 }
 
 fn display_tool_name(tool_name: &str) -> String {
@@ -387,4 +415,191 @@ fn header_value(request_context: &RequestContext<RoleServer>, name: &str) -> Opt
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    //! In-process gate FSV: a real `SynapseService` over a temp RocksDB. We
+    //! drive `run_gate` with synthetic risky input, watch the Pending
+    //! `agent_permission` row appear in `CF_KV` (physical source of truth),
+    //! decide it through the real dashboard decide path, and assert both the
+    //! verdict JSON returned to the (would-be) agent AND the durable row state.
+    use std::num::NonZeroUsize;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use serde_json::{Value, json};
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::m2::M2ServiceConfig;
+    use crate::m3::M3ServiceConfig;
+    use crate::m3::approvals::{ApprovalDecision, ApprovalKind, ApprovalStatus, approval_snapshot};
+    use crate::m4::M4ServiceConfig;
+
+    fn service_with_db(path: &Path) -> SynapseService {
+        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(path.join("db")),
+                Some(path.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                NonZeroUsize::new(4).expect("nonzero"),
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
+        .expect("construct service")
+    }
+
+    fn verdict_of(result: &CallToolResult) -> Value {
+        let text = result
+            .content
+            .iter()
+            .filter_map(|content| content.as_text().map(|t| t.text.clone()))
+            .collect::<Vec<_>>()
+            .join("");
+        serde_json::from_str(&text).expect("verdict is JSON")
+    }
+
+    /// Wait for the single pending `agent_permission` approval to appear and
+    /// return its id (the gate generates the id internally).
+    async fn await_pending_id(service: &SynapseService) -> String {
+        let db = service.m3_storage().expect("storage");
+        for _ in 0..200 {
+            let pending = approval_snapshot(&db, Some(ApprovalKind::AgentPermission)).expect("snap");
+            if let Some(item) = pending.into_iter().next() {
+                return item.item.approval_id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("no pending agent_permission approval ever appeared");
+    }
+
+    #[tokio::test]
+    async fn auto_allows_safe_tool_without_creating_a_row() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let result = service
+            .run_gate("Read", &json!({"file":"x"}), Some("t1"), "sess", Some("agent-spawn-a"))
+            .await
+            .expect("gate");
+        let verdict = verdict_of(&result);
+        assert_eq!(verdict["behavior"], "allow");
+        // Physical SoT: no approval row was created for an auto-allowed call.
+        let db = service.m3_storage().expect("storage");
+        let pending = approval_snapshot(&db, Some(ApprovalKind::AgentPermission)).expect("snap");
+        assert!(pending.is_empty(), "auto-allow must not enqueue an approval");
+    }
+
+    #[tokio::test]
+    async fn risky_tool_blocks_then_resumes_allow_on_approval() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let input = json!({ "command": "git push origin main" });
+
+        let gate = service.run_gate("Bash", &input, Some("tuse-1"), "sess", Some("agent-spawn-b"));
+        let decide = async {
+            let id = await_pending_id(&service).await;
+            // Physical SoT before deciding: row is Pending, destructive, gate kind.
+            let db = service.m3_storage().expect("storage");
+            let item = crate::m3::approvals::get_approval(&db, &id)
+                .expect("read")
+                .expect("exists")
+                .item;
+            assert_eq!(item.status, ApprovalStatus::Pending);
+            assert_eq!(item.kind, ApprovalKind::AgentPermission);
+            assert!(item.destructive, "git push must be flagged destructive");
+            service
+                .approval_decide_from_dashboard(&id, ApprovalDecision::Accept, None, "tester")
+                .expect("decide");
+            id
+        };
+        let (result, id) = tokio::join!(gate, decide);
+        let verdict = verdict_of(&result.expect("gate ok"));
+        assert_eq!(verdict["behavior"], "allow");
+        assert_eq!(verdict["updatedInput"]["command"], "git push origin main");
+        // Physical SoT after: durable row is Accepted.
+        let db = service.m3_storage().expect("storage");
+        let item = crate::m3::approvals::get_approval(&db, &id)
+            .expect("read")
+            .expect("exists")
+            .item;
+        assert_eq!(item.status, ApprovalStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn risky_tool_resumes_deny_on_decline_with_reason() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let input = json!({ "command": "rm -rf build" });
+
+        let gate = service.run_gate("Bash", &input, Some("tuse-2"), "sess", Some("agent-spawn-c"));
+        let decide = async {
+            let id = await_pending_id(&service).await;
+            service
+                .approval_decide_from_dashboard(
+                    &id,
+                    ApprovalDecision::Decline,
+                    Some("not safe right now"),
+                    "tester",
+                )
+                .expect("decide");
+            id
+        };
+        let (result, id) = tokio::join!(gate, decide);
+        let verdict = verdict_of(&result.expect("gate ok"));
+        assert_eq!(verdict["behavior"], "deny");
+        assert_eq!(verdict["message"], "not safe right now");
+        let db = service.m3_storage().expect("storage");
+        let item = crate::m3::approvals::get_approval(&db, &id)
+            .expect("read")
+            .expect("exists")
+            .item;
+        assert_eq!(item.status, ApprovalStatus::Declined);
+    }
+
+    #[tokio::test]
+    async fn deadline_denies_and_records_timeout_decline() {
+        // SAFETY: single-threaded within this async test; the small value only
+        // shortens THIS gate's block. Other gate tests decide in <1s so a leaked
+        // value cannot cause a false timeout there.
+        unsafe {
+            std::env::set_var("SYNAPSE_APPROVAL_GATE_TIMEOUT_MS", "1000");
+        }
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let result = service
+            .run_gate(
+                "Bash",
+                &json!({ "command": "curl https://evil.example" }),
+                Some("tuse-3"),
+                "sess",
+                Some("agent-spawn-d"),
+            )
+            .await
+            .expect("gate");
+        unsafe {
+            std::env::remove_var("SYNAPSE_APPROVAL_GATE_TIMEOUT_MS");
+        }
+        let verdict = verdict_of(&result);
+        assert_eq!(verdict["behavior"], "deny");
+        assert!(
+            verdict["message"].as_str().unwrap_or_default().contains("timed out"),
+            "timeout deny must explain itself: {verdict}"
+        );
+        // Physical SoT: the gate recorded its own timeout decline.
+        let db = service.m3_storage().expect("storage");
+        let pending = approval_snapshot(&db, Some(ApprovalKind::AgentPermission)).expect("snap");
+        assert!(pending.is_empty(), "timed-out approval must no longer be pending");
+    }
 }

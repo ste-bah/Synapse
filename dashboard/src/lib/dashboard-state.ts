@@ -522,6 +522,36 @@ export async function killAgent(request: AgentKillRequest): Promise<AgentKillRes
   return (await readJsonOrThrow(response)) as unknown as AgentKillResponse;
 }
 
+export type ApprovalDecisionVerb = "approve" | "deny";
+
+export interface ApprovalDecideRequest {
+  approval_id: string;
+  decision: ApprovalDecisionVerb;
+  note?: string;
+}
+
+export interface ApprovalDecideResponse {
+  ok: boolean;
+  trigger: string;
+  source_of_truth: string;
+  decision: Record<string, unknown>;
+}
+
+// Resolve one pending approval from the inbox (#927). For an `agent_permission`
+// row this unblocks the still-running agent's permission_gate call.
+export async function decideApproval(
+  request: ApprovalDecideRequest
+): Promise<ApprovalDecideResponse> {
+  const response = await fetch("/dashboard/approval/decide", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: csrfHeaders(),
+    body: JSON.stringify(request)
+  });
+  return (await readJsonOrThrow(response)) as unknown as ApprovalDecideResponse;
+}
+
 export async function pauseTimeline(duration_ms?: number): Promise<TimelineControlResponse> {
   const response = await fetch("/dashboard/timeline/pause", {
     method: "POST",

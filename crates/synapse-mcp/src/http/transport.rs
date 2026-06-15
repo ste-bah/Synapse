@@ -575,6 +575,16 @@ fn router(
             )),
         )
         .route(
+            "/dashboard/api-model/update",
+            post(dashboard_api_model_update).layer(DefaultBodyLimit::max(
+                DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/dashboard/api-model/remove",
+            post(dashboard_api_model_remove),
+        )
+        .route(
             "/dashboard/approval/decide",
             post(dashboard_approval_decide)
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
@@ -1793,6 +1803,29 @@ struct DashboardModelListResponse {
     trigger: &'static str,
     source_of_truth: &'static str,
     list: crate::m3::local_models::LocalModelListResponse,
+}
+
+/// Browser-facing request to remove a model-registry row (and its stored key).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardModelRemoveRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+struct DashboardModelRemoveResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    remove: crate::m3::local_models::LocalModelRemoveResponse,
+}
+
+#[derive(Serialize)]
+struct DashboardModelUpdateResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    update: crate::m3::local_models::LocalModelUpdateResponse,
 }
 
 #[derive(Serialize)]
@@ -3225,6 +3258,73 @@ async fn dashboard_api_model_register(
     }
 }
 
+async fn dashboard_api_model_update(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(params): Json<crate::m3::local_models::LocalModelUpdateParams>,
+) -> Response {
+    if let Err(response) = state.dashboard_auth.authenticate(
+        &headers,
+        "POST",
+        "/dashboard/api-model/update",
+        CsrfPolicy::Required,
+    ) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_update_local_model(params).await {
+        Ok(update) => with_dashboard_security_headers(
+            Json(DashboardModelUpdateResponse {
+                ok: true,
+                trigger: "dashboard.api_model_update",
+                source_of_truth: "CF_KV local_model_registry/v1/model/name_hex/",
+                update,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_api_model_remove(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardModelRemoveRequest>,
+) -> Response {
+    if let Err(response) = state.dashboard_auth.authenticate(
+        &headers,
+        "POST",
+        "/dashboard/api-model/remove",
+        CsrfPolicy::Required,
+    ) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = crate::m3::local_models::LocalModelRemoveParams {
+        name: request.name,
+    };
+    match state.health_service.dashboard_remove_local_model(params) {
+        Ok(remove) => with_dashboard_security_headers(
+            Json(DashboardModelRemoveResponse {
+                ok: true,
+                trigger: "dashboard.api_model_remove",
+                source_of_truth: "CF_KV local_model_registry/v1/model/name_hex/",
+                remove,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
 async fn dashboard_model_list(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if let Err(response) = state.dashboard_auth.authenticate(
         &headers,
@@ -3669,12 +3769,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-Bkp29v78.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-CZWbP4ns.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-DGTECjYz.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-CZx4g_x2.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-Bkp29v78.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-CZWbP4ns.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-DGTECjYz.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-CZx4g_x2.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

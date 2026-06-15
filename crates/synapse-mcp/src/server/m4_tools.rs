@@ -1119,6 +1119,41 @@ impl SynapseService {
         )
     }
 
+    /// Removes a model-registry row (and any stored encrypted key) for the
+    /// dashboard model manager. Same CF_KV source of truth as `local_model_remove`.
+    pub(crate) fn dashboard_remove_local_model(
+        &self,
+        params: crate::m3::local_models::LocalModelRemoveParams,
+    ) -> Result<crate::m3::local_models::LocalModelRemoveResponse, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_MODEL_REMOVE_REQUESTED",
+            name = %params.name,
+            "dashboard.invocation kind=local_model_remove"
+        );
+        let db = self.m3_storage()?;
+        crate::m3::local_models::remove_local_model(&db, &params)
+    }
+
+    /// Updates a model-registry row (rename, edit fields, (re)store/clear the
+    /// API key, enable/disable) for the dashboard model manager, re-probing as
+    /// `update_local_model` requires. Same CF_KV source of truth.
+    pub(crate) async fn dashboard_update_local_model(
+        &self,
+        params: crate::m3::local_models::LocalModelUpdateParams,
+    ) -> Result<crate::m3::local_models::LocalModelUpdateResponse, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_MODEL_UPDATE_REQUESTED",
+            name = %params.name,
+            new_name = params.new_name.as_deref().unwrap_or(""),
+            has_api_key = params.api_key.is_some(),
+            clear_api_key = params.clear_api_key,
+            enabled = ?params.enabled,
+            "dashboard.invocation kind=local_model_update"
+        );
+        let db = self.m3_storage()?;
+        crate::m3::local_models::update_local_model(&db, params, "dashboard").await
+    }
+
     /// Resolves a caller's spawn request into concrete spawn params. A direct
     /// spawn (no `template_id`) passes its fields through; a template spawn
     /// renders the params atomically from the durable template and stamps the
