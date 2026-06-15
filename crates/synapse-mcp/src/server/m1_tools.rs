@@ -1,8 +1,9 @@
 use super::{
-    CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse, CdpCloseTabParams,
-    CdpCloseTabResponse, CdpNavigateAction, CdpNavigateTabParams, CdpNavigateTabResponse,
-    CdpOpenTabParams, CdpOpenTabResponse, CdpTargetOwner, ErrorData, FindParams, FindResponse,
-    Health, HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse,
+    CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
+    CdpActiveElementInfo, CdpCloseTabParams, CdpCloseTabResponse, CdpNavigateAction,
+    CdpNavigateTabParams, CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse,
+    CdpTargetInfoParams, CdpTargetInfoResponse, CdpTargetOwner, ErrorData, FindParams,
+    FindResponse, Health, HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse,
     HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters, ReadTextParams, SessionTarget,
     SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
     SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
@@ -1150,6 +1151,37 @@ impl SynapseService {
     }
 
     #[tool(
+        description = "Read the calling session's active browser tab target, or an explicit session-owned target, without navigation, activation, or debugger attach. Raw CDP uses Target.getTargets; the normal Chrome bridge uses chrome.tabs.get plus content-script active-element readback where extension permissions allow. It never uses the human foreground tab as an implicit fallback."
+    )]
+    pub async fn cdp_target_info(
+        &self,
+        params: Parameters<CdpTargetInfoParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<CdpTargetInfoResponse>, ErrorData> {
+        const TOOL: &str = "cdp_target_info";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=cdp_target_info"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let (window_hwnd, cdp_target_id) =
+            self.resolve_cdp_target_info_target(&session_id, &params.0)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .cdp_target_info_impl(&session_id, window_hwnd, &cdp_target_id)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
         description = "Navigate, reload, back, or forward the calling session's active browser tab target in the background. Raw CDP uses Page.navigate/Page.reload/Page.navigateToHistoryEntry; the normal Chrome extension bridge uses chrome.tabs without debugger attach. Requires an active session CDP target or a target owned by this session; never uses the human foreground tab as an implicit fallback and returns separate URL/title/readback metadata."
     )]
     pub async fn cdp_navigate_tab(
@@ -1494,6 +1526,76 @@ impl SynapseService {
         Ok((window_hwnd, target_id))
     }
 
+    fn resolve_cdp_target_info_target(
+        &self,
+        session_id: &str,
+        params: &CdpTargetInfoParams,
+    ) -> Result<(i64, String), ErrorData> {
+        if let Some(target_id) = params.cdp_target_id.as_deref() {
+            validate_cdp_target_id(target_id)?;
+        }
+        let active_target = self.session_target(Some(session_id))?;
+        let owner = params
+            .cdp_target_id
+            .as_deref()
+            .map(|target_id| {
+                self.cdp_target_owner_for_readback("cdp_target_info", session_id, target_id)
+            })
+            .transpose()?
+            .flatten();
+        let target_id = match (params.cdp_target_id.as_ref(), active_target.as_ref()) {
+            (Some(target_id), _) => target_id.clone(),
+            (None, Some(SessionTarget::Cdp { cdp_target_id, .. })) => cdp_target_id.clone(),
+            (None, Some(SessionTarget::Window { .. }) | None) => {
+                return Err(mcp_error(
+                    error_codes::TARGET_NOT_SET,
+                    "cdp_target_info requires an active CDP session target or explicit cdp_target_id owned by this session; refusing to use the human foreground tab",
+                ));
+            }
+        };
+        let window_hwnd = params
+            .window_hwnd
+            .or_else(|| owner.as_ref().map(|owner| owner.window_hwnd))
+            .or_else(|| match active_target.as_ref() {
+                Some(SessionTarget::Cdp { window_hwnd, .. }) => Some(*window_hwnd),
+                Some(SessionTarget::Window { hwnd }) => Some(*hwnd),
+                None => None,
+            })
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::TARGET_NOT_SET,
+                    "cdp_target_info requires window_hwnd when using an explicit target id without an active session target",
+                )
+            })?;
+        let active_matches = matches!(
+            active_target.as_ref(),
+            Some(SessionTarget::Cdp {
+                window_hwnd: active_hwnd,
+                cdp_target_id: active_target_id,
+            }) if *active_hwnd == window_hwnd && active_target_id.eq_ignore_ascii_case(&target_id)
+        );
+        if !active_matches && owner.is_none() {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "cdp_target_info refused target {target_id:?}: target is not the active CDP target and is not owned by this MCP session"
+                ),
+            ));
+        }
+        if let Some(owner) = owner.as_ref()
+            && owner.window_hwnd != window_hwnd
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "cdp_target_info refused target {target_id:?}: owner window {:#x} does not match requested window {:#x}",
+                    owner.window_hwnd, window_hwnd
+                ),
+            ));
+        }
+        Ok((window_hwnd, target_id))
+    }
+
     fn cdp_target_owner_for_navigation(
         &self,
         session_id: &str,
@@ -1524,6 +1626,45 @@ impl SynapseService {
         }
         select_cdp_owner_for_session(
             "cdp_navigate_tab",
+            session_id,
+            target_id,
+            active_target.as_ref(),
+            owned_by_session,
+        )
+        .map(|(_key, owner)| Some(owner))
+    }
+
+    fn cdp_target_owner_for_readback(
+        &self,
+        tool: &str,
+        session_id: &str,
+        target_id: &str,
+    ) -> Result<Option<CdpTargetOwner>, ErrorData> {
+        let active_target = self.session_target(Some(session_id))?;
+        let owners = self.cdp_target_owners_for_target_id(target_id)?;
+        if owners.is_empty() {
+            return Ok(None);
+        }
+        let owned_by_session = owners
+            .iter()
+            .filter(|(_key, owner)| owner.session_id == session_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if owned_by_session.is_empty() {
+            let owner_sessions = owners
+                .iter()
+                .map(|(_key, owner)| owner.session_id.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{tool} refused target {target_id:?}: owner_session_id(s)={owner_sessions:?}, requesting_session_id={session_id:?}",
+                ),
+            ));
+        }
+        select_cdp_owner_for_session(
+            tool,
             session_id,
             target_id,
             active_target.as_ref(),
@@ -1809,6 +1950,127 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn cdp_target_info_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+    ) -> Result<CdpTargetInfoResponse, ErrorData> {
+        if let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) {
+            let targets = synapse_a11y::cdp_list_targets(&endpoint)
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("cdp_target_info Target.getTargets readback failed: {error}"),
+                    )
+                })?;
+            let Some(target) = targets
+                .iter()
+                .find(|target| cdp_target_ids_equal(&target.target_id, cdp_target_id))
+            else {
+                return Err(mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "cdp_target_info Target.getTargets readback did not contain target {cdp_target_id:?}"
+                    ),
+                ));
+            };
+            tracing::info!(
+                code = "CDP_TARGET_INFO_READ",
+                session_id = %session_id,
+                hwnd = window_hwnd,
+                endpoint = %endpoint,
+                cdp_target_id = %target.target_id,
+                target_url = %target.url,
+                target_title = %target.title,
+                "readback=Target.getTargets outcome=target_present"
+            );
+            return Ok(CdpTargetInfoResponse {
+                session_id: session_id.to_owned(),
+                window_hwnd,
+                transport: "raw_cdp".to_owned(),
+                endpoint,
+                cdp_target_id: target.target_id.clone(),
+                tab_id: None,
+                chrome_window_id: None,
+                target_type: target.target_type.clone(),
+                url: target.url.clone(),
+                title: target.title.clone(),
+                ready_state: String::new(),
+                active: false,
+                highlighted: false,
+                pinned: false,
+                readback_backend: "Target.getTargets".to_owned(),
+                backend_tier_used: "cdp".to_owned(),
+                required_foreground: false,
+                target_candidate_count: u32::try_from(targets.len()).unwrap_or(u32::MAX),
+                target_selection_reason: "target_id".to_owned(),
+                active_element: None,
+            });
+        }
+
+        let info = crate::chrome_debugger_bridge::target_info(window_hwnd, cdp_target_id)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "cdp_target_info Chrome bridge chrome.tabs.get/readback failed: {}",
+                        error.detail()
+                    ),
+                )
+            })?;
+        let endpoint = info
+            .extension_id
+            .as_deref()
+            .map(chrome_debugger_endpoint)
+            .unwrap_or_else(chrome_debugger_default_endpoint);
+        tracing::info!(
+            code = "CDP_TARGET_INFO_READ",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %info.target_id,
+            tab_id = info.tab_id,
+            target_url = %info.url,
+            target_title = %info.title,
+            ready_state = %info.ready_state,
+            active = info.active,
+            highlighted = info.highlighted,
+            pinned = info.pinned,
+            readback_backend = %info.readback_backend,
+            "readback=chrome.tabs.get outcome=target_present"
+        );
+        Ok(CdpTargetInfoResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "chrome_tabs_extension".to_owned(),
+            endpoint,
+            cdp_target_id: info.target_id,
+            tab_id: Some(info.tab_id),
+            chrome_window_id: info.chrome_window_id,
+            target_type: info.target_type,
+            url: info.url,
+            title: info.title,
+            ready_state: info.ready_state,
+            active: info.active,
+            highlighted: info.highlighted,
+            pinned: info.pinned,
+            readback_backend: if info.readback_backend.trim().is_empty() {
+                "chrome.tabs.get".to_owned()
+            } else {
+                info.readback_backend
+            },
+            backend_tier_used: "chrome_tabs".to_owned(),
+            required_foreground: false,
+            target_candidate_count: info.target_candidate_count,
+            target_selection_reason: info.target_selection_reason,
+            active_element: info.active_element.as_ref().map(chrome_active_element_info),
+        })
+    }
+
+    #[cfg(windows)]
     async fn cdp_open_tab_raw_impl(
         &self,
         session_id: &str,
@@ -1900,6 +2162,19 @@ impl SynapseService {
             previous,
             current,
         })
+    }
+
+    #[cfg(not(windows))]
+    async fn cdp_target_info_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+    ) -> Result<CdpTargetInfoResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "cdp_target_info is only available on Windows in this build",
+        ))
     }
 
     #[cfg(not(windows))]
@@ -3444,6 +3719,35 @@ fn lock_reflex_runtime(
 #[cfg(windows)]
 fn elapsed_ms_u64(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn chrome_active_element_info(
+    active: &crate::chrome_debugger_bridge::ChromeDebuggerActiveElement,
+) -> CdpActiveElementInfo {
+    CdpActiveElementInfo {
+        available: active.available,
+        readback_source: active.readback_source.clone(),
+        has_active_element: active.has_active_element,
+        is_editable: active.is_editable,
+        tag_name: active.tag_name.clone(),
+        id_sha256: active.id.as_deref().and_then(non_empty_text_sha256),
+        name_sha256: active.name.as_deref().and_then(non_empty_text_sha256),
+        value_len: active.value.as_ref().map(|value| value.chars().count()),
+        value_sha256: active.value.as_deref().and_then(non_empty_text_sha256),
+        selected_text_sha256: active
+            .selected_text
+            .as_deref()
+            .and_then(non_empty_text_sha256),
+        error_code: active.error_code.clone(),
+        error_detail_sha256: active
+            .error_detail
+            .as_deref()
+            .and_then(non_empty_text_sha256),
+    }
+}
+
+fn non_empty_text_sha256(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| sha256_hex(value.as_bytes()))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

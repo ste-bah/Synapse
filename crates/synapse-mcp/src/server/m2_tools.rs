@@ -59,8 +59,8 @@ const ACTION_DIAGNOSTIC_MIN_TTL_MS: u64 = 100;
 const ACTION_DIAGNOSTIC_MAX_QUEUE_BLOCKER_MS: u32 = 10_000;
 const ACTION_DIAGNOSTIC_MIN_QUEUE_BLOCKER_MS: u32 = 250;
 const ACTION_DIAGNOSTIC_QUEUE_SETTLE_MS: u64 = 50;
-const ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH: &str = "cdp_target.url";
-const ACT_TYPE_BROWSER_URL_TEXT_INTEGRITY: &str = "cdp_target_url_readback";
+const ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH: &str = "browser_target.url";
+const ACT_TYPE_BROWSER_URL_TEXT_INTEGRITY: &str = "browser_target_url_readback";
 const ACT_TYPE_FOREGROUND_TEXT_SOURCE_OF_TRUTH: &str = "foreground_text_readback";
 const ACT_TYPE_TEXT_INTEGRITY_PREFIX: &str = "verify_delta_text_readback";
 const ACT_TYPE_TEXT_SOURCE_UIA_VALUE: &str = "uia_focused_value";
@@ -270,6 +270,7 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let foreground_fallback =
             match act_type_chromium_foreground_fallback_target(params.into_element.as_ref()) {
                 Ok(target) => target,
@@ -329,7 +330,9 @@ impl SynapseService {
                 self.audit_action_result_for_request("act_type", &result, &request_context)?;
                 return result.map(Json);
             }
-            let focus_readback = match self.capture_act_type_text_signature(160, true, false).await
+            let focus_readback = match self
+                .capture_act_type_text_signature(160, true, false, None)
+                .await
             {
                 Ok(signature) => signature,
                 Err(error) => {
@@ -356,7 +359,12 @@ impl SynapseService {
             params.verify_delta.then_some(focus_readback)
         } else if act_type_should_capture_text_signature(&params) {
             match self
-                .capture_act_type_text_signature(160, true, browser_url_policy.is_some())
+                .capture_act_type_text_signature(
+                    160,
+                    browser_url_policy.is_none(),
+                    browser_url_policy.is_some(),
+                    session_id.as_deref(),
+                )
                 .await
             {
                 Ok(signature) => Some(signature),
@@ -378,6 +386,7 @@ impl SynapseService {
                     verify_timeout_ms,
                     &emitted,
                     browser_url_policy.as_ref(),
+                    session_id.as_deref(),
                 )
                 .await
             }
@@ -1790,6 +1799,15 @@ struct CdpTargetUrlReadback {
     source: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct BrowserTargetReadback {
+    url: CdpTargetUrlReadback,
+    title: Option<String>,
+    ready_state: Option<String>,
+    active: Option<bool>,
+    active_text: Option<CdpActiveTextReadback>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ActTypeTextSignature {
@@ -1827,6 +1845,9 @@ struct ActTypeTextSignature {
     browser_url_sha256: Option<String>,
     browser_cdp_target_id: Option<String>,
     browser_url_readback_source: Option<String>,
+    browser_title_sha256: Option<String>,
+    browser_ready_state: Option<String>,
+    browser_tab_active: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -2240,6 +2261,7 @@ impl SynapseService {
         max_elements: usize,
         require_focused_text_value: bool,
         require_browser_url: bool,
+        session_id: Option<&str>,
     ) -> Result<ActTypeTextReadback, ErrorData> {
         let mut input = {
             let state = self.m1_state()?;
@@ -2247,11 +2269,26 @@ impl SynapseService {
         };
         crate::m1::enrich_input_with_cdp(&mut input, 6, max_elements).await;
         crate::m1::enrich_input_with_browser_ocr(&mut input, max_elements);
-        let browser_url = Self::cdp_selected_target_url(&input, require_browser_url).await?;
+        let bridge_target = self
+            .chrome_bridge_session_target_readback(
+                session_id,
+                require_browser_url || require_focused_text_value,
+            )
+            .await?;
+        let browser_url = match bridge_target.as_ref() {
+            Some(readback) => readback.url.clone(),
+            None => Self::cdp_selected_target_url(&input, require_browser_url).await?,
+        };
 
         let focused = focused_text_candidate(input.focused.as_ref(), &input.elements);
         let (uia_value, uia_readback_source) = focused_text_readback(focused.as_ref());
-        let cdp_readback = cdp_active_text_readback(&input).await;
+        let cdp_readback = match bridge_target
+            .as_ref()
+            .and_then(|readback| readback.active_text.clone())
+        {
+            Some(readback) => readback,
+            None => cdp_active_text_readback(&input).await,
+        };
         let ocr_readback = ocr_focused_rect_text_readback(focused.as_ref(), &input.elements);
         let mut text_readback_attempts = Vec::new();
         text_readback_attempts.push(match uia_readback_source {
@@ -2312,6 +2349,14 @@ impl SynapseService {
             browser_url_sha256: browser_url.url.as_deref().and_then(non_empty_sha256),
             browser_cdp_target_id: browser_url.target_id.clone(),
             browser_url_readback_source: browser_url.source,
+            browser_title_sha256: bridge_target
+                .as_ref()
+                .and_then(|readback| readback.title.as_deref())
+                .and_then(non_empty_sha256),
+            browser_ready_state: bridge_target
+                .as_ref()
+                .and_then(|readback| readback.ready_state.clone()),
+            browser_tab_active: bridge_target.as_ref().and_then(|readback| readback.active),
         };
         if require_focused_text_value && value.is_none() {
             let signature_hash = verify_hash_json(&signature)?;
@@ -2598,7 +2643,7 @@ impl SynapseService {
         );
 
         let focus_readback = self
-            .capture_act_type_text_signature(160, false, false)
+            .capture_act_type_text_signature(160, false, false, None)
             .await?;
         act_type_foreground_fallback_focus_matches_target(&target, &focus_readback.signature)?;
 
@@ -2732,6 +2777,79 @@ impl SynapseService {
             pixel,
             point_pixel: point_region.map(|point| capture_pixel_signature(point_delta_rect(point))),
         })
+    }
+
+    async fn chrome_bridge_session_target_readback(
+        &self,
+        session_id: Option<&str>,
+        require_readback: bool,
+    ) -> Result<Option<BrowserTargetReadback>, ErrorData> {
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        let Some(SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        }) = self.session_target(Some(session_id))?
+        else {
+            return Ok(None);
+        };
+        if synapse_a11y::endpoint_for_window(window_hwnd).is_some() {
+            return Ok(None);
+        }
+        if !is_chrome_bridge_target_id(&cdp_target_id) {
+            if require_readback {
+                return Err(act_type_browser_url_readback_error(
+                    error_codes::A11Y_CDP_ATTACH_FAILED,
+                    format!(
+                        "act_type readback requires session target {cdp_target_id:?}, but no raw CDP endpoint or normal Chrome bridge target id is available"
+                    ),
+                    Some("session_target_without_cdp_endpoint"),
+                    None,
+                    None,
+                ));
+            }
+            return Ok(None);
+        }
+        let info = match crate::chrome_debugger_bridge::target_info(window_hwnd, &cdp_target_id)
+            .await
+        {
+            Ok(info) => info,
+            Err(error) => {
+                if require_readback {
+                    return Err(act_type_browser_url_readback_error(
+                        error.code(),
+                        format!(
+                            "Chrome bridge targetInfo readback failed for act_type session target {cdp_target_id:?}: {}",
+                            error.detail()
+                        ),
+                        Some("chrome_tabs_extension"),
+                        None,
+                        Some(error.detail()),
+                    ));
+                }
+                return Ok(None);
+            }
+        };
+        let source = if info.readback_backend.trim().is_empty() {
+            "chrome.tabs.get".to_owned()
+        } else {
+            info.readback_backend.clone()
+        };
+        Ok(Some(BrowserTargetReadback {
+            url: CdpTargetUrlReadback {
+                url: (!info.url.trim().is_empty()).then(|| info.url.clone()),
+                target_id: Some(info.target_id.clone()),
+                source: Some(source),
+            },
+            title: (!info.title.trim().is_empty()).then_some(info.title),
+            ready_state: (!info.ready_state.trim().is_empty()).then_some(info.ready_state),
+            active: Some(info.active),
+            active_text: info
+                .active_element
+                .as_ref()
+                .map(|active| chrome_bridge_active_text_readback(&info.target_id, active)),
+        }))
     }
 
     async fn cdp_selected_target_url(
@@ -2884,6 +3002,7 @@ impl SynapseService {
         verify_timeout_ms: u32,
         emitted: &str,
         browser_url_policy: Option<&ActTypeBrowserUrlPolicy>,
+        session_id: Option<&str>,
     ) -> Result<ActTypeResponse, ErrorData> {
         let started = Instant::now();
         let timeout = Duration::from_millis(u64::from(verify_timeout_ms));
@@ -2898,7 +3017,12 @@ impl SynapseService {
             tokio::time::sleep(std::cmp::min(poll_interval, timeout - elapsed)).await;
 
             let after = self
-                .capture_act_type_text_signature(160, false, browser_url_policy.is_some())
+                .capture_act_type_text_signature(
+                    160,
+                    false,
+                    browser_url_policy.is_some(),
+                    session_id,
+                )
                 .await?;
             let before_hash = verify_hash_json(&before.signature)?;
             let after_hash = verify_hash_json(&after.signature)?;
@@ -2941,7 +3065,7 @@ impl SynapseService {
         }
 
         let after = match self
-            .capture_act_type_text_signature(160, false, browser_url_policy.is_some())
+            .capture_act_type_text_signature(160, false, browser_url_policy.is_some(), session_id)
             .await
         {
             Ok(after) => after,
@@ -4212,6 +4336,39 @@ fn choose_act_type_text_readback(
     (None, None)
 }
 
+fn is_chrome_bridge_target_id(target_id: &str) -> bool {
+    target_id.starts_with("chrome-tab:")
+}
+
+fn chrome_bridge_active_text_readback(
+    target_id: &str,
+    active: &crate::chrome_debugger_bridge::ChromeDebuggerActiveElement,
+) -> CdpActiveTextReadback {
+    let value = (active.available).then(|| active.value.clone()).flatten();
+    let attempt = if active.available {
+        "chrome_bridge_active_element:available".to_owned()
+    } else {
+        format!(
+            "chrome_bridge_active_element:{}",
+            active.error_code.as_deref().unwrap_or("unavailable")
+        )
+    };
+    CdpActiveTextReadback {
+        value_len: value.as_ref().map(|value| value.chars().count()),
+        value_sha256: value.as_deref().and_then(non_empty_sha256),
+        value,
+        target_id: Some(target_id.to_owned()),
+        has_active_element: active.has_active_element,
+        is_editable: active.is_editable,
+        tag_name: active.tag_name.clone(),
+        id_sha256: active.id.as_deref().and_then(non_empty_sha256),
+        name_sha256: active.name.as_deref().and_then(non_empty_sha256),
+        error_code: active.error_code.clone(),
+        error_detail_sha256: active.error_detail.as_deref().and_then(non_empty_sha256),
+        attempt,
+    }
+}
+
 fn should_prefer_cdp_active_text(
     focused: Option<&ActTypeFocusedTextCandidate>,
     uia_value: Option<&str>,
@@ -4592,7 +4749,7 @@ fn verify_act_type_browser_url_response(
         postcondition_failed_error(
             "act_type",
             ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH,
-            "expected_browser_url_regex was set but after-read CDP target URL was absent",
+            "expected_browser_url_regex was set but after-read browser target URL was absent",
             before_hash.clone(),
             after_hash.clone(),
             json!({
@@ -4606,7 +4763,7 @@ fn verify_act_type_browser_url_response(
         return Err(postcondition_failed_error(
             "act_type",
             ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH,
-            "after-read CDP target URL did not match expected_browser_url_regex",
+            "after-read browser target URL did not match expected_browser_url_regex",
             before_hash,
             after_hash,
             json!({
@@ -4627,7 +4784,7 @@ fn verify_act_type_browser_url_response(
             before_signature: Some(before_hash),
             after_signature: Some(after_hash),
             detail: Some(format!(
-                "act_type verify_delta verified after-read CDP target URL matched expected_browser_url_regex; no URL delta was observed within {verify_timeout_ms} ms"
+                "act_type verify_delta verified after-read browser target URL matched expected_browser_url_regex; no URL delta was observed within {verify_timeout_ms} ms"
             )),
         }
     } else {
@@ -4636,7 +4793,7 @@ fn verify_act_type_browser_url_response(
             ACT_TYPE_BROWSER_URL_SOURCE_OF_TRUTH,
             before_hash,
             after_hash,
-            "observed after-read CDP target URL matching expected_browser_url_regex after delivery",
+            "observed after-read browser target URL matching expected_browser_url_regex after delivery",
         )
     };
     response.target_readback_required = false;
@@ -7196,6 +7353,9 @@ mod tests {
                 browser_url_sha256: browser_url_owned.as_deref().and_then(non_empty_sha256),
                 browser_cdp_target_id: Some("TARGET810".to_owned()),
                 browser_url_readback_source: Some("Target.getTargets".to_owned()),
+                browser_title_sha256: non_empty_sha256("Synthetic - Google Chrome"),
+                browser_ready_state: Some("complete".to_owned()),
+                browser_tab_active: Some(false),
             },
             value: focused_value,
             browser_url: browser_url_owned,
@@ -7286,6 +7446,9 @@ mod tests {
             browser_url_sha256: None,
             browser_cdp_target_id: None,
             browser_url_readback_source: None,
+            browser_title_sha256: None,
+            browser_ready_state: None,
+            browser_tab_active: None,
         }
     }
 

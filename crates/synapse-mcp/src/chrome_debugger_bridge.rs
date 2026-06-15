@@ -508,12 +508,52 @@ pub(crate) struct ChromeDebuggerCloseTabResult {
 pub(crate) struct ChromeDebuggerTargetInfo {
     pub target_id: String,
     pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
     pub target_type: String,
     pub url: String,
     pub title: String,
+    #[serde(default)]
+    pub ready_state: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub highlighted: bool,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub readback_backend: String,
+    #[serde(default)]
+    pub active_element: Option<ChromeDebuggerActiveElement>,
     pub target_candidate_count: u32,
     pub target_selection_reason: String,
     pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerActiveElement {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub readback_source: String,
+    #[serde(default)]
+    pub has_active_element: Option<bool>,
+    #[serde(default)]
+    pub is_editable: Option<bool>,
+    #[serde(default)]
+    pub tag_name: Option<String>,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub selected_text: Option<String>,
+    #[serde(default)]
+    pub error_code: Option<String>,
+    #[serde(default)]
+    pub error_detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

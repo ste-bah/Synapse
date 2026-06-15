@@ -629,6 +629,64 @@ pub struct CdpCloseTabResponse {
     pub current: Option<TargetWire>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpTargetInfoParams {
+    /// Browser HWND whose target table contains the CDP/Chrome bridge target.
+    /// If omitted, the active session CDP target is used.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// CDP TargetID / Chrome bridge target id to read. If omitted, the active
+    /// session CDP target is used.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpTargetInfoResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_id: Option<i64>,
+    pub target_type: String,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    pub active: bool,
+    pub highlighted: bool,
+    pub pinned: bool,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+    pub target_candidate_count: u32,
+    pub target_selection_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_element: Option<CdpActiveElementInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpActiveElementInfo {
+    pub available: bool,
+    pub readback_source: String,
+    pub has_active_element: Option<bool>,
+    pub is_editable: Option<bool>,
+    pub tag_name: Option<String>,
+    pub id_sha256: Option<String>,
+    pub name_sha256: Option<String>,
+    pub value_len: Option<usize>,
+    pub value_sha256: Option<String>,
+    pub selected_text_sha256: Option<String>,
+    pub error_code: Option<String>,
+    pub error_detail_sha256: Option<String>,
+}
+
 #[derive(Copy, Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CdpNavigateAction {

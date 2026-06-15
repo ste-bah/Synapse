@@ -414,13 +414,22 @@ async function handleCloseTab(params) {
 
 async function handleTargetInfo(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
+  const state = await tabPageState(selected.tabId, selected.target);
+  const activeElement = await tabActiveElementState(selected.tabId);
   return {
     extension_id: chrome.runtime.id,
-    target_id: selected.target.id,
+    target_id: state.target_id || selected.target.id,
     tab_id: selected.tabId,
-    target_type: selected.target.type || "page",
-    url: selected.target.url || "",
-    title: selected.target.title || "",
+    chrome_window_id: state.chrome_window_id,
+    target_type: state.target_type || selected.target.type || "page",
+    url: state.url || "",
+    title: state.title || "",
+    ready_state: state.ready_state || "",
+    active: Boolean(state.active),
+    highlighted: Boolean(state.highlighted),
+    pinned: Boolean(state.pinned),
+    readback_backend: "chrome.tabs.get",
+    active_element: activeElement,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
@@ -588,9 +597,14 @@ function tabTargetFromTab(tab) {
   return {
     id: targetIdForTabId(tab.id),
     tabId: tab.id,
+    chromeWindowId: typeof tab.windowId === "number" ? tab.windowId : null,
     type: "page",
     url: String(tab.pendingUrl || tab.url || ""),
     title: String(tab.title || ""),
+    status: String(tab.status || ""),
+    active: Boolean(tab.active),
+    highlighted: Boolean(tab.highlighted),
+    pinned: Boolean(tab.pinned),
     attached: false
   };
 }
@@ -685,11 +699,109 @@ async function tabPageState(tabId, fallbackTarget = null) {
   const target = tabTargetFromTab(tab);
   return {
     target_id: String(target?.id || fallbackTarget?.id || ""),
+    tab_id: tabId,
+    chrome_window_id: typeof tab.windowId === "number" ? tab.windowId : target?.chromeWindowId || null,
+    target_type: String(target?.type || fallbackTarget?.type || "page"),
     url: String(tab.pendingUrl || tab.url || target?.url || fallbackTarget?.url || ""),
     title: String(tab.title || target?.title || fallbackTarget?.title || ""),
     ready_state: String(tab.status || ""),
+    active: Boolean(tab.active),
+    highlighted: Boolean(tab.highlighted),
+    pinned: Boolean(tab.pinned),
     history_current_index: -1,
     history_entry_count: 0
+  };
+}
+
+async function tabActiveElementState(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    return {
+      available: false,
+      readback_source: "chrome.scripting.executeScript",
+      error_code: "CHROME_SCRIPTING_UNAVAILABLE",
+      error_detail: "Chrome scripting API is unavailable; extension is missing scripting permission"
+    };
+  }
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId },
+      func: readActiveElementInPage
+    });
+    const first = Array.isArray(results) ? results[0] : null;
+    if (!first || typeof first.result !== "object" || first.result === null) {
+      return {
+        available: false,
+        readback_source: "chrome.scripting.executeScript",
+        error_code: "CHROME_SCRIPTING_EMPTY_RESULT",
+        error_detail: "chrome.scripting.executeScript returned no active-element result"
+      };
+    }
+    return {
+      available: true,
+      readback_source: "chrome.scripting.executeScript",
+      ...first.result
+    };
+  } catch (error) {
+    return {
+      available: false,
+      readback_source: "chrome.scripting.executeScript",
+      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
+      error_detail: errorMessage(error)
+    };
+  }
+}
+
+function readActiveElementInPage() {
+  const element = document.activeElement;
+  if (!element) {
+    return {
+      has_active_element: false,
+      is_editable: false,
+      tag_name: "",
+      id: "",
+      name: "",
+      value: null,
+      selected_text: null
+    };
+  }
+  const tagName = String(element.tagName || "");
+  const lowerTag = tagName.toLowerCase();
+  const contentEditable =
+    element.isContentEditable ||
+    String(element.getAttribute?.("contenteditable") || "").toLowerCase() === "true";
+  const valueCapable = "value" in element;
+  const isEditable =
+    contentEditable ||
+    lowerTag === "textarea" ||
+    lowerTag === "select" ||
+    (lowerTag === "input" && !["button", "checkbox", "color", "file", "hidden", "image", "radio", "range", "reset", "submit"].includes(String(element.type || "").toLowerCase()));
+  let value = null;
+  if (valueCapable) {
+    value = String(element.value ?? "");
+  } else if (contentEditable) {
+    value = String(element.innerText || element.textContent || "");
+  }
+  let selectedText = null;
+  try {
+    if (typeof element.selectionStart === "number" && typeof element.selectionEnd === "number" && value !== null) {
+      selectedText = String(value).slice(element.selectionStart, element.selectionEnd);
+    } else {
+      const selection = document.getSelection?.();
+      if (selection && selection.rangeCount > 0) {
+        selectedText = String(selection.toString() || "");
+      }
+    }
+  } catch (_) {
+    selectedText = null;
+  }
+  return {
+    has_active_element: true,
+    is_editable: Boolean(isEditable),
+    tag_name: tagName,
+    id: String(element.id || ""),
+    name: String(element.getAttribute?.("name") || ""),
+    value,
+    selected_text: selectedText
   };
 }
 

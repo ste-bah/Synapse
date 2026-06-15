@@ -23,8 +23,9 @@ use crate::{
     http::sse::SseState,
     m1::{
         CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
-        CdpCloseTabParams, CdpCloseTabResponse, CdpNavigateAction, CdpNavigateTabParams,
-        CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, FindParams, FindResponse,
+        CdpActiveElementInfo, CdpCloseTabParams, CdpCloseTabResponse, CdpNavigateAction,
+        CdpNavigateTabParams, CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse,
+        CdpTargetInfoParams, CdpTargetInfoResponse, FindParams, FindResponse,
         HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus,
         M1State, ObserveParams, ReadTextParams, SetCaptureTargetParams, SetCaptureTargetResponse,
         SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
@@ -180,6 +181,7 @@ mod audit_context;
 pub(crate) mod command_audit;
 mod context;
 pub(crate) use context::AgentTranscriptSnapshotRow;
+mod data_cleaning;
 pub(crate) mod drain;
 pub(crate) mod escalation;
 mod everquest_autocombat;
@@ -201,7 +203,6 @@ mod everquest_trajectory;
 mod everquest_ui_context;
 mod everquest_world_model;
 mod everquest_world_summary;
-mod data_cleaning;
 mod handler;
 mod health;
 mod hygiene_report;

@@ -75,7 +75,7 @@ pub struct ActTypeParams {
     #[serde(default)]
     #[schemars(
         default,
-        description = "When set on foreground typing with verify_delta=true, verify the after-read Chromium CDP target URL against this regex. Intended for address-bar navigation where focus may move from the address field to the document; CDP URL readback is required and missing/unreachable CDP fails closed before input."
+        description = "When set with verify_delta=true, verify the after-read browser target URL against this regex. Intended for navigation where focus may move from an address field to the document; Synapse uses the session browser target readback (Chrome bridge chrome.tabs or raw CDP) and fails closed before input when no URL SoT is available."
     )]
     pub expected_browser_url_regex: Option<String>,
     #[serde(default = "default_act_type_verify_timeout_ms")]
