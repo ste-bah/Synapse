@@ -3723,6 +3723,16 @@ fn deferred_panel(tool: &'static str, tool_names: &BTreeSet<&str>) -> DashboardP
     )
 }
 
+/// The dashboard's ONLY access control, by deliberate policy.
+///
+/// POLICY (binding — see STATE/DECISION_LOG.md, issues #892/#913): the local
+/// dashboard must NEVER be locked behind an access token, login, cookie session,
+/// or CSRF gate. Synapse is single-user on the operator's own machine; the OS
+/// login is the trust boundary and an app-layer credential is pure friction that
+/// has been removed twice. This guard is transport hardening, NOT authentication:
+/// it requires a loopback bind and a loopback `Host` header (blocking DNS-rebind /
+/// cross-origin reach) and nothing else. Do not add `Authorization`/cookie/token
+/// checks to any `/dashboard/*` route.
 fn dashboard_local_only(state: &HttpState, headers: &HeaderMap) -> Result<(), Response> {
     if !state.bind_addr.ip().is_loopback() {
         return Err((StatusCode::FORBIDDEN, "DASHBOARD_LOOPBACK_BIND_REQUIRED").into_response());

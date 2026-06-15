@@ -12,3 +12,4 @@ Use this checklist for every Command Center view.
 - Keep every control keyboard-reachable with visible focus.
 - Use semantic status labels with icon, shape, text, and color.
 - Verify zero runtime requests outside `/dashboard/*` and loopback daemon endpoints.
+- NEVER gate the dashboard behind a login, access token, cookie session, or CSRF. Access is local-only by policy: loopback bind + `Host` guard is the entire access model (see `STATE/DECISION_LOG.md`, issues #892/#913). Do not add an auth/unlock screen.
