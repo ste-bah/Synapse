@@ -1808,6 +1808,185 @@ mod tests {
         assert_eq!(decided.after_status, ApprovalStatus::Accepted);
     }
 
+    // ---- #1030 approve-with-edits / respond / reject-requires-note ----
+
+    fn request_kind(title: &str, kind: ApprovalKind, allow: Option<ApprovalAllow>) -> ApprovalRequestParams {
+        ApprovalRequestParams {
+            kind,
+            title: title.to_owned(),
+            body: "body".to_owned(),
+            payload_json: Some(r#"{"tool_name":"act_set_field_text","input":{"text":"hi"}}"#.to_owned()),
+            dedupe_key: None,
+            timeout_ms: None,
+            timeout_decision: None,
+            destructive: false,
+            notify: false,
+            suppress_popup: false,
+            allow,
+        }
+    }
+
+    fn decide(
+        db: &Arc<Db>,
+        id: &str,
+        decision: ApprovalDecision,
+        note: Option<&str>,
+        edited_args: Option<&str>,
+        response: Option<&str>,
+    ) -> Result<ApprovalDecideResponse, ErrorData> {
+        decide_approval(
+            db,
+            &ApprovalDecideParams {
+                approval_id: id.to_owned(),
+                decision,
+                note: note.map(str::to_owned),
+                snooze_ms: None,
+                edited_args: edited_args.map(str::to_owned),
+                response: response.map(str::to_owned),
+            },
+            "operator",
+        )
+    }
+
+    #[test]
+    fn approve_with_edits_persists_edited_args_to_physical_row() {
+        let db = db();
+        let created = request_approval(
+            &db,
+            &request_kind("edit-me", ApprovalKind::AgentPermission, None),
+            "agent",
+        )
+        .expect("request");
+        // Default agent_permission affordances must allow editing.
+        assert!(created.item.allow.edit, "agent_permission must allow edit by default");
+        let id = created.item.approval_id.clone();
+        println!("before: status={} edited_args={:?}", created.item.status.as_str(), created.item.edited_args_json);
+
+        let edited = r#"{"text":"EDITED by operator"}"#;
+        let decided = decide(&db, &id, ApprovalDecision::Accept, None, Some(edited), None)
+            .expect("approve-with-edits");
+        assert_eq!(decided.after_status, ApprovalStatus::Accepted);
+
+        // FSV: re-read the physical CF_KV row — not the return value.
+        let stored = get_approval(&db, &id).expect("get").expect("row").item;
+        println!("after: status={} edited_args={:?}", stored.status.as_str(), stored.edited_args_json);
+        assert_eq!(stored.status, ApprovalStatus::Accepted);
+        assert_eq!(stored.edited_args_json.as_deref(), Some(edited));
+        assert!(stored.operator_response.is_none());
+    }
+
+    #[test]
+    fn respond_persists_operator_answer_to_physical_row() {
+        let db = db();
+        let created = request_approval(
+            &db,
+            &request_kind("question?", ApprovalKind::AgentQuestion, None),
+            "agent",
+        )
+        .expect("request");
+        assert!(created.item.allow.respond, "agent_question must allow respond by default");
+        let id = created.item.approval_id.clone();
+
+        let answer = "use the staging bucket, not prod";
+        let decided = decide(&db, &id, ApprovalDecision::Accept, None, None, Some(answer))
+            .expect("respond");
+        assert_eq!(decided.after_status, ApprovalStatus::Accepted);
+
+        let stored = get_approval(&db, &id).expect("get").expect("row").item;
+        println!("after: status={} operator_response={:?}", stored.status.as_str(), stored.operator_response);
+        assert_eq!(stored.operator_response.as_deref(), Some(answer));
+    }
+
+    #[test]
+    fn declining_agent_permission_requires_a_note() {
+        let db = db();
+        let id = request_approval(
+            &db,
+            &request_kind("deny-me", ApprovalKind::AgentPermission, None),
+            "agent",
+        )
+        .expect("request")
+        .item
+        .approval_id;
+
+        // No note → loud refusal; the row must stay pending (fail closed).
+        let err = decide(&db, &id, ApprovalDecision::Decline, None, None, None).unwrap_err();
+        println!("reject-no-note err: {}", err.message);
+        let still = get_approval(&db, &id).expect("get").expect("row").item;
+        assert_eq!(still.status, ApprovalStatus::Pending, "must not decline without a note");
+
+        // With a note → declines and feeds the note back.
+        let ok = decide(&db, &id, ApprovalDecision::Decline, Some("unsafe in prod"), None, None)
+            .expect("decline-with-note");
+        assert_eq!(ok.after_status, ApprovalStatus::Declined);
+        let stored = get_approval(&db, &id).expect("get").expect("row").item;
+        assert_eq!(stored.decision_note.as_deref(), Some("unsafe in prod"));
+    }
+
+    #[test]
+    fn edit_rejected_when_item_does_not_allow_edit() {
+        let db = db();
+        // A suggestion does not allow editing.
+        let id = request_approval(&db, &request("no-edit"), "agent")
+            .expect("request")
+            .item
+            .approval_id;
+        let err = decide(&db, &id, ApprovalDecision::Accept, None, Some(r#"{"x":1}"#), None)
+            .unwrap_err();
+        println!("edit-not-allowed err: {}", err.message);
+        assert!(err.message.contains("allow.edit=false"));
+        // Fail closed: row untouched.
+        let still = get_approval(&db, &id).expect("get").expect("row").item;
+        assert_eq!(still.status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn edit_with_non_object_json_is_rejected_before_dispatch() {
+        let db = db();
+        let id = request_approval(
+            &db,
+            &request_kind("bad-edit", ApprovalKind::AgentPermission, None),
+            "agent",
+        )
+        .expect("request")
+        .item
+        .approval_id;
+        // A JSON array is valid JSON but not a tool argument map.
+        let err = decide(&db, &id, ApprovalDecision::Accept, None, Some("[1,2,3]"), None).unwrap_err();
+        println!("bad-edit err: {}", err.message);
+        assert!(err.message.contains("must be a JSON object"));
+        // And outright garbage.
+        let err2 = decide(&db, &id, ApprovalDecision::Accept, None, Some("not json"), None).unwrap_err();
+        assert!(err2.message.contains("valid JSON object"));
+        let still = get_approval(&db, &id).expect("get").expect("row").item;
+        assert_eq!(still.status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn edited_args_and_response_rejected_on_non_accept() {
+        let db = db();
+        let id = request_approval(
+            &db,
+            &request_kind("modifier-misuse", ApprovalKind::AgentPermission, None),
+            "agent",
+        )
+        .expect("request")
+        .item
+        .approval_id;
+        assert!(
+            decide(&db, &id, ApprovalDecision::Decline, Some("n"), Some(r#"{"x":1}"#), None)
+                .unwrap_err()
+                .message
+                .contains("edited_args is valid only when decision=\"accept\"")
+        );
+        assert!(
+            decide(&db, &id, ApprovalDecision::Decline, Some("n"), None, Some("hi"))
+                .unwrap_err()
+                .message
+                .contains("response is valid only when decision=\"accept\"")
+        );
+    }
+
     #[test]
     fn approval_timeout_materializes_ignored_on_list() {
         let db = db();

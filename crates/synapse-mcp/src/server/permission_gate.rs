@@ -565,6 +565,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approve_with_edits_returns_edited_updated_input() {
+        // #1030: the operator edits the proposed args; the still-blocked agent
+        // must receive the EDITED input via the permission verdict's updatedInput.
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let input = json!({ "command": "rm -rf /important" });
+
+        let gate = service.run_gate("Bash", &input, Some("tuse-edit"), "sess", Some("agent-spawn-e"));
+        let decide = async {
+            let id = await_pending_id(&service).await;
+            service
+                .approval_decide_from_dashboard(
+                    &id,
+                    ApprovalDecision::Accept,
+                    None,
+                    Some(r#"{"command":"rm -rf ./build"}"#),
+                    None,
+                    "tester",
+                )
+                .expect("decide");
+            id
+        };
+        let (result, id) = tokio::join!(gate, decide);
+        let verdict = verdict_of(&result.expect("gate ok"));
+        assert_eq!(verdict["behavior"], "allow");
+        // The agent runs the EDITED command, not the dangerous proposed one.
+        assert_eq!(verdict["updatedInput"]["command"], "rm -rf ./build");
+        // Physical SoT: the durable row records exactly what the operator authorized.
+        let db = service.m3_storage().expect("storage");
+        let item = crate::m3::approvals::get_approval(&db, &id)
+            .expect("read")
+            .expect("exists")
+            .item;
+        assert_eq!(item.status, ApprovalStatus::Accepted);
+        assert_eq!(
+            item.edited_args_json.as_deref(),
+            Some(r#"{"command":"rm -rf ./build"}"#)
+        );
+    }
+
+    #[tokio::test]
     async fn risky_tool_resumes_deny_on_decline_with_reason() {
         let dir = TempDir::new().expect("tmp");
         let service = service_with_db(dir.path());
