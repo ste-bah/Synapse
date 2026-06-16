@@ -59,6 +59,11 @@ pub struct M1State {
     pub synthetic: Option<ObservationInput>,
     pub force_no_perception: bool,
     pub force_observe_internal: bool,
+    /// Reproduce the real `GetForegroundWindow returned null` condition (locked
+    /// screen / desktop focus / unattended session) deterministically so the
+    /// no-foreground action-gate behavior (#1061) is testable without depending
+    /// on ambient host focus at run time.
+    pub force_no_foreground: bool,
     pub last_observed_foreground: Option<ForegroundContext>,
     pub everquest_log_cursor: Option<EverQuestLogCursorState>,
     pub everquest_event_seq: u64,
@@ -76,6 +81,8 @@ impl M1State {
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         let force_observe_internal = std::env::var("SYNAPSE_MCP_FORCE_OBSERVE_INTERNAL")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let force_no_foreground = std::env::var("SYNAPSE_MCP_FORCE_NO_FOREGROUND")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
         Self {
             capture_config: CaptureConfig::default().with_env_backend(),
             capture_controller: CaptureController::new(),
@@ -88,6 +95,7 @@ impl M1State {
             synthetic,
             force_no_perception,
             force_observe_internal,
+            force_no_foreground,
             last_observed_foreground: None,
             everquest_log_cursor: None,
             everquest_event_seq: 0,

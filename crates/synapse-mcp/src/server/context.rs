@@ -203,7 +203,38 @@ impl SynapseService {
         let active_profile_id_before = runtime
             .active_profile_id()
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let initial_foreground = self.current_audit_foreground()?;
+        let initial_foreground = match self.current_audit_foreground() {
+            Ok(foreground) => foreground,
+            Err(error) => {
+                // Daemon robustness (#1061): a missing foreground window (locked
+                // screen, focus on the desktop, unattended background session)
+                // must not block tools that never drive the foreground. Evaluate
+                // scope against the active profile and continue. Foreground-driving
+                // tools and every other error kind (forced no-perception, forced
+                // internal, any non-A11Y_NO_FOREGROUND failure) stay fail-closed.
+                if error_data_code(&error) == Some(synapse_core::error_codes::A11Y_NO_FOREGROUND)
+                    && !super::action_preflight::tool_requires_live_foreground(tool)
+                {
+                    tracing::info!(
+                        code = synapse_core::error_codes::A11Y_NO_FOREGROUND,
+                        tool,
+                        "action gate: no foreground window; evaluating scope against active profile (non-foreground tool, see #1061)"
+                    );
+                    let preflight = super::action_preflight::no_foreground_preflight(
+                        tool,
+                        active_profile_id_before,
+                    );
+                    ensure_profile_scope_allows_action(
+                        &runtime,
+                        tool,
+                        self.allow_unknown_profile()?,
+                    )
+                    .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
+                    return Ok(preflight);
+                }
+                return Err(error);
+            }
+        };
         let (foreground, preflight) = self.preflight_action_foreground(
             tool,
             &runtime,
@@ -857,6 +888,17 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+/// Extract the structured `code` string an `mcp_error` carries in its data
+/// payload, used by the action gate to distinguish `A11Y_NO_FOREGROUND` from
+/// other failure kinds before degrading gracefully (#1061).
+fn error_data_code(error: &ErrorData) -> Option<&str> {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
 }
 
 fn act_type_foreground_lost_error(
@@ -1589,6 +1631,69 @@ mod scope_gate_tests {
         for tool in ACTION_WRITE_TOOLS {
             service.ensure_supported_use_allows_action(tool)?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn action_scope_gate_no_foreground_allows_non_foreground_tools() -> anyhow::Result<()> {
+        let profiles = TempDir::new()?;
+        write_profile(
+            &profiles.path().join("single-player.toml"),
+            "single-player",
+            "single_player",
+        )?;
+        let service = service_with_profiles(profiles.path(), false)?;
+        let runtime = service.profile_runtime()?;
+        runtime.activate("single-player")?;
+        {
+            let mut state = service
+                .m1_state
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("M1 service state lock poisoned"))?;
+            state.force_no_foreground = true;
+        }
+
+        let preflight = service.ensure_supported_use_allows_action("act_run_shell")?;
+
+        assert_eq!(preflight.status, "no_foreground_scope_evaluated");
+        assert!(!preflight.applied);
+        assert_eq!(
+            preflight.active_profile_id_before.as_deref(),
+            Some("single-player")
+        );
+        assert_eq!(preflight.before.hwnd, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn action_scope_gate_no_foreground_still_denies_foreground_driving_tools() -> anyhow::Result<()>
+    {
+        let profiles = TempDir::new()?;
+        write_profile(
+            &profiles.path().join("single-player.toml"),
+            "single-player",
+            "single_player",
+        )?;
+        let service = service_with_profiles(profiles.path(), false)?;
+        let runtime = service.profile_runtime()?;
+        runtime.activate("single-player")?;
+        {
+            let mut state = service
+                .m1_state
+                .lock()
+                .map_err(|_err| anyhow::anyhow!("M1 service state lock poisoned"))?;
+            state.force_no_foreground = true;
+        }
+
+        let error = match service.ensure_supported_use_allows_action("act_type") {
+            Ok(value) => anyhow::bail!("foreground-driving act_type returned {value:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!(error_codes::A11Y_NO_FOREGROUND))
+        );
         Ok(())
     }
 

@@ -401,6 +401,71 @@ pub(super) fn attach_action_preflight_to_error(
     ErrorData::new(error.code, error.message.to_string(), Some(data))
 }
 
+/// Whether a tool drives the OS foreground / active-target input surface and
+/// therefore MUST fail closed when no foreground window exists.
+///
+/// Daemon robustness (#1061): the action gate reads the current foreground to
+/// (a) reevaluate the active profile from the foreground window and (b) verify
+/// the surface an input emitter is about to drive. For tools that emit input
+/// into a window (every input `act_*` tool) that read is essential and a missing
+/// foreground (locked screen, desktop focus, unattended session) must stay
+/// fail-closed. But registration / spawn / shell / launch tools never touch the
+/// foreground -- the foreground-derived profile reevaluation is irrelevant to
+/// them -- so requiring a live foreground window only made the background daemon
+/// (epic #717) unusable exactly when the operator is away.
+///
+/// Fail-closed is the safe default: a tool requires a live foreground unless it
+/// is explicitly exempted here. Exempt tools evaluate scope against the active
+/// profile with no foreground present instead of erroring `A11Y_NO_FOREGROUND`.
+/// Note `act_spawn_agent` is gated under the `act_launch` tool name (see
+/// `spawn_agent_journaled`), so exempting `act_launch` covers spawn too.
+pub(super) fn tool_requires_live_foreground(tool: &str) -> bool {
+    !matches!(
+        tool,
+        "reflex_register"
+            | "act_run_shell"
+            | "act_run_shell_start"
+            | "act_run_shell_status"
+            | "act_run_shell_cancel"
+            | "act_launch"
+    )
+}
+
+/// Preflight readback for the degraded "no foreground window" path taken by
+/// non-foreground tools (see [`tool_requires_live_foreground`]). Records that
+/// the action gate evaluated scope against the active profile with no
+/// foreground present rather than hard-failing `A11Y_NO_FOREGROUND` (#1061).
+pub(super) fn no_foreground_preflight(
+    tool: &'static str,
+    active_profile_id_before: Option<ProfileId>,
+) -> ActionPreflightReadback {
+    ActionPreflightReadback {
+        tool,
+        target_profile_id: None,
+        active_profile_id_before,
+        applied: false,
+        status: "no_foreground_scope_evaluated",
+        target: None,
+        before: ForegroundProof {
+            hwnd: 0,
+            pid: 0,
+            process_name: String::new(),
+            process_path: String::new(),
+            window_title: String::new(),
+            is_minimized: None,
+            minimized_readback_error: None,
+            observed_profile_id: None,
+        },
+        candidate_count: None,
+        focus_attempted: false,
+        focus_hwnd: None,
+        focus_error: None,
+        after: None,
+        readback_error: None,
+        everquest_ui_context: None,
+    }
+}
+
 fn not_applicable_preflight(
     tool: &'static str,
     active_profile_id_before: Option<ProfileId>,

@@ -290,6 +290,15 @@ impl SynapseService {
                     "no perception source is available",
                 ));
             }
+            if state.force_no_foreground {
+                // Reproduce the real GetForegroundWindow-returned-null condition
+                // deterministically (#1061), matching synapse_a11y's NoForeground
+                // error exactly so the action gate sees an identical signal.
+                return Err(mcp_error(
+                    error_codes::A11Y_NO_FOREGROUND,
+                    "GetForegroundWindow returned null",
+                ));
+            }
             if let Some(input) = &state.synthetic {
                 return Ok(input.foreground.clone());
             }
