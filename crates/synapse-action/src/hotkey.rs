@@ -100,8 +100,8 @@ mod platform {
                 UnregisterHotKey,
             },
             WindowsAndMessaging::{
-                CallNextHookEx, DispatchMessageW, GetMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG,
-                PM_NOREMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
+                CallNextHookEx, DispatchMessageW, HHOOK, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE,
+                PM_REMOVE, PeekMessageW, PostThreadMessageW, SetWindowsHookExW, TranslateMessage,
                 UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_QUIT,
                 WM_SYSKEYDOWN, WM_SYSKEYUP,
             },
@@ -115,6 +115,8 @@ mod platform {
     const STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
     const KEY_DOWN_MASK: i16 = i16::MIN;
     const HOTKEY_SIGNAL_DEBOUNCE_MS: u64 = 750;
+    const HOTKEY_HOOK_REARM_INTERVAL_MS: u64 = 500;
+    const HOTKEY_MESSAGE_POLL_MS: u64 = 25;
     const VK_CONTROL_CODE: i32 = 0x11;
     const VK_MENU_CODE: i32 = 0x12;
     const VK_SHIFT_CODE: i32 = 0x10;
@@ -342,24 +344,13 @@ mod platform {
                 return;
             }
         };
-        let keyboard_hook = match unsafe {
-            SetWindowsHookExW(
-                WH_KEYBOARD_LL,
-                Some(keyboard_hook_proc),
-                Some(HINSTANCE(module.0)),
-                0,
-            )
-        } {
-            Ok(hook) => hook,
+        let mut hook_guard = match install_keyboard_hook(module, config) {
+            Ok(hook_guard) => hook_guard,
             Err(error) => {
-                let _send_result = ready.send(Err(format!(
-                    "SetWindowsHookExW(WH_KEYBOARD_LL) failed for {}: {error}",
-                    config.label
-                )));
+                let _send_result = ready.send(Err(error));
                 return;
             }
         };
-        let _hook_guard = HookGuard(keyboard_hook);
 
         let registered_hotkey_guard = match unsafe {
             RegisterHotKey(
@@ -386,33 +377,76 @@ mod platform {
             component = "operator_hotkey",
             hotkey = config.label.as_str(),
             low_level_hook_installed = true,
+            rearm_interval_ms = HOTKEY_HOOK_REARM_INTERVAL_MS,
             register_hotkey_backup = registered_hotkey_guard.is_some(),
             hook_thread_priority_high = priority_high,
             "operator panic hotkey armed"
         );
 
+        let mut last_rearm_ms = unsafe { GetTickCount64() };
         loop {
-            let received = unsafe { GetMessageW(&raw mut msg, None, 0, 0) };
-            if received.0 == -1 {
-                tracing::error!(
-                    component = "operator_hotkey",
-                    "operator hotkey message loop failed"
-                );
-                break;
-            }
-            if !received.as_bool() {
-                break;
+            while unsafe { PeekMessageW(&raw mut msg, None, 0, 0, PM_REMOVE) }.as_bool() {
+                if msg.message == WM_QUIT {
+                    return;
+                }
+
+                if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_WPARAM {
+                    maybe_send_hotkey_signal("register_hotkey_backup");
+                    continue;
+                }
+
+                unsafe {
+                    let _translated = TranslateMessage(&raw const msg);
+                    let _dispatch_result = DispatchMessageW(&raw const msg);
+                }
             }
 
-            if msg.message == WM_HOTKEY && msg.wParam.0 == HOTKEY_WPARAM {
-                maybe_send_hotkey_signal("register_hotkey_backup");
-                continue;
+            let now_ms = unsafe { GetTickCount64() };
+            if now_ms.saturating_sub(last_rearm_ms) >= HOTKEY_HOOK_REARM_INTERVAL_MS {
+                match install_keyboard_hook(module, config) {
+                    Ok(new_hook_guard) => {
+                        let old_hook_guard = std::mem::replace(&mut hook_guard, new_hook_guard);
+                        drop(old_hook_guard);
+                        last_rearm_ms = now_ms;
+                        tracing::debug!(
+                            component = "operator_hotkey",
+                            hotkey = config.label.as_str(),
+                            "operator low-level keyboard hook re-armed at hook-chain head"
+                        );
+                    }
+                    Err(error) => {
+                        last_rearm_ms = now_ms;
+                        tracing::error!(
+                            component = "operator_hotkey",
+                            hotkey = config.label.as_str(),
+                            detail = error,
+                            "operator low-level keyboard hook re-arm failed"
+                        );
+                    }
+                }
             }
 
-            unsafe {
-                let _translated = TranslateMessage(&raw const msg);
-                let _dispatch_result = DispatchMessageW(&raw const msg);
-            }
+            thread::sleep(Duration::from_millis(HOTKEY_MESSAGE_POLL_MS));
+        }
+    }
+
+    fn install_keyboard_hook(
+        module: windows::Win32::Foundation::HMODULE,
+        config: &HotkeyConfig,
+    ) -> Result<HookGuard, String> {
+        match unsafe {
+            SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(keyboard_hook_proc),
+                Some(HINSTANCE(module.0)),
+                0,
+            )
+        } {
+            Ok(hook) => Ok(HookGuard(hook)),
+            Err(error) => Err(format!(
+                "SetWindowsHookExW(WH_KEYBOARD_LL) failed for {}: {error}",
+                config.label
+            )),
         }
     }
 
@@ -677,8 +711,8 @@ pub use platform::OperatorHotkeyGuard;
 ///
 /// # Errors
 ///
-/// Returns a [`crate::ActionError`] when the platform hotkey thread cannot
-/// start or the Windows `RegisterHotKey` call fails.
+/// Returns a [`crate::ActionError`] when the platform hotkey thread or
+/// low-level keyboard hook cannot start.
 pub fn install_operator_hotkey<F>(handler: F) -> ActionResult<OperatorHotkeyGuard>
 where
     F: Fn() + Send + 'static,
