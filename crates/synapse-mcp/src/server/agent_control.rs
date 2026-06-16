@@ -79,6 +79,9 @@ const TOOL_AGENT_INTERRUPT: &str = "agent_interrupt";
 const TOOL_AGENT_KILL: &str = "agent_kill";
 const TOOL_FLEET_STOP: &str = "fleet_stop";
 const TOOL_AGENT_STEER: &str = "agent_steer";
+const TOOL_AGENT_PAUSE: &str = "agent_pause";
+const TOOL_AGENT_RESUME: &str = "agent_resume";
+const TOOL_AGENT_RESPAWN: &str = "agent_respawn";
 
 /// TTL for a cooperative steering instruction. Long enough that an agent busy
 /// in a multi-minute turn still sees it when it next drains its inbox, short
@@ -344,9 +347,126 @@ pub struct AgentSteerResponse {
     pub process: ProcessReadback,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPauseParams {
+    /// The agent to pause/resume: its own MCP session id, or `agent-spawn-*` id.
+    pub session_id: String,
+}
+
+/// Shared response for `agent_pause` and `agent_resume`. Both freeze/thaw the
+/// agent's whole owned process tree and prove the outcome by reading the OS
+/// thread table back, so the response shape is identical.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSuspendResponse {
+    pub requested_id: String,
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spawn_id: Option<String>,
+    pub agent_kind: String,
+    pub lifecycle: String,
+    pub resolution_source: String,
+    /// `pause` or `resume`.
+    pub operation: String,
+    /// Whole tree fully suspended BEFORE this call (physical thread-table read).
+    pub was_suspended_before: bool,
+    /// Whole tree fully suspended AFTER this call (physical thread-table read).
+    pub is_suspended_after: bool,
+    /// True when the call changed nothing because the tree was already in the
+    /// requested state — pause/resume are idempotent and never stack suspends.
+    pub no_op: bool,
+    /// True when the call reached the requested terminal state (paused for
+    /// pause, running for resume), judged by the thread-table readback.
+    pub ok: bool,
+    /// Physical suspend/resume readback (per-pid thread suspend counts after).
+    pub suspend: crate::m4::OwnedProcessSuspendReadback,
+    /// The `StateChanged` journal row, written only when the state changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub journal_event: Option<JournalReadback>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRespawnParams {
+    /// The agent to respawn: its own MCP session id, or `agent-spawn-*` id. May
+    /// be live (it is killed first) or already dead (it is simply re-launched).
+    pub session_id: String,
+    /// The work prompt for the new instance. Required: the original prompt is
+    /// not persisted (only its size is journaled), so respawn never fabricates
+    /// it — supply the continued task. The new agent's kind/model/model_ref and
+    /// (when journaled) working_dir/target are reused from the prior spawn.
+    pub prompt: String,
+    /// When true (default), a continuity packet naming the prior spawn/session
+    /// and, if present, its final message is prepended to the prompt so the new
+    /// instance knows it is resuming.
+    #[serde(default = "default_true")]
+    #[schemars(default = "default_true")]
+    pub carry_context: bool,
+    /// Graceful window (ms) for killing the prior instance when it is still live.
+    #[serde(default = "default_kill_grace_ms")]
+    #[schemars(default = "default_kill_grace_ms", range(min = 0, max = 120_000))]
+    pub grace_ms: u64,
+}
+
+/// What was reused from the prior spawn to build the respawn.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RespawnManifest {
+    pub agent_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_ref: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Source of the reused manifest fields, e.g. `spawn-manifest.json` /
+    /// `spawn_requested_journal`.
+    pub source: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentRespawnResponse {
+    pub requested_id: String,
+    /// The prior instance's MCP session id.
+    pub prior_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prior_spawn_id: Option<String>,
+    /// True when the prior instance was live and this call killed it first.
+    pub prior_killed: bool,
+    /// True when the prior instance was already dead (no kill needed).
+    pub prior_already_dead: bool,
+    /// What the respawn reused from the prior spawn.
+    pub manifest: RespawnManifest,
+    /// True when a continuity packet was prepended to the new prompt.
+    pub carried_context: bool,
+    /// Character count of the final prompt the new instance was spawned with.
+    pub effective_prompt_chars: usize,
+    /// The new instance's MCP session id.
+    pub new_session_id: String,
+    /// The new instance's `agent-spawn-*` id.
+    pub new_spawn_id: String,
+    /// The `StateChanged` lineage row written on the prior agent (respawned_into).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lineage_journal_event: Option<JournalReadback>,
+}
+
 // ----------------------------------------------------------------------------
 // Resolved-target model
 // ----------------------------------------------------------------------------
+
+/// The side-effect-free plan for an `agent_respawn`: everything reconstructed
+/// from the prior agent's persisted state before any kill or launch happens.
+#[derive(Clone, Debug)]
+struct RespawnPlan {
+    lookup: String,
+    target: ResolvedAgent,
+    manifest: RespawnManifest,
+    effective_prompt: String,
+    carried_context: bool,
+    request_value: Value,
+}
 
 /// A spawned agent located in the live session registry.
 #[derive(Clone, Debug)]
@@ -441,6 +561,58 @@ impl SynapseService {
         );
         let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
         self.agent_steer_impl(params.0, caller.as_deref()).map(Json)
+    }
+
+    #[tool(
+        description = "Pause (freeze) ONE running spawned agent (#906) by its MCP session id or agent-spawn-* id. Suspends every process in the agent's owned tree with ntdll NtSuspendProcess (race-free, the PsSuspend/py-spy approach), then reads the OS thread table back to PROVE every thread is suspended. Idempotent: an already-paused tree is a no-op (never stacks suspend counts). Resume with agent_resume. Errors if the tree cannot be fully suspended."
+    )]
+    pub async fn agent_pause(
+        &self,
+        params: Parameters<AgentPauseParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<AgentSuspendResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "agent_pause",
+            "tool.invocation kind=agent_pause"
+        );
+        let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
+        self.agent_pause_impl(params.0, caller.as_deref()).map(Json)
+    }
+
+    #[tool(
+        description = "Resume (thaw) ONE paused spawned agent (#906) by its MCP session id or agent-spawn-* id. Resumes every process in the agent's owned tree with ntdll NtResumeProcess, then reads the OS thread table back to PROVE every thread is running again. Idempotent: an already-running tree is a no-op. Errors if the tree cannot be fully resumed."
+    )]
+    pub async fn agent_resume(
+        &self,
+        params: Parameters<AgentPauseParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<AgentSuspendResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "agent_resume",
+            "tool.invocation kind=agent_resume"
+        );
+        let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
+        self.agent_resume_impl(params.0, caller.as_deref()).map(Json)
+    }
+
+    #[tool(
+        description = "Respawn ONE spawned agent (#906): kill the prior instance (if live) and launch a fresh one that reuses the prior spawn's kind/model/model_ref and journaled working_dir/target, with a continuity packet (prior spawn/session id + final message) prepended so it resumes. prompt is REQUIRED — the original prompt is not persisted, so respawn supplies the continued task rather than fabricate it. Writes a StateChanged lineage row (respawned_into) on the prior agent and returns both ids. Errors loudly if the prior spawn manifest cannot be read."
+    )]
+    pub async fn agent_respawn(
+        &self,
+        params: Parameters<AgentRespawnParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<AgentRespawnResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "agent_respawn",
+            "tool.invocation kind=agent_respawn"
+        );
+        self.agent_respawn_impl(params.0, &request_context)
+            .await
+            .map(Json)
     }
 }
 
@@ -1109,6 +1281,494 @@ impl SynapseService {
                 row_key: None,
             },
         }
+    }
+
+    // ------------------------------------------------------------------
+    // agent_pause / agent_resume (#906)
+    // ------------------------------------------------------------------
+
+    fn agent_pause_impl(
+        &self,
+        params: AgentPauseParams,
+        caller_session: Option<&str>,
+    ) -> Result<AgentSuspendResponse, ErrorData> {
+        self.suspend_resume_core(params, caller_session, true)
+    }
+
+    fn agent_resume_impl(
+        &self,
+        params: AgentPauseParams,
+        caller_session: Option<&str>,
+    ) -> Result<AgentSuspendResponse, ErrorData> {
+        self.suspend_resume_core(params, caller_session, false)
+    }
+
+    /// Shared suspend/resume path. `pause=true` freezes the tree, `pause=false`
+    /// thaws it. The OS thread table is the source of truth for the before/after
+    /// state, the operation is idempotent (never stacks suspend counts), and a
+    /// `StateChanged` journal row is written only when the state actually changed.
+    fn suspend_resume_core(
+        &self,
+        params: AgentPauseParams,
+        caller_session: Option<&str>,
+        pause: bool,
+    ) -> Result<AgentSuspendResponse, ErrorData> {
+        let tool = if pause {
+            TOOL_AGENT_PAUSE
+        } else {
+            TOOL_AGENT_RESUME
+        };
+        let operation = if pause { "pause" } else { "resume" };
+        let lookup = validate_lookup_id(&params.session_id, tool)?;
+        let target = self.resolve_spawned_agent(&lookup, tool)?;
+        if target.dead {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_ALREADY_DEAD: agent {} (session {}) is closed; {operation} targets a live agent",
+                    lookup, target.session_id
+                ),
+            ));
+        }
+        let process = process_readback_for_target(&target);
+        if process.live_process_ids.is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_NO_LIVE_PROCESS: agent {} (session {}) has no live process tree to {operation}",
+                    lookup, target.session_id
+                ),
+            ));
+        }
+
+        // Physical state BEFORE acting.
+        let states_before = crate::m4::process_tree_suspend_state(&process.live_process_ids);
+        let was_suspended_before = !states_before.is_empty()
+            && states_before.iter().all(|state| state.fully_suspended);
+        let any_suspended_before = states_before.iter().any(|state| state.suspended_threads > 0);
+        // Idempotency: pause is a no-op when already fully suspended (stacking a
+        // second suspend would need a second resume); resume is a no-op when no
+        // thread is suspended at all.
+        let no_op = if pause {
+            was_suspended_before
+        } else {
+            !any_suspended_before
+        };
+
+        let payload = json!({
+            "requested_id": lookup,
+            "operation": operation,
+            "from": caller_session,
+            "process_tree_ids": process.process_tree_ids,
+        });
+        let before = json!({
+            "process": &process,
+            "states_before": &states_before,
+            "was_suspended_before": was_suspended_before,
+        });
+        self.command_audit_intent(
+            CommandAuditInput::mcp(
+                tool,
+                operation,
+                caller_session.map(ToOwned::to_owned),
+                Some(target.session_id.clone()),
+                payload.clone(),
+                before.clone(),
+                Value::Null,
+                "pending",
+            )
+            .with_target(json!({ "spawn_id": target.spawn_id, "agent_kind": target.agent_kind })),
+        )?;
+
+        let suspend = if no_op {
+            // Report current physical state without mutating suspend counts.
+            crate::m4::OwnedProcessSuspendReadback {
+                process_ids: process.process_tree_ids.clone(),
+                live_process_ids: process.live_process_ids.clone(),
+                applied_process_ids: Vec::new(),
+                failed: Vec::new(),
+                all_suspended: was_suspended_before,
+                all_running: !any_suspended_before,
+                states_after: states_before.clone(),
+            }
+        } else if pause {
+            crate::m4::suspend_owned_process_ids(&process.process_tree_ids)
+        } else {
+            crate::m4::resume_owned_process_ids(&process.process_tree_ids)
+        };
+
+        let is_suspended_after = suspend.all_suspended;
+        let ok = if pause {
+            suspend.all_suspended
+        } else {
+            suspend.all_running
+        };
+
+        // Journal a StateChanged row only when this call actually changed state.
+        let journal_event = if no_op {
+            None
+        } else {
+            Some(self.journal_lifecycle_event(
+                AgentEventKind::StateChanged,
+                &target,
+                tool,
+                None,
+                json!({
+                    "operation": operation,
+                    "was_suspended_before": was_suspended_before,
+                    "suspend": &suspend,
+                }),
+            )?)
+        };
+
+        let response = AgentSuspendResponse {
+            requested_id: lookup,
+            session_id: target.session_id.clone(),
+            spawn_id: target.spawn_id.clone(),
+            agent_kind: target.agent_kind.clone(),
+            lifecycle: target.lifecycle.clone(),
+            resolution_source: target.resolution_source.clone(),
+            operation: operation.to_owned(),
+            was_suspended_before,
+            is_suspended_after,
+            no_op,
+            ok,
+            suspend,
+            journal_event,
+        };
+
+        let after = json!({
+            "operation": operation,
+            "no_op": response.no_op,
+            "ok": response.ok,
+            "is_suspended_after": response.is_suspended_after,
+            "suspend": &response.suspend,
+        });
+        self.command_audit_final(
+            CommandAuditInput::mcp(
+                tool,
+                operation,
+                caller_session.map(ToOwned::to_owned),
+                Some(target.session_id.clone()),
+                payload,
+                before,
+                after,
+                if response.ok { "ok" } else { "error" },
+            )
+            .with_target(json!({ "spawn_id": target.spawn_id, "agent_kind": target.agent_kind })),
+        )?;
+
+        if !response.ok {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_{}_INCOMPLETE: agent {} (session {}) could not be fully {operation}d; per-pid failures: {:?}; thread state after: {:?}",
+                    operation.to_ascii_uppercase(),
+                    response.requested_id,
+                    response.session_id,
+                    response.suspend.failed,
+                    response.suspend.states_after,
+                ),
+            ));
+        }
+        Ok(response)
+    }
+
+    // ------------------------------------------------------------------
+    // agent_respawn (#906)
+    // ------------------------------------------------------------------
+
+    /// Builds the respawn plan from the prior agent's persisted state WITHOUT
+    /// any side effect (no kill, no launch). Validates the prompt/grace,
+    /// resolves the prior agent, reconstructs its spawn identity from the
+    /// manifest, and assembles the continuity prompt + spawn request value.
+    /// Split out so the reconstruction is unit-testable without a launch.
+    fn agent_respawn_plan(&self, params: &AgentRespawnParams) -> Result<RespawnPlan, ErrorData> {
+        let lookup = validate_lookup_id(&params.session_id, TOOL_AGENT_RESPAWN)?;
+        let prompt = params.prompt.trim();
+        if prompt.is_empty() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "AGENT_RESPAWN_PROMPT_REQUIRED: the original prompt is not persisted; supply the continued task prompt for the new instance",
+            ));
+        }
+        if params.grace_ms > MAX_KILL_GRACE_MS {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_RESPAWN_GRACE_INVALID: grace_ms must be 0..={MAX_KILL_GRACE_MS}, got {}",
+                    params.grace_ms
+                ),
+            ));
+        }
+        let target = self.resolve_spawned_agent(&lookup, TOOL_AGENT_RESPAWN)?;
+
+        // Reuse the prior spawn's identity from its persisted manifest (the SoT
+        // for kind/model/model_ref) — refuse loudly if it cannot be read rather
+        // than guess.
+        let manifest = self.read_respawn_manifest(&target)?;
+        let Some(cli_token) = spawn_cli_serde_token(&manifest.agent_kind) else {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_RESPAWN_KIND_UNSUPPORTED: prior spawn manifest reports agent kind {:?}, which is not a respawnable CLI",
+                    manifest.agent_kind
+                ),
+            ));
+        };
+
+        // Continuity packet: name the prior lineage and, when present, fold in
+        // its final message so the new instance resumes with context.
+        let mut effective_prompt = String::new();
+        let mut carried_context = false;
+        if params.carry_context {
+            let final_message = read_prior_final_message(&target.log_dir);
+            effective_prompt.push_str(&format!(
+                "[Respawn continuity] You are a respawn of agent {} (prior MCP session {}). \
+                 The prior instance was {}. Resume its work from where it left off.\n",
+                target.spawn_id.as_deref().unwrap_or(&target.session_id),
+                target.session_id,
+                if target.dead { "no longer running" } else { "stopped to respawn it" },
+            ));
+            if let Some(message) = final_message {
+                effective_prompt.push_str("\nPrior final message:\n");
+                effective_prompt.push_str(&message);
+                effective_prompt.push('\n');
+            }
+            effective_prompt.push_str("\n---\n\n");
+            carried_context = true;
+        }
+        effective_prompt.push_str(prompt);
+
+        // Build a direct spawn request reusing the prior identity. Constructed
+        // via serde so every unspecified field takes its documented default.
+        let mut request_value = json!({
+            "cli": cli_token,
+            "prompt": effective_prompt,
+        });
+        if let Some(model) = manifest.model.as_deref() {
+            request_value["model"] = json!(model);
+        }
+        if let Some(model_ref) = manifest.model_ref.as_deref() {
+            request_value["model_ref"] = json!(model_ref);
+        }
+        if let Some(working_dir) = manifest.working_dir.as_deref() {
+            request_value["working_dir"] = json!(working_dir);
+        }
+
+        Ok(RespawnPlan {
+            lookup,
+            target,
+            manifest,
+            effective_prompt,
+            carried_context,
+            request_value,
+        })
+    }
+
+    async fn agent_respawn_impl(
+        &self,
+        params: AgentRespawnParams,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<AgentRespawnResponse, ErrorData> {
+        let caller = super::context::mcp_session_id_from_request_context(request_context)?;
+        let RespawnPlan {
+            lookup,
+            target,
+            manifest,
+            effective_prompt,
+            carried_context,
+            request_value,
+        } = self.agent_respawn_plan(&params)?;
+        let prior_spawn_id = target.spawn_id.clone();
+
+        let payload = json!({
+            "requested_id": lookup,
+            "carry_context": params.carry_context,
+            "grace_ms": params.grace_ms,
+            "manifest": &manifest,
+            "from": caller,
+        });
+        let before = json!({
+            "prior_session_id": target.session_id,
+            "prior_spawn_id": prior_spawn_id,
+            "prior_lifecycle": target.lifecycle,
+        });
+        self.command_audit_intent(
+            CommandAuditInput::mcp(
+                TOOL_AGENT_RESPAWN,
+                "respawn",
+                caller.clone(),
+                Some(target.session_id.clone()),
+                payload.clone(),
+                before.clone(),
+                Value::Null,
+                "pending",
+            )
+            .with_target(json!({ "spawn_id": prior_spawn_id, "agent_kind": target.agent_kind })),
+        )?;
+
+        // Kill the prior instance first when it is still live; an already-dead
+        // prior is simply re-launched.
+        let prior_already_dead = target.dead
+            || process_readback_for_target(&target).live_process_ids.is_empty();
+        let prior_killed = if prior_already_dead {
+            false
+        } else {
+            self.agent_kill_impl(
+                AgentKillParams {
+                    session_id: target.session_id.clone(),
+                    grace_ms: params.grace_ms,
+                    interrupt_first: true,
+                },
+                caller.as_deref(),
+            )
+            .await
+            .map(|kill| kill.killed)
+            .unwrap_or(false)
+        };
+
+        let request: crate::m4::ActSpawnAgentRequest = serde_json::from_value(request_value)
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("AGENT_RESPAWN_REQUEST_BUILD_FAILED: {error}"),
+                )
+            })?;
+        let spawned = self
+            .spawn_agent_journaled(request, request_context)
+            .await?;
+
+        // Lineage: record on the prior agent that it was respawned into the new
+        // spawn, so agent_query/the journal can trace the chain.
+        let lineage_journal_event = self
+            .journal_lifecycle_event(
+                AgentEventKind::StateChanged,
+                &target,
+                TOOL_AGENT_RESPAWN,
+                None,
+                json!({
+                    "operation": "respawned_into",
+                    "new_spawn_id": spawned.spawn_id,
+                    "new_session_id": spawned.session_id,
+                    "prior_killed": prior_killed,
+                }),
+            )
+            .ok();
+
+        let response = AgentRespawnResponse {
+            requested_id: lookup,
+            prior_session_id: target.session_id.clone(),
+            prior_spawn_id,
+            prior_killed,
+            prior_already_dead,
+            manifest,
+            carried_context,
+            effective_prompt_chars: effective_prompt.chars().count(),
+            new_session_id: spawned.session_id.clone(),
+            new_spawn_id: spawned.spawn_id.clone(),
+            lineage_journal_event,
+        };
+
+        let after = json!({
+            "new_session_id": response.new_session_id,
+            "new_spawn_id": response.new_spawn_id,
+            "prior_killed": response.prior_killed,
+            "prior_already_dead": response.prior_already_dead,
+            "carried_context": response.carried_context,
+        });
+        self.command_audit_final(
+            CommandAuditInput::mcp(
+                TOOL_AGENT_RESPAWN,
+                "respawn",
+                caller,
+                Some(target.session_id.clone()),
+                payload,
+                before,
+                after,
+                "ok",
+            )
+            .with_target(json!({ "spawn_id": response.prior_spawn_id, "agent_kind": target.agent_kind })),
+        )?;
+
+        Ok(response)
+    }
+
+    /// Reads the prior spawn's reusable identity from its `spawn-manifest.json`
+    /// (kind/model/model_ref) and folds in the journaled working_dir. Errors if
+    /// no manifest exists — respawn never fabricates a spawn identity.
+    fn read_respawn_manifest(&self, target: &ResolvedAgent) -> Result<RespawnManifest, ErrorData> {
+        let manifest_path = PathBuf::from(&target.log_dir)
+            .join(super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME);
+        let bytes = fs::read(&manifest_path).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_RESPAWN_NO_MANIFEST: cannot read prior spawn manifest {}: {error}",
+                    manifest_path.display()
+                ),
+            )
+        })?;
+        let manifest: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_RESPAWN_MANIFEST_INVALID: prior spawn manifest {} is not valid JSON: {error}",
+                    manifest_path.display()
+                ),
+            )
+        })?;
+        let agent_kind = manifest
+            .get("kind")
+            .or_else(|| manifest.get("cli"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| target.agent_kind.clone(), ToOwned::to_owned);
+        let string_field = |key: &str| {
+            manifest
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        };
+        Ok(RespawnManifest {
+            agent_kind,
+            model: string_field("model"),
+            model_ref: string_field("model_ref"),
+            working_dir: self.prior_spawn_working_dir(target.spawn_id.as_deref()),
+            source: super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME.to_owned(),
+        })
+    }
+
+    /// Recovers the prior spawn's working_dir from its `SpawnRequested` journal
+    /// row (the manifest does not record it). Best-effort: `None` lets the new
+    /// spawn fall back to the daemon default.
+    fn prior_spawn_working_dir(&self, spawn_id: Option<&str>) -> Option<String> {
+        let spawn_id = spawn_id?;
+        let db = self.agent_control_db().ok()?;
+        let (rows, _more) = db
+            .scan_cf_from(synapse_storage::cf::CF_AGENT_EVENTS, &[], 1_000_000)
+            .ok()?;
+        for (_key, value) in rows {
+            let Ok(record) = serde_json::from_slice::<AgentEventRecord>(&value) else {
+                continue;
+            };
+            if record.kind == AgentEventKind::SpawnRequested
+                && record.spawn_id.as_deref() == Some(spawn_id)
+            {
+                if let Some(working_dir) = record
+                    .payload
+                    .get("working_dir")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    return Some(working_dir.to_owned());
+                }
+            }
+        }
+        None
     }
 
     // ------------------------------------------------------------------
@@ -2009,6 +2669,40 @@ fn compact_for_channel_reason(value: &str) -> String {
         compact
     } else {
         format!("{}...", &compact[..LIMIT])
+    }
+}
+
+/// Maps a stored agent-kind token (manifest/registry, which may use the
+/// `local-model` hyphen form from `ActSpawnAgentCli::as_str`) to the canonical
+/// serde token the spawn request deserializes (`snake_case`). `None` for kinds
+/// that are not a respawnable CLI.
+fn spawn_cli_serde_token(kind: &str) -> Option<&'static str> {
+    match kind.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "codex" => Some("codex"),
+        "claude" => Some("claude"),
+        "local_model" => Some("local_model"),
+        _ => None,
+    }
+}
+
+/// Reads a prior spawn's final message for respawn continuity, bounded so a
+/// huge transcript cannot blow up the new prompt. `None` when the agent left no
+/// final message (e.g. it was killed mid-run).
+fn read_prior_final_message(log_dir: &str) -> Option<String> {
+    const LIMIT: usize = 4_000;
+    if log_dir.trim().is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(log_dir).join("final-message.txt");
+    let text = fs::read_to_string(&path).ok()?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() > LIMIT {
+        Some(trimmed.chars().take(LIMIT).collect::<String>())
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 

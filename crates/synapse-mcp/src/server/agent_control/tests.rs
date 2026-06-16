@@ -227,6 +227,26 @@ fn register_spawned_victim(
     pid: u32,
     kind: &str,
 ) {
+    register_spawned_victim_with_log_dir(
+        service,
+        session_id,
+        spawn_id,
+        pid,
+        kind,
+        Path::new("C:\\temp\\regression"),
+    );
+}
+
+/// Like `register_spawned_victim` but with an explicit log dir, so a test can
+/// place a real `spawn-manifest.json` for the resolver to read back.
+fn register_spawned_victim_with_log_dir(
+    service: &SynapseService,
+    session_id: &str,
+    spawn_id: &str,
+    pid: u32,
+    kind: &str,
+    log_dir: &Path,
+) {
     let now = unix_time_ms_now();
     {
         let mut registry = service
@@ -244,7 +264,7 @@ fn register_spawned_victim(
                 started_by_session_id: Some("operator-regression".to_owned()),
                 launched_at_unix_ms: now,
                 launch_target: "powershell.exe".to_owned(),
-                log_dir: "C:\\temp\\regression".to_owned(),
+                log_dir: log_dir.display().to_string(),
                 template_id: None,
                 template_version: None,
                 control: None,
@@ -822,6 +842,301 @@ async fn agent_steer_delivers_cooperative_mailbox_and_journals_message_sent() {
     );
 
     // Clean up the still-live victim deterministically.
+    let _ = service
+        .agent_kill_impl(
+            AgentKillParams {
+                session_id: session.to_owned(),
+                grace_ms: 0,
+                interrupt_first: false,
+            },
+            Some("operator-regression"),
+        )
+        .await
+        .expect("cleanup kill");
+    assert!(!crate::m4::process_exists(pid));
+}
+
+// ---------------------------------------------------------------------------
+// agent_pause / agent_resume (#906) — deterministic param coverage + FSV
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pause_params_reject_unknown_fields() {
+    let result: Result<AgentPauseParams, _> =
+        serde_json::from_value(json!({ "session_id": "s-1", "grace_ms": 10 }));
+    assert!(
+        result.is_err(),
+        "agent_pause/agent_resume take only session_id; unknown fields must be rejected"
+    );
+}
+
+#[tokio::test]
+async fn pause_unknown_session_errors_structurally() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let error = service
+        .agent_pause_impl(
+            AgentPauseParams {
+                session_id: "session-does-not-exist".to_owned(),
+            },
+            Some("operator-regression"),
+        )
+        .expect_err("unknown session must error");
+    assert!(
+        error.message.contains("AGENT_NOT_FOUND"),
+        "unexpected error: {}",
+        error.message
+    );
+}
+
+// ---------------------------------------------------------------------------
+// agent_respawn (#906) — pure-logic units + validation coverage
+// ---------------------------------------------------------------------------
+
+#[test]
+fn respawn_cli_serde_token_maps_stored_kinds() {
+    // The manifest/registry store the `as_str` hyphen form; the spawn request
+    // deserializes the snake_case serde token. The mapping must bridge them.
+    assert_eq!(spawn_cli_serde_token("local-model"), Some("local_model"));
+    assert_eq!(spawn_cli_serde_token("local_model"), Some("local_model"));
+    assert_eq!(spawn_cli_serde_token("Codex"), Some("codex"));
+    assert_eq!(spawn_cli_serde_token("claude"), Some("claude"));
+    assert_eq!(spawn_cli_serde_token("nonsense"), None);
+}
+
+#[test]
+fn respawn_final_message_is_trimmed_and_bounded() {
+    let temp = TempDir::new().expect("temp dir");
+    let log_dir = temp.path();
+    // No file -> None.
+    assert!(read_prior_final_message(&log_dir.display().to_string()).is_none());
+    // Empty/whitespace file -> None.
+    std::fs::write(log_dir.join("final-message.txt"), "   \n  ").expect("write");
+    assert!(read_prior_final_message(&log_dir.display().to_string()).is_none());
+    // Normal content is returned trimmed.
+    std::fs::write(log_dir.join("final-message.txt"), "  done: shipped X  ").expect("write");
+    assert_eq!(
+        read_prior_final_message(&log_dir.display().to_string()).as_deref(),
+        Some("done: shipped X")
+    );
+    // Oversized content is bounded to 4000 chars.
+    std::fs::write(log_dir.join("final-message.txt"), "y".repeat(10_000)).expect("write");
+    let bounded = read_prior_final_message(&log_dir.display().to_string()).expect("some");
+    assert_eq!(bounded.chars().count(), 4_000);
+}
+
+#[test]
+fn respawn_params_reject_unknown_fields() {
+    let result: Result<AgentRespawnParams, _> =
+        serde_json::from_value(json!({ "session_id": "s-1", "prompt": "go", "bogus": true }));
+    assert!(result.is_err(), "deny_unknown_fields must reject extra keys");
+}
+
+#[test]
+fn respawn_plan_empty_prompt_errors_before_resolution() {
+    // The plan validates the prompt before resolving, so this needs no agent.
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let error = service
+        .agent_respawn_plan(&AgentRespawnParams {
+            session_id: "session-anything".to_owned(),
+            prompt: "   ".to_owned(),
+            carry_context: true,
+            grace_ms: 0,
+        })
+        .expect_err("empty prompt must error");
+    assert!(
+        error.message.contains("AGENT_RESPAWN_PROMPT_REQUIRED"),
+        "unexpected error: {}",
+        error.message
+    );
+}
+
+#[test]
+fn respawn_plan_unknown_session_errors_structurally() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let error = service
+        .agent_respawn_plan(&AgentRespawnParams {
+            session_id: "session-does-not-exist".to_owned(),
+            prompt: "continue the task".to_owned(),
+            carry_context: false,
+            grace_ms: 0,
+        })
+        .expect_err("unknown session must error");
+    assert!(
+        error.message.contains("AGENT_NOT_FOUND"),
+        "unexpected error: {}",
+        error.message
+    );
+}
+
+#[tokio::test]
+#[ignore = "real-process FSV: registers a real spawned victim to exercise manifest reconstruction; run with `cargo test -p synapse-mcp -- --ignored`"]
+async fn respawn_plan_reconstructs_identity_from_physical_manifest() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let session = "session-regression-respawn-1";
+    let spawn = "agent-spawn-regression-respawn-1";
+    let pid = spawn_victim();
+    let _guard = VictimGuard { pid };
+
+    // Register the victim with a log dir that holds a real spawn-manifest.json.
+    let log_dir = temp.path().join("respawn-log");
+    std::fs::create_dir_all(&log_dir).expect("mkdir log dir");
+    std::fs::write(
+        log_dir.join("spawn-manifest.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "spawn_id": spawn,
+            "cli": "local-model",
+            "kind": "local-model",
+            "model": "gemma3",
+            "model_ref": "gemma-local",
+        }))
+        .expect("encode manifest"),
+    )
+    .expect("write manifest");
+    std::fs::write(log_dir.join("final-message.txt"), "halfway through step 3")
+        .expect("write final message");
+    register_spawned_victim_with_log_dir(&service, session, spawn, pid, "local-model", &log_dir);
+
+    // No side effects: plan only reads the prior state.
+    let plan = service
+        .agent_respawn_plan(&AgentRespawnParams {
+            session_id: session.to_owned(),
+            prompt: "finish step 3 and write the test".to_owned(),
+            carry_context: true,
+            grace_ms: 0,
+        })
+        .expect("plan must reconstruct from the physical manifest");
+
+    // The reconstructed identity must come from the manifest on disk.
+    assert_eq!(plan.manifest.agent_kind, "local-model");
+    assert_eq!(plan.manifest.model.as_deref(), Some("gemma3"));
+    assert_eq!(plan.manifest.model_ref.as_deref(), Some("gemma-local"));
+    assert_eq!(plan.request_value["cli"], json!("local_model"));
+    assert_eq!(plan.request_value["model"], json!("gemma3"));
+    assert_eq!(plan.request_value["model_ref"], json!("gemma-local"));
+    // Continuity packet folds in the prior final message + the continued task.
+    assert!(plan.carried_context);
+    assert!(plan.effective_prompt.contains("Respawn continuity"));
+    assert!(plan.effective_prompt.contains(spawn));
+    assert!(plan.effective_prompt.contains("halfway through step 3"));
+    assert!(plan.effective_prompt.contains("finish step 3 and write the test"));
+
+    // Cleanup.
+    let _ = service
+        .agent_kill_impl(
+            AgentKillParams {
+                session_id: session.to_owned(),
+                grace_ms: 0,
+                interrupt_first: false,
+            },
+            Some("operator-regression"),
+        )
+        .await
+        .expect("cleanup kill");
+    assert!(!crate::m4::process_exists(pid));
+}
+
+#[tokio::test]
+#[ignore = "real-process FSV: suspends/resumes a real OS process and reads the thread table back; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
+async fn agent_pause_resume_freezes_real_process_tree_and_is_idempotent() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let session = "session-regression-pause-1";
+    let spawn = "agent-spawn-regression-pause-1";
+    let pid = spawn_victim();
+    let _guard = VictimGuard { pid };
+    register_spawned_victim(&service, session, spawn, pid, "local-model");
+
+    // Baseline: the live process has running threads, none suspended.
+    let baseline = crate::m4::process_tree_suspend_state(&[pid]);
+    assert!(
+        baseline.iter().any(|s| s.total_threads > 0),
+        "victim must have live threads before pause: {baseline:?}"
+    );
+    assert!(
+        baseline.iter().all(|s| s.suspended_threads == 0),
+        "victim must not be suspended before pause: {baseline:?}"
+    );
+
+    // Pause: every thread must be suspended afterwards (physical SoT).
+    let paused = service
+        .agent_pause_impl(
+            AgentPauseParams {
+                session_id: session.to_owned(),
+            },
+            Some("operator-regression"),
+        )
+        .expect("pause must fully suspend the tree");
+    assert!(paused.ok && paused.is_suspended_after && !paused.no_op);
+    assert!(
+        paused.journal_event.is_some(),
+        "a state change must journal a StateChanged row"
+    );
+    assert!(
+        paused
+            .suspend
+            .states_after
+            .iter()
+            .all(|s| s.fully_suspended && s.suspended_threads == s.total_threads),
+        "every thread must be suspended: {:?}",
+        paused.suspend.states_after
+    );
+
+    // Independent physical readback of the OS thread table confirms suspension.
+    let observed = crate::m4::process_tree_suspend_state(&paused.suspend.live_process_ids);
+    assert!(
+        observed.iter().all(|s| s.total_threads > 0 && s.fully_suspended),
+        "independent thread-table read must show the tree frozen: {observed:?}"
+    );
+
+    // Pause again: idempotent no-op (must not stack a second suspend count).
+    let repaused = service
+        .agent_pause_impl(
+            AgentPauseParams {
+                session_id: session.to_owned(),
+            },
+            Some("operator-regression"),
+        )
+        .expect("second pause is a no-op");
+    assert!(repaused.no_op && repaused.ok && repaused.is_suspended_after);
+    assert!(
+        repaused.journal_event.is_none(),
+        "a no-op must not journal a StateChanged row"
+    );
+
+    // Resume: every thread must be running again (one resume suffices because
+    // pause never stacked).
+    let resumed = service
+        .agent_resume_impl(
+            AgentPauseParams {
+                session_id: session.to_owned(),
+            },
+            Some("operator-regression"),
+        )
+        .expect("resume must fully thaw the tree");
+    assert!(resumed.ok && !resumed.is_suspended_after && !resumed.no_op);
+    let observed_running = crate::m4::process_tree_suspend_state(&resumed.suspend.live_process_ids);
+    assert!(
+        observed_running.iter().all(|s| s.suspended_threads == 0),
+        "independent thread-table read must show the tree running: {observed_running:?}"
+    );
+
+    // Resume again: idempotent no-op.
+    let reresumed = service
+        .agent_resume_impl(
+            AgentPauseParams {
+                session_id: session.to_owned(),
+            },
+            Some("operator-regression"),
+        )
+        .expect("second resume is a no-op");
+    assert!(reresumed.no_op && reresumed.ok);
+
+    // Cleanup.
     let _ = service
         .agent_kill_impl(
             AgentKillParams {

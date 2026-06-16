@@ -8036,6 +8036,263 @@ pub(crate) fn terminate_owned_process_ids(process_ids: &[u32]) -> OwnedProcessTe
     }
 }
 
+// ----------------------------------------------------------------------------
+// Process suspend / resume (#906 agent_pause / agent_resume)
+// ----------------------------------------------------------------------------
+//
+// Suspending a process is done with the undocumented ntdll `NtSuspendProcess` /
+// `NtResumeProcess` rather than the documented "enumerate threads then
+// SuspendThread each" route: the documented route has a thread-creation race
+// (a thread spawned between the snapshot and the per-thread suspend escapes),
+// whereas the kernel walks the live thread list atomically. This is the same
+// approach PsSuspend and py-spy use. Each suspend increments a per-thread
+// suspend count, so N suspends require N resumes — `agent_pause` therefore
+// reads the physical suspend state back and refuses to stack suspends.
+
+/// Physical suspend-state of one process, read from the OS thread table — the
+/// source of truth for "is it actually frozen". A fully-suspended process has
+/// `total_threads > 0` and `suspended_threads == total_threads`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSuspendState {
+    pub pid: u32,
+    pub total_threads: u32,
+    pub suspended_threads: u32,
+    pub fully_suspended: bool,
+}
+
+/// One pid that an Nt(Suspend|Resume)Process call could not be applied to.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessControlFailure {
+    pub pid: u32,
+    pub reason: String,
+}
+
+/// Readback for a suspend/resume sweep over an owned process tree. `states_after`
+/// is the physical thread-table readback taken AFTER the operation.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OwnedProcessSuspendReadback {
+    pub process_ids: Vec<u32>,
+    pub live_process_ids: Vec<u32>,
+    /// Pids the Nt(Suspend|Resume)Process call returned success for.
+    pub applied_process_ids: Vec<u32>,
+    /// Pids the call could not be applied to, each with its reason.
+    pub failed: Vec<ProcessControlFailure>,
+    /// Physical per-process thread suspend-state after the operation (the SoT).
+    pub states_after: Vec<ProcessSuspendState>,
+    /// True iff every live process in the tree is fully suspended.
+    pub all_suspended: bool,
+    /// True iff every live process in the tree has zero suspended threads.
+    pub all_running: bool,
+}
+
+fn summarize_suspend_readback(
+    process_ids: Vec<u32>,
+    live_process_ids: Vec<u32>,
+    applied_process_ids: Vec<u32>,
+    failed: Vec<ProcessControlFailure>,
+) -> OwnedProcessSuspendReadback {
+    let states_after = process_tree_suspend_state(&live_process_ids);
+    let all_suspended = !states_after.is_empty()
+        && states_after.iter().all(|state| state.fully_suspended);
+    let all_running = states_after
+        .iter()
+        .all(|state| state.suspended_threads == 0);
+    OwnedProcessSuspendReadback {
+        process_ids,
+        live_process_ids,
+        applied_process_ids,
+        failed,
+        states_after,
+        all_suspended,
+        all_running,
+    }
+}
+
+/// Suspends the given owned process ids (the caller's already-resolved tree).
+pub(crate) fn suspend_owned_process_ids(process_ids: &[u32]) -> OwnedProcessSuspendReadback {
+    let live_process_ids = shell_job_live_process_ids(process_ids);
+    let (applied, failed) = set_process_tree_suspended_platform(&live_process_ids, true);
+    summarize_suspend_readback(process_ids.to_vec(), live_process_ids, applied, failed)
+}
+
+/// Resumes the given owned process ids (the caller's already-resolved tree).
+pub(crate) fn resume_owned_process_ids(process_ids: &[u32]) -> OwnedProcessSuspendReadback {
+    let live_process_ids = shell_job_live_process_ids(process_ids);
+    let (applied, failed) = set_process_tree_suspended_platform(&live_process_ids, false);
+    summarize_suspend_readback(process_ids.to_vec(), live_process_ids, applied, failed)
+}
+
+/// Reads the physical suspend state of each pid from the OS thread table.
+pub(crate) fn process_tree_suspend_state(process_ids: &[u32]) -> Vec<ProcessSuspendState> {
+    process_tree_suspend_state_platform(process_ids)
+}
+
+#[cfg(windows)]
+fn set_process_tree_suspended_platform(
+    live_process_ids: &[u32],
+    suspend: bool,
+) -> (Vec<u32>, Vec<ProcessControlFailure>) {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_SUSPEND_RESUME};
+
+    // Undocumented but stable ntdll process-wide suspend/resume. Exported from
+    // ntdll on every supported Windows; linked directly the way py-spy does.
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtSuspendProcess(handle: HANDLE) -> i32;
+        fn NtResumeProcess(handle: HANDLE) -> i32;
+    }
+
+    let mut applied = Vec::new();
+    let mut failed = Vec::new();
+    for &pid in live_process_ids {
+        let handle = match unsafe { OpenProcess(PROCESS_SUSPEND_RESUME, false, pid) } {
+            Ok(handle) => handle,
+            Err(error) => {
+                failed.push(ProcessControlFailure {
+                    pid,
+                    reason: format!("OpenProcess(PROCESS_SUSPEND_RESUME) failed: {error}"),
+                });
+                continue;
+            }
+        };
+        // NTSTATUS: negative values are errors; 0 (STATUS_SUCCESS) is success.
+        let status = if suspend {
+            unsafe { NtSuspendProcess(handle) }
+        } else {
+            unsafe { NtResumeProcess(handle) }
+        };
+        let _ = unsafe { CloseHandle(handle) };
+        if status < 0 {
+            failed.push(ProcessControlFailure {
+                pid,
+                reason: format!(
+                    "{} returned NTSTATUS 0x{status:08x}",
+                    if suspend { "NtSuspendProcess" } else { "NtResumeProcess" }
+                ),
+            });
+        } else {
+            applied.push(pid);
+        }
+    }
+    (applied, failed)
+}
+
+/// Reads each pid's thread suspend state by a NET-ZERO probe: `SuspendThread`
+/// returns the suspend count *before* it increments, so we suspend then
+/// immediately resume each thread, leaving the count unchanged while learning
+/// whether it was already suspended (returned count >= 1). Lower UB risk than
+/// hand-walking `NtQuerySystemInformation` buffers, and still a real read of OS
+/// state. Safe because we only ever touch pids inside an owned agent tree.
+#[cfg(windows)]
+fn process_tree_suspend_state_platform(process_ids: &[u32]) -> Vec<ProcessSuspendState> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME};
+
+    let mut states: Vec<ProcessSuspendState> = process_ids
+        .iter()
+        .map(|&pid| ProcessSuspendState {
+            pid,
+            total_threads: 0,
+            suspended_threads: 0,
+            fully_suspended: false,
+        })
+        .collect();
+    if states.is_empty() {
+        return states;
+    }
+
+    let snapshot = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) } {
+        Ok(snapshot) => snapshot,
+        Err(_) => return states,
+    };
+    let mut entry = THREADENTRY32 {
+        dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).unwrap_or(0),
+        ..Default::default()
+    };
+    if unsafe { Thread32First(snapshot, &mut entry) }.is_ok() {
+        loop {
+            let owner = entry.th32OwnerProcessID;
+            if let Some(state) = states.iter_mut().find(|state| state.pid == owner) {
+                state.total_threads = state.total_threads.saturating_add(1);
+                if let Ok(thread) =
+                    unsafe { OpenThread(THREAD_SUSPEND_RESUME, false, entry.th32ThreadID) }
+                {
+                    // Net-zero probe: previous count = value returned by SuspendThread.
+                    let previous = unsafe { SuspendThread(thread) };
+                    if previous != u32::MAX {
+                        let _ = unsafe { ResumeThread(thread) };
+                        if previous >= 1 {
+                            state.suspended_threads = state.suspended_threads.saturating_add(1);
+                        }
+                    }
+                    let _ = unsafe { CloseHandle(thread) };
+                }
+            }
+            entry = THREADENTRY32 {
+                dwSize: u32::try_from(std::mem::size_of::<THREADENTRY32>()).unwrap_or(0),
+                ..Default::default()
+            };
+            if unsafe { Thread32Next(snapshot, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    let _ = unsafe { CloseHandle(snapshot) };
+
+    for state in &mut states {
+        state.fully_suspended =
+            state.total_threads > 0 && state.suspended_threads == state.total_threads;
+    }
+    states
+}
+
+#[cfg(not(windows))]
+fn set_process_tree_suspended_platform(
+    live_process_ids: &[u32],
+    suspend: bool,
+) -> (Vec<u32>, Vec<ProcessControlFailure>) {
+    let signal = if suspend { "-STOP" } else { "-CONT" };
+    let mut applied = Vec::new();
+    let mut failed = Vec::new();
+    for &pid in live_process_ids {
+        match StdCommand::new("kill").args([signal, &pid.to_string()]).output() {
+            Ok(output) if output.status.success() => applied.push(pid),
+            Ok(output) => failed.push(ProcessControlFailure {
+                pid,
+                reason: format!("kill {signal} exited {:?}", output.status.code()),
+            }),
+            Err(error) => failed.push(ProcessControlFailure {
+                pid,
+                reason: format!("kill {signal} spawn failed: {error}"),
+            }),
+        }
+    }
+    (applied, failed)
+}
+
+#[cfg(not(windows))]
+fn process_tree_suspend_state_platform(process_ids: &[u32]) -> Vec<ProcessSuspendState> {
+    // Non-Windows builds exist only for unit-testable host portability; the
+    // owned-PTY/agent fleet runs on Windows. Report unknown thread counts
+    // rather than fabricate a suspend state.
+    process_ids
+        .iter()
+        .map(|&pid| ProcessSuspendState {
+            pid,
+            total_threads: 0,
+            suspended_threads: 0,
+            fully_suspended: false,
+        })
+        .collect()
+}
+
 fn terminate_shell_job_process_tree(pid: u32) -> ShellJobTerminationReadback {
     let process_ids = shell_job_process_tree_ids(pid);
     let initial_live_process_ids = shell_job_live_process_ids(&process_ids);
