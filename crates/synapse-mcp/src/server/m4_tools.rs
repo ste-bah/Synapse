@@ -3652,10 +3652,10 @@ fn build_agent_spawn_prompt(
     if agent_kind.is_local_model() {
         let assigned_prompt = params.prompt.as_deref().unwrap_or("").trim();
         if assigned_prompt.is_empty() {
-            return Ok(
-                "Use the Synapse health tool once, then respond with a compact health_ok summary."
-                    .to_owned(),
-            );
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "act_spawn_agent local_model prompt must not be empty",
+            ));
         }
         return Ok(assigned_prompt.to_owned());
     }
@@ -5649,6 +5649,39 @@ mod tests {
         assert_eq!(manifest["kind"], "local-model");
         assert_eq!(manifest["model"], "ollama-gemma4-e4b");
         assert_eq!(manifest["model_ref"], "ollama-gemma4-e4b");
+    }
+
+    #[test]
+    fn local_model_spawn_prompt_builder_rejects_blank_prompt() {
+        let dir = tempfile::TempDir::new().expect("create temp dir");
+        let task_started_path = dir.path().join("task-started.json");
+        let task_started_script_path = dir.path().join("write-task-started.ps1");
+        let mut params = test_spawn_params();
+        params.cli = None;
+        params.kind = Some(ActSpawnAgentCli::LocalModel);
+        params.model_ref = Some("ollama-gemma4-e4b".to_owned());
+        params.prompt = Some("  \r\n\t ".to_owned());
+
+        let error = build_agent_spawn_prompt(
+            "agent-spawn-test",
+            &params,
+            dir.path(),
+            &task_started_path,
+            &task_started_script_path,
+        )
+        .expect_err("blank local-model prompt must fail closed");
+
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!(error_codes::TOOL_PARAMS_INVALID))
+        );
+        assert!(
+            error
+                .message
+                .contains("local_model prompt must not be empty"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

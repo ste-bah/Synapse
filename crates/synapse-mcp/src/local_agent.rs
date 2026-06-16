@@ -608,6 +608,16 @@ impl Runner {
             return Ok(());
         }
 
+        if let Some(reason) = model_tool_call_pre_gate_rejection(
+            &tool_name,
+            &args,
+            self.synapse_tool_exists(&tool_name),
+        ) {
+            self.record_model_tool_call_invalid(&call, &tool_name, routed, &reason)
+                .await?;
+            bail!("MODEL_TOOL_CALL_INVALID: {tool_name}: {reason}");
+        }
+
         // #1028: gate hazardous tool calls through the shared approval queue
         // before dispatch. Safe (read-only/low-consequence) calls pass through
         // instantly; risky calls block on the in-daemon approval_gate and may be
@@ -749,6 +759,12 @@ impl Runner {
                 .successful_workspace_puts
                 .iter()
                 .any(|successful| workspace_put_args_match(successful, args))
+    }
+
+    fn synapse_tool_exists(&self, tool_name: &str) -> bool {
+        self.tools
+            .iter()
+            .any(|tool| tool.name.as_ref() == tool_name)
     }
 
     async fn record_duplicate_workspace_put_completion(
@@ -920,6 +936,59 @@ impl Runner {
         }))
         .await?;
         Ok(verdict)
+    }
+
+    async fn record_model_tool_call_invalid(
+        &mut self,
+        call: &OpenAiToolCall,
+        tool_name: &str,
+        routed: bool,
+        reason: &str,
+    ) -> anyhow::Result<()> {
+        self.tool_call_error_count = self.tool_call_error_count.saturating_add(1);
+        let detail = format!("MODEL_TOOL_CALL_INVALID: {tool_name}: {reason}");
+        let result_value = json!({ "error": detail });
+        self.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": json!({
+                "error": "MODEL_TOOL_CALL_INVALID",
+                "tool": tool_name,
+                "message": reason,
+                "recoverable": false,
+                "suggestion": "Stop. Do not ask approval for malformed or runner-control tool calls.",
+            }).to_string(),
+        }));
+        self.write_line(json!({
+            "type": "local.tool_call.finished",
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "turn_index": self.turn_count,
+            "tool_name": call.name,
+            "routed_tool_name": if routed { Some(tool_name) } else { None },
+            "tool_call_id": call.id,
+            "status": "error",
+            "error_code": "MODEL_TOOL_CALL_INVALID",
+            "terminal": true,
+            "result": result_value,
+            "tool_exposure": self.tool_exposure.as_str(),
+        }))?;
+        self.post_event(json!({
+            "event": "tool_call_finished",
+            "session_id": self.mcp_session_id,
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "registry_name": self.registry.name,
+            "turn_index": self.turn_count,
+            "tool_name": call.name,
+            "routed_tool_name": if routed { Some(tool_name) } else { None },
+            "tool_call_id": call.id,
+            "tool_response": result_value,
+            "error_code": "MODEL_TOOL_CALL_INVALID",
+            "tool_exposure": self.tool_exposure.as_str(),
+        }))
+        .await?;
+        Ok(())
     }
 
     /// Feed an operator denial back to the model as the tool result (so it can
@@ -1423,6 +1492,33 @@ async fn call_mcp_tool_json(
 struct WorkspacePutReadbackPlan {
     arguments: JsonObject,
     expected_value: Value,
+}
+
+fn model_tool_call_pre_gate_rejection(
+    tool_name: &str,
+    args: &JsonObject,
+    tool_present: bool,
+) -> Option<String> {
+    if !tool_present {
+        return Some(format!(
+            "{tool_name} is not present in Synapse tools/list; local models must emit a real Synapse tool name"
+        ));
+    }
+    match tool_name {
+        "agent_send" | "approval_decide" | "approval_gate" => Some(format!(
+            "{tool_name} is runner/operator-control; local models must not call it"
+        )),
+        "workspace_put" => {
+            if !args.contains_key("value") && !args.contains_key("artifact") {
+                return Some(
+                    "workspace_put requires at least one of value or artifact before approval"
+                        .to_owned(),
+                );
+            }
+            None
+        }
+        _ => None,
+    }
 }
 
 async fn readback_workspace_put(
@@ -2203,6 +2299,7 @@ fn error_code_from_detail(detail: &str) -> &str {
         "MODEL_ENDPOINT_UNREACHABLE",
         "MODEL_TOOLS_UNSUPPORTED",
         "MODEL_EMPTY_COMPLETION",
+        "MODEL_TOOL_CALL_INVALID",
         "LOCAL_AGENT_CONTEXT_OVERFLOW",
         "LOCAL_AGENT_INTERRUPTED",
         "LOCAL_AGENT_TURN_LIMIT",
@@ -2442,6 +2539,53 @@ mod tests {
         }))?;
         assert!(workspace_put_args_match(&first, &same));
         assert!(!workspace_put_args_match(&first, &different));
+        Ok(())
+    }
+
+    #[test]
+    fn model_tool_call_pre_gate_rejects_workspace_put_without_value_or_artifact()
+    -> anyhow::Result<()> {
+        let args: JsonObject = serde_json::from_value(json!({
+            "run_id": "issue1055",
+            "key": "missing-value",
+        }))?;
+        let reason = model_tool_call_pre_gate_rejection("workspace_put", &args, true)
+            .expect("workspace_put without value/artifact must fail before approval");
+        assert!(reason.contains("requires at least one of value or artifact"));
+
+        let with_value: JsonObject = serde_json::from_value(json!({
+            "run_id": "issue1055",
+            "key": "ok",
+            "value": null,
+        }))?;
+        assert!(model_tool_call_pre_gate_rejection("workspace_put", &with_value, true).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn model_tool_call_pre_gate_rejects_unknown_tool_before_approval() -> anyhow::Result<()> {
+        let args: JsonObject = serde_json::from_value(json!({
+            "malformed_output": true,
+        }))?;
+        let reason = model_tool_call_pre_gate_rejection("agent_retry", &args, false)
+            .expect("invented tool names must fail before approval");
+        assert!(reason.contains("not present in Synapse tools/list"));
+        assert!(reason.contains("real Synapse tool name"));
+        Ok(())
+    }
+
+    #[test]
+    fn model_tool_call_pre_gate_rejects_local_model_approval_control() -> anyhow::Result<()> {
+        let args: JsonObject = serde_json::from_value(json!({
+            "approval_id": "apr1-test",
+            "decision": "decline",
+        }))?;
+        let reason = model_tool_call_pre_gate_rejection("approval_decide", &args, true)
+            .expect("local models must not self-decide approval rows");
+        assert!(reason.contains("runner/operator-control"));
+        assert!(model_tool_call_pre_gate_rejection("approval_gate", &args, true).is_some());
+        assert!(model_tool_call_pre_gate_rejection("agent_send", &args, true).is_some());
+        assert!(model_tool_call_pre_gate_rejection("workspace_get", &args, true).is_none());
         Ok(())
     }
 

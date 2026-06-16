@@ -1226,6 +1226,17 @@ pub fn validate_agent_spawn_params(params: &ActSpawnAgentParams) -> Result<(), E
             format!("act_spawn_agent wait_timeout_ms must be <= {MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS}"),
         ));
     }
+    if agent_kind.is_local_model()
+        && params
+            .prompt
+            .as_deref()
+            .is_none_or(|prompt| prompt.trim().is_empty())
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_spawn_agent local_model prompt must not be empty",
+        ));
+    }
     if let Some(prompt) = &params.prompt {
         if prompt.len() > MAX_AGENT_SPAWN_PROMPT_BYTES {
             return Err(mcp_error(
@@ -8095,8 +8106,8 @@ fn summarize_suspend_readback(
     failed: Vec<ProcessControlFailure>,
 ) -> OwnedProcessSuspendReadback {
     let states_after = process_tree_suspend_state(&live_process_ids);
-    let all_suspended = !states_after.is_empty()
-        && states_after.iter().all(|state| state.fully_suspended);
+    let all_suspended =
+        !states_after.is_empty() && states_after.iter().all(|state| state.fully_suspended);
     let all_running = states_after
         .iter()
         .all(|state| state.suspended_threads == 0);
@@ -8171,7 +8182,11 @@ fn set_process_tree_suspended_platform(
                 pid,
                 reason: format!(
                     "{} returned NTSTATUS 0x{status:08x}",
-                    if suspend { "NtSuspendProcess" } else { "NtResumeProcess" }
+                    if suspend {
+                        "NtSuspendProcess"
+                    } else {
+                        "NtResumeProcess"
+                    }
                 ),
             });
         } else {
@@ -8193,7 +8208,9 @@ fn process_tree_suspend_state_platform(process_ids: &[u32]) -> Vec<ProcessSuspen
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
     };
-    use windows::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME};
+    use windows::Win32::System::Threading::{
+        OpenThread, ResumeThread, SuspendThread, THREAD_SUSPEND_RESUME,
+    };
 
     let mut states: Vec<ProcessSuspendState> = process_ids
         .iter()
@@ -8262,7 +8279,10 @@ fn set_process_tree_suspended_platform(
     let mut applied = Vec::new();
     let mut failed = Vec::new();
     for &pid in live_process_ids {
-        match StdCommand::new("kill").args([signal, &pid.to_string()]).output() {
+        match StdCommand::new("kill")
+            .args([signal, &pid.to_string()])
+            .output()
+        {
             Ok(output) if output.status.success() => applied.push(pid),
             Ok(output) => failed.push(ProcessControlFailure {
                 pid,
@@ -9568,6 +9588,48 @@ mod tests {
             durable_timeout_ms: None,
             idempotency_key: None,
         }
+    }
+
+    fn local_model_spawn_params(prompt: Option<&str>) -> ActSpawnAgentParams {
+        ActSpawnAgentParams {
+            cli: Some(ActSpawnAgentCli::LocalModel),
+            kind: Some(ActSpawnAgentCli::LocalModel),
+            model: None,
+            model_ref: Some("qwen8v2-tool-live".to_owned()),
+            prompt: prompt.map(str::to_owned),
+            target: None,
+            working_dir: Some(r"C:\code\Synapse".to_owned()),
+            mcp_url: default_agent_spawn_mcp_url(),
+            wait_timeout_ms: default_agent_spawn_wait_timeout_ms(),
+            hold_open_ms: default_agent_spawn_hold_open_ms(),
+            require_approval_gate: default_require_approval_gate(),
+            template_id: None,
+            template_version: None,
+            template_config_hash: None,
+        }
+    }
+
+    #[test]
+    fn local_model_spawn_empty_prompt_errors_before_launch() {
+        for prompt in [None, Some("   \n\t   ")] {
+            let params = local_model_spawn_params(prompt);
+            let error = validate_agent_spawn_params(&params)
+                .expect_err("blank local-model prompts must fail before launch");
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data.get("code")),
+                Some(&json!(error_codes::TOOL_PARAMS_INVALID))
+            );
+            assert!(
+                error
+                    .message
+                    .contains("local_model prompt must not be empty"),
+                "{}",
+                error.message
+            );
+        }
+
+        validate_agent_spawn_params(&local_model_spawn_params(Some("call health once")))
+            .expect("nonblank local-model prompt remains valid");
     }
 
     fn foreground_for_launch_selection(
