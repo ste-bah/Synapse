@@ -83,6 +83,29 @@ impl StdioMcpClient {
                     .tempdir()?,
             )
         };
+        // Default a deterministic synthetic foreground for every stdio MCP test.
+        //
+        // Action-gated tools (reflex_register, act_spawn_agent, task_dispatch_once,
+        // act_*, ...) run the supported-use scope gate, which reads the current
+        // foreground via current_audit_foreground() -> GetForegroundWindow(). With
+        // no fixture that calls the REAL desktop and hard-fails A11Y_NO_FOREGROUND
+        // whenever the host has no focused window (locked screen, focus elsewhere,
+        // unattended run). Because the live foreground fluctuates between and during
+        // runs, this made `cargo test --workspace` intermittently red in a way that
+        // could not be pinned to one test. Injecting the synthetic notepad fixture
+        // here makes the foreground a controlled input for the whole suite — one
+        // place, no per-test drift. Tests that deliberately exercise a different
+        // perception state (their own fixture, or force-no-perception /
+        // force-observe-internal) set one of these keys and keep full control; the
+        // value lookup in current_audit_foreground checks the force flags first.
+        let caller_controls_perception = envs.iter().any(|(key, _value)| {
+            matches!(
+                key.to_ascii_uppercase().as_str(),
+                "SYNAPSE_MCP_SYNTHETIC_FIXTURE"
+                    | "SYNAPSE_MCP_FORCE_NO_PERCEPTION"
+                    | "SYNAPSE_MCP_FORCE_OBSERVE_INTERNAL"
+            )
+        });
         let mut command = Command::new(bin);
         command
             .args(["--mode", "stdio"])
@@ -91,6 +114,9 @@ impl StdioMcpClient {
             .stderr(Stdio::piped())
             .env("SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY", "1")
             .env("SYNAPSE_LOG_LEVEL", "debug");
+        if !caller_controls_perception {
+            command.env("SYNAPSE_MCP_SYNTHETIC_FIXTURE", "notepad");
+        }
         if let Some(temp_db_dir) = temp_db_dir.as_ref() {
             command.env("SYNAPSE_DB", temp_db_dir.path().join("db"));
         }
