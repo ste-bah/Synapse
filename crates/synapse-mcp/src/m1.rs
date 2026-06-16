@@ -26,12 +26,12 @@ pub use detection::populate_detection_from_state;
 use detection::{DetectionRuntime, DetectionRuntimeConfig, default_detection_config};
 #[cfg(windows)]
 pub use ocr::ocr_result_from_web_bitmap;
-#[cfg(windows)]
-pub use ocr::read_text_request_from_bgra;
 pub use ocr::{
     ReadTextCaptureSource, ResolvedReadTextRequest, effective_ocr_backend,
     read_text_request_uncached, resolve_read_text_request,
 };
+#[cfg(windows)]
+pub use ocr::{read_text_request_for_captured_bitmap, read_text_request_from_bgra};
 use search::{element_match, entity_match};
 pub use sources::{
     ClipboardTimelineSample, FsRecentTracker, FsTimelineEvent,
@@ -291,7 +291,8 @@ pub enum FindResultKind {
 pub struct ReadTextParams {
     /// OCR region. With `window_hwnd` or this MCP session's active window
     /// target, this is window-client-relative. With no target, this is an
-    /// absolute screen region.
+    /// absolute screen region. When a target window is present and both
+    /// `region` and `element_id` are omitted, OCR reads the whole target window.
     #[serde(default)]
     pub region: Option<Rect>,
     #[serde(default)]

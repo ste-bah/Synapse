@@ -9,6 +9,7 @@ use windows::{
             D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
             D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Resource, ID3D11Texture2D,
         },
+        Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
         Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
             DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, HGDIOBJ, RDW_ALLCHILDREN,
@@ -122,6 +123,51 @@ pub fn window_region_to_bgra_bitmap(
     }
 }
 
+/// Captures the entire window using the WGC frame's own native dimensions.
+///
+/// Unlike [`window_region_to_bgra_bitmap`], this performs no client/window
+/// coordinate math: the returned bitmap is exactly the captured DWM surface, so
+/// it is immune to the `GetWindowRect` vs WGC-frame size mismatch caused by
+/// invisible resize borders (#1203).
+///
+/// # Errors
+///
+/// Returns [`CaptureError`] when the HWND is invalid, no WGC frame arrives, WGC
+/// returns blank output, or the bitmap copy fails. `PrintWindow` fallback stays
+/// disabled, identical to [`window_region_to_bgra_bitmap`].
+pub fn window_full_frame_to_bgra_bitmap(
+    hwnd: i64,
+    timeout_ms: u64,
+) -> Result<CapturedWindowBgraBitmap, CaptureError> {
+    match graphics_capture_window_full_frame_to_bgra_bitmap(hwnd, timeout_ms) {
+        Ok(bitmap) if !is_all_zero_bgra(&bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
+            bitmap,
+            capture_backend: "graphics_capture_window_bgra",
+        }),
+        Ok(_bitmap) => {
+            tracing::error!(
+                code = "CAPTURE_WGC_WINDOW_ALL_ZERO_PRINTWINDOW_DISABLED",
+                hwnd,
+                "WGC whole-window capture returned all-zero pixels; refusing target-reentering PrintWindow fallback"
+            );
+            Err(CaptureError::PrintWindowDisabled {
+                detail: format!(
+                    "WGC whole-window capture for hwnd {hwnd:#x} returned all-zero pixels; PrintWindow fallback is disabled because Windows asks the target process to handle WM_PRINT/WM_PRINTCLIENT and can surface app-visible failures"
+                ),
+            })
+        }
+        Err(wgc_error) => {
+            tracing::error!(
+                code = "CAPTURE_WGC_WINDOW_FAILED_PRINTWINDOW_DISABLED",
+                hwnd,
+                error = %wgc_error,
+                "WGC whole-window capture failed; refusing target-reentering PrintWindow fallback"
+            );
+            Err(wgc_error)
+        }
+    }
+}
+
 pub fn window_region_to_bgra_bitmap_printwindow(
     hwnd: i64,
     region: Rect,
@@ -187,10 +233,12 @@ pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, C
         return Ok(window_region);
     }
 
-    let mut window_rect = windows::Win32::Foundation::RECT::default();
-    unsafe { GetWindowRect(hwnd, &raw mut window_rect) }.map_err(capture_unsupported)?;
-    let window_width = window_rect.right.saturating_sub(window_rect.left);
-    let window_height = window_rect.bottom.saturating_sub(window_rect.top);
+    let mut client_rect = windows::Win32::Foundation::RECT::default();
+    unsafe { GetClientRect(hwnd, &raw mut client_rect) }.map_err(capture_unsupported)?;
+    let client_width = client_rect.right.saturating_sub(client_rect.left);
+    let client_height = client_rect.bottom.saturating_sub(client_rect.top);
+    let frame_rect = dwm_extended_frame_bounds(hwnd)?;
+    let (frame_width, frame_height) = rect_extent(&frame_rect);
     let mut client_origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
     if !unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(hwnd, &raw mut client_origin) }
         .as_bool()
@@ -199,23 +247,28 @@ pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, C
             detail: "ClientToScreen failed while converting screenshot region".to_owned(),
         });
     }
-    let offset_x = client_origin.x.saturating_sub(window_rect.left);
-    let offset_y = client_origin.y.saturating_sub(window_rect.top);
-    let window_region = Rect {
-        x: region.x.saturating_add(offset_x),
-        y: region.y.saturating_add(offset_y),
-        w: region.w,
-        h: region.h,
-    };
-    validate_region_inside_window(window_region, window_width, window_height)?;
+    let offset_x = client_origin.x.saturating_sub(frame_rect.left);
+    let offset_y = client_origin.y.saturating_sub(frame_rect.top);
+    let window_region = client_region_to_frame_region(
+        region,
+        client_width,
+        client_height,
+        offset_x,
+        offset_y,
+        frame_width,
+        frame_height,
+    )?;
     Ok(window_region)
 }
 
-fn graphics_capture_window_region_to_bgra_bitmap(
+fn graphics_capture_window_frame<F>(
     hwnd: i64,
-    region: Rect,
     timeout_ms: u64,
-) -> Result<CapturedBgraBitmap, CaptureError> {
+    select_region: F,
+) -> Result<CapturedBgraBitmap, CaptureError>
+where
+    F: FnOnce(&CapturedFrame) -> Rect,
+{
     let timeout = Duration::from_millis(timeout_ms.max(1));
     let handle = spawn_capture_loop(CaptureConfig {
         target: CaptureTarget::Window { hwnd },
@@ -240,13 +293,33 @@ fn graphics_capture_window_region_to_bgra_bitmap(
             });
         }
     };
+    let region = select_region(&frame);
     let result = captured_frame_region_to_bgra_bitmap(&frame, region);
     let stop_result = handle.stop();
-    match (result, stop_result) {
-        (Ok(bitmap), Ok(())) => Ok(bitmap),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(error)) | (Err(_), Err(error)) => Err(error),
+    match stop_result {
+        Ok(()) => result,
+        Err(error) => Err(error),
     }
+}
+
+fn graphics_capture_window_region_to_bgra_bitmap(
+    hwnd: i64,
+    region: Rect,
+    timeout_ms: u64,
+) -> Result<CapturedBgraBitmap, CaptureError> {
+    graphics_capture_window_frame(hwnd, timeout_ms, |_frame| region)
+}
+
+fn graphics_capture_window_full_frame_to_bgra_bitmap(
+    hwnd: i64,
+    timeout_ms: u64,
+) -> Result<CapturedBgraBitmap, CaptureError> {
+    graphics_capture_window_frame(hwnd, timeout_ms, |frame| Rect {
+        x: 0,
+        y: 0,
+        w: i32::try_from(frame.width).unwrap_or(i32::MAX),
+        h: i32::try_from(frame.height).unwrap_or(i32::MAX),
+    })
 }
 
 fn minimized_client_offset_in_window_bitmap(
@@ -285,9 +358,9 @@ fn minimized_non_client_offset_from_style(
     unsafe {
         AdjustWindowRectExForDpi(
             &raw mut client_rect,
-            WINDOW_STYLE(style_bits as u32),
+            WINDOW_STYLE(style_bits.cast_unsigned()),
             !menu.is_invalid(),
-            WINDOW_EX_STYLE(ex_style_bits as u32),
+            WINDOW_EX_STYLE(ex_style_bits.cast_unsigned()),
             dpi,
         )
     }
@@ -301,16 +374,17 @@ fn minimized_non_client_offset_from_style(
 fn window_capture_extent(
     hwnd: windows::Win32::Foundation::HWND,
 ) -> Result<(i32, i32), CaptureError> {
+    if !unsafe { IsIconic(hwnd) }.as_bool() {
+        return Ok(rect_extent(&dwm_extended_frame_bounds(hwnd)?));
+    }
+
     let mut window_rect = windows::Win32::Foundation::RECT::default();
     unsafe { GetWindowRect(hwnd, &raw mut window_rect) }.map_err(capture_unsupported)?;
     let window_width = window_rect.right.saturating_sub(window_rect.left);
     let window_height = window_rect.bottom.saturating_sub(window_rect.top);
-    if !unsafe { IsIconic(hwnd) }.as_bool() {
-        return Ok((window_width, window_height));
-    }
 
     let mut placement = WINDOWPLACEMENT {
-        length: size_of::<WINDOWPLACEMENT>() as u32,
+        length: u32::try_from(size_of::<WINDOWPLACEMENT>()).unwrap_or(u32::MAX),
         ..Default::default()
     };
     unsafe { GetWindowPlacement(hwnd, &raw mut placement) }.map_err(capture_unsupported)?;
@@ -326,6 +400,72 @@ fn window_capture_extent(
         return Ok((normal_width, normal_height));
     }
     Ok((window_width, window_height))
+}
+
+fn dwm_extended_frame_bounds(
+    hwnd: windows::Win32::Foundation::HWND,
+) -> Result<windows::Win32::Foundation::RECT, CaptureError> {
+    let mut frame_rect = windows::Win32::Foundation::RECT::default();
+    unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            (&raw mut frame_rect).cast::<c_void>(),
+            u32::try_from(size_of::<windows::Win32::Foundation::RECT>()).unwrap_or(u32::MAX),
+        )
+    }
+    .map_err(capture_unsupported)?;
+    let (width, height) = rect_extent(&frame_rect);
+    if width <= 0 || height <= 0 {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!("DWM extended frame bounds are empty: {frame_rect:?}"),
+        });
+    }
+    Ok(frame_rect)
+}
+
+const fn rect_extent(rect: &windows::Win32::Foundation::RECT) -> (i32, i32) {
+    (
+        rect.right.saturating_sub(rect.left),
+        rect.bottom.saturating_sub(rect.top),
+    )
+}
+
+fn client_region_to_frame_region(
+    client_region: Rect,
+    client_width: i32,
+    client_height: i32,
+    offset_x: i32,
+    offset_y: i32,
+    frame_width: i32,
+    frame_height: i32,
+) -> Result<Rect, CaptureError> {
+    if client_width <= 0 || client_height <= 0 {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!(
+                "target window has no client area ({client_width}x{client_height}) for region conversion"
+            ),
+        });
+    }
+    if client_region.x < 0
+        || client_region.y < 0
+        || client_region.x.saturating_add(client_region.w) > client_width
+        || client_region.y.saturating_add(client_region.h) > client_height
+    {
+        return Err(CaptureError::TargetInvalid {
+            detail: format!(
+                "client-relative region {client_region:?} is outside the target window client area {client_width}x{client_height}; pass a region within the client bounds, or omit region to OCR/capture the whole window"
+            ),
+        });
+    }
+    let frame_region = Rect {
+        x: client_region.x.saturating_add(offset_x),
+        y: client_region.y.saturating_add(offset_y),
+        w: client_region.w,
+        h: client_region.h,
+    };
+    validate_region_inside_window(frame_region, frame_width, frame_height)?;
+    Ok(frame_region)
 }
 
 fn software_bitmap_from_bgra(
@@ -895,7 +1035,10 @@ mod tests {
 
     use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
 
-    use super::{copy_bgra_region_from_bytes, copy_mapped_rows, validate_region_inside_texture};
+    use super::{
+        client_region_to_frame_region, copy_bgra_region_from_bytes, copy_mapped_rows,
+        validate_region_inside_texture,
+    };
     use crate::CaptureError;
     use synapse_core::Rect;
 
@@ -986,5 +1129,56 @@ mod tests {
                 17, 18, 19, 20, 21, 22, 23, 24,
             ]
         );
+    }
+
+    #[test]
+    fn client_region_uses_dwm_frame_offset_not_getwindowrect_border() {
+        let mapped = client_region_to_frame_region(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 3027,
+                h: 1740,
+            },
+            3027,
+            1740,
+            2,
+            89,
+            3031,
+            1829,
+        )
+        .expect("full client area fits the DWM/WGC frame");
+
+        assert_eq!(
+            mapped,
+            Rect {
+                x: 2,
+                y: 89,
+                w: 3027,
+                h: 1740,
+            }
+        );
+    }
+
+    #[test]
+    fn client_region_over_bounds_names_client_area_limit() {
+        let error = client_region_to_frame_region(
+            Rect {
+                x: 0,
+                y: 0,
+                w: 3049,
+                h: 1740,
+            },
+            3027,
+            1740,
+            2,
+            89,
+            3031,
+            1829,
+        )
+        .expect_err("over-wide client region is rejected before frame conversion");
+
+        assert!(matches!(error, CaptureError::TargetInvalid { .. }));
+        assert!(error.to_string().contains("client area 3027x1740"));
     }
 }

@@ -343,7 +343,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; with no target it uses legacy screen-region OCR. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. If OCR text matches local prompt-injection heuristics, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
+        description = "OCR text from a screen region, visible element, or target window. With window_hwnd or this MCP session's active window target, region is window-client-relative and OCR runs over passive target-window WGC BGRA capture; omitting region/element_id OCRs the whole target window using the WGC frame's native size. With no target it uses legacy screen-region/focused-element OCR. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path. If OCR text matches local prompt-injection heuristics, the response includes perceived_text_notice and suspected_injection annotations; clean responses omit them."
     )]
     pub async fn read_text(
         &self,
@@ -3523,6 +3523,7 @@ impl SynapseService {
         request: crate::m1::ResolvedReadTextRequest,
         captured: CapturedOcrBitmap,
     ) -> Result<OcrResult, ErrorData> {
+        let request = crate::m1::read_text_request_for_captured_bitmap(request, &captured)?;
         if request.synthetic || request.effective_backend != OcrBackend::Winrt {
             return read_text_request_uncached(&request);
         }
@@ -3738,7 +3739,47 @@ fn capture_ocr_bitmap(
                 capture_region: window_region,
             })
         }
+        crate::m1::ReadTextCaptureSource::WholeWindow { hwnd } => {
+            let captured = synapse_capture::window_full_frame_to_bgra_bitmap(
+                hwnd,
+                WINDOW_SCREENSHOT_TIMEOUT_MS,
+            )
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("OCR whole-window capture failed for hwnd {hwnd:#x}: {error}"),
+                )
+            })?;
+            let capture_region = full_bitmap_region(&captured.bitmap)?;
+            Ok(CapturedOcrBitmap {
+                bitmap: captured.bitmap,
+                capture_source: "whole_window",
+                capture_backend: captured.capture_backend,
+                capture_hwnd: Some(hwnd),
+                capture_region,
+            })
+        }
     }
+}
+
+#[cfg(windows)]
+fn full_bitmap_region(bitmap: &synapse_capture::CapturedBgraBitmap) -> Result<Rect, ErrorData> {
+    Ok(Rect {
+        x: 0,
+        y: 0,
+        w: i32::try_from(bitmap.width).map_err(|_| {
+            mcp_error(
+                error_codes::OCR_NO_TEXT,
+                format!("OCR bitmap width {} exceeds i32", bitmap.width),
+            )
+        })?,
+        h: i32::try_from(bitmap.height).map_err(|_| {
+            mcp_error(
+                error_codes::OCR_NO_TEXT,
+                format!("OCR bitmap height {} exceeds i32", bitmap.height),
+            )
+        })?,
+    })
 }
 
 #[cfg(windows)]

@@ -1,13 +1,21 @@
 use rmcp::ErrorData;
-use synapse_core::{ForegroundContext, OcrBackend, OcrResult, OcrWord, Rect, error_codes};
+use synapse_core::{OcrBackend, OcrResult, OcrWord, Rect, error_codes};
 use synapse_perception::{TextRegion, read_text as platform_read_text, read_text_with_provider};
 
-use crate::m1::{M1State, ReadTextParams, current_input, mcp_error, window_input_from_hwnd};
+use crate::m1::{M1State, ReadTextParams, current_input, mcp_error};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ReadTextCaptureSource {
     Screen,
-    Window { hwnd: i64, window_region: Rect },
+    Window {
+        hwnd: i64,
+        window_region: Rect,
+    },
+    /// OCR the entire window using the captured WGC frame's native dimensions.
+    /// Used when `window_hwnd` is supplied with no region/element target.
+    WholeWindow {
+        hwnd: i64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -38,7 +46,9 @@ pub fn resolve_read_text_request(
     target_hwnd: Option<i64>,
 ) -> Result<ResolvedReadTextRequest, ErrorData> {
     let (region, capture_source) = text_region(state, params, target_hwnd)?;
-    validate_ocr_region(region)?;
+    if !matches!(capture_source, ReadTextCaptureSource::WholeWindow { .. }) {
+        validate_ocr_region(region)?;
+    }
     Ok(ResolvedReadTextRequest {
         region,
         capture_source,
@@ -82,6 +92,7 @@ pub fn read_text_request_from_bgra(
     if request.synthetic {
         return read_text_request_uncached(request);
     }
+    let request = read_text_request_for_captured_bitmap(request.clone(), captured)?;
     match request.effective_backend {
         OcrBackend::Winrt => {
             let words = synapse_perception::read_text_from_bgra_bitmap(
@@ -91,7 +102,7 @@ pub fn read_text_request_from_bgra(
                 &captured.bytes,
             )
             .map_err(|err| mcp_error(err.code(), err.to_string()))?;
-            Ok(ocr_result_from_text_regions(words, request))
+            Ok(ocr_result_from_text_regions(words, &request))
         }
         OcrBackend::Crnn => Err(crnn_unavailable_error()),
         OcrBackend::Auto => Err(mcp_error(
@@ -99,6 +110,42 @@ pub fn read_text_request_from_bgra(
             "internal OCR backend resolution left backend=auto after request validation",
         )),
     }
+}
+
+#[cfg(windows)]
+pub fn read_text_request_for_captured_bitmap(
+    mut request: ResolvedReadTextRequest,
+    captured: &synapse_capture::CapturedBgraBitmap,
+) -> Result<ResolvedReadTextRequest, ErrorData> {
+    if matches!(
+        request.capture_source,
+        ReadTextCaptureSource::WholeWindow { .. }
+    ) {
+        request.region = Rect {
+            x: 0,
+            y: 0,
+            w: i32::try_from(captured.width).map_err(|_| {
+                mcp_error(
+                    error_codes::OCR_NO_TEXT,
+                    format!(
+                        "whole-window OCR bitmap width {} exceeds i32",
+                        captured.width
+                    ),
+                )
+            })?,
+            h: i32::try_from(captured.height).map_err(|_| {
+                mcp_error(
+                    error_codes::OCR_NO_TEXT,
+                    format!(
+                        "whole-window OCR bitmap height {} exceeds i32",
+                        captured.height
+                    ),
+                )
+            })?,
+        };
+        validate_ocr_region(request.region)?;
+    }
+    Ok(request)
 }
 
 /// Runs WinRT OCR over a web element's captured BGRA bitmap and returns an
@@ -194,23 +241,15 @@ fn text_region(
         return Ok((region, ReadTextCaptureSource::Screen));
     };
 
-    let input = {
-        fail_if_minimized_target_needs_uia_region(hwnd)?;
-        window_input_from_hwnd(hwnd, 2, state.perception_mode)?
-    };
-    let absolute_region = input.focused.map(|focused| focused.bbox).ok_or_else(|| {
-        mcp_error(
-            error_codes::OCR_NO_TEXT,
-            "read_text requires region, element_id, or a focused element with a visible OCR region",
-        )
-    })?;
-    let window_region = absolute_region_to_window_region(&input.foreground, absolute_region)?;
+    fail_if_minimized_target_needs_window_capture(hwnd)?;
     Ok((
-        window_region,
-        ReadTextCaptureSource::Window {
-            hwnd,
-            window_region,
+        Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
         },
+        ReadTextCaptureSource::WholeWindow { hwnd },
     ))
 }
 
@@ -265,7 +304,7 @@ fn target_window_region_capture_source(
 }
 
 #[cfg(windows)]
-fn fail_if_minimized_target_needs_uia_region(hwnd: i64) -> Result<(), ErrorData> {
+fn fail_if_minimized_target_needs_window_capture(hwnd: i64) -> Result<(), ErrorData> {
     synapse_capture::validate_hwnd(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
@@ -281,7 +320,7 @@ fn fail_if_minimized_target_needs_uia_region(hwnd: i64) -> Result<(), ErrorData>
         return Err(mcp_error(
             error_codes::A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE,
             format!(
-                "read_text target hwnd {hwnd:#x} is minimized and no explicit window-relative OCR region was supplied; UIA focused-region lookup is unavailable without restoring the window"
+                "read_text target hwnd {hwnd:#x} is minimized and no explicit window-relative OCR region was supplied; whole-window WGC OCR requires a live non-minimized target window"
             ),
         ));
     }
@@ -289,45 +328,11 @@ fn fail_if_minimized_target_needs_uia_region(hwnd: i64) -> Result<(), ErrorData>
 }
 
 #[cfg(not(windows))]
-fn fail_if_minimized_target_needs_uia_region(_hwnd: i64) -> Result<(), ErrorData> {
+fn fail_if_minimized_target_needs_window_capture(_hwnd: i64) -> Result<(), ErrorData> {
     Err(mcp_error(
         error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
-        "read_text target-window OCR requires Windows UI Automation",
+        "read_text target-window OCR requires Windows window capture",
     ))
-}
-
-fn absolute_region_to_window_region(
-    foreground: &ForegroundContext,
-    absolute_region: Rect,
-) -> Result<Rect, ErrorData> {
-    let window_region = Rect {
-        x: absolute_region.x.saturating_sub(foreground.window_bounds.x),
-        y: absolute_region.y.saturating_sub(foreground.window_bounds.y),
-        w: absolute_region.w,
-        h: absolute_region.h,
-    };
-    if absolute_region.x < foreground.window_bounds.x
-        || absolute_region.y < foreground.window_bounds.y
-        || absolute_region.x.saturating_add(absolute_region.w)
-            > foreground
-                .window_bounds
-                .x
-                .saturating_add(foreground.window_bounds.w)
-        || absolute_region.y.saturating_add(absolute_region.h)
-            > foreground
-                .window_bounds
-                .y
-                .saturating_add(foreground.window_bounds.h)
-    {
-        return Err(mcp_error(
-            error_codes::OCR_NO_TEXT,
-            format!(
-                "focused OCR region {absolute_region:?} is outside target window bounds {:?}",
-                foreground.window_bounds
-            ),
-        ));
-    }
-    Ok(window_region)
 }
 
 pub fn effective_ocr_backend(backend: OcrBackend) -> Result<OcrBackend, ErrorData> {
@@ -474,9 +479,10 @@ impl synapse_perception::OcrProvider for SyntheticOcrProvider {
 #[cfg(test)]
 mod tests {
     use super::{
-        AMBIGUOUS_IDENTIFIER_CONFIDENCE_CAP, identifier_aware_confidence,
-        is_ambiguous_identifier_token,
+        AMBIGUOUS_IDENTIFIER_CONFIDENCE_CAP, ReadTextCaptureSource, ResolvedReadTextRequest,
+        identifier_aware_confidence, is_ambiguous_identifier_token,
     };
+    use synapse_core::{OcrBackend, Rect};
 
     #[test]
     fn caps_short_tokens_collapsed_to_only_ambiguous_glyphs() {
@@ -496,5 +502,47 @@ mod tests {
     fn does_not_cap_ordinary_words_containing_some_ambiguous_letters() {
         assert!(!is_ambiguous_identifier_token("look"));
         assert_eq!(identifier_aware_confidence("look", 0.96), 0.96);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn whole_window_request_uses_captured_bitmap_extent() {
+        let request = ResolvedReadTextRequest {
+            region: Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+            capture_source: ReadTextCaptureSource::WholeWindow { hwnd: 0x1234 },
+            requested_backend: OcrBackend::Auto,
+            effective_backend: OcrBackend::Winrt,
+            lang_hint: None,
+            synthetic: false,
+        };
+        let captured = synapse_capture::CapturedBgraBitmap {
+            region: Rect {
+                x: 0,
+                y: 0,
+                w: 3031,
+                h: 1829,
+            },
+            width: 3031,
+            height: 1829,
+            bytes: Vec::new(),
+        };
+
+        let resolved = super::read_text_request_for_captured_bitmap(request, &captured)
+            .expect("captured extent is valid");
+
+        assert_eq!(
+            resolved.region,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 3031,
+                h: 1829,
+            }
+        );
     }
 }

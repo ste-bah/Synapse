@@ -65,6 +65,13 @@ pub fn window_region_to_bgra_bitmap(
     Err(capture_backend_unavailable())
 }
 
+pub fn window_full_frame_to_bgra_bitmap(
+    _hwnd: i64,
+    _timeout_ms: u64,
+) -> Result<CapturedWindowBgraBitmap, CaptureError> {
+    Err(capture_backend_unavailable())
+}
+
 pub fn window_region_to_bgra_bitmap_printwindow(
     _hwnd: i64,
     _region: Rect,

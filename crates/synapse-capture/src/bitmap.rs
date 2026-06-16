@@ -81,6 +81,25 @@ pub fn window_region_to_bgra_bitmap(
     platform::window_region_to_bgra_bitmap(hwnd, region, timeout_ms)
 }
 
+/// Captures the entire window using the WGC frame's native dimensions, with no
+/// client/window coordinate conversion.
+///
+/// This is the exact path for "capture/read the whole target window" because
+/// it is immune to the `GetWindowRect` vs WGC-frame mismatch caused by
+/// invisible DWM resize borders (#1203).
+///
+/// # Errors
+///
+/// Returns [`CaptureError`] when the HWND is invalid, no WGC frame arrives, WGC
+/// returns blank output, or the bitmap copy fails (Windows), or
+/// `GraphicsApiUnsupported` on non-Windows builds.
+pub fn window_full_frame_to_bgra_bitmap(
+    hwnd: i64,
+    timeout_ms: u64,
+) -> Result<CapturedWindowBgraBitmap, CaptureError> {
+    platform::window_full_frame_to_bgra_bitmap(hwnd, timeout_ms)
+}
+
 /// Explicit `PrintWindow` capture for a window-region bitmap.
 ///
 /// This is intentionally separate from `window_region_to_bgra_bitmap`: callers
