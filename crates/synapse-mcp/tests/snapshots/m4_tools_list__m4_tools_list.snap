@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m4_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 178,
+  "count": 180,
   "m4_defaults": [
     {
       "actual": 33,
@@ -316,6 +316,7 @@ expression: snapshot
     "notify_human",
     "observe",
     "observe_delta",
+    "plan_get",
     "profile_activate",
     "profile_authoring_decide",
     "profile_authoring_export",
@@ -339,6 +340,7 @@ expression: snapshot
     "reflex_register",
     "release_all",
     "replay_record",
+    "routine_compile_plan",
     "routine_feedback",
     "routine_inspect",
     "routine_label_export",

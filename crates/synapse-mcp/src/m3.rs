@@ -8,6 +8,7 @@ pub mod episodes;
 pub mod hygiene;
 pub mod intent;
 pub mod intent_events;
+pub mod plan;
 pub mod interaction_cadence;
 pub mod local_models;
 pub mod permissions;

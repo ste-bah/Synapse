@@ -462,7 +462,10 @@ pub(crate) fn load_state_row(
 }
 
 /// Point lookup of one `CF_ROUTINES` row by routine id.
-fn load_routine_record(db: &Db, routine_id: &str) -> Result<Option<RoutineRecord>, ErrorData> {
+pub(crate) fn load_routine_record(
+    db: &Db,
+    routine_id: &str,
+) -> Result<Option<RoutineRecord>, ErrorData> {
     let key = routine_codec::routine_key(routine_id).map_err(|error| invalid(error.to_string()))?;
     let rows = db
         .scan_cf_prefix(cf::CF_ROUTINES, &key)
@@ -1099,7 +1102,7 @@ pub fn required_permissions_update(_params: &RoutineUpdateParams) -> RequiredPer
     required([Permission::ReadStorage, Permission::WriteStorage])
 }
 
-fn validate_routine_id_param(tool: &str, routine_id: &str) -> Result<(), ErrorData> {
+pub(crate) fn validate_routine_id_param(tool: &str, routine_id: &str) -> Result<(), ErrorData> {
     routine_codec::routine_key(routine_id)
         .map(|_key| ())
         .map_err(|_error| {
