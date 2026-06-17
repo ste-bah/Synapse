@@ -124,6 +124,8 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "cdp_open_tab",
     "cdp_target_info",
     "clear_target",
+    "control_lease_acquire",
+    "control_lease_release",
     "control_lease_status",
     "escalation_list",
     "find",
@@ -202,10 +204,11 @@ impl ToolProfileKind {
         }
     }
 
-    /// Whether this profile is permitted to reach a human-foreground action
-    /// tier. Only the break-glass/admin and trusted full-capability local-model
-    /// profiles may; `normal_agent`/`browser_control` are background-first and a
-    /// foreground tier from them is a policy violation (#1004/#1006).
+    /// Whether this profile is permitted to reach the real human OS foreground
+    /// input tier. Normal/task profiles still preserve foreground-equivalent
+    /// capability through `agent_logical_foreground` / `foreground_lane` routes;
+    /// only the serialized real-foreground tier needs break-glass/full-capability
+    /// proof (#999/#1219).
     pub(crate) const fn allows_foreground_tier(self) -> bool {
         matches!(self, Self::BreakGlass | Self::FullCapability)
     }
@@ -299,8 +302,32 @@ pub(crate) struct ToolProfileSnapshot {
     pub visible_tool_sha256: String,
     pub visible_tool_names: Vec<String>,
     pub denied_break_glass_tools: Vec<String>,
+    pub foreground_capability: ToolProfileForegroundCapability,
+    pub hidden_tool_routes: Vec<HiddenToolCapabilityRoute>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_row: Option<ToolProfileRowReadback>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ToolProfileForegroundCapability {
+    pub source_of_truth: &'static str,
+    pub profile_preserves_capability: bool,
+    pub human_os_foreground: &'static str,
+    pub agent_logical_foreground: &'static str,
+    pub preferred_path: &'static str,
+    pub real_os_foreground_path: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HiddenToolCapabilityRoute {
+    pub hidden_tool: String,
+    pub status: &'static str,
+    pub preferred_tools: Vec<String>,
+    pub agent_logical_foreground_policy: &'static str,
+    pub human_os_foreground_policy: &'static str,
+    pub break_glass_policy: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -346,7 +373,7 @@ pub(crate) struct ToolProfileSetResponse {
 #[tool_router(router = tool_profile_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Read this MCP session's effective tool profile, visible tools/list names, and durable CF_SESSIONS policy row. This is the Source of Truth for why foreground-prone break-glass tools are visible or hidden.",
+        description = "Read this MCP session's effective tool profile, visible tools/list names, durable CF_SESSIONS policy row, and capability-preserving routes for hidden raw foreground primitives. The readback distinguishes human_os_foreground from agent_logical_foreground: normal/task profiles prefer target_act/browser/CDP/session-lane tools, while real OS foreground primitives stay reachable only through an explicit lease + break_glass path.",
         input_schema = empty_input_schema()
     )]
     pub async fn tool_profile_status(
@@ -365,7 +392,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Set this MCP session's durable tool profile. normal_agent and browser_control keep raw foreground primitives hidden; break_glass exposes the full raw surface only when confirm_break_glass=true, reason is non-empty, and this session currently owns the foreground input lease."
+        description = "Set this MCP session's durable tool profile. normal_agent and browser_control preserve capability through target_act/browser/CDP/session-lane routes while keeping raw human-OS-foreground primitives out of the default affordance. break_glass exposes the full raw surface only when confirm_break_glass=true, reason is non-empty, and this session currently owns the foreground input lease."
     )]
     pub async fn tool_profile_set(
         &self,
@@ -580,6 +607,7 @@ impl SynapseService {
         };
         let visible_tool_sha256 = sha256_json_hex(&visible_tool_names)?;
         let denied_break_glass_tools = denied_break_glass_tools(&visible_tool_names);
+        let hidden_tool_routes = hidden_tool_capability_routes(&visible_tool_names);
         Ok(ToolProfileSnapshot {
             source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
             session_id: session_id.map(ToOwned::to_owned),
@@ -591,6 +619,8 @@ impl SynapseService {
             visible_tool_sha256,
             visible_tool_names,
             denied_break_glass_tools,
+            foreground_capability: foreground_capability_policy(profile),
+            hidden_tool_routes,
             policy_row,
         })
     }
@@ -613,6 +643,7 @@ impl SynapseService {
         }
         let visible_tool_names =
             visible_tool_names_for_profile(row.record.profile, &full_tool_names);
+        let capability_route = hidden_tool_capability_route(tool_name);
         let error = ErrorData::new(
             ErrorCode(-32099),
             format!(
@@ -628,7 +659,8 @@ impl SynapseService {
                 "source_of_truth": TOOL_PROFILE_SOURCE_OF_TRUTH,
                 "policy_row": row,
                 "visible_tool_count": visible_tool_names.len(),
-                "resolution": "use a background-safe/session-targeted tool, or explicitly acquire the foreground input lease and set profile=break_glass with a non-empty reason",
+                "capability_route": capability_route,
+                "resolution": "use the named capability_route preferred tools for agent logical foreground work, or explicitly acquire the foreground input lease and set profile=break_glass with confirm_break_glass=true plus a non-empty reason for real human OS foreground work",
             })),
         );
         let command_payload = json!({
@@ -651,6 +683,7 @@ impl SynapseService {
                 json!({
                     "source_of_truth": "CF_ACTION_LOG command_audit row",
                     "denied_tool": tool_name,
+                    "capability_route": hidden_tool_capability_route(tool_name),
                 }),
                 "error",
             )
@@ -954,6 +987,110 @@ fn denied_break_glass_tools(visible_tool_names: &[String]) -> Vec<String> {
         .collect()
 }
 
+fn foreground_capability_policy(profile: ToolProfileKind) -> ToolProfileForegroundCapability {
+    let (preferred_path, real_os_foreground_path) = match profile {
+        ToolProfileKind::NormalAgent => (
+            "target_act, browser_set_value, cdp_* and per-session target/claim tools are visible in the normal profile",
+            "control_lease_acquire + tool_profile_set break_glass + raw foreground primitive; denied without lease/reason/confirm",
+        ),
+        ToolProfileKind::BrowserControl => (
+            "browser/CDP/target_act tools plus lease controls are visible in the task profile; raw shell/spawn surfaces stay hidden",
+            "control_lease_acquire + tool_profile_set break_glass + raw foreground primitive; denied without lease/reason/confirm",
+        ),
+        ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability => (
+            "full raw surface is visible; prefer target_act/session-lane tools unless real OS foreground input is the intended lane",
+            "raw foreground primitives may run only under their own lease/target guards and action-audit policy",
+        ),
+    };
+    ToolProfileForegroundCapability {
+        source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
+        profile_preserves_capability: true,
+        human_os_foreground: "the physical foreground window used by the human; never an implicit fallback for hidden tools",
+        agent_logical_foreground: "the per-session foreground-equivalent target/lane; preferred for valid local work",
+        preferred_path,
+        real_os_foreground_path,
+    }
+}
+
+fn hidden_tool_capability_routes(visible_tool_names: &[String]) -> Vec<HiddenToolCapabilityRoute> {
+    let visible = visible_tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    BREAK_GLASS_HAZARDOUS_TOOLS
+        .iter()
+        .copied()
+        .filter(|name| !visible.contains(name))
+        .map(hidden_tool_capability_route)
+        .collect()
+}
+
+fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
+    let preferred_tools = match tool_name {
+        "act_click" => vec![
+            "target_act verb=click",
+            "browser DOM action through target_act",
+            "target_claim",
+        ],
+        "act_type" | "act_set_value" | "act_set_field_text" => {
+            vec![
+                "target_act verb=set_field",
+                "browser_set_value",
+                "browser_evaluate",
+            ]
+        }
+        "act_press" | "act_keymap" | "act_combo" => {
+            vec![
+                "target_act verb=press",
+                "browser DOM action through target_act",
+            ]
+        }
+        "act_scroll" => vec![
+            "browser_evaluate scrollIntoView/window.scrollBy",
+            "capture_screenshot",
+            "observe",
+            "target_claim",
+        ],
+        "act_stroke" | "act_pad" => vec![
+            "target_claim",
+            "control_lease_acquire",
+            "tool_profile_set break_glass",
+        ],
+        "act_focus_window" => vec!["set_target", "target_claim", "session_status"],
+        "act_launch" => vec![
+            "act_spawn_agent",
+            "cdp_open_tab",
+            "target_act verb=navigate",
+        ],
+        "act_clipboard" => vec![
+            "workspace_put",
+            "browser_set_value",
+            "target_act verb=set_field",
+        ],
+        "release_all" => vec![
+            "target_release",
+            "control_lease_release",
+            "clear_target",
+            "session_end",
+        ],
+        "hidden_desktop_pip_frame" => {
+            vec!["capture_screenshot", "window_list", "session_status"]
+        }
+        "action_diagnostic_queue_full_setup" | "action_diagnostic_rate_limit_override" => {
+            vec!["health", "storage_inspect", "session_status"]
+        }
+        _ => vec!["target_act", "tool_profile_set break_glass"],
+    };
+    HiddenToolCapabilityRoute {
+        hidden_tool: tool_name.to_owned(),
+        status: "routed_or_break_glass",
+        preferred_tools: preferred_tools.into_iter().map(str::to_owned).collect(),
+        agent_logical_foreground_policy: "use the preferred tools against this session's agent_logical_foreground/foreground_lane",
+        human_os_foreground_policy: "never use the human OS foreground as an implicit fallback",
+        break_glass_policy: "for a real OS foreground primitive, first acquire the input lease, then set profile=break_glass with confirm_break_glass=true and a non-empty reason",
+    }
+}
+
 fn sort_tools_for_profile(tools: &mut [Tool], profile: ToolProfileKind) {
     tools.sort_by(|left, right| {
         let left_name = left.name.as_ref();
@@ -1076,6 +1213,11 @@ mod tests {
                 "cdp_open_tab",
                 "health",
                 "session_list",
+                "target_act",
+                "browser_evaluate",
+                "browser_set_value",
+                "control_lease_acquire",
+                "control_lease_release",
                 "tool_profile_set",
                 "tool_profile_status",
             ]
@@ -1086,14 +1228,56 @@ mod tests {
     }
 
     #[test]
-    fn normal_profile_hides_foreground_primitives() {
+    fn normal_profile_routes_foreground_capability_without_raw_primitives() {
         let visible = visible_tool_names_for_profile(ToolProfileKind::NormalAgent, &names());
         assert!(visible.contains(&"act_run_shell".to_owned()));
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
+        assert!(visible.contains(&"target_act".to_owned()));
+        assert!(visible.contains(&"browser_set_value".to_owned()));
+        assert!(visible.contains(&"control_lease_acquire".to_owned()));
         assert!(visible.contains(&"tool_profile_set".to_owned()));
         assert!(!visible.contains(&"act_click".to_owned()));
         assert!(!visible.contains(&"act_type".to_owned()));
         assert!(!visible.contains(&"release_all".to_owned()));
+
+        let policy = foreground_capability_policy(ToolProfileKind::NormalAgent);
+        assert!(policy.profile_preserves_capability);
+        assert!(
+            policy
+                .agent_logical_foreground
+                .contains("per-session foreground-equivalent")
+        );
+        assert!(
+            policy
+                .human_os_foreground
+                .contains("never an implicit fallback")
+        );
+
+        let routes = hidden_tool_capability_routes(&visible);
+        let act_type_route = routes
+            .iter()
+            .find(|route| route.hidden_tool == "act_type")
+            .expect("act_type route");
+        assert!(
+            act_type_route
+                .preferred_tools
+                .contains(&"target_act verb=set_field".to_owned())
+        );
+        assert!(
+            act_type_route
+                .preferred_tools
+                .contains(&"browser_set_value".to_owned())
+        );
+        assert!(
+            act_type_route
+                .agent_logical_foreground_policy
+                .contains("agent_logical_foreground")
+        );
+        assert!(
+            act_type_route
+                .human_os_foreground_policy
+                .contains("never use the human OS foreground")
+        );
     }
 
     #[test]
@@ -1101,6 +1285,10 @@ mod tests {
         let visible = visible_tool_names_for_profile(ToolProfileKind::BrowserControl, &names());
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
         assert!(visible.contains(&"session_list".to_owned()));
+        assert!(visible.contains(&"target_act".to_owned()));
+        assert!(visible.contains(&"browser_set_value".to_owned()));
+        assert!(visible.contains(&"control_lease_acquire".to_owned()));
+        assert!(visible.contains(&"control_lease_release".to_owned()));
         assert!(!visible.contains(&"act_run_shell".to_owned()));
         assert!(!visible.contains(&"act_click".to_owned()));
     }
@@ -1232,6 +1420,9 @@ mod tests {
         );
         assert!(tools.contains(&"cdp_open_tab".to_owned()));
         assert!(tools.contains(&"cdp_target_info".to_owned()));
+        assert!(tools.contains(&"target_act".to_owned()));
+        assert!(tools.contains(&"control_lease_acquire".to_owned()));
+        assert!(tools.contains(&"control_lease_release".to_owned()));
         assert!(tools.contains(&"tool_profile_set".to_owned()));
         assert!(!tools.contains(&"act_run_shell".to_owned()));
         assert!(!tools.contains(&"act_spawn_agent".to_owned()));
@@ -1252,6 +1443,25 @@ mod tests {
             .and_then(|data| data.get("code"))
             .and_then(Value::as_str);
         assert_eq!(code, Some(error_codes::TOOL_PROFILE_POLICY_DENIED));
+        let route = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("capability_route"))
+            .expect("capability route in denial");
+        assert_eq!(route["hidden_tool"], "act_type");
+        let preferred_tools = route["preferred_tools"]
+            .as_array()
+            .expect("preferred tools array");
+        assert!(
+            preferred_tools
+                .iter()
+                .any(|tool| tool.as_str() == Some("target_act verb=set_field"))
+        );
+        assert!(
+            preferred_tools
+                .iter()
+                .any(|tool| tool.as_str() == Some("browser_set_value"))
+        );
 
         let db = service.m3_storage().expect("storage");
         let audit_rows = db

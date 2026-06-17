@@ -30,7 +30,7 @@ async fn reflex_register_succeeds_with_no_foreground_window() -> anyhow::Result<
         &[
             ("SYNAPSE_DB", db_path.as_str()),
             // Reproduce the real "no focused window" condition; this also
-            // suppresses the harness's default synthetic notepad foreground.
+            // disables the harness's default synthetic notepad foreground.
             ("SYNAPSE_MCP_FORCE_NO_FOREGROUND", "1"),
         ],
     )

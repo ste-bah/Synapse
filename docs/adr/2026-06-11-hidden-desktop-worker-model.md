@@ -202,8 +202,9 @@ Positive:
   daemon with Tokio, COM, UIA, hooks, and possible hidden runtime windows.
 - Per-worker process boundaries give exact PIDs for cleanup, crash isolation,
   job assignment, logs, and future primary-agent attribution.
-- The action router can stay background-first and fail closed when raw input is
-  required.
+- The action router can stay capability-preserving: use target/session-lane
+  routes where they satisfy the task, and fail closed with a precise reason when
+  raw real-foreground input is required without the right lease/proof.
 
 Negative:
 

@@ -1,15 +1,16 @@
-//! `target_act` (#1005): a compact, high-level background-first computer-use
+//! `target_act` (#1005): a compact, high-level capability-preserving computer-use
 //! router.
 //!
 //! The raw tool surface is large, and model priors make low-level primitive
 //! selection brittle and foreground-prone. `target_act` gives agents one
-//! intent-named verb that routes to the correct *background-capable*,
-//! session-targeted primitive and never to the human OS foreground. It is a thin
-//! dispatcher: each verb delegates to the existing tool method, inheriting that
-//! tool's target resolution, background routing, action audit (#1006), and
-//! lease/foreground guards (#999/#1004) — so a normal (leaseless) session can
-//! drive a background target through this router but cannot escalate to the
-//! human foreground, which the delegate refuses before any mutation.
+//! intent-named verb that routes to the correct session-targeted primitive: a
+//! background/target path when that satisfies the task, an agent logical
+//! foreground/foreground-lane path when foreground-equivalent semantics are
+//! required, and never an implicit fallback to the human OS foreground. It is a
+//! thin dispatcher: each verb delegates to the existing tool method, inheriting
+//! that tool's target resolution, action audit (#1006), and lease/foreground
+//! guards (#999/#1004) - so a normal (leaseless) session can drive its owned
+//! target but cannot seize the human foreground.
 
 use super::browser_field::BrowserSetValueParams;
 use super::{ErrorData, Json, Parameters, SessionTarget, SynapseService, tool, tool_router};
@@ -128,7 +129,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level background-first computer-use router (#1005/#1033/#1207). One verb, routed to the correct background-capable, session-targeted primitive — never the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via background tiers or by CSS selector through the safe normal-Chrome bridge; verb=click clicks a target element by observed element_id or, with selector/role/name, by target-tab DOM action; verb=press presses a named button/link in the session-owned tab; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=run_shell runs a command in the session workspace. Prefer this over raw act_* primitives: it inherits target resolution, action audit, and lease/foreground guards, so a normal (leaseless) session can drive a background target but cannot seize the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers or by CSS selector through the safe normal-Chrome bridge; verb=click clicks a target element by observed element_id or, with selector/role/name, by target-tab DOM action; verb=press presses a named button/link in the session-owned tab; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=run_shell runs a command in the session workspace. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -299,7 +300,7 @@ impl SynapseService {
             ok,
             status: status.to_owned(),
             delegated_tool: delegated_tool.to_owned(),
-            routing: "background-first; delegated to the session-targeted primitive, which inherits the action audit and lease/foreground guards and refuses the human foreground before input".to_owned(),
+            routing: "capability-preserving; delegated to the session-targeted primitive, inheriting action audit plus lane/lease/foreground guards and refusing implicit human OS foreground use before input".to_owned(),
             result,
         }))
     }

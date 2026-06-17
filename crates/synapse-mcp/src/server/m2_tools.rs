@@ -7398,7 +7398,7 @@ mod tests {
         assert!(act_type_requires_foreground_route(&params, Some(&target)));
         assert!(
             !act_type_requires_foreground_route(&params, None),
-            "ordinary into_element routes stay background-only unless the Chromium fallback target is detected"
+            "ordinary into_element routes stay target-capable unless the Chromium fallback target is detected"
         );
         params.into_element = None;
         assert!(act_type_requires_foreground_route(&params, None));

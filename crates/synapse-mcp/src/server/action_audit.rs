@@ -527,11 +527,12 @@ impl SynapseService {
     /// Compute the per-row foreground-tier policy block (#1006): which backend
     /// tier the action used, whether it required the human foreground, the live
     /// foreground-input lease state, and the calling session's foreground
-    /// policy. When a session whose profile is NOT allowed to reach the
-    /// foreground tier nonetheless records `required_foreground=true` on a
-    /// non-denied action, this is a background-first policy violation and is
-    /// surfaced as a high-severity audit marker + ERROR log (queryable via
-    /// `audit_intelligence_query`).
+    /// policy. When a session whose profile is NOT allowed to reach the real
+    /// human OS foreground tier nonetheless records `required_foreground=true`
+    /// on a non-denied action, this is a policy violation and is surfaced as a
+    /// high-severity audit marker + ERROR log (queryable via
+    /// `audit_intelligence_query`). Foreground-equivalent agent lanes are not
+    /// this shared human OS foreground tier.
     fn action_audit_foreground_tier(
         &self,
         tool: &'static str,
@@ -564,8 +565,8 @@ impl SynapseService {
                 profile = policy_label,
                 backend_tier = backend_tier.as_deref().unwrap_or("<none>"),
                 lease_owner = lease.owner_session_id.as_deref().unwrap_or("<none>"),
-                "a session whose tool profile forbids the foreground tier recorded a \
-                 foreground-tier action; background-first policy violation (#1006)"
+                "a session whose tool profile lacks real human OS foreground permission recorded a \
+                 foreground-tier action without break-glass/full-capability proof (#1006/#1219)"
             );
         }
         json!({
@@ -800,9 +801,10 @@ mod tests {
         let service = service_with_db(dir.path());
         let session_id = "issue1006-normal-session";
 
-        // A normal_agent session that records a foreground-tier action is a
-        // background-first policy violation. The profile is resolved from the
-        // real CF_SESSIONS row (default normal_agent for a non-local session).
+        // A normal_agent session that records a real foreground-tier action is
+        // a human OS foreground policy violation. The profile is resolved from
+        // the real CF_SESSIONS row (default normal_agent for a non-local
+        // session).
         let violation = service.action_audit_foreground_tier(
             "act_type",
             "ok",

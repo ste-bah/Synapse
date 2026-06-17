@@ -188,7 +188,7 @@ plain `observe`; see [Delta-First Reality Tool Boundary](docs/delta-reality.md).
 
 <br clear="all">
 
-### 🤝 It shares your PC — background-first, multi-agent safe
+### 🤝 It shares your PC — foreground-capable, multi-agent safe
 
 <img src="docs/assets/multi-agent.png" alt="Many agents and one human share one machine without fighting over focus" align="right" width="42%">
 
@@ -200,9 +200,11 @@ time**.
 - **Per-session targets** — `set_target` points each agent at *its own window*
   (or browser tab); `observe`, `find`, `read_text`, and `capture_screenshot`
   all honor it, so an agent watches its workspace, not your foreground.
-- **Background-first actions** — clicks, text, values, and scrolls route
-  through UI Automation patterns, CDP, and direct window messages *before*
-  ever considering the shared cursor. Most work never needs focus at all.
+- **Capability-preserving actions** — clicks, text, values, and scrolls route
+  through UI Automation patterns, CDP, direct window messages, and each
+  session's logical foreground lane before ever considering the shared cursor.
+  Most work never needs the human's real foreground, but valid
+  foreground-equivalent work still has a route.
 - **Target claims** — `target_claim` gives a session exclusive ownership of a
   window; another agent that tries to mutate it **fails closed**. No two
   agents typing into the same field.

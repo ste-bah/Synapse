@@ -1,8 +1,8 @@
-# Background-first computer control — acceptance & operator runbook (epic #717)
+# Foreground-capability computer control - acceptance & operator runbook (epic #717)
 
 This is the **manual acceptance runbook** required by #1009 (explicitly *not* an
 automated FSV harness) and the human-active acceptance procedure required by
-#1001, plus the operator-safe bootstrap for #1011. It records the
+#1220, plus the operator-safe bootstrap for #1011. It records the
 Source-of-Truth (SoT) readbacks to inspect for each gate.
 
 Status legend: **VERIFIED** = proven against an independent SoT in this repo;
@@ -15,28 +15,25 @@ implemented and unit/integration-gated, awaiting the human-active acceptance run
 
 | Invariant | Tool/code | SoT proof |
 |---|---|---|
-| Default surface hides foreground primitives (#1002/#1008) | `normal_agent` profile (87 tools) | `tool_profile_status` → `denied_break_glass_tools` includes `act_*`; CF_SESSIONS `mcp/tool-profile/v1/<sid>` row |
-| Hidden tool fails closed with policy proof (#1002/#1004) | tool-profile policy gate | calling `act_type` from `normal_agent` → error `TOOL_PROFILE_POLICY_DENIED` carrying the CF_SESSIONS `policy_row` |
+| Default surface preserves foreground-equivalent capability through routes (#1219) | `normal_agent` profile | `tool_profile_status` -> `foreground_capability.profile_preserves_capability=true`, `hidden_tool_routes` names the preferred `target_act`/browser/CDP/session-lane route for raw `act_*`; CF_SESSIONS `mcp/tool-profile/v1/<sid>` row |
+| Hidden raw tool fails closed with route proof (#1002/#1004/#1219) | tool-profile policy gate | calling `act_type` from `normal_agent` -> error `TOOL_PROFILE_POLICY_DENIED` carrying the CF_SESSIONS `policy_row` plus `capability_route` |
 | Break-glass needs lease + reason + confirm (#999) | `validate_profile_set_policy` | `tool_profile_set break_glass` rejected unless `control_lease` held, `confirm_break_glass=true`, non-empty `reason` |
-| Profile change is visible **in-session** (#1020) | `tool_profile_set` → `peer.notify_tool_list_changed()` | `notifications/tools/list_changed` frame on the standalone GET SSE stream; `tools/list` widens 87→150 with **no reconnect** |
+| Profile change is visible **in-session** (#1020) | `tool_profile_set` -> `peer.notify_tool_list_changed()` | `notifications/tools/list_changed` frame on the standalone GET SSE stream; `tools/list` changes in the same session with **no reconnect** |
 | Agent target distinct from human foreground (#994) | `window_list` / `set_target` | `window_list.human_os_foreground_hwnd` reported separately; per-entry `is_foreground`; `GetForegroundWindow()` cross-check matches |
 | Passive target discovery without shelling out (#1021) | `window_list` | HWND+PID rows match Win32 `Get-Process MainWindowHandle`; round-trips through `set_target` with no activation |
 
-### Reproduce (isolated daemon, no disruption to the live :7700 daemon)
+### Manual readback checklist
 
-```sh
-# 1. build + launch an isolated daemon on a throwaway port/db
-cargo build -p synapse-mcp --bin synapse-mcp
-TMPDB=$(mktemp -d)
-./target/debug/synapse-mcp.exe --mode http --bind 127.0.0.1:7711 --db "$TMPDB" --log-level info &
+Use the real wired Synapse MCP client for the trigger, then read the SoT with a
+separate operation. Do not use any script, helper client, or harness as
+acceptance.
+Supporting tests may exercise notifications/tool-list mechanics, but issue
+closure still requires manual `tool_profile_status`, `session_list`,
+`target_claim_status`, `storage_inspect`/read-only CF row, and physical
+window/DOM/UIA readbacks.
 
-# 2. drive it with the bundled FSV client (token from %APPDATA%\synapse\token.txt)
-python tmp/fsv_mcp.py        # asserts #1020 + #1021 end-to-end, exit 0 = pass
-```
-
-`tmp/fsv_mcp.py` opens the standalone SSE stream, captures the
-`notifications/tools/list_changed` frame, flips the profile, and proves the tool
-surface widened in the same session. Cross-check `window_list` against Win32:
+Cross-check `window_list` against Win32 when the manual scenario needs the
+human OS foreground SoT:
 
 ```powershell
 Add-Type 'using System;using System.Runtime.InteropServices;
@@ -92,65 +89,73 @@ different window throughout):
 
 ---
 
-## 3. Human-active non-interference acceptance run (#1001 — the final gate)
+## 3. Human-active foreground-equivalent acceptance run (#1220 - the final gate)
 
 Run this with **you actively using the computer** (switching foreground
 windows, typing, moving the mouse) the entire time.
 
 Setup:
-- Start **two** Synapse MCP sessions (two agents / two terminals), each binds a
-  **different** background window via `window_list` → `set_target` →
-  `target_claim`. Neither claims the window you (the human) are using.
+- Start the target 50+ Synapse MCP sessions, or the maximum locally supported
+  count plus a filed capacity issue if a hard local limit remains after all
+  reversible setup. Each session binds a different owned target/lane via
+  `window_list`/`cdp_open_tab` -> `set_target` -> `target_claim`.
+- Each session must have an `agent_logical_foreground` / `foreground_lane`
+  readback. None claims the window you (the human) are using.
 - Keep a third shell open to sample SoT.
 
 During the run, while the human keeps working:
-1. Agent A: `cdp_navigate_tab` / `act_type` (break-glass into its *own* tab only)
-   / `read_text` / `observe` / `capture_screenshot` on its target.
-2. Agent B: `act_run_shell` in its workspace + `observe`/`window_list` on its
-   own target.
-3. Neither agent calls a human-foreground tier unless explicitly testing the
-   break-glass lease path.
+1. Mix browser navigation/eval, click, type/set_field, read, screenshot, and
+   shell tasks across separate agent lanes/targets.
+2. Routine work uses `target_act`, browser/CDP tools, or the session's
+   foreground lane. No routine task may fall back to the human OS foreground.
+3. Exactly one edge may test explicit real OS foreground break-glass with an
+   owned lease and audit proof.
 
-SoT samples to capture **before / during / after** (paste into the #1001 close
+SoT samples to capture **before / during / after** (paste into the #1220 close
 comment):
-- `session_list` — two live sessions, distinct `active target`, distinct lease
-  ownership.
-- `target_claim_status` — each window owned by exactly one session; no overlap.
-- `GetForegroundWindow()` / `GetCursorPos()` — the human's foreground/cursor are
+- `session_list` - all live sessions, distinct `agent_logical_foreground` /
+  `foreground_lane` readbacks, and no implicit human OS foreground fallback.
+- `target_claim_status` - each window/tab target owned by exactly one session;
+  no overlap.
+- `GetForegroundWindow()` / `GetCursorPos()` - the human's foreground/cursor are
   whatever the human set; **no agent action changed them** (sample repeatedly).
 - Per-target DOM/UIA/window readbacks — each agent sees only its own target.
-- `CF_ACTION_LOG` rows — `backend tier` is background for all routine actions;
-  any foreground tier row is present **only** for the explicit break-glass test
-  and carries a held lease id.
+- `CF_ACTION_LOG` rows - routine actions identify target/lane/session routing;
+  any real foreground tier row is present **only** for the explicit break-glass
+  test and carries a held lease id.
 
-**Pass = ** two agents act/read in their own targets with zero cross-talk while
-the human freely uses the foreground; the only foreground-tier action in the
-audit is the deliberate break-glass test. Close #1001/#755 with this evidence.
+**Pass =** many agents act/read in their own lanes/targets with zero cross-talk
+while the human freely uses the real foreground; the only real foreground-tier
+action in the audit is the deliberate break-glass test. Close #1220 with this
+evidence.
 
 ---
 
 ## 4. Behavioral tool-affordance acceptance (#1009)
 
-Goal: prove the task-scoped surface steers agents to background-safe tools.
+Goal: prove the task-scoped surface steers agents to capability-preserving
+routers and lane-aware tools without stranding foreground-equivalent work.
 Compare these `tools/list` profiles via real spawned agents / the wired client:
 
 | Profile | How to get it | Expected surface |
 |---|---|---|
 | raw/full legacy | `SYNAPSE_DEBUG_TOOLS=1 SYNAPSE_ENABLE_EVERQUEST=1` | full implementation surface (~177) |
-| normal background-safe | default `normal_agent` | 87 tools; no `act_*` foreground primitives; `window_list`/`set_target`/`cdp_*` present |
+| normal capability-preserving | default `normal_agent` | visible count from `tool_profile_status`; no raw `act_*` foreground primitives; `target_act`, `window_list`, `set_target`, `cdp_*`, and route readbacks present |
 | browser-control task | `tool_profile_set browser_control` | narrower; perception + cdp + target tools only |
 | break-glass/admin | lease + `tool_profile_set break_glass` | full raw surface incl. `act_*` |
 
-For each, give the same synthetic task with a known background solution
+For each, give the same synthetic task with a known target/lane solution
 ("read the title of the LinkedIn tab", "type into the dashboard search box",
 "run `git status` in the repo") and record, per the #1009 schema:
 - first tool attempted, any rejected tool attempts, selected target semantics,
   whether any foreground-tier tool was attempted.
 
-Expected: normal/browser-control agents pick `window_list`→`set_target`→
-`cdp_*`/`read_text`; they never see or attempt `act_*`. Any attempt at a hidden
-tool returns `TOOL_PROFILE_POLICY_DENIED` with the CF_SESSIONS policy row (a
-physical audit row). Break-glass agents may use `act_*` only after the lease.
+Expected: normal/browser-control agents pick `window_list` -> `set_target` ->
+`target_act`/`cdp_*`/`read_text`/browser tools and can still complete valid
+foreground-equivalent work through the session lane. Any attempt at a hidden raw
+tool returns `TOOL_PROFILE_POLICY_DENIED` with the CF_SESSIONS policy row,
+`capability_route`, and a physical audit row. Break-glass agents may use `act_*`
+only after the lease.
 Feed the table into the #1007 matrix (`docs/multi-agent-capability-matrix.md`,
 already kept in sync by `multi_agent_capability_matrix.rs`).
 
@@ -177,6 +182,7 @@ is blocked must refuse *before* input (SoT: target value unchanged).
 
 ## 6. Remaining net-new work
 
-- **#1005** — a high-level background computer-use router (`navigate/click/
-  set_field/read/screenshot/run_shell` by target capability) so models pick one
-  safe verb instead of raw primitives. Net-new tool surface.
+- **#1005** — a high-level capability-preserving computer-use router
+  (`navigate/click/set_field/read/screenshot/run_shell` by target/lane
+  capability) so models pick one intent-level verb instead of raw primitives.
+  Net-new tool surface.

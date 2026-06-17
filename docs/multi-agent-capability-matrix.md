@@ -18,31 +18,31 @@ Status values:
 Model-selection exposure values:
 
 - `normal_agent`: visible in the default HTTP MCP profile.
-- `break_glass`: hidden from the default profile; visible only after an explicit break-glass/admin profile transition.
+- `break_glass`: raw primitive is hidden from the default profile, but `tool_profile_status.hidden_tool_routes` must name a capability-preserving route; raw use is visible only after an explicit break-glass/admin profile transition.
 - `debug_only`: hidden from normal agent profiles and reserved for diagnostic/debug tool surfaces.
 
 The model-selection overlay is a checked extension of the capability matrix. It captures the affordance risk of exposing a tool name/schema to models, not only the technical implementation risk. The `Default exposure` and `Break-glass only` columns are kept in sync with `crates/synapse-mcp/src/server/tool_profiles.rs` by `crates/synapse-mcp/tests/multi_agent_capability_matrix.rs`.
 
 | Tool | Default exposure | Break-glass only | Hidden/internal | Deprecated alias | Foreground-prone wording | Safe replacement tool |
 | --- | --- | --- | --- | --- | --- | --- |
-| act_click | break_glass | yes | no | no | yes | cdp_navigate_tab, target_claim, #1005 |
-| act_clipboard | break_glass | yes | no | no | no | workspace_put, #1005 |
-| act_combo | break_glass | yes | no | no | yes | #1005 background router |
-| act_focus_window | break_glass | yes | no | no | yes | set_target, target_claim |
-| act_keymap | break_glass | yes | no | no | yes | cdp_target_info, #1005 |
+| act_click | break_glass | yes | no | no | yes | target_act verb=click, browser DOM action, target_claim |
+| act_clipboard | break_glass | yes | no | no | no | workspace_put, browser_set_value, target_act verb=set_field |
+| act_combo | break_glass | yes | no | no | yes | target_act verb=press, browser DOM action |
+| act_focus_window | break_glass | yes | no | no | yes | set_target, target_claim, session_status |
+| act_keymap | break_glass | yes | no | no | yes | target_act verb=press, browser DOM action |
 | act_launch | break_glass | yes | no | no | yes | act_spawn_agent, cdp_open_tab |
-| act_pad | break_glass | yes | no | no | yes | #1005 background router |
-| act_press | break_glass | yes | no | no | yes | cdp_target_info, #1005 |
+| act_pad | break_glass | yes | no | no | yes | target_claim, control_lease_acquire, tool_profile_set break_glass |
+| act_press | break_glass | yes | no | no | yes | target_act verb=press, browser DOM action |
 | act_run_shell | normal_agent | no | no | no | no | none - default-safe |
 | act_run_shell_cancel | normal_agent | no | no | no | no | none - default-safe |
 | act_run_shell_start | normal_agent | no | no | no | no | none - default-safe |
 | act_run_shell_status | normal_agent | no | no | no | no | none - default-safe |
-| act_scroll | break_glass | yes | no | no | yes | cdp_target_info, #1005 |
-| act_set_field_text | break_glass | yes | no | no | yes | cdp_target_info, #1005 |
-| act_set_value | break_glass | yes | no | no | yes | #1005 background router |
+| act_scroll | break_glass | yes | no | no | yes | browser_evaluate scrollIntoView/window.scrollBy, observe, capture_screenshot |
+| act_set_field_text | break_glass | yes | no | no | yes | target_act verb=set_field, browser_set_value, browser_evaluate |
+| act_set_value | break_glass | yes | no | no | yes | target_act verb=set_field, browser_set_value, browser_evaluate |
 | act_spawn_agent | normal_agent | no | no | no | no | none - default-safe |
-| act_stroke | break_glass | yes | no | no | yes | #1005 background router |
-| act_type | break_glass | yes | no | no | yes | cdp_target_info, #997, #1005 |
+| act_stroke | break_glass | yes | no | no | yes | target_claim, control_lease_acquire, tool_profile_set break_glass |
+| act_type | break_glass | yes | no | no | yes | target_act verb=set_field, browser_set_value, browser_evaluate |
 | action_diagnostic_queue_full_setup | debug_only | yes | yes | no | no | action_diagnostic_rate_limit_override |
 | action_diagnostic_rate_limit_override | debug_only | yes | yes | no | no | action_diagnostic_queue_full_setup |
 | agent_cost | normal_agent | no | no | no | no | none - default-safe |
@@ -121,7 +121,7 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 
 Research basis:
 
-- Microsoft UI Automation control patterns expose semantic behavior such as Invoke, Scroll, Value, Text, and Window through client/provider interfaces, which is the correct background-first path before coordinate input: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-controlpatternsoverview
+- Microsoft UI Automation control patterns expose semantic behavior such as Invoke, Scroll, Value, Text, and Window through client/provider interfaces, which is the correct target-scoped semantic path before coordinate input: https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-controlpatternsoverview
 - Microsoft Win32 clipboard operations require a single open owner, `EmptyClipboard` destroys prior contents/ownership, `EnumClipboardFormats` preserves format order, and `SetClipboardData` transfers `GMEM_MOVEABLE` memory ownership to the system: https://learn.microsoft.com/en-us/windows/win32/dataxchg/clipboard-operations
 - Chrome DevTools Protocol `Target.createTarget` has `background`, `hidden`, and `focus` fields, and `Target.closeTarget` closes a target by id without activating it: https://chromedevtools.github.io/devtools-protocol/tot/Target/
 - Chrome DevTools Protocol `Input.dispatchKeyEvent`, `Input.dispatchMouseEvent`, and `Input.insertText` are per-page input surfaces, while `Page.navigate` navigates the current page target: https://chromedevtools.github.io/devtools-protocol/tot/Input/ and https://chromedevtools.github.io/devtools-protocol/tot/Page/
@@ -209,13 +209,13 @@ Research basis:
 | set_target | target control | current MCP session id plus validated HWND or owned CDP target | sets the session's `agent_logical_foreground` by writing the per-session target registry and `CF_SESSIONS mcp/session-target/v1/<session_id>`; does not alter or imply the human OS foreground | no foreground lease | background-pass | #720 #797 #1216 | get_target/session_status readback, validated window title/process, and persisted session-target row |
 | subscribe | perception control | SSE event bus and optional a11y bridge | per-subscription event queue | no foreground lease, but event bridge is process-global | gap-linked | #720 | subscription id, health subscriber count, event bus state |
 | subscribe_cancel | perception control | subscription id | event bus unsubscribe | no foreground lease | control | #720 | health subscriber count and cancellation readback |
-| target_act | perception | current MCP session target (set_target); never the human OS foreground | high-level background-first router: delegates read→observe, screenshot→capture_screenshot, navigate→cdp_navigate_tab, set_field→act_set_field_text, run_shell→act_run_shell, inheriting each delegate's background routing and lease/foreground guards | no foreground lease; delegates fail closed before input when only a foreground route exists | control | #1005 | delegated tool response, per-target DOM/UIA/window readback, and CF_ACTION_LOG backend tier of the delegate |
+| target_act | perception | current MCP session target (`agent_logical_foreground` / `foreground_lane`); never the human OS foreground as an implicit fallback | high-level capability-preserving router: delegates read->observe, screenshot->capture_screenshot, navigate->cdp_navigate_tab, set_field->act_set_field_text/browser_set_value, click/press/select/submit->target DOM/UIA actions, run_shell->act_run_shell, inheriting each delegate's target routing and lane/lease guards | no real foreground lease for target/lane routes; explicit real OS foreground remains break-glass only | control | #1005 #1219 | delegated tool response, per-target DOM/UIA/window readback, session_status foreground_lane, and CF_ACTION_LOG backend tier of the delegate |
 | target_claim | target control | current MCP session active target or explicit window/CDP target | daemon-local target ownership registry mutation | no foreground lease; mutating actions by other sessions fail closed with TARGET_CO_OWNED | control | #720 #797 | target_claim_status/session_list before and after plus denied mutating action readback |
 | target_claim_adopt | target control | live target claim owner read from target_claim_status/session_list plus current MCP session identity | explicit same-agent recovery: old owner must be older, same client identity, no in-flight tool, and no input lease; then session lifecycle teardown terminates old owner before new claim generation is written | no foreground lease; fails closed with TARGET_CLAIM_ADOPT_REFUSED or TARGET_CLAIM_OWNER_ACTIVE | control | #813 #797 #801 | target_claim_status/session_list before and after, owner teardown report, terminated-session rejection, and denied active/different-agent edge readbacks |
 | target_claim_status | target control | target ownership registry | read-only target claim registry read | no foreground lease | control | #797 | target_claim_status response and session_list target_claims |
 | target_release | target control | current MCP session active target or explicit window/CDP target | daemon-local target ownership registry mutation scoped to the owner session | no foreground lease | control | #797 | target_claim_status/session_list before and after |
-| tool_profile_set | session control | current MCP session id plus requested profile | durable CF_SESSIONS profile assignment controls the session-filtered tools/list surface; break_glass requires confirm_break_glass, non-empty reason, and owned foreground input lease | no foreground lease for normal_agent or browser_control; break_glass transition requires the foreground input lease proof | control | none (#1008) | CF_SESSIONS mcp/tool-profile row, health/tools-list names, and CF_ACTION_LOG profile_set rows |
-| tool_profile_status | session control | current MCP session id | reads the durable session profile row and recomputes visible tools/list names for the current profile | no foreground lease | control | none (#1008) | CF_SESSIONS mcp/tool-profile row plus visible_tool_names/count/hash readback |
+| tool_profile_set | session control | current MCP session id plus requested profile | durable CF_SESSIONS profile assignment controls the session-filtered tools/list surface; normal/task profiles preserve capability through router/browser/CDP/session-lane routes; break_glass requires confirm_break_glass, non-empty reason, and owned foreground input lease | no real foreground lease for normal_agent or browser_control; break_glass transition requires foreground input lease proof | control | #1219 | CF_SESSIONS mcp/tool-profile row, health/tools-list names, and CF_ACTION_LOG profile_set rows |
+| tool_profile_status | session control | current MCP session id | reads durable session profile row, visible tools/list names, foreground_capability policy, and hidden_tool_routes for raw primitives | no foreground lease | control | #1219 | CF_SESSIONS mcp/tool-profile row plus visible_tool_names/count/hash, foreground_capability, and hidden_tool_routes readback |
 | window_list | perception | daemon top-level window enumeration (EnumWindows + visibility/cloak filter); never the human foreground as an implicit work surface | read-only EnumWindows snapshot with per-window target-claim ownership annotation; no activation, no foregrounding, no debugger attach | no foreground lease | control | #1021 | window_list windows[] round-tripped through set_target plus target_claim_status ownership cross-check; human_os_foreground_hwnd reported separately |
 | workspace_get | session control | current MCP session id plus run-scoped key | exact CF_KV workspace-blackboard row read and hash readback | no foreground lease | control | none (#796) | CF_KV workspace row key/hash plus returned value/artifact handle |
 | workspace_list | session control | current MCP session id plus run/prefix | CF_KV run-prefix scan with expired-row delete and corrupt-row isolation | no foreground lease | control | none (#796) | CF_KV workspace run prefix before/after, skipped corrupt row report, returned row hashes |
