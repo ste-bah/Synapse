@@ -1,7 +1,7 @@
 use super::{
     BrowserContentParams, BrowserContentResponse, BrowserEvaluateParams, BrowserEvaluateResponse,
-    BrowserInspectParams, BrowserInspectResponse, BrowserLocateParams, BrowserLocateResponse,
-    BrowserLocateStrategy, CaptureScreenshotFormat, ElementInspection,
+    BrowserInspectParams, BrowserInspectResponse, BrowserLayoutRelation, BrowserLocateEngine,
+    BrowserLocateParams, BrowserLocateResponse, CaptureScreenshotFormat, ElementInspection,
     CaptureScreenshotParams, CaptureScreenshotResponse,
     CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
     CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
@@ -1680,7 +1680,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Resolve a CSS or XPath selector to element ids in the calling session's owned background browser tab via raw CDP (DOM.querySelectorAll / DOM.performSearch). Returns match_count (the Playwright count()), the resolved element_ids (capped at limit) that feed directly into browser_inspect / act_* / etc., and url/title. Requires an active session CDP target or an explicit cdp_target_id owned by this session; never the human foreground tab. Read-only, background-safe. Raw CDP only; the popup-safe extension bridge fails closed."
+        description = "Resolve any Playwright-style selector to element ids in the calling session's owned background browser tab via raw CDP — the full selector engine. engine ∈ css | xpath | text | role | label | placeholder | alttext | title | testid | layout (default css); `query` is the CSS/XPath text, visible text (getByText), ARIA role token (getByRole), label/placeholder/alt/title text, test-id value, or (layout) the base CSS. Options: exact/regex (text & attribute engines), name/name_exact/name_regex + ARIA state filters checked/pressed/expanded/selected/disabled/level/include_hidden (role), testid_attribute (testid, default data-testid), relation+anchor+max_distance (layout), has_text filter, nth (.first/.last via 0/-1, negative counts from end), strict (error on >1 unless nth), root_element_id (scope/chain within an element). Returns match_count (Playwright count()), the resolved element_ids (capped at limit) that feed directly into browser_inspect / act_* / etc., and url/title. Requires an active session CDP target or an explicit cdp_target_id owned by this session; never the human foreground tab. Read-only, background-safe. Raw CDP only; the popup-safe extension bridge fails closed."
     )]
     pub async fn browser_locate(
         &self,
@@ -1694,24 +1694,82 @@ impl SynapseService {
             "tool.invocation kind=browser_locate"
         );
         let session_id = require_target_session_id(&request_context)?;
-        if params.0.selector.trim().is_empty() {
+        if params.0.query.trim().is_empty() {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
-                "browser_locate requires a non-empty selector",
+                "browser_locate requires a non-empty query",
             ));
         }
-        if params.0.selector.len() > BROWSER_LOCATE_MAX_SELECTOR_BYTES {
+        if params.0.query.len() > BROWSER_LOCATE_MAX_SELECTOR_BYTES {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
                 format!(
-                    "browser_locate selector is {} bytes; the maximum is {BROWSER_LOCATE_MAX_SELECTOR_BYTES}",
-                    params.0.selector.len()
+                    "browser_locate query is {} bytes; the maximum is {BROWSER_LOCATE_MAX_SELECTOR_BYTES}",
+                    params.0.query.len()
                 ),
             ));
+        }
+        // Fail loud on contradictory matching modes rather than silently picking.
+        if params.0.exact == Some(true) && params.0.regex == Some(true) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "browser_locate exact and regex are mutually exclusive",
+            ));
+        }
+        if params.0.name_exact == Some(true) && params.0.name_regex == Some(true) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "browser_locate name_exact and name_regex are mutually exclusive",
+            ));
+        }
+        if params.0.engine == BrowserLocateEngine::Layout {
+            if params.0.relation.is_none() {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "browser_locate layout engine requires `relation` (near|right-of|left-of|above|below)",
+                ));
+            }
+            if params
+                .0
+                .anchor
+                .as_deref()
+                .is_none_or(|anchor| anchor.trim().is_empty())
+            {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "browser_locate layout engine requires a non-empty `anchor` CSS selector",
+                ));
+            }
         }
         if let Some(target_id) = params.0.cdp_target_id.as_deref() {
             validate_cdp_target_id(target_id)?;
         }
+        // A root_element_id scopes the search and carries its own CDP target,
+        // which must agree with any explicit cdp_target_id.
+        let root_element = params
+            .0
+            .root_element_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(parse_browser_evaluate_element)
+            .transpose()?;
+        if let (Some((_, root_target)), Some(explicit)) =
+            (root_element.as_ref(), params.0.cdp_target_id.as_deref())
+            && !root_target.eq_ignore_ascii_case(explicit)
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser_locate root_element_id resolves to CDP target {root_target:?} but cdp_target_id {explicit:?} was also supplied; they must match"
+                ),
+            ));
+        }
+        let resolution_target = params
+            .0
+            .cdp_target_id
+            .clone()
+            .or_else(|| root_element.as_ref().map(|(_, target)| target.clone()));
+        let root_backend_node_id = root_element.as_ref().map(|(backend, _)| *backend);
         let limit = params
             .0
             .limit
@@ -1720,9 +1778,10 @@ impl SynapseService {
         let request_details = json!({
             "session_id": &session_id,
             "window_hwnd": params.0.window_hwnd,
-            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
-            "strategy": params.0.strategy,
-            "selector_len": params.0.selector.len(),
+            "requested_cdp_target": cdp_target_id_audit_ref(resolution_target.as_deref()),
+            "engine": params.0.engine,
+            "query_len": params.0.query.len(),
+            "root_element_id": params.0.root_element_id,
             "limit": limit,
             "required_foreground": false,
             "phase": "target_resolution",
@@ -1731,7 +1790,7 @@ impl SynapseService {
             TOOL,
             &session_id,
             params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
+            resolution_target.as_deref(),
         );
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
@@ -1743,8 +1802,11 @@ impl SynapseService {
             "session_id": &session_id,
             "window_hwnd": window_hwnd,
             "cdp_target_id": &cdp_target_id,
-            "strategy": params.0.strategy,
-            "selector_len": params.0.selector.len(),
+            "engine": params.0.engine,
+            "query_len": params.0.query.len(),
+            "root_element_id": params.0.root_element_id,
+            "nth": params.0.nth,
+            "strict": params.0.strict,
             "limit": limit,
             "required_foreground": false,
         });
@@ -1754,8 +1816,8 @@ impl SynapseService {
                 &session_id,
                 window_hwnd,
                 &cdp_target_id,
-                params.0.strategy,
-                &params.0.selector,
+                &params.0,
+                root_backend_node_id,
                 limit,
             )
             .await;
@@ -2972,31 +3034,56 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one selector-engine request build + structured readback log + response"
+    )]
     async fn browser_locate_impl(
         &self,
         session_id: &str,
         window_hwnd: i64,
         cdp_target_id: &str,
-        strategy: BrowserLocateStrategy,
-        selector: &str,
+        params: &BrowserLocateParams,
+        root_backend_node_id: Option<i64>,
         limit: usize,
     ) -> Result<BrowserLocateResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             return Err(browser_raw_cdp_required_error("browser_locate", window_hwnd));
         };
-        let a11y_strategy = match strategy {
-            BrowserLocateStrategy::Css => synapse_a11y::CdpLocateStrategy::Css,
-            BrowserLocateStrategy::Xpath => synapse_a11y::CdpLocateStrategy::Xpath,
+        let engine = browser_locate_engine_to_a11y(params.engine);
+        let request = synapse_a11y::CdpLocateRequest {
+            engine,
+            query: params.query.clone(),
+            exact: params.exact.unwrap_or(false),
+            regex: params.regex.unwrap_or(false),
+            name: params.name.clone(),
+            name_exact: params.name_exact.unwrap_or(false),
+            name_regex: params.name_regex.unwrap_or(false),
+            testid_attribute: params.testid_attribute.clone(),
+            checked: params.checked,
+            pressed: params.pressed,
+            expanded: params.expanded,
+            selected: params.selected,
+            disabled: params.disabled,
+            level: params.level,
+            include_hidden: params.include_hidden.unwrap_or(false),
+            relation: params.relation.map(browser_layout_relation_to_a11y),
+            anchor: params.anchor.clone(),
+            max_distance: params.max_distance,
+            has_text: params.has_text.clone(),
+            nth: params.nth,
+            strict: params.strict.unwrap_or(false),
+            root_backend_node_id,
+            limit,
         };
-        let located =
-            synapse_a11y::cdp_locate(&endpoint, cdp_target_id, a11y_strategy, selector, limit)
-                .await
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("browser_locate raw CDP selector resolution failed: {error}"),
-                    )
-                })?;
+        let located = synapse_a11y::cdp_locate(&endpoint, cdp_target_id, request)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("browser_locate raw CDP selector resolution failed: {error}"),
+                )
+            })?;
         let element_ids: Vec<String> = located
             .backend_node_ids
             .iter()
@@ -3005,17 +3092,23 @@ impl SynapseService {
                     .to_string()
             })
             .collect();
+        let readback_backend = if params.engine == BrowserLocateEngine::Role {
+            "Accessibility.queryAXTree + AX state filter"
+        } else {
+            "injected selector engine + Runtime.getProperties + DOM.describeNode"
+        };
         tracing::info!(
             code = "CDP_BACKGROUND_LOCATE",
             session_id = %session_id,
             hwnd = window_hwnd,
             endpoint = %endpoint,
             cdp_target_id = %located.target_id,
-            strategy = %located.strategy,
+            engine = %located.engine,
             match_count = located.match_count,
             returned_count = element_ids.len(),
+            root_scoped = root_backend_node_id.is_some(),
             target_url = %located.url,
-            "readback=DOM.querySelectorAll/performSearch outcome=located"
+            "readback={readback_backend} outcome=located"
         );
         Ok(BrowserLocateResponse {
             session_id: session_id.to_owned(),
@@ -3023,15 +3116,15 @@ impl SynapseService {
             transport: "raw_cdp".to_owned(),
             endpoint,
             cdp_target_id: located.target_id,
-            strategy: located.strategy,
-            selector: located.selector,
+            engine: located.engine,
+            query: located.query,
             match_count: located.match_count,
             returned_count: element_ids.len(),
             truncated: located.truncated,
             element_ids,
             url: located.url,
             title: located.title,
-            readback_backend: "DOM.querySelectorAll/performSearch + DOM.describeNode".to_owned(),
+            readback_backend: readback_backend.to_owned(),
             required_foreground: false,
         })
     }
@@ -3042,8 +3135,8 @@ impl SynapseService {
         _session_id: &str,
         _window_hwnd: i64,
         _cdp_target_id: &str,
-        _strategy: BrowserLocateStrategy,
-        _selector: &str,
+        _params: &BrowserLocateParams,
+        _root_backend_node_id: Option<i64>,
         _limit: usize,
     ) -> Result<BrowserLocateResponse, ErrorData> {
         Err(mcp_error(
@@ -3870,6 +3963,37 @@ const BROWSER_EVALUATE_MAX_ARGS: usize = 64;
 const DEFAULT_BROWSER_LOCATE_LIMIT: usize = 50;
 const MAX_BROWSER_LOCATE_LIMIT: usize = 500;
 const BROWSER_LOCATE_MAX_SELECTOR_BYTES: usize = 16 * 1024;
+
+/// Maps the MCP `browser_locate` engine onto the a11y selector engine.
+#[cfg(windows)]
+fn browser_locate_engine_to_a11y(engine: BrowserLocateEngine) -> synapse_a11y::CdpLocateEngine {
+    match engine {
+        BrowserLocateEngine::Css => synapse_a11y::CdpLocateEngine::Css,
+        BrowserLocateEngine::Xpath => synapse_a11y::CdpLocateEngine::Xpath,
+        BrowserLocateEngine::Text => synapse_a11y::CdpLocateEngine::Text,
+        BrowserLocateEngine::Role => synapse_a11y::CdpLocateEngine::Role,
+        BrowserLocateEngine::Label => synapse_a11y::CdpLocateEngine::Label,
+        BrowserLocateEngine::Placeholder => synapse_a11y::CdpLocateEngine::Placeholder,
+        BrowserLocateEngine::AltText => synapse_a11y::CdpLocateEngine::AltText,
+        BrowserLocateEngine::Title => synapse_a11y::CdpLocateEngine::Title,
+        BrowserLocateEngine::TestId => synapse_a11y::CdpLocateEngine::TestId,
+        BrowserLocateEngine::Layout => synapse_a11y::CdpLocateEngine::Layout,
+    }
+}
+
+/// Maps the MCP layout relation onto the a11y layout relation.
+#[cfg(windows)]
+fn browser_layout_relation_to_a11y(
+    relation: BrowserLayoutRelation,
+) -> synapse_a11y::CdpLayoutRelation {
+    match relation {
+        BrowserLayoutRelation::Near => synapse_a11y::CdpLayoutRelation::Near,
+        BrowserLayoutRelation::RightOf => synapse_a11y::CdpLayoutRelation::RightOf,
+        BrowserLayoutRelation::LeftOf => synapse_a11y::CdpLayoutRelation::LeftOf,
+        BrowserLayoutRelation::Above => synapse_a11y::CdpLayoutRelation::Above,
+        BrowserLayoutRelation::Below => synapse_a11y::CdpLayoutRelation::Below,
+    }
+}
 
 const DEFAULT_BROWSER_CONTENT_MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BROWSER_CONTENT_BYTES: usize = 8 * 1024 * 1024;
@@ -5963,6 +6087,51 @@ mod tests {
     use synapse_storage::cf;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
+
+    // Locks the MCP→a11y selector-engine enum mapping (#1110): every wire engine
+    // and layout relation must route to its a11y counterpart 1:1, so a new engine
+    // can never silently fall through to the wrong resolver.
+    #[cfg(windows)]
+    #[test]
+    fn browser_locate_engine_and_relation_mapping_is_total() {
+        use super::{browser_layout_relation_to_a11y, browser_locate_engine_to_a11y};
+        use crate::m1::{BrowserLayoutRelation, BrowserLocateEngine};
+        use synapse_a11y::{CdpLayoutRelation, CdpLocateEngine};
+
+        let engines = [
+            (BrowserLocateEngine::Css, CdpLocateEngine::Css),
+            (BrowserLocateEngine::Xpath, CdpLocateEngine::Xpath),
+            (BrowserLocateEngine::Text, CdpLocateEngine::Text),
+            (BrowserLocateEngine::Role, CdpLocateEngine::Role),
+            (BrowserLocateEngine::Label, CdpLocateEngine::Label),
+            (BrowserLocateEngine::Placeholder, CdpLocateEngine::Placeholder),
+            (BrowserLocateEngine::AltText, CdpLocateEngine::AltText),
+            (BrowserLocateEngine::Title, CdpLocateEngine::Title),
+            (BrowserLocateEngine::TestId, CdpLocateEngine::TestId),
+            (BrowserLocateEngine::Layout, CdpLocateEngine::Layout),
+        ];
+        for (wire, expected) in engines {
+            let got = browser_locate_engine_to_a11y(wire);
+            println!("readback=engine_map wire={wire:?} a11y={got:?}");
+            assert_eq!(got.as_str(), expected.as_str(), "engine {wire:?}");
+        }
+        let relations = [
+            (BrowserLayoutRelation::Near, CdpLayoutRelation::Near),
+            (BrowserLayoutRelation::RightOf, CdpLayoutRelation::RightOf),
+            (BrowserLayoutRelation::LeftOf, CdpLayoutRelation::LeftOf),
+            (BrowserLayoutRelation::Above, CdpLayoutRelation::Above),
+            (BrowserLayoutRelation::Below, CdpLayoutRelation::Below),
+        ];
+        for (wire, expected) in relations {
+            let got = browser_layout_relation_to_a11y(wire);
+            println!("readback=relation_map wire={wire:?}");
+            assert_eq!(
+                format!("{got:?}"),
+                format!("{expected:?}"),
+                "relation {wire:?}"
+            );
+        }
+    }
 
     #[test]
     fn browser_evaluate_params_validation_edges() {

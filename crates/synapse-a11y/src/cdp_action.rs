@@ -188,23 +188,131 @@ pub struct CdpEvaluateResult {
     pub unserializable_value: Option<String>,
 }
 
-/// Selector resolution strategy for [`cdp_locate`] (#1111/#1112).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CdpLocateStrategy {
-    /// `DOM.querySelectorAll` (CSS selector).
+/// Selector resolution engine for [`cdp_locate`] (#1110–#1119), giving Synapse
+/// the full Playwright locator surface (CSS / XPath / text / role / label /
+/// placeholder / altText / title / testid / layout).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CdpLocateEngine {
+    /// `DOM.querySelectorAll` semantics, shadow-piercing (`getBy`-free CSS).
+    #[default]
     Css,
-    /// `DOM.performSearch` with an XPath query.
+    /// `document.evaluate` XPath (Playwright `xpath=`).
     Xpath,
+    /// Visible text (`getByText`): normalized whitespace, substring/exact/regex.
+    Text,
+    /// ARIA role + accessible name + state (`getByRole`), via the live AX tree.
+    Role,
+    /// `getByLabel`: `aria-labelledby` / `aria-label` / wrapping/`for=` `<label>`.
+    Label,
+    /// `getByPlaceholder`: the `placeholder` attribute.
+    Placeholder,
+    /// `getByAltText`: the `alt` attribute.
+    AltText,
+    /// `getByTitle`: the `title` attribute.
+    Title,
+    /// `getByTestId`: a configurable attribute (default `data-testid`).
+    TestId,
+    /// Layout/relational (`:near` / `:right-of` / … ) ranked by box geometry.
+    Layout,
 }
 
-impl CdpLocateStrategy {
+impl CdpLocateEngine {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Css => "css",
             Self::Xpath => "xpath",
+            Self::Text => "text",
+            Self::Role => "role",
+            Self::Label => "label",
+            Self::Placeholder => "placeholder",
+            Self::AltText => "alttext",
+            Self::Title => "title",
+            Self::TestId => "testid",
+            Self::Layout => "layout",
         }
     }
+
+    /// Engines resolved by the injected JavaScript selector engine (everything
+    /// except `role`, which uses the native `Accessibility.queryAXTree`).
+    const fn uses_injected_js(self) -> bool {
+        !matches!(self, Self::Role)
+    }
+}
+
+/// Direction for the `layout` engine (Playwright proximity pseudo-classes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CdpLayoutRelation {
+    /// Within `max_distance` (default 50 CSS px) in any direction.
+    #[default]
+    Near,
+    RightOf,
+    LeftOf,
+    Above,
+    Below,
+}
+
+impl CdpLayoutRelation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Near => "near",
+            Self::RightOf => "right-of",
+            Self::LeftOf => "left-of",
+            Self::Above => "above",
+            Self::Below => "below",
+        }
+    }
+}
+
+/// A fully-specified selector resolution request (#1110). Built by the MCP layer
+/// and consumed by [`cdp_locate`]. Field semantics mirror Playwright locators.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CdpLocateRequest {
+    pub engine: CdpLocateEngine,
+    /// Primary query: CSS/XPath text, visible-text, role token, label text,
+    /// placeholder/alt/title text, test-id value, or (layout) the base CSS.
+    pub query: String,
+    /// Exact match (whitespace-normalized) vs the default case-insensitive
+    /// substring, for text/label/placeholder/altText/title/testid.
+    pub exact: bool,
+    /// Interpret `query` as a JS regular expression body.
+    pub regex: bool,
+    /// `getByRole` accessible-name filter (role token stays in `query`).
+    pub name: Option<String>,
+    /// Exact accessible-name match for `role`.
+    pub name_exact: bool,
+    /// Interpret `name` as a regular expression for `role`.
+    pub name_regex: bool,
+    /// `getByTestId` attribute name (default `data-testid`).
+    pub testid_attribute: Option<String>,
+    /// ARIA state filters for `role` (`None` = unconstrained).
+    pub checked: Option<bool>,
+    pub pressed: Option<bool>,
+    pub expanded: Option<bool>,
+    pub selected: Option<bool>,
+    pub disabled: Option<bool>,
+    /// `aria-level` (headings) exact match.
+    pub level: Option<i64>,
+    /// Include nodes ignored for accessibility (`getByRole` `includeHidden`).
+    pub include_hidden: bool,
+    /// Layout direction (required for `layout`).
+    pub relation: Option<CdpLayoutRelation>,
+    /// Layout anchor CSS selector (required for `layout`).
+    pub anchor: Option<String>,
+    /// Layout maximum CSS-pixel distance (default 50 for `near`).
+    pub max_distance: Option<f64>,
+    /// `.filter({ hasText })`: keep only matches whose normalized text contains
+    /// this (case-insensitive). Applies to every JS-resolved engine.
+    pub has_text: Option<String>,
+    /// Positional pick (`.nth`/`.first`/`.last`): 0-based, negative counts from
+    /// the end (-1 == last). Applied after `has_text`, before `limit`.
+    pub nth: Option<i64>,
+    /// Strict mode: error when more than one element matches (Playwright strict).
+    pub strict: bool,
+    /// Resolve only within this element (`backendNodeId`); chaining/scoping.
+    pub root_backend_node_id: Option<i64>,
+    /// Maximum element ids to return. `match_count` always reports the true total.
+    pub limit: usize,
 }
 
 /// Result of resolving a selector to live DOM nodes in a CDP page target
@@ -215,8 +323,8 @@ pub struct CdpLocateResult {
     pub target_id: String,
     pub url: String,
     pub title: String,
-    pub strategy: String,
-    pub selector: String,
+    pub engine: String,
+    pub query: String,
     pub match_count: usize,
     pub backend_node_ids: Vec<i64>,
     pub returned_count: usize,
@@ -952,106 +1060,666 @@ pub async fn cdp_evaluate_on_element(
     .await
 }
 
-/// Resolves a CSS or XPath `selector` to live DOM nodes in a CDP page target,
-/// returning their `backendNodeId`s (capped at `limit`) plus the total match
-/// count (#1111/#1112/#1119). Background-safe: read-only, no tab activation, no
-/// OS foreground input.
+/// The injected JavaScript selector engine (#1110). One self-contained function
+/// `(scope, spec) => { count, elements }` that resolves css / xpath / text /
+/// label / placeholder / altText / title / testid / layout against `scope`
+/// (the document or a root element), applies the `hasText` filter and `nth`
+/// pick, and returns the matched elements (shadow-piercing, DOM order, or — for
+/// `layout` — sorted by ascending geometric distance). The algorithms mirror
+/// Playwright's injected engine (`selectorUtils.ts` / `layoutSelectorUtils.ts`):
+/// whitespace normalization, deepest-element text matching, the label
+/// resolution order, and the proximity box scorers. `role` is resolved natively
+/// by [`locate_role`] instead because accessible role/name are not exposed to
+/// page JavaScript.
+///
+/// Kept placeholder-free so it can be concatenated (never `format!`-ed, which
+/// would choke on the JS braces) into a `Runtime.evaluate` / `callFunctionOn`
+/// expression.
+const SYNAPSE_LOCATE_JS: &str = r"function(scope, spec) {
+  function norm(s){ return (s==null?'':String(s)).replace(/[\u200b\u00ad]/g,'').replace(/\s+/g,' ').trim(); }
+  function skipText(el){
+    if(!el||!el.nodeName) return true;
+    var d = el.ownerDocument;
+    return el.nodeName==='SCRIPT'||el.nodeName==='NOSCRIPT'||el.nodeName==='STYLE'||(!!d&&!!d.head&&d.head.contains(el));
+  }
+  var textCache = new Map();
+  function elementText(root){
+    var v = textCache.get(root);
+    if(v!==undefined) return v;
+    v = {full:'', normalized:'', immediate:[]};
+    if(!skipText(root)){
+      if((root instanceof HTMLInputElement) && (root.type==='submit'||root.type==='button')){
+        v = {full:root.value, normalized:norm(root.value), immediate:[root.value]};
+      } else {
+        var cur='';
+        for(var c=root.firstChild;c;c=c.nextSibling){
+          if(c.nodeType===3){ v.full+=c.nodeValue||''; cur+=c.nodeValue||''; }
+          else if(c.nodeType===8){ continue; }
+          else { if(cur) v.immediate.push(cur); cur=''; if(c.nodeType===1) v.full+=elementText(c).full; }
+        }
+        if(cur) v.immediate.push(cur);
+        if(root.shadowRoot) v.full+=elementText(root.shadowRoot).full;
+        if(v.full) v.normalized=norm(v.full);
+      }
+    }
+    textCache.set(root,v);
+    return v;
+  }
+  // Playwright 'self': element matches AND no descendant element also matches,
+  // i.e. the deepest element bearing the text (avoids returning <body>/<div>).
+  function matchesTextSelf(el, matcher){
+    if(skipText(el)) return false;
+    if(!matcher(elementText(el))) return false;
+    for(var c=el.firstChild;c;c=c.nextSibling){
+      if(c.nodeType===1 && matcher(elementText(c))) return false;
+    }
+    if(el.shadowRoot && matcher(elementText(el.shadowRoot))) return false;
+    return true;
+  }
+  function ariaLabelledBy(el){
+    if(!el.getAttribute) return null;
+    var ref = el.getAttribute('aria-labelledby');
+    if(ref===null) return null;
+    var root = el.getRootNode();
+    var out=[]; var ids = ref.split(/\s+/);
+    for(var i=0;i<ids.length;i++){
+      var id=ids[i]; if(!id) continue;
+      var found = (root && root.getElementById)? root.getElementById(id) : el.ownerDocument.getElementById(id);
+      if(found) out.push(found);
+    }
+    return out;
+  }
+  function elementLabels(el){
+    var lbe = ariaLabelledBy(el);
+    if(lbe && lbe.length) return lbe.map(function(l){return elementText(l);});
+    var al = el.getAttribute? el.getAttribute('aria-label'):null;
+    if(al!==null && al.trim()) return [{full:al, normalized:norm(al), immediate:[al]}];
+    var isInput = el.nodeName==='INPUT' && el.type!=='hidden';
+    if(['BUTTON','METER','OUTPUT','PROGRESS','SELECT','TEXTAREA'].indexOf(el.nodeName)>=0 || isInput){
+      var labels = el.labels;
+      if(labels){ var arr=[]; for(var i=0;i<labels.length;i++) arr.push(elementText(labels[i])); return arr; }
+    }
+    return [];
+  }
+  function stringMatcher(query, exact, isRegex){
+    if(isRegex){ var re=new RegExp(query); return function(s){ return re.test(s==null?'':String(s)); }; }
+    if(exact){ var q=norm(query); return function(s){ return norm(s)===q; }; }
+    var q2=norm(query).toLowerCase(); return function(s){ return norm(s).toLowerCase().indexOf(q2)>=0; };
+  }
+  function allElements(root){
+    var out=[];
+    function walk(r){
+      var els=r.querySelectorAll('*');
+      for(var i=0;i<els.length;i++){ out.push(els[i]); if(els[i].shadowRoot) walk(els[i].shadowRoot); }
+    }
+    walk(root);
+    return out;
+  }
+  function boxRightOf(b1,b2,md){ var d=b1.left-b2.right; if(d<0||(md!==undefined&&d>md)) return undefined; return d+Math.max(b2.bottom-b1.bottom,0)+Math.max(b1.top-b2.top,0); }
+  function boxLeftOf(b1,b2,md){ var d=b2.left-b1.right; if(d<0||(md!==undefined&&d>md)) return undefined; return d+Math.max(b2.bottom-b1.bottom,0)+Math.max(b1.top-b2.top,0); }
+  function boxAbove(b1,b2,md){ var d=b2.top-b1.bottom; if(d<0||(md!==undefined&&d>md)) return undefined; return d+Math.max(b1.left-b2.left,0)+Math.max(b2.right-b1.right,0); }
+  function boxBelow(b1,b2,md){ var d=b1.top-b2.bottom; if(d<0||(md!==undefined&&d>md)) return undefined; return d+Math.max(b1.left-b2.left,0)+Math.max(b2.right-b1.right,0); }
+  function boxNear(b1,b2,md){ var k=(md===undefined)?50:md; var s=0; if(b1.left-b2.right>=0)s+=b1.left-b2.right; if(b2.left-b1.right>=0)s+=b2.left-b1.right; if(b2.top-b1.bottom>=0)s+=b2.top-b1.bottom; if(b1.top-b2.bottom>=0)s+=b1.top-b2.bottom; return s>k?undefined:s; }
+
+  var qroot = scope;
+  var engine = spec.engine;
+  var results = [];
+  if(engine==='css'){
+    results = Array.prototype.slice.call(qroot.querySelectorAll(spec.query));
+  } else if(engine==='xpath'){
+    var doc = scope.ownerDocument || scope;
+    var snap = doc.evaluate(spec.query, scope, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+    for(var i=0;i<snap.snapshotLength;i++){ var n=snap.snapshotItem(i); if(n&&n.nodeType===1) results.push(n); }
+  } else if(engine==='text'){
+    var m;
+    if(spec.regex){ var re=new RegExp(spec.query); m=function(t){ return re.test(t.normalized); }; }
+    else if(spec.exact){ var q=norm(spec.query); m=function(t){ return t.normalized===q; }; }
+    else { var q2=norm(spec.query).toLowerCase(); m=function(t){ return t.normalized.toLowerCase().indexOf(q2)>=0; }; }
+    var all=allElements(qroot);
+    for(var i=0;i<all.length;i++){ if(matchesTextSelf(all[i],m)) results.push(all[i]); }
+  } else if(engine==='testid'){
+    var attr = spec.testidAttribute || 'data-testid';
+    var exact = (spec.exact===undefined)? true : spec.exact;
+    var mt = stringMatcher(spec.query, exact, spec.regex);
+    var all=allElements(qroot);
+    for(var i=0;i<all.length;i++){ var el=all[i]; if(el.hasAttribute(attr) && mt(el.getAttribute(attr))) results.push(el); }
+  } else if(engine==='placeholder'||engine==='alttext'||engine==='title'){
+    var attr2 = engine==='placeholder'?'placeholder':(engine==='alttext'?'alt':'title');
+    var ma = stringMatcher(spec.query, spec.exact, spec.regex);
+    var all=allElements(qroot);
+    for(var i=0;i<all.length;i++){ var el=all[i]; var val=el.getAttribute(attr2); if(val!==null && ma(val)) results.push(el); }
+  } else if(engine==='label'){
+    var ml = stringMatcher(spec.query, spec.exact, spec.regex);
+    var all=allElements(qroot);
+    for(var i=0;i<all.length;i++){ var el=all[i]; var labels=elementLabels(el); if(labels.length){ var hit=false; for(var j=0;j<labels.length;j++){ if(ml(labels[j].normalized)){hit=true;break;} } if(hit) results.push(el); } }
+  } else if(engine==='layout'){
+    var base = Array.prototype.slice.call(qroot.querySelectorAll(spec.query));
+    var anchors = spec.anchor ? Array.prototype.slice.call(qroot.querySelectorAll(spec.anchor)) : [];
+    var rel = spec.relation;
+    var md = (spec.maxDistance===undefined||spec.maxDistance===null)?undefined:spec.maxDistance;
+    var scorer = rel==='left-of'?boxLeftOf : rel==='right-of'?boxRightOf : rel==='above'?boxAbove : rel==='below'?boxBelow : boxNear;
+    var scored=[];
+    for(var i=0;i<base.length;i++){
+      var b=base[i]; var bb=b.getBoundingClientRect(); var best=undefined;
+      for(var j=0;j<anchors.length;j++){ var a=anchors[j]; if(a===b) continue; var sc=scorer(bb,a.getBoundingClientRect(),md); if(sc===undefined) continue; if(best===undefined||sc<best) best=sc; }
+      if(best!==undefined) scored.push([b,best]);
+    }
+    scored.sort(function(x,y){ return x[1]-y[1]; });
+    results = scored.map(function(x){ return x[0]; });
+  } else {
+    throw new Error('synapse_locate: unsupported engine '+engine);
+  }
+  if(spec.hasText!==undefined && spec.hasText!==null && spec.hasText!==''){
+    var ht=norm(spec.hasText).toLowerCase();
+    results = results.filter(function(el){ return elementText(el).normalized.toLowerCase().indexOf(ht)>=0; });
+  }
+  var count = results.length;
+  if(spec.nth!==undefined && spec.nth!==null){
+    var idx = spec.nth; if(idx<0) idx = count + idx;
+    results = (idx>=0 && idx<count)? [results[idx]] : [];
+  }
+  var limit = spec.limit || 50;
+  var elements = results.slice(0, limit);
+  return { count: count, returned: elements.length, elements: elements };
+}";
+
+const SYNAPSE_LOCATE_OBJECT_GROUP: &str = "synapse_locate";
+
+/// Resolves a Playwright-style selector (`engine` + `query` + options) to live
+/// DOM nodes in a CDP page target, returning their `backendNodeId`s (capped at
+/// `request.limit`) plus the total match count before the cap (#1110–#1119).
+/// Background-safe: read-only, no tab activation, no OS foreground input.
+///
+/// `css` / `xpath` / `text` / `label` / `placeholder` / `altText` / `title` /
+/// `testid` / `layout` are resolved by the injected [`SYNAPSE_LOCATE_JS`]
+/// engine; `role` is resolved by the native `Accessibility.queryAXTree`. Strict
+/// mode, `nth`, and `limit` are enforced uniformly.
 ///
 /// # Errors
 ///
 /// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
-/// `A11Y_CDP_AXTREE_FAILED` if the document/query/search/describe commands fail
-/// (an invalid selector surfaces the protocol error verbatim).
+/// `A11Y_CDP_AXTREE_FAILED` if any document/eval/AX command fails (an invalid
+/// selector or regex surfaces the engine's error verbatim) or strict mode is
+/// violated.
 pub async fn cdp_locate(
     endpoint: &str,
     target_id: &str,
-    strategy: CdpLocateStrategy,
-    selector: &str,
-    limit: usize,
+    request: CdpLocateRequest,
 ) -> A11yResult<CdpLocateResult> {
-    use chromiumoxide::cdp::browser_protocol::dom::{
-        DescribeNodeParams, DiscardSearchResultsParams, GetDocumentParams, GetSearchResultsParams,
-        PerformSearchParams, QuerySelectorAllParams,
-    };
-    let selector = selector.to_owned();
     with_target_page(endpoint, target_id, |page| async move {
         let target_id = page.target_id().inner().clone();
         let state = read_page_state(&page).await?;
-        let (node_ids, match_count) = match strategy {
-            CdpLocateStrategy::Css => {
-                let document = page
-                    .execute(GetDocumentParams::builder().depth(0).build())
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("DOM.getDocument: {err}"),
-                    })?;
-                let root = document.result.root.node_id;
-                let found = page
-                    .execute(QuerySelectorAllParams::new(root, selector.clone()))
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("DOM.querySelectorAll({selector:?}): {err}"),
-                    })?;
-                let ids = found.result.node_ids.clone();
-                let total = ids.len();
-                (ids.into_iter().take(limit).collect::<Vec<_>>(), total)
-            }
-            CdpLocateStrategy::Xpath => {
-                let search = page
-                    .execute(PerformSearchParams::new(selector.clone()))
-                    .await
-                    .map_err(|err| A11yError::CdpAxtreeFailed {
-                        detail: format!("DOM.performSearch({selector:?}): {err}"),
-                    })?;
-                let search_id = search.result.search_id.clone();
-                let total = usize::try_from(search.result.result_count).unwrap_or(0);
-                let want = total.min(limit);
-                let ids = if want > 0 {
-                    let got = page
-                        .execute(GetSearchResultsParams::new(
-                            search_id.clone(),
-                            0,
-                            i64::try_from(want).unwrap_or(i64::MAX),
-                        ))
-                        .await
-                        .map_err(|err| A11yError::CdpAxtreeFailed {
-                            detail: format!("DOM.getSearchResults({selector:?}): {err}"),
-                        })?;
-                    got.result.node_ids.clone()
-                } else {
-                    Vec::new()
-                };
-                // Best-effort cleanup of the search session; failure is non-fatal.
-                let _ = page
-                    .execute(DiscardSearchResultsParams::new(search_id))
-                    .await;
-                (ids, total)
-            }
+        let (backend_node_ids, match_count) = if request.engine.uses_injected_js() {
+            locate_via_injected_js(&page, &request).await?
+        } else {
+            locate_role(&page, &request).await?
         };
-        let mut backend_node_ids = Vec::with_capacity(node_ids.len());
-        for node_id in node_ids {
-            let described = page
-                .execute(DescribeNodeParams::builder().node_id(node_id).build())
-                .await
-                .map_err(|err| A11yError::CdpAxtreeFailed {
-                    detail: format!("DOM.describeNode: {err}"),
-                })?;
-            backend_node_ids.push(*described.result.node.backend_node_id.inner());
+        // Strict mode mirrors Playwright: an explicit nth/first/last already
+        // disambiguates, so it bypasses the strictness check.
+        if request.strict && request.nth.is_none() && match_count > 1 {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "strict mode: {} selector {:?} resolved to {match_count} elements; refine the query, set nth, or disable strict",
+                    request.engine.as_str(),
+                    request.query
+                ),
+            });
         }
         let returned_count = backend_node_ids.len();
+        // With an explicit nth we deliberately picked a single element, so
+        // `match_count > returned_count` is expected and not a truncation.
+        let truncated = request.nth.is_none() && match_count > returned_count;
         Ok(CdpLocateResult {
             target_id,
             url: state.url,
             title: state.title,
-            strategy: strategy.as_str().to_owned(),
-            selector,
+            engine: request.engine.as_str().to_owned(),
+            query: request.query.clone(),
             match_count,
             backend_node_ids,
             returned_count,
-            truncated: match_count > returned_count,
+            truncated,
         })
     })
     .await
+}
+
+/// Serializes a [`CdpLocateRequest`] into the `spec` object the injected engine
+/// consumes (camelCase keys; `None`s become JSON `null`, which the engine
+/// treats as "unset").
+fn locate_spec_json(request: &CdpLocateRequest) -> Value {
+    serde_json::json!({
+        "engine": request.engine.as_str(),
+        "query": request.query,
+        "exact": request.exact,
+        "regex": request.regex,
+        "testidAttribute": request.testid_attribute,
+        "relation": request.relation.map(CdpLayoutRelation::as_str),
+        "anchor": request.anchor,
+        "maxDistance": request.max_distance,
+        "hasText": request.has_text,
+        "nth": request.nth,
+        "limit": request.limit,
+    })
+}
+
+/// Resolves the JS-engine families. Evaluates [`SYNAPSE_LOCATE_JS`] against the
+/// document (or a root element, when `root_backend_node_id` is set) and maps the
+/// returned element handles to `backendNodeId`s.
+#[allow(
+    clippy::future_not_send,
+    reason = "single CDP eval/getProperties transaction; matches the rest of this module"
+)]
+async fn locate_via_injected_js(
+    page: &chromiumoxide::Page,
+    request: &CdpLocateRequest,
+) -> A11yResult<(Vec<i64>, usize)> {
+    use chromiumoxide::cdp::browser_protocol::dom::{
+        BackendNodeId, DescribeNodeParams, ResolveNodeParams,
+    };
+    use chromiumoxide::cdp::js_protocol::runtime::{
+        CallArgument, CallFunctionOnParams, EvaluateParams, GetPropertiesParams,
+        ReleaseObjectGroupParams,
+    };
+
+    let spec = locate_spec_json(request);
+
+    // Evaluate the engine, yielding the `{count, elements}` result object id.
+    let (result_object_id, _) = if let Some(root_backend) = request.root_backend_node_id {
+        let resolve = ResolveNodeParams::builder()
+            .backend_node_id(BackendNodeId::new(root_backend))
+            .object_group(SYNAPSE_LOCATE_OBJECT_GROUP)
+            .build();
+        let resolved = page
+            .execute(resolve)
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("locate root resolveNode backendNodeId {root_backend}: {err}"),
+            })?;
+        let root_object_id = resolved.object.object_id.clone().ok_or_else(|| {
+            A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "locate root backendNodeId {root_backend} returned no objectId (not in this target's DOM?)"
+                ),
+            }
+        })?;
+        let declaration =
+            String::from("function(spec){ return (") + SYNAPSE_LOCATE_JS + ")(this, spec); }";
+        let call = CallFunctionOnParams::builder()
+            .function_declaration(declaration)
+            .object_id(root_object_id)
+            .object_group(SYNAPSE_LOCATE_OBJECT_GROUP)
+            .argument(CallArgument::builder().value(spec).build())
+            .return_by_value(false)
+            .build()
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("locate callFunctionOn params build: {err}"),
+            })?;
+        let returns = page
+            .execute(call)
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("locate Runtime.callFunctionOn: {err}"),
+            })?
+            .result;
+        if let Some(exception) = returns.exception_details.as_ref() {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "locate engine threw: {}",
+                    format_evaluate_exception(exception)
+                ),
+            });
+        }
+        (returns.result.object_id, returns.result.subtype)
+    } else {
+        let spec_json = serde_json::to_string(&spec).map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("locate spec serialize: {err}"),
+        })?;
+        let expression =
+            String::from("(") + SYNAPSE_LOCATE_JS + ")(document, " + &spec_json + ")";
+        let params = EvaluateParams::builder()
+            .expression(expression)
+            .object_group(SYNAPSE_LOCATE_OBJECT_GROUP)
+            .return_by_value(false)
+            .await_promise(false)
+            .build()
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("locate Runtime.evaluate params build: {err}"),
+            })?;
+        let returns = page
+            .execute(params)
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("locate Runtime.evaluate: {err}"),
+            })?
+            .result;
+        if let Some(exception) = returns.exception_details.as_ref() {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "locate engine threw: {}",
+                    format_evaluate_exception(exception)
+                ),
+            });
+        }
+        (returns.result.object_id, returns.result.subtype)
+    };
+
+    let Some(result_object_id) = result_object_id else {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: "locate engine returned no result object (expected {count, elements})"
+                .to_owned(),
+        });
+    };
+
+    // Read `count` (true total) and the `elements` array handle off the result.
+    let result_props = page
+        .execute(
+            GetPropertiesParams::builder()
+                .object_id(result_object_id)
+                .own_properties(true)
+                .build()
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("locate getProperties(result) build: {err}"),
+                })?,
+        )
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("locate Runtime.getProperties(result): {err}"),
+        })?
+        .result;
+    let mut match_count = 0usize;
+    let mut elements_object_id = None;
+    for prop in result_props.result {
+        match prop.name.as_str() {
+            "count" => {
+                match_count = prop
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.value.as_ref())
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|count| usize::try_from(count).ok())
+                    .unwrap_or(0);
+            }
+            "elements" => {
+                elements_object_id =
+                    prop.value.as_ref().and_then(|value| value.object_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    let mut backend_node_ids = Vec::new();
+    if let Some(elements_object_id) = elements_object_id {
+        let element_props = page
+            .execute(
+                GetPropertiesParams::builder()
+                    .object_id(elements_object_id)
+                    .own_properties(true)
+                    .build()
+                    .map_err(|err| A11yError::CdpAxtreeFailed {
+                        detail: format!("locate getProperties(elements) build: {err}"),
+                    })?,
+            )
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("locate Runtime.getProperties(elements): {err}"),
+            })?
+            .result;
+        // Indexed properties ("0","1",…) carry the element handles; sort numeric.
+        let mut indexed: Vec<(usize, _)> = Vec::new();
+        for prop in element_props.result {
+            let Ok(index) = prop.name.parse::<usize>() else {
+                continue;
+            };
+            if let Some(object_id) = prop.value.as_ref().and_then(|value| value.object_id.clone()) {
+                indexed.push((index, object_id));
+            }
+        }
+        indexed.sort_by_key(|(index, _)| *index);
+        for (index, object_id) in indexed {
+            let described = page
+                .execute(DescribeNodeParams::builder().object_id(object_id).build())
+                .await
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("locate DOM.describeNode(match {index}): {err}"),
+                })?;
+            backend_node_ids.push(*described.result.node.backend_node_id.inner());
+        }
+    }
+
+    // Best-effort release of the element handles; failure is non-fatal.
+    let _ = page
+        .execute(ReleaseObjectGroupParams::new(SYNAPSE_LOCATE_OBJECT_GROUP))
+        .await;
+
+    Ok((backend_node_ids, match_count))
+}
+
+/// Resolves the `role` engine (`getByRole`) via the native
+/// `Accessibility.queryAXTree`, which computes ARIA role + accessible name for
+/// every node in the subtree (the same computation Playwright reimplements in
+/// JS). Filters by accessible name (exact/substring/regex), ARIA states
+/// (checked/pressed/expanded/selected/disabled/level), and hidden-node
+/// inclusion, then applies `nth`/`limit`.
+#[allow(
+    clippy::future_not_send,
+    reason = "single CDP queryAXTree transaction; matches the rest of this module"
+)]
+async fn locate_role(
+    page: &chromiumoxide::Page,
+    request: &CdpLocateRequest,
+) -> A11yResult<(Vec<i64>, usize)> {
+    use chromiumoxide::cdp::browser_protocol::accessibility::QueryAxTreeParams;
+    use chromiumoxide::cdp::browser_protocol::dom::{BackendNodeId, GetDocumentParams};
+
+    let mut builder = QueryAxTreeParams::builder().role(request.query.clone());
+    builder = if let Some(root_backend) = request.root_backend_node_id {
+        builder.backend_node_id(BackendNodeId::new(root_backend))
+    } else {
+        let document = page
+            .execute(GetDocumentParams::builder().depth(0).build())
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("locate role DOM.getDocument: {err}"),
+            })?;
+        builder.node_id(document.result.root.node_id)
+    };
+    let nodes = page
+        .execute(builder.build())
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "Accessibility.queryAXTree(role={:?}): {err}",
+                request.query
+            ),
+        })?
+        .result
+        .nodes;
+
+    let name_matcher = request
+        .name
+        .as_deref()
+        .map(|name| NameMatcher::new(name, request.name_exact, request.name_regex))
+        .transpose()?;
+
+    let mut all: Vec<i64> = Vec::new();
+    for node in nodes {
+        if node.ignored && !request.include_hidden {
+            continue;
+        }
+        let Some(backend) = node.backend_dom_node_id.as_ref().map(|id| *id.inner()) else {
+            continue;
+        };
+        if let Some(matcher) = name_matcher.as_ref() {
+            let actual = ax_value_to_string(node.name.as_ref());
+            if !matcher.matches(&actual) {
+                continue;
+            }
+        }
+        if !ax_states_match(&node, request) {
+            continue;
+        }
+        all.push(backend);
+    }
+
+    let match_count = all.len();
+    let selected = apply_nth_and_limit(all, request.nth, request.limit);
+    Ok((selected, match_count))
+}
+
+/// Accessible-name / attribute-text matcher mirroring the injected engine's
+/// `stringMatcher`: regex (ECMA-ish), exact (whitespace-normalized,
+/// case-sensitive), or default case-insensitive normalized substring.
+#[derive(Debug)]
+enum NameMatcher {
+    Regex(regex::Regex),
+    Exact(String),
+    Substring(String),
+}
+
+impl NameMatcher {
+    fn new(query: &str, exact: bool, is_regex: bool) -> A11yResult<Self> {
+        if is_regex {
+            let re = regex::Regex::new(query).map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("locate name regex {query:?} is invalid: {err}"),
+            })?;
+            Ok(Self::Regex(re))
+        } else if exact {
+            Ok(Self::Exact(normalize_ws(query)))
+        } else {
+            Ok(Self::Substring(normalize_ws(query).to_lowercase()))
+        }
+    }
+
+    fn matches(&self, actual: &str) -> bool {
+        match self {
+            Self::Regex(re) => re.is_match(&normalize_ws(actual)),
+            Self::Exact(want) => normalize_ws(actual) == *want,
+            Self::Substring(want) => normalize_ws(actual).to_lowercase().contains(want),
+        }
+    }
+}
+
+/// Whitespace normalization identical to the injected engine's `norm`: drop
+/// zero-width spaces / soft hyphens, collapse runs of whitespace to one space,
+/// trim ends.
+fn normalize_ws(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for ch in text.chars() {
+        if ch == '\u{200b}' || ch == '\u{00ad}' {
+            continue;
+        }
+        if ch.is_whitespace() {
+            if !out.is_empty() {
+                pending_space = true;
+            }
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Reads an `AxValue`'s string payload (role/name), empty when absent.
+fn ax_value_to_string(
+    value: Option<&chromiumoxide::cdp::browser_protocol::accessibility::AxValue>,
+) -> String {
+    value
+        .and_then(|value| value.value.as_ref())
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Reads a boolean-ish AX property (`true`/`false`/`mixed` tristate), `None`
+/// when the property is absent. `mixed` is treated as not-`true`.
+fn ax_bool_property(
+    node: &chromiumoxide::cdp::browser_protocol::accessibility::AxNode,
+    name: chromiumoxide::cdp::browser_protocol::accessibility::AxPropertyName,
+) -> Option<bool> {
+    let value = node
+        .properties
+        .as_ref()?
+        .iter()
+        .find(|prop| prop.name == name)?
+        .value
+        .value
+        .as_ref()?;
+    value
+        .as_bool()
+        .or_else(|| value.as_str().map(|raw| raw.eq_ignore_ascii_case("true")))
+}
+
+/// Reads the integer `aria-level` AX property, `None` when absent.
+fn ax_level_property(
+    node: &chromiumoxide::cdp::browser_protocol::accessibility::AxNode,
+) -> Option<i64> {
+    use chromiumoxide::cdp::browser_protocol::accessibility::AxPropertyName;
+    let value = node
+        .properties
+        .as_ref()?
+        .iter()
+        .find(|prop| prop.name == AxPropertyName::Level)?
+        .value
+        .value
+        .as_ref()?;
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|raw| raw.parse::<i64>().ok()))
+}
+
+/// True when every requested ARIA state filter on `request` matches `node`.
+/// An unrequested filter (`None`) is unconstrained; a missing boolean property
+/// reads as `false`.
+fn ax_states_match(
+    node: &chromiumoxide::cdp::browser_protocol::accessibility::AxNode,
+    request: &CdpLocateRequest,
+) -> bool {
+    use chromiumoxide::cdp::browser_protocol::accessibility::AxPropertyName;
+    let bool_ok = |want: Option<bool>, name: AxPropertyName| -> bool {
+        want.is_none_or(|want| ax_bool_property(node, name).unwrap_or(false) == want)
+    };
+    if !bool_ok(request.checked, AxPropertyName::Checked) {
+        return false;
+    }
+    if !bool_ok(request.pressed, AxPropertyName::Pressed) {
+        return false;
+    }
+    if !bool_ok(request.expanded, AxPropertyName::Expanded) {
+        return false;
+    }
+    if !bool_ok(request.selected, AxPropertyName::Selected) {
+        return false;
+    }
+    if !bool_ok(request.disabled, AxPropertyName::Disabled) {
+        return false;
+    }
+    if let Some(level) = request.level
+        && ax_level_property(node) != Some(level)
+    {
+        return false;
+    }
+    true
+}
+
+/// Applies an optional `nth` pick (0-based, negative counts from the end) and
+/// then the `limit` cap to an ordered backend-id list.
+fn apply_nth_and_limit(mut ids: Vec<i64>, nth: Option<i64>, limit: usize) -> Vec<i64> {
+    if let Some(nth) = nth {
+        let len = i64::try_from(ids.len()).unwrap_or(i64::MAX);
+        let index = if nth < 0 { len + nth } else { nth };
+        return match usize::try_from(index) {
+            Ok(index) if index < ids.len() => vec![ids[index]],
+            _ => Vec::new(),
+        };
+    }
+    ids.truncate(limit);
+    ids
 }
 
 /// Maps a `Runtime.RemoteObject` (from evaluate or callFunctionOn) plus the
@@ -2681,5 +3349,127 @@ mod tests {
         );
         assert_eq!(drag_move.buttons, Some(1));
         assert_eq!(drag_move.button, Some(MouseButton::Left));
+    }
+
+    // ---- selector engine: pure helpers (#1110–#1118) ----
+
+    #[test]
+    fn normalize_ws_collapses_trims_and_drops_zero_width() {
+        let cases = [
+            ("  Apply   now \n", "Apply now"),
+            ("\tSubmit\u{200b} \u{00ad}order\t", "Submit order"),
+            ("single", "single"),
+            ("   ", ""),
+        ];
+        for (input, expected) in cases {
+            let got = normalize_ws(input);
+            println!("readback=normalize_ws before={input:?} after={got:?}");
+            assert_eq!(got, expected);
+        }
+    }
+
+    #[test]
+    fn name_matcher_substring_is_case_insensitive_and_normalized() {
+        let matcher = NameMatcher::new("apply now", false, false).expect("valid substring");
+        println!("readback=name_matcher edge=substring");
+        assert!(matcher.matches("  Click  APPLY   NOW  please "));
+        assert!(!matcher.matches("apply"));
+    }
+
+    #[test]
+    fn name_matcher_exact_is_case_sensitive_after_normalization() {
+        let matcher = NameMatcher::new("Apply Now", true, false).expect("valid exact");
+        println!("readback=name_matcher edge=exact");
+        assert!(matcher.matches("Apply   Now"));
+        assert!(!matcher.matches("apply now"));
+        assert!(!matcher.matches("Apply Now please"));
+    }
+
+    #[test]
+    fn name_matcher_regex_runs_against_normalized_text() {
+        let matcher = NameMatcher::new("^Item \\d+$", false, true).expect("valid regex");
+        println!("readback=name_matcher edge=regex");
+        assert!(matcher.matches("Item   42"));
+        assert!(!matcher.matches("Item x"));
+    }
+
+    #[test]
+    fn name_matcher_invalid_regex_errors_loud() {
+        let err = NameMatcher::new("a(", false, true).expect_err("invalid regex must fail");
+        let detail = err.to_string();
+        println!("readback=name_matcher edge=invalid_regex err={detail:?}");
+        assert!(detail.contains("invalid"), "error should explain the cause");
+    }
+
+    #[test]
+    fn apply_nth_and_limit_picks_positions_and_caps() {
+        let ids = vec![10_i64, 20, 30, 40];
+        println!("readback=nth before={ids:?}");
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(0), 50), vec![10]);
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(2), 50), vec![30]);
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(-1), 50), vec![40]);
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(-2), 50), vec![30]);
+        // Out-of-range nth resolves to empty rather than panicking.
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(9), 50), Vec::<i64>::new());
+        assert_eq!(apply_nth_and_limit(ids.clone(), Some(-9), 50), Vec::<i64>::new());
+        // No nth: cap by limit, preserve order.
+        assert_eq!(apply_nth_and_limit(ids.clone(), None, 2), vec![10, 20]);
+        assert_eq!(apply_nth_and_limit(ids, None, 50).len(), 4);
+    }
+
+    #[test]
+    fn engine_and_relation_wire_strings_match_playwright_tokens() {
+        assert_eq!(CdpLocateEngine::Css.as_str(), "css");
+        assert_eq!(CdpLocateEngine::AltText.as_str(), "alttext");
+        assert_eq!(CdpLocateEngine::TestId.as_str(), "testid");
+        assert!(CdpLocateEngine::Text.uses_injected_js());
+        assert!(!CdpLocateEngine::Role.uses_injected_js());
+        assert_eq!(CdpLayoutRelation::RightOf.as_str(), "right-of");
+        assert_eq!(CdpLayoutRelation::Near.as_str(), "near");
+    }
+
+    #[test]
+    fn locate_spec_json_carries_options_in_camel_case() {
+        let request = CdpLocateRequest {
+            engine: CdpLocateEngine::Layout,
+            query: "button".to_owned(),
+            relation: Some(CdpLayoutRelation::RightOf),
+            anchor: Some("#label".to_owned()),
+            max_distance: Some(120.0),
+            has_text: Some("Save".to_owned()),
+            nth: Some(-1),
+            limit: 25,
+            ..Default::default()
+        };
+        let spec = locate_spec_json(&request);
+        println!("readback=locate_spec_json spec={spec}");
+        assert_eq!(spec["engine"], "layout");
+        assert_eq!(spec["query"], "button");
+        assert_eq!(spec["relation"], "right-of");
+        assert_eq!(spec["anchor"], "#label");
+        assert_eq!(spec["maxDistance"], 120.0);
+        assert_eq!(spec["hasText"], "Save");
+        assert_eq!(spec["nth"], -1);
+        assert_eq!(spec["limit"], 25);
+        // Unset options serialize to JSON null (the engine treats null as unset).
+        assert!(spec["testidAttribute"].is_null());
+    }
+
+    #[test]
+    fn injected_engine_js_is_syntactically_self_contained() {
+        // Guards against an accidental unbalanced brace/paren in the engine body
+        // that would only surface as a runtime CDP exception against live Chrome.
+        let opens = SYNAPSE_LOCATE_JS.matches('{').count();
+        let closes = SYNAPSE_LOCATE_JS.matches('}').count();
+        let popen = SYNAPSE_LOCATE_JS.matches('(').count();
+        let pclose = SYNAPSE_LOCATE_JS.matches(')').count();
+        println!(
+            "readback=engine_js braces={opens}/{closes} parens={popen}/{pclose} len={}",
+            SYNAPSE_LOCATE_JS.len()
+        );
+        assert_eq!(opens, closes, "unbalanced braces in injected engine");
+        assert_eq!(popen, pclose, "unbalanced parens in injected engine");
+        assert!(SYNAPSE_LOCATE_JS.starts_with("function(scope, spec)"));
+        assert!(!SYNAPSE_LOCATE_JS.contains('"'), "engine must use single quotes");
     }
 }

@@ -1169,27 +1169,131 @@ pub struct BrowserInspectResponse {
     pub required_foreground: bool,
 }
 
-/// Selector strategy for `browser_locate` (#1110).
+/// Selector engine for `browser_locate` (#1110) — the full Playwright locator
+/// surface. Each engine resolves to Synapse element ids consumable by every
+/// action tool.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum BrowserLocateStrategy {
-    /// CSS selector via `DOM.querySelectorAll`.
+pub enum BrowserLocateEngine {
+    /// CSS selector (`DOM.querySelectorAll` semantics), shadow-piercing.
     #[default]
     Css,
-    /// XPath query via `DOM.performSearch`.
+    /// XPath query (`document.evaluate`).
     Xpath,
+    /// Visible text (`getByText`): normalized whitespace; substring/exact/regex.
+    Text,
+    /// ARIA role + accessible name + state (`getByRole`), via the live AX tree.
+    Role,
+    /// `getByLabel`: aria-labelledby / aria-label / wrapping or `for=` `<label>`.
+    Label,
+    /// `getByPlaceholder`: the `placeholder` attribute.
+    Placeholder,
+    /// `getByAltText`: the `alt` attribute.
+    #[serde(rename = "alttext")]
+    AltText,
+    /// `getByTitle`: the `title` attribute.
+    Title,
+    /// `getByTestId`: a configurable attribute (default `data-testid`).
+    #[serde(rename = "testid")]
+    TestId,
+    /// Layout / relational (`:near`/`:right-of`/…), ranked by box geometry.
+    Layout,
 }
 
-/// Parameters for `browser_locate` (#1111/#1112/#1119): resolve a selector to
-/// element ids in the calling session's owned CDP page target.
+/// Direction for the `layout` engine (Playwright proximity pseudo-classes).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrowserLayoutRelation {
+    /// Within `max_distance` (default 50 CSS px) in any direction.
+    #[default]
+    Near,
+    /// To the right of the anchor.
+    RightOf,
+    /// To the left of the anchor.
+    LeftOf,
+    /// Above the anchor.
+    Above,
+    /// Below the anchor.
+    Below,
+}
+
+/// Parameters for `browser_locate` (#1110–#1119): resolve any Playwright-style
+/// selector to element ids in the calling session's owned CDP page target.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserLocateParams {
-    /// CSS selector (default) or XPath query, per `strategy`.
-    pub selector: String,
-    /// Resolution strategy: "css" (default) or "xpath".
+    /// The primary query: CSS/XPath text, visible text, ARIA role token, label /
+    /// placeholder / alt / title text, test-id value, or (for `layout`) the base
+    /// CSS selector whose matches are ranked against `anchor`.
+    pub query: String,
+    /// Which selector engine interprets `query` (default `css`).
     #[serde(default)]
-    pub strategy: BrowserLocateStrategy,
+    pub engine: BrowserLocateEngine,
+    /// Exact match (whitespace-normalized) instead of the default
+    /// case-insensitive substring, for text/label/placeholder/alttext/title.
+    /// (`testid` defaults to exact; set `exact:false` for substring.)
+    #[serde(default)]
+    pub exact: Option<bool>,
+    /// Interpret `query` as a JS regular expression body.
+    #[serde(default)]
+    pub regex: Option<bool>,
+    /// `role` only: accessible-name filter (the role token stays in `query`).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `role` only: exact accessible-name match.
+    #[serde(default)]
+    pub name_exact: Option<bool>,
+    /// `role` only: interpret `name` as a regular expression.
+    #[serde(default)]
+    pub name_regex: Option<bool>,
+    /// `testid` only: attribute name to read (default `data-testid`).
+    #[serde(default)]
+    pub testid_attribute: Option<String>,
+    /// `role` only: require `aria-checked` to equal this.
+    #[serde(default)]
+    pub checked: Option<bool>,
+    /// `role` only: require `aria-pressed` to equal this.
+    #[serde(default)]
+    pub pressed: Option<bool>,
+    /// `role` only: require `aria-expanded` to equal this.
+    #[serde(default)]
+    pub expanded: Option<bool>,
+    /// `role` only: require `aria-selected` to equal this.
+    #[serde(default)]
+    pub selected: Option<bool>,
+    /// `role` only: require the disabled state to equal this.
+    #[serde(default)]
+    pub disabled: Option<bool>,
+    /// `role` only: require `aria-level` (e.g. heading level) to equal this.
+    #[serde(default)]
+    pub level: Option<i64>,
+    /// `role` only: include nodes ignored for accessibility (`includeHidden`).
+    #[serde(default)]
+    pub include_hidden: Option<bool>,
+    /// `layout` only: relation to the anchor (required for `layout`).
+    #[serde(default)]
+    pub relation: Option<BrowserLayoutRelation>,
+    /// `layout` only: the anchor CSS selector (required for `layout`).
+    #[serde(default)]
+    pub anchor: Option<String>,
+    /// `layout` only: maximum CSS-pixel distance (default 50 for `near`).
+    #[serde(default)]
+    pub max_distance: Option<f64>,
+    /// `.filter({ hasText })`: keep only matches whose normalized text contains
+    /// this (case-insensitive). Applies to every engine except `role`.
+    #[serde(default)]
+    pub has_text: Option<String>,
+    /// Positional pick (`.nth`/`.first`/`.last`): 0-based; negative counts from
+    /// the end (-1 == last). Bypasses strict mode.
+    #[serde(default)]
+    pub nth: Option<i64>,
+    /// Strict mode: error when more than one element matches (unless `nth` set).
+    #[serde(default)]
+    pub strict: Option<bool>,
+    /// Resolve only within this element id (chaining / scoping). Its embedded CDP
+    /// target must match the resolved target.
+    #[serde(default)]
+    pub root_element_id: Option<String>,
     /// CDP TargetID to query. Defaults to the active session CDP target. Must be
     /// owned by this session; the human foreground tab is never a fallback.
     #[serde(default)]
@@ -1213,13 +1317,15 @@ pub struct BrowserLocateResponse {
     pub transport: String,
     pub endpoint: String,
     pub cdp_target_id: String,
-    pub strategy: String,
-    pub selector: String,
-    /// Total matches before the `limit` cap (this is the Playwright `count()`).
+    /// The engine that resolved the query (echoed for audit).
+    pub engine: String,
+    /// The resolved query string (echoed for audit).
+    pub query: String,
+    /// Total matches before the `nth`/`limit` cap (Playwright `count()`).
     pub match_count: usize,
     /// Number of element ids returned (== `element_ids.len()`).
     pub returned_count: usize,
-    /// True when `match_count` exceeded the returned cap.
+    /// True when `match_count` exceeded the returned cap (false when `nth` set).
     pub truncated: bool,
     /// Resolved element ids — feed directly into `browser_inspect`, `act_*`, etc.
     pub element_ids: Vec<String>,
