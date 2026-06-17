@@ -352,11 +352,8 @@ $extensionManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-J
 $requiredPermissions = @($extensionManifest.permissions)
 $optionalPermissions = @($extensionManifest.optional_permissions)
 $hostPermissions = @($extensionManifest.host_permissions)
-if ($requiredPermissions -contains 'debugger') {
-    throw "SYNAPSE_CHROME_EXTENSION_REQUIRED_DEBUGGER_PERMISSION_FORBIDDEN path=$manifestPath remediation=normal end-user bridge must use chrome.tabs without required debugger permission"
-}
 if ($optionalPermissions -contains 'debugger') {
-    throw "SYNAPSE_CHROME_EXTENSION_OPTIONAL_DEBUGGER_PERMISSION_FORBIDDEN path=$manifestPath remediation=normal end-user bridge must use chrome.tabs without optional debugger permission; use raw CDP from a Synapse-launched automation profile for DOM/action CDP"
+    throw "SYNAPSE_CHROME_EXTENSION_OPTIONAL_DEBUGGER_PERMISSION_FORBIDDEN path=$manifestPath remediation=the bundled bridge uses required debugger only for the guarded session-owned capturePageScreenshot command; optional debugger permission is ambiguous and forbidden"
 }
 if ($requiredPermissions -contains 'nativeMessaging') {
     throw "SYNAPSE_CHROME_EXTENSION_NATIVE_MESSAGING_FORBIDDEN path=$manifestPath remediation=normal end-user bridge must use direct localhost HTTP registration plus WebSocket command delivery; nativeMessaging can launch a visible cmd.exe wrapper on Windows"
@@ -481,7 +478,7 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
                         runtime_enabled = $runtimeState.runtime_enabled
                     }
                     $synapseChromeProfileReadback += $row
-                    if ($activeApi -contains 'debugger' -or $activeApi -contains 'nativeMessaging') {
+                    if ($activeApi -contains 'nativeMessaging') {
                         $staleSynapseActivePermissions += $row
                     }
                     if ($activeApi -contains 'alarms') {
@@ -544,10 +541,11 @@ $externalHazardExtensionIds = @(
 # Synapse NEVER disables a user's Chrome extensions. External extensions and
 # native-messaging hosts that use debugger/nativeMessaging are observed for
 # diagnostics only (reported below) and are never blocked. Popup-free background
-# automation is achieved entirely on Synapse's own side: the bundled bridge is
-# tabs-only over localhost WebSocket (no debugger/nativeMessaging), and deep CDP
-# work runs in a dedicated Synapse-launched automation profile started with
-# --silent-debugger-extension-api.
+# automation is achieved entirely on Synapse's own side: the bundled bridge uses
+# tabs over localhost WebSocket plus guarded debugger Page.captureScreenshot for
+# inactive session-owned screenshots only, never creates helper Chrome windows,
+# while deep DOM/action CDP work runs in a dedicated Synapse-launched automation
+# profile started with --silent-debugger-extension-api.
 #
 # As a one-way remediation we remove any debugger/nativeMessaging blockers that
 # an earlier Synapse version wrote into Chrome ExtensionSettings, so running the
@@ -565,18 +563,18 @@ $chromePolicyCleanup = Remove-SynapseChromeExternalDebuggerPolicy
     daemon_bridge_transport = 'direct_localhost_websocket'
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
     bridge_self_reload_command = 'cdp_bridge_reload'
-    bridge_build_id_expected = 'synapse-chrome-bridge-2026-06-17-page-vitals-evaluate-v1'
-    bridge_build_sha256_expected = '7a77ff099704319e36345d4310c2fcb8abcb5e6176725d076aab664585097c6f'
-    bridge_required_capabilities = @('activateTab', 'closeTab', 'domAction', 'evaluateScript', 'navigateTab', 'openTab', 'pageVitals', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
-    background_navigation_backend = 'chrome.tabs_no_debugger_permission_no_native_messaging'
+    bridge_build_id_expected = 'synapse-chrome-bridge-2026-06-17-target-screenshot-debugger-v2'
+    bridge_build_sha256_expected = '7e35f9d0e81f41eca7f49a5378ca5f2a33fe49778ad6fc79f261aad1e859c9e6'
+    bridge_required_capabilities = @('activateTab', 'closeTab', 'capturePageScreenshot', 'domAction', 'evaluateScript', 'navigateTab', 'openTab', 'pageVitals', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
+    background_navigation_backend = 'chrome.tabs_plus_guarded_debugger_Page_captureScreenshot_no_native_messaging'
     reconnect_driver = 'bounded_websocket_reconnect_with_disconnected_extension_keepalive_no_alarms'
-    attach_popup_prevention = 'normal_bridge_tabs_only_no_debugger_api_no_nativeMessaging_permission_plus_daemon_side_attach_disabled'
+    attach_popup_prevention = 'normal_bridge_debugger_limited_to_inactive_session_owned_capturePageScreenshot_no_helper_windows_no_nativeMessaging_permission_plus_daemon_side_attach_disabled_for_other_attach_commands'
     normal_bridge_attach_commands_available = $false
-    normal_bridge_debugger_api_calls_present = $false
+    normal_bridge_debugger_api_calls_present = $true
     expected_extension_id_guard_present = $true
     required_alarms_permission_present = $false
     recurring_wakeup_permission_present = $false
-    required_debugger_permission_present = $false
+    required_debugger_permission_present = ($requiredPermissions -contains 'debugger')
     optional_debugger_permission_present = $false
     required_native_messaging_permission_present = $false
     optional_native_messaging_permission_present = $false

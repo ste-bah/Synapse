@@ -39,12 +39,13 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-17-page-vitals-evaluate-v1";
+    "synapse-chrome-bridge-2026-06-17-target-screenshot-debugger-v2";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "7a77ff099704319e36345d4310c2fcb8abcb5e6176725d076aab664585097c6f";
+    "7e35f9d0e81f41eca7f49a5378ca5f2a33fe49778ad6fc79f261aad1e859c9e6";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "activateTab",
     "closeTab",
+    "capturePageScreenshot",
     "domAction",
     "evaluateScript",
     "navigateTab",
@@ -68,7 +69,7 @@ const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
-const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the normal end-user bridge uses chrome.tabs over direct localhost WebSocket without nativeMessaging or debugger permissions, and attach-capable debugger commands are disabled in the normal bridge; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
+const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the normal end-user bridge uses chrome.tabs over direct localhost WebSocket without nativeMessaging, never creates helper Chrome windows, and chrome.debugger is limited to inactive session-owned capturePageScreenshot while other attach-capable debugger commands are disabled in the normal bridge; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
 
@@ -228,7 +229,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
             detail: format!(
-                "normal Synapse Chrome Bridge refused attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=the normal end-user bridge is tabs-only and contains no daemon-side chrome.debugger attach transport{external_surface_hint} remediation=use raw CDP from a dedicated Synapse-launched automation profile started with --silent-debugger-extension-api for DOM/action CDP; Synapse never modifies Chrome policy or disables the user's extensions, so the user's normal Chrome profile is left untouched"
+                "normal Synapse Chrome Bridge refused attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=the normal end-user bridge exposes chrome.debugger only for guarded session-owned capturePageScreenshot and contains no daemon-side DOM/action attach transport{external_surface_hint} remediation=use raw CDP from a dedicated Synapse-launched automation profile started with --silent-debugger-extension-api for DOM/action CDP; Synapse never modifies Chrome policy or disables the user's extensions, so the user's normal Chrome profile is left untouched"
             ),
         }
     }
@@ -606,6 +607,22 @@ pub(crate) struct ChromeDebuggerNodeValue {
 pub(crate) struct ChromeDebuggerOpenTabResult {
     pub target_id: String,
     pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default)]
+    pub chrome_window_focused: Option<bool>,
+    #[serde(default)]
+    pub chrome_window_state: String,
+    #[serde(default)]
+    pub chrome_window_selection_reason: String,
+    #[serde(default)]
+    pub chrome_window_candidate_count: u32,
+    #[serde(default)]
+    pub chrome_window_non_focused_count: u32,
+    #[serde(default)]
+    pub target_active: bool,
+    #[serde(default)]
+    pub target_highlighted: bool,
     pub target_type: String,
     pub url: String,
     pub title: String,
@@ -649,6 +666,46 @@ pub(crate) struct ChromeDebuggerTargetInfo {
     pub page_text: Option<ChromeDebuggerPageText>,
     #[serde(default)]
     pub page_vitals: Option<ChromeDebuggerPageVitals>,
+    pub target_candidate_count: u32,
+    pub target_selection_reason: String,
+    pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerCaptureVisibleTabResult {
+    pub target_id: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default)]
+    pub chrome_window_focused: Option<bool>,
+    #[serde(default)]
+    pub chrome_window_state: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub ready_state: String,
+    #[serde(default)]
+    pub before_active: bool,
+    #[serde(default)]
+    pub active_for_capture: bool,
+    #[serde(default)]
+    pub before_highlighted: bool,
+    #[serde(default)]
+    pub highlighted_for_capture: bool,
+    #[serde(default)]
+    pub previous_active_tab_id: Option<u32>,
+    #[serde(default)]
+    pub restored_previous_active: bool,
+    #[serde(default)]
+    pub image_format: String,
+    pub image_data_url: String,
+    #[serde(default)]
+    pub image_data_url_len: usize,
+    #[serde(default)]
+    pub readback_backend: String,
     pub target_candidate_count: u32,
     pub target_selection_reason: String,
     pub extension_id: Option<String>,
@@ -2306,6 +2363,29 @@ pub(crate) async fn target_info(
     })
 }
 
+pub(crate) async fn capture_visible_tab(
+    hwnd: i64,
+    target_id: &str,
+    expected_chrome_window_id: Option<i64>,
+) -> Result<ChromeDebuggerCaptureVisibleTabResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_popup_safe(hwnd, "capturePageScreenshot")?;
+    let result = bridge()
+        .send_command(
+            "capturePageScreenshot",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+                "expectedChromeWindowId": expected_chrome_window_id,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerCaptureVisibleTabResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger capturePageScreenshot response: {error}"
+        ))
+    })
+}
+
 pub(crate) async fn type_active_element(
     hwnd: i64,
     target_id: &str,
@@ -2396,7 +2476,7 @@ pub(crate) async fn navigate_tab(
 /// Background-safe tab activation (#1189): selects `target_id` as the active
 /// tab in its own Chrome window via `chrome.tabs.update({active:true})` without
 /// taking the OS foreground. Refused before queueing if the live Chrome
-/// profile/process readback is popup-unsafe, identical to the other tabs-only
+/// profile/process readback is popup-unsafe, identical to the other normal-bridge
 /// verbs.
 pub(crate) async fn activate_tab(
     hwnd: i64,
@@ -3147,6 +3227,12 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
         "openTab" => json!({
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
+            "chrome_window_id": result.get("chrome_window_id"),
+            "chrome_window_focused": result.get("chrome_window_focused"),
+            "chrome_window_state": result.get("chrome_window_state"),
+            "chrome_window_selection_reason": result.get("chrome_window_selection_reason"),
+            "chrome_window_candidate_count": result.get("chrome_window_candidate_count"),
+            "chrome_window_non_focused_count": result.get("chrome_window_non_focused_count"),
             "url": result.get("url"),
             "target_attached": result.get("target_attached"),
             "target_count_before": result.get("target_count_before"),
@@ -3176,6 +3262,25 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "chrome_window_id": result.get("chrome_window_id"),
             "before_active": result.get("before_active"),
             "active": result.get("active"),
+            "readback_backend": result.get("readback_backend"),
+            "target_selection_reason": result.get("target_selection_reason"),
+            "extension_id": result.get("extension_id"),
+        }),
+        "capturePageScreenshot" => json!({
+            "target_id": result.get("target_id"),
+            "tab_id": result.get("tab_id"),
+            "chrome_window_id": result.get("chrome_window_id"),
+            "chrome_window_focused": result.get("chrome_window_focused"),
+            "chrome_window_state": result.get("chrome_window_state"),
+            "url": result.get("url"),
+            "title": result.get("title"),
+            "ready_state": result.get("ready_state"),
+            "before_active": result.get("before_active"),
+            "active_for_capture": result.get("active_for_capture"),
+            "previous_active_tab_id": result.get("previous_active_tab_id"),
+            "restored_previous_active": result.get("restored_previous_active"),
+            "image_format": result.get("image_format"),
+            "image_data_url_len": result.get("image_data_url_len"),
             "readback_backend": result.get("readback_backend"),
             "target_selection_reason": result.get("target_selection_reason"),
             "extension_id": result.get("extension_id"),
@@ -3639,7 +3744,7 @@ mod tests {
         assert!(
             error
                 .detail()
-                .contains("normal end-user bridge is tabs-only")
+                .contains("guarded session-owned capturePageScreenshot")
         );
         assert!(error.detail().contains("raw CDP"));
         assert!(error.detail().contains("--silent-debugger-extension-api"));

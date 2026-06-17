@@ -70,7 +70,7 @@ pub struct TargetActParams {
     #[serde(default)]
     pub element_id: Option<String>,
     /// `set_field` / browser DOM action: strict CSS selector routed to the safe
-    /// normal-Chrome bridge (background, no foreground, no debugger).
+    /// normal-Chrome bridge (background, no foreground, no DOM/action debugger attach).
     #[serde(default)]
     pub selector: Option<String>,
     /// `set_field`: full replacement text (empty clears the field).
@@ -201,7 +201,7 @@ impl SynapseService {
             "set_field" => {
                 if let Some(selector) = params.selector.filter(|value| !value.trim().is_empty()) {
                     // Background-safe web field replace in the user's normal Chrome
-                    // via the safe bridge (no foreground, no debugger, no UIA) — the
+                    // via the safe bridge (no foreground, no DOM/action debugger attach, no UIA) — the
                     // #1000/#1005 path for forms perceived UIA-only.
                     let response = self
                         .browser_set_value(

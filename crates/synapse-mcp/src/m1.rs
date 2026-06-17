@@ -603,6 +603,16 @@ pub struct CdpOpenTabResponse {
     pub session_id: String,
     pub window_hwnd: i64,
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_window_hwnd: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_focused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_state: Option<String>,
+    pub target_active: bool,
+    pub target_highlighted: bool,
     pub requested_url: String,
     pub cdp_target_id: String,
     pub target_type: String,

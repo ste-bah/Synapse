@@ -2608,6 +2608,55 @@ pub async fn cdp_capture_node_bgra(
     result
 }
 
+/// Captures a CDP page target's viewport, or a viewport clip, as a BGRA8 bitmap.
+///
+/// This is target-specific `Page.captureScreenshot`: no OS foreground, no
+/// window downgrade, and no screen-coordinate capture. `region`, when present,
+/// is interpreted as CSS viewport coordinates for the page target.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if capture or PNG decode fails.
+pub async fn cdp_capture_page_bgra(
+    endpoint: &str,
+    target_id: &str,
+    region: Option<synapse_core::Rect>,
+) -> A11yResult<CdpNodeBitmap> {
+    if let Some(region) = region
+        && (region.w <= 0 || region.h <= 0)
+    {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "Page.captureScreenshot clip must be non-empty: bbox=({}, {}, {}, {})",
+                region.x, region.y, region.w, region.h
+            ),
+        });
+    }
+    with_target_page(endpoint, target_id, |page| async move {
+        let mut params = ScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Png)
+            .from_surface(true);
+        if let Some(region) = region {
+            params = params.clip(Viewport {
+                x: f64::from(region.x),
+                y: f64::from(region.y),
+                width: f64::from(region.w),
+                height: f64::from(region.h),
+                scale: 1.0,
+            });
+        }
+        let png_bytes =
+            page.screenshot(params.build())
+                .await
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("Page.captureScreenshot: {err}"),
+                })?;
+        decode_png_to_bgra(&png_bytes)
+    })
+    .await
+}
+
 fn mouse_event(
     kind: DispatchMouseEventType,
     point: CdpActionPoint,

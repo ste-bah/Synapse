@@ -273,6 +273,10 @@ pub(crate) struct CdpTargetOwner {
     pub session_id: String,
     pub window_hwnd: i64,
     pub endpoint: String,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default)]
+    pub capture_window_hwnd: Option<i64>,
     pub cdp_target_id: String,
     pub requested_url: String,
     pub target_url: String,

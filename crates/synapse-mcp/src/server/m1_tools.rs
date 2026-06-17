@@ -24,6 +24,7 @@ use crate::m1::{
 };
 use crate::m3::activity_recorder::BrowserNavigationEvent;
 use crate::server::session_continuity::PersistedCdpTargetOwner;
+use base64::Engine as _;
 use rmcp::{RoleServer, service::RequestContext};
 
 use std::{
@@ -420,7 +421,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture a PNG/JPEG screenshot. With window_hwnd or this MCP session's active target, captures that window in the background using passive per-window WGC and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path."
+        description = "Capture a PNG/JPEG screenshot. With an active session CDP target, captures that exact browser tab through raw CDP Page.captureScreenshot or the safe normal Chrome bridge Page.captureScreenshot path; it never downgrades to the browser HWND, and the normal bridge refuses an active/highlighted tab in the focused human Chrome window. With window_hwnd or a window target, captures that window in the background using passive per-window WGC and interprets region as client-relative. With no target, preserves legacy foreground-window or absolute screen-region capture. PrintWindow is disabled for normal targets because it executes target-process WM_PRINT/WM_PRINTCLIENT handlers, but session-owned hidden-desktop targets use an explicit per-desktop worker PrintWindow path."
     )]
     pub async fn capture_screenshot(
         &self,
@@ -434,6 +435,28 @@ impl SynapseService {
         );
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let target = self.request_session_target(&request_context)?;
+        if params.0.window_hwnd.is_none()
+            && let Some(SessionTarget::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            }) = target.as_ref()
+        {
+            let session_id = session_id.as_deref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::HTTP_SESSION_INVALID,
+                    "capture_screenshot requires an MCP session id for a CDP session target",
+                )
+            })?;
+            return self
+                .capture_cdp_target_screenshot_to_file(
+                    &params.0,
+                    session_id,
+                    *window_hwnd,
+                    cdp_target_id,
+                )
+                .await
+                .map(Json);
+        }
         let session_target_hwnd =
             perception_window_hwnd("capture_screenshot", &target, params.0.window_hwnd)?;
         if let Some(window_hwnd) = params.0.window_hwnd.or(session_target_hwnd) {
@@ -998,6 +1021,172 @@ impl SynapseService {
             bitmap_sha256,
             Some(captured.context),
         )
+    }
+
+    #[cfg(windows)]
+    async fn capture_cdp_target_screenshot_to_file(
+        &self,
+        params: &CaptureScreenshotParams,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+    ) -> Result<CaptureScreenshotResponse, ErrorData> {
+        validate_cdp_target_id(cdp_target_id)?;
+        if let Some(region) = params.region {
+            validate_screenshot_region(region)?;
+        }
+        let owner =
+            self.cdp_target_owner_for_readback("capture_screenshot", session_id, cdp_target_id)?;
+        if let Some(owner) = owner.as_ref()
+            && owner.window_hwnd != window_hwnd
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "capture_screenshot refused target {cdp_target_id:?}: owner window {:#x} does not match bound window {:#x}",
+                    owner.window_hwnd, window_hwnd
+                ),
+            ));
+        }
+        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd)
+            .or_else(|| owner.as_ref().map(|owner| owner.endpoint.clone()))
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "capture_screenshot refused CDP target {cdp_target_id:?}: no raw CDP endpoint and no session-owned Chrome bridge owner row"
+                    ),
+                )
+            })?;
+        let output_path = screenshot_output_path(&params.path)?;
+        let format = screenshot_format_from_path(&output_path)?;
+        ensure_screenshot_path_available(&output_path, params.overwrite)?;
+        let target_context = resolve_capture_target_window_context(window_hwnd).ok();
+        if is_chrome_debugger_endpoint(&endpoint) {
+            let captured = crate::chrome_debugger_bridge::capture_visible_tab(
+                window_hwnd,
+                cdp_target_id,
+                owner.as_ref().and_then(|owner| owner.chrome_window_id),
+            )
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "capture_screenshot Chrome bridge Page.captureScreenshot/readback failed: {}",
+                        error.detail()
+                    ),
+                )
+            })?;
+            if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
+                return Err(mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "capture_screenshot Chrome bridge returned target {:?} for requested target {:?}",
+                        captured.target_id, cdp_target_id
+                    ),
+                ));
+            }
+            if let Some(expected_window_id) =
+                owner.as_ref().and_then(|owner| owner.chrome_window_id)
+                && captured.chrome_window_id != Some(expected_window_id)
+            {
+                return Err(mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "capture_screenshot Chrome bridge captured Chrome window {:?} for requested target {:?}, expected Chrome window {}",
+                        captured.chrome_window_id, cdp_target_id, expected_window_id
+                    ),
+                ));
+            }
+            if chrome_tab_screenshot_hits_visible_human_tab(
+                captured.chrome_window_focused,
+                captured.before_active || captured.before_highlighted,
+                captured.active_for_capture || captured.highlighted_for_capture,
+            ) {
+                return Err(mcp_error(
+                    error_codes::CAPTURE_TARGET_INVALID,
+                    format!(
+                        "capture_screenshot Chrome bridge refused target {cdp_target_id:?}: target tab is active/highlighted in focused Chrome window {:?}",
+                        captured.chrome_window_id
+                    ),
+                ));
+            }
+            let bitmap = chrome_capture_visible_tab_data_url_to_bgra(
+                &captured.image_data_url,
+                params.region,
+            )?;
+            let bitmap_sha256 = sha256_hex(&bitmap.bytes);
+            tracing::info!(
+                code = "CDP_TARGET_SCREENSHOT_CAPTURED",
+                session_id = %session_id,
+                hwnd = window_hwnd,
+                endpoint = %endpoint,
+                cdp_target_id = %captured.target_id,
+                tab_id = captured.tab_id,
+                chrome_window_id = captured.chrome_window_id.unwrap_or_default(),
+                before_active = captured.before_active,
+                active_for_capture = captured.active_for_capture,
+                restored_previous_active = captured.restored_previous_active,
+                image_data_url_len = captured.image_data_url_len,
+                output_path = %output_path.display(),
+                "readback=chrome.debugger.Page.captureScreenshot outcome=screenshot_bitmap_decoded"
+            );
+            return write_screenshot_bitmap(
+                params,
+                output_path,
+                format,
+                bitmap,
+                "chrome_debugger_page_capture_screenshot_bgra",
+                bitmap_sha256,
+                None,
+            );
+        }
+        let page_bitmap =
+            synapse_a11y::cdp_capture_page_bgra(&endpoint, cdp_target_id, params.region)
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "capture_screenshot raw CDP Page.captureScreenshot failed: {error}"
+                        ),
+                    )
+                })?;
+        let captured = cdp_page_bitmap_to_captured_bgra(page_bitmap, params.region)?;
+        let bitmap_sha256 = sha256_hex(&captured.bytes);
+        tracing::info!(
+            code = "CDP_TARGET_SCREENSHOT_CAPTURED",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %cdp_target_id,
+            output_path = %output_path.display(),
+            "readback=Page.captureScreenshot outcome=screenshot_bitmap_decoded"
+        );
+        write_screenshot_bitmap(
+            params,
+            output_path,
+            format,
+            captured,
+            "raw_cdp_page_capture_screenshot_bgra",
+            bitmap_sha256,
+            target_context,
+        )
+    }
+
+    #[cfg(not(windows))]
+    async fn capture_cdp_target_screenshot_to_file(
+        &self,
+        _params: &CaptureScreenshotParams,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+    ) -> Result<CaptureScreenshotResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "capture_screenshot CDP target screenshots are only available on Windows in this build",
+        ))
     }
 
     fn hidden_desktop_pip_frame_to_file(
@@ -2739,10 +2928,47 @@ impl SynapseService {
             .map(chrome_debugger_endpoint)
             .unwrap_or_else(chrome_debugger_default_endpoint);
         let cdp_target_id = opened.target_id.clone();
+        let chrome_window_id = opened.chrome_window_id;
+        if chrome_window_id.is_none() {
+            let _ = crate::chrome_debugger_bridge::close_tab(window_hwnd, &cdp_target_id).await;
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "cdp_open_tab Chrome bridge did not return an actual chrome_window_id for target {cdp_target_id:?}"
+                ),
+            ));
+        }
+        let requested_window_is_human_foreground = synapse_a11y::current_foreground_context()
+            .map(|foreground| foreground.hwnd == window_hwnd)
+            .unwrap_or(false);
+        if opened.chrome_window_focused == Some(true) && !requested_window_is_human_foreground {
+            let _ = crate::chrome_debugger_bridge::close_tab(window_hwnd, &cdp_target_id).await;
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "cdp_open_tab refused target {cdp_target_id:?}: Chrome bridge selected focused Chrome window {:?} while requested HWND {window_hwnd:#x} is not the human foreground; OS HWND cannot be mapped inside the normal extension bridge",
+                    chrome_window_id
+                ),
+            ));
+        }
+        if opened.chrome_window_focused == Some(true)
+            && (opened.target_active || opened.target_highlighted)
+        {
+            let _ = crate::chrome_debugger_bridge::close_tab(window_hwnd, &cdp_target_id).await;
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "cdp_open_tab refused target {cdp_target_id:?}: Chrome bridge created an active/highlighted tab in focused Chrome window {:?}",
+                    chrome_window_id
+                ),
+            ));
+        }
         let owner_key = self.register_cdp_target_owner(CdpTargetOwner {
             session_id: session_id.to_owned(),
             window_hwnd,
             endpoint: endpoint.clone(),
+            chrome_window_id,
+            capture_window_hwnd: None,
             cdp_target_id: cdp_target_id.clone(),
             requested_url: requested_url.to_owned(),
             target_url: opened.url.clone(),
@@ -2767,6 +2993,12 @@ impl SynapseService {
             cdp_target_id = %cdp_target_id,
             cdp_owner_key = %owner_key,
             tab_id = opened.tab_id,
+            chrome_window_id = chrome_window_id.unwrap_or_default(),
+            chrome_window_focused = opened.chrome_window_focused.unwrap_or(false),
+            chrome_window_state = %opened.chrome_window_state,
+            chrome_window_selection_reason = %opened.chrome_window_selection_reason,
+            target_active = opened.target_active,
+            target_highlighted = opened.target_highlighted,
             requested_url = %requested_url,
             target_url = %opened.url,
             window_title = %window_title,
@@ -2786,7 +3018,7 @@ impl SynapseService {
             url: opened.url.clone(),
             title: opened.title.clone(),
             tab_id: Some(opened.tab_id),
-            chrome_window_id: None,
+            chrome_window_id,
             window_hwnd: Some(window_hwnd),
             cdp_target_id: Some(cdp_target_id.clone()),
             endpoint: Some(endpoint.clone()),
@@ -2804,6 +3036,16 @@ impl SynapseService {
             session_id: session_id.to_owned(),
             window_hwnd,
             endpoint,
+            chrome_window_id,
+            capture_window_hwnd: None,
+            chrome_window_focused: opened.chrome_window_focused,
+            chrome_window_state: if opened.chrome_window_state.is_empty() {
+                None
+            } else {
+                Some(opened.chrome_window_state)
+            },
+            target_active: opened.target_active,
+            target_highlighted: opened.target_highlighted,
             requested_url: requested_url.to_owned(),
             cdp_target_id,
             target_type: opened.target_type,
@@ -3476,6 +3718,8 @@ impl SynapseService {
             session_id: session_id.to_owned(),
             window_hwnd,
             endpoint: endpoint.to_owned(),
+            chrome_window_id: None,
+            capture_window_hwnd: None,
             cdp_target_id: cdp_target_id.clone(),
             requested_url: requested_url.to_owned(),
             target_url: opened.target.url.clone(),
@@ -3534,6 +3778,12 @@ impl SynapseService {
             session_id: session_id.to_owned(),
             window_hwnd,
             endpoint: endpoint.to_owned(),
+            chrome_window_id: None,
+            capture_window_hwnd: None,
+            chrome_window_focused: None,
+            chrome_window_state: None,
+            target_active: false,
+            target_highlighted: false,
             requested_url: requested_url.to_owned(),
             cdp_target_id,
             target_type: opened.target.target_type,
@@ -4733,6 +4983,231 @@ fn capture_target_window_screenshot_to_file(
         bitmap_sha256,
         foreground,
     )
+}
+
+fn chrome_tab_screenshot_hits_visible_human_tab(
+    chrome_window_focused: Option<bool>,
+    before_visible_tab: bool,
+    after_visible_tab: bool,
+) -> bool {
+    chrome_window_focused == Some(true) && (before_visible_tab || after_visible_tab)
+}
+
+#[cfg(windows)]
+fn chrome_capture_visible_tab_data_url_to_bgra(
+    data_url: &str,
+    region: Option<Rect>,
+) -> Result<synapse_capture::CapturedBgraBitmap, ErrorData> {
+    let (header, encoded) = data_url.split_once(',').ok_or_else(|| {
+        mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            "capture_screenshot Chrome bridge returned malformed image data URL",
+        )
+    })?;
+    let header_lower = header.to_ascii_lowercase();
+    if !header_lower.starts_with("data:image/") || !header_lower.contains(";base64") {
+        return Err(mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            format!(
+                "capture_screenshot Chrome bridge returned unsupported image data URL header {header:?}"
+            ),
+        ));
+    }
+    let image_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|error| {
+            mcp_error(
+                error_codes::A11Y_CDP_AXTREE_FAILED,
+                format!("capture_screenshot could not decode bridge screenshot base64: {error}"),
+            )
+        })?;
+    let rgba = image::load_from_memory(&image_bytes)
+        .map_err(|error| {
+            mcp_error(
+                error_codes::A11Y_CDP_AXTREE_FAILED,
+                format!("capture_screenshot could not decode bridge screenshot image: {error}"),
+            )
+        })?
+        .to_rgba8();
+    let width = rgba.width();
+    let height = rgba.height();
+    let mut bgra = rgba.into_raw();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    let bitmap = synapse_capture::CapturedBgraBitmap {
+        region: bitmap_full_region(width, height)?,
+        width,
+        height,
+        bytes: bgra,
+    };
+    match region {
+        Some(region) => crop_bgra_bitmap(bitmap, region),
+        None => Ok(bitmap),
+    }
+}
+
+#[cfg(windows)]
+fn cdp_page_bitmap_to_captured_bgra(
+    page_bitmap: synapse_a11y::CdpNodeBitmap,
+    region: Option<Rect>,
+) -> Result<synapse_capture::CapturedBgraBitmap, ErrorData> {
+    Ok(synapse_capture::CapturedBgraBitmap {
+        region: region.unwrap_or(bitmap_full_region(page_bitmap.width, page_bitmap.height)?),
+        width: page_bitmap.width,
+        height: page_bitmap.height,
+        bytes: page_bitmap.bgra,
+    })
+}
+
+fn bitmap_full_region(width: u32, height: u32) -> Result<Rect, ErrorData> {
+    Ok(Rect {
+        x: 0,
+        y: 0,
+        w: i32::try_from(width).map_err(|_| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!("capture_screenshot bitmap width {width} exceeds i32"),
+            )
+        })?,
+        h: i32::try_from(height).map_err(|_| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!("capture_screenshot bitmap height {height} exceeds i32"),
+            )
+        })?,
+    })
+}
+
+fn crop_bgra_bitmap(
+    bitmap: synapse_capture::CapturedBgraBitmap,
+    region: Rect,
+) -> Result<synapse_capture::CapturedBgraBitmap, ErrorData> {
+    validate_screenshot_region(region)?;
+    if region.x < 0 || region.y < 0 {
+        return Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot region for browser target must be viewport-relative and non-negative: bbox=({}, {}, {}, {})",
+                region.x, region.y, region.w, region.h
+            ),
+        ));
+    }
+    let x = usize::try_from(region.x).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot region x {} is invalid", region.x),
+        )
+    })?;
+    let y = usize::try_from(region.y).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot region y {} is invalid", region.y),
+        )
+    })?;
+    let w = usize::try_from(region.w).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot region width {} is invalid", region.w),
+        )
+    })?;
+    let h = usize::try_from(region.h).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot region height {} is invalid", region.h),
+        )
+    })?;
+    let bitmap_width = usize::try_from(bitmap.width).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot bitmap width {} exceeds usize",
+                bitmap.width
+            ),
+        )
+    })?;
+    let bitmap_height = usize::try_from(bitmap.height).map_err(|_| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot bitmap height {} exceeds usize",
+                bitmap.height
+            ),
+        )
+    })?;
+    if x.checked_add(w).is_none_or(|right| right > bitmap_width)
+        || y.checked_add(h).is_none_or(|bottom| bottom > bitmap_height)
+    {
+        return Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot browser target region bbox=({}, {}, {}, {}) exceeds captured bitmap {}x{}",
+                region.x, region.y, region.w, region.h, bitmap.width, bitmap.height
+            ),
+        ));
+    }
+    let row_bytes = bitmap_width.checked_mul(4).ok_or_else(|| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!(
+                "capture_screenshot bitmap row width {} overflows",
+                bitmap.width
+            ),
+        )
+    })?;
+    let crop_row_bytes = w.checked_mul(4).ok_or_else(|| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("capture_screenshot crop row width {} overflows", region.w),
+        )
+    })?;
+    let capacity = crop_row_bytes.checked_mul(h).ok_or_else(|| {
+        mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            "capture_screenshot crop byte length overflows",
+        )
+    })?;
+    let mut cropped = Vec::with_capacity(capacity);
+    for row in y..(y + h) {
+        let start = row
+            .checked_mul(row_bytes)
+            .and_then(|offset| offset.checked_add(x * 4))
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::CAPTURE_TARGET_INVALID,
+                    "capture_screenshot crop offset overflows",
+                )
+            })?;
+        let end = start.checked_add(crop_row_bytes).ok_or_else(|| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                "capture_screenshot crop end offset overflows",
+            )
+        })?;
+        let slice = bitmap.bytes.get(start..end).ok_or_else(|| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                "capture_screenshot crop range exceeds bitmap byte buffer",
+            )
+        })?;
+        cropped.extend_from_slice(slice);
+    }
+    Ok(synapse_capture::CapturedBgraBitmap {
+        region,
+        width: u32::try_from(w).map_err(|_| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!("capture_screenshot crop width {w} exceeds u32"),
+            )
+        })?,
+        height: u32::try_from(h).map_err(|_| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!("capture_screenshot crop height {h} exceeds u32"),
+            )
+        })?,
+        bytes: cropped,
+    })
 }
 
 fn write_screenshot_bitmap(
@@ -6683,16 +7158,20 @@ mod tests {
         BROWSER_EVALUATE_MAX_EXPRESSION_BYTES, CdpTargetOwner, SessionTarget, SynapseService,
         TargetWire, attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
         cdp_activate_resolution_request_details, cdp_target_info_resolution_request_details,
-        chrome_page_vitals_info, hidden_desktop_pip_ended_response, hidden_worker_target_miss,
-        mcp_error, ocr_cache_key, page_text_info_from_parts, perception_window_hwnd,
-        resolve_capture_target_window_context, sha256_hex, target_wire, template_value,
-        unavailable_page_vitals_info, validate_browser_evaluate_params, validate_target_window,
+        chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
+        chrome_tab_screenshot_hits_visible_human_tab, hidden_desktop_pip_ended_response,
+        hidden_worker_target_miss, mcp_error, ocr_cache_key, page_text_info_from_parts,
+        perception_window_hwnd, resolve_capture_target_window_context, sha256_hex, target_wire,
+        template_value, unavailable_page_vitals_info, validate_browser_evaluate_params,
+        validate_target_window,
     };
     use crate::m1::{
         BrowserEvaluateParams, CdpActivateTabParams, CdpTargetInfoParams, FindResponse, FindResult,
         FindResultKind, HiddenDesktopPipFrameParams, HiddenDesktopPipStreamStatus,
     };
     use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
+    use base64::Engine as _;
+    use image::{DynamicImage, ImageFormat, RgbaImage};
     use rmcp::{
         model::{ClientCapabilities, Implementation, InitializeRequestParams},
         transport::streamable_http_server::session::SessionState,
@@ -6909,6 +7388,111 @@ mod tests {
             .and_then(serde_json::Value::as_str);
         assert_eq!(code, Some(error_codes::TARGET_WINDOW_NOT_FOUND));
         println!("readback=capture_screenshot edge=dead_hwnd code={code:?}");
+    }
+
+    #[test]
+    fn chrome_capture_visible_tab_data_url_decodes_and_crops_bgra() {
+        let mut image = RgbaImage::new(2, 2);
+        image.put_pixel(0, 0, image::Rgba([10, 0, 0, 255]));
+        image.put_pixel(1, 0, image::Rgba([0, 20, 0, 255]));
+        image.put_pixel(0, 1, image::Rgba([0, 0, 30, 255]));
+        image.put_pixel(1, 1, image::Rgba([40, 50, 60, 255]));
+        let mut png = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut png);
+            if let Err(error) =
+                DynamicImage::ImageRgba8(image).write_to(&mut cursor, ImageFormat::Png)
+            {
+                panic!("test PNG encode failed: {error}");
+            }
+        }
+        let data_url = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(png)
+        );
+        let bitmap = match chrome_capture_visible_tab_data_url_to_bgra(
+            &data_url,
+            Some(Rect {
+                x: 1,
+                y: 0,
+                w: 1,
+                h: 2,
+            }),
+        ) {
+            Ok(bitmap) => bitmap,
+            Err(error) => panic!("data URL decode/crop failed: {error:?}"),
+        };
+
+        assert_eq!(bitmap.width, 1);
+        assert_eq!(bitmap.height, 2);
+        assert_eq!(
+            bitmap.region,
+            Rect {
+                x: 1,
+                y: 0,
+                w: 1,
+                h: 2,
+            }
+        );
+        assert_eq!(
+            bitmap.bytes,
+            vec![
+                0, 20, 0, 255, //
+                60, 50, 40, 255,
+            ]
+        );
+        println!(
+            "readback=capture_screenshot browser_data_url crop width={} height={} bytes={}",
+            bitmap.width,
+            bitmap.height,
+            bitmap.bytes.len()
+        );
+    }
+
+    #[test]
+    fn chrome_capture_visible_tab_data_url_rejects_non_image_data() {
+        let error = match chrome_capture_visible_tab_data_url_to_bgra(
+            "data:text/plain;base64,SGVsbG8=",
+            None,
+        ) {
+            Ok(bitmap) => panic!("non-image data URL unexpectedly decoded: {bitmap:?}"),
+            Err(error) => error,
+        };
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::A11Y_CDP_AXTREE_FAILED));
+        println!("readback=capture_screenshot edge=non_image_data_url code={code:?}");
+    }
+
+    #[test]
+    fn chrome_tab_screenshot_refuses_visible_human_tab_only() {
+        assert!(chrome_tab_screenshot_hits_visible_human_tab(
+            Some(true),
+            true,
+            false
+        ));
+        assert!(chrome_tab_screenshot_hits_visible_human_tab(
+            Some(true),
+            false,
+            true
+        ));
+        assert!(!chrome_tab_screenshot_hits_visible_human_tab(
+            Some(true),
+            false,
+            false
+        ));
+        assert!(!chrome_tab_screenshot_hits_visible_human_tab(
+            Some(false),
+            true,
+            true
+        ));
+        assert!(!chrome_tab_screenshot_hits_visible_human_tab(
+            None, true, true
+        ));
+        println!("readback=capture_screenshot edge=visible_human_tab_predicate ok=true");
     }
 
     #[test]
@@ -7204,6 +7788,8 @@ mod tests {
             session_id: "other-session".to_owned(),
             window_hwnd: 0x7777,
             endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+            chrome_window_id: None,
+            capture_window_hwnd: None,
             cdp_target_id: target_id.to_owned(),
             requested_url: "about:blank".to_owned(),
             target_url: "about:blank".to_owned(),
@@ -7270,6 +7856,8 @@ mod tests {
             session_id: owner_session.to_owned(),
             window_hwnd: 0x7777,
             endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+            chrome_window_id: None,
+            capture_window_hwnd: None,
             cdp_target_id: target_id.to_owned(),
             requested_url: "about:blank".to_owned(),
             target_url: "about:blank".to_owned(),
@@ -7325,6 +7913,8 @@ mod tests {
             session_id: owner_session.to_owned(),
             window_hwnd: 0x8888,
             endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+            chrome_window_id: None,
+            capture_window_hwnd: None,
             cdp_target_id: target_id.to_owned(),
             requested_url: "about:blank".to_owned(),
             target_url: "about:blank".to_owned(),
@@ -7364,6 +7954,8 @@ mod tests {
                 session_id: owner_session.to_owned(),
                 window_hwnd: 0x9999,
                 endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+                chrome_window_id: None,
+                capture_window_hwnd: None,
                 cdp_target_id: target_id.to_owned(),
                 requested_url: "about:blank#rehydrated".to_owned(),
                 target_url: "about:blank#rehydrated".to_owned(),

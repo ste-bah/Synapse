@@ -1,9 +1,10 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-page-vitals-evaluate-v1";
-const BRIDGE_BUILD_SHA256 = "7a77ff099704319e36345d4310c2fcb8abcb5e6176725d076aab664585097c6f";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-target-screenshot-debugger-v2";
+const BRIDGE_BUILD_SHA256 = "7e35f9d0e81f41eca7f49a5378ca5f2a33fe49778ad6fc79f261aad1e859c9e6";
 const COMMAND_CAPABILITIES = Object.freeze([
   "openTab",
   "closeTab",
+  "capturePageScreenshot",
   "targetInfo",
   "targetInfoPageText",
   "navigateTab",
@@ -359,6 +360,8 @@ async function handleCommand(command) {
       result = await handleOpenTab(params);
     } else if (kind === "closeTab") {
       result = await handleCloseTab(params);
+    } else if (kind === "capturePageScreenshot") {
+      result = await handleCapturePageScreenshot(params);
     } else if (kind === "targetInfo" || kind === "targetInfoPageText") {
       result = await handleTargetInfo(params);
     } else if (kind === "typeActiveElement") {
@@ -410,7 +413,8 @@ function rejectAttachCommand(kind, params) {
   throw bridgeError(
     ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
     `normal Synapse Chrome Bridge refused ${String(kind)} before browser debugger startup; ` +
-      `the normal end-user extension is tabs-only and contains no debugger transport. ` +
+      `the normal end-user extension exposes chrome.debugger only for guarded ` +
+      `session-owned capturePageScreenshot, not DOM/action attach commands. ` +
       `hwnd=${String(params?.hwnd ?? "unknown")} remediation=use raw CDP with a dedicated ` +
       `Synapse-launched automation profile`
   );
@@ -420,12 +424,17 @@ async function handleOpenTab(params) {
   const requestedUrl = normalizeOpenUrl(params.url);
   const agentSessionId = normalizeOptionalSessionId(params.agentSessionId);
   const beforePages = await tabTargets();
+  const openWindow = await selectOpenWindowForHwndHint(params);
   let tab;
+  const createParams = {
+    url: requestedUrl || "about:blank",
+    active: false
+  };
+  if (Number.isInteger(openWindow?.windowId)) {
+    createParams.windowId = openWindow.windowId;
+  }
   try {
-    tab = await chrome.tabs.create({
-      url: requestedUrl || "about:blank",
-      active: false
-    });
+    tab = await chrome.tabs.create(createParams);
   } catch (error) {
     throw bridgeError(ERROR_AXTREE_FAILED, `chrome.tabs.create(active=false): ${errorMessage(error)}`);
   }
@@ -438,14 +447,36 @@ async function handleOpenTab(params) {
     sessionId: agentSessionId
   });
   const target = await waitForTabTarget(tab.id, 10000);
+  const state = await tabPageState(tab.id, target);
+  if (
+    Number.isInteger(openWindow?.windowId) &&
+    Number.isInteger(state.chrome_window_id) &&
+    state.chrome_window_id !== openWindow.windowId
+  ) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `chrome.tabs.create returned tab in Chrome window ${state.chrome_window_id}, expected ${openWindow.windowId}`
+    );
+  }
+  const openedWindow = Number.isInteger(state.chrome_window_id)
+    ? await chromeWindowState(state.chrome_window_id)
+    : null;
   const afterPages = await tabTargets();
   return {
     extension_id: chrome.runtime.id,
     target_id: target.id,
     tab_id: tab.id,
+    chrome_window_id: state.chrome_window_id,
+    chrome_window_focused: typeof openedWindow?.focused === "boolean" ? openedWindow.focused : null,
+    chrome_window_state: typeof openedWindow?.state === "string" ? openedWindow.state : "",
+    chrome_window_selection_reason: openWindow?.selectionReason || "default_chrome_tabs_create",
+    chrome_window_candidate_count: openWindow?.candidateCount || 0,
+    chrome_window_non_focused_count: openWindow?.nonFocusedCount || 0,
+    target_active: Boolean(state.active),
+    target_highlighted: Boolean(state.highlighted),
     target_type: target.type || "page",
-    url: target.url || tab.url || requestedUrl || "about:blank",
-    title: target.title || tab.title || "",
+    url: state.url || target.url || tab.url || requestedUrl || "about:blank",
+    title: state.title || target.title || tab.title || "",
     target_attached: Boolean(target.attached),
     target_count_before: beforePages.length,
     target_count_after: afterPages.length
@@ -511,6 +542,122 @@ async function handlePageVitals(params) {
     ready_state: state.ready_state || "",
     readback_backend: "chrome.tabs.get+chrome.scripting.executeScript",
     page_vitals: pageVitals,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
+async function handleCapturePageScreenshot(params) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const before = await tabPageState(selected.tabId, selected.target);
+  const windowId = before.chrome_window_id || selected.target.chromeWindowId;
+  const expectedWindowId = optionalInteger(params.expectedChromeWindowId);
+  if (
+    Number.isInteger(expectedWindowId) &&
+    Number.isInteger(windowId) &&
+    windowId !== expectedWindowId
+  ) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `capturePageScreenshot refused target ${selected.target.id}: tab is in Chrome window ${windowId}, expected ${expectedWindowId}`
+    );
+  }
+  if (!Number.isInteger(windowId)) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `capturePageScreenshot could not resolve chrome window id for target ${JSON.stringify(selected.target.id)}`
+    );
+  }
+  const captureWindow = await chromeWindowState(windowId);
+  if (captureWindow?.focused === true && (before.active || before.highlighted)) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `capturePageScreenshot refused target ${selected.target.id}: tab is active/highlighted in focused Chrome window ${windowId}`
+    );
+  }
+  if (!chrome.debugger || typeof chrome.debugger.attach !== "function" || typeof chrome.debugger.sendCommand !== "function") {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      "chrome.debugger unavailable; extension is missing debugger permission for Page.captureScreenshot"
+    );
+  }
+  const debuggee = { tabId: selected.tabId };
+  let attached = false;
+  let screenshot;
+  let detachError = null;
+  try {
+    await withTimeout(
+      chrome.debugger.attach(debuggee, "1.3"),
+      5000,
+      `chrome.debugger.attach(tabId=${selected.tabId})`
+    );
+    attached = true;
+    await withTimeout(
+      chrome.debugger.sendCommand(debuggee, "Page.enable", {}),
+      5000,
+      `chrome.debugger.sendCommand(Page.enable, tabId=${selected.tabId})`
+    );
+    screenshot = await withTimeout(
+      chrome.debugger.sendCommand(debuggee, "Page.captureScreenshot", {
+        format: "png",
+        fromSurface: true
+      }),
+      15000,
+      `chrome.debugger.sendCommand(Page.captureScreenshot, tabId=${selected.tabId})`
+    );
+  } catch (error) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `capturePageScreenshot failed for target ${selected.target.id}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attached) {
+      try {
+        await withTimeout(
+          chrome.debugger.detach(debuggee),
+          5000,
+          `chrome.debugger.detach(tabId=${selected.tabId})`
+        );
+      } catch (error) {
+        detachError = errorMessage(error);
+      }
+    }
+  }
+  if (detachError) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `capturePageScreenshot captured target ${selected.target.id} but failed to detach debugger from tab ${selected.tabId}: ${detachError}`
+    );
+  }
+  const imageData = typeof screenshot?.data === "string" ? screenshot.data : "";
+  if (!imageData) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      "Page.captureScreenshot returned no image data"
+    );
+  }
+  const imageDataUrl = `data:image/png;base64,${imageData}`;
+  const after = await tabPageState(selected.tabId, selected.target);
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: after.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: windowId,
+    chrome_window_focused: typeof captureWindow?.focused === "boolean" ? captureWindow.focused : null,
+    chrome_window_state: typeof captureWindow?.state === "string" ? captureWindow.state : "",
+    url: after.url || "",
+    title: after.title || "",
+    ready_state: after.ready_state || "",
+    before_active: Boolean(before.active),
+    active_for_capture: Boolean(after.active),
+    before_highlighted: Boolean(before.highlighted),
+    highlighted_for_capture: Boolean(after.highlighted),
+    previous_active_tab_id: null,
+    restored_previous_active: false,
+    image_format: "png",
+    image_data_url: imageDataUrl,
+    image_data_url_len: imageDataUrl.length,
+    readback_backend: "chrome.debugger.Page.captureScreenshot+chrome.tabs.get",
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
@@ -871,10 +1018,21 @@ async function selectTabTarget(params, options = {}) {
     throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.query returned no tab targets");
   }
   const targetIdHint = String(params.targetIdHint || "").trim();
+  const expectedWindowId = optionalInteger(params.expectedChromeWindowId);
   const tabIdHint = tabIdFromTargetId(targetIdHint);
   if (Number.isInteger(tabIdHint)) {
     const selectedById = tabs.find((target) => target.tabId === tabIdHint);
     if (selectedById) {
+      if (
+        Number.isInteger(expectedWindowId) &&
+        Number.isInteger(selectedById.chromeWindowId) &&
+        selectedById.chromeWindowId !== expectedWindowId
+      ) {
+        throw bridgeError(
+          ERROR_AXTREE_FAILED,
+          `targetIdHint ${targetIdHint} is in Chrome window ${selectedById.chromeWindowId}, expected ${expectedWindowId}`
+        );
+      }
       return selectedPage(selectedById, tabs.length, "chrome_tab_id_hint");
     }
     throw bridgeError(
@@ -914,6 +1072,71 @@ async function selectTabTarget(params, options = {}) {
     }
   }
   return selectedPage(tabs[0], tabs.length, "fallback_first_tab");
+}
+
+async function selectOpenWindowForHwndHint(params) {
+  if (params.hwnd === undefined || params.hwnd === null) {
+    return null;
+  }
+  let windows;
+  try {
+    windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
+  } catch (error) {
+    throw bridgeError(ERROR_AXTREE_FAILED, `chrome.windows.getAll(normal): ${errorMessage(error)}`);
+  }
+  const candidates = windows
+    .filter((windowInfo) => Number.isInteger(windowInfo.id))
+    .map((windowInfo) => ({
+      id: windowInfo.id,
+      focused: Boolean(windowInfo.focused),
+      state: String(windowInfo.state || ""),
+      type: String(windowInfo.type || "")
+    }));
+  const nonFocused = candidates.filter((windowInfo) => !windowInfo.focused);
+  if (nonFocused.length === 1) {
+    return {
+      windowId: nonFocused[0].id,
+      focused: nonFocused[0].focused,
+      state: nonFocused[0].state,
+      selectionReason: "single_non_focused_chrome_window_for_hwnd_hint",
+      candidateCount: candidates.length,
+      nonFocusedCount: nonFocused.length
+    };
+  }
+  if (nonFocused.length === 0 && candidates.length === 1 && candidates[0].focused) {
+    return {
+      windowId: candidates[0].id,
+      focused: true,
+      state: candidates[0].state,
+      selectionReason: "focused_chrome_window_inactive_tab_for_hwnd_hint",
+      candidateCount: candidates.length,
+      nonFocusedCount: nonFocused.length
+    };
+  }
+  throw bridgeError(
+    ERROR_AXTREE_FAILED,
+    `openTab refused hwnd hint ${String(params.hwnd)}: candidate_count=${candidates.length} non_focused_count=${nonFocused.length}; OS HWND cannot be mapped inside the normal extension bridge`
+  );
+}
+
+async function chromeWindowState(windowId) {
+  if (!Number.isInteger(windowId)) {
+    return null;
+  }
+  try {
+    const windowInfo = await chrome.windows.get(windowId);
+    return {
+      id: windowInfo.id,
+      focused: Boolean(windowInfo.focused),
+      state: String(windowInfo.state || ""),
+      type: String(windowInfo.type || "")
+    };
+  } catch (error) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `chrome.windows.get(${windowId}) failed: ${errorMessage(error)}`
+    );
+  }
 }
 
 async function tabTargets() {
@@ -1145,6 +1368,28 @@ async function tabPageTextState(tabId) {
       error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
       error_detail: errorMessage(error)
     };
+  }
+}
+
+function optionalInteger(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  const numberValue = Number(value);
+  return Number.isSafeInteger(numberValue) ? numberValue : null;
+}
+
+async function withTimeout(promise, timeoutMs, description) {
+  let timeoutId;
+  const timeout = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
+      reject(new Error(`${description} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
 
