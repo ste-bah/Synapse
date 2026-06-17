@@ -13,7 +13,7 @@
 //! `chrome.tabs` active-element readback. Fail-loud on every divergence; never an
 //! optimistic success and never a foreground fallback.
 
-use super::{ErrorData, Json, Parameters, SynapseService, SessionTarget, tool, tool_router};
+use super::{ErrorData, Json, Parameters, SessionTarget, SynapseService, tool, tool_router};
 use crate::m1::mcp_error;
 use crate::m2::postcondition::text_signature;
 use rmcp::schemars::JsonSchema;
@@ -136,7 +136,13 @@ impl SynapseService {
         });
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
-            .browser_set_value_run(&session_id, window_hwnd, &cdp_target_id, &locator, &params.text)
+            .browser_set_value_run(
+                &session_id,
+                window_hwnd,
+                &cdp_target_id,
+                &locator,
+                &params.text,
+            )
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)

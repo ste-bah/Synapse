@@ -12,7 +12,7 @@
 //! human foreground, which the delegate refuses before any mutation.
 
 use super::browser_field::BrowserSetValueParams;
-use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
+use super::{ErrorData, Json, Parameters, SessionTarget, SynapseService, tool, tool_router};
 use crate::m1::{
     CaptureScreenshotParams, CdpNavigateAction, CdpNavigateTabParams, ObserveParams, mcp_error,
 };
@@ -30,7 +30,8 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, click, run_shell";
+const TARGET_ACT_KNOWN_VERBS: &str =
+    "read, screenshot, navigate, set_field, click, press, select, submit, run_shell";
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -64,20 +65,37 @@ pub struct TargetActParams {
     #[serde(default)]
     pub path: Option<String>,
     /// `set_field`: target element id (from observe/find), for the UIA/CDP-id
-    /// background tiers. Mutually exclusive with `selector`.
+    /// background tiers. `click` can also use this as an observed element id;
+    /// DOM actions treat it as a page element id.
     #[serde(default)]
     pub element_id: Option<String>,
-    /// `set_field`: strict CSS selector for the field, routed to the safe
-    /// normal-Chrome bridge (background, no foreground, no debugger). Takes
-    /// precedence over `element_id` when both are present.
+    /// `set_field` / browser DOM action: strict CSS selector routed to the safe
+    /// normal-Chrome bridge (background, no foreground, no debugger).
     #[serde(default)]
     pub selector: Option<String>,
     /// `set_field`: full replacement text (empty clears the field).
     #[serde(default)]
     pub text: Option<String>,
+    /// Browser DOM action: accessible/ARIA role to resolve.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Browser DOM action: accessible name to resolve.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Browser DOM action: value match. For `select`, this is the option value
+    /// when `option` is omitted.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// `select`: option text or option value.
+    #[serde(default)]
+    pub option: Option<String>,
     /// `click`: click count for target element clicks. Defaults to 1; valid range is 1..=3.
     #[serde(default)]
     pub clicks: Option<u8>,
+    /// Browser DOM action readback wait budget (ms). Defaults to the browser
+    /// bridge command budget and is capped by the daemon command timeout.
+    #[serde(default)]
+    pub wait_timeout_ms: Option<u64>,
     /// `run_shell`: executable/program name (arguments go in `args`).
     #[serde(default)]
     pub command: Option<String>,
@@ -110,7 +128,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level background-first computer-use router (#1005/#1033). One verb, routed to the correct background-capable, session-targeted primitive — never the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text — by element id via background tiers, or by CSS `selector` routed to the safe normal-Chrome bridge (background, no foreground, no debugger) which is the right path for a web form perceived UIA-only; verb=click clicks a target element by semantic/background tiers with verify_delta enabled; verb=run_shell runs a command in the session workspace. Prefer this over raw act_* primitives: it inherits each delegate's target resolution, action audit, and lease/foreground guards, so a normal (leaseless) session can drive a background target but cannot seize the human foreground (the delegate fails closed before input). Mutating delegated failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list)."
+        description = "High-level background-first computer-use router (#1005/#1033/#1207). One verb, routed to the correct background-capable, session-targeted primitive — never the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via background tiers or by CSS selector through the safe normal-Chrome bridge; verb=click clicks a target element by observed element_id or, with selector/role/name, by target-tab DOM action; verb=press presses a named button/link in the session-owned tab; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=run_shell runs a command in the session workspace. Prefer this over raw act_* primitives: it inherits target resolution, action audit, and lease/foreground guards, so a normal (leaseless) session can drive a background target but cannot seize the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -220,19 +238,32 @@ impl SynapseService {
                 }
             }
             "click" => {
-                let element_id = require_param(params.element_id, "click", "element_id")?;
-                let element_id = ElementId::parse(&element_id).map_err(|error| {
-                    mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
-                        format!("target_act verb=click element_id is invalid: {error}"),
-                    )
-                })?;
-                let clicks = target_act_click_count(params.clicks)?;
-                let click_params = target_act_click_params(element_id, clicks)?;
-                let response = self
-                    .act_click(Parameters(click_params), request_context)
-                    .await;
-                target_act_delegate_response("act_click", response)?
+                if target_act_has_dom_locator(&params) {
+                    target_act_browser_dom_action(self, "click", &params, &request_context).await?
+                } else {
+                    let element_id =
+                        require_param(params.element_id.clone(), "click", "element_id")?;
+                    if let Some(element_id) = target_act_legacy_click_element_id(&element_id)? {
+                        let clicks = target_act_click_count(params.clicks)?;
+                        let click_params = target_act_click_params(element_id, clicks)?;
+                        let response = self
+                            .act_click(Parameters(click_params), request_context)
+                            .await;
+                        target_act_delegate_response("act_click", response)?
+                    } else {
+                        target_act_browser_dom_action(self, "click", &params, &request_context)
+                            .await?
+                    }
+                }
+            }
+            "press" => {
+                target_act_browser_dom_action(self, "press", &params, &request_context).await?
+            }
+            "select" => {
+                target_act_browser_dom_action(self, "select", &params, &request_context).await?
+            }
+            "submit" => {
+                target_act_browser_dom_action(self, "submit", &params, &request_context).await?
             }
             "run_shell" => {
                 let command = require_param(params.command, "run_shell", "command")?;
@@ -273,6 +304,233 @@ impl SynapseService {
         }))
     }
 }
+
+async fn target_act_browser_dom_action(
+    service: &SynapseService,
+    action: &'static str,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let session_id = super::context::mcp_session_id_from_request_context(request_context)?
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "target_act browser DOM actions require an MCP session id",
+            )
+        })?;
+    target_act_validate_dom_locator(action, params)?;
+    let wait_timeout_ms = target_act_dom_wait_timeout(params.wait_timeout_ms)?;
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": action,
+        "selector_present": params.selector.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "element_id_present": params.element_id.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "role": params.role.as_deref(),
+        "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "value_present": params.value.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "option_present": params.option.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "clicks": params.clicks,
+        "wait_timeout_ms": wait_timeout_ms,
+        "required_foreground": false,
+    });
+    let (window_hwnd, cdp_target_id) = match service.audit_cdp_target_resolution_result(
+        "target_act",
+        &session_id,
+        &request_details,
+        service.resolve_cdp_tab_mutation_target("target_act", &session_id, None, None),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Ok((
+                "chrome_debugger_bridge.domAction",
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("target_act", error),
+            ));
+        }
+    };
+    let target = SessionTarget::Cdp {
+        window_hwnd,
+        cdp_target_id: cdp_target_id.clone(),
+    };
+    if let Err(error) =
+        service.ensure_target_claim_allows_session("target_act", &session_id, &target)
+    {
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "chrome_debugger_bridge.domAction",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    }
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": action,
+        "window_hwnd": window_hwnd,
+        "cdp_target_id": &cdp_target_id,
+        "selector_present": params.selector.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "element_id_present": params.element_id.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "role": params.role.as_deref(),
+        "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "value_present": params.value.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "option_present": params.option.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "clicks": params.clicks,
+        "wait_timeout_ms": wait_timeout_ms,
+        "required_foreground": false,
+    });
+    service.audit_action_started_with_details_for_session(
+        "target_act",
+        &request_details,
+        &session_id,
+    )?;
+    let result = crate::chrome_debugger_bridge::dom_action(
+        crate::chrome_debugger_bridge::ChromeDebuggerDomActionRequest {
+            hwnd: window_hwnd,
+            target_id: &cdp_target_id,
+            action,
+            selector: params.selector.as_deref(),
+            element_id: params.element_id.as_deref(),
+            role: params.role.as_deref(),
+            name: params.name.as_deref(),
+            value: params.value.as_deref(),
+            option: params.option.as_deref(),
+            clicks: params.clicks,
+            wait_timeout_ms,
+        },
+    )
+    .await
+    .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
+    service.audit_action_result_for_session("target_act", &result, &session_id)?;
+    match result {
+        Ok(value) => Ok((
+            "chrome_debugger_bridge.domAction",
+            true,
+            TARGET_ACT_STATUS_OK,
+            value,
+        )),
+        Err(error) => Ok((
+            "chrome_debugger_bridge.domAction",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("chrome_debugger_bridge.domAction", error),
+        )),
+    }
+}
+
+fn target_act_has_dom_locator(params: &TargetActParams) -> bool {
+    params
+        .selector
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .role
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .name
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .value
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .option
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn target_act_legacy_click_element_id(value: &str) -> Result<Option<ElementId>, ErrorData> {
+    match ElementId::parse(value) {
+        Ok(element_id) => Ok(Some(element_id)),
+        Err(_) if target_act_click_element_id_can_be_dom_id(value) => Ok(None),
+        Err(error) => Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb=click element_id is invalid: {error}"),
+        )),
+    }
+}
+
+fn target_act_click_element_id_can_be_dom_id(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && !value.starts_with("0x")
+        && !value.starts_with("-0x")
+        && !value.contains(':')
+}
+
+fn target_act_validate_dom_locator(
+    action: &str,
+    params: &TargetActParams,
+) -> Result<(), ErrorData> {
+    let has_element_id = params
+        .element_id
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_selector = params
+        .selector
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_semantic = params
+        .role
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .name
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .value
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty());
+    if !(has_element_id || has_selector || has_semantic) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb={action} requires element_id, selector, or a semantic locator (role/name/value)"
+            ),
+        ));
+    }
+    if action == "select"
+        && !params
+            .option
+            .as_ref()
+            .or(params.value.as_ref())
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=select requires option or value",
+        ));
+    }
+    if matches!(action, "click" | "press") {
+        let _ = target_act_click_count(params.clicks)?;
+    }
+    Ok(())
+}
+
+fn target_act_dom_wait_timeout(value: Option<u64>) -> Result<u64, ErrorData> {
+    let wait_timeout_ms = value.unwrap_or(default_verify_timeout_ms().into());
+    if wait_timeout_ms == 0 || wait_timeout_ms > 30_000 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act DOM wait_timeout_ms must be 1..=30000, got {wait_timeout_ms}"),
+        ));
+    }
+    Ok(wait_timeout_ms)
+}
+
+/*
+ * Legacy element-id click helpers below are kept for observed native/UIA/OCR
+ * element ids. Browser DOM selector/name/role actions route through the normal
+ * Chrome bridge instead.
+ */
 
 fn require_param(value: Option<String>, verb: &str, field: &str) -> Result<String, ErrorData> {
     value.filter(|value| !value.is_empty()).ok_or_else(|| {
@@ -370,6 +628,7 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
             error_codes::ACTION_NO_OBSERVED_DELTA
             | error_codes::ACTION_FOREGROUND_LOST
             | error_codes::ACTION_POSTCONDITION_FAILED
+            | error_codes::CHROME_DOM_ACTION_POSTCONDITION_FAILED
             | error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE,
         ) => TARGET_ACT_STATUS_VERIFY_NEEDED,
         Some(
@@ -380,6 +639,11 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
             | error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD
             | error_codes::ACTION_TARGET_INVALID
             | error_codes::A11Y_ELEMENT_STALE
+            | error_codes::CHROME_DOM_ACTION_UNSUPPORTED
+            | error_codes::CHROME_DOM_ELEMENT_AMBIGUOUS
+            | error_codes::CHROME_DOM_ELEMENT_NOT_ACTIONABLE
+            | error_codes::CHROME_DOM_ELEMENT_NOT_FOUND
+            | error_codes::CHROME_DOM_SELECTOR_INVALID
             | error_codes::FOREGROUND_ACTIVATION_REFUSED
             | error_codes::TARGET_CO_OWNED
             | error_codes::TARGET_WINDOW_NOT_FOUND
@@ -477,6 +741,109 @@ mod tests {
         assert_eq!(
             target_act_error_code(&error),
             Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+
+    #[test]
+    fn target_act_dom_verbs_deserialize_and_validate() {
+        let press: TargetActParams = serde_json::from_value(json!({
+            "verb": "press",
+            "role": "button",
+            "name": "Create token"
+        }))
+        .expect("press params should deserialize");
+        assert_eq!(press.verb.as_str(), "press");
+        target_act_validate_dom_locator("press", &press).expect("press locator should validate");
+
+        let select: TargetActParams = serde_json::from_value(json!({
+            "verb": "select",
+            "selector": "#scope",
+            "option": "Workers KV Storage"
+        }))
+        .expect("select params should deserialize");
+        assert_eq!(select.verb.as_str(), "select");
+        target_act_validate_dom_locator("select", &select).expect("select locator should validate");
+
+        let submit: TargetActParams = serde_json::from_value(json!({
+            "verb": "submit",
+            "selector": "form#token"
+        }))
+        .expect("submit params should deserialize");
+        assert_eq!(submit.verb.as_str(), "submit");
+        target_act_validate_dom_locator("submit", &submit).expect("submit locator should validate");
+    }
+
+    #[test]
+    fn target_act_select_requires_option_or_value() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "select",
+            "selector": "#scope"
+        }))
+        .expect("synthetic select params should deserialize");
+        let error = target_act_validate_dom_locator("select", &params)
+            .expect_err("select must require an option/value");
+
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+
+    #[test]
+    fn target_act_click_plain_element_id_routes_to_dom() {
+        let routed = target_act_legacy_click_element_id("create-token-button")
+            .expect("plain page id should be accepted as DOM id");
+
+        assert!(
+            routed.is_none(),
+            "plain page element ids should route through the browser DOM bridge"
+        );
+    }
+
+    #[test]
+    fn target_act_click_native_shaped_element_id_stays_legacy() {
+        let routed = target_act_legacy_click_element_id("0x2a:0000000000000001")
+            .expect("valid native/UIA id should parse");
+
+        assert_eq!(
+            routed
+                .expect("native/UIA id should stay on legacy click path")
+                .as_str(),
+            "0x2a:0000000000000001"
+        );
+    }
+
+    #[test]
+    fn target_act_click_malformed_native_id_fails_closed() {
+        let error = target_act_legacy_click_element_id("0xnotvalid:bad")
+            .expect_err("malformed native-looking id should not fall back to DOM");
+
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+
+    #[test]
+    fn target_act_dom_error_codes_classify() {
+        for code in [
+            error_codes::CHROME_DOM_ACTION_UNSUPPORTED,
+            error_codes::CHROME_DOM_ELEMENT_AMBIGUOUS,
+            error_codes::CHROME_DOM_ELEMENT_NOT_ACTIONABLE,
+            error_codes::CHROME_DOM_ELEMENT_NOT_FOUND,
+            error_codes::CHROME_DOM_SELECTOR_INVALID,
+        ] {
+            let error = mcp_error(code, "synthetic DOM refusal");
+            assert_eq!(target_act_error_status(&error), TARGET_ACT_STATUS_REFUSED);
+        }
+
+        let postcondition = mcp_error(
+            error_codes::CHROME_DOM_ACTION_POSTCONDITION_FAILED,
+            "synthetic DOM readback mismatch",
+        );
+        assert_eq!(
+            target_act_error_status(&postcondition),
+            TARGET_ACT_STATUS_VERIFY_NEEDED
         );
     }
 

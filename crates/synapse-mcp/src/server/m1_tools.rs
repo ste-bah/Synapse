@@ -1,17 +1,17 @@
 use super::{
     BrowserContentParams, BrowserContentResponse, BrowserEvaluateParams, BrowserEvaluateResponse,
     BrowserInspectParams, BrowserInspectResponse, BrowserLayoutRelation, BrowserLocateEngine,
-    BrowserLocateParams, BrowserLocateResponse, CaptureScreenshotFormat, ElementInspection,
-    CaptureScreenshotParams, CaptureScreenshotResponse,
-    CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
-    CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
-    CdpCloseTabResponse, CdpNavigateAction, CdpNavigateTabParams, CdpNavigateTabResponse,
-    CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo, CdpTargetInfoParams,
-    CdpTargetInfoResponse, CdpTargetOwner, ErrorData, FindParams, FindResponse, Health,
-    HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json,
-    ObserveParams, Parameters, ReadTextParams, SessionTarget, SetCaptureTargetParams,
-    SetCaptureTargetResponse, SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam,
-    SetTargetParams, SynapseService, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
+    BrowserLocateParams, BrowserLocateResponse, CaptureScreenshotFormat, CaptureScreenshotParams,
+    CaptureScreenshotResponse, CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo,
+    CdpBridgeHostReadback, CdpBridgeReloadAckReadback, CdpBridgeReloadParams,
+    CdpBridgeReloadResponse, CdpCloseTabParams, CdpCloseTabResponse, CdpNavigateAction,
+    CdpNavigateTabParams, CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse,
+    CdpPageTextInfo, CdpTargetInfoParams, CdpTargetInfoResponse, CdpTargetOwner, ElementInspection,
+    ErrorData, FindParams, FindResponse, Health, HiddenDesktopPipFrameParams,
+    HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters,
+    ReadTextParams, SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse,
+    SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
+    SynapseService, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
     WindowListResponse, empty_input_schema, mcp_error, observe_include, observe_input,
     populate_audio_summary, populate_clipboard_summary, populate_detection_from_state,
     populate_fs_recent, read_text_request_uncached, resolve_read_text_request,
@@ -2075,7 +2075,7 @@ impl SynapseService {
     /// the human foreground tab: requires either the active CDP session target
     /// or an explicit target id owned by this MCP session. Shared by
     /// cdp_navigate_tab and cdp_activate_tab.
-    fn resolve_cdp_tab_mutation_target(
+    pub(super) fn resolve_cdp_tab_mutation_target(
         &self,
         tool: &str,
         session_id: &str,
@@ -2255,7 +2255,7 @@ impl SynapseService {
         .map(|(_key, owner)| Some(owner))
     }
 
-    fn audit_cdp_target_resolution_result(
+    pub(super) fn audit_cdp_target_resolution_result(
         &self,
         tool: &'static str,
         session_id: &str,
@@ -2804,7 +2804,9 @@ impl SynapseService {
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("browser_evaluate raw CDP Runtime.evaluate (with args) failed: {error}"),
+                    format!(
+                        "browser_evaluate raw CDP Runtime.evaluate (with args) failed: {error}"
+                    ),
                 )
             })?;
             (evaluated, "page", "Runtime.evaluate")
@@ -2878,7 +2880,10 @@ impl SynapseService {
         max_bytes: usize,
     ) -> Result<BrowserContentResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-            return Err(browser_raw_cdp_required_error("browser_content", window_hwnd));
+            return Err(browser_raw_cdp_required_error(
+                "browser_content",
+                window_hwnd,
+            ));
         };
         let expression = format!(
             r#"(() => {{
@@ -2964,7 +2969,10 @@ impl SynapseService {
         max_html_bytes: usize,
     ) -> Result<BrowserInspectResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-            return Err(browser_raw_cdp_required_error("browser_inspect", window_hwnd));
+            return Err(browser_raw_cdp_required_error(
+                "browser_inspect",
+                window_hwnd,
+            ));
         };
         let evaluated = synapse_a11y::cdp_evaluate_on_element(
             &endpoint,
@@ -3048,7 +3056,10 @@ impl SynapseService {
         limit: usize,
     ) -> Result<BrowserLocateResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-            return Err(browser_raw_cdp_required_error("browser_locate", window_hwnd));
+            return Err(browser_raw_cdp_required_error(
+                "browser_locate",
+                window_hwnd,
+            ));
         };
         let engine = browser_locate_engine_to_a11y(params.engine);
         let request = synapse_a11y::CdpLocateRequest {
@@ -6104,7 +6115,10 @@ mod tests {
             (BrowserLocateEngine::Text, CdpLocateEngine::Text),
             (BrowserLocateEngine::Role, CdpLocateEngine::Role),
             (BrowserLocateEngine::Label, CdpLocateEngine::Label),
-            (BrowserLocateEngine::Placeholder, CdpLocateEngine::Placeholder),
+            (
+                BrowserLocateEngine::Placeholder,
+                CdpLocateEngine::Placeholder,
+            ),
             (BrowserLocateEngine::AltText, CdpLocateEngine::AltText),
             (BrowserLocateEngine::Title, CdpLocateEngine::Title),
             (BrowserLocateEngine::TestId, CdpLocateEngine::TestId),
@@ -6184,7 +6198,9 @@ mod tests {
             .and_then(|data| data.get("code"))
             .and_then(serde_json::Value::as_str);
         assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
-        println!("readback=browser_evaluate validation edges all rejected with TOOL_PARAMS_INVALID");
+        println!(
+            "readback=browser_evaluate validation edges all rejected with TOOL_PARAMS_INVALID"
+        );
     }
 
     #[test]

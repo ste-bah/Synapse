@@ -1375,8 +1375,7 @@ async fn locate_via_injected_js(
         let spec_json = serde_json::to_string(&spec).map_err(|err| A11yError::CdpAxtreeFailed {
             detail: format!("locate spec serialize: {err}"),
         })?;
-        let expression =
-            String::from("(") + SYNAPSE_LOCATE_JS + ")(document, " + &spec_json + ")";
+        let expression = String::from("(") + SYNAPSE_LOCATE_JS + ")(document, " + &spec_json + ")";
         let params = EvaluateParams::builder()
             .expression(expression)
             .object_group(SYNAPSE_LOCATE_OBJECT_GROUP)
@@ -1441,8 +1440,10 @@ async fn locate_via_injected_js(
                     .unwrap_or(0);
             }
             "elements" => {
-                elements_object_id =
-                    prop.value.as_ref().and_then(|value| value.object_id.clone());
+                elements_object_id = prop
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.object_id.clone());
             }
             _ => {}
         }
@@ -1471,7 +1472,11 @@ async fn locate_via_injected_js(
             let Ok(index) = prop.name.parse::<usize>() else {
                 continue;
             };
-            if let Some(object_id) = prop.value.as_ref().and_then(|value| value.object_id.clone()) {
+            if let Some(object_id) = prop
+                .value
+                .as_ref()
+                .and_then(|value| value.object_id.clone())
+            {
                 indexed.push((index, object_id));
             }
         }
@@ -1528,10 +1533,7 @@ async fn locate_role(
         .execute(builder.build())
         .await
         .map_err(|err| A11yError::CdpAxtreeFailed {
-            detail: format!(
-                "Accessibility.queryAXTree(role={:?}): {err}",
-                request.query
-            ),
+            detail: format!("Accessibility.queryAXTree(role={:?}): {err}", request.query),
         })?
         .result
         .nodes;
@@ -3410,8 +3412,14 @@ mod tests {
         assert_eq!(apply_nth_and_limit(ids.clone(), Some(-1), 50), vec![40]);
         assert_eq!(apply_nth_and_limit(ids.clone(), Some(-2), 50), vec![30]);
         // Out-of-range nth resolves to empty rather than panicking.
-        assert_eq!(apply_nth_and_limit(ids.clone(), Some(9), 50), Vec::<i64>::new());
-        assert_eq!(apply_nth_and_limit(ids.clone(), Some(-9), 50), Vec::<i64>::new());
+        assert_eq!(
+            apply_nth_and_limit(ids.clone(), Some(9), 50),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            apply_nth_and_limit(ids.clone(), Some(-9), 50),
+            Vec::<i64>::new()
+        );
         // No nth: cap by limit, preserve order.
         assert_eq!(apply_nth_and_limit(ids.clone(), None, 2), vec![10, 20]);
         assert_eq!(apply_nth_and_limit(ids, None, 50).len(), 4);
@@ -3470,6 +3478,9 @@ mod tests {
         assert_eq!(opens, closes, "unbalanced braces in injected engine");
         assert_eq!(popen, pclose, "unbalanced parens in injected engine");
         assert!(SYNAPSE_LOCATE_JS.starts_with("function(scope, spec)"));
-        assert!(!SYNAPSE_LOCATE_JS.contains('"'), "engine must use single quotes");
+        assert!(
+            !SYNAPSE_LOCATE_JS.contains('"'),
+            "engine must use single quotes"
+        );
     }
 }

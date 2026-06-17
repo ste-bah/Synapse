@@ -39,11 +39,12 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-17-set-field-value-v1";
+    "synapse-chrome-bridge-2026-06-17-dom-action-set-field-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "aa134c36b51b7a02ebcf4c94523e8034c85aa958776aa12e7815edd7d5e68540";
+    "73214efb5b05ab9caf0df44f8c3decb43833f9a45248f15b69413b5dac6e3ee7";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "closeTab",
+    "domAction",
     "navigateTab",
     "openTab",
     "reloadSelf",
@@ -168,6 +169,27 @@ impl ChromeDebuggerBridgeError {
             }
             Some(error_codes::A11Y_CDP_AXTREE_FAILED) => error_codes::A11Y_CDP_AXTREE_FAILED,
             Some(error_codes::A11Y_CDP_ATTACH_FAILED) => error_codes::A11Y_CDP_ATTACH_FAILED,
+            Some(error_codes::CHROME_SCRIPTING_EXECUTE_FAILED) => {
+                error_codes::CHROME_SCRIPTING_EXECUTE_FAILED
+            }
+            Some(error_codes::CHROME_DOM_SELECTOR_INVALID) => {
+                error_codes::CHROME_DOM_SELECTOR_INVALID
+            }
+            Some(error_codes::CHROME_DOM_ELEMENT_NOT_FOUND) => {
+                error_codes::CHROME_DOM_ELEMENT_NOT_FOUND
+            }
+            Some(error_codes::CHROME_DOM_ELEMENT_AMBIGUOUS) => {
+                error_codes::CHROME_DOM_ELEMENT_AMBIGUOUS
+            }
+            Some(error_codes::CHROME_DOM_ELEMENT_NOT_ACTIONABLE) => {
+                error_codes::CHROME_DOM_ELEMENT_NOT_ACTIONABLE
+            }
+            Some(error_codes::CHROME_DOM_ACTION_UNSUPPORTED) => {
+                error_codes::CHROME_DOM_ACTION_UNSUPPORTED
+            }
+            Some(error_codes::CHROME_DOM_ACTION_POSTCONDITION_FAILED) => {
+                error_codes::CHROME_DOM_ACTION_POSTCONDITION_FAILED
+            }
             _ => error_codes::A11Y_CDP_ATTACH_FAILED,
         };
         Self {
@@ -2308,6 +2330,44 @@ pub(crate) async fn activate_tab(
     })
 }
 
+pub(crate) struct ChromeDebuggerDomActionRequest<'a> {
+    pub hwnd: i64,
+    pub target_id: &'a str,
+    pub action: &'a str,
+    pub selector: Option<&'a str>,
+    pub element_id: Option<&'a str>,
+    pub role: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub value: Option<&'a str>,
+    pub option: Option<&'a str>,
+    pub clicks: Option<u8>,
+    pub wait_timeout_ms: u64,
+}
+
+pub(crate) async fn dom_action(
+    request: ChromeDebuggerDomActionRequest<'_>,
+) -> Result<Value, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_popup_safe(request.hwnd, "domAction")?;
+    bridge()
+        .send_command(
+            "domAction",
+            json!({
+                "hwnd": request.hwnd,
+                "targetIdHint": request.target_id,
+                "action": request.action,
+                "selector": request.selector,
+                "elementId": request.element_id,
+                "role": request.role,
+                "name": request.name,
+                "value": request.value,
+                "option": request.option,
+                "clicks": request.clicks,
+                "waitTimeoutMs": request.wait_timeout_ms,
+            }),
+        )
+        .await
+}
+
 pub(crate) fn validate_reload_wait_timeout(
     value: Option<u64>,
 ) -> Result<u64, ChromeDebuggerBridgeError> {
@@ -3139,6 +3199,23 @@ mod tests {
         assert!(is_unknown_native_host_detail(detail));
         assert!(is_unknown_native_host_error(&error));
         assert!(!is_unknown_native_host_detail("bridge protocol mismatch"));
+    }
+
+    #[test]
+    fn extension_error_preserves_dom_action_codes() {
+        for code in [
+            error_codes::CHROME_SCRIPTING_EXECUTE_FAILED,
+            error_codes::CHROME_DOM_SELECTOR_INVALID,
+            error_codes::CHROME_DOM_ELEMENT_NOT_FOUND,
+            error_codes::CHROME_DOM_ELEMENT_AMBIGUOUS,
+            error_codes::CHROME_DOM_ELEMENT_NOT_ACTIONABLE,
+            error_codes::CHROME_DOM_ACTION_UNSUPPORTED,
+            error_codes::CHROME_DOM_ACTION_POSTCONDITION_FAILED,
+        ] {
+            let error = ChromeDebuggerBridgeError::extension(Some(code), "dom action failed");
+            assert_eq!(error.code(), code);
+            assert_eq!(error.detail(), "dom action failed");
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-set-field-value-v1";
-const BRIDGE_BUILD_SHA256 = "aa134c36b51b7a02ebcf4c94523e8034c85aa958776aa12e7815edd7d5e68540";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-dom-action-set-field-v1";
+const BRIDGE_BUILD_SHA256 = "73214efb5b05ab9caf0df44f8c3decb43833f9a45248f15b69413b5dac6e3ee7";
 const COMMAND_CAPABILITIES = Object.freeze([
   "openTab",
   "closeTab",
@@ -8,6 +8,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "targetInfoPageText",
   "navigateTab",
   "activateTab",
+  "domAction",
   "reloadSelf",
   "typeActiveElement",
   "setFieldValue"
@@ -21,6 +22,13 @@ const ERROR_EXTENSION_TIMEOUT = "A11Y_CDP_EXTENSION_TIMEOUT";
 const ERROR_EXTENSION_STALE = "CHROME_BRIDGE_EXTENSION_STALE";
 const ERROR_EXTENSION_ID_MISMATCH = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
 const ERROR_DAEMON_UNAVAILABLE = "SYNAPSE_CHROME_DAEMON_UNAVAILABLE";
+const ERROR_CHROME_SCRIPTING_EXECUTE_FAILED = "CHROME_SCRIPTING_EXECUTE_FAILED";
+const ERROR_CHROME_DOM_SELECTOR_INVALID = "CHROME_DOM_SELECTOR_INVALID";
+const ERROR_CHROME_DOM_ELEMENT_NOT_FOUND = "CHROME_DOM_ELEMENT_NOT_FOUND";
+const ERROR_CHROME_DOM_ELEMENT_AMBIGUOUS = "CHROME_DOM_ELEMENT_AMBIGUOUS";
+const ERROR_CHROME_DOM_ELEMENT_NOT_ACTIONABLE = "CHROME_DOM_ELEMENT_NOT_ACTIONABLE";
+const ERROR_CHROME_DOM_ACTION_UNSUPPORTED = "CHROME_DOM_ACTION_UNSUPPORTED";
+const ERROR_CHROME_DOM_ACTION_POSTCONDITION_FAILED = "CHROME_DOM_ACTION_POSTCONDITION_FAILED";
 const TAB_TARGET_PREFIX = "chrome-tab:";
 const BRIDGE_TOKEN_HEADER = "X-Synapse-Bridge-Token";
 const DAEMON_WS_BASE_URL = "ws://127.0.0.1:7700";
@@ -359,6 +367,8 @@ async function handleCommand(command) {
       result = await handleNavigateTab(params);
     } else if (kind === "activateTab") {
       result = await handleActivateTab(params);
+    } else if (kind === "domAction") {
+      result = await handleDomAction(params);
     } else if (kind === "reloadSelf") {
       result = handleReloadSelf(params);
       reloadAfterResponse = true;
@@ -649,6 +659,78 @@ async function handleActivateTab(params) {
     readback_backend: "chrome.tabs.get",
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
+  };
+}
+
+async function handleDomAction(params) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const action = normalizeDomAction(params.action);
+  const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+
+  const before = await tabPageState(selected.tabId, selected.target);
+  const beforePageText = await tabPageTextState(selected.tabId);
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId: selected.tabId },
+      func: performDomActionInPage,
+      args: [{
+        action,
+        selector: stringOrNull(params.selector),
+        elementId: stringOrNull(params.elementId),
+        role: stringOrNull(params.role),
+        name: stringOrNull(params.name),
+        value: stringOrNull(params.value),
+        option: stringOrNull(params.option),
+        clicks: normalizeClickCount(params.clicks),
+        maxPageTextChars: MAX_PAGE_TEXT_CHARS
+      }]
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript domAction(${selected.tabId}, ${action}) failed: ${errorMessage(error)}`
+    );
+  }
+
+  const first = Array.isArray(injected) ? injected[0] : null;
+  const actionResult = first?.result;
+  if (!actionResult || typeof actionResult !== "object") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript domAction returned no structured result"
+    );
+  }
+  if (!actionResult.ok) {
+    throw bridgeError(
+      String(actionResult.error_code || ERROR_AXTREE_FAILED),
+      `domAction ${action} failed: ${String(actionResult.error_detail || "")}`
+    );
+  }
+
+  const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
+  const afterPageText = await tabPageTextState(selected.tabId);
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: after.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: after.chrome_window_id,
+    action,
+    before_page: before,
+    after_page: after,
+    before_page_text: beforePageText,
+    after_page_text: afterPageText,
+    readback_backend: "chrome.scripting.executeScript+chrome.tabs.get",
+    required_foreground: false,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason,
+    ...actionResult
   };
 }
 
@@ -1419,6 +1501,510 @@ function setFieldValueInPage(request) {
     after_value: afterValue,
     expected_value: expected
   };
+}
+
+function normalizeDomAction(action) {
+  const normalized = String(action || "").trim().toLowerCase();
+  if (["click", "press", "select", "submit"].includes(normalized)) {
+    return normalized;
+  }
+  throw bridgeError(
+    ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+    `domAction action must be one of click, press, select, submit; got ${JSON.stringify(action)}`
+  );
+}
+
+function stringOrNull(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function normalizeClickCount(value) {
+  if (value === null || value === undefined) {
+    return 1;
+  }
+  const clicks = Number(value);
+  if (!Number.isSafeInteger(clicks) || clicks < 1 || clicks > 3) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `domAction clicks must be an integer in 1..=3; got ${JSON.stringify(value)}`
+    );
+  }
+  return clicks;
+}
+
+function performDomActionInPage(request) {
+  const ERROR_SELECTOR_INVALID = "CHROME_DOM_SELECTOR_INVALID";
+  const ERROR_ELEMENT_NOT_FOUND = "CHROME_DOM_ELEMENT_NOT_FOUND";
+  const ERROR_ELEMENT_AMBIGUOUS = "CHROME_DOM_ELEMENT_AMBIGUOUS";
+  const ERROR_ELEMENT_NOT_ACTIONABLE = "CHROME_DOM_ELEMENT_NOT_ACTIONABLE";
+  const ERROR_ACTION_UNSUPPORTED = "CHROME_DOM_ACTION_UNSUPPORTED";
+  const ERROR_POSTCONDITION_FAILED = "CHROME_DOM_ACTION_POSTCONDITION_FAILED";
+
+  const action = String(request?.action || "").trim().toLowerCase();
+  const locator = {
+    selector: stringOrEmpty(request?.selector),
+    elementId: stringOrEmpty(request?.elementId),
+    role: normalizeText(request?.role),
+    name: normalizeText(request?.name),
+    value: stringOrEmpty(request?.value),
+    option: stringOrEmpty(request?.option)
+  };
+  const clicks = Number.isSafeInteger(request?.clicks) ? request.clicks : 1;
+  const maxPageTextChars = Number.isSafeInteger(request?.maxPageTextChars)
+    ? Math.min(Math.max(request.maxPageTextChars, 0), 65536)
+    : 4096;
+
+  if (!["click", "press", "select", "submit"].includes(action)) {
+    return fail(ERROR_ACTION_UNSUPPORTED, `unsupported DOM action ${JSON.stringify(action)}`);
+  }
+
+  const beforeUrl = String(location.href || "");
+  const beforePageText = readPageText(maxPageTextChars);
+  const resolved = resolveDomActionElement(action, locator);
+  if (!resolved.ok) {
+    return resolved;
+  }
+  const element = resolved.element;
+  const beforeElement = elementSummary(element);
+
+  if (!isElementEnabled(element)) {
+    return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is disabled or aria-disabled", {
+      matched_count: resolved.matchedCount,
+      resolved_by: resolved.resolvedBy,
+      before_element: beforeElement
+    });
+  }
+  if (!isElementVisible(element) && action !== "submit") {
+    return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is not visible/actionable", {
+      matched_count: resolved.matchedCount,
+      resolved_by: resolved.resolvedBy,
+      before_element: beforeElement
+    });
+  }
+
+  const eventsDispatched = [];
+  let actionReadback = {};
+  try {
+    if (action === "click" || action === "press") {
+      actionReadback = performClick(element, clicks, eventsDispatched);
+    } else if (action === "select") {
+      actionReadback = performNativeSelect(element, locator.option || locator.value, eventsDispatched);
+    } else if (action === "submit") {
+      actionReadback = performSubmit(element, eventsDispatched);
+    }
+  } catch (error) {
+    return fail(error?.code || ERROR_ACTION_UNSUPPORTED, errorMessageLocal(error), {
+      matched_count: resolved.matchedCount,
+      resolved_by: resolved.resolvedBy,
+      before_element: beforeElement,
+      events_dispatched: eventsDispatched
+    });
+  }
+
+  const afterElement = element.isConnected ? elementSummary(element) : null;
+  const afterPageText = readPageText(maxPageTextChars);
+  return {
+    ok: true,
+    action,
+    matched_count: resolved.matchedCount,
+    resolved_by: resolved.resolvedBy,
+    before_element: beforeElement,
+    after_element: afterElement,
+    events_dispatched: eventsDispatched,
+    action_readback: actionReadback,
+    in_page_before_url: beforeUrl,
+    in_page_after_url: String(location.href || ""),
+    in_page_title: String(document.title || ""),
+    in_page_ready_state: String(document.readyState || ""),
+    in_page_before_text: beforePageText,
+    in_page_after_text: afterPageText
+  };
+
+  function resolveDomActionElement(actionName, loc) {
+    let candidates = [];
+    let resolvedBy = "semantic";
+    if (loc.selector) {
+      resolvedBy = "selector";
+      try {
+        candidates = Array.from(document.querySelectorAll(loc.selector));
+      } catch (error) {
+        return fail(ERROR_SELECTOR_INVALID, `invalid selector ${JSON.stringify(loc.selector)}: ${errorMessageLocal(error)}`);
+      }
+    } else if (loc.elementId) {
+      resolvedBy = "element_id";
+      const id = loc.elementId.startsWith("#") ? loc.elementId.slice(1) : loc.elementId;
+      const byId = id ? document.getElementById(id) : null;
+      candidates = byId ? [byId] : [];
+    } else {
+      candidates = semanticCandidates(actionName);
+    }
+
+    const filtered = candidates.filter((candidate) => {
+      if (!(candidate instanceof Element)) {
+        return false;
+      }
+      if (loc.role && normalizeText(inferRole(candidate)) !== loc.role) {
+        return false;
+      }
+      if (loc.name && !textMatches(accessibleName(candidate), loc.name)) {
+        return false;
+      }
+      if (loc.value && actionName !== "select" && !valueMatches(candidate, loc.value)) {
+        return false;
+      }
+      return true;
+    });
+
+    if (filtered.length === 0) {
+      return fail(ERROR_ELEMENT_NOT_FOUND, `no DOM element matched ${locatorDebug(loc)}`, {
+        matched_count: 0,
+        resolved_by: resolvedBy
+      });
+    }
+    if (filtered.length > 1) {
+      return fail(ERROR_ELEMENT_AMBIGUOUS, `${filtered.length} DOM elements matched ${locatorDebug(loc)}`, {
+        matched_count: filtered.length,
+        resolved_by: resolvedBy,
+        candidates: filtered.slice(0, 5).map(elementSummary)
+      });
+    }
+    return {
+      ok: true,
+      element: filtered[0],
+      matchedCount: filtered.length,
+      resolvedBy
+    };
+  }
+
+  function semanticCandidates(actionName) {
+    if (actionName === "select") {
+      return Array.from(document.querySelectorAll("select,[role='combobox'],[role='listbox']"));
+    }
+    if (actionName === "submit") {
+      return Array.from(document.querySelectorAll("form,button,input[type='submit'],input[type='image'],input[type='button'],[role='button']"));
+    }
+    return Array.from(document.querySelectorAll("button,a[href],input[type='button'],input[type='submit'],input[type='reset'],summary,[role='button'],[role='link'],[role='menuitem'],[role='tab'],[tabindex]"));
+  }
+
+  function performClick(element, count, events) {
+    if (typeof element.click !== "function") {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, `resolved ${tag(element)} element has no click() method`);
+    }
+    scrollIntoViewIfPossible(element);
+    const bounded = Math.min(Math.max(count, 1), 3);
+    for (let index = 0; index < bounded; index += 1) {
+      element.click();
+      events.push("click");
+    }
+    return {
+      click_count: bounded
+    };
+  }
+
+  function performNativeSelect(element, requested, events) {
+    if (tag(element) !== "select") {
+      throw actionError(
+        ERROR_ACTION_UNSUPPORTED,
+        `domAction select supports native <select> only; resolved ${tag(element)} role=${inferRole(element)}`
+      );
+    }
+    const optionNeedle = stringOrEmpty(requested);
+    if (!optionNeedle) {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, "domAction select requires option or value");
+    }
+    const options = Array.from(element.options || []);
+    const exactValue = options.filter((option) => String(option.value ?? "") === optionNeedle);
+    const exactText = options.filter((option) => normalizeText(option.textContent) === normalizeText(optionNeedle));
+    const matches = exactValue.length > 0 ? exactValue : exactText;
+    if (matches.length === 0) {
+      throw actionError(ERROR_ELEMENT_NOT_FOUND, `no <option> matched ${JSON.stringify(optionNeedle)}`);
+    }
+    if (matches.length > 1) {
+      throw actionError(ERROR_ELEMENT_AMBIGUOUS, `${matches.length} <option> elements matched ${JSON.stringify(optionNeedle)}`);
+    }
+    const option = matches[0];
+    element.value = String(option.value ?? "");
+    option.selected = true;
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+    events.push("input");
+    element.dispatchEvent(new Event("change", { bubbles: true }));
+    events.push("change");
+    if (element.value !== String(option.value ?? "")) {
+      throw actionError(
+        ERROR_POSTCONDITION_FAILED,
+        `select value readback ${JSON.stringify(element.value)} did not equal requested option value ${JSON.stringify(option.value)}`
+      );
+    }
+    return {
+      selected_value: String(option.value ?? ""),
+      selected_text: trimForReadback(option.textContent, 160),
+      selected_index: element.selectedIndex
+    };
+  }
+
+  function performSubmit(element, events) {
+    const form = tag(element) === "form" ? element : (element.form || element.closest?.("form"));
+    if (!(form instanceof HTMLFormElement)) {
+      throw actionError(ERROR_ELEMENT_NOT_FOUND, `resolved ${tag(element)} element is not a form and has no owning form`);
+    }
+    if (typeof form.requestSubmit !== "function") {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, "HTMLFormElement.requestSubmit() is unavailable");
+    }
+    let submitter = tag(element) === "form" ? null : element;
+    if (submitter && !isSubmitter(submitter)) {
+      submitter = null;
+    }
+    if (submitter) {
+      form.requestSubmit(submitter);
+    } else {
+      form.requestSubmit();
+    }
+    events.push("submit");
+    return {
+      form_id: String(form.id || ""),
+      submitter_tag: submitter ? tag(submitter) : null,
+      submitter_id: submitter ? String(submitter.id || "") : null,
+      submitter_name: submitter ? String(submitter.getAttribute("name") || "") : null
+    };
+  }
+
+  function isSubmitter(element) {
+    const lower = tag(element);
+    if (lower === "button") {
+      const type = String(element.getAttribute("type") || "submit").toLowerCase();
+      return type === "submit" || type === "";
+    }
+    if (lower === "input") {
+      const type = String(element.getAttribute("type") || "").toLowerCase();
+      return type === "submit" || type === "image";
+    }
+    return false;
+  }
+
+  function accessibleName(element) {
+    const labelledBy = stringOrEmpty(element.getAttribute("aria-labelledby"));
+    if (labelledBy) {
+      const text = labelledBy
+        .split(/\s+/)
+        .map((id) => document.getElementById(id)?.textContent || "")
+        .join(" ")
+        .trim();
+      if (text) {
+        return text;
+      }
+    }
+    for (const attr of ["aria-label", "alt", "title", "placeholder", "value"]) {
+      const value = stringOrEmpty(element.getAttribute(attr));
+      if (value) {
+        return value;
+      }
+    }
+    if (element.id) {
+      const label = document.querySelector(`label[for="${cssEscapeLocal(element.id)}"]`);
+      if (label?.textContent?.trim()) {
+        return label.textContent;
+      }
+    }
+    const wrappingLabel = element.closest?.("label");
+    if (wrappingLabel?.textContent?.trim()) {
+      return wrappingLabel.textContent;
+    }
+    return element.textContent || "";
+  }
+
+  function inferRole(element) {
+    const explicit = stringOrEmpty(element.getAttribute("role")).toLowerCase();
+    if (explicit) {
+      return explicit;
+    }
+    const lower = tag(element);
+    if (lower === "a" && element.hasAttribute("href")) {
+      return "link";
+    }
+    if (lower === "button") {
+      return "button";
+    }
+    if (lower === "select") {
+      return "combobox";
+    }
+    if (lower === "form") {
+      return "form";
+    }
+    if (lower === "textarea") {
+      return "textbox";
+    }
+    if (lower === "input") {
+      const type = String(element.getAttribute("type") || "text").toLowerCase();
+      if (["button", "submit", "reset", "image"].includes(type)) {
+        return "button";
+      }
+      if (type === "checkbox") {
+        return "checkbox";
+      }
+      if (type === "radio") {
+        return "radio";
+      }
+      return "textbox";
+    }
+    return lower || "element";
+  }
+
+  function elementSummary(element) {
+    if (!(element instanceof Element)) {
+      return null;
+    }
+    const lower = tag(element);
+    const value = "value" in element ? String(element.value ?? "") : "";
+    return {
+      tag_name: lower,
+      role: inferRole(element),
+      id: String(element.id || ""),
+      name_attr: String(element.getAttribute("name") || ""),
+      type_attr: String(element.getAttribute("type") || ""),
+      accessible_name: trimForReadback(accessibleName(element), 160),
+      text: trimForReadback(element.textContent, 160),
+      value_len: value.length,
+      checked: "checked" in element ? Boolean(element.checked) : null,
+      selected_index: lower === "select" ? element.selectedIndex : null,
+      visible: isElementVisible(element),
+      enabled: isElementEnabled(element)
+    };
+  }
+
+  function isElementEnabled(element) {
+    if (Boolean(element.disabled)) {
+      return false;
+    }
+    return String(element.getAttribute("aria-disabled") || "").toLowerCase() !== "true";
+  }
+
+  function isElementVisible(element) {
+    if (!(element instanceof Element) || !element.isConnected) {
+      return false;
+    }
+    const style = window.getComputedStyle(element);
+    if (!style || style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") {
+      return false;
+    }
+    if (Number(style.opacity) === 0) {
+      return false;
+    }
+    const rects = element.getClientRects();
+    return rects && rects.length > 0 && Array.from(rects).some((rect) => rect.width > 0 && rect.height > 0);
+  }
+
+  function scrollIntoViewIfPossible(element) {
+    try {
+      element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
+    } catch (_) {
+      try {
+        element.scrollIntoView();
+      } catch (_) {
+        // A failed scroll is not by itself proof the element is unclickable.
+      }
+    }
+  }
+
+  function textMatches(actual, expectedNormalized) {
+    const actualNormalized = normalizeText(actual);
+    return actualNormalized === expectedNormalized || actualNormalized.includes(expectedNormalized);
+  }
+
+  function valueMatches(element, expected) {
+    const expectedNormalized = normalizeText(expected);
+    const values = [
+      "value" in element ? String(element.value ?? "") : "",
+      element.getAttribute("value") || "",
+      element.getAttribute("data-value") || "",
+      element.textContent || ""
+    ];
+    return values.some((value) => normalizeText(value) === expectedNormalized);
+  }
+
+  function readPageText(maxChars) {
+    const source =
+      document.body && typeof document.body.innerText === "string"
+        ? document.body.innerText
+        : document.documentElement && typeof document.documentElement.innerText === "string"
+          ? document.documentElement.innerText
+          : document.body && typeof document.body.textContent === "string"
+            ? document.body.textContent
+            : document.documentElement && typeof document.documentElement.textContent === "string"
+              ? document.documentElement.textContent
+              : "";
+    let text = "";
+    let textLen = 0;
+    for (const ch of String(source || "")) {
+      if (textLen < maxChars) {
+        text += ch;
+      }
+      textLen += 1;
+    }
+    return {
+      text,
+      text_len: textLen,
+      text_truncated: textLen > maxChars,
+      max_chars: maxChars
+    };
+  }
+
+  function locatorDebug(loc) {
+    return JSON.stringify({
+      selector: loc.selector || null,
+      elementId: loc.elementId || null,
+      role: loc.role || null,
+      name: loc.name || null,
+      value: loc.value || null,
+      option: loc.option || null
+    });
+  }
+
+  function normalizeText(value) {
+    return String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+  }
+
+  function stringOrEmpty(value) {
+    return value === null || value === undefined ? "" : String(value).trim();
+  }
+
+  function trimForReadback(value, maxChars) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    return [...text].slice(0, maxChars).join("");
+  }
+
+  function tag(element) {
+    return String(element?.tagName || "").toLowerCase();
+  }
+
+  function cssEscapeLocal(value) {
+    if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+      return CSS.escape(value);
+    }
+    return String(value).replace(/["\\]/g, "\\$&");
+  }
+
+  function actionError(code, detail) {
+    const error = new Error(detail);
+    error.code = code;
+    return error;
+  }
+
+  function errorMessageLocal(error) {
+    return error && error.message ? String(error.message) : String(error);
+  }
+
+  function fail(errorCode, errorDetail, extra = {}) {
+    return {
+      ok: false,
+      error_code: errorCode,
+      error_detail: errorDetail,
+      ...extra
+    };
+  }
 }
 
 function tabsNavigationMethod(action) {
