@@ -137,6 +137,7 @@ function Invoke-SynapseChromeBridgeVerifier {
 
 $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
 $processToolSurfaceHashAtStart = $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START
+$processToolSurfaceSnapshotAtStart = $env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START
 $script:SynapseSetupMaintenanceLockStream = $null
 $script:SynapseSetupMaintenanceLockPath = $null
 $script:SynapseSetupMaintenanceLockReason = $null
@@ -751,13 +752,23 @@ if ($synapseHasConfig) {
     Write-Error "SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_INVALID path=$synapseToolSurfacePath remediation=delete the invalid snapshot and rerun scripts\synapse-setup.ps1"
     exit 1
   }
+  $synapseStartSnapshotDir = Join-Path $env:LOCALAPPDATA 'synapse\codex-start-snapshots'
+  $synapseStartSnapshotPath = Join-Path $synapseStartSnapshotDir ("codex-tool-surface-{0}-{1}.json" -f $PID, [Guid]::NewGuid().ToString('N'))
+  try {
+    New-Item -ItemType Directory -Force -Path $synapseStartSnapshotDir | Out-Null
+    Copy-Item -LiteralPath $synapseToolSurfacePath -Destination $synapseStartSnapshotPath -Force
+  } catch {
+    Write-Error "SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=$synapseStartSnapshotPath error=$($_.Exception.Message) remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-start-snapshots before starting Codex"
+    exit 1
+  }
   $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START = $synapseToolSurfaceHash
   $env:SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START = [string]$synapseToolSurface.tool_count
-  $env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START = $synapseToolSurfacePath
+  $env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START = $synapseStartSnapshotPath
 }
 Remove-Variable synapseConfigPath,synapseTokenPath,synapseHasConfig -ErrorAction SilentlyContinue
 Remove-Variable synapseTokenRaw,synapseToken -ErrorAction SilentlyContinue
 Remove-Variable synapseToolSurfacePath,synapseToolSurface,synapseToolSurfaceHash -ErrorAction SilentlyContinue
+Remove-Variable synapseStartSnapshotDir,synapseStartSnapshotPath -ErrorAction SilentlyContinue
 # Synapse MCP token loader: end
 
 $exe=""
@@ -842,9 +853,21 @@ IF DEFINED _synapse_has_cfg (
     ECHO SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_INVALID path=%_synapse_surface% remediation=delete the invalid snapshot and rerun scripts\synapse-setup.ps1 1>&2
     EXIT /B 1
   )
+  SET "_synapse_start_dir=%LOCALAPPDATA%\synapse\codex-start-snapshots"
+  SET "_synapse_start_surface=!_synapse_start_dir!\codex-tool-surface-!RANDOM!-!RANDOM!.json"
+  IF NOT EXIST "!_synapse_start_dir!" MD "!_synapse_start_dir!" >NUL 2>NUL
+  IF NOT EXIST "!_synapse_start_dir!" (
+    ECHO SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=!_synapse_start_surface! remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-start-snapshots before starting Codex 1>&2
+    EXIT /B 1
+  )
+  COPY /Y "%_synapse_surface%" "!_synapse_start_surface!" >NUL
+  IF ERRORLEVEL 1 (
+    ECHO SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=!_synapse_start_surface! remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-start-snapshots before starting Codex 1>&2
+    EXIT /B 1
+  )
   SET "SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START=!_synapse_surface_hash!"
   SET "SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START=!_synapse_surface_count!"
-  SET "SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START=%_synapse_surface%"
+  SET "SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START=!_synapse_start_surface!"
 )
 SET "_synapse_cfg="
 SET "_synapse_tok="
@@ -853,6 +876,8 @@ SET "_synapse_has_cfg="
 SET "_synapse_file_token="
 SET "_synapse_surface_hash="
 SET "_synapse_surface_count="
+SET "_synapse_start_dir="
+SET "_synapse_start_surface="
 REM Synapse MCP token loader: end
 
 IF EXIST "%dp0%\node.exe" (
@@ -912,12 +937,18 @@ if [ -f "$synapse_cfg" ] && grep -Eq '^\[mcp_servers\.synapse\]' "$synapse_cfg";
         printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_INVALID path=$synapse_surface remediation=delete the invalid snapshot and rerun scripts/synapse-setup.ps1" >&2
         exit 1
     fi
+    synapse_start_dir="$LOCALAPPDATA/synapse/codex-start-snapshots"
+    synapse_start_surface="$synapse_start_dir/codex-tool-surface-$$-$(date +%s).json"
+    if ! mkdir -p "$synapse_start_dir" || ! cp "$synapse_surface" "$synapse_start_surface"; then
+        printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=$synapse_start_surface remediation=repair permissions on $synapse_start_dir before starting Codex" >&2
+        exit 1
+    fi
     SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START="$synapse_surface_hash"
     SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START="$synapse_surface_count"
-    SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START="$synapse_surface"
+    SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START="$synapse_start_surface"
     export SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START
 fi
-unset synapse_cfg synapse_tok synapse_file_token synapse_surface synapse_surface_hash synapse_surface_count
+unset synapse_cfg synapse_tok synapse_file_token synapse_surface synapse_surface_hash synapse_surface_count synapse_start_dir synapse_start_surface
 # Synapse MCP token loader: end
 
 case `uname` in
@@ -1283,6 +1314,24 @@ function Get-SynapseSha256Hex {
     }
 }
 
+function Get-SynapseObjectPropertyValue {
+    param(
+        [AllowNull()]$Object,
+        [Parameter(Mandatory=$true)][string[]]$Names
+    )
+
+    if ($null -eq $Object) {
+        return $null
+    }
+    foreach ($name in $Names) {
+        $property = $Object.PSObject.Properties[$name]
+        if ($property) {
+            return $property.Value
+        }
+    }
+    return $null
+}
+
 function Read-SynapseMcpSseJsonResponse {
     param(
         [Parameter(Mandatory=$true)][string]$Content,
@@ -1435,6 +1484,21 @@ function Read-SynapseDaemonToolSurface {
 
         $sortedTools = @($tools | Sort-Object name)
         $toolNames = @($sortedTools | ForEach-Object { [string]$_.name })
+        $toolSchemas = @($sortedTools | ForEach-Object {
+            $tool = $_
+            $inputSchema = Get-SynapseObjectPropertyValue -Object $tool -Names @('inputSchema', 'input_schema')
+            $outputSchema = Get-SynapseObjectPropertyValue -Object $tool -Names @('outputSchema', 'output_schema')
+            $toolCanonical = Get-SynapseCanonicalJson -Value $tool
+            [ordered]@{
+                name = [string]$tool.name
+                description = [string]$tool.description
+                input_schema = $inputSchema
+                input_schema_sha256 = Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $inputSchema)
+                output_schema = $outputSchema
+                output_schema_sha256 = if ($null -eq $outputSchema) { $null } else { Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $outputSchema) }
+                tool_sha256 = Get-SynapseSha256Hex -Text $toolCanonical
+            }
+        })
         $canonical = Get-SynapseCanonicalJson -Value ([ordered]@{
             mcp_surface = 'tools/list'
             tools = $sortedTools
@@ -1443,13 +1507,14 @@ function Read-SynapseDaemonToolSurface {
         $daemonPid = try { [int]$Health.pid } catch { $null }
 
         return [pscustomobject]([ordered]@{
-            schema = 1
+            schema = 2
             created_at_utc = [DateTime]::UtcNow.ToString('o')
             bind = $Bind
             daemon_pid = $daemonPid
             tool_count = $toolNames.Count
             tool_surface_sha256 = $hash
             tool_names = $toolNames
+            tool_schemas = $toolSchemas
         })
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
@@ -1656,11 +1721,97 @@ function Write-SynapseCodexToolSurfaceSnapshot {
     Info "Codex tool-surface snapshot written path=$Path daemon_pid=$($Surface.daemon_pid) tool_count=$($Surface.tool_count) tool_surface_sha256=$($Surface.tool_surface_sha256)"
 }
 
+function Read-SynapseCodexToolSurfaceSnapshotOrNull {
+    param([AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+    try {
+        return Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+    } catch {
+        return [pscustomobject]@{
+            unreadable = $true
+            path = $Path
+            error = $_.Exception.Message
+        }
+    }
+}
+
+function New-SynapseToolSchemaHashMap {
+    param([AllowNull()]$Surface)
+
+    $map = @{}
+    if ($null -eq $Surface -or $Surface.unreadable) {
+        return $map
+    }
+    foreach ($record in @($Surface.tool_schemas)) {
+        $name = [string]$record.name
+        $hash = [string]$record.tool_sha256
+        if (-not [string]::IsNullOrWhiteSpace($name) -and -not [string]::IsNullOrWhiteSpace($hash)) {
+            $map[$name] = $hash
+        }
+    }
+    return $map
+}
+
+function Format-SynapseLimitedList {
+    param(
+        [AllowNull()]$Items,
+        [int]$Limit = 20
+    )
+
+    $values = @($Items | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Sort-Object -Unique)
+    if ($values.Count -eq 0) {
+        return 'none'
+    }
+    $shown = @($values | Select-Object -First $Limit)
+    $suffix = if ($values.Count -gt $Limit) { ",+$($values.Count - $Limit)_more" } else { '' }
+    return (($shown -join ',') + $suffix)
+}
+
+function Get-SynapseToolSurfaceDiffSummary {
+    param(
+        [AllowNull()]$StartSurface,
+        [Parameter(Mandatory=$true)]$CurrentSurface
+    )
+
+    if ($null -eq $StartSurface) {
+        return 'start_snapshot=missing added=unknown removed=unknown schema_changed=unknown'
+    }
+    if ($StartSurface.unreadable) {
+        return "start_snapshot=unreadable error=$($StartSurface.error) added=unknown removed=unknown schema_changed=unknown"
+    }
+
+    $startNames = @($StartSurface.tool_names | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $currentNames = @($CurrentSurface.tool_names | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+    $added = @($currentNames | Where-Object { $startNames -notcontains $_ })
+    $removed = @($startNames | Where-Object { $currentNames -notcontains $_ })
+
+    $startMap = New-SynapseToolSchemaHashMap -Surface $StartSurface
+    $currentMap = New-SynapseToolSchemaHashMap -Surface $CurrentSurface
+    $changed = @()
+    if ($startMap.Count -gt 0 -and $currentMap.Count -gt 0) {
+        foreach ($name in $currentNames) {
+            if ($startMap.ContainsKey($name) -and $currentMap.ContainsKey($name) -and $startMap[$name] -ne $currentMap[$name]) {
+                $changed += $name
+            }
+        }
+    }
+    $schemaDetail = if ($startMap.Count -gt 0 -and $currentMap.Count -gt 0) { 'present' } else { 'missing' }
+    return ("start_snapshot_schema_detail={0} added={1} removed={2} schema_changed={3}" -f `
+        $schemaDetail,
+        (Format-SynapseLimitedList -Items $added),
+        (Format-SynapseLimitedList -Items $removed),
+        (Format-SynapseLimitedList -Items $changed))
+}
+
 function Assert-CodexCurrentProcessToolSurfaceFresh {
     param(
         [AllowNull()]$CodexAncestor,
         [Parameter(Mandatory=$true)]$CurrentSurface,
         [AllowNull()][string]$ProcessHashAtStart,
+        [AllowNull()][string]$ProcessSnapshotAtStart,
         [Parameter(Mandatory=$true)][string]$SnapshotPath
     )
 
@@ -1669,23 +1820,29 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
     }
 
     $currentHash = [string]$CurrentSurface.tool_surface_sha256
+    $startSurface = Read-SynapseCodexToolSurfaceSnapshotOrNull -Path $ProcessSnapshotAtStart
+    $diffSummary = Get-SynapseToolSurfaceDiffSummary -StartSurface $startSurface -CurrentSurface $CurrentSurface
     if ([string]::IsNullOrWhiteSpace($ProcessHashAtStart)) {
-        Die ("SYNAPSE_CODEX_TOOL_SURFACE_STALE codex_pid={0} tool_surface_at_process_start=missing current_tool_surface_sha256={1} tool_count={2} daemon_pid={3} snapshot={4} remediation=restart Codex through the patched codex launcher; this current Codex process cannot prove it loaded the current tools/list and cannot hot-add newly installed MCP tools." -f `
+        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=missing current_tool_surface_sha256={1} tool_count={2} daemon_pid={3} snapshot={4} start_snapshot={5} {6} remediation=restart Codex through the patched codex launcher; this current Codex process cannot prove it loaded the current tools/list schema and cannot hot-add newly installed MCP tools or schema changes." -f `
             $CodexAncestor.ProcessId,
             $currentHash,
             $CurrentSurface.tool_count,
             $CurrentSurface.daemon_pid,
-            $SnapshotPath)
+            $SnapshotPath,
+            $ProcessSnapshotAtStart,
+            $diffSummary)
     }
 
     if ($ProcessHashAtStart -ne $currentHash) {
-        Die ("SYNAPSE_CODEX_TOOL_SURFACE_STALE codex_pid={0} tool_surface_at_process_start=mismatch start_tool_surface_sha256={1} current_tool_surface_sha256={2} tool_count={3} daemon_pid={4} snapshot={5} remediation=restart Codex through the patched codex launcher; Windows cannot update this already-running Codex process's MCP tool namespace after daemon tools/list changes." -f `
+        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=mismatch start_tool_surface_sha256={1} current_tool_surface_sha256={2} tool_count={3} daemon_pid={4} snapshot={5} start_snapshot={6} {7} remediation=restart Codex through the patched codex launcher; Windows cannot update this already-running Codex process's MCP tool namespace or cached tool schemas after daemon tools/list changes." -f `
             $CodexAncestor.ProcessId,
             $ProcessHashAtStart,
             $currentHash,
             $CurrentSurface.tool_count,
             $CurrentSurface.daemon_pid,
-            $SnapshotPath)
+            $SnapshotPath,
+            $ProcessSnapshotAtStart,
+            $diffSummary)
     }
 
     Info "Codex current-process tool surface matches daemon snapshot codex_pid=$($CodexAncestor.ProcessId) tool_surface_sha256=$currentHash tool_count=$($CurrentSurface.tool_count)"
@@ -2635,6 +2792,7 @@ if (-not $SkipClientWiring) {
         -CodexAncestor $codexAncestor `
         -CurrentSurface $toolSurface `
         -ProcessHashAtStart $processToolSurfaceHashAtStart `
+        -ProcessSnapshotAtStart $processToolSurfaceSnapshotAtStart `
         -SnapshotPath $CodexToolSurfaceSnapshotPath
 } else {
     Info "Skipped Codex current-process freshness check because -SkipClientWiring was set; daemon health and tools/list were still verified."

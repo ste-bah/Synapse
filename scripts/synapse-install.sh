@@ -79,11 +79,17 @@ else
     if [ -z "\$_synapse_mcp_surface_hash" ]; then
         printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_SNAPSHOT_INVALID path=\$_synapse_mcp_surface_path remediation=delete the invalid snapshot and rerun scripts/synapse-setup.ps1" >&2
     else
+        _synapse_mcp_start_dir="\$HOME/.config/synapse/codex-start-snapshots"
+        _synapse_mcp_start_surface="\$_synapse_mcp_start_dir/codex-tool-surface-\$\$-\$(date +%s).json"
+        if ! mkdir -p "\$_synapse_mcp_start_dir" || ! cp "\$_synapse_mcp_surface_path" "\$_synapse_mcp_start_surface"; then
+            printf '%s\n' "SYNAPSE_CODEX_TOOL_SURFACE_START_SNAPSHOT_FAILED path=\$_synapse_mcp_start_surface remediation=repair permissions on \$_synapse_mcp_start_dir before starting Codex" >&2
+        else
         export SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START="\$_synapse_mcp_surface_hash"
         export SYNAPSE_TOOL_SURFACE_TOOL_COUNT_AT_CODEX_START="\$_synapse_mcp_surface_count"
-        export SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START="\$_synapse_mcp_surface_path"
+        export SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START="\$_synapse_mcp_start_surface"
+        fi
     fi
-    unset _synapse_mcp_surface_hash _synapse_mcp_surface_count
+    unset _synapse_mcp_surface_hash _synapse_mcp_surface_count _synapse_mcp_start_dir _synapse_mcp_start_surface
 fi
 
 unset _synapse_mcp_token_path _synapse_mcp_surface_path

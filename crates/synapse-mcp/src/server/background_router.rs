@@ -19,7 +19,7 @@ use crate::m2::{ActClickParams, ActSetFieldTextParams, default_verify_timeout_ms
 use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
 use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, service::RequestContext};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use synapse_core::{ElementId, error_codes};
@@ -29,38 +29,25 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
+const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, click, run_shell";
 
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum TargetActVerb {
-    /// Observe the session target (UIA/WGC/CDP perception) — background.
-    Read,
-    /// Capture the session target to a file — background.
-    Screenshot,
-    /// Navigate the session's owned browser target — background (Chrome bridge
-    /// / CDP), never the human foreground tab.
-    Navigate,
-    /// Replace a target web/UIA field's text by element id — background CDP/UIA
-    /// tiers; the delegate refuses before input if only a foreground route
-    /// exists and no break-glass lease is held.
-    SetField,
-    /// Click a target element by element id through semantic/background tiers
-    /// first. Inconclusive post-state returns `verify_needed`.
-    Click,
-    /// Run a shell command in the session workspace — background.
-    RunShell,
+#[derive(Clone, Debug, JsonSchema)]
+#[schemars(transparent)]
+pub struct TargetActVerb(String);
+
+impl<'de> Deserialize<'de> for TargetActVerb {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Ok(Self(raw.trim().to_ascii_lowercase()))
+    }
 }
 
 impl TargetActVerb {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Screenshot => "screenshot",
-            Self::Navigate => "navigate",
-            Self::SetField => "set_field",
-            Self::Click => "click",
-            Self::RunShell => "run_shell",
-        }
+    fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
@@ -124,7 +111,7 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<TargetActResponse>, ErrorData> {
         let params = params.0;
-        let verb = params.verb;
+        let verb = params.verb.as_str().to_owned();
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "target_act",
@@ -132,8 +119,8 @@ impl SynapseService {
             "tool.invocation kind=target_act"
         );
 
-        let (delegated_tool, ok, status, result) = match verb {
-            TargetActVerb::Read => {
+        let (delegated_tool, ok, status, result) = match verb.as_str() {
+            "read" => {
                 let response = self
                     .observe(Parameters(ObserveParams::default()), request_context)
                     .await?;
@@ -144,7 +131,7 @@ impl SynapseService {
                     target_act_result(&response.0)?,
                 )
             }
-            TargetActVerb::Screenshot => {
+            "screenshot" => {
                 let path = require_param(params.path, "screenshot", "path")?;
                 let response = self
                     .capture_screenshot(
@@ -164,7 +151,7 @@ impl SynapseService {
                     target_act_result(&response.0)?,
                 )
             }
-            TargetActVerb::Navigate => {
+            "navigate" => {
                 let url = require_param(params.url, "navigate", "url")?;
                 let response = self
                     .cdp_navigate_tab(
@@ -186,7 +173,7 @@ impl SynapseService {
                     target_act_result(&response.0)?,
                 )
             }
-            TargetActVerb::SetField => {
+            "set_field" => {
                 let element_id = require_param(params.element_id, "set_field", "element_id")?;
                 let element_id = ElementId::parse(&element_id).map_err(|error| {
                     mcp_error(
@@ -206,7 +193,7 @@ impl SynapseService {
                     .await;
                 target_act_delegate_response("act_set_field_text", response)?
             }
-            TargetActVerb::Click => {
+            "click" => {
                 let element_id = require_param(params.element_id, "click", "element_id")?;
                 let element_id = ElementId::parse(&element_id).map_err(|error| {
                     mcp_error(
@@ -221,7 +208,7 @@ impl SynapseService {
                     .await;
                 target_act_delegate_response("act_click", response)?
             }
-            TargetActVerb::RunShell => {
+            "run_shell" => {
                 let command = require_param(params.command, "run_shell", "command")?;
                 let response = self
                     .act_run_shell(
@@ -247,6 +234,7 @@ impl SynapseService {
                     target_act_result(&response.0)?,
                 )
             }
+            other => return Err(target_act_unknown_verb_error(other)),
         };
 
         Ok(Json(TargetActResponse {
@@ -267,6 +255,13 @@ fn require_param(value: Option<String>, verb: &str, field: &str) -> Result<Strin
             format!("target_act verb={verb} requires a non-empty `{field}`"),
         )
     })
+}
+
+fn target_act_unknown_verb_error(verb: &str) -> ErrorData {
+    mcp_error(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!("target_act verb must be one of {TARGET_ACT_KNOWN_VERBS}; got {verb:?}"),
+    )
 }
 
 fn target_act_result<T: Serialize>(value: &T) -> Result<Value, ErrorData> {
@@ -380,6 +375,7 @@ fn target_act_error_code(error: &ErrorData) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::schemars::schema_for;
 
     #[test]
     fn target_act_verb_click_deserializes() {
@@ -390,9 +386,47 @@ mod tests {
         }))
         .expect("click params should deserialize");
 
-        assert!(matches!(params.verb, TargetActVerb::Click));
+        assert_eq!(params.verb.as_str(), "click");
         assert_eq!(params.clicks, Some(2));
-        assert_eq!(TargetActVerb::Click.as_str(), "click");
+    }
+
+    #[test]
+    fn target_act_verb_schema_is_forward_compatible_string() {
+        let schema = serde_json::to_value(schema_for!(TargetActParams))
+            .unwrap_or_else(|error| panic!("target_act params schema should serialize: {error}"));
+        let schema_text = schema.to_string();
+
+        assert!(
+            schema_text.contains("\"verb\""),
+            "target_act schema must include verb: {schema_text}"
+        );
+        assert!(
+            schema_text.contains("\"type\":\"string\""),
+            "target_act verb schema must be an open string: {schema_text}"
+        );
+        assert!(
+            !schema_text.contains("\"enum\""),
+            "target_act verb schema must not be a closed enum: {schema_text}"
+        );
+    }
+
+    #[test]
+    fn target_act_unknown_verb_is_runtime_validation_error() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "future_dashboard_action"
+        }))
+        .expect("future target_act verb should deserialize so clients do not stale on schema");
+        let error = target_act_unknown_verb_error(params.verb.as_str());
+
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert!(
+            error.message.contains("future_dashboard_action"),
+            "unknown verb error should name the rejected verb: {}",
+            error.message
+        );
     }
 
     #[test]

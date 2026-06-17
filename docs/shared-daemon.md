@@ -176,6 +176,16 @@ not accepted as live session proof.
   `SYNAPSE_CODEX_CURRENT_PROCESS_ENV_STALE` and the current chat cannot claim
   direct `mcp__synapse` FSV until a fresh Codex process initializes with the
   token loader.
+- **Codex exposes stale `mcp__synapse` tool schemas after setup/restart** —
+  setup snapshots the daemon's sanitized `tools/list` at
+  `%APPDATA%\synapse\codex-tool-surface.json` and each patched Codex launcher
+  copies that file to an immutable per-process start snapshot under
+  `%LOCALAPPDATA%\synapse\codex-start-snapshots`. If setup later sees the live
+  daemon schema hash differ from `SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START`, it
+  fails with `SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE` and reports
+  added/removed/schema-changed tools. Restart Codex through the patched launcher
+  so the real wired `mcp__synapse` client loads the new schema. Direct HTTP or
+  stdio probes remain diagnostics only and are not D1/client-parity FSV.
 - **WSL Codex/Claude leaves `synapse-mcp --mode connect` children under
   `wsl.exe`** — this is a configuration error. Reconfigure the WSL client to
   HTTP transport with bearer auth. The bridge now refuses direct WSL interop
