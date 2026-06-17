@@ -38,10 +38,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-17-hwnd-nonmin-open-tab-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-17-screenshot-retry-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "5a242bed1c70ae3f13a0b97867319335b1494d7eb42a8b3414c7c22f6c64526e";
+    "196f108467bbaf4d40a1768a09eb5cdc838f4b5b12d425d63beb6c139ed67adf";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "activateTab",
     "closeTab",
@@ -705,10 +704,28 @@ pub(crate) struct ChromeDebuggerCaptureVisibleTabResult {
     #[serde(default)]
     pub image_data_url_len: usize,
     #[serde(default)]
+    pub capture_attempt_count: usize,
+    #[serde(default)]
+    pub capture_attempts: Vec<ChromeDebuggerCaptureAttempt>,
+    #[serde(default)]
     pub readback_backend: String,
     pub target_candidate_count: u32,
     pub target_selection_reason: String,
     pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerCaptureAttempt {
+    #[serde(default)]
+    pub attempt: u32,
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub error_detail: String,
+    #[serde(default)]
+    pub retryable: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

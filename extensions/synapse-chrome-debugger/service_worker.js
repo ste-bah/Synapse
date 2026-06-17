@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-hwnd-nonmin-open-tab-v1";
-const BRIDGE_BUILD_SHA256 = "5a242bed1c70ae3f13a0b97867319335b1494d7eb42a8b3414c7c22f6c64526e";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-17-screenshot-retry-v1";
+const BRIDGE_BUILD_SHA256 = "196f108467bbaf4d40a1768a09eb5cdc838f4b5b12d425d63beb6c139ed67adf";
 const COMMAND_CAPABILITIES = Object.freeze([
   "openTab",
   "closeTab",
@@ -43,6 +43,10 @@ const AGENT_NAVIGATION_CLAIM_TTL_MS = 30000;
 const MAX_RECENT_NAVIGATION_KEYS = 128;
 const MAX_PAGE_TEXT_CHARS = 4096;
 const OPEN_WINDOW_BOUNDS_TOLERANCE_PX = 96;
+const CAPTURE_SCREENSHOT_ATTACH_TIMEOUT_MS = 5000;
+const CAPTURE_SCREENSHOT_COMMAND_TIMEOUT_MS = 15000;
+const CAPTURE_SCREENSHOT_MAX_ATTEMPTS = 2;
+const CAPTURE_SCREENSHOT_RETRY_DELAY_MS = 150;
 
 let hostId = null;
 let bridgeToken = null;
@@ -576,54 +580,8 @@ async function handleCapturePageScreenshot(params) {
       "chrome.debugger unavailable; extension is missing debugger permission for Page.captureScreenshot"
     );
   }
-  const debuggee = { tabId: selected.tabId };
-  let attached = false;
-  let screenshot;
-  let detachError = null;
-  try {
-    await withTimeout(
-      chrome.debugger.attach(debuggee, "1.3"),
-      5000,
-      `chrome.debugger.attach(tabId=${selected.tabId})`
-    );
-    attached = true;
-    await withTimeout(
-      chrome.debugger.sendCommand(debuggee, "Page.enable", {}),
-      5000,
-      `chrome.debugger.sendCommand(Page.enable, tabId=${selected.tabId})`
-    );
-    screenshot = await withTimeout(
-      chrome.debugger.sendCommand(debuggee, "Page.captureScreenshot", {
-        format: "png",
-        fromSurface: true
-      }),
-      15000,
-      `chrome.debugger.sendCommand(Page.captureScreenshot, tabId=${selected.tabId})`
-    );
-  } catch (error) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `capturePageScreenshot failed for target ${selected.target.id}: ${errorMessage(error)}`
-    );
-  } finally {
-    if (attached) {
-      try {
-        await withTimeout(
-          chrome.debugger.detach(debuggee),
-          5000,
-          `chrome.debugger.detach(tabId=${selected.tabId})`
-        );
-      } catch (error) {
-        detachError = errorMessage(error);
-      }
-    }
-  }
-  if (detachError) {
-    throw bridgeError(
-      ERROR_AXTREE_FAILED,
-      `capturePageScreenshot captured target ${selected.target.id} but failed to detach debugger from tab ${selected.tabId}: ${detachError}`
-    );
-  }
+  const capture = await capturePageScreenshotWithRetry(selected);
+  const screenshot = capture.screenshot;
   const imageData = typeof screenshot?.data === "string" ? screenshot.data : "";
   if (!imageData) {
     throw bridgeError(
@@ -653,9 +611,120 @@ async function handleCapturePageScreenshot(params) {
     image_data_url: imageDataUrl,
     image_data_url_len: imageDataUrl.length,
     readback_backend: "chrome.debugger.Page.captureScreenshot+chrome.tabs.get",
+    capture_attempt_count: capture.attempts.length,
+    capture_attempts: capture.attempts,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
+}
+
+async function capturePageScreenshotWithRetry(selected) {
+  const attempts = [];
+  let lastError = null;
+  for (let attempt = 1; attempt <= CAPTURE_SCREENSHOT_MAX_ATTEMPTS; attempt += 1) {
+    const startedAt = Date.now();
+    try {
+      const screenshot = await capturePageScreenshotAttempt(selected.tabId);
+      attempts.push({
+        attempt,
+        ok: true,
+        elapsed_ms: elapsedSince(startedAt)
+      });
+      return { screenshot, attempts };
+    } catch (error) {
+      const detail = errorMessage(error);
+      lastError = error;
+      attempts.push({
+        attempt,
+        ok: false,
+        elapsed_ms: elapsedSince(startedAt),
+        error_detail: detail,
+        retryable: isCapturePageScreenshotRetryableError(error)
+      });
+      if (
+        attempt >= CAPTURE_SCREENSHOT_MAX_ATTEMPTS ||
+        !isCapturePageScreenshotRetryableError(error)
+      ) {
+        break;
+      }
+      await delay(CAPTURE_SCREENSHOT_RETRY_DELAY_MS);
+    }
+  }
+  throw bridgeError(
+    ERROR_AXTREE_FAILED,
+    `capturePageScreenshot failed for target ${selected.target.id} after ${attempts.length} attempts: ` +
+      `${formatCaptureAttempts(attempts)}; last_error=${errorMessage(lastError)}`
+  );
+}
+
+async function capturePageScreenshotAttempt(tabId) {
+  const debuggee = { tabId };
+  let attached = false;
+  let screenshot;
+  let primaryError = null;
+  let detachError = null;
+  try {
+    await withTimeout(
+      chrome.debugger.attach(debuggee, "1.3"),
+      CAPTURE_SCREENSHOT_ATTACH_TIMEOUT_MS,
+      `chrome.debugger.attach(tabId=${tabId})`
+    );
+    attached = true;
+    await withTimeout(
+      chrome.debugger.sendCommand(debuggee, "Page.enable", {}),
+      CAPTURE_SCREENSHOT_ATTACH_TIMEOUT_MS,
+      `chrome.debugger.sendCommand(Page.enable, tabId=${tabId})`
+    );
+    screenshot = await withTimeout(
+      chrome.debugger.sendCommand(debuggee, "Page.captureScreenshot", {
+        format: "png",
+        fromSurface: true
+      }),
+      CAPTURE_SCREENSHOT_COMMAND_TIMEOUT_MS,
+      `chrome.debugger.sendCommand(Page.captureScreenshot, tabId=${tabId})`
+    );
+  } catch (error) {
+    primaryError = error;
+  } finally {
+    if (attached) {
+      try {
+        await withTimeout(
+          chrome.debugger.detach(debuggee),
+          CAPTURE_SCREENSHOT_ATTACH_TIMEOUT_MS,
+          `chrome.debugger.detach(tabId=${tabId})`
+        );
+      } catch (error) {
+        detachError = errorMessage(error);
+      }
+    }
+  }
+  if (detachError) {
+    const detail = primaryError
+      ? `${errorMessage(primaryError)}; detach failed: ${detachError}`
+      : `debugger detach failed: ${detachError}`;
+    throw new Error(detail);
+  }
+  if (primaryError) {
+    throw primaryError;
+  }
+  return screenshot;
+}
+
+function isCapturePageScreenshotRetryableError(error) {
+  const message = errorMessage(error);
+  return message.includes("Page.captureScreenshot") && message.includes("timed out after");
+}
+
+function formatCaptureAttempts(attempts) {
+  return attempts
+    .map((attempt) => {
+      if (attempt.ok) {
+        return `attempt ${attempt.attempt} ok elapsed_ms=${attempt.elapsed_ms}`;
+      }
+      return `attempt ${attempt.attempt} error retryable=${attempt.retryable} ` +
+        `elapsed_ms=${attempt.elapsed_ms} detail=${attempt.error_detail}`;
+    })
+    .join("; ");
 }
 
 async function handleEvaluateScript(params) {
@@ -1525,6 +1594,14 @@ async function withTimeout(promise, timeoutMs, description) {
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+function delay(timeoutMs) {
+  return new Promise((resolve) => setTimeout(resolve, timeoutMs));
+}
+
+function elapsedSince(startedAt) {
+  return Math.max(0, Date.now() - startedAt);
 }
 
 async function tabPageVitalsState(tabId) {

@@ -1116,6 +1116,8 @@ impl SynapseService {
                 active_for_capture = captured.active_for_capture,
                 restored_previous_active = captured.restored_previous_active,
                 image_data_url_len = captured.image_data_url_len,
+                capture_attempt_count = captured.capture_attempt_count,
+                capture_attempts = ?captured.capture_attempts,
                 output_path = %output_path.display(),
                 "readback=chrome.debugger.Page.captureScreenshot outcome=screenshot_bitmap_decoded"
             );

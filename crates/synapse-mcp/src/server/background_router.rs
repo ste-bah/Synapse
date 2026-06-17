@@ -159,23 +159,53 @@ impl SynapseService {
             }
             "screenshot" => {
                 let path = require_param(params.path, "screenshot", "path")?;
-                let response = self
-                    .capture_screenshot(
-                        Parameters(CaptureScreenshotParams {
-                            path,
-                            region: None,
-                            window_hwnd: None,
-                            overwrite: true,
-                        }),
-                        request_context,
-                    )
-                    .await?;
-                (
-                    "capture_screenshot",
-                    true,
-                    TARGET_ACT_STATUS_OK,
-                    target_act_result(&response.0)?,
-                )
+                let session_id = target_act_session_id(&request_context, "screenshot")?;
+                let request_details = json!({
+                    "session_id": &session_id,
+                    "verb": "screenshot",
+                    "path": &path,
+                    "requires_agent_logical_foreground": true,
+                    "no_human_os_foreground_fallback": true,
+                });
+                match self.agent_logical_foreground(&session_id)? {
+                    Some(_target) => {
+                        let response = self
+                            .capture_screenshot(
+                                Parameters(CaptureScreenshotParams {
+                                    path,
+                                    region: None,
+                                    window_hwnd: None,
+                                    overwrite: true,
+                                }),
+                                request_context,
+                            )
+                            .await?;
+                        (
+                            "capture_screenshot",
+                            true,
+                            TARGET_ACT_STATUS_OK,
+                            target_act_result(&response.0)?,
+                        )
+                    }
+                    None => {
+                        let error = mcp_error(
+                            error_codes::TARGET_NOT_SET,
+                            "target_act verb=screenshot requires this MCP session to have an agent_logical_foreground/foreground_lane target; refusing capture_screenshot's legacy human OS foreground fallback",
+                        );
+                        self.audit_action_denied_with_details_for_session(
+                            "target_act",
+                            &error,
+                            &request_details,
+                            &session_id,
+                        );
+                        (
+                            "capture_screenshot",
+                            false,
+                            target_act_error_status(&error),
+                            target_act_error_result("target_act", error),
+                        )
+                    }
+                }
             }
             "navigate" => {
                 let url = require_param(params.url, "navigate", "url")?;
@@ -306,19 +336,25 @@ impl SynapseService {
     }
 }
 
+fn target_act_session_id(
+    request_context: &RequestContext<RoleServer>,
+    verb: &str,
+) -> Result<String, ErrorData> {
+    super::context::mcp_session_id_from_request_context(request_context)?.ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb={verb} requires an MCP session id"),
+        )
+    })
+}
+
 async fn target_act_browser_dom_action(
     service: &SynapseService,
     action: &'static str,
     params: &TargetActParams,
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
-    let session_id = super::context::mcp_session_id_from_request_context(request_context)?
-        .ok_or_else(|| {
-            mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                "target_act browser DOM actions require an MCP session id",
-            )
-        })?;
+    let session_id = target_act_session_id(request_context, action)?;
     target_act_validate_dom_locator(action, params)?;
     let wait_timeout_ms = target_act_dom_wait_timeout(params.wait_timeout_ms)?;
     let request_details = json!({
@@ -647,6 +683,7 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
             | error_codes::CHROME_DOM_SELECTOR_INVALID
             | error_codes::FOREGROUND_ACTIVATION_REFUSED
             | error_codes::TARGET_CO_OWNED
+            | error_codes::TARGET_NOT_SET
             | error_codes::TARGET_WINDOW_NOT_FOUND
             | error_codes::TOOL_PARAMS_INVALID
             | error_codes::TRANSIENT_ELEMENT_EXPIRED,
@@ -870,6 +907,7 @@ mod tests {
             error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED,
             error_codes::ACTION_ELEMENT_VALUE_READ_ONLY,
             error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            error_codes::TARGET_NOT_SET,
         ] {
             let error = mcp_error(code, "synthetic delegated refusal");
             assert_eq!(target_act_error_status(&error), TARGET_ACT_STATUS_REFUSED);
