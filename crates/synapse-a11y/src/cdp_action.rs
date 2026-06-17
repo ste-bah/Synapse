@@ -816,30 +816,136 @@ pub async fn cdp_evaluate_expression(
                 ),
             });
         }
-        let remote = returns.result;
-        let result_type = remote_object_type_str(&remote.r#type);
-        let result_subtype = remote
-            .subtype
-            .as_ref()
-            .and_then(|subtype| serde_json::to_value(subtype).ok())
-            .and_then(|value| value.as_str().map(ToOwned::to_owned));
-        Ok(CdpEvaluateResult {
+        Ok(evaluate_result_from_remote(
             target_id,
-            url: state.url,
-            title: state.title,
-            ready_state: state.ready_state,
-            result_type,
-            result_subtype,
-            returned_by_value: return_by_value,
-            value: remote.value.unwrap_or(Value::Null),
-            description: remote.description,
-            unserializable_value: remote
-                .unserializable_value
-                .as_ref()
-                .map(|raw| raw.inner().clone()),
-        })
+            &state,
+            return_by_value,
+            returns.result,
+        ))
     })
     .await
+}
+
+/// Calls a JavaScript function declaration against a specific DOM element
+/// (resolved from its `backend_node_id`) in a CDP page target, passing `args` as
+/// `Runtime.callFunctionOn` arguments and returning the same structured result
+/// shape as [`cdp_evaluate_expression`] (#1066/#1067). `this` inside the function
+/// is the element. Background-safe: no tab activation, no OS foreground input.
+///
+/// # Errors
+///
+/// `A11Y_CDP_ATTACH_FAILED` if the endpoint/target cannot be reached;
+/// `A11Y_CDP_AXTREE_FAILED` if the node cannot be resolved in this target, the
+/// call fails at the protocol level, the function throws, or the result cannot
+/// be decoded.
+pub async fn cdp_evaluate_on_element(
+    endpoint: &str,
+    target_id: &str,
+    backend_node_id: i64,
+    function_declaration: &str,
+    args: &[Value],
+    await_promise: bool,
+    return_by_value: bool,
+) -> A11yResult<CdpEvaluateResult> {
+    let function_declaration = function_declaration.to_owned();
+    let args = args.to_vec();
+    with_target_page(endpoint, target_id, |page| async move {
+        let target_id = page.target_id().inner().clone();
+        let state = read_page_state(&page).await?;
+        let resolve = ResolveNodeParams::builder()
+            .backend_node_id(BackendNodeId::new(backend_node_id))
+            .object_group("synapse_browser_evaluate")
+            .build();
+        let resolved =
+            page.execute(resolve)
+                .await
+                .map_err(|err| A11yError::CdpAxtreeFailed {
+                    detail: format!("resolveNode for backendNodeId {backend_node_id}: {err}"),
+                })?;
+        let object_id =
+            resolved
+                .object
+                .object_id
+                .clone()
+                .ok_or_else(|| A11yError::CdpAxtreeFailed {
+                    detail: format!(
+                        "resolveNode for backendNodeId {backend_node_id} returned no objectId (element not present in this target's DOM?)"
+                    ),
+                })?;
+        // Playwright-parity calling convention: the element is passed as the
+        // FIRST argument (e.g. `el => el.value`), followed by the caller's args.
+        // CDP `callFunctionOn` binds the element to `this`, so wrap the user
+        // function and forward `this` + the call arguments to it. This works for
+        // arrow functions (which cannot bind `this`) and regular functions
+        // alike.
+        let wrapped = format!(
+            "function() {{ return ({function_declaration}).apply(null, [this].concat(Array.prototype.slice.call(arguments))); }}"
+        );
+        let mut call = CallFunctionOnParams::builder()
+            .function_declaration(wrapped)
+            .object_id(object_id)
+            .return_by_value(return_by_value)
+            .await_promise(await_promise);
+        for arg in &args {
+            call = call.argument(CallArgument::builder().value(arg.clone()).build());
+        }
+        let call = call.build().map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("build Runtime.callFunctionOn params: {err}"),
+        })?;
+        let returns = page
+            .execute(call)
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Runtime.callFunctionOn: {err}"),
+            })?
+            .result;
+        if let Some(exception) = returns.exception_details.as_ref() {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "Runtime.callFunctionOn threw: {}",
+                    format_evaluate_exception(exception)
+                ),
+            });
+        }
+        Ok(evaluate_result_from_remote(
+            target_id,
+            &state,
+            return_by_value,
+            returns.result,
+        ))
+    })
+    .await
+}
+
+/// Maps a `Runtime.RemoteObject` (from evaluate or callFunctionOn) plus the
+/// page-state context into the structured [`CdpEvaluateResult`].
+fn evaluate_result_from_remote(
+    target_id: String,
+    state: &CdpPageState,
+    return_by_value: bool,
+    remote: chromiumoxide::cdp::js_protocol::runtime::RemoteObject,
+) -> CdpEvaluateResult {
+    let result_type = remote_object_type_str(&remote.r#type);
+    let result_subtype = remote
+        .subtype
+        .as_ref()
+        .and_then(|subtype| serde_json::to_value(subtype).ok())
+        .and_then(|value| value.as_str().map(ToOwned::to_owned));
+    CdpEvaluateResult {
+        target_id,
+        url: state.url.clone(),
+        title: state.title.clone(),
+        ready_state: state.ready_state.clone(),
+        result_type,
+        result_subtype,
+        returned_by_value: return_by_value,
+        value: remote.value.unwrap_or(Value::Null),
+        description: remote.description,
+        unserializable_value: remote
+            .unserializable_value
+            .as_ref()
+            .map(|raw| raw.inner().clone()),
+    }
 }
 
 /// Renders a `Runtime.RemoteObject.type` enum to its protocol string.

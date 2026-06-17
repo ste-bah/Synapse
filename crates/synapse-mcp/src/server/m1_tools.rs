@@ -1450,7 +1450,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Evaluate a JavaScript expression in the calling session's owned background browser tab via raw CDP Runtime.evaluate, returning the JSON value plus Runtime.RemoteObject type metadata read back from the same target. Requires an active session CDP target or an explicit cdp_target_id owned by this session; never uses the human foreground tab as a fallback. JS exceptions are surfaced loudly (thrown message, class, source location). Background-safe: never activates the tab or uses OS foreground input. This is the keystone for page content / element introspection / state queries / web-first assertions. Only the raw CDP transport supports arbitrary evaluation; the popup-safe normal extension bridge never attaches the debugger and fails closed with a clear reason."
+        description = "Evaluate JavaScript in the calling session's owned background browser tab via raw CDP, returning the JSON value plus Runtime.RemoteObject type metadata read back from the same target. Page scope (default): `expression` is evaluated via Runtime.evaluate; pass `args` to invoke it as a function with those args. Element scope: pass `element_id` and a function `expression`, called Playwright-style as fn(element, ...args) via Runtime.callFunctionOn. Requires an active session CDP target or an explicit cdp_target_id/element owned by this session; never uses the human foreground tab as a fallback. JS exceptions are surfaced loudly (thrown message, class, source location). Background-safe: never activates the tab or uses OS foreground input. This is the keystone for page content / element introspection / state queries / web-first assertions. Only the raw CDP transport supports arbitrary evaluation; the popup-safe normal extension bridge never attaches the debugger and fails closed with a clear reason."
     )]
     pub async fn browser_evaluate(
         &self,
@@ -1465,12 +1465,36 @@ impl SynapseService {
         );
         let session_id = require_target_session_id(&request_context)?;
         validate_browser_evaluate_params(&params.0)?;
+        // Element-scoped evaluation derives its CDP target from the element id;
+        // it must agree with any explicit cdp_target_id.
+        let element = params
+            .0
+            .element_id
+            .as_deref()
+            .map(parse_browser_evaluate_element)
+            .transpose()?;
+        if let (Some((_, element_target)), Some(explicit)) =
+            (element.as_ref(), params.0.cdp_target_id.as_deref())
+            && !element_target.eq_ignore_ascii_case(explicit)
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser_evaluate element_id resolves to CDP target {element_target:?} but cdp_target_id {explicit:?} was also supplied; they must match"
+                ),
+            ));
+        }
+        let resolution_target = params
+            .0
+            .cdp_target_id
+            .clone()
+            .or_else(|| element.as_ref().map(|(_, target)| target.clone()));
         let request_details = browser_evaluate_resolution_request_details(&session_id, &params.0);
         let resolution = self.resolve_cdp_tab_mutation_target(
             TOOL,
             &session_id,
             params.0.window_hwnd,
-            params.0.cdp_target_id.as_deref(),
+            resolution_target.as_deref(),
         );
         let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
             TOOL,
@@ -1480,11 +1504,16 @@ impl SynapseService {
         )?;
         let await_promise = params.0.await_promise.unwrap_or(true);
         let return_by_value = params.0.return_by_value.unwrap_or(true);
+        let backend_node_id = element.as_ref().map(|(backend, _)| *backend);
+        let args = params.0.args.clone().unwrap_or_default();
         let request_details = json!({
             "session_id": &session_id,
             "window_hwnd": window_hwnd,
             "cdp_target_id": &cdp_target_id,
+            "scope": if backend_node_id.is_some() { "element" } else { "page" },
+            "element_id": params.0.element_id,
             "expression_len": params.0.expression.len(),
+            "arg_count": args.len(),
             "await_promise": await_promise,
             "return_by_value": return_by_value,
             "required_foreground": false,
@@ -1496,6 +1525,9 @@ impl SynapseService {
                 window_hwnd,
                 &cdp_target_id,
                 &params.0.expression,
+                params.0.element_id.as_deref(),
+                backend_node_id,
+                &args,
                 await_promise,
                 return_by_value,
             )
@@ -2395,12 +2427,19 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "browser_evaluate carries page/element scope, args, and CDP flags through the audited choke point"
+    )]
     async fn browser_evaluate_impl(
         &self,
         session_id: &str,
         window_hwnd: i64,
         cdp_target_id: &str,
         expression: &str,
+        element_id: Option<&str>,
+        backend_node_id: Option<i64>,
+        args: &[Value],
         await_promise: bool,
         return_by_value: bool,
     ) -> Result<BrowserEvaluateResponse, ErrorData> {
@@ -2412,30 +2451,88 @@ impl SynapseService {
                 ),
             ));
         };
-        let evaluated = synapse_a11y::cdp_evaluate_expression(
-            &endpoint,
-            cdp_target_id,
-            expression,
-            await_promise,
-            return_by_value,
-        )
-        .await
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!("browser_evaluate raw CDP Runtime.evaluate failed: {error}"),
+        let (evaluated, scope, readback_backend) = if let Some(backend_node_id) = backend_node_id {
+            // Element scope: callFunctionOn the resolved node with args; `this`
+            // and the first parameter are bound to the element.
+            let evaluated = synapse_a11y::cdp_evaluate_on_element(
+                &endpoint,
+                cdp_target_id,
+                backend_node_id,
+                expression,
+                args,
+                await_promise,
+                return_by_value,
             )
-        })?;
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("browser_evaluate raw CDP Runtime.callFunctionOn failed: {error}"),
+                )
+            })?;
+            (evaluated, "element", "Runtime.callFunctionOn")
+        } else if args.is_empty() {
+            // Page scope, no args: plain Runtime.evaluate of the expression.
+            let evaluated = synapse_a11y::cdp_evaluate_expression(
+                &endpoint,
+                cdp_target_id,
+                expression,
+                await_promise,
+                return_by_value,
+            )
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("browser_evaluate raw CDP Runtime.evaluate failed: {error}"),
+                )
+            })?;
+            (evaluated, "page", "Runtime.evaluate")
+        } else {
+            // Page scope with args: treat the expression as a function and invoke
+            // it with the JSON args injected by value (Playwright evaluate(fn,arg)).
+            let arg_list = args
+                .iter()
+                .map(|arg| {
+                    serde_json::to_string(arg).map_err(|error| {
+                        mcp_error(
+                            error_codes::TOOL_PARAMS_INVALID,
+                            format!("browser_evaluate could not serialize arg: {error}"),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .join(", ");
+            let invocation = format!("({expression})({arg_list})");
+            let evaluated = synapse_a11y::cdp_evaluate_expression(
+                &endpoint,
+                cdp_target_id,
+                &invocation,
+                await_promise,
+                return_by_value,
+            )
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("browser_evaluate raw CDP Runtime.evaluate (with args) failed: {error}"),
+                )
+            })?;
+            (evaluated, "page", "Runtime.evaluate")
+        };
         tracing::info!(
             code = "CDP_BACKGROUND_EVALUATE",
             session_id = %session_id,
             hwnd = window_hwnd,
             endpoint = %endpoint,
             cdp_target_id = %evaluated.target_id,
+            scope = scope,
+            element_id = element_id.unwrap_or(""),
+            arg_count = args.len(),
             result_type = %evaluated.result_type,
             returned_by_value = evaluated.returned_by_value,
             target_url = %evaluated.url,
-            "readback=Runtime.evaluate outcome=evaluated"
+            "readback={readback_backend} outcome=evaluated"
         );
         Ok(BrowserEvaluateResponse {
             session_id: session_id.to_owned(),
@@ -2443,6 +2540,8 @@ impl SynapseService {
             transport: "raw_cdp".to_owned(),
             endpoint,
             cdp_target_id: evaluated.target_id,
+            scope: scope.to_owned(),
+            element_id: element_id.map(ToOwned::to_owned),
             url: evaluated.url,
             title: evaluated.title,
             ready_state: evaluated.ready_state,
@@ -2452,19 +2551,26 @@ impl SynapseService {
             value: evaluated.value,
             description: evaluated.description,
             unserializable_value: evaluated.unserializable_value,
-            readback_backend: "Runtime.evaluate".to_owned(),
+            readback_backend: readback_backend.to_owned(),
             backend_tier_used: "cdp".to_owned(),
             required_foreground: false,
         })
     }
 
     #[cfg(not(windows))]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "signature mirrors the Windows implementation"
+    )]
     async fn browser_evaluate_impl(
         &self,
         _session_id: &str,
         _window_hwnd: i64,
         _cdp_target_id: &str,
         _expression: &str,
+        _element_id: Option<&str>,
+        _backend_node_id: Option<i64>,
+        _args: &[Value],
         _await_promise: bool,
         _return_by_value: bool,
     ) -> Result<BrowserEvaluateResponse, ErrorData> {
@@ -3273,7 +3379,48 @@ fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<()
     if let Some(target_id) = params.cdp_target_id.as_deref() {
         validate_cdp_target_id(target_id)?;
     }
+    if let Some(args) = params.args.as_ref()
+        && args.len() > BROWSER_EVALUATE_MAX_ARGS
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_evaluate accepts at most {BROWSER_EVALUATE_MAX_ARGS} args; got {}",
+                args.len()
+            ),
+        ));
+    }
     Ok(())
+}
+
+const BROWSER_EVALUATE_MAX_ARGS: usize = 64;
+
+/// Parses a browser `element_id` into its `(backendNodeId, cdp_target_id)` for
+/// element-scoped evaluation, failing loud when it is not a CDP web element.
+fn parse_browser_evaluate_element(element_id: &str) -> Result<(i64, String), ErrorData> {
+    let parsed = synapse_core::ElementId::parse(element_id).map_err(|err| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("browser_evaluate element_id {element_id:?} is not a valid element id: {err}"),
+        )
+    })?;
+    let backend = synapse_a11y::cdp_backend_from_element_id(&parsed).ok_or_else(|| {
+        mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "browser_evaluate element_id {element_id:?} is not a CDP web element (no backendNodeId); element-scoped evaluation only supports browser DOM elements"
+            ),
+        )
+    })?;
+    let target = synapse_a11y::cdp_target_from_element_id(&parsed).ok_or_else(|| {
+        mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "browser_evaluate element_id {element_id:?} has no embedded CDP target id; re-resolve it via find/observe against the owned tab"
+            ),
+        )
+    })?;
+    Ok((backend, target))
 }
 
 const DEFAULT_CDP_NAVIGATE_WAIT_TIMEOUT_MS: u64 = 10_000;

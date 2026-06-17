@@ -984,6 +984,21 @@ pub struct BrowserEvaluateParams {
     /// `cdp_target_id` without an active session target.
     #[serde(default)]
     pub window_hwnd: Option<i64>,
+    /// Optional element id (from `find`/`observe`) to scope evaluation to a DOM
+    /// element. When set, `expression` MUST be a function and is called
+    /// Playwright-style as `fn(element, ...args)` — the element is the FIRST
+    /// argument (e.g. `el => el.value` or
+    /// `(el, suffix) => el.id + suffix`), followed by any `args`. The element's
+    /// CDP target must be owned by this session.
+    #[serde(default)]
+    pub element_id: Option<String>,
+    /// Optional JSON arguments. When provided (or with `element_id`), `expression`
+    /// is treated as a function declaration invoked with these args (Playwright
+    /// `evaluate(fn, ...args)` semantics). Page-scope args are passed by
+    /// JSON-injection into a `Runtime.evaluate` call; element-scope args are
+    /// passed as `Runtime.callFunctionOn` arguments.
+    #[serde(default)]
+    pub args: Option<Vec<serde_json::Value>>,
     /// Await a returned promise/thenable before resolving. Defaults to true.
     #[serde(default)]
     pub await_promise: Option<bool>,
@@ -1004,6 +1019,12 @@ pub struct BrowserEvaluateResponse {
     pub transport: String,
     pub endpoint: String,
     pub cdp_target_id: String,
+    /// Evaluation scope: "page" (Runtime.evaluate) or "element"
+    /// (Runtime.callFunctionOn on a resolved DOM node).
+    pub scope: String,
+    /// Echo of the element id when scope is "element".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_id: Option<String>,
     pub url: String,
     pub title: String,
     pub ready_state: String,
