@@ -29,7 +29,9 @@ use super::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
+#[cfg(test)]
 const MAILBOX_PREFIX: &str = "agent-mailbox/v1";
+const MESSAGE_PREFIX: &str = "agent-mailbox/v1/recipient_hex/";
 /// CF_KV key prefix for sender-visible receipt rows (#908). Distinct from the
 /// recipient message prefix so receipts never appear in an agent's own inbox.
 const RECEIPT_PREFIX: &str = "agent-mailbox/v1/receipt";
@@ -1103,7 +1105,7 @@ fn scan_inbox(db: &Db, session_id: &str, now_unix_ms: u64) -> Result<InboxScan, 
 
 fn cleanup_expired_mailbox_rows(db: &Db, now_unix_ms: u64) -> Result<usize, ErrorData> {
     let rows = db
-        .scan_cf_prefix(cf::CF_KV, MAILBOX_PREFIX.as_bytes())
+        .scan_cf_prefix(cf::CF_KV, MESSAGE_PREFIX.as_bytes())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     let mut expired_keys = Vec::new();
     for (key, encoded) in rows {
@@ -1482,10 +1484,7 @@ fn require_mailbox_session_id(
 }
 
 fn mailbox_recipient_prefix(session_id: &str) -> String {
-    format!(
-        "{MAILBOX_PREFIX}/recipient_hex/{}/msg/",
-        hex_bytes(session_id.as_bytes())
-    )
+    format!("{MESSAGE_PREFIX}{}/msg/", hex_bytes(session_id.as_bytes()))
 }
 
 fn mailbox_row_key(session_id: &str, sent_at_unix_ms: u64, seq: u64, message_id: &str) -> String {
@@ -2216,6 +2215,86 @@ mod tests {
             now + 4,
         )?;
         assert_eq!(empty.returned_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn receipt_rows_do_not_poison_message_cleanup_before_send() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let now = 35_000;
+        register_session(&service, "sender", now)?;
+        register_session(&service, "receipt-recipient", now)?;
+        register_session(&service, "live-recipient", now)?;
+
+        service.agent_send_impl_at(
+            AgentSendParams {
+                to_session: "receipt-recipient".to_owned(),
+                kind: "task".to_owned(),
+                payload: json!({"receipt": true}),
+                artifact_handle: None,
+                ttl_ms: 60_000,
+                request_receipt: true,
+            },
+            "sender",
+            now,
+        )?;
+
+        let drained = service.agent_inbox_impl_at(
+            AgentInboxParams {
+                drain: true,
+                max_messages: 10,
+                kinds: Vec::new(),
+            },
+            "receipt-recipient",
+            now + 1,
+        )?;
+        assert_eq!(drained.returned_count, 1);
+
+        let db = service.mailbox_db()?;
+        assert_eq!(
+            db.scan_cf_prefix(cf::CF_KV, RECEIPT_PREFIX.as_bytes())?
+                .len(),
+            1,
+            "receipt row must remain present before the next send"
+        );
+
+        let sent = service.agent_send_impl_at(
+            AgentSendParams {
+                to_session: "live-recipient".to_owned(),
+                kind: "after-receipt".to_owned(),
+                payload: json!({"ok": true}),
+                artifact_handle: None,
+                ttl_ms: 60_000,
+                request_receipt: false,
+            },
+            "sender",
+            now + 2,
+        )?;
+        assert_eq!(sent.to_session, "live-recipient");
+
+        let live_inbox = service.agent_inbox_impl_at(
+            AgentInboxParams {
+                drain: true,
+                max_messages: 10,
+                kinds: Vec::new(),
+            },
+            "live-recipient",
+            now + 3,
+        )?;
+        assert_eq!(live_inbox.returned_count, 1);
+        assert_eq!(live_inbox.messages[0].kind, "after-receipt");
+
+        let receipts = service.agent_receipts_impl_at(
+            AgentReceiptsParams {
+                drain: true,
+                max_receipts: 10,
+            },
+            "sender",
+            now + 4,
+        )?;
+        assert_eq!(receipts.returned_count, 1);
+        assert_eq!(receipts.receipts[0].message_kind, "task");
         Ok(())
     }
 
