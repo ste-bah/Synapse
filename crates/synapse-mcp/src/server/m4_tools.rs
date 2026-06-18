@@ -5959,8 +5959,10 @@ mod tests {
         assert!(
             interrupt_script.contains("$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)")
                 && interrupt_script.contains("Write-TextNoBom -Path $tmp")
-                && interrupt_script.contains("Append-LineNoBom"),
-            "Codex app-server interrupt control/events files must be written without a UTF-8 BOM"
+                && interrupt_script.contains("Append-LineNoBom")
+                && interrupt_script.contains("Invoke-WithFileRetry")
+                && interrupt_script.contains("Move-ReplaceWithRetry"),
+            "Codex app-server interrupt control/events files must be no-BOM and retry transient file contention"
         );
     }
 

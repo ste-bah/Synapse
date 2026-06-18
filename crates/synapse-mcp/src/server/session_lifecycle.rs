@@ -878,6 +878,22 @@ impl SessionLifecycleState {
         reason: &str,
         options: SessionTeardownOptions,
     ) -> Result<SessionTeardownReport, ErrorData> {
+        let report = self
+            .teardown_session_with_options_report(session_id, reason, options)
+            .await?;
+        if report.failure_count == 0 {
+            Ok(report)
+        } else {
+            Err(session_teardown_error(report))
+        }
+    }
+
+    pub(crate) async fn teardown_session_with_options_report(
+        &self,
+        session_id: &str,
+        reason: &str,
+        options: SessionTeardownOptions,
+    ) -> Result<SessionTeardownReport, ErrorData> {
         validate_lifecycle_session_id(session_id)?;
         let mut report = SessionTeardownReport::new(session_id, reason);
         self.mark_terminated_session(&mut report);
@@ -903,7 +919,6 @@ impl SessionLifecycleState {
                 report = ?report,
                 "readback=session_lifecycle after=all_owned_resources_reclaimed"
             );
-            Ok(report)
         } else {
             tracing::error!(
                 code = "MCP_SESSION_TEARDOWN_FAILED",
@@ -913,8 +928,8 @@ impl SessionLifecycleState {
                 report = ?report,
                 "session lifecycle teardown encountered cleanup failures"
             );
-            Err(session_teardown_error(report))
         }
+        Ok(report)
     }
 
     pub(crate) async fn release_session_inputs_for_daemon_shutdown(

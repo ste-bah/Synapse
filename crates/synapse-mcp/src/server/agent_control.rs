@@ -257,13 +257,34 @@ pub struct AgentKillResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub journal_killed_event: Option<JournalReadback>,
     /// Full per-resource teardown report (process job close/force, lease, claim,
-    /// desktop, registry transitions) when teardown succeeded.
+    /// desktop, registry transitions). Present even when cleanup sections fail,
+    /// so callers can inspect the exact resource/channel readback.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub teardown: Option<SessionTeardownReport>,
-    /// Set when teardown returned an error; the kill's success is still judged
-    /// by `orphan_process_ids` (the OS process table), never by this alone.
+    /// Structured summary of failed teardown sections. The full `teardown`
+    /// report remains the source of truth for exact resource readbacks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teardown_failure_summary: Option<AgentTeardownFailureSummary>,
+    /// Set when teardown cleanup failed; the kill's success is still judged by
+    /// `orphan_process_ids` (the OS process table), never by this alone.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub teardown_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTeardownFailureSummary {
+    pub session_id: String,
+    pub failure_count: u32,
+    pub failed_sections: Vec<AgentTeardownFailedSection>,
+    pub next_action: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTeardownFailedSection {
+    pub section: String,
+    pub detail: String,
 }
 
 /// One agent's outcome in a `fleet_stop` sweep.
@@ -2055,17 +2076,18 @@ impl SynapseService {
         // of the process tree, plus lease/claim/desktop release and registry
         // close. Keyed by the agent's OWN session id, which owns all of it.
         let lifecycle = self.session_lifecycle_state()?;
-        let (teardown, teardown_error) = match lifecycle
-            .teardown_session_with_options(
+        let teardown_report = lifecycle
+            .teardown_session_with_options_report(
                 &target.session_id,
                 "agent_kill",
                 SessionTeardownOptions::explicit_kill(),
             )
-            .await
-        {
-            Ok(report) => (Some(report), None),
-            Err(error) => (None, Some(error.message.to_string())),
-        };
+            .await?;
+        let teardown_failure_summary = summarize_teardown_failures(&teardown_report);
+        let teardown_error = teardown_failure_summary
+            .as_ref()
+            .map(|summary| format_teardown_failure_error(&teardown_report, summary));
+        let teardown = Some(teardown_report);
 
         // Source of truth for "is it dead": re-read the OS process table.
         let mut process_after = process_readback_for_target(&target);
@@ -2116,6 +2138,7 @@ impl SynapseService {
             completion_artifact_cleanup_error,
             journal_killed_event,
             teardown,
+            teardown_failure_summary,
             teardown_error,
         };
 
@@ -2126,6 +2149,7 @@ impl SynapseService {
             "orphan_process_ids": response.orphan_process_ids,
             "process_after": response.process_after,
             "resolution_source": response.resolution_source,
+            "teardown_failure_summary": response.teardown_failure_summary,
             "teardown_error": response.teardown_error,
             "post_teardown_force_termination": response.post_teardown_force_termination,
             "completion_artifact_cleanup_status": response.completion_artifact_cleanup_status,
@@ -2787,6 +2811,232 @@ fn spawn_stdout_summary(path: &PathBuf) -> (u64, Option<String>) {
         }
     }
     (line_count, last_event_type)
+}
+
+fn summarize_teardown_failures(
+    report: &SessionTeardownReport,
+) -> Option<AgentTeardownFailureSummary> {
+    if report.failure_count == 0 {
+        return None;
+    }
+
+    let mut failed_sections = Vec::new();
+    if report.termination_marker_failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "termination_marker".to_owned(),
+            detail: report
+                .termination_marker_error_message
+                .clone()
+                .unwrap_or_else(|| "termination marker failed without an error message".to_owned()),
+        });
+    }
+    if report.input.failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "input".to_owned(),
+            detail: format!(
+                "released_keys={} released_buttons={} neutralized_pads={} lease_owner_before={:?} error_code={:?} error_message={:?}",
+                report.input.released_keys,
+                report.input.released_buttons,
+                report.input.neutralized_pads,
+                report.input.lease_owner_before,
+                report.input.error_code,
+                report.input.error_message
+            ),
+        });
+    }
+    if report.target.failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "target".to_owned(),
+            detail: format!(
+                "target_sessions_before={} target_sessions_after={} target_cleared={} error_message={:?}",
+                report.target.target_sessions_before,
+                report.target.target_sessions_after,
+                report.target.target_cleared,
+                report.target.error_message
+            ),
+        });
+    }
+    if report.continuity.failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "continuity".to_owned(),
+            detail: format!(
+                "target_row_deleted={} target_row_exists_after={} lease_row_deleted={} lease_row_exists_after={} error_message={:?}",
+                report.continuity.target_row_deleted,
+                report.continuity.target_row_exists_after,
+                report.continuity.lease_row_deleted,
+                report.continuity.lease_row_exists_after,
+                report.continuity.error_message
+            ),
+        });
+    }
+    if report.audit_session.failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "audit_session".to_owned(),
+            detail: format!(
+                "cache_sessions_before={} cache_sessions_after={} removed={} error_message={:?}",
+                report.audit_session.cache_sessions_before,
+                report.audit_session.cache_sessions_after,
+                report.audit_session.removed,
+                report.audit_session.error_message
+            ),
+        });
+    }
+    if report.clipboard.failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "clipboard".to_owned(),
+            detail: format!(
+                "buffer_existed_before={} buffer_exists_after={} buffer_count_before={} buffer_count_after={} error_message={:?}",
+                report.clipboard.buffer_existed_before,
+                report.clipboard.buffer_exists_after,
+                report.clipboard.buffer_count_before,
+                report.clipboard.buffer_count_after,
+                report.clipboard.error_message
+            ),
+        });
+    }
+    if report.cdp.failed > 0 {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "cdp".to_owned(),
+            detail: format!(
+                "owned_before={} closed={} failed={} target_ids={:?}",
+                report.cdp.owned_before,
+                report.cdp.closed,
+                report.cdp.failed,
+                report.cdp.target_ids
+            ),
+        });
+    }
+    if report.target_claims.failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "target_claims".to_owned(),
+            detail: format!(
+                "owned_before={} released={} target_keys={:?} error_message={:?}",
+                report.target_claims.owned_before,
+                report.target_claims.released,
+                report.target_claims.target_keys,
+                report.target_claims.error_message
+            ),
+        });
+    }
+    if report.shell.failed > 0 {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "shell".to_owned(),
+            detail: format!(
+                "job_root={:?} live_jobs_before={} retained_live_jobs={} termination_attempted={} termination_succeeded={} failed={} job_ids={:?} remaining_process_ids={:?} error_code={:?} error_message={:?}",
+                report.shell.job_root,
+                report.shell.live_jobs_before,
+                report.shell.retained_live_jobs,
+                report.shell.termination_attempted,
+                report.shell.termination_succeeded,
+                report.shell.failed,
+                report.shell.job_ids,
+                report.shell.remaining_process_ids,
+                report.shell.error_code,
+                report.shell.error_message
+            ),
+        });
+    }
+    if report.processes.failed > 0 {
+        let items = report
+            .processes
+            .items
+            .iter()
+            .map(|item| {
+                format!(
+                    "{} pid={} resource={:?} launch_target={} remaining={:?} completion_artifact_cleanup_status={:?} completion_artifact_cleanup_error={:?}",
+                    item.tool,
+                    item.pid,
+                    item.resource_id,
+                    item.launch_target,
+                    item.remaining_process_ids_after,
+                    item.completion_artifact_cleanup_status,
+                    item.completion_artifact_cleanup_error
+                )
+            })
+            .collect::<Vec<_>>();
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "processes".to_owned(),
+            detail: format!(
+                "owned_before={} job_close_attempted={} force_termination_attempted={} terminated={} failed={} items=[{}]",
+                report.processes.owned_before,
+                report.processes.job_close_attempted,
+                report.processes.force_termination_attempted,
+                report.processes.terminated,
+                report.processes.failed,
+                items.join("; ")
+            ),
+        });
+    }
+    if report.subscriptions.failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "subscriptions".to_owned(),
+            detail: format!(
+                "owned_before={} cancelled={} subscription_ids={:?} error_code={:?} error_message={:?}",
+                report.subscriptions.owned_before,
+                report.subscriptions.cancelled,
+                report.subscriptions.subscription_ids,
+                report.subscriptions.error_code,
+                report.subscriptions.error_message
+            ),
+        });
+    }
+    if report.session_store.failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "session_store".to_owned(),
+            detail: format!(
+                "key={} existed_before={} deleted={} exists_after={} error_message={:?}",
+                report.session_store.key,
+                report.session_store.existed_before,
+                report.session_store.deleted,
+                report.session_store.exists_after,
+                report.session_store.error_message
+            ),
+        });
+    }
+    if report.registry.failed {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "registry".to_owned(),
+            detail: format!(
+                "closed_recorded={} reason_code={} journal_event_written={} error_message={:?}",
+                report.registry.closed_recorded,
+                report.registry.reason_code,
+                report.registry.journal_event_written,
+                report.registry.error_message
+            ),
+        });
+    }
+    if failed_sections.is_empty() {
+        failed_sections.push(AgentTeardownFailedSection {
+            section: "unknown".to_owned(),
+            detail: format!(
+                "failure_count={} but no failed sub-report flag was set; inspect full teardown report",
+                report.failure_count
+            ),
+        });
+    }
+
+    Some(AgentTeardownFailureSummary {
+        session_id: report.session_id.clone(),
+        failure_count: report.failure_count,
+        failed_sections,
+        next_action: "Inspect the named failed sections in the full teardown report; reclaim the exact target/process/shell/session resource if it remains live, or classify it as already cleaned before rerunning the worker ramp.".to_owned(),
+    })
+}
+
+fn format_teardown_failure_error(
+    report: &SessionTeardownReport,
+    summary: &AgentTeardownFailureSummary,
+) -> String {
+    let sections = summary
+        .failed_sections
+        .iter()
+        .map(|section| format!("{}: {}", section.section, section.detail))
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "session teardown for {:?} failed with {} cleanup failure(s); failed_sections=[{}]; see `teardown_failure_summary` and `teardown` for exact resource readback",
+        report.session_id, report.failure_count, sections
+    )
 }
 
 fn run_codex_interrupt_helper(

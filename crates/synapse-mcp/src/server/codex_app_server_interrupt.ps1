@@ -19,13 +19,42 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+$FileRetryAttempts = 8
+$FileRetryBaseDelayMs = 25
+
+function Invoke-WithFileRetry([string]$Operation, [string]$Path, [scriptblock]$Body) {
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $FileRetryAttempts; $attempt++) {
+        try {
+            return & $Body
+        } catch [System.IO.IOException] {
+            $lastError = $_.Exception.Message
+        } catch [System.UnauthorizedAccessException] {
+            $lastError = $_.Exception.Message
+        }
+        if ($attempt -lt $FileRetryAttempts) {
+            Start-Sleep -Milliseconds ($FileRetryBaseDelayMs * $attempt)
+        }
+    }
+    throw ("{0}_retry_exhausted path={1} attempts={2} last_error={3}" -f $Operation, $Path, $FileRetryAttempts, $lastError)
+}
 
 function Write-TextNoBom([string]$Path, [string]$Value) {
-    [System.IO.File]::WriteAllText($Path, $Value, $Utf8NoBom)
+    Invoke-WithFileRetry -Operation 'write_text_no_bom' -Path $Path -Body {
+        [System.IO.File]::WriteAllText($Path, $Value, $Utf8NoBom)
+    }
 }
 
 function Append-LineNoBom([string]$Path, [string]$Value) {
-    [System.IO.File]::AppendAllText($Path, ($Value + [Environment]::NewLine), $Utf8NoBom)
+    Invoke-WithFileRetry -Operation 'append_line_no_bom' -Path $Path -Body {
+        [System.IO.File]::AppendAllText($Path, ($Value + [Environment]::NewLine), $Utf8NoBom)
+    }
+}
+
+function Move-ReplaceWithRetry([string]$Source, [string]$Destination) {
+    Invoke-WithFileRetry -Operation 'move_replace' -Path $Destination -Body {
+        Move-Item -LiteralPath $Source -Destination $Destination -Force
+    }
 }
 
 function Get-UnixMs {
@@ -69,7 +98,7 @@ function Update-Control([string]$Status, [string]$ErrorText) {
     $current['updated_at_unix_ms'] = Get-UnixMs
     $tmp = "$ControlPath.tmp.interrupt.$PID"
     Write-TextNoBom -Path $tmp -Value ($current | ConvertTo-Json -Depth 100)
-    Move-Item -LiteralPath $tmp -Destination $ControlPath -Force
+    Move-ReplaceWithRetry -Source $tmp -Destination $ControlPath
 }
 
 function Send-WebSocketJson($Socket, [object]$Message) {

@@ -34,8 +34,15 @@ use crate::m2::M2ServiceConfig;
 use crate::m3::M3ServiceConfig;
 use crate::m4::M4ServiceConfig;
 use crate::safety::{DisableReport, OperatorHotkeyImmediateReport, ReleaseAllReport};
-use crate::server::session_lifecycle::SessionProcessResource;
+use crate::server::session_lifecycle::{
+    SessionAuditSessionCleanupReport, SessionCdpCleanupReport, SessionClipboardCleanupReport,
+    SessionContinuityCleanupReport, SessionInputCleanupReport, SessionProcessCleanupItem,
+    SessionProcessCleanupReport, SessionProcessResource, SessionRegistryCleanupReport,
+    SessionShellCleanupReport, SessionStoreCleanupReport, SessionSubscriptionCleanupReport,
+    SessionTargetCleanupReport, SessionTeardownReport,
+};
 use crate::server::session_registry::SpawnedAgentRead;
+use crate::server::target_claims::TargetClaimCleanupReport;
 
 // ---------------------------------------------------------------------------
 // Deterministic unit tests
@@ -236,6 +243,114 @@ fn delivered_via_preserves_highest_ranked_successful_channel() {
         delivered_via.as_deref(),
         Some("codex_app_server_turn_interrupt"),
         "lower-ranked mailbox delivery must not overwrite the rank-1 Codex interrupt verdict"
+    );
+}
+
+fn empty_teardown_report_for_test() -> SessionTeardownReport {
+    SessionTeardownReport {
+        session_id: "session-teardown-summary-test".to_owned(),
+        reason: "agent_kill".to_owned(),
+        started_at_unix_ms: 1,
+        finished_at_unix_ms: 2,
+        already_terminated: false,
+        marked_terminated: true,
+        termination_marker_failed: false,
+        termination_marker_error_message: None,
+        input: SessionInputCleanupReport::default(),
+        target: SessionTargetCleanupReport::default(),
+        continuity: SessionContinuityCleanupReport::default(),
+        audit_session: SessionAuditSessionCleanupReport::default(),
+        clipboard: SessionClipboardCleanupReport::default(),
+        cdp: SessionCdpCleanupReport::default(),
+        target_claims: TargetClaimCleanupReport::default(),
+        shell: SessionShellCleanupReport::default(),
+        processes: SessionProcessCleanupReport::default(),
+        subscriptions: SessionSubscriptionCleanupReport::default(),
+        session_store: SessionStoreCleanupReport::default(),
+        registry: SessionRegistryCleanupReport::default(),
+        failure_count: 0,
+    }
+}
+
+#[test]
+fn teardown_failure_summary_absent_for_success_report() {
+    let report = empty_teardown_report_for_test();
+
+    assert!(
+        summarize_teardown_failures(&report).is_none(),
+        "successful teardown reports must not produce a failure summary"
+    );
+}
+
+#[test]
+fn teardown_failure_summary_names_failed_sections_and_resources() {
+    let mut report = empty_teardown_report_for_test();
+    report.target.failed = true;
+    report.target.target_sessions_before = 1;
+    report.target.target_sessions_after = 1;
+    report.target.error_message = Some("target row still owned".to_owned());
+    report.processes.owned_before = 1;
+    report.processes.failed = 1;
+    report.processes.items.push(SessionProcessCleanupItem {
+        tool: "act_spawn_agent".to_owned(),
+        pid: 12_345,
+        resource_id: Some("agent-spawn-summary-test".to_owned()),
+        launch_target: "codex".to_owned(),
+        agent_cli: Some("codex".to_owned()),
+        registered_at_unix_ms: 1,
+        process_ids_before: vec![12_345],
+        live_process_ids_before: vec![12_345],
+        job_handle_dropped: true,
+        natural_exit_wait_ms: 0,
+        force_termination_status: Some("terminated".to_owned()),
+        completion_status_path: None,
+        completion_status_before_cleanup: None,
+        completion_artifact_cleanup_status: Some("failed".to_owned()),
+        completion_artifact_cleanup_error: Some("completion status file locked".to_owned()),
+        desktop_name: None,
+        desktop_close_attempted: false,
+        desktop_close_succeeded: None,
+        desktop_close_error: None,
+        desktop_window_process_ids_before: Vec::new(),
+        desktop_window_termination_attempted: false,
+        desktop_window_termination_status: None,
+        desktop_window_process_ids_after: Vec::new(),
+        remaining_process_ids_after: Vec::new(),
+    });
+    report.failure_count = 2;
+
+    let summary = summarize_teardown_failures(&report).expect("summary");
+    let sections = summary
+        .failed_sections
+        .iter()
+        .map(|section| section.section.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(sections, vec!["target", "processes"]);
+    assert!(
+        summary.failed_sections[0]
+            .detail
+            .contains("target row still owned"),
+        "target detail must name the failed target cleanup: {:?}",
+        summary.failed_sections[0]
+    );
+    assert!(
+        summary.failed_sections[1]
+            .detail
+            .contains("agent-spawn-summary-test"),
+        "process detail must name the failed spawn resource: {:?}",
+        summary.failed_sections[1]
+    );
+
+    let error = format_teardown_failure_error(&report, &summary);
+    assert!(error.contains("target"), "error: {error}");
+    assert!(error.contains("processes"), "error: {error}");
+    assert!(
+        error.contains("teardown_failure_summary"),
+        "error must point callers to the structured summary: {error}"
+    );
+    assert!(
+        error.contains("teardown"),
+        "error must point callers to the full teardown report: {error}"
     );
 }
 
