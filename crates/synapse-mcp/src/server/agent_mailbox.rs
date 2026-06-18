@@ -64,7 +64,9 @@ static NEXT_MAILBOX_SEQ: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentSendParams {
-    /// Live recipient MCP Streamable HTTP session id.
+    /// Live recipient MCP Streamable HTTP session id, the well-known
+    /// `orchestrator` alias, or a known stale session id whose live successor
+    /// can be resolved from the session registry.
     pub to_session: String,
     /// Caller-defined message kind, such as "handoff", "ready", or "finding".
     pub kind: String,
@@ -326,6 +328,15 @@ struct InboxScan {
     messages: Vec<DecodedMailboxRow>,
 }
 
+#[derive(Clone, Debug)]
+struct MailboxRecipientResolution {
+    requested_to_session: String,
+    resolved_to_session: String,
+    resolution_source: String,
+    recipient: SessionRegistryRead,
+    replaced_recipient: Option<SessionRegistryRead>,
+}
+
 #[derive(Clone)]
 struct DecodedMailboxRow {
     key: Vec<u8>,
@@ -336,7 +347,7 @@ struct DecodedMailboxRow {
 #[tool_router(router = agent_mailbox_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Send a bounded durable JSON message to a live MCP peer session. Fails with RECIPIENT_UNKNOWN for stale/closed/unknown recipients instead of queueing to nowhere. The message is persisted under CF_KV and returned with an exact row readback."
+        description = "Send a bounded durable JSON message to a live MCP peer. `to_session` accepts an exact live MCP session id, the stable `orchestrator` alias, or a known stale session id that resolves to a live same-client successor after MCP reconnect. Fails with RECIPIENT_UNKNOWN when no live physical recipient can be proven instead of queueing to nowhere. The message is persisted under CF_KV for the resolved session id and returned with an exact row readback."
     )]
     pub async fn agent_send(
         &self,
@@ -444,17 +455,16 @@ impl SynapseService {
         validate_send_params(&params)?;
         let db = self.mailbox_db()?;
         let expired_rows_deleted_before = cleanup_expired_mailbox_rows(&db, now_unix_ms)?;
-        let recipient = self.recipient_live_read(from_session, &params.to_session, now_unix_ms)?;
-        let depth_before = queue_depth_for_recipient(&db, &params.to_session, now_unix_ms)?;
+        let resolution = self.recipient_live_read(from_session, &params.to_session, now_unix_ms)?;
+        let to_session = resolution.resolved_to_session.clone();
+        let depth_before = queue_depth_for_recipient(&db, &to_session, now_unix_ms)?;
         if depth_before >= MAX_INBOX_ROWS_PER_RECIPIENT {
-            return Err(mailbox_full_error(
-                from_session,
-                &params.to_session,
-                depth_before,
-            ));
+            return Err(mailbox_full_error(from_session, &to_session, depth_before));
         }
         let command_payload = json!({
-            "to_session": &params.to_session,
+            "requested_to_session": &resolution.requested_to_session,
+            "to_session": &to_session,
+            "recipient_resolution_source": &resolution.resolution_source,
             "kind": &params.kind,
             "payload": &params.payload,
             "artifact_handle": &params.artifact_handle,
@@ -462,7 +472,9 @@ impl SynapseService {
         });
         let command_before = json!({
             "source_of_truth": cf::CF_KV,
-            "recipient_lifecycle": &recipient.lifecycle,
+            "recipient_lifecycle": &resolution.recipient.lifecycle,
+            "recipient_session_id": &resolution.recipient.session_id,
+            "replaced_recipient": &resolution.replaced_recipient,
             "queue_depth_before": depth_before,
             "expired_rows_deleted_before": expired_rows_deleted_before,
         });
@@ -470,7 +482,7 @@ impl SynapseService {
             "agent_send",
             "steer",
             Some(from_session.to_owned()),
-            Some(params.to_session.clone()),
+            Some(to_session.clone()),
             command_payload.clone(),
             command_before.clone(),
             Value::Null,
@@ -479,13 +491,13 @@ impl SynapseService {
 
         let seq = NEXT_MAILBOX_SEQ.fetch_add(1, Ordering::Relaxed);
         let message_id = format!("agentmsg-{now_unix_ms:020}-{seq:020}");
-        let row_key = mailbox_row_key(&params.to_session, now_unix_ms, seq, &message_id);
+        let row_key = mailbox_row_key(&to_session, now_unix_ms, seq, &message_id);
         let message = AgentMailboxMessage {
             schema_version: SCHEMA_VERSION,
             message_id: message_id.clone(),
             row_key: row_key.clone(),
             from_session: from_session.to_owned(),
-            to_session: params.to_session.clone(),
+            to_session: to_session.clone(),
             kind: params.kind.trim().to_owned(),
             payload: params.payload,
             artifact_handle: params.artifact_handle.map(|value| value.trim().to_owned()),
@@ -504,7 +516,7 @@ impl SynapseService {
                 )
             })?;
         let storage_readback = readback_exact_mailbox_row(&db, &row_key)?;
-        let queue_depth_after = queue_depth_for_recipient(&db, &params.to_session, now_unix_ms)?;
+        let queue_depth_after = queue_depth_for_recipient(&db, &to_session, now_unix_ms)?;
 
         // Journal the delivery fact (#897). The mailbox row is already
         // committed, so a journal failure is surfaced with that context.
@@ -515,7 +527,9 @@ impl SynapseService {
         journal_record.session_id = Some(from_session.to_owned());
         journal_record.attributes.conversation_id = Some(from_session.to_owned());
         journal_record.payload = json!({
-            "to_session": &params.to_session,
+            "requested_to_session": &resolution.requested_to_session,
+            "to_session": &to_session,
+            "recipient_resolution_source": &resolution.resolution_source,
             "message_id": &message_id,
             "message_kind": &message.kind,
             "payload_bytes": storage_readback.value_len_bytes,
@@ -552,8 +566,10 @@ impl SynapseService {
         tracing::info!(
             code = "AGENT_MAILBOX_SEND_COMMITTED",
             from_session,
-            to_session = %params.to_session,
-            recipient_lifecycle = %recipient.lifecycle,
+            requested_to_session = %resolution.requested_to_session,
+            to_session = %to_session,
+            recipient_resolution_source = %resolution.resolution_source,
+            recipient_lifecycle = %resolution.recipient.lifecycle,
             message_id,
             row_key,
             kind = %message.kind,
@@ -569,7 +585,7 @@ impl SynapseService {
             ok: true,
             message_id,
             from_session: from_session.to_owned(),
-            to_session: params.to_session,
+            to_session,
             kind: message.kind,
             row_key,
             sent_at_unix_ms: now_unix_ms,
@@ -781,28 +797,62 @@ impl SynapseService {
         from_session: &str,
         to_session: &str,
         now_unix_ms: u64,
-    ) -> Result<SessionRegistryRead, ErrorData> {
+    ) -> Result<MailboxRecipientResolution, ErrorData> {
         validate_session_id(to_session)?;
-        let recipient = {
+        let reads = {
             let guard = self.session_registry_ref().lock().map_err(|_error| {
                 mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
                     "session registry lock poisoned while validating mailbox recipient",
                 )
             })?;
-            guard
-                .reads(now_unix_ms)
-                .into_iter()
-                .find(|entry| entry.session_id == to_session)
+            guard.reads(now_unix_ms)
         };
-        match recipient {
-            Some(read) if read.lifecycle == "live" => Ok(read),
-            other => Err(recipient_unknown_error(
+
+        if let Some(read) = reads
+            .iter()
+            .find(|entry| entry.session_id == to_session)
+            .cloned()
+        {
+            if read.lifecycle == "live" {
+                return Ok(MailboxRecipientResolution {
+                    requested_to_session: to_session.to_owned(),
+                    resolved_to_session: read.session_id.clone(),
+                    resolution_source: "exact_live_session".to_owned(),
+                    recipient: read,
+                    replaced_recipient: None,
+                });
+            }
+            if let Some(successor) = successor_for_rotated_session(&reads, &read) {
+                return Ok(MailboxRecipientResolution {
+                    requested_to_session: to_session.to_owned(),
+                    resolved_to_session: successor.session_id.clone(),
+                    resolution_source: "successor_same_client_identity".to_owned(),
+                    recipient: successor,
+                    replaced_recipient: Some(read),
+                });
+            }
+            return Err(recipient_unknown_error(
                 from_session,
                 to_session,
-                other.as_ref(),
-            )),
+                Some(&read),
+            ));
         }
+
+        if is_orchestrator_alias(to_session) {
+            if let Some(read) = orchestrator_alias_session(&reads, from_session) {
+                return Ok(MailboxRecipientResolution {
+                    requested_to_session: to_session.to_owned(),
+                    resolved_to_session: read.session_id.clone(),
+                    resolution_source: "well_known_orchestrator_alias".to_owned(),
+                    recipient: read,
+                    replaced_recipient: None,
+                });
+            }
+            return Err(recipient_unknown_error(from_session, to_session, None));
+        }
+
+        Err(recipient_unknown_error(from_session, to_session, None))
     }
 
     /// Live MCP sessions other than `exclude_session`, as `(session_id,
@@ -1465,6 +1515,76 @@ fn recipient_unknown_error(
     )
 }
 
+fn is_orchestrator_alias(value: &str) -> bool {
+    value.eq_ignore_ascii_case("orchestrator")
+}
+
+fn orchestrator_alias_session(
+    reads: &[SessionRegistryRead],
+    from_session: &str,
+) -> Option<SessionRegistryRead> {
+    let live_primary = reads
+        .iter()
+        .filter(|entry| entry.lifecycle == "live")
+        .filter(|entry| entry.spawned_agent.is_none())
+        .filter(|entry| entry.agent_kind != "local-model");
+    latest_session_read(
+        live_primary
+            .clone()
+            .filter(|entry| entry.session_id != from_session),
+    )
+    .or_else(|| latest_session_read(live_primary))
+}
+
+fn successor_for_rotated_session(
+    reads: &[SessionRegistryRead],
+    old: &SessionRegistryRead,
+) -> Option<SessionRegistryRead> {
+    if old.lifecycle == "live" {
+        return None;
+    }
+    if let Some(old_spawn) = old.spawned_agent.as_ref() {
+        return latest_session_read(reads.iter().filter(|entry| {
+            entry.lifecycle == "live"
+                && entry.session_id != old.session_id
+                && entry
+                    .spawned_agent
+                    .as_ref()
+                    .is_some_and(|spawned| spawned.spawn_id == old_spawn.spawn_id)
+        }));
+    }
+
+    let old_client_name = old.client_name.as_deref()?;
+    latest_session_read(reads.iter().filter(|entry| {
+        entry.lifecycle == "live"
+            && entry.session_id != old.session_id
+            && entry.spawned_agent.is_none()
+            && entry.client_name.as_deref() == Some(old_client_name)
+            && entry.agent_kind == old.agent_kind
+            && (entry.started_at_unix_ms >= old.started_at_unix_ms
+                || entry.last_seen_unix_ms >= old.last_seen_unix_ms)
+    }))
+}
+
+fn latest_session_read<'a>(
+    reads: impl Iterator<Item = &'a SessionRegistryRead>,
+) -> Option<SessionRegistryRead> {
+    reads
+        .max_by(|left, right| {
+            (
+                left.last_seen_unix_ms,
+                left.started_at_unix_ms,
+                &left.session_id,
+            )
+                .cmp(&(
+                    right.last_seen_unix_ms,
+                    right.started_at_unix_ms,
+                    &right.session_id,
+                ))
+        })
+        .cloned()
+}
+
 fn params_error(message: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_PARAMS_INVALID, message.into())
 }
@@ -1529,6 +1649,8 @@ const fn default_true() -> bool {
 mod tests {
     use std::{num::NonZeroUsize, path::Path};
 
+    use rmcp::model::{ClientCapabilities, Implementation, InitializeRequestParams};
+    use rmcp::transport::streamable_http_server::session::SessionState;
     use serde_json::json;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -1572,6 +1694,24 @@ mod tests {
             .lock()
             .map_err(|_error| anyhow::anyhow!("session registry lock poisoned"))?;
         registry.record_seen(session_id, Some("test".to_owned()), now);
+        Ok(())
+    }
+
+    fn register_initialized_session(
+        service: &SynapseService,
+        session_id: &str,
+        client_name: &str,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let state = SessionState::new(InitializeRequestParams::new(
+            ClientCapabilities::default(),
+            Implementation::new(client_name, "0.0.0-test"),
+        ));
+        let mut registry = service
+            .session_registry_ref()
+            .lock()
+            .map_err(|_error| anyhow::anyhow!("session registry lock poisoned"))?;
+        registry.record_initialized(session_id, &state, "http", now);
         Ok(())
     }
 
@@ -1654,6 +1794,97 @@ mod tests {
             2_030,
         )?;
         assert_eq!(after.returned_count, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn send_to_orchestrator_alias_resolves_latest_live_primary_session() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        register_session(&service, "worker-session", 500)?;
+        register_initialized_session(&service, "orchestrator-old", "codex-mcp-client", 1_000)?;
+        register_initialized_session(&service, "orchestrator-new", "codex-mcp-client", 2_000)?;
+
+        let sent = service.agent_send_impl_at(
+            AgentSendParams {
+                to_session: "orchestrator".to_owned(),
+                kind: "finding".to_owned(),
+                payload: json!({"case": "orchestrator-alias"}),
+                artifact_handle: None,
+                ttl_ms: 60_000,
+                request_receipt: false,
+            },
+            "worker-session",
+            3_000,
+        )?;
+        assert_eq!(sent.to_session, "orchestrator-new");
+
+        let inbox = service.agent_inbox_impl_at(
+            AgentInboxParams {
+                drain: false,
+                max_messages: 10,
+                kinds: Vec::new(),
+            },
+            "orchestrator-new",
+            3_001,
+        )?;
+        assert_eq!(inbox.returned_count, 1);
+        assert_eq!(inbox.messages[0].to_session, "orchestrator-new");
+        assert_eq!(inbox.messages[0].payload["case"], "orchestrator-alias");
+        Ok(())
+    }
+
+    #[test]
+    fn send_to_closed_session_id_resolves_same_client_successor() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        register_session(&service, "worker-session", 500)?;
+        register_initialized_session(&service, "old-session", "codex-mcp-client", 1_000)?;
+        {
+            let mut registry = service
+                .session_registry_ref()
+                .lock()
+                .map_err(|_error| anyhow::anyhow!("session registry lock poisoned"))?;
+            registry.record_closed("old-session", 1_500);
+        }
+        register_initialized_session(&service, "new-session", "codex-mcp-client", 2_000)?;
+
+        let sent = service.agent_send_impl_at(
+            AgentSendParams {
+                to_session: "old-session".to_owned(),
+                kind: "finding".to_owned(),
+                payload: json!({"case": "successor"}),
+                artifact_handle: None,
+                ttl_ms: 60_000,
+                request_receipt: false,
+            },
+            "worker-session",
+            3_000,
+        )?;
+        assert_eq!(sent.to_session, "new-session");
+
+        let old_inbox = service.agent_inbox_impl_at(
+            AgentInboxParams {
+                drain: false,
+                max_messages: 10,
+                kinds: Vec::new(),
+            },
+            "old-session",
+            3_001,
+        )?;
+        assert_eq!(old_inbox.returned_count, 0);
+
+        let new_inbox = service.agent_inbox_impl_at(
+            AgentInboxParams {
+                drain: false,
+                max_messages: 10,
+                kinds: Vec::new(),
+            },
+            "new-session",
+            3_001,
+        )?;
+        assert_eq!(new_inbox.returned_count, 1);
+        assert_eq!(new_inbox.messages[0].payload["case"], "successor");
         Ok(())
     }
 
