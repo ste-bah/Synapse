@@ -1092,68 +1092,100 @@ impl SessionLifecycleState {
         &self,
         active_sessions: &BTreeSet<String>,
     ) -> BTreeSet<String> {
+        // #1238: liveness for a spawned agent is an OS-process fact, never an
+        // "MCP-request recency" fact. An agent doing native Read/Write/Bash
+        // work makes zero Synapse calls for minutes, so the daemon legitimately
+        // idle-evicts its MCP session (a readiness concern), but it must
+        // never drop the kill-on-close job that owns the still-running child (a
+        // *liveness* action). Read the registry once and partition spawned-agent
+        // sessions by a real process probe: live ones are protected from
+        // idle-driven teardown; exited ones remain reap candidates.
+        let registry_reads = match self.session_registry.lock() {
+            Ok(registry) => registry.reads(unix_time_ms_now()),
+            Err(_poisoned) => {
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    "session registry lock poisoned during stale-candidate scan; spawned-agent liveness protection unavailable this pass"
+                );
+                Vec::new()
+            }
+        };
+        let (live_spawn_sessions, exited_spawn_sessions) =
+            partition_spawned_sessions(&registry_reads, &|pid| m4::process_exists(pid));
+        // Treat a live spawned-agent session as "active" everywhere below, so no
+        // ownership ledger (inputs, lease, target, clipboard, process, CDP,
+        // subscriptions) can flag it stale while its process is alive.
+        let live: BTreeSet<String> = active_sessions
+            .iter()
+            .cloned()
+            .chain(live_spawn_sessions)
+            .collect();
+
         let mut candidates = BTreeSet::new();
         if let Ok(snapshot) = self.action_handle.session_inputs_snapshot() {
             for session in snapshot.sessions {
-                add_if_stale(&mut candidates, active_sessions, &session.session_id);
+                add_if_stale(&mut candidates, &live, &session.session_id);
             }
         }
         let lease_status = synapse_action::lease::status();
         if let Some(owner) = lease_status.owner_session_id.as_ref()
             && owner != synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID
         {
-            add_if_stale(&mut candidates, active_sessions, owner);
+            add_if_stale(&mut candidates, &live, owner);
         }
         if let Ok(targets) = self.session_targets.lock() {
             for session_id in targets.keys() {
-                add_if_stale(&mut candidates, active_sessions, session_id);
+                add_if_stale(&mut candidates, &live, session_id);
             }
         }
         if let Ok(state) = self.m3_state.lock() {
             for session_id in state.mcp_audit_sessions.keys() {
-                add_if_stale(&mut candidates, active_sessions, session_id);
+                add_if_stale(&mut candidates, &live, session_id);
             }
         }
         if let Ok(owners) = self.cdp_target_owners.lock() {
             for owner in owners.values() {
-                add_if_stale(&mut candidates, active_sessions, &owner.session_id);
+                add_if_stale(&mut candidates, &live, &owner.session_id);
             }
         }
         if let Ok(claims) = self.target_claims.lock() {
             for read in claims.reads(unix_time_ms_now()) {
-                add_if_stale(&mut candidates, active_sessions, &read.owner_session_id);
+                add_if_stale(&mut candidates, &live, &read.owner_session_id);
             }
         }
         if let Ok(clipboards) = self.session_clipboards.lock() {
             for session_id in clipboards.keys() {
-                add_if_stale(&mut candidates, active_sessions, session_id);
+                add_if_stale(&mut candidates, &live, session_id);
             }
         }
         if let Ok(processes) = self.session_processes.lock() {
             for session_id in processes.keys() {
-                add_if_stale(&mut candidates, active_sessions, session_id);
+                add_if_stale(&mut candidates, &live, session_id);
             }
         }
         if let Ok(session_ids) = self.sse_state.subscription_owner_session_ids() {
             for session_id in session_ids {
-                add_if_stale(&mut candidates, active_sessions, &session_id);
+                add_if_stale(&mut candidates, &live, &session_id);
             }
         }
-        if let Ok(registry) = self.session_registry.lock() {
-            for read in registry.reads(unix_time_ms_now()) {
-                if read.lifecycle == "stale" {
-                    add_if_stale(&mut candidates, active_sessions, &read.session_id);
-                }
-                if spawned_agent_process_exited(&read) && candidates.insert(read.session_id.clone())
-                {
-                    tracing::warn!(
-                        code = "MCP_SESSION_SPAWNED_AGENT_PROCESS_EXITED",
-                        session_id = %read.session_id,
-                        spawned_agent = ?read.spawned_agent,
-                        active_session_count = active_sessions.len(),
-                        "readback=session_registry edge=spawned_primary_process_gone before=session_teardown_candidate"
-                    );
-                }
+        // Non-spawn (operator/human) sessions still reap on MCP-idle staleness
+        // for input/lease/target cleanup. Spawned-agent sessions are
+        // intentionally excluded here; their liveness is governed solely by the
+        // process probe (protected above when alive, reaped below when gone).
+        for read in &registry_reads {
+            if read.lifecycle == "stale" && read.spawned_agent.is_none() {
+                add_if_stale(&mut candidates, &live, &read.session_id);
+            }
+        }
+        for read in exited_spawn_sessions {
+            if candidates.insert(read.session_id.clone()) {
+                tracing::warn!(
+                    code = "MCP_SESSION_SPAWNED_AGENT_PROCESS_EXITED",
+                    session_id = %read.session_id,
+                    spawned_agent = ?read.spawned_agent,
+                    active_session_count = active_sessions.len(),
+                    "readback=session_registry edge=spawned_primary_process_gone before=session_teardown_candidate"
+                );
             }
         }
         candidates
@@ -1836,17 +1868,59 @@ fn add_if_stale(
     }
 }
 
-fn spawned_agent_process_exited(read: &super::session_registry::SessionRegistryRead) -> bool {
+/// The OS pid that proves a spawned agent is alive: its own process when the
+/// daemon learned it (e.g. the Claude/Codex CLI pid), else the launcher pid.
+/// `None` for closed sessions and non-spawn sessions; neither has a spawned
+/// child to liveness-probe.
+fn spawned_agent_probe_pid(read: &super::session_registry::SessionRegistryRead) -> Option<u32> {
     if read.closed_at_unix_ms.is_some() {
-        return false;
+        return None;
     }
-    let Some(spawned_agent) = read.spawned_agent.as_ref() else {
-        return false;
-    };
-    let process_id = spawned_agent
-        .agent_process_id
-        .unwrap_or(spawned_agent.launcher_process_id);
-    !m4::process_exists(process_id)
+    let spawned_agent = read.spawned_agent.as_ref()?;
+    Some(
+        spawned_agent
+            .agent_process_id
+            .unwrap_or(spawned_agent.launcher_process_id),
+    )
+}
+
+#[cfg(test)]
+fn spawned_agent_process_exited(read: &super::session_registry::SessionRegistryRead) -> bool {
+    match spawned_agent_probe_pid(read) {
+        Some(pid) => !m4::process_exists(pid),
+        None => false,
+    }
+}
+
+/// Partitions spawned-agent registry sessions by a real liveness probe (#1238).
+///
+/// Returns `(live, exited)`: `live` is the set of session ids whose spawned
+/// process is still running. These are protected from idle-driven teardown so
+/// the daemon never kills an agent that is mid-work but quiet on the MCP wire.
+/// `exited` are sessions whose spawned process is gone, still reap candidates
+/// even if no exit event reached the journal. `process_alive` is injected so
+/// the rule is unit-testable without real processes; production passes the OS
+/// process-table probe.
+fn partition_spawned_sessions<'a>(
+    reads: &'a [super::session_registry::SessionRegistryRead],
+    process_alive: &dyn Fn(u32) -> bool,
+) -> (
+    BTreeSet<String>,
+    Vec<&'a super::session_registry::SessionRegistryRead>,
+) {
+    let mut live = BTreeSet::new();
+    let mut exited = Vec::new();
+    for read in reads {
+        let Some(pid) = spawned_agent_probe_pid(read) else {
+            continue;
+        };
+        if process_alive(pid) {
+            live.insert(read.session_id.clone());
+        } else {
+            exited.push(read);
+        }
+    }
+    (live, exited)
 }
 
 fn session_store_db(m3_state: &SharedM3State) -> Result<Arc<Db>, String> {
@@ -2001,5 +2075,118 @@ mod tests {
         let read = spawned_read("closed-session", Some(dead_pid), 0, true);
 
         assert!(!spawned_agent_process_exited(&read));
+    }
+
+    // #1238: a spawned agent whose process is alive must be protected from
+    // idle-driven teardown. It is live no matter how long since its last
+    // MCP call. Injected `process_alive` makes the rule deterministic.
+    #[test]
+    fn live_spawned_process_is_protected_not_exited() {
+        let reads = vec![spawned_read("live", Some(1234), 0, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| true);
+        assert!(live.contains("live"));
+        assert!(exited.is_empty());
+    }
+
+    #[test]
+    fn dead_spawned_process_is_exit_candidate_not_live() {
+        let reads = vec![spawned_read("dead", Some(1234), 0, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| false);
+        assert!(live.is_empty());
+        assert_eq!(exited.len(), 1);
+        assert_eq!(exited[0].session_id, "dead");
+    }
+
+    #[test]
+    fn closed_spawned_session_is_neither_live_nor_exit() {
+        let reads = vec![spawned_read("closed", Some(1234), 0, true)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| false);
+        assert!(
+            live.is_empty(),
+            "a closed session has no running child to protect"
+        );
+        assert!(
+            exited.is_empty(),
+            "a closed session is already torn down; not a fresh reap candidate"
+        );
+    }
+
+    #[test]
+    fn non_spawn_session_is_ignored_by_partition() {
+        let mut read = spawned_read("plain", Some(1234), 0, false);
+        read.spawned_agent = None;
+        let reads = [read];
+        let (live, exited) = partition_spawned_sessions(&reads, &|_pid| true);
+        assert!(live.is_empty());
+        assert!(exited.is_empty());
+    }
+
+    // Regression evidence against the real OS process table (#1238): no
+    // injected probe. A genuinely-running spawned process, even with a long-
+    // stale `last_seen` (it made no MCP calls), is protected from teardown;
+    // once actually killed it flips to a reap candidate. This is the exact
+    // signal the fix relies on, proven against reality.
+    #[test]
+    fn real_live_process_protected_until_actually_killed() {
+        #[cfg(windows)]
+        let mut child = {
+            use std::os::windows::process::CommandExt;
+            // Spawn ping.exe DIRECTLY (not via cmd /C) so the pid we track is
+            // the process kill() terminates; no orphaned grandchild. Null the
+            // streams so the 60s child cannot spam the test harness.
+            let mut command = Command::new("ping");
+            command.args(["-n", "60", "127.0.0.1"]);
+            command.stdout(std::process::Stdio::null());
+            command.stderr(std::process::Stdio::null());
+            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+            command
+                .spawn()
+                .expect("long-lived child should spawn for liveness regression")
+        };
+        #[cfg(not(windows))]
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("long-lived child should spawn for liveness regression");
+
+        let pid = child.id();
+        assert!(
+            m4::process_exists(pid),
+            "freshly spawned child must be live in the OS process table"
+        );
+
+        // last_seen far in the past (id arg is unused for stale modelling here;
+        // the point is the probe, not the clock): the process is the truth.
+        let reads = vec![spawned_read("real-live", Some(pid), 0, false)];
+        let (live, exited) = partition_spawned_sessions(&reads, &|probe| m4::process_exists(probe));
+        assert!(
+            live.contains("real-live"),
+            "a live spawned process must be protected from idle teardown"
+        );
+        assert!(exited.is_empty(), "a live process is not a reap candidate");
+
+        child.kill().expect("kill the regression child");
+        let _ = child.wait();
+        for _ in 0..200 {
+            if !m4::process_exists(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !m4::process_exists(pid),
+            "child must be gone from the OS process table after kill"
+        );
+
+        let (live_after, exited_after) =
+            partition_spawned_sessions(&reads, &|probe| m4::process_exists(probe));
+        assert!(
+            live_after.is_empty(),
+            "a dead process must NOT be protected"
+        );
+        assert_eq!(exited_after.len(), 1, "a dead spawn is a reap candidate");
+        assert_eq!(exited_after[0].session_id, "real-live");
     }
 }
