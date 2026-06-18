@@ -1206,6 +1206,30 @@ impl SessionLifecycleState {
         candidates
     }
 
+    pub(crate) fn live_spawned_session_ids_for_shutdown(&self) -> BTreeSet<String> {
+        let registry_reads = match self.session_registry.lock() {
+            Ok(registry) => registry.reads(unix_time_ms_now()),
+            Err(_poisoned) => {
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    "session registry lock poisoned during daemon-shutdown spawned-agent liveness scan; restart handoff cannot include idle-evicted spawned sessions this pass"
+                );
+                Vec::new()
+            }
+        };
+        let live_spawn_sessions =
+            live_spawned_session_ids(&registry_reads, &|pid| m4::process_exists(pid));
+        if !live_spawn_sessions.is_empty() {
+            tracing::info!(
+                code = "MCP_SESSION_LIVE_SPAWNED_SHUTDOWN_HANDOFF_CANDIDATES",
+                live_spawn_session_count = live_spawn_sessions.len(),
+                session_ids = ?live_spawn_sessions,
+                "readback=session_registry edge=daemon_shutdown before=live_spawned_process_handoff"
+            );
+        }
+        live_spawn_sessions
+    }
+
     fn mark_terminated_session(&self, report: &mut SessionTeardownReport) {
         match self.terminated_sessions.lock() {
             Ok(mut terminated) => {
@@ -1947,6 +1971,13 @@ fn partition_spawned_sessions<'a>(
     (live, exited)
 }
 
+fn live_spawned_session_ids(
+    reads: &[super::session_registry::SessionRegistryRead],
+    process_alive: &dyn Fn(u32) -> bool,
+) -> BTreeSet<String> {
+    partition_spawned_sessions(reads, process_alive).0
+}
+
 fn spawned_agent_exit_reason(read: &super::session_registry::SessionRegistryRead) -> &'static str {
     let Some(spawned) = read.spawned_agent.as_ref() else {
         return SPAWNED_AGENT_PROCESS_EXITED_REASON;
@@ -2170,6 +2201,26 @@ mod tests {
         assert!(live.is_empty());
         assert_eq!(exited.len(), 1);
         assert_eq!(exited[0].session_id, "both-dead");
+    }
+
+    #[test]
+    fn live_spawned_session_ids_include_only_process_alive_spawns() {
+        let mut plain = spawned_read("plain", Some(111), 0, false);
+        plain.spawned_agent = None;
+        let reads = vec![
+            spawned_read("live-agent", Some(111), 0, false),
+            spawned_read("live-launcher", Some(222), 333, false),
+            spawned_read("dead", Some(444), 0, false),
+            spawned_read("closed", Some(555), 0, true),
+            plain,
+        ];
+
+        let live = live_spawned_session_ids(&reads, &|pid| pid == 111 || pid == 333);
+
+        assert_eq!(
+            live,
+            BTreeSet::from(["live-agent".to_owned(), "live-launcher".to_owned()])
+        );
     }
 
     #[test]

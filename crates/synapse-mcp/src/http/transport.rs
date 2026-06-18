@@ -73,6 +73,8 @@ struct HttpRouterRuntime {
 struct DaemonShutdownInputCleanupReport {
     reason: &'static str,
     active_sessions_before: usize,
+    live_spawn_sessions_before: usize,
+    shutdown_sessions_before: usize,
     cleaned_sessions: usize,
     orphan_lease_owner_cleanup:
         Option<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
@@ -881,8 +883,10 @@ async fn cleanup_active_session_inputs_for_shutdown(
     reason: &'static str,
 ) -> DaemonShutdownInputCleanupReport {
     let active_sessions = active_http_session_ids(session_manager).await;
-    let mut session_reports = Vec::with_capacity(active_sessions.len());
-    for session_id in &active_sessions {
+    let live_spawn_sessions = session_lifecycle.live_spawned_session_ids_for_shutdown();
+    let shutdown_sessions = shutdown_cleanup_session_ids(&active_sessions, &live_spawn_sessions);
+    let mut session_reports = Vec::with_capacity(shutdown_sessions.len());
+    for session_id in &shutdown_sessions {
         session_reports.push(
             session_lifecycle
                 .release_session_inputs_for_daemon_shutdown(session_id, reason)
@@ -893,7 +897,7 @@ async fn cleanup_active_session_inputs_for_shutdown(
     let mut final_lease = synapse_action::lease::status();
     if let Some(owner_session_id) = final_lease.owner_session_id.clone()
         && owner_session_id != synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID
-        && !active_sessions.contains(&owner_session_id)
+        && !shutdown_sessions.contains(&owner_session_id)
     {
         orphan_lease_owner_cleanup = Some(
             session_lifecycle
@@ -921,6 +925,8 @@ async fn cleanup_active_session_inputs_for_shutdown(
     DaemonShutdownInputCleanupReport {
         reason,
         active_sessions_before: active_sessions.len(),
+        live_spawn_sessions_before: live_spawn_sessions.len(),
+        shutdown_sessions_before: shutdown_sessions.len(),
         cleaned_sessions: session_reports.len(),
         orphan_lease_owner_cleanup,
         final_lease_held: final_lease.held,
@@ -930,6 +936,17 @@ async fn cleanup_active_session_inputs_for_shutdown(
         failure_count,
         session_reports,
     }
+}
+
+fn shutdown_cleanup_session_ids(
+    active_sessions: &BTreeSet<String>,
+    live_spawn_sessions: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    active_sessions
+        .iter()
+        .cloned()
+        .chain(live_spawn_sessions.iter().cloned())
+        .collect()
 }
 
 #[cfg(test)]
@@ -4073,7 +4090,7 @@ async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashMap,
+        collections::{BTreeSet, HashMap},
         sync::{Arc, Mutex},
         time::Duration,
     };
@@ -4505,6 +4522,23 @@ mod tests {
         Arc::new(Mutex::new(
             crate::server::session_registry::SessionRegistry::default(),
         ))
+    }
+
+    #[test]
+    fn shutdown_cleanup_session_ids_include_live_spawned_sessions() {
+        let active = BTreeSet::from(["active".to_owned(), "both".to_owned()]);
+        let live_spawns = BTreeSet::from(["both".to_owned(), "idle-spawn".to_owned()]);
+
+        let cleanup = shutdown_cleanup_session_ids(&active, &live_spawns);
+
+        assert_eq!(
+            cleanup,
+            BTreeSet::from([
+                "active".to_owned(),
+                "both".to_owned(),
+                "idle-spawn".to_owned()
+            ])
+        );
     }
 
     #[tokio::test]
