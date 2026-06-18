@@ -437,7 +437,10 @@ fn chrome_extension_runtime_state(setting: &Value) -> ChromeExtensionRuntimeStat
         .unwrap_or_default();
     disable_reasons.sort_unstable();
     disable_reasons.dedup();
-    let runtime_enabled = active_bit != Some(false) && disable_reasons.is_empty();
+    // `active_bit=false` can appear in Secure Preferences for an extension that
+    // still has active API permissions. Only concrete disable reasons prove the
+    // extension is disabled enough to remove debugger/nativeMessaging risk.
+    let runtime_enabled = disable_reasons.is_empty();
     ChromeExtensionRuntimeState {
         active_bit,
         disable_reasons,
@@ -3846,6 +3849,22 @@ mod tests {
         assert_eq!(runtime_state.active_bit, Some(false));
         assert_eq!(runtime_state.disable_reasons, vec![65536]);
         assert!(!runtime_state.runtime_enabled);
+    }
+
+    #[test]
+    fn chrome_extension_runtime_state_does_not_trust_active_bit_alone() {
+        let setting = json!({
+            "active_bit": false,
+            "active_permissions": {
+                "api": ["debugger", "nativeMessaging"]
+            }
+        });
+
+        let runtime_state = chrome_extension_runtime_state(&setting);
+
+        assert_eq!(runtime_state.active_bit, Some(false));
+        assert!(runtime_state.disable_reasons.is_empty());
+        assert!(runtime_state.runtime_enabled);
     }
 
     #[test]

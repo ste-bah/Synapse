@@ -549,7 +549,9 @@ function Get-ChromeExtensionRuntimeState {
         $disableReasons = @($Setting.disable_reasons)
     }
     $runtimeEnabled = $true
-    if ($activeBit -eq $false -or $disableReasons.Count -gt 0) {
+    # Chrome can leave active_bit=false on rows whose active_permissions still
+    # include debugger/nativeMessaging. Disable reasons are the concrete SoT.
+    if ($disableReasons.Count -gt 0) {
         $runtimeEnabled = $false
     }
 
