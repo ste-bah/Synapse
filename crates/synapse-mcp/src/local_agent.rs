@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 const SYNAPSE_TOOL_CATALOG: &str = "synapse_tool_catalog";
 const SYNAPSE_TOOL_CALL: &str = "synapse_tool";
+const INTERNALIZED_TOOL_CALL_ENVELOPE: &str = "tool_call";
 
 #[derive(Clone, Debug)]
 pub(crate) struct LocalAgentCli {
@@ -152,6 +153,7 @@ struct Runner {
     task_tool_contract: Option<TaskToolContract>,
     completed_task_tools: BTreeSet<String>,
     completed_task_tool_sources: BTreeMap<String, String>,
+    approval_wait_elapsed: Duration,
     http: reqwest::Client,
 }
 
@@ -179,6 +181,8 @@ impl ToolExposure {
 #[derive(Clone, Debug)]
 struct TaskToolContract {
     allowed_tools: BTreeSet<String>,
+    ordered_tools: Vec<String>,
+    argument_templates: BTreeMap<String, JsonObject>,
     source: &'static str,
 }
 
@@ -201,10 +205,43 @@ impl TaskToolContract {
             .join(", ")
     }
 
+    fn ordered_tools_json(&self) -> Value {
+        Value::Array(
+            self.ordered_tools
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect(),
+        )
+    }
+
+    fn ordered_tools_display(&self) -> String {
+        self.ordered_tools.join(" -> ")
+    }
+
+    fn argument_templates_json(&self) -> Value {
+        let templates = self
+            .argument_templates
+            .iter()
+            .map(|(tool, args)| (tool.clone(), Value::Object(args.clone())))
+            .collect::<Map<_, _>>();
+        Value::Object(templates)
+    }
+
     fn to_json(&self) -> Value {
         json!({
             "source": self.source,
             "allowed_tools": self.allowed_tools_json(),
+            "ordered_tools": self.ordered_tools_json(),
+            "argument_templates": self.argument_templates_json(),
+        })
+    }
+
+    fn model_facing_json(&self) -> Value {
+        json!({
+            "allowed_tools": self.allowed_tools_json(),
+            "ordered_tools": self.ordered_tools_json(),
+            "argument_templates": self.argument_templates_json(),
         })
     }
 }
@@ -337,12 +374,12 @@ impl Runner {
         let event_url = agent_event_url(&cli.mcp_url, &spawn_id)?;
         let tool_exposure = resolve_tool_exposure(&registry, tools.len());
         let task_tool_contract = infer_task_tool_contract(&task, &tools);
-        let openai_tools = match tool_exposure {
-            ToolExposure::Direct => tools.iter().map(openai_tool_from_mcp).collect::<Vec<_>>(),
-            ToolExposure::Routed => routed_harness_tools(),
-            // Internalized: surface is in the weights — inject ZERO tools.
-            ToolExposure::Internalized => Vec::new(),
-        };
+        let openai_tools = openai_tools_for_exposure(
+            tool_exposure,
+            &tools,
+            task_tool_contract.as_ref(),
+            &registry,
+        )?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_millis(cli.timeout_ms))
             .build()
@@ -449,6 +486,7 @@ impl Runner {
             task_tool_contract,
             completed_task_tools: BTreeSet::new(),
             completed_task_tool_sources: BTreeMap::new(),
+            approval_wait_elapsed: Duration::ZERO,
             http,
         };
         runner.write_line(json!({
@@ -492,9 +530,14 @@ impl Runner {
         let started = Instant::now();
         let mut used_any_tool = false;
         for turn in 1..=self.cli.max_turns {
-            if started.elapsed() > Duration::from_millis(self.cli.timeout_ms) {
+            let active_elapsed = local_agent_active_elapsed(started, self.approval_wait_elapsed);
+            if active_elapsed > Duration::from_millis(self.cli.timeout_ms) {
                 bail!(
-                    "MODEL_ENDPOINT_UNREACHABLE: local-agent timeout exceeded before turn {turn}"
+                    "LOCAL_AGENT_TIMEOUT: local-agent active timeout exceeded before turn {turn} \
+                     (active_ms={} approval_wait_ms={} timeout_ms={})",
+                    active_elapsed.as_millis(),
+                    self.approval_wait_elapsed.as_millis(),
+                    self.cli.timeout_ms,
                 );
             }
             self.turn_count = turn;
@@ -609,7 +652,9 @@ impl Runner {
 
     async fn execute_tool_call(&mut self, call: OpenAiToolCall) -> anyhow::Result<()> {
         self.tool_call_count = self.tool_call_count.saturating_add(1);
-        let routed = call.name == SYNAPSE_TOOL_CALL;
+        let internalized_envelope = self.tool_exposure == ToolExposure::Internalized
+            && call.name == INTERNALIZED_TOOL_CALL_ENVELOPE;
+        let routed = call.name == SYNAPSE_TOOL_CALL || internalized_envelope;
         let catalog = call.name == SYNAPSE_TOOL_CATALOG;
         self.write_line(json!({
             "type": "local.tool_call.started",
@@ -677,8 +722,16 @@ impl Runner {
             return Ok(());
         }
 
-        let (tool_name, args) = if routed {
+        let (tool_name, args) = if call.name == SYNAPSE_TOOL_CALL {
             match parse_routed_tool_call(&call.arguments) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    self.record_tool_parse_error(&call, error).await?;
+                    return Ok(());
+                }
+            }
+        } else if internalized_envelope {
+            match parse_internalized_tool_call_envelope(&call.arguments) {
                 Ok(parsed) => parsed,
                 Err(error) => {
                     self.record_tool_parse_error(&call, error).await?;
@@ -704,6 +757,26 @@ impl Runner {
         if self.is_duplicate_successful_workspace_put(&tool_name, &args) {
             self.record_duplicate_workspace_put_completion(&call, &tool_name, routed, &args)
                 .await?;
+            return Ok(());
+        }
+
+        if self.should_defer_repeated_completed_task_tool_for_contract(&tool_name) {
+            self.record_repeated_task_contract_tool_deferred(&call, &tool_name, routed, &args)
+                .await?;
+            return Ok(());
+        }
+
+        if let Some(reason) = task_contract_out_of_order_rejection(
+            self.task_tool_contract.as_ref(),
+            &self.completed_task_tools,
+            &tool_name,
+        ) {
+            let terminal = self
+                .record_model_tool_call_invalid(&call, &tool_name, routed, &reason)
+                .await?;
+            if terminal {
+                bail!("MODEL_TOOL_CALL_INVALID: {tool_name}: {}", reason.reason);
+            }
             return Ok(());
         }
 
@@ -826,7 +899,12 @@ impl Runner {
             self.record_completed_task_tool(&tool_name, "model_tool_call");
             self.attach_task_contract_progress(&mut result_value);
         }
-        let result_text = bounded_result_text(&result_value);
+        let result_text = bounded_result_text(&model_tool_result_value(
+            &result_value,
+            &self.task_tool_contract,
+            &self.completed_task_tools,
+            &self.successful_workspace_puts,
+        ));
         self.messages.push(json!({
             "role": "tool",
             "tool_call_id": call.id,
@@ -859,7 +937,7 @@ impl Runner {
             "tool_exposure": self.tool_exposure.as_str(),
         }))
         .await?;
-        if !is_error && self.should_complete_verified_workspace_contract() {
+        if !is_error && self.should_complete_verified_task_contract() {
             self.record_verified_workspace_contract_completion().await?;
         }
         Ok(())
@@ -875,6 +953,14 @@ impl Runner {
 
     fn should_defer_repeated_workspace_put_for_contract(&self, tool_name: &str) -> bool {
         workspace_put_contract_repetition_should_defer(
+            &self.task_tool_contract,
+            &self.completed_task_tools,
+            tool_name,
+        )
+    }
+
+    fn should_defer_repeated_completed_task_tool_for_contract(&self, tool_name: &str) -> bool {
+        task_contract_completed_tool_repetition_should_defer(
             &self.task_tool_contract,
             &self.completed_task_tools,
             tool_name,
@@ -982,8 +1068,6 @@ impl Runner {
         routed: bool,
         args: &JsonObject,
     ) -> anyhow::Result<()> {
-        let missing_tools =
-            missing_task_contract_tools(&self.task_tool_contract, &self.completed_task_tools);
         let result_value = json!({
             "error": "WORKSPACE_PUT_ALREADY_COMPLETED",
             "recoverable": true,
@@ -996,10 +1080,19 @@ impl Runner {
                 &self.successful_workspace_puts,
             ),
             "completion_deferred": true,
-            "missing_task_tools": missing_tools,
             "suggestion": "Do not call workspace_put again. Call the missing exact-tool contract tool(s), using the suggested arguments when present.",
         });
-        let result_text = bounded_result_text(&result_value);
+        let result_text = bounded_result_text(&model_tool_result_value(
+            &json!({
+                "error": "WORKSPACE_PUT_ALREADY_COMPLETED",
+                "executed": false,
+                "duplicate_suppressed": true,
+                "message": "workspace_put already succeeded and was read back in this run",
+            }),
+            &self.task_tool_contract,
+            &self.completed_task_tools,
+            &self.successful_workspace_puts,
+        ));
         self.messages.push(json!({
             "role": "tool",
             "tool_call_id": call.id,
@@ -1032,6 +1125,75 @@ impl Runner {
             "tool_response": result_value,
             "error_code": "WORKSPACE_PUT_ALREADY_COMPLETED",
             "terminal": false,
+            "tool_exposure": self.tool_exposure.as_str(),
+        }))
+        .await?;
+        Ok(())
+    }
+
+    async fn record_repeated_task_contract_tool_deferred(
+        &mut self,
+        call: &OpenAiToolCall,
+        tool_name: &str,
+        routed: bool,
+        args: &JsonObject,
+    ) -> anyhow::Result<()> {
+        let result_value = json!({
+            "ok": true,
+            "executed": false,
+            "duplicate_suppressed": true,
+            "tool": tool_name,
+            "reason": "exact-tool contract tool already completed in this run; this repeated call was not dispatched",
+            "arguments": args,
+            "task_contract_progress": task_contract_progress_value(
+                &self.task_tool_contract,
+                &self.completed_task_tools,
+                &self.successful_workspace_puts,
+            ),
+            "completion_deferred": true,
+            "suggestion": "Do not repeat completed exact-tool contract tools. Call the suggested next missing tool with suggested_next_arguments when present.",
+        });
+        let result_text = bounded_result_text(&model_tool_result_value(
+            &json!({
+                "ok": true,
+                "executed": false,
+                "duplicate_suppressed": true,
+                "name": tool_name,
+                "message": "that function already completed; do not call it again",
+            }),
+            &self.task_tool_contract,
+            &self.completed_task_tools,
+            &self.successful_workspace_puts,
+        ));
+        self.messages.push(json!({
+            "role": "tool",
+            "tool_call_id": call.id,
+            "content": result_text,
+        }));
+        self.write_line(json!({
+            "type": "local.tool_call.finished",
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "turn_index": self.turn_count,
+            "tool_name": call.name,
+            "routed_tool_name": if routed { Some(tool_name) } else { None },
+            "tool_call_id": call.id,
+            "status": "ok",
+            "result": result_value,
+            "tool_exposure": self.tool_exposure.as_str(),
+        }))?;
+        self.post_event(json!({
+            "event": "tool_call_finished",
+            "session_id": self.mcp_session_id,
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "registry_name": self.registry.name,
+            "turn_index": self.turn_count,
+            "tool_name": call.name,
+            "routed_tool_name": if routed { Some(tool_name) } else { None },
+            "tool_call_id": call.id,
+            "tool_response": result_value,
+            "error_code": "",
             "tool_exposure": self.tool_exposure.as_str(),
         }))
         .await?;
@@ -1091,12 +1253,16 @@ impl Runner {
         );
         gate_args.insert("spawn_id".to_owned(), Value::String(self.spawn_id.clone()));
 
-        let verdict = match self
+        let wait_started = Instant::now();
+        let gate_result = self
             .mcp
             .peer()
             .call_tool(CallToolRequestParams::new("approval_gate").with_arguments(gate_args))
-            .await
-        {
+            .await;
+        let wait_elapsed = wait_started.elapsed();
+        self.approval_wait_elapsed = self.approval_wait_elapsed.saturating_add(wait_elapsed);
+
+        let verdict = match gate_result {
             Ok(result) => parse_gate_verdict(&tool_result_value(&result), &args)?,
             Err(error) => {
                 if tool_call_error_is_terminal(&error) {
@@ -1159,23 +1325,41 @@ impl Runner {
         } else {
             rejection.suggestion
         };
-        let result_value = json!({ "error": detail });
+        let task_contract_progress = task_contract_progress_value(
+            &self.task_tool_contract,
+            &self.completed_task_tools,
+            &self.successful_workspace_puts,
+        );
+        let mut model_feedback = json!({
+            "error": "MODEL_TOOL_CALL_INVALID",
+            "tool": tool_name,
+            "message": rejection.reason,
+            "recoverable": !terminal,
+            "retry_count": self.invalid_tool_call_count,
+            "retry_limit": self.cli.tool_parse_retry_limit,
+            "exact_function_contract": self
+                .task_tool_contract
+                .as_ref()
+                .map(TaskToolContract::model_facing_json),
+            "suggestion": suggestion,
+        });
+        if let Some(progress) = task_contract_model_status_value(
+            &self.task_tool_contract,
+            &self.completed_task_tools,
+            &self.successful_workspace_puts,
+        ) {
+            attach_model_contract_status_feedback(&mut model_feedback, progress);
+        }
+        let mut result_value = json!({ "error": detail });
+        if let Some(progress) = task_contract_progress {
+            if let Value::Object(result) = &mut result_value {
+                result.insert("task_contract_progress".to_owned(), progress);
+            }
+        }
         self.messages.push(json!({
             "role": "tool",
             "tool_call_id": call.id,
-            "content": json!({
-                "error": "MODEL_TOOL_CALL_INVALID",
-                "tool": tool_name,
-                "message": rejection.reason,
-                "recoverable": !terminal,
-                "retry_count": self.invalid_tool_call_count,
-                "retry_limit": self.cli.tool_parse_retry_limit,
-                "task_tool_contract": self
-                    .task_tool_contract
-                    .as_ref()
-                    .map(TaskToolContract::to_json),
-                "suggestion": suggestion,
-            }).to_string(),
+            "content": model_feedback.to_string(),
         }));
         self.write_line(json!({
             "type": "local.tool_call.finished",
@@ -1275,7 +1459,32 @@ impl Runner {
     ) -> anyhow::Result<()> {
         self.parse_error_count = self.parse_error_count.saturating_add(1);
         let detail = format!("TOOL_CALL_ARGUMENTS_NOT_JSON: {error}");
-        let result_value = json!({ "error": detail });
+        let task_contract_progress = task_contract_progress_value(
+            &self.task_tool_contract,
+            &self.completed_task_tools,
+            &self.successful_workspace_puts,
+        );
+        let mut result_value = json!({ "error": detail });
+        if let Some(progress) = task_contract_progress.clone() {
+            if let Value::Object(result) = &mut result_value {
+                result.insert("task_contract_progress".to_owned(), progress);
+            }
+        }
+        let mut model_feedback = json!({
+            "error": "MODEL_TOOL_ARGUMENTS_INVALID",
+            "tool": call.name,
+            "message": detail,
+            "recoverable": self.parse_error_count <= self.cli.tool_parse_retry_limit,
+            "retry_count": self.parse_error_count,
+            "retry_limit": self.cli.tool_parse_retry_limit,
+        });
+        if let Some(progress) = task_contract_model_status_value(
+            &self.task_tool_contract,
+            &self.completed_task_tools,
+            &self.successful_workspace_puts,
+        ) {
+            attach_model_contract_status_feedback(&mut model_feedback, progress);
+        }
         self.write_line(json!({
             "type": "local.tool_parse_error",
             "conversation_id": self.conversation_id,
@@ -1290,7 +1499,7 @@ impl Runner {
         self.messages.push(json!({
             "role": "tool",
             "tool_call_id": call.id,
-            "content": detail,
+            "content": model_feedback.to_string(),
         }));
         self.post_event(json!({
             "event": "tool_call_finished",
@@ -1479,14 +1688,19 @@ impl Runner {
 
     async fn chat_completion(&self) -> anyhow::Result<ChatCompletion> {
         let stream = should_stream(self.cli.no_stream, self.tool_exposure);
+        let turn_tools = self.openai_tools_for_current_turn()?;
+        let turn_messages = self.messages_for_current_turn();
         let mut body = json!({
             "model": self.registry.model_id,
-            "messages": self.messages,
-            "tools": self.openai_tools,
+            "messages": turn_messages,
+            "tools": turn_tools.tools,
             "tool_choice": "auto",
             "temperature": 0,
             "stream": stream,
         });
+        if let Some(tool_choice) = turn_tools.tool_choice {
+            body["tool_choice"] = tool_choice;
+        }
         apply_runtime_preset(&self.registry, &mut body);
         if stream {
             body["stream_options"] = json!({"include_usage": true});
@@ -1510,6 +1724,36 @@ impl Runner {
         } else {
             parse_streaming_response(response).await
         }
+    }
+
+    fn messages_for_current_turn(&self) -> Vec<Value> {
+        let mut messages = self.messages.clone();
+        if self.tool_exposure == ToolExposure::Internalized {
+            if let Some(contract) = &self.task_tool_contract {
+                if let Some(message) =
+                    task_contract_next_instruction_message(contract, &self.completed_task_tools)
+                {
+                    messages.push(message);
+                }
+            }
+        }
+        messages
+    }
+
+    fn openai_tools_for_current_turn(&self) -> anyhow::Result<TurnToolSelection> {
+        if self.tool_exposure == ToolExposure::Internalized {
+            if let Some(contract) = &self.task_tool_contract {
+                return exact_contract_turn_tools_for_internalized(
+                    &self.tools,
+                    contract,
+                    &self.completed_task_tools,
+                );
+            }
+        }
+        Ok(TurnToolSelection {
+            tools: self.openai_tools.clone(),
+            tool_choice: None,
+        })
     }
 
     async fn truncate_context_if_needed(&mut self) -> anyhow::Result<()> {
@@ -1714,8 +1958,13 @@ impl Runner {
         }
     }
 
-    fn should_complete_verified_workspace_contract(&self) -> bool {
+    fn should_complete_verified_task_contract(&self) -> bool {
         verified_workspace_contract_complete(&self.task_tool_contract, &self.completed_task_tools)
+            || verified_workspace_checkpoint_contract_complete(
+                &self.task_tool_contract,
+                &self.completed_task_tools,
+                &self.successful_workspace_puts,
+            )
     }
 
     async fn record_verified_workspace_contract_completion(&mut self) -> anyhow::Result<()> {
@@ -1834,6 +2083,12 @@ struct WorkspacePutReadbackPlan {
     expected_value: Value,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct TurnToolSelection {
+    tools: Vec<Value>,
+    tool_choice: Option<Value>,
+}
+
 fn model_tool_call_pre_gate_rejection(
     tool_name: &str,
     args: &JsonObject,
@@ -1858,6 +2113,9 @@ fn model_tool_call_pre_gate_rejection(
                 "Retry using only an allowed task tool with the exact user-provided arguments.",
             ));
         }
+        if let Some(rejection) = task_contract_argument_rejection(contract, tool_name, args) {
+            return Some(rejection);
+        }
     }
     match tool_name {
         "agent_send" | "approval_decide" | "approval_gate" => {
@@ -1879,6 +2137,50 @@ fn model_tool_call_pre_gate_rejection(
     }
 }
 
+fn task_contract_argument_rejection(
+    contract: &TaskToolContract,
+    tool_name: &str,
+    args: &JsonObject,
+) -> Option<ModelToolCallRejection> {
+    let expected = contract.argument_templates.get(tool_name)?;
+    if expected == args {
+        return None;
+    }
+    let missing = expected
+        .keys()
+        .filter(|key| !args.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let extra = args
+        .keys()
+        .filter(|key| !expected.contains_key(*key))
+        .cloned()
+        .collect::<Vec<_>>();
+    let changed = expected
+        .iter()
+        .filter(|(key, expected_value)| {
+            args.get(*key)
+                .is_some_and(|actual_value| actual_value != *expected_value)
+        })
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    Some(ModelToolCallRejection::recoverable(
+        format!(
+            "{tool_name} arguments do not match this exact-tool contract; expected {}, got {}; missing_keys=[{}], extra_keys=[{}], changed_keys=[{}]",
+            stable_json_object_text(expected),
+            stable_json_object_text(args),
+            missing.join(", "),
+            extra.join(", "),
+            changed.join(", ")
+        ),
+        "Retry with contract_status.next_function.arguments exactly; do not add, omit, or change keys.",
+    ))
+}
+
+fn stable_json_object_text(args: &JsonObject) -> String {
+    serde_json::to_string(&Value::Object(args.clone())).unwrap_or_else(|_| "{}".to_owned())
+}
+
 fn infer_task_tool_contract(task: &str, tools: &[Tool]) -> Option<TaskToolContract> {
     let lower = task.to_ascii_lowercase();
     let exact_tool_phrase = [
@@ -1893,24 +2195,49 @@ fn infer_task_tool_contract(task: &str, tools: &[Tool]) -> Option<TaskToolContra
     if !exact_tool_phrase {
         return None;
     }
-    let allowed_tools = tools
+    let mut mentioned_tools = tools
         .iter()
         .filter_map(|tool| {
             let name = tool.name.as_ref();
-            task_mentions_tool_name(task, name).then(|| name.to_owned())
+            task_tool_name_position(task, name).map(|position| (position, name.to_owned()))
         })
-        .collect::<BTreeSet<_>>();
+        .collect::<Vec<_>>();
+    mentioned_tools.sort_by(|(left_position, left_name), (right_position, right_name)| {
+        left_position
+            .cmp(right_position)
+            .then_with(|| left_name.cmp(right_name))
+    });
+    let ordered_tools = mentioned_tools
+        .iter()
+        .map(|(_, name)| name.clone())
+        .collect::<Vec<_>>();
+    let allowed_tools = ordered_tools.iter().cloned().collect::<BTreeSet<_>>();
+    let argument_templates = mentioned_tools
+        .iter()
+        .filter_map(|(_, name)| {
+            task_tool_argument_template_for_name(task, name).map(|args| (name.clone(), args))
+        })
+        .collect::<BTreeMap<_, _>>();
     if allowed_tools.is_empty() {
         return None;
     }
     Some(TaskToolContract {
         allowed_tools,
+        ordered_tools,
+        argument_templates,
         source: "task_exact_tool_phrase",
     })
 }
 
-fn task_mentions_tool_name(task: &str, tool_name: &str) -> bool {
+fn task_tool_name_position(task: &str, tool_name: &str) -> Option<usize> {
+    task_tool_name_positions(task, tool_name)
+        .into_iter()
+        .find(|position| !task_tool_mention_is_denied(task, *position))
+}
+
+fn task_tool_name_positions(task: &str, tool_name: &str) -> Vec<usize> {
     let mut search_start = 0;
+    let mut positions = Vec::new();
     while let Some(offset) = task[search_start..].find(tool_name) {
         let start = search_start + offset;
         let end = start + tool_name.len();
@@ -1925,15 +2252,98 @@ fn task_mentions_tool_name(task: &str, tool_name: &str) -> bool {
                 .next()
                 .is_none_or(|ch| !is_tool_name_char(ch));
         if before_ok && after_ok {
-            return true;
+            positions.push(start);
         }
         search_start = end;
     }
-    false
+    positions
+}
+
+fn task_tool_mention_is_denied(task: &str, tool_position: usize) -> bool {
+    let line_start = task[..tool_position]
+        .rfind('\n')
+        .map(|offset| offset + 1)
+        .unwrap_or(0);
+    let line_end = task[tool_position..]
+        .find('\n')
+        .map(|offset| tool_position + offset)
+        .unwrap_or(task.len());
+    let line = task[line_start..line_end].to_ascii_lowercase();
+    let tool_offset = tool_position.saturating_sub(line_start);
+    let before_tool = &line[..tool_offset.min(line.len())];
+    let denial_markers = [
+        "do not call",
+        "do not use",
+        "don't call",
+        "don't use",
+        "never call",
+        "never use",
+        "avoid",
+        "forbidden",
+        "prohibited",
+        "not allowed",
+        "unless task names",
+    ];
+    denial_markers
+        .iter()
+        .any(|marker| before_tool.contains(marker) || line.contains(marker))
 }
 
 fn is_tool_name_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn task_tool_argument_template(task: &str, tool_position: usize) -> Option<JsonObject> {
+    let line_end = task[tool_position..]
+        .find('\n')
+        .map(|offset| tool_position + offset)
+        .unwrap_or(task.len());
+    let line_tail = &task[tool_position..line_end];
+    let object_offset = line_tail.find('{')?;
+    let object_start = tool_position + object_offset;
+    parse_json_object_at(task, object_start).ok()
+}
+
+fn task_tool_argument_template_for_name(task: &str, tool_name: &str) -> Option<JsonObject> {
+    task_tool_name_positions(task, tool_name)
+        .into_iter()
+        .filter(|position| !task_tool_mention_is_denied(task, *position))
+        .find_map(|position| task_tool_argument_template(task, position))
+}
+
+fn parse_json_object_at(input: &str, object_start: usize) -> anyhow::Result<JsonObject> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in input[object_start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    let end = object_start + offset + ch.len_utf8();
+                    let value: Value = serde_json::from_str(&input[object_start..end])?;
+                    return value
+                        .as_object()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("argument template must be a JSON object"));
+                }
+            }
+            _ => {}
+        }
+    }
+    bail!("argument template JSON object is unterminated")
 }
 
 fn missing_task_contract_tools(
@@ -1944,12 +2354,44 @@ fn missing_task_contract_tools(
         .as_ref()
         .map(|contract| {
             contract
-                .allowed_tools
-                .difference(completed_task_tools)
+                .ordered_tools
+                .iter()
+                .filter(|tool| !completed_task_tools.contains(*tool))
                 .cloned()
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn next_missing_task_contract_tool<'a>(
+    contract: &'a TaskToolContract,
+    completed_task_tools: &BTreeSet<String>,
+) -> Option<&'a str> {
+    contract
+        .ordered_tools
+        .iter()
+        .find(|tool| !completed_task_tools.contains(*tool))
+        .map(String::as_str)
+}
+
+fn task_contract_next_instruction_message(
+    contract: &TaskToolContract,
+    completed_task_tools: &BTreeSet<String>,
+) -> Option<Value> {
+    let next_tool = next_missing_task_contract_tool(contract, completed_task_tools)?;
+    let arguments = contract
+        .argument_templates
+        .get(next_tool)
+        .cloned()
+        .unwrap_or_default();
+    let arguments_text =
+        serde_json::to_string(&Value::Object(arguments)).unwrap_or_else(|_| "{}".to_owned());
+    Some(json!({
+        "role": "user",
+        "content": format!(
+            "NEXT_REQUIRED_FUNCTION\nname: {next_tool}\narguments: {arguments_text}\nReturn exactly one OpenAI tool call for this function now. Any other function name is off-contract and no tool will run."
+        ),
+    }))
 }
 
 fn workspace_put_contract_repetition_should_defer(
@@ -1962,6 +2404,47 @@ fn workspace_put_contract_repetition_should_defer(
         && !missing_task_contract_tools(task_tool_contract, completed_task_tools).is_empty()
 }
 
+fn task_contract_completed_tool_repetition_should_defer(
+    task_tool_contract: &Option<TaskToolContract>,
+    completed_task_tools: &BTreeSet<String>,
+    tool_name: &str,
+) -> bool {
+    let Some(contract) = task_tool_contract else {
+        return false;
+    };
+    contract.allowed_tools.contains(tool_name)
+        && completed_task_tools.contains(tool_name)
+        && !missing_task_contract_tools(task_tool_contract, completed_task_tools).is_empty()
+}
+
+fn task_contract_out_of_order_rejection(
+    contract: Option<&TaskToolContract>,
+    completed_task_tools: &BTreeSet<String>,
+    tool_name: &str,
+) -> Option<ModelToolCallRejection> {
+    let contract = contract?;
+    if !contract.allowed_tools.contains(tool_name) || completed_task_tools.contains(tool_name) {
+        return None;
+    }
+    let remaining = contract
+        .ordered_tools
+        .iter()
+        .filter(|tool| !completed_task_tools.contains(*tool))
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected = remaining.first()?;
+    if expected == tool_name {
+        return None;
+    }
+    Some(ModelToolCallRejection::recoverable(
+        format!(
+            "{tool_name} is out of order for this exact-tool contract; next required tool is {expected}; remaining order: {}",
+            remaining.join(" -> ")
+        ),
+        "Retry with the next required function from contract_status.next_function and its exact JSON arguments.",
+    ))
+}
+
 fn verified_workspace_contract_complete(
     task_tool_contract: &Option<TaskToolContract>,
     completed_task_tools: &BTreeSet<String>,
@@ -1972,6 +2455,19 @@ fn verified_workspace_contract_complete(
     contract.allowed_tools.len() == 2
         && contract.allowed_tools.contains("workspace_put")
         && contract.allowed_tools.contains("workspace_get")
+        && missing_task_contract_tools(task_tool_contract, completed_task_tools).is_empty()
+}
+
+fn verified_workspace_checkpoint_contract_complete(
+    task_tool_contract: &Option<TaskToolContract>,
+    completed_task_tools: &BTreeSet<String>,
+    successful_workspace_puts: &[JsonObject],
+) -> bool {
+    let Some(contract) = task_tool_contract else {
+        return false;
+    };
+    contract.allowed_tools.contains("workspace_put")
+        && !successful_workspace_puts.is_empty()
         && missing_task_contract_tools(task_tool_contract, completed_task_tools).is_empty()
 }
 
@@ -2006,6 +2502,7 @@ fn task_contract_progress_value(
     let mut progress = json!({
         "source": contract.source,
         "allowed_tools": contract.allowed_tools_json(),
+        "ordered_tools": contract.ordered_tools_json(),
         "completed_tools": completed_tools,
         "missing_tools": missing_tools,
         "all_required_tools_complete": missing_tools.is_empty(),
@@ -2022,6 +2519,20 @@ fn task_contract_progress_value(
                 "suggested_next_tool".to_owned(),
                 Value::String(next_tool.clone()),
             );
+            if let Some(arguments) = contract
+                .argument_templates
+                .get(&next_tool)
+                .map(|args| Value::Object(args.clone()))
+            {
+                map.insert("suggested_next_arguments".to_owned(), arguments);
+                map.insert(
+                    "suggestion".to_owned(),
+                    Value::String(format!(
+                        "Next call {next_tool} with suggested_next_arguments."
+                    )),
+                );
+                return Some(progress);
+            }
             if next_tool == "workspace_get" {
                 if let Some(arguments) = successful_workspace_puts.last().and_then(|put_args| {
                     workspace_put_readback_plan(put_args)
@@ -2058,16 +2569,187 @@ fn task_contract_progress_value(
     Some(progress)
 }
 
+fn task_contract_model_status_value(
+    task_tool_contract: &Option<TaskToolContract>,
+    completed_task_tools: &BTreeSet<String>,
+    successful_workspace_puts: &[JsonObject],
+) -> Option<Value> {
+    let contract = task_tool_contract.as_ref()?;
+    let remaining = missing_task_contract_tools(task_tool_contract, completed_task_tools);
+    let completed = completed_task_tools
+        .iter()
+        .cloned()
+        .map(Value::String)
+        .collect::<Vec<_>>();
+    let all_required_functions_complete = remaining.is_empty();
+    let mut status = json!({
+        "allowed_function_names": contract.allowed_tools_json(),
+        "ordered_function_names": contract.ordered_tools_json(),
+        "completed_function_names": completed,
+        "remaining_function_names": remaining.clone(),
+        "all_required_functions_complete": all_required_functions_complete,
+    });
+    let Value::Object(map) = &mut status else {
+        return Some(status);
+    };
+    let next_tool = remaining.first().cloned();
+    if let Some(next_tool) = next_tool {
+        let next_arguments = if let Some(arguments) = contract
+            .argument_templates
+            .get(&next_tool)
+            .map(|args| Value::Object(args.clone()))
+        {
+            arguments
+        } else if next_tool == "workspace_get" {
+            successful_workspace_puts
+                .last()
+                .and_then(|put_args| {
+                    workspace_put_readback_plan(put_args)
+                        .ok()
+                        .map(|plan| Value::Object(plan.arguments))
+                })
+                .unwrap_or_else(|| Value::Object(Map::new()))
+        } else {
+            Value::Object(Map::new())
+        };
+        map.insert(
+            "next_function".to_owned(),
+            json!({
+                "name": next_tool,
+                "arguments": next_arguments,
+            }),
+        );
+        map.insert(
+            "instruction".to_owned(),
+            Value::String(format!(
+                "Return exactly one function call now: name={next_tool}; arguments=next_function.arguments. Do not call any other name and do not use positional arrays."
+            )),
+        );
+    } else {
+        map.insert(
+            "instruction".to_owned(),
+            Value::String(
+                "All required function calls are complete; return the final answer without another tool call."
+                    .to_owned(),
+            ),
+        );
+    }
+    Some(status)
+}
+
+fn strip_model_hidden_contract_fields(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let filtered = map
+                .iter()
+                .filter(|(key, _)| {
+                    !matches!(
+                        key.as_str(),
+                        "task_contract_progress"
+                            | "missing_task_tools"
+                            | "completed_task_tool_sources"
+                    )
+                })
+                .map(|(key, value)| (key.clone(), strip_model_hidden_contract_fields(value)))
+                .collect::<Map<_, _>>();
+            Value::Object(filtered)
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .map(strip_model_hidden_contract_fields)
+                .collect(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn model_tool_result_value(
+    result_value: &Value,
+    task_tool_contract: &Option<TaskToolContract>,
+    completed_task_tools: &BTreeSet<String>,
+    successful_workspace_puts: &[JsonObject],
+) -> Value {
+    let Some(status) = task_contract_model_status_value(
+        task_tool_contract,
+        completed_task_tools,
+        successful_workspace_puts,
+    ) else {
+        return strip_model_hidden_contract_fields(result_value);
+    };
+    let mut value = json!({
+        "result": strip_model_hidden_contract_fields(result_value),
+        "contract_status": status,
+    });
+    if let Some(status) = value.get("contract_status").cloned() {
+        attach_model_contract_status_feedback(&mut value, status);
+    }
+    value
+}
+
+fn attach_model_contract_status_feedback(model_feedback: &mut Value, status: Value) {
+    let Value::Object(feedback) = model_feedback else {
+        return;
+    };
+    if let Some(next_function) = status.get("next_function").cloned() {
+        let instruction = status
+            .get("instruction")
+            .cloned()
+            .unwrap_or_else(|| Value::String("Call next_function now.".to_owned()));
+        feedback.insert("next_function".to_owned(), next_function.clone());
+        feedback.insert(
+            "call_next".to_owned(),
+            json!({
+                "function": next_function,
+                "instruction": instruction,
+            }),
+        );
+    }
+    feedback.insert("contract_status".to_owned(), status);
+}
+
 fn task_contract_prompt(contract: &TaskToolContract) -> String {
-    format!(
+    let mut prompt = format!(
         "Exact-tool contract active.\n\
 Allowed tool names: {}.\n\
+Required tool order: {}.\n\
 Use only these tool names exactly; a semantically similar tool name is invalid.\n\
+For OpenAI tool_calls, function.name must be the exact tool name and function.arguments must be the JSON object; no wrapper and no positional array.\n\
 Copy the task's argument keys and values exactly into the allowed tool call.\n\
 If workspace_put is allowed and the task gives a value, its arguments must include run_id, key, and value.\n\
 Do not add expected_version unless the task explicitly asks to replace an existing row.",
-        contract.allowed_tools_display()
-    )
+        contract.allowed_tools_display(),
+        contract.ordered_tools_display()
+    );
+    if let Some(guidance) = browser_target_contract_guidance(contract) {
+        prompt.push('\n');
+        prompt.push_str(&guidance);
+    }
+    prompt
+}
+
+fn browser_target_contract_guidance(contract: &TaskToolContract) -> Option<String> {
+    let hints = contract
+        .ordered_tools
+        .iter()
+        .filter_map(|tool| match tool.as_str() {
+            "cdp_open_tab" => Some("cdp_open_tab opens the owned Chrome tab"),
+            "target_claim" => Some("target_claim claims the returned owned target"),
+            "browser_set_value" => Some("browser_set_value changes a field in the owned tab"),
+            "target_act" => Some("target_act mutates the owned target/lane"),
+            "cdp_target_info" => Some("cdp_target_info reads typed page text/vitals"),
+            "browser_evaluate" => Some("browser_evaluate reads back DOM state"),
+            "workspace_put" => Some("workspace_put records the verified result"),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if hints.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Browser/target route hints: {}. Any unlisted status, probe, control, or semantically similar tool name fails this contract.",
+        hints.join("; ")
+    ))
 }
 
 async fn readback_workspace_put(
@@ -2231,6 +2913,79 @@ fn routed_harness_tools() -> Vec<Value> {
     ]
 }
 
+fn openai_tools_for_exposure(
+    tool_exposure: ToolExposure,
+    tools: &[Tool],
+    task_tool_contract: Option<&TaskToolContract>,
+    registry: &LocalModelRegistryRow,
+) -> anyhow::Result<Vec<Value>> {
+    match tool_exposure {
+        ToolExposure::Direct => Ok(tools.iter().map(openai_tool_from_mcp).collect::<Vec<_>>()),
+        ToolExposure::Routed => Ok(routed_harness_tools()),
+        ToolExposure::Internalized => {
+            contract_tools_for_internalized(tools, task_tool_contract, registry)
+        }
+    }
+}
+
+fn contract_tools_for_internalized(
+    tools: &[Tool],
+    task_tool_contract: Option<&TaskToolContract>,
+    registry: &LocalModelRegistryRow,
+) -> anyhow::Result<Vec<Value>> {
+    let Some(contract) = task_tool_contract else {
+        return Ok(Vec::new());
+    };
+    if let Some(max_tools) = registry.max_tools {
+        if contract.ordered_tools.len() > max_tools {
+            bail!(
+                "MODEL_TOOLS_UNSUPPORTED: exact-tool contract needs {} tools but registry max_tools is {}",
+                contract.ordered_tools.len(),
+                max_tools
+            );
+        }
+    }
+    contract
+        .ordered_tools
+        .iter()
+        .map(|name| {
+            openai_tool_by_name(tools, name).with_context(|| {
+                format!("MODEL_TOOLS_UNSUPPORTED: contract tool {name} missing from tools/list")
+            })
+        })
+        .collect()
+}
+
+fn openai_tool_by_name(tools: &[Tool], name: &str) -> Option<Value> {
+    tools
+        .iter()
+        .find(|tool| tool.name.as_ref() == name)
+        .map(openai_tool_from_mcp)
+}
+
+fn exact_contract_turn_tools_for_internalized(
+    tools: &[Tool],
+    contract: &TaskToolContract,
+    completed_task_tools: &BTreeSet<String>,
+) -> anyhow::Result<TurnToolSelection> {
+    let Some(next_tool) = next_missing_task_contract_tool(contract, completed_task_tools) else {
+        return Ok(TurnToolSelection {
+            tools: Vec::new(),
+            tool_choice: None,
+        });
+    };
+    let tool = openai_tool_by_name(tools, next_tool).with_context(|| {
+        format!("MODEL_TOOLS_UNSUPPORTED: contract tool {next_tool} missing from tools/list")
+    })?;
+    Ok(TurnToolSelection {
+        tools: vec![tool],
+        tool_choice: Some(json!({
+            "type": "function",
+            "function": {"name": next_tool},
+        })),
+    })
+}
+
 fn resolve_tool_exposure(row: &LocalModelRegistryRow, tool_count: usize) -> ToolExposure {
     // Internalized models carry the surface in their weights — never inject a
     // catalog, regardless of max_tools. This takes precedence over the routed
@@ -2278,6 +3033,38 @@ fn parse_routed_tool_call(raw: &str) -> anyhow::Result<(String, JsonObject)> {
         Some(other) => {
             bail!("routed tool arguments must be a JSON object, got {other}");
         }
+        None => Map::new(),
+    };
+    Ok((name, arguments))
+}
+
+fn parse_internalized_tool_call_envelope(raw: &str) -> anyhow::Result<(String, JsonObject)> {
+    let mut envelope = parse_tool_arguments(raw)?;
+    let name = envelope
+        .remove("name")
+        .or_else(|| envelope.remove("tool_name"))
+        .or_else(|| envelope.remove("function"))
+        .or_else(|| envelope.remove("function_name"))
+        .and_then(|value| value.as_str().map(str::trim).map(ToOwned::to_owned))
+        .filter(|value| !value.is_empty())
+        .context("internalized tool_call envelope requires non-empty tool_name")?;
+    let arguments = match envelope
+        .remove("arguments")
+        .or_else(|| envelope.remove("args"))
+    {
+        Some(Value::Object(map)) => map,
+        Some(Value::String(raw)) => {
+            let value: Value = serde_json::from_str(&raw)
+                .context("internalized tool_call arguments string is not JSON")?;
+            value
+                .as_object()
+                .cloned()
+                .context("internalized tool_call arguments string must decode to a JSON object")?
+        }
+        Some(Value::Array(_)) => bail!(
+            "internalized tool_call args must be a JSON object with exact argument keys; positional arrays are ambiguous and rejected fail-closed"
+        ),
+        Some(other) => bail!("internalized tool_call arguments must be a JSON object, got {other}"),
         None => Map::new(),
     };
     Ok((name, arguments))
@@ -2374,12 +3161,19 @@ fn apply_runtime_preset(row: &LocalModelRegistryRow, body: &mut Value) {
             }
         }
         "internalized_no_catalog" => {
-            // Surface is in the weights: send NO tool catalog and no forced
-            // choice. The model emits tool calls from a near-empty prompt; the
-            // response is parsed/routed exactly like Direct exposure.
+            // Surface is in the weights: send NO full catalog. Exact-tool
+            // contract runs may still carry a bounded task-local tool list; it
+            // keeps function-name selection grounded without reintroducing the
+            // huge catalog that internalization exists to avoid.
             if let Some(object) = body.as_object_mut() {
-                object.remove("tools");
-                object.remove("tool_choice");
+                let has_bounded_tools = object
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|tools| !tools.is_empty());
+                if !has_bounded_tools {
+                    object.remove("tools");
+                    object.remove("tool_choice");
+                }
             }
         }
         _ => {}
@@ -2749,7 +3543,7 @@ fn local_agent_spawn_root_dir() -> anyhow::Result<PathBuf> {
 /// approach is therefore retired; this prompt only governs behavior.
 fn system_prompt(tool_exposure: ToolExposure, tools: &[Tool]) -> String {
     const BASE: &str = "Synapse agent. Use attached MCP tools to inspect/change state.\nRules:\n- Never invent tool results.\n- Stored artifact -> read back before success.\n- post_write_readback.matched=true => success; do not repeat write.\n- Summarize after required tools succeed.";
-    const INTERNALIZED_BASE: &str = "Synapse agent. Return one tool call and no prose when a tool is needed.\nRules:\n- Use task-requested tool names; no probe/control tools unless task names them.\n- Copy exact argument keys/values from task; omit no required keys; add no keys.\n- workspace_put requires key and value or artifact; do not add expected_version unless task says replace.\n- Never invent tool results.\n- Stored artifact -> read back before success.\n- post_write_readback.matched=true => success; do not repeat write.";
+    const INTERNALIZED_BASE: &str = "Synapse agent. Return one OpenAI tool_call and no prose when a tool is needed.\nRules:\n- function.name = exact task-requested Synapse tool name.\n- function.arguments = JSON object string with exact argument keys/values; never a positional array.\n- Do not use wrapper, probe, control, status, retry, or reconcile calls unless task names them.\n- workspace_put requires key and value or artifact; do not add expected_version unless task says replace.\n- Never invent tool results.\n- Stored artifact -> read back before success.\n- post_write_readback.matched=true => success; do not repeat write.";
     match tool_exposure {
         // Direct: the model holds every tool schema natively, so it just needs
         // to know they are there and callable by name.
@@ -2843,12 +3637,17 @@ fn parse_gate_verdict(verdict: &Value, fallback: &JsonObject) -> anyhow::Result<
     }
 }
 
+fn local_agent_active_elapsed(started: Instant, approval_wait_elapsed: Duration) -> Duration {
+    started.elapsed().saturating_sub(approval_wait_elapsed)
+}
+
 fn error_code_from_detail(detail: &str) -> &str {
     for code in [
         "MODEL_ENDPOINT_UNREACHABLE",
         "MODEL_TOOLS_UNSUPPORTED",
         "MODEL_EMPTY_COMPLETION",
         "MODEL_TOOL_CALL_INVALID",
+        "LOCAL_AGENT_TIMEOUT",
         "LOCAL_AGENT_CONTEXT_OVERFLOW",
         "LOCAL_AGENT_INTERRUPTED",
         "LOCAL_AGENT_TURN_LIMIT",
@@ -2979,6 +3778,35 @@ mod tests {
         assert_eq!(name, "workspace_put");
         assert_eq!(args["run_id"], "issue985");
         assert_eq!(args["value"]["actual"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn internalized_tool_call_envelope_parses_only_object_arguments() -> anyhow::Result<()> {
+        let (name, args) = parse_internalized_tool_call_envelope(
+            r##"{"tool_name":"cdp_open_tab","args":{"url":"http://127.0.0.1:8896/fixture.html","window_hwnd":2427400}}"##,
+        )?;
+        assert_eq!(name, "cdp_open_tab");
+        assert_eq!(args["url"], "http://127.0.0.1:8896/fixture.html");
+        assert_eq!(args["window_hwnd"], 2427400);
+
+        let (name, args) = parse_internalized_tool_call_envelope(
+            r#"{"function":"target_claim","args":{"ttl_ms":120000}}"#,
+        )?;
+        assert_eq!(name, "target_claim");
+        assert_eq!(args["ttl_ms"], 120000);
+
+        let (name, args) = parse_internalized_tool_call_envelope(
+            r#"{"function_name":"target_claim","args":{"ttl_ms":120000}}"#,
+        )?;
+        assert_eq!(name, "target_claim");
+        assert_eq!(args["ttl_ms"], 120000);
+
+        let array = parse_internalized_tool_call_envelope(
+            r#"{"tool_name":"cdp_open_tab","args":["http://127.0.0.1:8896/fixture.html","2427400"]}"#,
+        )
+        .expect_err("positional args are ambiguous and must fail closed");
+        assert!(array.to_string().contains("positional arrays"));
         Ok(())
     }
 
@@ -3212,6 +4040,185 @@ mod tests {
     }
 
     #[test]
+    fn exact_tool_contract_defers_repeated_completed_browser_tool() {
+        let tools = tools_named([
+            "cdp_open_tab",
+            "target_claim",
+            "target_act",
+            "browser_evaluate",
+            "workspace_put",
+        ]);
+        let task = "Use exactly these real Synapse tools in this exact order:\n\
+cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+        let mut completed = BTreeSet::new();
+        completed.insert("cdp_open_tab".to_owned());
+
+        assert!(task_contract_completed_tool_repetition_should_defer(
+            &Some(contract.clone()),
+            &completed,
+            "cdp_open_tab"
+        ));
+        assert!(!task_contract_completed_tool_repetition_should_defer(
+            &Some(contract.clone()),
+            &completed,
+            "target_claim"
+        ));
+        assert!(!task_contract_completed_tool_repetition_should_defer(
+            &Some(contract.clone()),
+            &completed,
+            "act_press"
+        ));
+
+        for tool in [
+            "target_claim",
+            "target_act",
+            "browser_evaluate",
+            "workspace_put",
+        ] {
+            completed.insert(tool.to_owned());
+        }
+        assert!(!task_contract_completed_tool_repetition_should_defer(
+            &Some(contract),
+            &completed,
+            "cdp_open_tab"
+        ));
+    }
+
+    #[test]
+    fn exact_tool_contract_rejects_out_of_order_allowed_tool_before_approval() {
+        let tools = tools_named([
+            "cdp_open_tab",
+            "target_claim",
+            "browser_set_value",
+            "target_act",
+            "cdp_target_info",
+            "workspace_put",
+        ]);
+        let task = "Use exactly these real Synapse tools in this exact order:\n\
+1. cdp_open_tab {\"url\":\"http://127.0.0.1:8896/fixture.html\",\"window_hwnd\":2427400}\n\
+2. target_claim {\"ttl_ms\":120000}\n\
+3. browser_set_value {\"selector\":\"#lane-value\",\"text\":\"x\"}\n\
+4. target_act {\"selector\":\"#mark\",\"verb\":\"click\",\"wait_timeout_ms\":10000}\n\
+5. cdp_target_info {}\n\
+6. workspace_put {\"run_id\":\"issue1246\",\"key\":\"browser-target\",\"value\":{\"ok\":true}}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+        let completed = BTreeSet::from([
+            "cdp_open_tab".to_owned(),
+            "target_claim".to_owned(),
+            "browser_set_value".to_owned(),
+        ]);
+
+        let rejection =
+            task_contract_out_of_order_rejection(Some(&contract), &completed, "workspace_put")
+                .expect("workspace_put is allowed but not next");
+        assert!(rejection.reason.contains("out of order"));
+        assert!(
+            rejection
+                .reason
+                .contains("next required tool is target_act")
+        );
+        assert!(!rejection.terminal);
+        assert!(
+            task_contract_out_of_order_rejection(Some(&contract), &completed, "target_act")
+                .is_none()
+        );
+        assert!(
+            task_contract_out_of_order_rejection(Some(&contract), &completed, "act_press")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exact_tool_contract_rejects_argument_drift_before_approval() -> anyhow::Result<()> {
+        let tools = tools_named([
+            "cdp_open_tab",
+            "target_claim",
+            "browser_set_value",
+            "target_act",
+            "cdp_target_info",
+            "workspace_put",
+        ]);
+        let task = "Use exactly these real Synapse tools in this exact order:\n\
+1. cdp_open_tab {\"url\":\"http://127.0.0.1:8896/fixture.html\",\"window_hwnd\":2427400}\n\
+2. target_claim {\"ttl_ms\":120000}\n\
+3. browser_set_value {\"selector\":\"#lane-value\",\"text\":\"issue1246\"}\n\
+4. target_act {\"selector\":\"#mark\",\"verb\":\"click\",\"wait_timeout_ms\":10000}\n\
+5. cdp_target_info {}\n\
+6. workspace_put {\"run_id\":\"issue1246\",\"key\":\"browser-target\",\"value\":{\"ok\":true}}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact contract");
+
+        let exact_empty = Map::new();
+        assert!(
+            model_tool_call_pre_gate_rejection(
+                "cdp_target_info",
+                &exact_empty,
+                true,
+                Some(&contract)
+            )
+            .is_none()
+        );
+
+        let extra_args: JsonObject = serde_json::from_value(json!({"include": []}))?;
+        let rejection = model_tool_call_pre_gate_rejection(
+            "cdp_target_info",
+            &extra_args,
+            true,
+            Some(&contract),
+        )
+        .expect("extra argument must fail before approval");
+        assert!(
+            rejection
+                .reason
+                .contains("expected {}, got {\"include\":[]}")
+        );
+        assert!(rejection.reason.contains("extra_keys=[include]"));
+        assert!(!rejection.terminal);
+
+        let missing_args: JsonObject =
+            serde_json::from_value(json!({"run_id":"issue1246","key":"browser-target"}))?;
+        let rejection = model_tool_call_pre_gate_rejection(
+            "workspace_put",
+            &missing_args,
+            true,
+            Some(&contract),
+        )
+        .expect("missing exact value must fail before approval");
+        assert!(rejection.reason.contains("missing_keys=[value]"));
+
+        let changed_args: JsonObject = serde_json::from_value(json!({
+            "run_id":"issue1246",
+            "key":"browser-target",
+            "value":{"ok":false}
+        }))?;
+        let rejection = model_tool_call_pre_gate_rejection(
+            "workspace_put",
+            &changed_args,
+            true,
+            Some(&contract),
+        )
+        .expect("changed exact value must fail before approval");
+        assert!(rejection.reason.contains("changed_keys=[value]"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_agent_timeout_budget_excludes_approval_wait() {
+        let started = Instant::now() - Duration::from_millis(240_000);
+        let active = local_agent_active_elapsed(started, Duration::from_millis(180_000));
+        assert!(active < Duration::from_millis(90_000), "{active:?}");
+
+        let fully_blocked = local_agent_active_elapsed(started, Duration::from_millis(300_000));
+        assert_eq!(fully_blocked, Duration::ZERO);
+    }
+
+    #[test]
+    fn local_agent_timeout_error_code_is_not_endpoint_unreachable() {
+        let detail = "LOCAL_AGENT_TIMEOUT: local-agent active timeout exceeded before turn 2";
+        assert_eq!(error_code_from_detail(detail), "LOCAL_AGENT_TIMEOUT");
+    }
+
+    #[test]
     fn exact_tool_contract_progress_suggests_workspace_get_arguments() -> anyhow::Result<()> {
         let tools = tools_named(["workspace_put", "workspace_get"]);
         let task = "Use exactly these real Synapse tools:\n\
@@ -3245,6 +4252,253 @@ mod tests {
                 .unwrap()
                 .contains("do not call workspace_put again")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_tool_contract_preserves_browser_target_task_order() {
+        let tools = tools_named([
+            "browser_evaluate",
+            "workspace_put",
+            "target_claim",
+            "cdp_open_tab",
+            "target_act",
+        ]);
+        let task = "Use exactly these real Synapse tools:\n\
+1. Call cdp_open_tab with url \"http://127.0.0.1:8893/issue1246.html\".\n\
+2. Call target_claim for the returned target.\n\
+3. Call target_act to set the field.\n\
+4. Call browser_evaluate to read #status.\n\
+5. Call workspace_put with run_id \"issue1246\", key \"browser-target\", and value {\"ok\":true}.";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+
+        assert_eq!(
+            contract.ordered_tools,
+            vec![
+                "cdp_open_tab",
+                "target_claim",
+                "target_act",
+                "browser_evaluate",
+                "workspace_put",
+            ]
+        );
+        assert_eq!(
+            missing_task_contract_tools(&Some(contract.clone()), &BTreeSet::new()),
+            vec![
+                "cdp_open_tab",
+                "target_claim",
+                "target_act",
+                "browser_evaluate",
+                "workspace_put",
+            ]
+        );
+        let mut completed = BTreeSet::new();
+        completed.insert("cdp_open_tab".to_owned());
+        let progress = task_contract_progress_value(&Some(contract), &completed, &[])
+            .expect("progress after first browser tool");
+        assert_eq!(progress["suggested_next_tool"], json!("target_claim"));
+        assert_eq!(
+            progress["missing_tools"],
+            json!([
+                "target_claim",
+                "target_act",
+                "browser_evaluate",
+                "workspace_put"
+            ])
+        );
+    }
+
+    #[test]
+    fn exact_tool_contract_ignores_negative_tool_mentions_before_ordered_list() {
+        let tools = tools_named([
+            "act_press",
+            "act_type",
+            "browser_evaluate",
+            "browser_set_value",
+            "cdp_open_tab",
+            "cdp_target_info",
+            "target_act",
+            "target_claim",
+            "workspace_put",
+        ]);
+        let task = "Use exactly these real Synapse tools in this exact order.\n\
+Do not call task_retry, browser_evaluate, act_type, act_press, or raw foreground tools.\n\n\
+1. cdp_open_tab {\"url\":\"http://127.0.0.1:8896/issue1246-browser-target.html\",\"window_hwnd\":2427400}\n\
+2. target_claim {\"ttl_ms\":120000}\n\
+3. browser_set_value {\"selector\":\"#lane-value\",\"text\":\"issue1246\"}\n\
+4. target_act {\"verb\":\"click\",\"selector\":\"#mark\",\"wait_timeout_ms\":10000}\n\
+5. cdp_target_info {}\n\
+6. workspace_put {\"run_id\":\"issue1246\",\"key\":\"browser-target\",\"value\":{\"ok\":true}}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+
+        assert_eq!(
+            contract.ordered_tools,
+            vec![
+                "cdp_open_tab",
+                "target_claim",
+                "browser_set_value",
+                "target_act",
+                "cdp_target_info",
+                "workspace_put",
+            ]
+        );
+        assert!(!contract.allowed_tools.contains("browser_evaluate"));
+        assert!(!contract.allowed_tools.contains("act_type"));
+        assert!(!contract.allowed_tools.contains("act_press"));
+        let progress = task_contract_progress_value(&Some(contract), &BTreeSet::new(), &[])
+            .expect("initial progress");
+        assert_eq!(progress["suggested_next_tool"], json!("cdp_open_tab"));
+    }
+
+    #[test]
+    fn exact_tool_contract_progress_includes_exact_task_arguments() {
+        let tools = tools_named(["cdp_open_tab", "target_claim"]);
+        let task = "Use exactly these real Synapse tools in this exact order:\n\
+cdp_open_tab, target_claim.\n\n\
+1. cdp_open_tab {\"url\":\"http://127.0.0.1:8896/issue1246-browser-target.html\",\"window_hwnd\":2427400}\n\
+2. target_claim {\"ttl_ms\":120000}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+        let progress = task_contract_progress_value(&Some(contract.clone()), &BTreeSet::new(), &[])
+            .expect("initial progress");
+
+        assert_eq!(progress["suggested_next_tool"], json!("cdp_open_tab"));
+        assert_eq!(
+            progress["suggested_next_arguments"],
+            json!({
+                "url": "http://127.0.0.1:8896/issue1246-browser-target.html",
+                "window_hwnd": 2427400,
+            })
+        );
+        assert_eq!(
+            contract.argument_templates["target_claim"],
+            serde_json::from_value::<JsonObject>(json!({"ttl_ms": 120000})).unwrap()
+        );
+    }
+
+    #[test]
+    fn model_facing_exact_contract_feedback_hides_internal_task_keys() {
+        let tools = tools_named(["cdp_open_tab", "target_claim"]);
+        let task = "Use exactly these real Synapse tools in this exact order:\n\
+cdp_open_tab, target_claim.\n\n\
+1. cdp_open_tab {\"url\":\"http://127.0.0.1:8896/issue1246.html\",\"window_hwnd\":2427400}\n\
+2. target_claim {\"ttl_ms\":120000}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+        let mut completed = BTreeSet::new();
+        completed.insert("cdp_open_tab".to_owned());
+        let internal_progress =
+            task_contract_progress_value(&Some(contract.clone()), &completed, &[])
+                .expect("internal progress still exists for logs");
+        let model_value = model_tool_result_value(
+            &json!({
+                "ok": true,
+                "task_contract_progress": internal_progress,
+            }),
+            &Some(contract),
+            &completed,
+            &[],
+        );
+        let text = model_value.to_string();
+
+        assert!(!text.contains("task_exact_tool_phrase"));
+        assert!(!text.contains("task_contract_progress"));
+        assert!(!text.contains("suggested_next_tool"));
+        assert!(text.contains("target_claim"));
+        assert_eq!(
+            model_value["contract_status"]["next_function"]["name"],
+            json!("target_claim")
+        );
+        assert_eq!(model_value["next_function"]["name"], json!("target_claim"));
+        assert_eq!(
+            model_value["contract_status"]["next_function"]["arguments"],
+            json!({"ttl_ms": 120000})
+        );
+        assert_eq!(
+            model_value["call_next"]["function"]["arguments"],
+            json!({"ttl_ms": 120000})
+        );
+    }
+
+    #[test]
+    fn exact_tool_contract_prompt_guides_browser_target_route_without_raw_foreground() {
+        let tools = tools_named([
+            "cdp_open_tab",
+            "target_claim",
+            "browser_set_value",
+            "target_act",
+            "cdp_target_info",
+            "browser_evaluate",
+            "workspace_put",
+            "act_press",
+        ]);
+        let task = "Use exactly these real Synapse tools:\n\
+1. Call cdp_open_tab.\n\
+2. Call target_claim.\n\
+3. Call browser_set_value.\n\
+4. Call target_act.\n\
+5. Call cdp_target_info.\n\
+6. Call workspace_put.";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+
+        let prompt = task_contract_prompt(&contract);
+
+        assert!(prompt.contains(
+            "Required tool order: cdp_open_tab -> target_claim -> browser_set_value -> target_act -> cdp_target_info -> workspace_put."
+        ));
+        assert!(prompt.contains("cdp_open_tab opens the owned Chrome tab"));
+        assert!(prompt.contains("target_claim claims the returned owned target"));
+        assert!(prompt.contains("browser_set_value changes a field"));
+        assert!(prompt.contains("cdp_target_info reads typed page text/vitals"));
+        assert!(prompt.contains("workspace_put records the verified result"));
+        assert!(!prompt.contains("act_press"));
+    }
+
+    #[test]
+    fn verified_browser_checkpoint_contract_completes_after_workspace_readback()
+    -> anyhow::Result<()> {
+        let tools = tools_named([
+            "cdp_open_tab",
+            "target_claim",
+            "target_act",
+            "browser_evaluate",
+            "workspace_put",
+        ]);
+        let task = "Use exactly these real Synapse tools:\n\
+1. Call cdp_open_tab.\n\
+2. Call target_claim.\n\
+3. Call target_act.\n\
+4. Call browser_evaluate.\n\
+5. Call workspace_put.";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+        let mut completed = BTreeSet::new();
+        for tool in [
+            "cdp_open_tab",
+            "target_claim",
+            "target_act",
+            "browser_evaluate",
+            "workspace_put",
+        ] {
+            completed.insert(tool.to_owned());
+        }
+
+        assert!(!verified_workspace_contract_complete(
+            &Some(contract.clone()),
+            &completed
+        ));
+        assert!(!verified_workspace_checkpoint_contract_complete(
+            &Some(contract.clone()),
+            &completed,
+            &[]
+        ));
+        let successful_put: JsonObject = serde_json::from_value(json!({
+            "run_id": "issue1246",
+            "key": "browser-target",
+            "value": {"ok": true},
+        }))?;
+        assert!(verified_workspace_checkpoint_contract_complete(
+            &Some(contract),
+            &completed,
+            &[successful_put]
+        ));
         Ok(())
     }
 
@@ -3329,7 +4583,8 @@ mod tests {
         assert!(!prompt.contains(SYNAPSE_TOOL_CATALOG));
         assert!(!prompt.contains("attached MCP tools"));
         assert!(!prompt.contains("attached directly"));
-        assert!(prompt.contains("one tool call and no prose"));
+        assert!(prompt.contains("one OpenAI tool_call and no prose"));
+        assert!(prompt.contains("function.name = exact task-requested Synapse tool name"));
         assert!(prompt.contains("exact argument keys"));
         assert!(prompt.contains("post_write_readback.matched=true"));
         // Internalized serving endpoints are validated through non-streaming
@@ -3344,6 +4599,99 @@ mod tests {
         apply_runtime_preset(&row, &mut body);
         assert!(body.get("tools").is_none());
         assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn internalized_exact_contract_exposes_only_contract_tools() -> anyhow::Result<()> {
+        let mut row = test_local_agent_row();
+        row.runtime_preset = Some("internalized_no_catalog".to_owned());
+        row.max_tools = Some(16);
+        let tools = tools_named(["workspace_put", "workspace_get", "local_model_probe"]);
+        let task = "Use exactly these real Synapse tools:\n\
+1. workspace_put {\"run_id\":\"issue1246\",\"key\":\"k\",\"value\":\"v\"}\n\
+2. workspace_get {\"run_id\":\"issue1246\",\"key\":\"k\"}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact contract");
+
+        let exposed =
+            openai_tools_for_exposure(ToolExposure::Internalized, &tools, Some(&contract), &row)?;
+
+        let exposed_names = exposed
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exposed_names, vec!["workspace_put", "workspace_get"]);
+        assert!(!exposed_names.contains(&"local_model_probe"));
+
+        let mut body = json!({"tools": exposed, "tool_choice": "auto", "model": "x"});
+        apply_runtime_preset(&row, &mut body);
+        assert_eq!(body["tool_choice"], json!("auto"));
+        assert_eq!(body["tools"].as_array().map(Vec::len), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn internalized_exact_contract_turn_exposes_only_next_function() -> anyhow::Result<()> {
+        let tools = tools_named(["cdp_open_tab", "target_claim", "browser_set_value"]);
+        let task = "Use exactly these real Synapse tools in this exact order:\n\
+1. cdp_open_tab {\"url\":\"http://127.0.0.1:8896/fixture.html\",\"window_hwnd\":2427400}\n\
+2. target_claim {\"ttl_ms\":120000}\n\
+3. browser_set_value {\"selector\":\"#lane-value\",\"text\":\"issue1246\"}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact contract");
+        let mut completed = BTreeSet::new();
+        completed.insert("cdp_open_tab".to_owned());
+
+        let selection = exact_contract_turn_tools_for_internalized(&tools, &contract, &completed)?;
+        let exposed_names = selection
+            .tools
+            .iter()
+            .filter_map(|tool| {
+                tool.get("function")
+                    .and_then(|function| function.get("name"))
+                    .and_then(Value::as_str)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exposed_names, vec!["target_claim"]);
+        assert_eq!(
+            selection.tool_choice,
+            Some(json!({
+                "type": "function",
+                "function": {"name": "target_claim"},
+            }))
+        );
+
+        completed.insert("target_claim".to_owned());
+        completed.insert("browser_set_value".to_owned());
+        let complete_selection =
+            exact_contract_turn_tools_for_internalized(&tools, &contract, &completed)?;
+        assert!(complete_selection.tools.is_empty());
+        assert!(complete_selection.tool_choice.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn internalized_exact_contract_turn_instruction_names_only_next_function() {
+        let tools = tools_named(["cdp_open_tab", "target_claim", "browser_set_value"]);
+        let task = "Use exactly these real Synapse tools in this exact order:\n\
+1. cdp_open_tab {\"url\":\"http://127.0.0.1:8896/fixture.html\",\"window_hwnd\":2427400}\n\
+2. target_claim {\"ttl_ms\":120000}\n\
+3. browser_set_value {\"selector\":\"#lane-value\",\"text\":\"issue1246\"}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact contract");
+        let mut completed = BTreeSet::new();
+        completed.insert("cdp_open_tab".to_owned());
+        completed.insert("target_claim".to_owned());
+
+        let message = task_contract_next_instruction_message(&contract, &completed)
+            .expect("next instruction");
+        let content = message["content"].as_str().expect("content");
+        assert!(content.contains("NEXT_REQUIRED_FUNCTION"));
+        assert!(content.contains("name: browser_set_value"));
+        assert!(content.contains(r##""selector":"#lane-value""##));
+        assert!(content.contains(r#""text":"issue1246""#));
+        assert!(!content.contains("name: cdp_open_tab"));
     }
 
     #[test]

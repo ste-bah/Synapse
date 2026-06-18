@@ -38,9 +38,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-18-popup-free-tabs-v2";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-18-popup-free-tabs-v3";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "e7493db900f64eaddefe89573c61d211ee264f7345681dc25d38178f65d8018f";
+    "d24f1d218007f4db52b08bfe8d0b3b838e105593b7f6424b169b11d416c3b49b";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
     "activateTab",
@@ -2321,6 +2321,7 @@ pub(crate) async fn open_tab(
     url: &str,
     agent_session_id: Option<&str>,
     expected_window_bounds: Option<Rect>,
+    expected_window_title: Option<&str>,
 ) -> Result<ChromeDebuggerOpenTabResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_popup_safe(hwnd, "openTab")?;
     let result = bridge()
@@ -2336,6 +2337,7 @@ pub(crate) async fn open_tab(
                     "w": bounds.w,
                     "h": bounds.h,
                 })),
+                "expectedWindowTitle": expected_window_title,
             }),
         )
         .await?;

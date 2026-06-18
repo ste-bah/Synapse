@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-18-popup-free-tabs-v2";
-const BRIDGE_BUILD_SHA256 = "e7493db900f64eaddefe89573c61d211ee264f7345681dc25d38178f65d8018f";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-18-popup-free-tabs-v3";
+const BRIDGE_BUILD_SHA256 = "d24f1d218007f4db52b08bfe8d0b3b838e105593b7f6424b169b11d416c3b49b";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "openTab",
@@ -958,8 +958,15 @@ async function selectOpenWindowForHwndHint(params) {
       focused: Boolean(windowInfo.focused),
       state: String(windowInfo.state || ""),
       type: String(windowInfo.type || ""),
-      bounds: chromeWindowBounds(windowInfo)
+      bounds: chromeWindowBounds(windowInfo),
+      activeTabTitle: "",
+      activeTabUrl: ""
     }));
+  await Promise.all(candidates.map(async (candidate) => {
+    const activeTab = await activeTabForWindow(candidate.id);
+    candidate.activeTabTitle = String(activeTab?.title || "");
+    candidate.activeTabUrl = String(activeTab?.url || "");
+  }));
   const expectedBounds = normalizeExpectedWindowBounds(params.expectedWindowBounds);
   if (expectedBounds) {
     const boundsMatches = candidates
@@ -984,6 +991,29 @@ async function selectOpenWindowForHwndHint(params) {
       throw bridgeError(
         ERROR_AXTREE_FAILED,
         `openTab refused hwnd hint ${String(params.hwnd)}: expected_window_bounds matched ${boundsMatches.length} Chrome windows within ${OPEN_WINDOW_BOUNDS_TOLERANCE_PX}px`
+      );
+    }
+  }
+  const expectedTitle = normalizeExpectedWindowTitle(params.expectedWindowTitle);
+  if (expectedTitle) {
+    const titleMatches = candidates.filter((windowInfo) =>
+      chromeWindowTitleMatches(windowInfo.activeTabTitle, expectedTitle)
+    );
+    if (titleMatches.length === 1) {
+      const selected = titleMatches[0];
+      return {
+        windowId: selected.id,
+        focused: selected.focused,
+        state: selected.state,
+        selectionReason: "passive_active_tab_title_match_for_hwnd_hint",
+        candidateCount: candidates.length,
+        nonFocusedCount: candidates.filter((windowInfo) => !windowInfo.focused).length
+      };
+    }
+    if (titleMatches.length > 1) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `openTab refused hwnd hint ${String(params.hwnd)}: expected_window_title matched ${titleMatches.length} Chrome windows`
       );
     }
   }
@@ -1035,6 +1065,18 @@ async function selectOpenWindowForHwndHint(params) {
   );
 }
 
+async function activeTabForWindow(windowId) {
+  if (!Number.isInteger(windowId)) {
+    return null;
+  }
+  try {
+    const tabs = await chrome.tabs.query({ windowId, active: true });
+    return tabs[0] || null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function normalizeExpectedWindowBounds(raw) {
   if (!raw || typeof raw !== "object") {
     return null;
@@ -1047,6 +1089,43 @@ function normalizeExpectedWindowBounds(raw) {
     return null;
   }
   return { x, y, w, h };
+}
+
+function normalizeExpectedWindowTitle(raw) {
+  if (raw === undefined || raw === null) {
+    return "";
+  }
+  return String(raw).trim();
+}
+
+function titleCompareVariants(raw) {
+  const base = String(raw || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!base) {
+    return [];
+  }
+  const withoutChromeSuffix = base.replace(/\s+-\s+google chrome$/, "").trim();
+  const withoutAttentionPrefix = withoutChromeSuffix.replace(/^\(\d+\)\s*/, "").trim();
+  return Array.from(new Set([
+    base,
+    withoutChromeSuffix,
+    withoutAttentionPrefix
+  ].filter((value) => value.length >= 3)));
+}
+
+function chromeWindowTitleMatches(activeTabTitle, expectedWindowTitle) {
+  const actualVariants = titleCompareVariants(activeTabTitle);
+  const expectedVariants = titleCompareVariants(expectedWindowTitle);
+  for (const actual of actualVariants) {
+    for (const expected of expectedVariants) {
+      if (actual === expected || actual.includes(expected) || expected.includes(actual)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function chromeWindowBounds(windowInfo) {

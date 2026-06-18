@@ -3009,6 +3009,7 @@ impl SynapseService {
             requested_url,
             Some(session_id),
             Some(window_bounds),
+            Some(window_title),
         )
         .await
         .map_err(|error| {
