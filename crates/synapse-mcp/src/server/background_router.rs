@@ -18,7 +18,9 @@ use crate::m1::{
     CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction, CdpNavigateTabParams,
     CdpTargetInfoParams, ObserveParams, mcp_error,
 };
-use crate::m2::{ActClickParams, ActSetFieldTextParams, default_verify_timeout_ms};
+use crate::m2::{
+    ActClickParams, ActFocusWindowParams, ActSetFieldTextParams, default_verify_timeout_ms,
+};
 use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
 use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, service::RequestContext};
@@ -28,12 +30,13 @@ use std::collections::BTreeMap;
 use synapse_core::{ElementId, error_codes};
 
 const DEFAULT_TARGET_ACT_SHELL_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_TARGET_ACT_FOCUS_STABLE_MS: u32 = 75;
 const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
 const TARGET_ACT_KNOWN_VERBS: &str =
-    "read, screenshot, navigate, set_field, click, press, select, submit, run_shell";
+    "read, screenshot, navigate, set_field, click, press, select, submit, run_shell, focus_window";
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -130,7 +133,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers or by CSS selector through the safe normal-Chrome bridge; verb=click clicks a target element by observed element_id or, with selector/role/name, by target-tab DOM action; verb=press presses a named button/link in the session-owned tab; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=run_shell runs a command in the session workspace. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers or by CSS selector through the safe normal-Chrome bridge; verb=click clicks a target element by observed element_id or, with selector/role/name, by target-tab DOM action; verb=press presses a named button/link in the session-owned tab; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -376,6 +379,97 @@ impl SynapseService {
                     target_act_result(&response.0)?,
                 )
             }
+            "focus_window" => {
+                let session_id = target_act_session_id(&request_context, "focus_window")?;
+                let request_details = json!({
+                    "session_id": &session_id,
+                    "verb": "focus_window",
+                    "delegated_tool": "act_focus_window",
+                    "requires_tool_profile": "break_glass_or_full_capability",
+                    "requires_foreground_input_lease": true,
+                    "target_source": "session_target",
+                    "no_human_os_foreground_fallback": true,
+                });
+                if let Err(error) =
+                    self.admit_tool_call_for_profile("act_focus_window", Some(&session_id))
+                {
+                    self.audit_action_denied_with_details_for_session(
+                        "target_act",
+                        &error,
+                        &request_details,
+                        &session_id,
+                    );
+                    (
+                        "act_focus_window",
+                        false,
+                        target_act_error_status(&error),
+                        target_act_error_result("act_focus_window", error),
+                    )
+                } else {
+                    let target = self.session_target(Some(&session_id))?;
+                    let target = match target {
+                        Some(target) => target,
+                        None => {
+                            let error = target_act_focus_window_missing_target_error();
+                            self.audit_action_denied_with_details_for_session(
+                                "target_act",
+                                &error,
+                                &request_details,
+                                &session_id,
+                            );
+                            return Ok(Json(TargetActResponse {
+                                verb: verb.as_str().to_owned(),
+                                ok: false,
+                                status: target_act_error_status(&error).to_owned(),
+                                delegated_tool: "act_focus_window".to_owned(),
+                                routing: target_act_routing_description(),
+                                result: target_act_error_result("act_focus_window", error),
+                            }));
+                        }
+                    };
+                    if let Err(error) =
+                        target_act_focus_window_preflight(self, &session_id, &target)
+                    {
+                        self.audit_action_denied_with_details_for_session(
+                            "target_act",
+                            &error,
+                            &request_details,
+                            &session_id,
+                        );
+                        return Ok(Json(TargetActResponse {
+                            verb: verb.as_str().to_owned(),
+                            ok: false,
+                            status: target_act_error_status(&error).to_owned(),
+                            delegated_tool: "act_focus_window".to_owned(),
+                            routing: target_act_routing_description(),
+                            result: target_act_error_result("act_focus_window", error),
+                        }));
+                    }
+                    let focus_params = match target_act_focus_window_params(Some(&target)) {
+                        Ok(params) => params,
+                        Err(error) => {
+                            self.audit_action_denied_with_details_for_session(
+                                "target_act",
+                                &error,
+                                &request_details,
+                                &session_id,
+                            );
+                            return Ok(Json(TargetActResponse {
+                                verb: verb.as_str().to_owned(),
+                                ok: false,
+                                status: target_act_error_status(&error).to_owned(),
+                                delegated_tool: "act_focus_window".to_owned(),
+                                routing: target_act_routing_description(),
+                                result: target_act_error_result("act_focus_window", error),
+                            }));
+                        }
+                    };
+                    let response = self
+                        .act_focus_window(Parameters(focus_params), request_context)
+                        .await;
+                    target_act_delegate_response("act_focus_window", response)?
+                }
+            }
             other => return Err(target_act_unknown_verb_error(other)),
         };
 
@@ -384,7 +478,7 @@ impl SynapseService {
             ok,
             status: status.to_owned(),
             delegated_tool: delegated_tool.to_owned(),
-            routing: "capability-preserving; delegated to the session-targeted primitive, inheriting action audit plus lane/lease/foreground guards and refusing implicit human OS foreground use before input".to_owned(),
+            routing: target_act_routing_description(),
             result,
         }))
     }
@@ -639,11 +733,69 @@ fn target_act_unknown_verb_error(verb: &str) -> ErrorData {
     )
 }
 
+fn target_act_focus_window_params(
+    target: Option<&SessionTarget>,
+) -> Result<ActFocusWindowParams, ErrorData> {
+    let hwnd = match target {
+        Some(SessionTarget::Window { hwnd }) => *hwnd,
+        Some(SessionTarget::Cdp { window_hwnd, .. }) => *window_hwnd,
+        None => {
+            return Err(target_act_focus_window_missing_target_error());
+        }
+    };
+    Ok(ActFocusWindowParams {
+        hwnd: Some(hwnd),
+        title_regex: None,
+        pid: None,
+        verify_timeout_ms: default_verify_timeout_ms(),
+        stable_ms: DEFAULT_TARGET_ACT_FOCUS_STABLE_MS,
+    })
+}
+
+fn target_act_focus_window_missing_target_error() -> ErrorData {
+    mcp_error(
+        error_codes::TARGET_NOT_SET,
+        "target_act verb=focus_window requires this MCP session to have an agent_logical_foreground/foreground_lane target; call window_list then set_target for the exact HWND first",
+    )
+}
+
+fn target_act_focus_window_preflight(
+    service: &SynapseService,
+    session_id: &str,
+    target: &SessionTarget,
+) -> Result<(), ErrorData> {
+    if service
+        .target_claim_for_session(session_id, target)?
+        .is_none()
+    {
+        return Err(mcp_error(
+            error_codes::TARGET_CLAIM_NOT_FOUND,
+            "target_act verb=focus_window requires this MCP session to own a live target_claim for the session target before deliberate real-foreground activation",
+        ));
+    }
+    let lease = synapse_action::lease::status();
+    match lease.owner_session_id.as_deref() {
+        Some(owner) if owner == session_id => Ok(()),
+        Some(_owner) => Err(mcp_error(
+            error_codes::ACTION_FOREGROUND_LEASE_BUSY,
+            "target_act verb=focus_window requires this MCP session to own the foreground input lease; another live session owns it",
+        )),
+        None => Err(mcp_error(
+            error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
+            "target_act verb=focus_window requires this MCP session to own the foreground input lease before deliberate real-foreground activation",
+        )),
+    }
+}
+
 fn target_act_read_delegated_tool(target: Option<&SessionTarget>) -> &'static str {
     match target {
         Some(SessionTarget::Cdp { .. }) => "cdp_target_info",
         Some(SessionTarget::Window { .. }) | None => "observe",
     }
+}
+
+fn target_act_routing_description() -> String {
+    "capability-preserving; delegated to the session-targeted primitive, inheriting action audit plus lane/lease/foreground guards and refusing implicit human OS foreground use before input".to_owned()
 }
 
 fn target_act_result<T: Serialize>(value: &T) -> Result<Value, ErrorData> {
@@ -744,8 +896,10 @@ fn target_act_error_status(error: &ErrorData) -> &'static str {
             | error_codes::CHROME_DOM_SELECTOR_INVALID
             | error_codes::FOREGROUND_ACTIVATION_REFUSED
             | error_codes::TARGET_CO_OWNED
+            | error_codes::TARGET_CLAIM_NOT_FOUND
             | error_codes::TARGET_NOT_SET
             | error_codes::TARGET_WINDOW_NOT_FOUND
+            | error_codes::TOOL_PROFILE_POLICY_DENIED
             | error_codes::TOOL_PARAMS_INVALID
             | error_codes::TRANSIENT_ELEMENT_EXPIRED,
         ) => TARGET_ACT_STATUS_REFUSED,
@@ -831,6 +985,54 @@ mod tests {
             "unknown verb error should name the rejected verb: {}",
             error.message
         );
+    }
+
+    #[test]
+    fn target_act_focus_window_is_forward_compatible_verb() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "focus_window"
+        }))
+        .expect("focus_window should use the existing open-string target_act schema");
+
+        assert_eq!(params.verb.as_str(), "focus_window");
+        assert!(params.path.is_none());
+        assert!(params.element_id.is_none());
+    }
+
+    #[test]
+    fn target_act_focus_window_uses_window_session_target() {
+        let params =
+            target_act_focus_window_params(Some(&SessionTarget::Window { hwnd: 0x250a08 }))
+                .expect("window target should produce focus params");
+
+        assert_eq!(params.hwnd, Some(0x250a08));
+        assert!(params.title_regex.is_none());
+        assert!(params.pid.is_none());
+        assert_eq!(params.stable_ms, DEFAULT_TARGET_ACT_FOCUS_STABLE_MS);
+    }
+
+    #[test]
+    fn target_act_focus_window_uses_cdp_parent_window() {
+        let params = target_act_focus_window_params(Some(&SessionTarget::Cdp {
+            window_hwnd: 0x250a08,
+            cdp_target_id: "chrome-tab:42".to_owned(),
+        }))
+        .expect("cdp target should focus its containing browser HWND");
+
+        assert_eq!(params.hwnd, Some(0x250a08));
+        assert!(params.title_regex.is_none());
+        assert!(params.pid.is_none());
+    }
+
+    #[test]
+    fn target_act_focus_window_requires_session_target() {
+        let error = target_act_focus_window_params(None).expect_err("missing target should refuse");
+
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TARGET_NOT_SET)
+        );
+        assert_eq!(target_act_error_status(&error), TARGET_ACT_STATUS_REFUSED);
     }
 
     #[test]
@@ -988,7 +1190,10 @@ mod tests {
         for code in [
             error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED,
             error_codes::ACTION_ELEMENT_VALUE_READ_ONLY,
+            error_codes::ACTION_FOREGROUND_LEASE_BUSY,
+            error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
             error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            error_codes::TARGET_CLAIM_NOT_FOUND,
             error_codes::TARGET_NOT_SET,
         ] {
             let error = mcp_error(code, "synthetic delegated refusal");

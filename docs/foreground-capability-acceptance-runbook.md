@@ -18,7 +18,8 @@ implemented and unit/integration-gated, awaiting the human-active acceptance run
 | Default surface preserves foreground-equivalent capability through routes (#1219) | `normal_agent` profile | `tool_profile_status` -> `foreground_capability.profile_preserves_capability=true`, `hidden_tool_routes` names the preferred `target_act`/browser/CDP/session-lane route for raw `act_*`; CF_SESSIONS `mcp/tool-profile/v1/<sid>` row |
 | Hidden raw tool fails closed with route proof (#1002/#1004/#1219) | tool-profile policy gate | calling `act_type` from `normal_agent` -> error `TOOL_PROFILE_POLICY_DENIED` carrying the CF_SESSIONS `policy_row` plus `capability_route` |
 | Break-glass needs lease + reason + confirm (#999) | `validate_profile_set_policy` | `tool_profile_set break_glass` rejected unless `control_lease` held, `confirm_break_glass=true`, non-empty `reason` |
-| Profile change is visible **in-session** (#1020) | `tool_profile_set` -> `peer.notify_tool_list_changed()` | `notifications/tools/list_changed` frame on the standalone GET SSE stream; `tools/list` changes in the same session with **no reconnect** |
+| Break-glass has a stable Codex callable route (#1261) | `target_act verb=focus_window` | after `set_target`/`target_claim` + lease + `tool_profile_set break_glass`, the always-visible `target_act` schema can delegate to `act_focus_window`; normal profiles get `TOOL_PROFILE_POLICY_DENIED` |
+| Profile change is visible **in-session** (#1020) | `tool_profile_set` -> `peer.notify_tool_list_changed()` | `notifications/tools/list_changed` frame on the standalone GET SSE stream; `tools/list` changes in the same session with **no reconnect** for clients that honor the MCP notification |
 | Agent target distinct from human foreground (#994) | `window_list` / `set_target` | `window_list.human_os_foreground_hwnd` reported separately; per-entry `is_foreground`; `GetForegroundWindow()` cross-check matches |
 | Passive target discovery without shelling out (#1021) | `window_list` | HWND+PID rows match Win32 `Get-Process MainWindowHandle`; round-trips through `set_target` with no activation |
 
@@ -143,6 +144,15 @@ Compare these `tools/list` profiles via real spawned agents / the wired client:
 | normal capability-preserving | default `normal_agent` | visible count from `tool_profile_status`; no raw `act_*` foreground primitives; `target_act`, `window_list`, `set_target`, `cdp_*`, and route readbacks present |
 | browser-control task | `tool_profile_set browser_control` | narrower; perception + cdp + target tools only |
 | break-glass/admin | lease + `tool_profile_set break_glass` | full raw surface incl. `act_*` |
+
+Codex/client compatibility note (#1261): some clients keep a static callable
+tool namespace even after the server sends `notifications/tools/list_changed`.
+For deliberate real-foreground activation, bind the exact window first with
+`window_list` -> `set_target` -> `target_claim`, acquire the foreground input
+lease, set `profile=break_glass`, then call the already-visible
+`target_act {"verb":"focus_window"}` route. The route delegates to
+`act_focus_window` only after the profile gate passes and still uses the normal
+foreground lease plus `GetForegroundWindow` readback.
 
 For each, give the same synthetic task with a known target/lane solution
 ("read the title of the LinkedIn tab", "type into the dashboard search box",

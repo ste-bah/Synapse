@@ -1056,7 +1056,14 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
             "control_lease_acquire",
             "tool_profile_set break_glass",
         ],
-        "act_focus_window" => vec!["set_target", "target_claim", "session_status"],
+        "act_focus_window" => vec![
+            "set_target",
+            "target_claim",
+            "control_lease_acquire",
+            "tool_profile_set break_glass",
+            "target_act verb=focus_window",
+            "session_status",
+        ],
         "act_launch" => vec![
             "act_spawn_agent",
             "cdp_open_tab",
