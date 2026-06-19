@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-19-managed-popup-shield-v1";
-const BRIDGE_BUILD_SHA256 = "6a9168f4c16ef0c52d2ce61c39c610808d374b526b214199258312cf1f569ca1";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-19-runtime-debugger-api-shield-v1";
+const BRIDGE_BUILD_SHA256 = "4c7056621f8e40db2e539f22cc335fec12b69ccbdb2ccfa110e81f05021c14b3";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -85,6 +85,16 @@ async function startBridge() {
         `reload the unpacked extension from the Synapse extension directory so the daemon can ` +
         `authenticate the bridge origin`,
       ERROR_EXTENSION_ID_MISMATCH
+    );
+    return;
+  }
+  if (runtimeDebuggerApiAvailable()) {
+    disableBridgePermanently(
+      `loaded runtime exposes chrome.debugger; normal Synapse Chrome Bridge must be ` +
+        `debugger-free because Chrome's debugger infobar changes browser layout. ` +
+        `Reload the bundled extension from the Synapse repo before any normal-profile ` +
+        `browser work can proceed.`,
+      ERROR_DEBUGGER_WARNING_UNSUPPRESSED
     );
     return;
   }
@@ -663,6 +673,7 @@ async function handleCommand(command) {
   try {
     let result;
     let reloadAfterResponse = false;
+    rejectIfDebuggerApiAvailable(kind, params);
     await requireExternalPopupRisksSuppressed(kind, params);
     if (kind === "snapshot") {
       result = rejectAttachCommand(kind, params);
@@ -720,10 +731,33 @@ function bridgeIdentity() {
     protocolVersion: PROTOCOL_VERSION,
     buildId: BRIDGE_BUILD_ID,
     buildSha256: BRIDGE_BUILD_SHA256,
+    debuggerApiAvailable: runtimeDebuggerApiAvailable(),
     capabilities: [...COMMAND_CAPABILITIES],
     commandCapabilities: [...COMMAND_CAPABILITIES],
     popupRiskSuppression: popupRiskSuppressionSnapshot()
   };
+}
+
+function runtimeDebuggerApiAvailable() {
+  return Boolean(
+    chrome.debugger &&
+    (chrome.debugger.attach || chrome.debugger.sendCommand || chrome.debugger.getTargets)
+  );
+}
+
+function rejectIfDebuggerApiAvailable(kind, params) {
+  if (!runtimeDebuggerApiAvailable()) {
+    return;
+  }
+  throw bridgeError(
+    ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
+    `normal Synapse Chrome Bridge refused ${String(kind)} before browser work; ` +
+      `loaded runtime exposes chrome.debugger even though the normal bridge must be ` +
+      `debugger-free. Chrome's debugger infobar changes browser layout and breaks ` +
+      `coordinate truth. hwnd=${String(params?.hwnd ?? "unknown")} remediation=reload ` +
+      `the bundled Synapse extension from the repo and re-read mcp__synapse.health ` +
+      `until debuggerApiAvailable=false`
+  );
 }
 
 function rejectAttachCommand(kind, params) {

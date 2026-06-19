@@ -842,6 +842,8 @@ pub struct CdpBridgeHostReadback {
     pub extension_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_user_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_debugger_api_available: Option<bool>,
     pub pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_window: Option<String>,
@@ -866,6 +868,7 @@ pub struct CdpBridgeReloadAckReadback {
     pub protocol_version: u32,
     pub build_id: String,
     pub build_sha256: String,
+    pub debugger_api_available: bool,
     pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_id: Option<String>,

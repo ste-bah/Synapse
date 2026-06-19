@@ -41,9 +41,9 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-19-managed-popup-shield-v1";
+    "synapse-chrome-bridge-2026-06-19-runtime-debugger-api-shield-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "6a9168f4c16ef0c52d2ce61c39c610808d374b526b214199258312cf1f569ca1";
+    "4c7056621f8e40db2e539f22cc335fec12b69ccbdb2ccfa110e81f05021c14b3";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -1496,6 +1496,8 @@ pub(crate) struct ChromeBridgeReloadCommandAck {
     pub build_id: String,
     #[serde(rename = "buildSha256")]
     pub build_sha256: String,
+    #[serde(default, rename = "debuggerApiAvailable")]
+    pub debugger_api_available: bool,
     #[serde(default)]
     pub capabilities: Vec<String>,
     pub host_id: Option<String>,
@@ -1514,6 +1516,7 @@ pub(crate) struct ChromeBridgeHostSnapshot {
     pub extension_build_sha256: Option<String>,
     pub extension_capabilities: Vec<String>,
     pub extension_user_agent: Option<String>,
+    pub extension_debugger_api_available: Option<bool>,
     pub extension_popup_risk_suppression: Option<Value>,
     pub pid: u32,
     pub parent_window: Option<String>,
@@ -1657,6 +1660,7 @@ struct HostRecord {
     extension_build_sha256: Option<String>,
     extension_capabilities: BTreeSet<String>,
     extension_user_agent: Option<String>,
+    extension_debugger_api_available: Option<bool>,
     extension_popup_risk_suppression: Option<Value>,
     pid: u32,
     parent_window: Option<String>,
@@ -1679,6 +1683,7 @@ struct ChromeBridgeHealthRecord {
     extension_build_sha256: Option<String>,
     extension_capabilities: BTreeSet<String>,
     extension_user_agent: Option<String>,
+    extension_debugger_api_available: Option<bool>,
     extension_popup_risk_suppression: Option<Value>,
     pid: u32,
     parent_window: Option<String>,
@@ -1808,6 +1813,14 @@ fn bridge_command_stale_reason(host: &HostRecord, kind: &str) -> Option<String> 
     if !identity_reasons.is_empty() {
         return Some(identity_reasons.join("|"));
     }
+    if host.extension_debugger_api_available != Some(false) {
+        return Some(format!(
+            "debugger_api_available={} expected=false",
+            host.extension_debugger_api_available
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "not_seen_yet".to_owned())
+        ));
+    }
     if host.extension_capabilities.is_empty() {
         return Some(format!(
             "capabilities_not_advertised command={kind} required={}",
@@ -1845,6 +1858,14 @@ fn bridge_identity_stale_reasons(host: &ChromeBridgeHealthRecord) -> Vec<String>
                 .unwrap_or("not_seen_yet")
         ));
     }
+    if host.extension_debugger_api_available != Some(false) {
+        reasons.push(format!(
+            "debugger_api_available={} expected=false",
+            host.extension_debugger_api_available
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "not_seen_yet".to_owned())
+        ));
+    }
     let missing = bridge_missing_required_capabilities(&host.extension_capabilities);
     if !missing.is_empty() {
         reasons.push(format!("missing_capabilities={}", missing.join(",")));
@@ -1863,6 +1884,7 @@ fn host_record_to_health_record(host_id: &str, host: &HostRecord) -> ChromeBridg
         extension_build_sha256: host.extension_build_sha256.clone(),
         extension_capabilities: host.extension_capabilities.clone(),
         extension_user_agent: host.extension_user_agent.clone(),
+        extension_debugger_api_available: host.extension_debugger_api_available,
         extension_popup_risk_suppression: host.extension_popup_risk_suppression.clone(),
         pid: host.pid,
         parent_window: host.parent_window.clone(),
@@ -1886,6 +1908,7 @@ fn health_record_to_host_snapshot(host: &ChromeBridgeHealthRecord) -> ChromeBrid
         extension_build_sha256: host.extension_build_sha256.clone(),
         extension_capabilities: host.extension_capabilities.iter().cloned().collect(),
         extension_user_agent: host.extension_user_agent.clone(),
+        extension_debugger_api_available: host.extension_debugger_api_available,
         extension_popup_risk_suppression: host.extension_popup_risk_suppression.clone(),
         pid: host.pid,
         parent_window: host.parent_window.clone(),
@@ -1932,6 +1955,7 @@ impl ChromeDebuggerBridge {
             extension_build_sha256: None,
             extension_capabilities: BTreeSet::new(),
             extension_user_agent: None,
+            extension_debugger_api_available: None,
             extension_popup_risk_suppression: None,
             pid: request.pid,
             parent_window: request.parent_window,
@@ -2024,6 +2048,10 @@ impl ChromeDebuggerBridge {
                     .get("userAgent")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
+                host.extension_debugger_api_available = request
+                    .message
+                    .get("debuggerApiAvailable")
+                    .and_then(Value::as_bool);
                 host.extension_capabilities = string_set_field(&request.message, "capabilities");
                 host.extension_popup_risk_suppression =
                     request.message.get("popupRiskSuppression").cloned();
@@ -2038,6 +2066,7 @@ impl ChromeDebuggerBridge {
                     extension_protocol_version = host.extension_protocol_version.unwrap_or_default(),
                     extension_build_id = host.extension_build_id.as_deref().unwrap_or_default(),
                     extension_build_sha256 = host.extension_build_sha256.as_deref().unwrap_or_default(),
+                    debugger_api_available = host.extension_debugger_api_available.unwrap_or(true),
                     capabilities = %format_capabilities(&host.extension_capabilities),
                     popup_risk_suppression = %popup_risk_suppression,
                     pid = host.pid,
@@ -2597,6 +2626,7 @@ pub(crate) fn health_subsystem() -> SubsystemHealth {
                     extension_build_sha256: host.extension_build_sha256.clone(),
                     extension_capabilities: host.extension_capabilities.clone(),
                     extension_user_agent: host.extension_user_agent.clone(),
+                    extension_debugger_api_available: host.extension_debugger_api_available,
                     extension_popup_risk_suppression: host.extension_popup_risk_suppression.clone(),
                     pid: host.pid,
                     parent_window: host.parent_window.clone(),
@@ -2687,6 +2717,10 @@ fn chrome_bridge_health_from_snapshot(
         .unwrap_or("not_seen_yet");
     let extension_capabilities = format_capabilities(&host.extension_capabilities);
     let extension_user_agent = host.extension_user_agent.as_deref().unwrap_or("");
+    let extension_debugger_api_available = host
+        .extension_debugger_api_available
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "not_seen_yet".to_owned());
     let popup_risk_suppression =
         popup_risk_suppression_summary(&host.extension_popup_risk_suppression);
     let popup_risk_suppression_ok = popup_risk_suppression_covers_profile_risks(
@@ -2724,7 +2758,7 @@ fn chrome_bridge_health_from_snapshot(
     SubsystemHealth {
         status: status.to_owned(),
         detail: Some(format!(
-            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_build_sha256={} expected_extension_build_sha256={} extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} {} {} {} {} install_guidance={}",
+            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_build_sha256={} expected_extension_build_sha256={} extension_debugger_api_available={} expected_extension_debugger_api_available=false extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} {} {} {} {} install_guidance={}",
             tab_control_available,
             extension_stale,
             extension_stale_reasons,
@@ -2739,6 +2773,7 @@ fn chrome_bridge_health_from_snapshot(
             EXPECTED_EXTENSION_BUILD_ID,
             extension_build_sha256,
             EXPECTED_EXTENSION_BUILD_SHA256,
+            extension_debugger_api_available,
             extension_capabilities,
             REQUIRED_DIRECT_HTTP_CAPABILITIES.join(","),
             chrome_debugger_health_endpoint(endpoint_extension_id),
@@ -4122,6 +4157,7 @@ mod tests {
                 .map(|capability| (*capability).to_owned())
                 .collect(),
             extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(false),
             extension_popup_risk_suppression: Some(json!({
                 "ok": true,
                 "status": "clear",
@@ -4155,6 +4191,52 @@ mod tests {
         );
         assert!(detail.contains("queued_count=2"));
         assert!(detail.contains("pending_count=3"));
+        assert!(detail.contains("extension_debugger_api_available=false"));
+    }
+
+    #[test]
+    fn chrome_bridge_health_blocks_runtime_debugger_api_available() {
+        let host = ChromeBridgeHealthRecord {
+            host_id: "chrome-native-test".to_owned(),
+            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
+            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+            extension_version: Some("0.1.0".to_owned()),
+            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
+            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
+            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
+            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+            extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(true),
+            extension_popup_risk_suppression: Some(json!({
+                "ok": true,
+                "status": "clear",
+                "management_available": true,
+                "hazard_count": 0,
+                "disabled_count": 0,
+                "remaining_hazard_count": 0,
+                "failure_count": 0,
+                "remaining_hazards": [],
+                "failures": []
+            })),
+            pid: 42,
+            parent_window: Some("1001".to_owned()),
+            transport: Some("direct_http".to_owned()),
+            registered_unix_ms: 1000,
+            last_seen_unix_ms: 2000,
+            last_disconnect_detail: None,
+            last_detach_reason: None,
+        };
+
+        let health = chrome_bridge_health_from_snapshot(Some(&host), 1, 0, 0, &[], &[], &[]);
+
+        assert_eq!(health.status, "stale");
+        let detail = health.detail.as_deref().expect("health detail");
+        assert!(detail.contains("tab_control_available=false"));
+        assert!(detail.contains("extension_debugger_api_available=true"));
+        assert!(detail.contains("debugger_api_available=true expected=false"));
     }
 
     #[test]
@@ -4172,6 +4254,7 @@ mod tests {
                 .map(|capability| (*capability).to_owned())
                 .collect(),
             extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(false),
             extension_popup_risk_suppression: None,
             pid: 42,
             parent_window: None,
@@ -4215,6 +4298,7 @@ mod tests {
                 .map(|capability| (*capability).to_owned())
                 .collect(),
             extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(false),
             extension_popup_risk_suppression: Some(json!({
                 "ok": true,
                 "status": "suppressed",
@@ -4270,6 +4354,7 @@ mod tests {
                 .map(|capability| (*capability).to_owned())
                 .collect(),
             extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(false),
             extension_popup_risk_suppression: Some(json!({
                 "ok": true,
                 "status": "clear",
@@ -4329,6 +4414,7 @@ mod tests {
                 .map(|capability| (*capability).to_owned())
                 .collect(),
             extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(false),
             extension_popup_risk_suppression: Some(json!({
                 "ok": true,
                 "status": "clear",
@@ -4385,6 +4471,7 @@ mod tests {
                 .map(|capability| (*capability).to_owned())
                 .collect(),
             extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(false),
             extension_popup_risk_suppression: Some(json!({
                 "ok": true,
                 "status": "clear",
@@ -4432,6 +4519,7 @@ mod tests {
                 .map(|capability| (*capability).to_owned())
                 .collect(),
             extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(false),
             extension_popup_risk_suppression: Some(json!({
                 "ok": true,
                 "status": "clear",
@@ -4475,6 +4563,7 @@ mod tests {
             extension_build_sha256: None,
             extension_capabilities: BTreeSet::new(),
             extension_user_agent: None,
+            extension_debugger_api_available: None,
             extension_popup_risk_suppression: None,
             pid: 42,
             parent_window: None,
@@ -4515,6 +4604,16 @@ mod tests {
 
         host.extension_build_id = Some(EXPECTED_EXTENSION_BUILD_ID.to_owned());
         host.extension_build_sha256 = Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned());
+        let reason = bridge_command_stale_reason(&host, "openTab")
+            .expect("missing runtime debugger API readback is unsafe");
+        assert!(reason.contains("debugger_api_available=not_seen_yet"));
+
+        host.extension_debugger_api_available = Some(true);
+        let reason = bridge_command_stale_reason(&host, "openTab")
+            .expect("runtime debugger API availability is unsafe");
+        assert!(reason.contains("debugger_api_available=true"));
+
+        host.extension_debugger_api_available = Some(false);
         host.extension_capabilities.clear();
         let reason = bridge_command_stale_reason(&host, "openTab")
             .expect("exact identity without capability readback is still unsafe");
@@ -4534,6 +4633,7 @@ mod tests {
             .map(|capability| (*capability).to_owned())
             .collect();
         assert_eq!(bridge_command_stale_reason(&host, "reloadSelf"), None);
+        assert_eq!(bridge_command_stale_reason(&host, "openTab"), None);
     }
 
     #[test]
@@ -4548,6 +4648,7 @@ mod tests {
             extension_build_sha256: Some("old-sha".to_owned()),
             extension_capabilities: vec!["reloadSelf".to_owned()],
             extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(false),
             extension_popup_risk_suppression: None,
             pid: 0,
             parent_window: None,

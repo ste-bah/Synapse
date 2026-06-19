@@ -893,8 +893,8 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     daemon_bridge_transport = 'direct_localhost_websocket'
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
     bridge_self_reload_command = 'cdp_bridge_reload'
-    bridge_build_id_expected = 'synapse-chrome-bridge-2026-06-19-managed-popup-shield-v1'
-    bridge_build_sha256_expected = '6a9168f4c16ef0c52d2ce61c39c610808d374b526b214199258312cf1f569ca1'
+    bridge_build_id_expected = 'synapse-chrome-bridge-2026-06-19-runtime-debugger-api-shield-v1'
+    bridge_build_sha256_expected = '4c7056621f8e40db2e539f22cc335fec12b69ccbdb2ccfa110e81f05021c14b3'
     bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'closeTab', 'domAction', 'externalPopupRiskSuppression', 'navigateTab', 'openTab', 'pageVitals', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
     background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_for_typed_dom_actions_no_debugger_no_native_messaging_plus_chrome.management_external_popup_suppression'
     reconnect_driver = 'bounded_websocket_reconnect_with_chrome_alarms_mv3_wake'
