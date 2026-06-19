@@ -196,10 +196,15 @@ Chrome session, the supported attach path is:
    (`scripts\install-synapse-chrome-debugger.ps1`) apply a reversible HKCU Chrome
    `ExtensionSettings` popup shield for those `debugger`/`nativeMessaging`
    permissions by default, identified by Synapse's `blocked_install_message`
-   marker. Admin- or user-authored `ExtensionSettings` entries are preserved
-   except for that Synapse-authored permission shield. Run
+   marker. They also preserve a self-shield for the stable Synapse extension ID:
+   the current bridge does not request those permissions, while an old loaded
+   bridge build that still does is blocked by Chrome policy instead of being able
+   to show the "`started debugging this browser`" banner. Admin- or user-authored
+   `ExtensionSettings` entries are preserved except for that Synapse-authored
+   permission shield. Run
    `scripts\install-synapse-chrome-debugger.ps1 -RemoveExternalDebuggerPolicyOnly`
-   to remove only Synapse-authored popup shields. Use
+   to remove only Synapse-authored external popup shields; it keeps the Synapse
+   extension ID self-shield. Use
    `-PreserveExternalDebuggerExtensions` only as an explicit emergency opt-out.
    If `HKCU\Software\Policies\Google\Chrome` is ACL-locked, the verifier reports
    `SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED` and ACL readback as a
@@ -207,6 +212,11 @@ Chrome session, the supported attach path is:
    hazard through `chrome.management`; if Chrome rejects that suppression,
    normal bridge commands fail closed and report the exact extension IDs and
    suppression error.
+   `health` also reports
+   `synapse_chrome_self_policy_shield_present=<true|false>` from the same
+   `ExtensionSettings` value so agents can distinguish a real Synapse
+   self-shield from a debugger-free current bridge that is relying on
+   identity/capability gates plus fail-closed stale-active permission detection.
    Runtime `observe` diagnostics and health include a live
    `external_chrome_popup_risk` profile/process summary when Synapse refuses a
    normal-profile command, so remaining popups are attributed to the exact

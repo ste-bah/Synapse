@@ -248,7 +248,7 @@ function Set-SynapseChromeExternalDebuggerPolicy {
 
     $hazards = @($Extensions | Where-Object {
         $id = [string]$_.extension_id
-        $id -match '^[a-p]{32}$' -and $id -ne $ExtensionId
+        $id -match '^[a-p]{32}$'
     } | Sort-Object extension_id -Unique)
 
     $policyRoot = Get-ChromePolicyRoot -Hive 'HKCU'
@@ -257,7 +257,7 @@ function Set-SynapseChromeExternalDebuggerPolicy {
             hive = 'HKCU'
             path = $policyRoot
             changed = $false
-            reason = 'no_external_debugger_or_native_hazards'
+            reason = 'no_debugger_or_native_hazards'
             shielded_entries = @()
             unchanged_entries = @()
         }
@@ -369,7 +369,7 @@ function Set-SynapseChromeExternalDebuggerPolicy {
 }
 
 if ($RemoveExternalDebuggerPolicyOnly) {
-    $cleanup = Remove-SynapseChromeExternalDebuggerPolicy
+    $cleanup = Remove-SynapseChromeExternalDebuggerPolicy -PreserveExtensionIds @($ExtensionId)
     [pscustomobject]@{
         ok = $true
         mode = 'chrome_policy_cleanup_only'
@@ -780,10 +780,6 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
         }
     }
 }
-if ($staleSynapseActivePermissions.Count -gt 0) {
-    $detail = $staleSynapseActivePermissions | ConvertTo-Json -Depth 6 -Compress
-    throw "SYNAPSE_CHROME_EXTENSION_STALE_ACTIVE_DEBUGGER_PERMISSION extension_id=$ExtensionId detail=$detail remediation=if daemon health shows the live bridge advertises reloadSelf, call cdp_bridge_reload through the real Synapse MCP tool; if the loaded worker predates reloadSelf, fail closed and let Chrome reload/restart the extension out-of-band instead of automating chrome://extensions foreground UI; the normal bridge must be active with tabs only before setup can pass"
-}
 $externalNativeMessagingProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
         $_.CommandLine -match 'chrome\.nativeMessaging' -and
@@ -843,6 +839,17 @@ $externalHazardExtensionIds = @(
     @($externalNativeMessagingProcesses | ForEach-Object { $_.ExtensionId })
 ) | Where-Object { $_ -match '^[a-p]{32}$' } | Sort-Object -Unique
 
+$synapseSelfShieldRow = [pscustomobject]@{
+    extension_id = $ExtensionId
+    name = 'Synapse Chrome Bridge'
+    active_api = @()
+    granted_api = @()
+    manifest_api = @()
+    hazard_api = @('debugger', 'nativeMessaging')
+    runtime_enabled = $true
+    source = 'synapse_self_bridge_invariant'
+}
+
 # External extensions and native-messaging hosts that use debugger/nativeMessaging
 # can surface layout-changing Chrome popups independently of Synapse's tabs-only
 # bridge. Setup tries to apply a reversible HKCU ExtensionSettings shield for
@@ -850,21 +857,29 @@ $externalHazardExtensionIds = @(
 # installed bridge must suppress the hazards through chrome.management or normal
 # tabs/scripting commands fail closed before queueing any Chrome command.
 #
-# As a one-way remediation we remove any debugger/nativeMessaging blockers that
-# an earlier Synapse version wrote into Chrome ExtensionSettings, so running the
-# latest build self-heals previously-affected machines.
-$chromePolicyCleanup = Remove-SynapseChromeExternalDebuggerPolicy -PreserveExtensionIds $externalHazardExtensionIds
-$chromePolicyPopupShield = if ($PreserveExternalDebuggerExtensions) {
-    [pscustomobject]@{
-        hive = 'HKCU'
-        path = (Get-ChromePolicyRoot -Hive 'HKCU')
-        changed = $false
-        reason = 'preserve_external_debugger_extensions_requested'
-        shielded_entries = @()
-        unchanged_entries = @()
-    }
-} else {
-    Set-SynapseChromeExternalDebuggerPolicy -Extensions $allExternalDebuggerOrNativeExtensions
+# As a one-way remediation we remove stale Synapse-authored blockers from prior
+# builds, but preserve the current self-shield for the Synapse extension ID. The
+# current bridge does not request debugger/nativeMessaging, so blocking those
+# permissions is harmless for the supported build and prevents an older loaded
+# Synapse Chrome Bridge from retaining the capability that triggers Chrome's
+# layout-shifting "started debugging this browser" banner.
+$chromePolicyCleanup = Remove-SynapseChromeExternalDebuggerPolicy -PreserveExtensionIds @(
+    @($externalHazardExtensionIds)
+    $ExtensionId
+)
+$policyShieldExtensions = @($synapseSelfShieldRow)
+if (-not $PreserveExternalDebuggerExtensions) {
+    $policyShieldExtensions += @($allExternalDebuggerOrNativeExtensions)
+}
+$chromePolicyPopupShield = Set-SynapseChromeExternalDebuggerPolicy -Extensions $policyShieldExtensions
+
+if ($staleSynapseActivePermissions.Count -gt 0) {
+    $detail = [ordered]@{
+        extension_id = $ExtensionId
+        stale_active_permissions = $staleSynapseActivePermissions
+        chrome_policy_popup_shield = $chromePolicyPopupShield
+    } | ConvertTo-Json -Depth 8 -Compress
+    throw "SYNAPSE_CHROME_EXTENSION_STALE_ACTIVE_DEBUGGER_PERMISSION extension_id=$ExtensionId detail=$detail remediation=Synapse attempted to apply/preserve the HKCU ExtensionSettings self-shield for debugger/nativeMessaging and included the physical policy write result in detail.chrome_policy_popup_shield; call cdp_bridge_reload through the real Synapse MCP tool when the live bridge advertises reloadSelf, otherwise keep normal browser commands failed closed until Chrome reloads the extension or restarts the already-open profile"
 }
 
 [pscustomobject]@{

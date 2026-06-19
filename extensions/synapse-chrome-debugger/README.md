@@ -43,17 +43,20 @@ Install/verify the local bridge registration with:
 scripts\install-synapse-chrome-debugger.ps1
 ```
 
-The verifier registers the bridge, removes stale Synapse-authored
+The verifier registers the bridge, removes stale Synapse-authored external
 `debugger`/`nativeMessaging` blockers from earlier builds, then applies the
 current reversible HKCU Chrome `ExtensionSettings` popup shield for external
-extensions or native hosts that request `debugger`/`nativeMessaging`. The shield
-is identified by Synapse's `blocked_install_message` marker and can be removed
-with the maintenance command below. If the HKCU Chrome policy key is ACL-locked,
-the verifier reports `SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED` with ACL
-readback. That policy shield failure is not ignored: the loaded bridge uses
-`chrome.management` to disable enabled external `debugger`/`nativeMessaging`
-extensions, and normal commands fail closed if that suppression does not
-complete.
+extensions or native hosts that request `debugger`/`nativeMessaging`. It also
+preserves a self-shield for the stable Synapse extension ID. The current bridge
+does not request those permissions; an old loaded bridge build that still does
+is blocked by Chrome policy instead of being able to show the
+`started debugging this browser` banner. The shield is identified by Synapse's
+`blocked_install_message` marker and can be removed with the maintenance command
+below. If the HKCU Chrome policy key is ACL-locked, the verifier reports
+`SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED` with ACL readback. That policy
+shield failure is not ignored: the loaded bridge uses `chrome.management` to
+disable enabled external `debugger`/`nativeMessaging` extensions, and normal
+commands fail closed if that suppression does not complete.
 
 Then load this directory as an unpacked extension from `chrome://extensions`.
 The extension registers with the loopback daemon at `http://127.0.0.1:7700`,
@@ -159,13 +162,14 @@ reversible HKCU popup shield by default:
 scripts\synapse-setup.ps1
 ```
 
-Setup registers the bridge, removes stale Synapse-authored blockers from prior
-builds, and tries to write current Synapse-authored `blocked_permissions`
-entries for detected external debugger/nativeMessaging hazards. Those entries
-are reversible through the maintenance command below and are the supported
-first way to suppress popups from other extensions/native hosts; the runtime
-`chrome.management` fallback is the second way, and fail-closed is the only
-remaining behavior when both are unavailable.
+Setup registers the bridge, removes stale Synapse-authored external blockers
+from prior builds, preserves the Synapse extension ID self-shield, and tries to
+write current Synapse-authored `blocked_permissions` entries for detected
+external debugger/nativeMessaging hazards. Those entries are reversible through
+the maintenance command below and are the supported first way to suppress
+popups from other extensions/native hosts; the runtime `chrome.management`
+fallback is the second way, and fail-closed is the only remaining behavior when
+both are unavailable.
 
 To heal an affected machine without a full setup run, invoke the standalone
 verifier's maintenance entry point:
@@ -174,9 +178,10 @@ verifier's maintenance entry point:
 scripts\install-synapse-chrome-debugger.ps1 -RemoveExternalDebuggerPolicyOnly
 ```
 
-That removes only Synapse-authored blockers (matched by the
-`blocked_install_message` marker) from HKCU and HKLM and reports a per-hive
-result; admin- or user-authored `ExtensionSettings` entries are preserved.
+That removes only Synapse-authored external blockers (matched by the
+`blocked_install_message` marker) from HKCU and HKLM, preserves the Synapse
+extension ID self-shield, and reports a per-hive result; admin- or user-authored
+`ExtensionSettings` entries are preserved.
 Popup-free background automation is achieved on Synapse's own side: the bundled
 bridge is tabs-first over localhost WebSocket with no `debugger` or
 `nativeMessaging` permission, helper Chrome windows are never created, and

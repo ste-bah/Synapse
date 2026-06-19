@@ -63,12 +63,14 @@
 
   Synapse applies a reversible HKCU Chrome ExtensionSettings popup shield for
   external debugger/nativeMessaging hazards by default, identified by a
-  Synapse-authored blocked_install_message marker. It also removes stale
-  Synapse-authored blockers from prior builds before reapplying the current
-  shield. Popup-free background automation is still achieved on Synapse's own
-  side: the bundled bridge is tabs-only over localhost WebSocket (no
-  debugger/nativeMessaging permission), and deep CDP work runs in a dedicated
-  Synapse-launched automation profile started with --silent-debugger-extension-api.
+  Synapse-authored blocked_install_message marker. It also preserves a
+  self-shield for the stable Synapse extension ID so an older loaded bridge
+  build cannot retain debugger/nativeMessaging capability and show Chrome's
+  layout-shifting "started debugging this browser" banner. Popup-free
+  background automation is still achieved on Synapse's own side: the bundled
+  bridge is tabs-only over localhost WebSocket (no debugger/nativeMessaging
+  permission), and deep CDP work runs in a dedicated Synapse-launched automation
+  profile started with --silent-debugger-extension-api.
 
 .PARAMETER MaintenanceLockPath
   File-lock Source of Truth that serializes setup/remove across multiple
