@@ -802,6 +802,13 @@ pub(crate) fn read_persisted_cdp_target_owners_for_session(
     read_persisted_cdp_target_owners_for_session_from_db(&db, session_id)
 }
 
+pub(crate) fn persisted_cdp_target_owner_row_key_string(
+    owner_key: &str,
+    cdp_target_id: &str,
+) -> String {
+    String::from_utf8_lossy(&cdp_target_owner_row_key(owner_key, cdp_target_id)).into_owned()
+}
+
 fn delete_persisted_cdp_target_owner_from_db(
     db: &Db,
     owner_key: &str,

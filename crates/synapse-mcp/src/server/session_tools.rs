@@ -125,6 +125,34 @@ pub struct SessionLeaseReadback {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct PersistedCdpTargetOwnerReadback {
+    pub source_of_truth: String,
+    pub row_key: String,
+    pub owner_key: String,
+    pub owner_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_client_name: Option<String>,
+    pub owner_agent_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_started_at_unix_ms: Option<u64>,
+    pub stored_at_unix_ms: u64,
+    pub target: TargetWire,
+    pub window_hwnd: i64,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_window_hwnd: Option<i64>,
+    pub cdp_target_id: String,
+    pub requested_url: String,
+    pub target_url: String,
+    pub created_at_unix_ms: u64,
+    pub cleanup_action: String,
+    pub recovery_guidance: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionSummary {
     #[serde(flatten)]
     pub registry: SessionRegistryRead,
@@ -135,6 +163,8 @@ pub struct SessionSummary {
     pub foreground_lane: ForegroundLaneReadback,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_claims: Vec<TargetClaimRead>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub persisted_cdp_target_owners: Vec<PersistedCdpTargetOwnerReadback>,
     pub lease: SessionLeaseReadback,
     /// #898 lifecycle state machine read for this session's agent: state,
     /// reason code, heartbeat, waiting_for detail, runaway flag.
@@ -213,6 +243,7 @@ pub struct SessionListCompactRow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_target_key: Option<String>,
     pub target_claim_count: usize,
+    pub persisted_cdp_target_owner_count: usize,
     pub lease_is_owner: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_state: Option<String>,
@@ -624,6 +655,8 @@ impl SynapseService {
         let memory_targets = self.session_targets()?;
         let persisted_target_session_ids = self.persisted_session_target_session_ids()?;
         let persisted_cdp_owner_session_ids = self.persisted_cdp_target_owner_session_ids()?;
+        let persisted_cdp_owners_by_session =
+            self.persisted_cdp_target_owner_readbacks_by_session(&persisted_cdp_owner_session_ids)?;
         let all_target_claims = self.target_claim_status_snapshot()?.claims;
         let target_claims_by_owner = target_claim_reads_by_owner(&all_target_claims);
         let lease_status = lease::status();
@@ -646,7 +679,11 @@ impl SynapseService {
         }
         let mut sessions = Vec::new();
         for session_id in session_ids {
-            let Some(summary) = build_session_summary(
+            let persisted_cdp_target_owners = persisted_cdp_owners_by_session
+                .get(&session_id)
+                .cloned()
+                .unwrap_or_default();
+            let Some(mut summary) = build_session_summary(
                 &session_id,
                 registry_reads.get(&session_id).cloned(),
                 targets.get(&session_id).cloned(),
@@ -658,10 +695,11 @@ impl SynapseService {
                 &lease_status,
                 now_unix_ms,
                 stale_after_ms,
-                persisted_cdp_owner_session_ids.contains(&session_id),
+                !persisted_cdp_target_owners.is_empty(),
             ) else {
                 continue;
             };
+            summary.persisted_cdp_target_owners = persisted_cdp_target_owners;
             if !options.include_closed && summary.registry.lifecycle == "closed" {
                 continue;
             }
@@ -760,11 +798,11 @@ impl SynapseService {
         let target_claims = target_claim_reads_by_owner(&all_target_claims)
             .remove(session_id)
             .unwrap_or_default();
-        let has_persisted_cdp_owner = self
-            .persisted_cdp_target_owner_session_ids()?
-            .contains(session_id);
+        let persisted_cdp_target_owners =
+            self.persisted_cdp_target_owner_readbacks_for_session(session_id)?;
+        let has_persisted_cdp_owner = !persisted_cdp_target_owners.is_empty();
         let lease_status = lease::status();
-        let session = build_session_summary(
+        let mut session = build_session_summary(
             session_id,
             registry_reads.get(session_id).cloned(),
             active_target,
@@ -775,6 +813,9 @@ impl SynapseService {
             stale_after_ms,
             has_persisted_cdp_owner,
         );
+        if let Some(summary) = session.as_mut() {
+            summary.persisted_cdp_target_owners = persisted_cdp_target_owners;
+        }
         Ok(SessionStatusResponse {
             now_unix_ms,
             stale_after_ms,
@@ -844,6 +885,42 @@ impl SynapseService {
         Ok(session_ids)
     }
 
+    fn persisted_cdp_target_owner_readbacks_by_session(
+        &self,
+        session_ids: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, Vec<PersistedCdpTargetOwnerReadback>>, ErrorData> {
+        let mut by_session = BTreeMap::new();
+        for session_id in session_ids {
+            let readbacks = self.persisted_cdp_target_owner_readbacks_for_session(session_id)?;
+            if !readbacks.is_empty() {
+                by_session.insert(session_id.clone(), readbacks);
+            }
+        }
+        Ok(by_session)
+    }
+
+    fn persisted_cdp_target_owner_readbacks_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PersistedCdpTargetOwnerReadback>, ErrorData> {
+        let m3_state = self.m3_state_handle();
+        let rows = super::session_continuity::read_persisted_cdp_target_owners_for_session(
+            &m3_state, session_id,
+        )
+        .map_err(|detail| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "read persisted CDP target owner rows for session {session_id:?}: {detail}"
+                ),
+            )
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|(owner_key, row)| persisted_cdp_target_owner_readback(owner_key, row))
+            .collect())
+    }
+
     pub(crate) fn human_os_foreground_readback(&self) -> HumanOsForegroundReadback {
         match self.current_audit_foreground() {
             Ok(foreground) => HumanOsForegroundReadback {
@@ -877,6 +954,45 @@ impl SynapseService {
     }
 }
 
+fn persisted_cdp_target_owner_readback(
+    owner_key: String,
+    row: super::session_continuity::PersistedCdpTargetOwner,
+) -> PersistedCdpTargetOwnerReadback {
+    let row_key = super::session_continuity::persisted_cdp_target_owner_row_key_string(
+        &owner_key,
+        &row.owner.cdp_target_id,
+    );
+    PersistedCdpTargetOwnerReadback {
+        source_of_truth: format!("CF_SESSIONS:{row_key}"),
+        row_key,
+        owner_key,
+        owner_session_id: row.owner_session_id.clone(),
+        owner_client_name: row.owner_client_name,
+        owner_agent_kind: row.owner_agent_kind,
+        owner_started_at_unix_ms: row.owner_started_at_unix_ms,
+        stored_at_unix_ms: row.stored_at_unix_ms,
+        target: TargetWire::Cdp {
+            window_hwnd: row.owner.window_hwnd,
+            cdp_target_id: row.owner.cdp_target_id.clone(),
+        },
+        window_hwnd: row.owner.window_hwnd,
+        endpoint: row.owner.endpoint,
+        chrome_window_id: row.owner.chrome_window_id,
+        capture_window_hwnd: row.owner.capture_window_hwnd,
+        cdp_target_id: row.owner.cdp_target_id,
+        requested_url: row.owner.requested_url,
+        target_url: row.owner.target_url,
+        created_at_unix_ms: row.owner.created_at_unix_ms,
+        cleanup_action: format!(
+            "call session_end with session_id={} while the Chrome bridge is healthy; cdp_close_tab recovery requires an exact target_claim for this target",
+            row.owner_session_id
+        ),
+        recovery_guidance:
+            "durable owner row remains until cleanup closes the tab or proves it already absent; use the already-open authenticated Chrome bridge, never foreground the human browser or launch a second Chrome profile"
+                .to_owned(),
+    }
+}
+
 fn compact_session_row(summary: &SessionSummary) -> SessionListCompactRow {
     SessionListCompactRow {
         session_id: summary.registry.session_id.clone(),
@@ -897,6 +1013,7 @@ fn compact_session_row(summary: &SessionSummary) -> SessionListCompactRow {
         foreground_lane_kind: summary.foreground_lane.lane_kind.clone(),
         foreground_target_key: summary.foreground_lane.target_key.clone(),
         target_claim_count: summary.target_claims.len(),
+        persisted_cdp_target_owner_count: summary.persisted_cdp_target_owners.len(),
         lease_is_owner: summary.lease.is_owner,
         agent_state: summary
             .agent_state
@@ -1600,6 +1717,7 @@ fn build_session_summary(
             lease_status,
         ),
         target_claims,
+        persisted_cdp_target_owners: Vec::new(),
         lease,
         agent_state,
         attention_class,
@@ -1999,6 +2117,61 @@ mod tests {
                 &status_response(Some(summary))
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn persisted_cdp_owner_readback_exposes_cleanup_source_of_truth() {
+        let readback = persisted_cdp_target_owner_readback(
+            "owner-key-1".to_owned(),
+            crate::server::session_continuity::PersistedCdpTargetOwner {
+                schema_version: 1,
+                owner_key: "owner-key-1".to_owned(),
+                stored_at_unix_ms: 1_100,
+                owner_session_id: "session-cdp".to_owned(),
+                owner_client_name: Some("codex-mcp-client".to_owned()),
+                owner_agent_kind: "codex".to_owned(),
+                owner_started_at_unix_ms: Some(900),
+                owner: crate::server::CdpTargetOwner {
+                    session_id: "session-cdp".to_owned(),
+                    window_hwnd: 0x1234,
+                    endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.tabs"
+                        .to_owned(),
+                    chrome_window_id: Some(7),
+                    capture_window_hwnd: Some(0x1234),
+                    cdp_target_id: "chrome-tab:600751746".to_owned(),
+                    requested_url: "about:blank#issue1268".to_owned(),
+                    target_url: "about:blank#issue1268".to_owned(),
+                    created_at_unix_ms: 1_000,
+                },
+            },
+        );
+
+        assert_eq!(
+            readback.source_of_truth,
+            "CF_SESSIONS:mcp/session-cdp-target-owner/v1/20:chrome-tab:600751746/owner-key-1"
+        );
+        match readback.target {
+            TargetWire::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            } => {
+                assert_eq!(window_hwnd, 0x1234);
+                assert_eq!(cdp_target_id, "chrome-tab:600751746");
+            }
+            TargetWire::Window { .. } => panic!("expected CDP target readback"),
+        }
+        assert_eq!(readback.owner_session_id, "session-cdp");
+        assert_eq!(readback.chrome_window_id, Some(7));
+        assert!(
+            readback
+                .cleanup_action
+                .contains("call session_end with session_id=session-cdp")
+        );
+        assert!(
+            readback
+                .recovery_guidance
+                .contains("already-open authenticated Chrome bridge")
         );
     }
 
@@ -2880,6 +3053,7 @@ mod tests {
                 &synapse_action::LeaseStatus::unheld(),
             ),
             target_claims: Vec::new(),
+            persisted_cdp_target_owners: Vec::new(),
             lease: SessionLeaseReadback {
                 held: false,
                 owner_session_id: None,

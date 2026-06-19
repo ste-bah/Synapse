@@ -564,6 +564,17 @@ fn external_chrome_popup_risk_warning(rows: &[String], suppression_ok: bool) -> 
     )
 }
 
+fn external_chrome_popup_risk_host_unavailable_warning(rows: &[String]) -> String {
+    if rows.is_empty() {
+        return "external_chrome_popup_risk_warning=false risk_count=0".to_owned();
+    }
+    format!(
+        "external_chrome_popup_risk_warning=true external_chrome_popup_risk_scope=host_unavailable_no_live_management risk_count={} external_chrome_popup_risk={} remediation=the active Synapse Chrome Bridge host is absent, so live Chrome management suppression state cannot be read; restore the already-open authenticated Chrome bridge host with cdp_bridge_reload or the installed bridge reconnect path, then re-read health before classifying external debugger/nativeMessaging rows as suppressed or blocking",
+        rows.len(),
+        format_external_chrome_popup_risks(rows)
+    )
+}
+
 fn external_chrome_layout_infobar_warning(rows: &[String]) -> String {
     if rows.is_empty() {
         return "external_chrome_layout_infobar_risk_warning=false layout_risk_count=0".to_owned();
@@ -573,6 +584,16 @@ fn external_chrome_layout_infobar_warning(rows: &[String]) -> String {
         rows.len(),
         rows.join(";")
     )
+}
+
+fn active_host_available() -> bool {
+    let Ok(inner) = bridge().inner.lock() else {
+        return false;
+    };
+    inner
+        .active_host_id
+        .as_ref()
+        .is_some_and(|host_id| inner.hosts.contains_key(host_id))
 }
 
 fn active_host_popup_risk_suppression_covers(profile_risk_count: usize) -> bool {
@@ -645,6 +666,17 @@ fn ensure_normal_bridge_external_popup_suppressed(
     let risks = external_chrome_popup_risks();
     if risks.is_empty() {
         return Ok(());
+    }
+    if !active_host_available() {
+        tracing::warn!(
+            code = "CHROME_EXTERNAL_POPUP_RISK_STATE_UNAVAILABLE",
+            hwnd,
+            command_kind,
+            risk_count = risks.len(),
+            external_chrome_popup_risk = %format_external_chrome_popup_risks(&risks),
+            "normal Chrome bridge command cannot classify external popup risk because no active bridge host is registered"
+        );
+        return Err(ChromeDebuggerBridgeError::unavailable());
     }
     let suppression_summary = active_host_popup_risk_suppression_summary();
     if active_host_popup_risk_suppression_covers(risks.len()) {
@@ -2749,7 +2781,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
         !synapse_chrome_self_active_popup_risks(self_profile_risks).is_empty();
 
     let Some(host) = active_host else {
-        let risk_warning = external_chrome_popup_risk_warning(popup_risks, false);
+        let risk_warning = external_chrome_popup_risk_host_unavailable_warning(popup_risks);
         return SubsystemHealth {
             status: "unavailable".to_owned(),
             detail: Some(format!(
@@ -4209,6 +4241,30 @@ mod tests {
         assert!(detail.contains("do not launch a second Chrome process/profile"));
         assert!(detail.contains("cdp_bridge_reload"));
         assert!(detail.contains("scripts\\install-synapse-chrome-debugger.ps1"));
+    }
+
+    #[test]
+    fn chrome_bridge_health_reports_external_popup_risk_unknown_without_active_host() {
+        let health = chrome_bridge_health_from_snapshot(
+            None,
+            0,
+            0,
+            0,
+            &["profile=Default extension_id=external active_api=debugger".to_owned()],
+            &[],
+            &[],
+        );
+
+        assert_eq!(health.status, "unavailable");
+        let detail = health.detail.as_deref().expect("health detail");
+        assert!(detail.contains("reason=no_active_chrome_bridge_host"));
+        assert!(detail.contains("external_chrome_popup_risk_warning=true"));
+        assert!(
+            detail.contains("external_chrome_popup_risk_scope=host_unavailable_no_live_management")
+        );
+        assert!(detail.contains("extension_id=external"));
+        assert!(!detail.contains("external_chrome_popup_risk_blocking=true"));
+        assert!(!detail.contains("external_chrome_popup_risk_scope=external_suppression_required"));
     }
 
     #[test]

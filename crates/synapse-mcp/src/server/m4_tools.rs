@@ -5255,6 +5255,7 @@ mod tests {
                 missing_reason: Some("test".to_owned()),
             },
             target_claims: Vec::new(),
+            persisted_cdp_target_owners: Vec::new(),
             lease: crate::server::session_tools::SessionLeaseReadback {
                 held: false,
                 owner_session_id: None,
