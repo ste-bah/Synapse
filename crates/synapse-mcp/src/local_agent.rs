@@ -834,14 +834,26 @@ impl Runner {
                 // transport is terminal. Crashing here previously killed agents
                 // on the first recoverable error (e.g. a missing required
                 // parameter), tearing down any process the agent had launched.
-                let fatal = tool_call_error_is_terminal(&error);
-                let detail = format!("SYNAPSE_TOOL_CALL_FAILED: {tool_name}: {error}");
+                let transport_terminal = tool_call_error_is_terminal(&error);
+                let exact_required_tool_failed = task_contract_required_tool_failure_is_terminal(
+                    self.task_tool_contract.as_ref(),
+                    &self.completed_task_tools,
+                    &tool_name,
+                    &args,
+                );
+                let fatal = transport_terminal || exact_required_tool_failed;
+                let error_code = if exact_required_tool_failed && !transport_terminal {
+                    "MODEL_TASK_REQUIRED_TOOL_FAILED"
+                } else {
+                    "SYNAPSE_TOOL_CALL_FAILED"
+                };
+                let detail = format!("{error_code}: {tool_name}: {error}");
                 self.tool_call_error_count = self.tool_call_error_count.saturating_add(1);
                 // Structured, actionable feedback for the model (not a bare
                 // exception string): names the tool, the failure, and the next
                 // step the model should take.
                 let model_feedback = json!({
-                    "error": "SYNAPSE_TOOL_CALL_FAILED",
+                    "error": error_code,
                     "tool": tool_name,
                     "message": error.to_string(),
                     "recoverable": !fatal,
@@ -862,7 +874,7 @@ impl Runner {
                     "routed_tool_name": if routed { Some(tool_name.as_str()) } else { None },
                     "tool_call_id": call.id,
                     "status": "error",
-                    "error_code": "SYNAPSE_TOOL_CALL_FAILED",
+                    "error_code": error_code,
                     "terminal": fatal,
                     "result": result_value,
                     "tool_exposure": self.tool_exposure.as_str(),
@@ -878,7 +890,7 @@ impl Runner {
                     "routed_tool_name": if routed { Some(tool_name.as_str()) } else { None },
                     "tool_call_id": call.id,
                     "tool_response": result_value,
-                    "error_code": "SYNAPSE_TOOL_CALL_FAILED",
+                    "error_code": error_code,
                     "tool_exposure": self.tool_exposure.as_str(),
                 }))
                 .await?;
@@ -2497,6 +2509,24 @@ fn task_contract_completed_tool_repetition_should_defer(
         && !missing_task_contract_tools(task_tool_contract, completed_task_tools).is_empty()
 }
 
+fn task_contract_required_tool_failure_is_terminal(
+    contract: Option<&TaskToolContract>,
+    completed_task_tools: &BTreeSet<String>,
+    tool_name: &str,
+    args: &JsonObject,
+) -> bool {
+    let Some(contract) = contract else {
+        return false;
+    };
+    if next_missing_task_contract_tool(contract, completed_task_tools) != Some(tool_name) {
+        return false;
+    }
+    contract
+        .argument_templates
+        .get(tool_name)
+        .is_some_and(|expected| expected == args)
+}
+
 fn task_contract_out_of_order_rejection(
     contract: Option<&TaskToolContract>,
     completed_task_tools: &BTreeSet<String>,
@@ -3771,6 +3801,7 @@ fn error_code_from_detail(detail: &str) -> &str {
         "MODEL_TOOLS_UNSUPPORTED",
         "MODEL_EMPTY_COMPLETION",
         "MODEL_TOOL_CALL_INVALID",
+        "MODEL_TASK_REQUIRED_TOOL_FAILED",
         "LOCAL_AGENT_TIMEOUT",
         "LOCAL_AGENT_CONTEXT_OVERFLOW",
         "LOCAL_AGENT_INTERRUPTED",
@@ -4321,6 +4352,72 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
     }
 
     #[test]
+    fn exact_tool_contract_terminal_on_fixed_next_tool_failure() -> anyhow::Result<()> {
+        let tools = tools_named([
+            "cdp_open_tab",
+            "target_claim",
+            "browser_set_value",
+            "target_act",
+            "workspace_put",
+        ]);
+        let task = "Exact-contract Synapse task. Execute exactly these MCP tools in order:\n\
+1. cdp_open_tab {\"url\":\"http://127.0.0.1:8896/fixture.html\",\"window_hwnd\":2427400}\n\
+2. target_claim {\"ttl_ms\":120000}\n\
+3. browser_set_value {\"selector\":\"#agent-input\",\"text\":\"ramp-004\"}\n\
+4. target_act {\"selector\":\"#mark\",\"verb\":\"click\",\"wait_timeout_ms\":10000}\n\
+5. workspace_put {\"run_id\":\"issue1280\",\"key\":\"ramp-004\",\"value\":{\"ok\":true}}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+        let completed = BTreeSet::from(["cdp_open_tab".to_owned(), "target_claim".to_owned()]);
+        let exact_args: JsonObject =
+            serde_json::from_value(json!({"selector":"#agent-input","text":"ramp-004"}))?;
+        assert!(
+            task_contract_required_tool_failure_is_terminal(
+                Some(&contract),
+                &completed,
+                "browser_set_value",
+                &exact_args,
+            ),
+            "the next required fixed-args tool cannot be retried forever after the daemon already rejected it"
+        );
+
+        let drifted_args: JsonObject =
+            serde_json::from_value(json!({"selector":"#agent-input","text":"wrong"}))?;
+        assert!(
+            !task_contract_required_tool_failure_is_terminal(
+                Some(&contract),
+                &completed,
+                "browser_set_value",
+                &drifted_args,
+            ),
+            "argument drift is handled by the pre-gate contract rejection path"
+        );
+        let out_of_order_args: JsonObject = serde_json::from_value(json!({
+            "selector":"#mark",
+            "verb":"click",
+            "wait_timeout_ms":10000
+        }))?;
+        assert!(
+            !task_contract_required_tool_failure_is_terminal(
+                Some(&contract),
+                &completed,
+                "target_act",
+                &out_of_order_args,
+            ),
+            "allowed but out-of-order tools remain governed by the out-of-order rejection path"
+        );
+        assert!(
+            !task_contract_required_tool_failure_is_terminal(
+                None,
+                &completed,
+                "browser_set_value",
+                &exact_args,
+            ),
+            "ordinary non-contract tool errors stay recoverable"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn exact_tool_contract_rejects_out_of_order_allowed_tool_before_approval() {
         let tools = tools_named([
             "cdp_open_tab",
@@ -4631,6 +4728,10 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
     fn local_agent_timeout_error_code_is_not_endpoint_unreachable() {
         let detail = "LOCAL_AGENT_TIMEOUT: local-agent active timeout exceeded before turn 2";
         assert_eq!(error_code_from_detail(detail), "LOCAL_AGENT_TIMEOUT");
+        assert_eq!(
+            error_code_from_detail("MODEL_TASK_REQUIRED_TOOL_FAILED: browser_set_value: synthetic"),
+            "MODEL_TASK_REQUIRED_TOOL_FAILED"
+        );
     }
 
     #[test]
