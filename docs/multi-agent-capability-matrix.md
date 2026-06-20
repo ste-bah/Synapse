@@ -30,7 +30,7 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | act_combo | break_glass | yes | no | no | yes | target_act verb=press, browser DOM action |
 | act_focus_window | break_glass | yes | no | no | yes | set_target, target_claim, control_lease_acquire, tool_profile_set break_glass, target_act verb=focus_window, session_status |
 | act_keymap | break_glass | yes | no | no | yes | target_act verb=press, browser DOM action |
-| act_launch | break_glass | yes | no | no | yes | act_spawn_agent, cdp_open_tab |
+| act_launch | normal_agent | no | no | no | yes | hidden launch mode, act_spawn_agent, cdp_open_tab |
 | act_pad | break_glass | yes | no | no | yes | target_claim, control_lease_acquire, tool_profile_set break_glass |
 | act_press | break_glass | yes | no | no | yes | target_act verb=press, browser DOM action |
 | act_run_shell | normal_agent | no | no | no | no | none - default-safe |
