@@ -34,18 +34,20 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
-use synapse_core::{ElementId, Point, Rect, error_codes};
+use synapse_core::{AccessibleNode, ElementId, Point, Rect, UiaPattern, error_codes};
 
 const DEFAULT_TARGET_ACT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TARGET_ACT_FOCUS_STABLE_MS: u32 = 75;
 const DEFAULT_TARGET_ACT_SAVE_TIMEOUT_MS: u32 = 2_000;
+const DEFAULT_TARGET_ACT_CLEANUP_NOTEPAD_TABS_TIMEOUT_MS: u32 = 5_000;
 const TARGET_ACT_SAVE_POLL_INTERVAL_MS: u64 = 50;
 const TARGET_ACT_SAVE_SOURCE_OF_TRUTH: &str = "file.bytes";
+const TARGET_ACT_CLEANUP_NOTEPAD_TABS_SOURCE_OF_TRUTH: &str = "hidden_desktop.notepad_tabs.uia";
 const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, click, type, press, select, submit, save, run_shell, focus_window";
+const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, click, type, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window";
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -99,7 +101,8 @@ pub struct TargetActParams {
     #[serde(default)]
     pub name: Option<String>,
     /// Browser DOM action: value match. For `select`, this is the option value
-    /// when `option` is omitted.
+    /// when `option` is omitted. `cleanup_notepad_tabs`: modified-tab policy
+    /// (`discard_modified` default, or `refuse_modified`).
     #[serde(default)]
     pub value: Option<String>,
     /// `select`: option text or option value.
@@ -181,7 +184,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers or by CSS selector through the safe normal-Chrome bridge; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=press presses a named button/link in the session-owned tab; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers or by CSS selector through the safe normal-Chrome bridge; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=press presses a named button/link in the session-owned tab; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -462,6 +465,9 @@ impl SynapseService {
                 target_act_browser_dom_action(self, "submit", &params, &request_context).await?
             }
             "save" => target_act_save(self, &params, &request_context).await?,
+            "cleanup_notepad_tabs" => {
+                target_act_cleanup_notepad_tabs(self, &params, &request_context).await?
+            }
             "run_shell" => {
                 let command = require_param(params.command, "run_shell", "command")?;
                 let response = self
@@ -631,6 +637,1051 @@ struct TargetActFileSnapshot {
     len: u64,
     sha256: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TargetActCleanupNotepadTabsResponse {
+    ok: bool,
+    method: String,
+    backend_tier_used: String,
+    required_foreground: bool,
+    source_of_truth: String,
+    target_hwnd: i64,
+    target_process_name: String,
+    target_window_title_before: String,
+    target_window_title_after: String,
+    keep_path: String,
+    keep_file_name: String,
+    modified_stale_policy: String,
+    desktop_names: Vec<String>,
+    active_desktop_name: String,
+    before_tabs: Vec<TargetActNotepadTabReadback>,
+    closed_tabs: Vec<TargetActNotepadTabCloseAttempt>,
+    after_tabs: Vec<TargetActNotepadTabReadback>,
+    before_signature: String,
+    after_signature: String,
+    stale_tabs_before: u32,
+    stale_tabs_after: u32,
+    modified_stale_tabs_discarded: u32,
+    postcondition: crate::m2::postcondition::ActPostcondition,
+    elapsed_ms: u32,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TargetActNotepadTabReadback {
+    element_id: ElementId,
+    name: String,
+    document_name: String,
+    modified: bool,
+    keep: bool,
+    bbox: Rect,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TargetActNotepadTabCloseAttempt {
+    tab: TargetActNotepadTabReadback,
+    selected: bool,
+    scrolled_into_view: bool,
+    stale_bbox_before: Rect,
+    stale_bbox_after_select: Rect,
+    close_method: String,
+    close_button_element_id: Option<ElementId>,
+    close_invoked: bool,
+    discard_button_element_id: Option<ElementId>,
+    discarded_modified: bool,
+    tabs_after: Vec<TargetActNotepadTabReadback>,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum TargetActModifiedStalePolicy {
+    DiscardModified,
+    RefuseModified,
+}
+
+impl TargetActModifiedStalePolicy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DiscardModified => "discard_modified",
+            Self::RefuseModified => "refuse_modified",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct TargetActNotepadSnapshot {
+    desktop_names: Vec<String>,
+    active_desktop_name: String,
+    context: synapse_core::ForegroundContext,
+    nodes: Vec<AccessibleNode>,
+    tabs: Vec<TargetActNotepadTabReadback>,
+}
+
+#[derive(Clone)]
+struct TargetActHiddenWindowSnapshot {
+    hwnd: i64,
+    nodes: Vec<AccessibleNode>,
+}
+
+async fn target_act_cleanup_notepad_tabs(
+    service: &SynapseService,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let result = target_act_cleanup_notepad_tabs_impl(service, params, request_context).await;
+    let _ = service.audit_action_result_for_request("target_act", &result, request_context);
+    match result {
+        Ok(response) => Ok((
+            "target_window_notepad_tab_cleanup",
+            true,
+            TARGET_ACT_STATUS_OK,
+            target_act_result(&response)?,
+        )),
+        Err(error) => Ok((
+            "target_window_notepad_tab_cleanup",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_window_notepad_tab_cleanup", error),
+        )),
+    }
+}
+
+async fn target_act_cleanup_notepad_tabs_impl(
+    service: &SynapseService,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<TargetActCleanupNotepadTabsResponse, ErrorData> {
+    let started = Instant::now();
+    target_act_validate_cleanup_notepad_tabs_params(params)?;
+    let session_id = target_act_session_id(request_context, "cleanup_notepad_tabs")?;
+    let keep_path = require_param(params.path.clone(), "cleanup_notepad_tabs", "path")?;
+    let keep_path =
+        canonical_existing_file_for_target_act_path("cleanup_notepad_tabs", Path::new(&keep_path))?;
+    let keep_file_name = target_act_file_name(&keep_path, "cleanup_notepad_tabs")?;
+    let modified_policy = target_act_modified_stale_policy(params.value.as_deref())?;
+    let verify_timeout_ms = target_act_cleanup_notepad_tabs_verify_timeout(params.wait_timeout_ms)?;
+    let target = service.session_target(Some(&session_id))?.ok_or_else(|| {
+        mcp_error(
+            error_codes::TARGET_NOT_SET,
+            "target_act verb=cleanup_notepad_tabs requires this MCP session to have an owned hidden-desktop Notepad window target; call act_launch/set_target first",
+        )
+    })?;
+    let hwnd = match target {
+        SessionTarget::Window { hwnd } => hwnd,
+        SessionTarget::Cdp { .. } => {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                "target_act verb=cleanup_notepad_tabs supports native Notepad window targets only",
+            ));
+        }
+    };
+    service.ensure_target_claim_allows_session("target_act", &session_id, &target)?;
+
+    let mut before =
+        target_act_hidden_notepad_snapshot(service, &session_id, hwnd, &keep_file_name)?;
+    if !before
+        .context
+        .process_name
+        .eq_ignore_ascii_case("notepad.exe")
+    {
+        return Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "target_act verb=cleanup_notepad_tabs only supports Notepad hidden targets; target 0x{hwnd:x} is process {} title {:?}",
+                before.context.process_name, before.context.window_title
+            ),
+        ));
+    }
+    if !target_act_notepad_title_matches_path(&before.context.window_title, &keep_path) {
+        return Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "target_act verb=cleanup_notepad_tabs refused: Notepad target title {:?} does not match keep file SoT {}",
+                before.context.window_title,
+                keep_path.display()
+            ),
+        ));
+    }
+    target_act_validate_notepad_keep_tab(&before.tabs, &keep_file_name)?;
+    let before_signature = target_act_notepad_tabs_signature(&before.tabs);
+    let before_tabs = before.tabs.clone();
+    let target_window_title_before = before.context.window_title.clone();
+    let stale_tabs_before = target_act_stale_notepad_tab_count(&before.tabs);
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": "cleanup_notepad_tabs",
+        "delegated_tool": "target_window_notepad_tab_cleanup",
+        "target_hwnd": hwnd,
+        "target_process_name": before.context.process_name,
+        "target_window_title": before.context.window_title,
+        "keep_path": keep_path.display().to_string(),
+        "keep_file_name": keep_file_name,
+        "desktop_names": before.desktop_names,
+        "source_of_truth": TARGET_ACT_CLEANUP_NOTEPAD_TABS_SOURCE_OF_TRUTH,
+        "before_signature": before_signature,
+        "stale_tabs_before": stale_tabs_before,
+        "modified_stale_policy": modified_policy.as_str(),
+        "verify_timeout_ms": verify_timeout_ms,
+        "requires_session_owned_hidden_desktop": true,
+        "required_foreground": false,
+        "no_human_os_foreground_fallback": true,
+    });
+    service.audit_action_started_with_details_for_request(
+        "target_act",
+        &request_details,
+        request_context,
+    )?;
+
+    let deadline = Instant::now() + Duration::from_millis(u64::from(verify_timeout_ms));
+    let mut attempts = Vec::new();
+    loop {
+        target_act_validate_notepad_keep_tab(&before.tabs, &keep_file_name)?;
+        if modified_policy == TargetActModifiedStalePolicy::RefuseModified {
+            if let Some(stale) = target_act_first_modified_stale_notepad_tab(&before.tabs) {
+                return Err(target_act_refuse_modified_stale_tab_error(&stale));
+            }
+        }
+        let Some(stale) = target_act_next_stale_notepad_tab(&before.tabs) else {
+            break;
+        };
+        if attempts.len() > 64 {
+            return Err(target_act_cleanup_notepad_tabs_postcondition_error(
+                "tab cleanup iteration limit reached",
+                &keep_path,
+                &keep_file_name,
+                &before_signature,
+                &before,
+                &before,
+                &attempts,
+                verify_timeout_ms,
+            ));
+        }
+        if Instant::now() >= deadline {
+            return Err(target_act_cleanup_notepad_tabs_postcondition_error(
+                "tab cleanup timed out before all stale tabs were removed",
+                &keep_path,
+                &keep_file_name,
+                &before_signature,
+                &before,
+                &before,
+                &attempts,
+                verify_timeout_ms,
+            ));
+        }
+        let attempt = target_act_cleanup_close_notepad_tab(
+            service,
+            &session_id,
+            hwnd,
+            &keep_file_name,
+            stale,
+            modified_policy,
+            deadline,
+        )
+        .await?;
+        attempts.push(attempt);
+        before = target_act_hidden_notepad_snapshot(service, &session_id, hwnd, &keep_file_name)?;
+    }
+
+    let after = target_act_hidden_notepad_snapshot(service, &session_id, hwnd, &keep_file_name)?;
+    target_act_validate_notepad_keep_tab(&after.tabs, &keep_file_name)?;
+    let stale_tabs_after = target_act_stale_notepad_tab_count(&after.tabs);
+    if stale_tabs_after != 0 {
+        return Err(target_act_cleanup_notepad_tabs_postcondition_error(
+            "stale tabs remained after cleanup",
+            &keep_path,
+            &keep_file_name,
+            &before_signature,
+            &before,
+            &after,
+            &attempts,
+            verify_timeout_ms,
+        ));
+    }
+    let after_signature = target_act_notepad_tabs_signature(&after.tabs);
+    let changed = before_signature != after_signature;
+    let modified_stale_tabs_discarded = attempts
+        .iter()
+        .filter(|attempt| attempt.discarded_modified)
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX);
+    Ok(TargetActCleanupNotepadTabsResponse {
+        ok: true,
+        method: "uia_select_tab_then_invoke_close_tab".to_owned(),
+        backend_tier_used: "uia_invoke_hidden_desktop_target".to_owned(),
+        required_foreground: false,
+        source_of_truth: TARGET_ACT_CLEANUP_NOTEPAD_TABS_SOURCE_OF_TRUTH.to_owned(),
+        target_hwnd: hwnd,
+        target_process_name: after.context.process_name.clone(),
+        target_window_title_before,
+        target_window_title_after: after.context.window_title.clone(),
+        keep_path: keep_path.display().to_string(),
+        keep_file_name,
+        modified_stale_policy: modified_policy.as_str().to_owned(),
+        desktop_names: after.desktop_names.clone(),
+        active_desktop_name: after.active_desktop_name.clone(),
+        before_tabs,
+        closed_tabs: attempts,
+        after_tabs: after.tabs,
+        before_signature: before_signature.clone(),
+        after_signature: after_signature.clone(),
+        stale_tabs_before,
+        stale_tabs_after,
+        modified_stale_tabs_discarded,
+        postcondition: crate::m2::postcondition::ActPostcondition {
+            status: "verified_state".to_owned(),
+            observed_delta: Some(changed),
+            source_of_truth: Some(TARGET_ACT_CLEANUP_NOTEPAD_TABS_SOURCE_OF_TRUTH.to_owned()),
+            before_signature: Some(before_signature.clone()),
+            after_signature: Some(after_signature),
+            detail: Some("target_act cleanup_notepad_tabs verified stale tab count is zero on the session-owned hidden Notepad target".to_owned()),
+        },
+        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+    })
+}
+
+async fn target_act_cleanup_close_notepad_tab(
+    service: &SynapseService,
+    session_id: &str,
+    hwnd: i64,
+    keep_file_name: &str,
+    stale: TargetActNotepadTabReadback,
+    modified_policy: TargetActModifiedStalePolicy,
+    deadline: Instant,
+) -> Result<TargetActNotepadTabCloseAttempt, ErrorData> {
+    let stale_bbox_before = stale.bbox;
+    let mut action_stale = stale.clone();
+    let mut scrolled_into_view = false;
+    if !target_act_rect_has_area(action_stale.bbox) {
+        target_act_scroll_uia_element_into_view(
+            "cleanup_notepad_tabs.scroll_stale_tab_into_view",
+            &action_stale.element_id,
+        )?;
+        scrolled_into_view = true;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let scrolled =
+            target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+        action_stale =
+            target_act_matching_notepad_tab(&scrolled.tabs, &stale).ok_or_else(|| {
+                mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "target_act verb=cleanup_notepad_tabs scrolled stale hidden Notepad tab {:?}, but the tab was absent from the post-scroll SoT",
+                        stale.name
+                    ),
+                )
+            })?;
+    }
+    target_act_invoke_uia_element(
+        "cleanup_notepad_tabs.select_stale_tab",
+        &action_stale.element_id,
+    )?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut selected =
+        target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+    let mut selected_stale =
+        target_act_matching_notepad_tab(&selected.tabs, &action_stale).ok_or_else(|| {
+            mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "target_act verb=cleanup_notepad_tabs selected stale tab {:?}, but the tab was absent from the selected hidden Notepad SoT",
+                    stale.name
+                ),
+            )
+        })?;
+    if !target_act_rect_has_area(selected_stale.bbox) {
+        target_act_scroll_uia_element_into_view(
+            "cleanup_notepad_tabs.scroll_selected_stale_tab_into_view",
+            &selected_stale.element_id,
+        )?;
+        scrolled_into_view = true;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        selected = target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+        selected_stale =
+            target_act_matching_notepad_tab(&selected.tabs, &action_stale).ok_or_else(|| {
+                mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "target_act verb=cleanup_notepad_tabs scrolled selected stale tab {:?}, but the tab was absent from the post-scroll SoT",
+                        stale.name
+                    ),
+                )
+            })?;
+    }
+    if !target_act_notepad_title_matches_document(
+        &selected.context.window_title,
+        &stale.document_name,
+    ) {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "target_act verb=cleanup_notepad_tabs selected stale tab {:?}, but Notepad title readback stayed {:?}",
+                stale.name, selected.context.window_title
+            ),
+        ));
+    }
+    let (close_method, close_button_element_id) = if let Some(close_button) =
+        target_act_notepad_close_tab_button(&selected.nodes, &selected_stale)
+    {
+        let close_button_element_id = Some(close_button.element_id.clone());
+        target_act_invoke_uia_element(
+            "cleanup_notepad_tabs.invoke_close_tab",
+            &close_button.element_id,
+        )?;
+        ("uia_close_tab_button".to_owned(), close_button_element_id)
+    } else if let Some(close_menu_item) = target_act_notepad_close_tab_menu_item_for_hidden_desktop(
+        service,
+        session_id,
+        hwnd,
+        &selected.nodes,
+    )
+    .await?
+    {
+        let close_button_element_id = Some(close_menu_item.element_id.clone());
+        target_act_invoke_uia_element(
+            "cleanup_notepad_tabs.invoke_file_close_tab",
+            &close_menu_item.element_id,
+        )?;
+        (
+            "uia_file_menu_close_tab".to_owned(),
+            close_button_element_id,
+        )
+    } else {
+        let close_glyph = target_act_notepad_close_tab_glyph(&selected.nodes, &selected_stale);
+        return Err(mcp_error(
+            error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+            format!(
+                "target_act verb=cleanup_notepad_tabs could not find a UIA Close Tab button or File > Close tab menu item for stale hidden Notepad tab {:?}; close_glyph_present={}",
+                stale.name,
+                close_glyph.is_some()
+            ),
+        ));
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut discard_button_element_id = None;
+    let mut discarded_modified = false;
+    let mut after_close =
+        target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+    if target_act_notepad_tab_still_present(&after_close.tabs, &stale) && stale.modified {
+        if modified_policy == TargetActModifiedStalePolicy::DiscardModified {
+            let discard_button = target_act_notepad_discard_button_for_hidden_desktop(
+                service,
+                session_id,
+                hwnd,
+                &after_close.nodes,
+            )
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+                    format!(
+                        "target_act verb=cleanup_notepad_tabs close of modified stale tab {:?} did not remove the tab and no discard button was visible in the hidden target/popup SoT: {error}",
+                        stale.name
+                    ),
+                )
+            })?;
+            discard_button_element_id = Some(discard_button.element_id.clone());
+            target_act_invoke_uia_element(
+                "cleanup_notepad_tabs.discard_modified_stale_tab",
+                &discard_button.element_id,
+            )?;
+            discarded_modified = true;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            after_close =
+                target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+        }
+    }
+    while target_act_notepad_tab_still_present(&after_close.tabs, &stale) {
+        if Instant::now() >= deadline {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "target_act verb=cleanup_notepad_tabs stale tab {:?} remained after Close Tab",
+                    stale.name
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        after_close =
+            target_act_hidden_notepad_snapshot(service, session_id, hwnd, keep_file_name)?;
+    }
+
+    Ok(TargetActNotepadTabCloseAttempt {
+        tab: stale,
+        selected: true,
+        scrolled_into_view,
+        stale_bbox_before,
+        stale_bbox_after_select: selected_stale.bbox,
+        close_method,
+        close_button_element_id,
+        close_invoked: true,
+        discard_button_element_id,
+        discarded_modified,
+        tabs_after: after_close.tabs,
+    })
+}
+
+fn target_act_validate_cleanup_notepad_tabs_params(
+    params: &TargetActParams,
+) -> Result<(), ErrorData> {
+    if params.url.as_ref().is_some_and(|value| !value.is_empty())
+        || params
+            .command
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || !params.args.is_empty()
+        || params
+            .working_dir
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || params.text.as_ref().is_some_and(|value| !value.is_empty())
+        || params
+            .option
+            .as_ref()
+            .is_some_and(|value| !value.is_empty())
+        || params.clicks.is_some()
+        || params
+            .element_id
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .selector
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .role
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .name
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || target_act_coordinate(params)?.is_some()
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=cleanup_notepad_tabs accepts only path, optional value=discard_modified|refuse_modified, and optional wait_timeout_ms",
+        ));
+    }
+    Ok(())
+}
+
+fn target_act_cleanup_notepad_tabs_verify_timeout(value: Option<u64>) -> Result<u32, ErrorData> {
+    let timeout = value.unwrap_or(u64::from(
+        DEFAULT_TARGET_ACT_CLEANUP_NOTEPAD_TABS_TIMEOUT_MS,
+    ));
+    if !(250..=30_000).contains(&timeout) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb=cleanup_notepad_tabs wait_timeout_ms must be 250..=30000, got {timeout}"
+            ),
+        ));
+    }
+    Ok(u32::try_from(timeout).unwrap_or(DEFAULT_TARGET_ACT_CLEANUP_NOTEPAD_TABS_TIMEOUT_MS))
+}
+
+fn target_act_modified_stale_policy(
+    value: Option<&str>,
+) -> Result<TargetActModifiedStalePolicy, ErrorData> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        None | Some("discard_modified") => Ok(TargetActModifiedStalePolicy::DiscardModified),
+        Some("refuse_modified") => Ok(TargetActModifiedStalePolicy::RefuseModified),
+        Some(other) => Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb=cleanup_notepad_tabs value must be discard_modified or refuse_modified, got {other:?}"
+            ),
+        )),
+    }
+}
+
+fn target_act_hidden_notepad_snapshot(
+    service: &SynapseService,
+    session_id: &str,
+    hwnd: i64,
+    keep_file_name: &str,
+) -> Result<TargetActNotepadSnapshot, ErrorData> {
+    let Some(hidden_desktop) = service.session_hidden_desktop_readback(session_id)? else {
+        return Err(mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "target_act verb=cleanup_notepad_tabs requires session-owned hidden desktop resources; session {session_id:?} has none"
+            ),
+        ));
+    };
+    let mut misses = Vec::new();
+    for desktop_name in &hidden_desktop.desktop_names {
+        match crate::desktop_worker::hidden_desktop_window_snapshot(desktop_name, hwnd, 16) {
+            Ok(snapshot) => {
+                let tabs = target_act_notepad_tabs_from_nodes(&snapshot.tree.nodes, keep_file_name);
+                return Ok(TargetActNotepadSnapshot {
+                    desktop_names: hidden_desktop.desktop_names.clone(),
+                    active_desktop_name: desktop_name.clone(),
+                    context: snapshot.context,
+                    nodes: snapshot.tree.nodes,
+                    tabs,
+                });
+            }
+            Err(error) if target_act_hidden_worker_target_miss(&error) => {
+                misses.push(desktop_name.clone());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(mcp_error(
+        error_codes::TARGET_WINDOW_NOT_FOUND,
+        format!(
+            "target_act verb=cleanup_notepad_tabs target HWND 0x{hwnd:x} was not found on this session's hidden desktop(s): {misses:?}"
+        ),
+    ))
+}
+
+fn target_act_hidden_worker_target_miss(error: &ErrorData) -> bool {
+    matches!(
+        target_act_error_code(error),
+        Some(error_codes::TARGET_WINDOW_NOT_FOUND)
+    )
+}
+
+fn target_act_notepad_tabs_from_nodes(
+    nodes: &[AccessibleNode],
+    keep_file_name: &str,
+) -> Vec<TargetActNotepadTabReadback> {
+    nodes
+        .iter()
+        .filter_map(|node| {
+            let role = target_act_normalized_role(&node.role);
+            if role != "tabitem" && role != "tab" {
+                return None;
+            }
+            let (document_name, modified) = target_act_parse_notepad_tab_name(&node.name)?;
+            let keep = target_act_names_equal(&document_name, keep_file_name);
+            Some(TargetActNotepadTabReadback {
+                element_id: node.element_id.clone(),
+                name: node.name.trim().to_owned(),
+                document_name,
+                modified,
+                keep,
+                bbox: node.bbox,
+            })
+        })
+        .collect()
+}
+
+fn target_act_parse_notepad_tab_name(name: &str) -> Option<(String, bool)> {
+    let name = name.trim();
+    for (suffix, modified) in [(". Modified.", true), (". Unmodified.", false)] {
+        if let Some(document_name) = name.strip_suffix(suffix) {
+            let document_name = document_name.trim().trim_start_matches('*').to_owned();
+            if !document_name.is_empty() {
+                return Some((document_name, modified));
+            }
+        }
+    }
+    None
+}
+
+fn target_act_validate_notepad_keep_tab(
+    tabs: &[TargetActNotepadTabReadback],
+    keep_file_name: &str,
+) -> Result<(), ErrorData> {
+    if tabs.is_empty() {
+        return Ok(());
+    }
+    let keep_count = tabs.iter().filter(|tab| tab.keep).count();
+    if keep_count == 1 {
+        return Ok(());
+    }
+    Err(mcp_error(
+        error_codes::ACTION_TARGET_INVALID,
+        format!(
+            "target_act verb=cleanup_notepad_tabs expected exactly one keep tab for {keep_file_name:?}, found {keep_count}; tabs={}",
+            target_act_notepad_tab_names(tabs).join(" | ")
+        ),
+    ))
+}
+
+fn target_act_stale_notepad_tab_count(tabs: &[TargetActNotepadTabReadback]) -> u32 {
+    tabs.iter()
+        .filter(|tab| !tab.keep)
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+fn target_act_first_modified_stale_notepad_tab(
+    tabs: &[TargetActNotepadTabReadback],
+) -> Option<TargetActNotepadTabReadback> {
+    tabs.iter().find(|tab| !tab.keep && tab.modified).cloned()
+}
+
+fn target_act_refuse_modified_stale_tab_error(stale: &TargetActNotepadTabReadback) -> ErrorData {
+    mcp_error(
+        error_codes::ACTION_TARGET_INVALID,
+        format!(
+            "target_act verb=cleanup_notepad_tabs found modified stale hidden Notepad tab {:?} and value=refuse_modified was requested",
+            stale.name
+        ),
+    )
+}
+
+fn target_act_next_stale_notepad_tab(
+    tabs: &[TargetActNotepadTabReadback],
+) -> Option<TargetActNotepadTabReadback> {
+    tabs.iter()
+        .filter(|tab| !tab.keep)
+        .min_by_key(|tab| {
+            (
+                if target_act_rect_has_area(tab.bbox) {
+                    0
+                } else {
+                    1
+                },
+                tab.bbox.x,
+                tab.bbox.y,
+                tab.name.clone(),
+            )
+        })
+        .cloned()
+}
+
+fn target_act_notepad_tab_still_present(
+    tabs: &[TargetActNotepadTabReadback],
+    stale: &TargetActNotepadTabReadback,
+) -> bool {
+    tabs.iter().any(|tab| {
+        tab.element_id == stale.element_id
+            || (target_act_names_equal(&tab.document_name, &stale.document_name)
+                && tab.modified == stale.modified)
+    })
+}
+
+fn target_act_matching_notepad_tab(
+    tabs: &[TargetActNotepadTabReadback],
+    stale: &TargetActNotepadTabReadback,
+) -> Option<TargetActNotepadTabReadback> {
+    tabs.iter()
+        .find(|tab| tab.element_id == stale.element_id)
+        .or_else(|| {
+            tabs.iter().find(|tab| {
+                target_act_names_equal(&tab.document_name, &stale.document_name)
+                    && tab.modified == stale.modified
+            })
+        })
+        .cloned()
+}
+
+fn target_act_notepad_close_tab_button(
+    nodes: &[AccessibleNode],
+    stale: &TargetActNotepadTabReadback,
+) -> Option<AccessibleNode> {
+    nodes
+        .iter()
+        .filter(|node| {
+            node.enabled
+                && target_act_normalized_role(&node.role) == "button"
+                && target_act_normalized_name(&node.name) == "closetab"
+                && node.patterns.contains(&UiaPattern::Invoke)
+        })
+        .min_by_key(|node| target_act_rect_distance_score(node.bbox, stale))
+        .cloned()
+}
+
+fn target_act_notepad_close_tab_glyph(
+    nodes: &[AccessibleNode],
+    stale: &TargetActNotepadTabReadback,
+) -> Option<AccessibleNode> {
+    nodes
+        .iter()
+        .filter(|node| {
+            if !node.enabled || target_act_normalized_role(&node.role) != "text" {
+                return false;
+            }
+            let bbox = node.bbox;
+            if bbox.w <= 0 || bbox.h <= 0 || bbox.w > 40 || bbox.h > 40 {
+                return false;
+            }
+            let (center_x, center_y) = target_act_rect_center(bbox);
+            let left = i64::from(stale.bbox.x);
+            let right = left + i64::from(stale.bbox.w);
+            let top = i64::from(stale.bbox.y);
+            let bottom = top + i64::from(stale.bbox.h);
+            center_x > left + i64::from(stale.bbox.w) / 2
+                && center_x <= right
+                && center_y >= top
+                && center_y <= bottom
+                && !target_act_names_equal(&node.name, &stale.document_name)
+        })
+        .min_by_key(|node| target_act_rect_distance_score(node.bbox, stale))
+        .cloned()
+}
+
+async fn target_act_notepad_close_tab_menu_item_for_hidden_desktop(
+    service: &SynapseService,
+    session_id: &str,
+    target_hwnd: i64,
+    target_nodes: &[AccessibleNode],
+) -> Result<Option<AccessibleNode>, ErrorData> {
+    let Some(file_menu) = target_act_notepad_file_menu_item(target_nodes) else {
+        return Ok(None);
+    };
+    target_act_invoke_uia_element("cleanup_notepad_tabs.open_file_menu", &file_menu.element_id)?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    if let Some(menu_item) = target_act_notepad_close_tab_menu_item(target_nodes) {
+        return Ok(Some(menu_item));
+    }
+    let snapshots =
+        target_act_hidden_desktop_auxiliary_snapshots(service, session_id, target_hwnd)?;
+    for snapshot in snapshots {
+        if let Some(menu_item) = target_act_notepad_close_tab_menu_item(&snapshot.nodes) {
+            return Ok(Some(menu_item));
+        }
+    }
+    Ok(None)
+}
+
+fn target_act_notepad_file_menu_item(nodes: &[AccessibleNode]) -> Option<AccessibleNode> {
+    nodes
+        .iter()
+        .find(|node| {
+            node.enabled
+                && target_act_normalized_role(&node.role) == "menuitem"
+                && target_act_normalized_name(&node.name) == "file"
+                && node.patterns.contains(&UiaPattern::ExpandCollapse)
+        })
+        .cloned()
+}
+
+fn target_act_notepad_close_tab_menu_item(nodes: &[AccessibleNode]) -> Option<AccessibleNode> {
+    nodes
+        .iter()
+        .find(|node| {
+            if !node.enabled {
+                return false;
+            }
+            let role = target_act_normalized_role(&node.role);
+            if role != "menuitem" && role != "button" && role != "listitem" {
+                return false;
+            }
+            target_act_normalized_name(&node.name).contains("closetab")
+                && node.patterns.contains(&UiaPattern::Invoke)
+        })
+        .cloned()
+}
+
+fn target_act_notepad_discard_button(nodes: &[AccessibleNode]) -> Option<AccessibleNode> {
+    nodes
+        .iter()
+        .find(|node| {
+            if !node.enabled || target_act_normalized_role(&node.role) != "button" {
+                return false;
+            }
+            let name = node.name.to_ascii_lowercase().replace('\u{2019}', "'");
+            name.contains("discard")
+                || name.contains("close without saving")
+                || name.contains("do not save")
+                || ((name.contains("don't") || name.contains("dont")) && name.contains("save"))
+        })
+        .cloned()
+}
+
+fn target_act_notepad_discard_button_for_hidden_desktop(
+    service: &SynapseService,
+    session_id: &str,
+    target_hwnd: i64,
+    target_nodes: &[AccessibleNode],
+) -> Result<AccessibleNode, String> {
+    if let Some(button) = target_act_notepad_discard_button(target_nodes) {
+        return Ok(button);
+    }
+    let snapshots = target_act_hidden_desktop_auxiliary_snapshots(service, session_id, target_hwnd)
+        .map_err(|error| error.to_string())?;
+    let mut inspected = Vec::new();
+    for snapshot in snapshots {
+        inspected.push(format!("0x{:x}", snapshot.hwnd));
+        if let Some(button) = target_act_notepad_discard_button(&snapshot.nodes) {
+            return Ok(button);
+        }
+    }
+    Err(format!(
+        "inspected auxiliary hidden HWNDs [{}]",
+        inspected.join(", ")
+    ))
+}
+
+fn target_act_hidden_desktop_auxiliary_snapshots(
+    service: &SynapseService,
+    session_id: &str,
+    target_hwnd: i64,
+) -> Result<Vec<TargetActHiddenWindowSnapshot>, ErrorData> {
+    let Some(hidden_desktop) = service.session_hidden_desktop_readback(session_id)? else {
+        return Ok(Vec::new());
+    };
+    let mut snapshots = Vec::new();
+    for desktop_name in &hidden_desktop.desktop_names {
+        for hwnd in crate::desktop_worker::hidden_desktop_window_hwnds(desktop_name)? {
+            if hwnd == target_hwnd {
+                continue;
+            }
+            match crate::desktop_worker::hidden_desktop_window_snapshot(desktop_name, hwnd, 8) {
+                Ok(snapshot) => snapshots.push(TargetActHiddenWindowSnapshot {
+                    hwnd,
+                    nodes: snapshot.tree.nodes,
+                }),
+                Err(error) if target_act_hidden_worker_target_miss(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(snapshots)
+}
+
+fn target_act_invoke_uia_element(
+    operation: &'static str,
+    element_id: &ElementId,
+) -> Result<(), ErrorData> {
+    synapse_action::invoke_element(element_id).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("target_act {operation} failed for element {element_id}: {error}"),
+        )
+    })
+}
+
+fn target_act_scroll_uia_element_into_view(
+    operation: &'static str,
+    element_id: &ElementId,
+) -> Result<(), ErrorData> {
+    synapse_a11y::scroll_element_into_view(element_id).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("target_act {operation} failed for element {element_id}: {error}"),
+        )
+    })
+}
+
+fn target_act_notepad_title_matches_document(title: &str, document_name: &str) -> bool {
+    let lowered_title = title.to_ascii_lowercase();
+    lowered_title.contains("notepad")
+        && lowered_title.contains(
+            document_name
+                .trim()
+                .trim_start_matches('*')
+                .to_ascii_lowercase()
+                .as_str(),
+        )
+}
+
+fn target_act_notepad_tabs_signature(tabs: &[TargetActNotepadTabReadback]) -> String {
+    let payload = tabs
+        .iter()
+        .map(|tab| {
+            format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                tab.element_id,
+                tab.document_name,
+                tab.modified,
+                tab.keep,
+                tab.bbox.x,
+                tab.bbox.y,
+                tab.bbox.w,
+                tab.bbox.h
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::m2::postcondition::hex_encode(&Sha256::digest(payload.as_bytes()))
+}
+
+fn target_act_cleanup_notepad_tabs_postcondition_error(
+    detail: &str,
+    keep_path: &Path,
+    keep_file_name: &str,
+    before_signature: &str,
+    before: &TargetActNotepadSnapshot,
+    after: &TargetActNotepadSnapshot,
+    attempts: &[TargetActNotepadTabCloseAttempt],
+    verify_timeout_ms: u32,
+) -> ErrorData {
+    let after_signature = target_act_notepad_tabs_signature(&after.tabs);
+    crate::m2::postcondition::postcondition_failed_error(
+        "target_act",
+        TARGET_ACT_CLEANUP_NOTEPAD_TABS_SOURCE_OF_TRUTH,
+        detail,
+        before_signature.to_owned(),
+        after_signature,
+        json!({
+            "path": keep_path.display().to_string(),
+            "keep_file_name": keep_file_name,
+            "before_tabs": before.tabs,
+            "after_tabs": after.tabs,
+            "attempts": attempts,
+            "verify_timeout_ms": verify_timeout_ms,
+        }),
+    )
+}
+
+fn target_act_notepad_tab_names(tabs: &[TargetActNotepadTabReadback]) -> Vec<String> {
+    tabs.iter().map(|tab| tab.name.clone()).collect()
+}
+
+fn target_act_file_name(path: &Path, verb: &str) -> Result<String, ErrorData> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "target_act verb={verb} path must have a UTF-8 file name: {}",
+                    path.display()
+                ),
+            )
+        })
+}
+
+fn target_act_names_equal(left: &str, right: &str) -> bool {
+    left.trim().eq_ignore_ascii_case(right.trim())
+}
+
+fn target_act_normalized_role(role: &str) -> String {
+    role.chars()
+        .filter(|character| !character.is_whitespace() && *character != '_' && *character != '-')
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn target_act_normalized_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| {
+            !character.is_whitespace()
+                && *character != '_'
+                && *character != '-'
+                && *character != '.'
+        })
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn target_act_rect_distance_score(rect: Rect, stale: &TargetActNotepadTabReadback) -> i64 {
+    let (rect_x, rect_y) = target_act_rect_center(rect);
+    let (tab_x, tab_y) = target_act_rect_center(stale.bbox);
+    (rect_x - tab_x).abs() + (rect_y - tab_y).abs()
+}
+
+fn target_act_rect_has_area(rect: Rect) -> bool {
+    rect.w > 0 && rect.h > 0
+}
+
+fn target_act_rect_center(rect: Rect) -> (i64, i64) {
+    (
+        i64::from(rect.x) + i64::from(rect.w) / 2,
+        i64::from(rect.y) + i64::from(rect.h) / 2,
+    )
 }
 
 async fn target_act_save(
@@ -807,17 +1858,24 @@ fn target_act_save_verify_timeout(value: Option<u64>) -> Result<u32, ErrorData> 
 }
 
 fn canonical_existing_file_for_target_act_save(path: &Path) -> Result<PathBuf, ErrorData> {
+    canonical_existing_file_for_target_act_path("save", path)
+}
+
+fn canonical_existing_file_for_target_act_path(
+    verb: &str,
+    path: &Path,
+) -> Result<PathBuf, ErrorData> {
     if path.as_os_str().is_empty() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=save path must not be empty",
+            format!("target_act verb={verb} path must not be empty"),
         ));
     }
     let metadata = fs::metadata(path).map_err(|error| {
         mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
-                "target_act verb=save requires an existing file path Source of Truth; {} could not be read: {error}",
+                "target_act verb={verb} requires an existing file path Source of Truth; {} could not be read: {error}",
                 path.display()
             ),
         )
@@ -826,7 +1884,7 @@ fn canonical_existing_file_for_target_act_save(path: &Path) -> Result<PathBuf, E
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
-                "target_act verb=save path must be an existing file, got {}",
+                "target_act verb={verb} path must be an existing file, got {}",
                 path.display()
             ),
         ));
@@ -835,7 +1893,7 @@ fn canonical_existing_file_for_target_act_save(path: &Path) -> Result<PathBuf, E
         mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
-                "target_act verb=save failed to canonicalize file SoT {}: {error}",
+                "target_act verb={verb} failed to canonicalize file SoT {}: {error}",
                 path.display()
             ),
         )
@@ -2039,6 +3097,366 @@ mod tests {
     }
 
     #[test]
+    fn target_act_cleanup_notepad_tabs_accepts_existing_schema_fields() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "cleanup_notepad_tabs",
+            "path": "C:\\Temp\\issue1276-keep.txt",
+            "value": "discard_modified",
+            "wait_timeout_ms": 750
+        }))
+        .expect(
+            "cleanup_notepad_tabs params should deserialize through the open target_act schema",
+        );
+
+        assert_eq!(params.verb.as_str(), "cleanup_notepad_tabs");
+        assert_eq!(params.path.as_deref(), Some("C:\\Temp\\issue1276-keep.txt"));
+        assert_eq!(params.value.as_deref(), Some("discard_modified"));
+        assert_eq!(params.wait_timeout_ms, Some(750));
+        target_act_validate_cleanup_notepad_tabs_params(&params)
+            .expect("cleanup_notepad_tabs should accept path/value/timeout only");
+        assert_eq!(
+            target_act_modified_stale_policy(params.value.as_deref())
+                .expect("discard policy should validate"),
+            TargetActModifiedStalePolicy::DiscardModified
+        );
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_rejects_unrelated_action_params() {
+        for params in [
+            json!({
+                "verb": "cleanup_notepad_tabs",
+                "path": "C:\\Temp\\issue1276-keep.txt",
+                "element_id": "0x2a:0000000000000001"
+            }),
+            json!({
+                "verb": "cleanup_notepad_tabs",
+                "path": "C:\\Temp\\issue1276-keep.txt",
+                "command": "powershell.exe"
+            }),
+            json!({
+                "verb": "cleanup_notepad_tabs",
+                "path": "C:\\Temp\\issue1276-keep.txt",
+                "x": 12,
+                "y": 34
+            }),
+        ] {
+            let params: TargetActParams = serde_json::from_value(params)
+                .expect("synthetic cleanup_notepad_tabs params deserialize");
+            let error = target_act_validate_cleanup_notepad_tabs_params(&params)
+                .expect_err("cleanup_notepad_tabs must reject unrelated parameters");
+
+            assert_eq!(
+                target_act_error_code(&error),
+                Some(error_codes::TOOL_PARAMS_INVALID)
+            );
+        }
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_policy_is_bounded() {
+        assert_eq!(
+            target_act_modified_stale_policy(None).expect("default policy should validate"),
+            TargetActModifiedStalePolicy::DiscardModified
+        );
+        assert_eq!(
+            target_act_modified_stale_policy(Some("refuse_modified"))
+                .expect("refuse policy should validate"),
+            TargetActModifiedStalePolicy::RefuseModified
+        );
+        let error = target_act_modified_stale_policy(Some("save_modified"))
+            .expect_err("unknown policy must fail closed");
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_parses_keep_and_stale_tabs() {
+        let nodes = vec![
+            target_act_test_accessible_node(
+                1,
+                "issue1276-keep.txt. Unmodified.",
+                "tab item",
+                &[UiaPattern::SelectionItem],
+            ),
+            target_act_test_accessible_node(
+                2,
+                "old-agent-tab.txt. Modified.",
+                "TabItem",
+                &[UiaPattern::SelectionItem],
+            ),
+            target_act_test_accessible_node(3, "Close Tab", "Button", &[UiaPattern::Invoke]),
+        ];
+        let tabs = target_act_notepad_tabs_from_nodes(&nodes, "issue1276-keep.txt");
+
+        assert_eq!(tabs.len(), 2);
+        assert!(tabs[0].keep);
+        assert!(!tabs[0].modified);
+        assert!(!tabs[1].keep);
+        assert!(tabs[1].modified);
+        assert_eq!(target_act_stale_notepad_tab_count(&tabs), 1);
+        target_act_validate_notepad_keep_tab(&tabs, "issue1276-keep.txt")
+            .expect("single keep tab should validate");
+        assert!(
+            target_act_notepad_close_tab_button(&nodes, &tabs[1]).is_some(),
+            "Close Tab invoke button should be discoverable"
+        );
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_chooses_nearest_close_tab_button() {
+        let mut stale = target_act_test_accessible_node(
+            10,
+            "old-agent-tab.txt. Unmodified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        stale.bbox = Rect {
+            x: 100,
+            y: 20,
+            w: 120,
+            h: 30,
+        };
+        let mut far_close =
+            target_act_test_accessible_node(11, "Close Tab", "Button", &[UiaPattern::Invoke]);
+        far_close.bbox = Rect {
+            x: 900,
+            y: 20,
+            w: 28,
+            h: 30,
+        };
+        let mut near_close =
+            target_act_test_accessible_node(12, "Close Tab", "Button", &[UiaPattern::Invoke]);
+        near_close.bbox = Rect {
+            x: 205,
+            y: 20,
+            w: 28,
+            h: 30,
+        };
+        let nodes = vec![far_close.clone(), stale, near_close.clone()];
+        let tabs = target_act_notepad_tabs_from_nodes(&nodes, "issue1276-keep.txt");
+
+        let close_button = target_act_notepad_close_tab_button(&nodes, &tabs[0])
+            .expect("nearest close tab button should resolve");
+
+        assert_eq!(close_button.element_id, near_close.element_id);
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_finds_close_glyph_inside_tab() {
+        let mut stale = target_act_test_accessible_node(
+            10,
+            "old-agent-tab.txt. Modified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        stale.bbox = Rect {
+            x: 100,
+            y: 20,
+            w: 150,
+            h: 48,
+        };
+        let mut title =
+            target_act_test_accessible_node(11, "old-agent-tab.txt", "Text", &[UiaPattern::Text]);
+        title.bbox = Rect {
+            x: 112,
+            y: 31,
+            w: 90,
+            h: 23,
+        };
+        let mut glyph = target_act_test_accessible_node(12, "x", "Text", &[UiaPattern::Text]);
+        glyph.bbox = Rect {
+            x: 214,
+            y: 34,
+            w: 18,
+            h: 18,
+        };
+        let nodes = vec![stale.clone(), title, glyph.clone()];
+        let tabs = target_act_notepad_tabs_from_nodes(&nodes, "issue1276-keep.txt");
+
+        let close_glyph = target_act_notepad_close_tab_glyph(&nodes, &tabs[0])
+            .expect("small right-side text glyph inside selected tab should be close target");
+
+        assert_eq!(close_glyph.element_id, glyph.element_id);
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_finds_file_close_tab_menu_item() {
+        let file_menu =
+            target_act_test_accessible_node(10, "File", "MenuItem", &[UiaPattern::ExpandCollapse]);
+        let close_window =
+            target_act_test_accessible_node(11, "Close", "Button", &[UiaPattern::Invoke]);
+        let close_tab = target_act_test_accessible_node(
+            12,
+            "Close tab Ctrl+W",
+            "MenuItem",
+            &[UiaPattern::Invoke],
+        );
+        let nodes = vec![close_window, file_menu.clone(), close_tab.clone()];
+
+        let found_file = target_act_notepad_file_menu_item(&nodes)
+            .expect("File menu item should resolve by name and ExpandCollapse");
+        let found_close_tab = target_act_notepad_close_tab_menu_item(&nodes)
+            .expect("Close tab menu item should resolve by name and InvokePattern");
+
+        assert_eq!(found_file.element_id, file_menu.element_id);
+        assert_eq!(found_close_tab.element_id, close_tab.element_id);
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_prefers_visible_stale_tab() {
+        let mut offscreen = target_act_test_accessible_node(
+            10,
+            "offscreen-old.txt. Unmodified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        offscreen.bbox = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let mut visible = target_act_test_accessible_node(
+            11,
+            "visible-old.txt. Unmodified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        visible.bbox = Rect {
+            x: 200,
+            y: 20,
+            w: 120,
+            h: 48,
+        };
+        let keep = target_act_test_accessible_node(
+            12,
+            "issue1276-keep.txt. Unmodified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        let tabs =
+            target_act_notepad_tabs_from_nodes(&[offscreen, keep, visible], "issue1276-keep.txt");
+
+        let next = target_act_next_stale_notepad_tab(&tabs)
+            .expect("visible stale tab should be selected first");
+
+        assert_eq!(next.document_name, "visible-old.txt");
+        assert!(target_act_rect_has_area(next.bbox));
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_refuse_policy_detects_any_modified_stale_tab() {
+        let keep = target_act_test_accessible_node(
+            10,
+            "issue1276-keep.txt. Unmodified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        let mut visible_unmodified = target_act_test_accessible_node(
+            11,
+            "visible-old.txt. Unmodified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        visible_unmodified.bbox = Rect {
+            x: 200,
+            y: 20,
+            w: 120,
+            h: 48,
+        };
+        let mut offscreen_modified = target_act_test_accessible_node(
+            12,
+            "offscreen-old.txt. Modified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        offscreen_modified.bbox = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let tabs = target_act_notepad_tabs_from_nodes(
+            &[keep, visible_unmodified, offscreen_modified],
+            "issue1276-keep.txt",
+        );
+
+        let next = target_act_next_stale_notepad_tab(&tabs)
+            .expect("visible unmodified tab should be selected for discard policy");
+        let modified = target_act_first_modified_stale_notepad_tab(&tabs)
+            .expect("refuse policy must detect modified stale tab before closing any stale tab");
+
+        assert_eq!(next.document_name, "visible-old.txt");
+        assert_eq!(modified.document_name, "offscreen-old.txt");
+        assert!(modified.modified);
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_matches_refreshed_tab_by_document() {
+        let mut original = target_act_test_accessible_node(
+            10,
+            "old-agent-tab.txt. Modified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        original.bbox = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
+        let original_tabs = target_act_notepad_tabs_from_nodes(&[original], "issue1276-keep.txt");
+        let mut refreshed = target_act_test_accessible_node(
+            44,
+            "old-agent-tab.txt. Modified.",
+            "TabItem",
+            &[UiaPattern::SelectionItem],
+        );
+        refreshed.bbox = Rect {
+            x: 350,
+            y: 242,
+            w: 126,
+            h: 48,
+        };
+        let refreshed_tabs = target_act_notepad_tabs_from_nodes(&[refreshed], "issue1276-keep.txt");
+
+        let matched = target_act_matching_notepad_tab(&refreshed_tabs, &original_tabs[0])
+            .expect("refreshed tab should match by document name and modified state");
+
+        assert_eq!(matched.document_name, "old-agent-tab.txt");
+        assert!(target_act_rect_has_area(matched.bbox));
+    }
+
+    #[test]
+    fn target_act_cleanup_notepad_tabs_requires_one_keep_tab_when_tabs_exist() {
+        let nodes = vec![
+            target_act_test_accessible_node(
+                1,
+                "one.txt. Unmodified.",
+                "TabItem",
+                &[UiaPattern::SelectionItem],
+            ),
+            target_act_test_accessible_node(
+                2,
+                "two.txt. Unmodified.",
+                "TabItem",
+                &[UiaPattern::SelectionItem],
+            ),
+        ];
+        let tabs = target_act_notepad_tabs_from_nodes(&nodes, "missing.txt");
+        let error = target_act_validate_notepad_keep_tab(&tabs, "missing.txt")
+            .expect_err("missing keep tab must fail closed");
+
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::ACTION_TARGET_INVALID)
+        );
+    }
+
+    #[test]
     fn target_act_focus_window_uses_window_session_target() {
         let params =
             target_act_focus_window_params(Some(&SessionTarget::Window { hwnd: 0x250a08 }))
@@ -2399,6 +3817,33 @@ mod tests {
             len: u64::try_from(bytes.len()).expect("synthetic bytes length should fit u64"),
             sha256: crate::m2::postcondition::hex_encode(&Sha256::digest(bytes)),
             bytes: bytes.to_vec(),
+        }
+    }
+
+    fn target_act_test_accessible_node(
+        sequence: u32,
+        name: &str,
+        role: &str,
+        patterns: &[UiaPattern],
+    ) -> AccessibleNode {
+        AccessibleNode {
+            element_id: synapse_core::element_id(0x2a, &format!("0000002a{sequence:08x}")),
+            parent: None,
+            name: name.to_owned(),
+            role: role.to_owned(),
+            automation_id: None,
+            value: None,
+            bbox: Rect {
+                x: i32::try_from(sequence).unwrap_or(0) * 10,
+                y: 20,
+                w: 100,
+                h: 30,
+            },
+            enabled: true,
+            focused: false,
+            patterns: patterns.to_vec(),
+            children_count: 0,
+            depth: 1,
         }
     }
 }

@@ -301,6 +301,88 @@ pub(crate) fn hidden_desktop_window_snapshot(
     }
 }
 
+#[cfg(windows)]
+pub(crate) fn hidden_desktop_window_hwnds(desktop_name: &str) -> Result<Vec<i64>, rmcp::ErrorData> {
+    use windows::{
+        Win32::{
+            Foundation::{LPARAM, SetLastError, WIN32_ERROR},
+            System::StationsAndDesktops::{
+                CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_ENUMERATE, DESKTOP_READ_CONTROL,
+                DESKTOP_READOBJECTS, EnumDesktopWindows, OpenDesktopW,
+            },
+        },
+        core::{BOOL, PCWSTR},
+    };
+
+    struct Search {
+        hwnds: Vec<i64>,
+    }
+
+    unsafe extern "system" fn enum_window(
+        hwnd: windows::Win32::Foundation::HWND,
+        lparam: LPARAM,
+    ) -> BOOL {
+        let search = unsafe { &mut *(lparam.0 as *mut Search) };
+        search.hwnds.push(hwnd.0 as isize as i64);
+        BOOL(1)
+    }
+
+    let desktop_wide = wide_null(desktop_name);
+    let access = DESKTOP_ENUMERATE.0 | DESKTOP_READOBJECTS.0 | DESKTOP_READ_CONTROL.0;
+    let handle = unsafe {
+        OpenDesktopW(
+            PCWSTR(desktop_wide.as_ptr()),
+            DESKTOP_CONTROL_FLAGS::default(),
+            false,
+            access,
+        )
+    }
+    .map_err(|error| {
+        crate::m1::mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!("hidden desktop HWND enumeration failed to open {desktop_name:?}: {error}"),
+        )
+    })?;
+
+    let mut search = Search { hwnds: Vec::new() };
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+    }
+    let enum_result = unsafe {
+        EnumDesktopWindows(
+            Some(handle),
+            Some(enum_window),
+            LPARAM((&raw mut search).cast::<core::ffi::c_void>() as isize),
+        )
+    };
+    let close_result = unsafe { CloseDesktop(handle) };
+    if let Err(error) = close_result {
+        return Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("hidden desktop HWND enumeration failed to close {desktop_name:?}: {error}"),
+        ));
+    }
+    if let Err(error) = enum_result {
+        return Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("EnumDesktopWindows failed for hidden desktop {desktop_name:?}: {error}"),
+        ));
+    }
+    search.hwnds.sort_unstable();
+    search.hwnds.dedup();
+    Ok(search.hwnds)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn hidden_desktop_window_hwnds(
+    _desktop_name: &str,
+) -> Result<Vec<i64>, rmcp::ErrorData> {
+    Err(crate::m1::mcp_error(
+        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "hidden desktop HWND enumeration is only supported on Windows",
+    ))
+}
+
 #[cfg(not(windows))]
 pub(crate) fn hidden_desktop_window_snapshot(
     _desktop_name: &str,
