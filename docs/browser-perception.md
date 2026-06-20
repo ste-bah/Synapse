@@ -176,8 +176,11 @@ Chrome session, the supported attach path is:
    `alarmReconnect` registration and re-read health; if a stale active host is
    present use `cdp_bridge_reload`; if no host registers, run
    `scripts\install-synapse-chrome-debugger.ps1` and reload the bundled
-   extension in that existing profile. Never launch a second Chrome profile as
-   the repair path.
+   extension in that existing profile. If health reports
+   `synapse_chrome_bridge_profile_installation installed=false`, Chrome has no
+   loaded bridge host for `cdp_bridge_reload` to contact; load the bundled
+   directory as an unpacked extension in the already-open profile, then re-read
+   health. Never launch a second Chrome profile as the repair path.
 9. The normal end-user extension is structurally tabs/scripting-only: it does not request
    `debugger`, does not call `chrome.debugger`, and rejects attach-capable
    commands before any browser debugger startup. The daemon also refuses those

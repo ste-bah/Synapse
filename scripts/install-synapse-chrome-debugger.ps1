@@ -579,6 +579,7 @@ $chromeProcesses = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -
 })
 
 $chromeUserDataRoot = Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data'
+$profileDirs = @()
 $synapseChromeProfileReadback = @()
 $staleSynapseActivePermissions = @()
 $staleSynapseGrantedPermissions = @()
@@ -639,7 +640,12 @@ function Test-ExternalPopupRiskEnabled {
 }
 if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
     $profileDirs = @(Get-ChildItem -LiteralPath $chromeUserDataRoot -Directory -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ne 'Snapshots' })
+        Where-Object {
+            $_.Name -ne 'Snapshots' -and (
+                (Test-Path -LiteralPath (Join-Path $_.FullName 'Preferences') -PathType Leaf) -or
+                (Test-Path -LiteralPath (Join-Path $_.FullName 'Secure Preferences') -PathType Leaf)
+            )
+        })
     foreach ($profileDir in $profileDirs) {
         $extensionRuntimeById = @{}
         foreach ($prefFileName in @('Preferences', 'Secure Preferences')) {
@@ -779,6 +785,50 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
             }
         }
     }
+}
+$activeChromeProfile = $null
+$chromeLocalStatePath = Join-Path $chromeUserDataRoot 'Local State'
+if (Test-Path -LiteralPath $chromeLocalStatePath -PathType Leaf) {
+    try {
+        $chromeLocalState = Get-Content -Raw -LiteralPath $chromeLocalStatePath | ConvertFrom-Json -ErrorAction Stop
+        if ($chromeLocalState.profile -and $chromeLocalState.profile.last_used) {
+            $activeChromeProfile = [string]$chromeLocalState.profile.last_used
+        }
+    } catch {
+        $activeChromeProfile = $null
+    }
+}
+$synapseChromeInstalledProfiles = @(
+    $synapseChromeProfileReadback |
+        Where-Object { $_.PSObject.Properties.Name -contains 'manifest_path' } |
+        ForEach-Object { [string]$_.profile } |
+        Sort-Object -Unique
+)
+$synapseChromeActiveProfileInstalled = $null
+if (-not [string]::IsNullOrWhiteSpace($activeChromeProfile)) {
+    $synapseChromeActiveProfileInstalled = @($synapseChromeInstalledProfiles) -contains $activeChromeProfile
+}
+$synapseChromeProfileInstallReason = if ($profileDirs.Count -eq 0) {
+    'no_profile_dirs'
+} elseif ($synapseChromeInstalledProfiles.Count -eq 0) {
+    'extension_id_absent_from_preferences_and_secure_preferences'
+} elseif ($synapseChromeActiveProfileInstalled -eq $false) {
+    'active_profile_missing_extension'
+} else {
+    'extension_profile_row_present'
+}
+$synapseChromeProfileInstallState = [pscustomobject]@{
+    scanned = $true
+    installed = ($synapseChromeInstalledProfiles.Count -gt 0)
+    chrome_user_data_root = $chromeUserDataRoot
+    profile_count = $profileDirs.Count
+    installed_profile_count = $synapseChromeInstalledProfiles.Count
+    installed_profiles = @($synapseChromeInstalledProfiles)
+    active_profile = $activeChromeProfile
+    active_profile_installed = $synapseChromeActiveProfileInstalled
+    reason = $synapseChromeProfileInstallReason
+    cdp_bridge_reload_can_install_absent_extension = $false
+    remediation = 'run scripts\install-synapse-chrome-debugger.ps1 to validate files and policies, then load extensions\synapse-chrome-debugger as an unpacked extension in the already-open Chrome profile; cdp_bridge_reload can only reload an already-registered bridge host and cannot install an absent Chrome extension'
 }
 $externalNativeMessagingProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
@@ -924,6 +974,7 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     external_popup_risk_block_reason = if ($allExternalDebuggerOrNativeExtensions.Count -gt 0) { 'external_debugger_or_native_hazards_require_chrome_management_suppression_or_policy_shield' } else { 'none' }
     external_popup_risk_bridge_management_required = ($allExternalDebuggerOrNativeExtensions.Count -gt 0)
     external_popup_risk_bridge_management_permission_present = ($requiredPermissions -contains 'management')
+    synapse_chrome_profile_install_state = $synapseChromeProfileInstallState
     synapse_chrome_profile_readback = $synapseChromeProfileReadback
     synapse_stale_granted_permission_warning = [pscustomobject]@{
         warning = ($staleSynapseGrantedPermissions.Count -gt 0)

@@ -36,6 +36,10 @@ activate Chrome, and does not use coordinates. If the currently loaded worker
 predates the `reloadSelf` capability, Synapse cannot make that old worker run
 new code; the correct behavior is a visible stale-worker error, not foreground
 automation.
+If daemon health reports `synapse_chrome_bridge_profile_installation
+installed=false`, Chrome has no loaded extension host to receive `reloadSelf`;
+load this directory as an unpacked extension in the already-open profile before
+retrying bridge health.
 
 Install/verify the local bridge registration with:
 

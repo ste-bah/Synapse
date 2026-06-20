@@ -72,7 +72,7 @@ const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
 const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the normal end-user bridge is debugger-free and uses chrome.tabs/chrome.scripting over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake without nativeMessaging, never creates helper Chrome windows, and refuses attach-capable debugger commands and arbitrary page eval before queueing any Chrome command; expected extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
-const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=use the already-open authenticated Chrome profile only; do not launch a second Chrome process/profile; wait for the installed bridge worker alarmReconnect registration and re-read health; if an active stale host appears call cdp_bridge_reload; if no host registers, run scripts\\install-synapse-chrome-debugger.ps1 and reload the bundled extension in the existing Chrome profile";
+const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=use the already-open authenticated Chrome profile only; do not launch a second Chrome process/profile; wait for the installed bridge worker alarmReconnect registration and re-read health; if an active stale host appears call cdp_bridge_reload; if no host registers, run scripts\\install-synapse-chrome-debugger.ps1 and reload the bundled extension in the existing Chrome profile; if health reports installed=false, cdp_bridge_reload cannot repair because Chrome has no loaded extension host to receive reloadSelf";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
 
@@ -133,10 +133,12 @@ impl ChromeDebuggerBridgeError {
     }
 
     fn unavailable() -> Self {
+        let profile_install_state = synapse_chrome_profile_install_state();
         Self {
             code: error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
             detail: format!(
-                "Chrome debugger extension bridge is not connected; reason=no_active_chrome_bridge_host; repair_guidance={NO_ACTIVE_HOST_REPAIR_GUIDANCE}; {INSTALL_GUIDANCE}"
+                "Chrome debugger extension bridge is not connected; reason=no_active_chrome_bridge_host; repair_guidance={NO_ACTIVE_HOST_REPAIR_GUIDANCE}; {}; {INSTALL_GUIDANCE}",
+                profile_install_state.detail
             ),
         }
     }
@@ -383,6 +385,138 @@ fn synapse_chrome_self_permission_warning(rows: &[String], policy_shield_present
         rows.len(),
         formatted
     )
+}
+
+#[derive(Clone, Debug)]
+struct SynapseChromeProfileInstallState {
+    detail: String,
+}
+
+impl SynapseChromeProfileInstallState {
+    fn not_scanned(reason: &str) -> Self {
+        Self {
+            detail: format!(
+                "synapse_chrome_bridge_profile_installation scanned=false installed=unknown reason={reason}"
+            ),
+        }
+    }
+}
+
+fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
+    let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") else {
+        return SynapseChromeProfileInstallState::not_scanned("localappdata_missing");
+    };
+    let user_data_root = PathBuf::from(local_appdata)
+        .join("Google")
+        .join("Chrome")
+        .join("User Data");
+    let active_profile = chrome_last_used_profile(&user_data_root);
+    let Ok(profile_dirs) = std::fs::read_dir(&user_data_root) else {
+        return SynapseChromeProfileInstallState {
+            detail: format!(
+                "synapse_chrome_bridge_profile_installation scanned=false installed=unknown user_data_root={} reason=user_data_root_unreadable",
+                quote_detail_value(&user_data_root.to_string_lossy())
+            ),
+        };
+    };
+
+    let mut profile_count = 0_usize;
+    let mut parse_error_count = 0_usize;
+    let mut installed_profiles = BTreeSet::new();
+    for profile_dir in profile_dirs.flatten() {
+        let Ok(file_type) = profile_dir.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || profile_dir.file_name() == "Snapshots" {
+            continue;
+        }
+        let profile = profile_dir.file_name().to_string_lossy().into_owned();
+        let profile_pref_paths = ["Preferences", "Secure Preferences"]
+            .into_iter()
+            .map(|pref_file| (pref_file, profile_dir.path().join(pref_file)))
+            .collect::<Vec<_>>();
+        if !profile_pref_paths.iter().any(|(_, path)| path.is_file()) {
+            continue;
+        }
+        profile_count += 1;
+        let mut profile_installed = false;
+        for (_pref_file, pref_path) in profile_pref_paths {
+            let Ok(raw) = std::fs::read_to_string(&pref_path) else {
+                continue;
+            };
+            let Ok(pref) = serde_json::from_str::<Value>(&raw) else {
+                parse_error_count += 1;
+                continue;
+            };
+            if pref
+                .get("extensions")
+                .and_then(|value| value.get("settings"))
+                .and_then(|settings| settings.get(EXTENSION_ID))
+                .is_some()
+            {
+                profile_installed = true;
+            }
+        }
+        if profile_installed {
+            installed_profiles.insert(profile);
+        }
+    }
+
+    let installed_profile_count = installed_profiles.len();
+    let installed = installed_profile_count > 0;
+    let active_profile_installed = active_profile
+        .as_ref()
+        .map(|profile| installed_profiles.contains(profile));
+    let reason = if profile_count == 0 {
+        "no_profile_dirs"
+    } else if !installed {
+        "extension_id_absent_from_preferences_and_secure_preferences"
+    } else if active_profile_installed == Some(false) {
+        "active_profile_missing_extension"
+    } else {
+        "extension_profile_row_present"
+    };
+    let active_profile_detail = active_profile
+        .as_deref()
+        .map(quote_detail_value)
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    let active_profile_installed_detail = active_profile_installed
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_owned());
+    let installed_profile_detail = if installed_profiles.is_empty() {
+        "<none>".to_owned()
+    } else {
+        installed_profiles
+            .iter()
+            .map(|profile| quote_detail_value(profile))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+
+    SynapseChromeProfileInstallState {
+        detail: format!(
+            "synapse_chrome_bridge_profile_installation scanned=true installed={} user_data_root={} profile_count={} installed_profile_count={} installed_profiles={} active_profile={} active_profile_installed={} parse_error_count={} reason={} cdp_bridge_reload_can_install_absent_extension=false remediation=run scripts\\install-synapse-chrome-debugger.ps1 to validate files and policies, then load extensions\\synapse-chrome-debugger as an unpacked extension in the already-open Chrome profile; cdp_bridge_reload can only reload an already-registered bridge host and cannot install an absent Chrome extension",
+            installed,
+            quote_detail_value(&user_data_root.to_string_lossy()),
+            profile_count,
+            installed_profile_count,
+            installed_profile_detail,
+            active_profile_detail,
+            active_profile_installed_detail,
+            parse_error_count,
+            reason
+        ),
+    }
+}
+
+fn chrome_last_used_profile(user_data_root: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(user_data_root.join("Local State")).ok()?;
+    let parsed = serde_json::from_str::<Value>(&raw).ok()?;
+    parsed
+        .get("profile")
+        .and_then(|profile| profile.get("last_used"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 #[derive(Clone, Debug)]
@@ -2976,6 +3110,7 @@ pub(crate) fn health_subsystem() -> SubsystemHealth {
     let popup_risks = external_chrome_popup_risks();
     let self_profile_risks = synapse_chrome_self_profile_surfaces();
     let layout_infobar_risks = external_chrome_layout_infobar_processes();
+    let profile_install_state = synapse_chrome_profile_install_state();
     let snapshot = match bridge().inner.lock() {
         Ok(inner) => {
             let active_host = inner
@@ -3019,7 +3154,8 @@ pub(crate) fn health_subsystem() -> SubsystemHealth {
             };
         }
     };
-    chrome_bridge_health_from_snapshot(
+    let self_policy_shield = synapse_chrome_self_policy_shield_status();
+    chrome_bridge_health_from_snapshot_with_self_policy(
         snapshot.0.as_ref(),
         snapshot.1,
         snapshot.2,
@@ -3027,9 +3163,12 @@ pub(crate) fn health_subsystem() -> SubsystemHealth {
         &popup_risks,
         &self_profile_risks,
         &layout_infobar_risks,
+        &self_policy_shield,
+        &profile_install_state,
     )
 }
 
+#[cfg(test)]
 fn chrome_bridge_health_from_snapshot(
     active_host: Option<&ChromeBridgeHealthRecord>,
     host_count: usize,
@@ -3040,6 +3179,7 @@ fn chrome_bridge_health_from_snapshot(
     layout_infobar_risks: &[String],
 ) -> SubsystemHealth {
     let self_policy_shield = synapse_chrome_self_policy_shield_status();
+    let profile_install_state = SynapseChromeProfileInstallState::not_scanned("snapshot_test");
     chrome_bridge_health_from_snapshot_with_self_policy(
         active_host,
         host_count,
@@ -3049,6 +3189,7 @@ fn chrome_bridge_health_from_snapshot(
         self_profile_risks,
         layout_infobar_risks,
         &self_policy_shield,
+        &profile_install_state,
     )
 }
 
@@ -3062,6 +3203,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     self_profile_risks: &[String],
     layout_infobar_risks: &[String],
     self_policy_shield: &SynapseChromeSelfPolicyShieldStatus,
+    profile_install_state: &SynapseChromeProfileInstallState,
 ) -> SubsystemHealth {
     let layout_warning = external_chrome_layout_infobar_warning(layout_infobar_risks);
     let self_permission_warning =
@@ -3074,7 +3216,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
         return SubsystemHealth {
             status: "unavailable".to_owned(),
             detail: Some(format!(
-                "tab_control_available=false reason=no_active_chrome_bridge_host host_count={} queued_count={} pending_count={} expected_extension_id={} endpoint={} repair_guidance={} {} {} {} {} install_guidance={}",
+                "tab_control_available=false reason=no_active_chrome_bridge_host host_count={} queued_count={} pending_count={} expected_extension_id={} endpoint={} repair_guidance={} {} {} {} {} {} install_guidance={}",
                 host_count,
                 queued_count,
                 pending_count,
@@ -3084,6 +3226,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
                 risk_warning,
                 self_permission_warning,
                 self_policy_shield.detail,
+                profile_install_state.detail,
                 layout_warning,
                 INSTALL_GUIDANCE
             )),
@@ -3148,7 +3291,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     SubsystemHealth {
         status: status.to_owned(),
         detail: Some(format!(
-            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_build_sha256={} expected_extension_build_sha256={} extension_debugger_api_available={} expected_extension_debugger_api_available=false extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} {} {} {} {} install_guidance={}",
+            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_build_sha256={} expected_extension_build_sha256={} extension_debugger_api_available={} expected_extension_debugger_api_available=false extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} {} {} {} {} {} install_guidance={}",
             tab_control_available,
             extension_stale,
             extension_stale_reasons,
@@ -3181,6 +3324,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
             risk_warning,
             self_permission_warning,
             self_policy_shield.detail,
+            profile_install_state.detail,
             layout_warning,
             INSTALL_GUIDANCE
         )),
@@ -4606,6 +4750,37 @@ mod tests {
     }
 
     #[test]
+    fn chrome_bridge_health_reports_absent_profile_install_without_active_host() {
+        let self_policy_shield = SynapseChromeSelfPolicyShieldStatus {
+            present: true,
+            detail: "synapse_chrome_self_policy_shield_present=true reason=test_present".to_owned(),
+        };
+        let profile_install_state = SynapseChromeProfileInstallState {
+            detail: "synapse_chrome_bridge_profile_installation scanned=true installed=false profile_count=6 installed_profile_count=0 active_profile=\"Profile 5\" active_profile_installed=false reason=extension_id_absent_from_preferences_and_secure_preferences cdp_bridge_reload_can_install_absent_extension=false remediation=test".to_owned(),
+        };
+        let health = chrome_bridge_health_from_snapshot_with_self_policy(
+            None,
+            0,
+            0,
+            0,
+            &[],
+            &[],
+            &[],
+            &self_policy_shield,
+            &profile_install_state,
+        );
+
+        assert_eq!(health.status, "unavailable");
+        let detail = health.detail.as_deref().expect("health detail");
+        assert!(detail.contains("reason=no_active_chrome_bridge_host"));
+        assert!(detail.contains("synapse_chrome_bridge_profile_installation"));
+        assert!(detail.contains("installed=false"));
+        assert!(detail.contains("installed_profile_count=0"));
+        assert!(detail.contains("active_profile_installed=false"));
+        assert!(detail.contains("cdp_bridge_reload_can_install_absent_extension=false"));
+    }
+
+    #[test]
     fn chrome_bridge_health_reports_external_popup_risk_unknown_without_active_host() {
         let health = chrome_bridge_health_from_snapshot(
             None,
@@ -5090,6 +5265,7 @@ mod tests {
             detail: "synapse_chrome_self_policy_shield_present=false reason=test_missing"
                 .to_owned(),
         };
+        let profile_install_state = SynapseChromeProfileInstallState::not_scanned("test");
         let health = chrome_bridge_health_from_snapshot_with_self_policy(
             Some(&host),
             1,
@@ -5099,6 +5275,7 @@ mod tests {
             &self_rows,
             &[],
             &missing_policy_shield,
+            &profile_install_state,
         );
 
         assert_eq!(health.status, "ok");
@@ -5153,6 +5330,7 @@ mod tests {
             present: true,
             detail: "synapse_chrome_self_policy_shield_present=true reason=test_present".to_owned(),
         };
+        let profile_install_state = SynapseChromeProfileInstallState::not_scanned("test");
         let health = chrome_bridge_health_from_snapshot_with_self_policy(
             Some(&host),
             1,
@@ -5162,6 +5340,7 @@ mod tests {
             &self_rows,
             &[],
             &present_policy_shield,
+            &profile_install_state,
         );
 
         assert_eq!(health.status, "ok");

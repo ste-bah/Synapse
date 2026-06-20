@@ -136,6 +136,22 @@ function Invoke-SynapseChromeBridgeVerifier {
     return $readback
 }
 
+function Format-SynapseChromeBridgeProfileInstallState {
+    param($Readback)
+
+    $state = $Readback.synapse_chrome_profile_install_state
+    if (-not $state) {
+        return 'profile_install_state=missing'
+    }
+    return ("profile_install_state=installed:{0},profile_count:{1},installed_profile_count:{2},active_profile:{3},active_profile_installed:{4},reason:{5}" -f `
+        $state.installed, `
+        $state.profile_count, `
+        $state.installed_profile_count, `
+        $state.active_profile, `
+        $state.active_profile_installed, `
+        $state.reason)
+}
+
 $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
 $processToolSurfaceHashAtStart = $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START
 $processToolSurfaceSnapshotAtStart = $env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START
@@ -2955,13 +2971,14 @@ $chromeBridgeInstaller = Join-Path $PSScriptRoot 'install-synapse-chrome-debugge
 $chromeBridgePreflight = Invoke-SynapseChromeBridgeVerifier `
     -InstallerPath $chromeBridgeInstaller `
     -NativeHostExePath $ChromeNativeHostExePath
-Info ("Chrome direct bridge preflight accepted transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4} popup_shield={5}" -f `
+Info ("Chrome direct bridge verifier preflight completed transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4} popup_shield={5} {6}" -f `
     $chromeBridgePreflight.daemon_bridge_transport, `
     $chromeBridgePreflight.extension_id, `
     $chromeBridgePreflight.native_host_registry_present, `
     $chromeBridgePreflight.native_host_manifest_present, `
     (($chromeBridgePreflight.chrome_policy_cleanup | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
-    (($chromeBridgePreflight.chrome_policy_popup_shield | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','))
+    (($chromeBridgePreflight.chrome_policy_popup_shield | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
+    (Format-SynapseChromeBridgeProfileInstallState -Readback $chromeBridgePreflight))
 
 # ---------------------------------------------------------------------------
 # 5. Drain the running daemon, then install the proven binary
@@ -3005,13 +3022,14 @@ Step "Verifying Chrome direct localhost bridge"
 $chromeBridgeReadback = Invoke-SynapseChromeBridgeVerifier `
     -InstallerPath $chromeBridgeInstaller `
     -NativeHostExePath $ChromeNativeHostExePath
-Info ("Chrome direct bridge verified transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4} popup_shield={5}" -f `
+Info ("Chrome direct bridge verifier completed transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4} popup_shield={5} {6}" -f `
     $chromeBridgeReadback.daemon_bridge_transport, `
     $chromeBridgeReadback.extension_id, `
     $chromeBridgeReadback.native_host_registry_present, `
     $chromeBridgeReadback.native_host_manifest_present, `
     (($chromeBridgeReadback.chrome_policy_cleanup | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
-    (($chromeBridgeReadback.chrome_policy_popup_shield | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','))
+    (($chromeBridgeReadback.chrome_policy_popup_shield | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
+    (Format-SynapseChromeBridgeProfileInstallState -Readback $chromeBridgeReadback))
 
 # ---------------------------------------------------------------------------
 # 6. Deploy bundled profiles next to the exe (executable-relative lookup) +
