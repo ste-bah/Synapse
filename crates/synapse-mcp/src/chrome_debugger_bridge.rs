@@ -1183,6 +1183,7 @@ fn external_chrome_layout_infobar_processes() -> Vec<String> {
             if command_line.is_empty() {
                 return None;
             }
+            let command_args = process_command_args(process);
 
             let has_automation_controlled = command_line.contains("--disable-blink-features")
                 && command_line.contains("AutomationControlled");
@@ -1210,19 +1211,199 @@ fn external_chrome_layout_infobar_processes() -> Vec<String> {
                 .parent()
                 .map(|parent| parent.as_u32().to_string())
                 .unwrap_or_else(|| "<unknown>".to_owned());
+            let user_data_dir = process_switch_arg_value(&command_args, "--user-data-dir");
+            let user_data_dir_state = chrome_user_data_dir_state_label(user_data_dir.as_deref());
+            let user_data_dir_display = user_data_dir
+                .as_deref()
+                .map(quote_detail_value)
+                .unwrap_or_else(|| "<missing>".to_owned());
+            let parent_chain = chrome_process_parent_chain(&system, process.parent());
+            let owner_hint = chrome_layout_infobar_owner_hint(
+                &command_line,
+                user_data_dir.as_deref(),
+                &parent_chain,
+            );
+            let repair_hint = chrome_layout_infobar_repair_hint(owner_hint);
+            let command_line_len = command_line.len();
+            let command_line_sha256 = sha256_hex_lower(command_line.as_bytes());
             Some(format!(
-                "chrome_process pid={} parent_pid={} name={} reasons={} has_remote_debugging_pipe={} has_remote_debugging_port={} has_silent_debugger_extension_api={} has_ms_playwright_mcp_dir={}",
+                "chrome_process pid={} parent_pid={} parent_chain={} name={} reasons={} user_data_dir={} user_data_dir_state={} owner_hint={} repair_hint={} has_remote_debugging_pipe={} has_remote_debugging_port={} has_silent_debugger_extension_api={} has_ms_playwright_mcp_dir={} command_metadata_policy=safe_display_v1 command_line_len={} command_line_sha256=sha256:{}",
                 pid.as_u32(),
                 parent_pid,
+                parent_chain,
                 name,
                 reasons.join(","),
+                user_data_dir_display,
+                user_data_dir_state,
+                owner_hint,
+                repair_hint,
                 has_remote_debugging_pipe,
                 has_remote_debugging_port,
                 has_silent_debugger,
-                has_ms_playwright_mcp
+                has_ms_playwright_mcp,
+                command_line_len,
+                command_line_sha256
             ))
         })
         .collect()
+}
+
+fn process_command_args(process: &sysinfo::Process) -> Vec<String> {
+    process
+        .cmd()
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn process_switch_arg_value(args: &[String], switch: &str) -> Option<String> {
+    for (index, arg) in args.iter().enumerate() {
+        if is_process_switch_arg(arg, switch) {
+            if let Some((_head, value)) = arg.split_once('=') {
+                return Some(trim_process_arg_quotes(value).to_owned());
+            }
+            if let Some(value) = args.get(index + 1) {
+                return Some(trim_process_arg_quotes(value).to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn is_process_switch_arg(arg: &str, switch: &str) -> bool {
+    let lower = trim_process_arg_quotes(arg).to_ascii_lowercase();
+    let switch = switch.to_ascii_lowercase();
+    lower == switch || lower.starts_with(&format!("{switch}="))
+}
+
+fn trim_process_arg_quotes(value: &str) -> &str {
+    value.trim().trim_matches('"')
+}
+
+fn chrome_user_data_dir_state_label(path: Option<&str>) -> &'static str {
+    let Some(path) = path else {
+        return "missing";
+    };
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return "missing";
+    }
+    if chrome_layout_default_user_data_dir(trimmed) {
+        "default_profile"
+    } else {
+        "dedicated_or_external"
+    }
+}
+
+fn chrome_layout_default_user_data_dir(path: &str) -> bool {
+    let Some(default_dir) = std::env::var_os("LOCALAPPDATA") else {
+        return false;
+    };
+    let default_dir = PathBuf::from(default_dir)
+        .join("Google")
+        .join("Chrome")
+        .join("User Data");
+    let candidate = normalize_chrome_process_path(path);
+    let default_dir = normalize_chrome_process_path(default_dir.to_string_lossy().as_ref());
+    candidate == default_dir || candidate.starts_with(&format!("{default_dir}\\"))
+}
+
+fn normalize_chrome_process_path(path: &str) -> String {
+    let path = trim_process_arg_quotes(path);
+    let path = std::path::Path::new(path);
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical
+        .to_string_lossy()
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn chrome_process_parent_chain(system: &sysinfo::System, parent: Option<sysinfo::Pid>) -> String {
+    let mut current = parent;
+    let mut seen = BTreeSet::new();
+    let mut parts = Vec::new();
+    for _ in 0..6 {
+        let Some(pid) = current else {
+            break;
+        };
+        if !seen.insert(pid.as_u32()) {
+            parts.push("cycle".to_owned());
+            break;
+        }
+        let Some(process) = system.process(pid) else {
+            parts.push(format!("{}:<missing>", pid.as_u32()));
+            break;
+        };
+        let name = process.name().to_string_lossy();
+        parts.push(format!("{}:{}", pid.as_u32(), compact_process_name(&name)));
+        current = process.parent();
+    }
+    if parts.is_empty() {
+        "<none>".to_owned()
+    } else {
+        parts.join(">")
+    }
+}
+
+fn compact_process_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn chrome_layout_infobar_owner_hint(
+    command_line: &str,
+    user_data_dir: Option<&str>,
+    parent_chain: &str,
+) -> &'static str {
+    let command_lower = command_line.to_ascii_lowercase();
+    let user_data_lower = user_data_dir.unwrap_or_default().to_ascii_lowercase();
+    let parent_lower = parent_chain.to_ascii_lowercase();
+    if user_data_lower.contains("synapse-cdp-profiles")
+        || parent_lower.contains("synapse-mcp.exe")
+        || parent_lower.contains("synapse-mcp")
+    {
+        "synapse_owned_or_spawned"
+    } else if command_lower.contains("ms-playwright-mcp")
+        || user_data_lower.contains("ms-playwright-mcp")
+    {
+        "ms_playwright_mcp_external"
+    } else if command_lower.contains("playwright") || user_data_lower.contains("playwright") {
+        "playwright_external"
+    } else {
+        "unknown_external"
+    }
+}
+
+fn chrome_layout_infobar_repair_hint(owner_hint: &str) -> &'static str {
+    match owner_hint {
+        "synapse_owned_or_spawned" => "terminate_exact_synapse_owned_pid_tree_or_session_cleanup",
+        "ms_playwright_mcp_external" | "playwright_external" => {
+            "stop_external_playwright_mcp_chrome_or_relaunch_with_popup_safe_flags"
+        }
+        _ => "do_not_attach_or_target_until_owner_identified",
+    }
+}
+
+fn quote_detail_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\\\""))
+}
+
+fn sha256_hex_lower(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -4748,10 +4929,7 @@ mod tests {
             0,
             &[],
             &[],
-            &[
-                "chrome_process pid=66452 reasons=headed_ms_playwright_mcp_layout_banner"
-                    .to_owned(),
-            ],
+            &["chrome_process pid=66452 parent_pid=100 parent_chain=100:node.exe name=chrome.exe reasons=headed_ms_playwright_mcp_layout_banner,remote_debugging_without_silent_debugger_extension_api user_data_dir=\"C:\\Users\\hotra\\AppData\\Local\\ms-playwright-mcp\\profile\" user_data_dir_state=dedicated_or_external owner_hint=ms_playwright_mcp_external repair_hint=stop_external_playwright_mcp_chrome_or_relaunch_with_popup_safe_flags has_remote_debugging_pipe=false has_remote_debugging_port=true has_silent_debugger_extension_api=false has_ms_playwright_mcp_dir=true command_metadata_policy=safe_display_v1 command_line_len=256 command_line_sha256=sha256:abc123".to_owned()],
         );
 
         assert_eq!(health.status, "ok");
@@ -4760,6 +4938,64 @@ mod tests {
         assert!(detail.contains("external_chrome_layout_infobar_risk_warning=true"));
         assert!(detail.contains("layout_risk_count=1"));
         assert!(detail.contains("headed_ms_playwright_mcp_layout_banner"));
+        assert!(detail.contains("parent_chain=100:node.exe"));
+        assert!(detail.contains("user_data_dir_state=dedicated_or_external"));
+        assert!(detail.contains("owner_hint=ms_playwright_mcp_external"));
+        assert!(detail.contains(
+            "repair_hint=stop_external_playwright_mcp_chrome_or_relaunch_with_popup_safe_flags"
+        ));
+        assert!(detail.contains("command_metadata_policy=safe_display_v1"));
+        assert!(detail.contains("command_line_sha256=sha256:abc123"));
+    }
+
+    #[test]
+    fn chrome_layout_infobar_metadata_parses_and_classifies_owner() {
+        let args = vec![
+            "chrome.exe".to_owned(),
+            "--remote-debugging-port=9222".to_owned(),
+            "--user-data-dir=C:\\Temp\\ms-playwright-mcp\\profile".to_owned(),
+        ];
+        assert_eq!(
+            process_switch_arg_value(&args, "--user-data-dir").as_deref(),
+            Some("C:\\Temp\\ms-playwright-mcp\\profile")
+        );
+        assert_eq!(
+            chrome_layout_infobar_owner_hint(
+                "chrome.exe --remote-debugging-port=9222",
+                Some("C:\\Temp\\ms-playwright-mcp\\profile"),
+                "100:node.exe"
+            ),
+            "ms_playwright_mcp_external"
+        );
+        assert_eq!(
+            chrome_layout_infobar_repair_hint("ms_playwright_mcp_external"),
+            "stop_external_playwright_mcp_chrome_or_relaunch_with_popup_safe_flags"
+        );
+        assert_eq!(
+            chrome_layout_infobar_owner_hint(
+                "chrome.exe --remote-debugging-pipe",
+                Some("C:\\Users\\hotra\\AppData\\Local\\synapse\\synapse-cdp-profiles\\agent"),
+                "200:synapse-mcp.exe"
+            ),
+            "synapse_owned_or_spawned"
+        );
+        assert_eq!(
+            chrome_layout_infobar_repair_hint("synapse_owned_or_spawned"),
+            "terminate_exact_synapse_owned_pid_tree_or_session_cleanup"
+        );
+        assert_eq!(
+            chrome_layout_infobar_owner_hint(
+                "chrome.exe --remote-debugging-port=9222",
+                None,
+                "300:powershell.exe"
+            ),
+            "unknown_external"
+        );
+        assert_eq!(
+            chrome_layout_infobar_repair_hint("unknown_external"),
+            "do_not_attach_or_target_until_owner_identified"
+        );
+        assert_eq!(quote_detail_value("a\"b"), "\"a\\\"b\"");
     }
 
     #[test]
