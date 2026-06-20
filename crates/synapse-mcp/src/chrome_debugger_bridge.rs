@@ -393,33 +393,41 @@ struct SynapseChromeSelfPolicyShieldStatus {
 
 #[cfg(windows)]
 fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldStatus {
+    let policy_write_access =
+        chrome_policy_set_value_access_status(r"Software\Policies\Google\Chrome");
     let Some(raw) =
         read_hkcu_registry_string(r"Software\Policies\Google\Chrome", "ExtensionSettings")
     else {
         return SynapseChromeSelfPolicyShieldStatus {
             present: false,
-            detail: "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=value_missing_or_unreadable".to_owned(),
+            detail: format!(
+                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=value_missing_or_unreadable {policy_write_access}"
+            ),
         };
     };
     if raw.trim().is_empty() {
         return SynapseChromeSelfPolicyShieldStatus {
             present: false,
-            detail: "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=value_empty".to_owned(),
+            detail: format!(
+                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=value_empty {policy_write_access}"
+            ),
         };
     }
     let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
         return SynapseChromeSelfPolicyShieldStatus {
             present: false,
             detail: format!(
-                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=parse_error raw_len={}",
-                raw.len()
+                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=parse_error raw_len={} {policy_write_access}",
+                raw.len(),
             ),
         };
     };
     let Some(entry) = parsed.get(EXTENSION_ID) else {
         return SynapseChromeSelfPolicyShieldStatus {
             present: false,
-            detail: "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=self_entry_missing".to_owned(),
+            detail: format!(
+                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=self_entry_missing {policy_write_access}"
+            ),
         };
     };
     let blocked = entry
@@ -443,7 +451,7 @@ fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldSt
     SynapseChromeSelfPolicyShieldStatus {
         present,
         detail: format!(
-            "synapse_chrome_self_policy_shield_present={} policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings blocked_permissions={} marker_matches={} reason={}",
+            "synapse_chrome_self_policy_shield_present={} policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings blocked_permissions={} marker_matches={} reason={} {policy_write_access}",
             present,
             if blocked.is_empty() {
                 "<none>".to_owned()
@@ -458,6 +466,49 @@ fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldSt
             }
         ),
     }
+}
+
+#[cfg(windows)]
+fn chrome_policy_set_value_access_status(subkey: &str) -> String {
+    use windows::{
+        Win32::System::Registry::{
+            HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, RegCloseKey, RegOpenKeyExW,
+        },
+        core::PCWSTR,
+    };
+
+    let subkey_wide = wide_null(subkey);
+    let mut key = HKEY::default();
+    let status = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey_wide.as_ptr()),
+            None,
+            KEY_SET_VALUE,
+            &mut key,
+        )
+    };
+    if status != windows::Win32::Foundation::ERROR_SUCCESS {
+        return format!(
+            "policy_set_value_access=false policy_set_value_access_reason=reg_open_key_set_value_failed status={} remediation=repair HKCU\\{subkey} ACL or run setup from an elevated maintenance context; until then rely on live chrome.management suppression and fail-closed command gates",
+            status.0
+        );
+    }
+
+    let close_status = unsafe { RegCloseKey(key) };
+    if close_status != windows::Win32::Foundation::ERROR_SUCCESS {
+        tracing::warn!(
+            code = "CHROME_POLICY_WRITE_ACCESS_REGCLOSE_FAILED",
+            status = close_status.0,
+            "RegCloseKey failed after Chrome ExtensionSettings write-access probe"
+        );
+    }
+    "policy_set_value_access=true policy_set_value_access_reason=key_set_value_allowed".to_owned()
+}
+
+#[cfg(not(windows))]
+fn chrome_policy_set_value_access_status(_subkey: &str) -> String {
+    "policy_set_value_access=false policy_set_value_access_reason=non_windows".to_owned()
 }
 
 #[cfg(not(windows))]
