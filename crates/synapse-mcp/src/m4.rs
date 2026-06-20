@@ -121,12 +121,18 @@ const SHELL_REMOTE_CLEANUP_FAILED: &str = "remote_cleanup_failed";
 const SHELL_REMOTE_CLEANUP_PRE_MARKER_TERMINAL: &str =
     "remote_process_never_started_or_untracked_pre_marker";
 const SHELL_JOB_STATUS_REMOTE_TRANSPORT_LOST: &str = "transport_lost_process_may_still_run";
+const SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE: &str =
+    "remote_process_exited_local_transport_stale";
 const SHELL_REMOTE_CLEANUP_TRANSPORT_LOST: &str = "transport_lost_process_may_still_run";
+const SHELL_REMOTE_CLEANUP_ALREADY_GONE: &str = "remote_process_already_gone";
 const SHELL_REMOTE_PROCESS_MARKER: &str = "SYNAPSE_REMOTE_PROCESS_V1";
+const SHELL_REMOTE_EXIT_MARKER: &str = "SYNAPSE_REMOTE_EXIT_V1";
 const SHELL_REMOTE_CLEANUP_MARKER: &str = "SYNAPSE_REMOTE_CLEANUP_V1";
+const SHELL_REMOTE_LIVENESS_MARKER: &str = "SYNAPSE_REMOTE_LIVENESS_V1";
 const SHELL_REMOTE_METADATA_PREFIX_BYTES: usize = 128 * 1024;
 const SHELL_REMOTE_METADATA_WAIT_MS: u64 = 1_500;
 const SHELL_REMOTE_CLEANUP_TIMEOUT_MS: u64 = 15_000;
+const SHELL_REMOTE_LIVENESS_TIMEOUT_MS: u64 = 2_500;
 pub const SHELL_PATTERN_TOO_BROAD: &str = "SHELL_PATTERN_TOO_BROAD";
 pub const LAUNCH_PATTERN_TOO_BROAD: &str = "LAUNCH_PATTERN_TOO_BROAD";
 
@@ -2058,6 +2064,22 @@ pub fn shell_job_status(
     if shell_job_live_status(&job.status) && !running {
         job = reconcile_shell_job_process_state(job, &paths)?;
         refresh_shell_job_remote_metadata_from_outputs(&mut job, &paths)?;
+        running = shell_job_process_still_running(&job);
+    }
+    if reconcile_shell_job_remote_exit_marker(
+        &mut job,
+        &paths,
+        running,
+        "act_run_shell_status_remote_exit_readback",
+    )? {
+        running = shell_job_process_still_running(&job);
+    }
+    if reconcile_shell_job_remote_already_gone_if_local_stale(
+        &mut job,
+        &paths,
+        running,
+        "act_run_shell_status_remote_liveness_readback",
+    ) {
         running = shell_job_process_still_running(&job);
     }
     verify_shell_job_remote_cleanup_after_terminal(
@@ -7444,7 +7466,8 @@ fn ssh_remote_tracking_plan(
     }
 
     let marker = format!("{SHELL_REMOTE_PROCESS_MARKER} job_id={job_id}");
-    let remote_wrapper = ssh_remote_tracking_command(&marker, &remote_command);
+    let exit_marker = format!("{SHELL_REMOTE_EXIT_MARKER} job_id={job_id}");
+    let remote_wrapper = ssh_remote_tracking_command(&marker, &exit_marker, &remote_command);
     let mut spawn_args = parts.control_args.clone();
     spawn_args.push(remote_wrapper);
     Some(SshRemoteTrackingPlan {
@@ -7455,9 +7478,10 @@ fn ssh_remote_tracking_plan(
     })
 }
 
-fn ssh_remote_tracking_command(marker: &str, remote_command: &str) -> String {
+fn ssh_remote_tracking_command(marker: &str, exit_marker: &str, remote_command: &str) -> String {
     const SCRIPT: &str = r#"marker=$1
-cmd=$2
+exit_marker=$2
+cmd=$3
 if ! command -v setsid >/dev/null 2>&1; then
   printf '%s error=setsid_unavailable\n' "$marker" >&2
   exit 127
@@ -7468,11 +7492,15 @@ pgid=$child
 sid=$(ps -o sid= -p "$child" 2>/dev/null | tr -d '[:space:]' || true)
 printf '%s pid=%s pgid=%s sid=%s\n' "$marker" "$child" "$pgid" "$sid" >&2
 wait "$child"
+rc=$?
+printf '%s pid=%s pgid=%s exit_code=%s\n' "$exit_marker" "$child" "$pgid" "$rc" >&2
+exit "$rc"
 "#;
     format!(
-        "sh -c {} synapse-remote-tracker {} {}",
+        "sh -c {} synapse-remote-tracker {} {} {}",
         posix_single_quote(SCRIPT),
         posix_single_quote(marker),
+        posix_single_quote(exit_marker),
         posix_single_quote(remote_command)
     )
 }
@@ -7790,6 +7818,14 @@ struct RemoteProcessMetadata {
     sid: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteExitMetadata {
+    job_id: String,
+    pid: String,
+    pgid: String,
+    exit_code: i32,
+}
+
 fn refresh_shell_job_remote_metadata_from_outputs(
     job: &mut ActRunShellJobStatus,
     paths: &ShellJobPaths,
@@ -7811,6 +7847,79 @@ fn refresh_shell_job_remote_metadata_from_outputs(
         return Ok(false);
     };
     apply_remote_process_metadata(job, metadata);
+    Ok(true)
+}
+
+fn reconcile_shell_job_remote_exit_marker(
+    job: &mut ActRunShellJobStatus,
+    paths: &ShellJobPaths,
+    running: bool,
+    trigger: &'static str,
+) -> Result<bool, ErrorData> {
+    if job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
+        || job.cancel_requested
+        || job.timed_out
+    {
+        return Ok(false);
+    }
+    let stderr_prefix =
+        read_file_prefix_lossy(&paths.stderr_path, SHELL_REMOTE_METADATA_PREFIX_BYTES)?;
+    let stderr_tail = tail_file_lossy(&paths.stderr_path, SHELL_JOB_TAIL_DEFAULT_BYTES as usize)?;
+    let metadata = parse_remote_exit_metadata(&stderr_prefix, &job.job_id)
+        .or_else(|| parse_remote_exit_metadata(&stderr_tail, &job.job_id));
+    let Some(metadata) = metadata else {
+        return Ok(false);
+    };
+    push_unique_evidence(
+        &mut job.remote_process_scope.detection_evidence,
+        format!(
+            "remote_exit_marker:{SHELL_REMOTE_EXIT_MARKER}:pid={}:pgid={}:exit_code={}",
+            metadata.pid, metadata.pgid, metadata.exit_code
+        ),
+    );
+    if job
+        .remote_process_scope
+        .remote_process_id
+        .as_deref()
+        .is_some_and(|pid| pid != metadata.pid)
+        || job
+            .remote_process_scope
+            .remote_process_group_id
+            .as_deref()
+            .is_some_and(|pgid| pgid != metadata.pgid)
+    {
+        push_unique_evidence(
+            &mut job.remote_process_scope.detection_evidence,
+            "remote_exit_marker_ignored:metadata_mismatch".to_owned(),
+        );
+        return Ok(false);
+    }
+    if metadata.exit_code != 0 {
+        return Ok(false);
+    }
+    if !running && job.status == "ok" && job.exit_code == Some(0) {
+        return Ok(false);
+    }
+    let termination = if running {
+        job.pid.map(terminate_shell_job_process_tree)
+    } else {
+        None
+    };
+    let local_termination_status = termination
+        .as_ref()
+        .map(|readback| readback.status.as_str())
+        .unwrap_or("already_exited");
+    let remaining_process_ids = termination
+        .as_ref()
+        .map(|readback| readback.remaining_process_ids.clone())
+        .unwrap_or_default();
+    mark_shell_job_remote_already_gone_local_stale(
+        job,
+        trigger,
+        local_termination_status,
+        &remaining_process_ids,
+        Some(metadata.exit_code),
+    );
     Ok(true)
 }
 
@@ -7999,6 +8108,194 @@ fn mark_shell_job_remote_transport_lost(
     job.error_message = Some(message);
 }
 
+fn reconcile_shell_job_remote_already_gone_if_local_stale(
+    job: &mut ActRunShellJobStatus,
+    paths: &ShellJobPaths,
+    running: bool,
+    trigger: &'static str,
+) -> bool {
+    if !running
+        || !shell_job_live_status(&job.status)
+        || job.cancel_requested
+        || job.timed_out
+        || job.remote_process_scope.transport != SHELL_REMOTE_TRANSPORT_SSH
+        || !job.remote_process_scope.remote_cleanup_required
+        || job.remote_process_scope.remote_cleanup_verified
+        || matches!(
+            job.remote_process_scope.remote_cleanup_status.as_str(),
+            SHELL_REMOTE_CLEANUP_TRANSPORT_LOST
+                | SHELL_REMOTE_CLEANUP_FAILED
+                | SHELL_REMOTE_CLEANUP_NOT_TRACKED
+        )
+    {
+        return false;
+    }
+    let Some(pid) = job.remote_process_scope.remote_process_id.clone() else {
+        return false;
+    };
+    let Some(pgid) = job.remote_process_scope.remote_process_group_id.clone() else {
+        return false;
+    };
+    if !valid_remote_process_number(&pid) || !valid_remote_process_number(&pgid) {
+        push_unique_evidence(
+            &mut job.remote_process_scope.detection_evidence,
+            "remote_liveness_probe_skipped:invalid_metadata".to_owned(),
+        );
+        return false;
+    }
+    let Some(remote_status) = probe_shell_job_remote_liveness(job, paths, &pid, &pgid) else {
+        return false;
+    };
+    if remote_status != "already_gone" {
+        return false;
+    }
+    let termination = job.pid.map(terminate_shell_job_process_tree);
+    let local_termination_status = termination
+        .as_ref()
+        .map(|readback| readback.status.as_str())
+        .unwrap_or("pid_unavailable");
+    let remaining_process_ids = termination
+        .as_ref()
+        .map(|readback| readback.remaining_process_ids.clone())
+        .unwrap_or_default();
+    mark_shell_job_remote_already_gone_local_stale(
+        job,
+        trigger,
+        local_termination_status,
+        &remaining_process_ids,
+        None,
+    );
+    true
+}
+
+fn probe_shell_job_remote_liveness(
+    job: &mut ActRunShellJobStatus,
+    paths: &ShellJobPaths,
+    pid: &str,
+    pgid: &str,
+) -> Option<String> {
+    let remote_cleanup = match read_shell_remote_cleanup_invocation(paths, &job.job_id) {
+        Ok(remote_cleanup) => remote_cleanup,
+        Err(_) => {
+            push_unique_evidence(
+                &mut job.remote_process_scope.detection_evidence,
+                "remote_liveness_probe_failed:sidecar_unreadable".to_owned(),
+            );
+            return None;
+        }
+    };
+    let Some(invocation) = shell_job_cleanup_invocation(job, None, remote_cleanup.as_ref()) else {
+        push_unique_evidence(
+            &mut job.remote_process_scope.detection_evidence,
+            "remote_liveness_probe_failed:ssh_destination_unavailable".to_owned(),
+        );
+        return None;
+    };
+    let Some(parts) = ssh_direct_command_parts(&invocation.args) else {
+        push_unique_evidence(
+            &mut job.remote_process_scope.detection_evidence,
+            "remote_liveness_probe_failed:ssh_destination_unavailable".to_owned(),
+        );
+        return None;
+    };
+    let mut liveness_args = parts.control_args;
+    liveness_args.push(ssh_remote_liveness_command(pid, pgid));
+    let readback = match run_shell_cleanup_command_with_timeout(
+        &invocation.command,
+        &liveness_args,
+        Duration::from_millis(SHELL_REMOTE_LIVENESS_TIMEOUT_MS),
+    ) {
+        Ok(readback) => readback,
+        Err(_) => {
+            push_unique_evidence(
+                &mut job.remote_process_scope.detection_evidence,
+                "remote_liveness_probe_failed:command_failed".to_owned(),
+            );
+            return None;
+        }
+    };
+    let Some(status) = parse_remote_liveness_status(&readback.stdout, pid, pgid) else {
+        push_unique_evidence(
+            &mut job.remote_process_scope.detection_evidence,
+            "remote_liveness_probe_failed:marker_unrecognized".to_owned(),
+        );
+        return None;
+    };
+    push_unique_evidence(
+        &mut job.remote_process_scope.detection_evidence,
+        format!(
+            "remote_liveness_marker:{SHELL_REMOTE_LIVENESS_MARKER}:pgid={pgid}:status={status}"
+        ),
+    );
+    Some(status)
+}
+
+fn mark_shell_job_remote_already_gone_local_stale(
+    job: &mut ActRunShellJobStatus,
+    trigger: &'static str,
+    local_termination_status: &str,
+    remaining_process_ids: &[u32],
+    remote_exit_code: Option<i32>,
+) {
+    let remote_identity = job
+        .remote_process_scope
+        .remote_identity
+        .as_deref()
+        .unwrap_or("unknown_remote");
+    let pid = job
+        .remote_process_scope
+        .remote_process_id
+        .as_deref()
+        .unwrap_or("unknown_pid");
+    let pgid = job
+        .remote_process_scope
+        .remote_process_group_id
+        .as_deref()
+        .unwrap_or("unknown_pgid");
+    let exit_message = remote_exit_code
+        .map(|exit_code| format!(" Remote exit code from {SHELL_REMOTE_EXIT_MARKER}={exit_code}."))
+        .unwrap_or_else(|| " Remote exit code is unavailable from the stale transport.".to_owned());
+    let message = format!(
+        "{trigger} verified remote pid {pid}, process group {pgid} on '{remote_identity}' is already gone while the local SSH transport was still live or reported a mismatched terminal state; local process-tree termination status={local_termination_status}.{exit_message}"
+    );
+    job.status = SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE.to_owned();
+    job.completed_at
+        .get_or_insert_with(|| chrono::Utc::now().to_rfc3339());
+    job.duration_ms
+        .get_or_insert_with(|| elapsed_ms_since_rfc3339(&job.started_at).unwrap_or_default());
+    job.exit_code = remote_exit_code;
+    job.remote_process_scope.remote_cleanup_required = false;
+    job.remote_process_scope.remote_cleanup_verified = true;
+    job.remote_process_scope.remote_cleanup_status = SHELL_REMOTE_CLEANUP_ALREADY_GONE.to_owned();
+    job.remote_process_scope.remote_cleanup_error_code = None;
+    job.remote_process_scope.remote_cleanup_message = Some(message.clone());
+    push_unique_evidence(
+        &mut job.remote_process_scope.detection_evidence,
+        "remote_process_already_gone_before_cancel".to_owned(),
+    );
+    push_unique_evidence(
+        &mut job.remote_process_scope.detection_evidence,
+        format!("local_transport_stale_termination:{local_termination_status}"),
+    );
+    if remaining_process_ids.is_empty() {
+        if job.error_code.as_deref() == Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
+        {
+            job.error_code = None;
+        }
+        job.error_message = Some(message);
+    } else {
+        let remaining = remaining_process_ids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        job.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+        job.error_message = Some(format!(
+            "{message} Local stale transport still has remaining process ids: {remaining}"
+        ));
+    }
+}
+
 fn parse_remote_process_metadata(
     stderr: &str,
     expected_job_id: &str,
@@ -8030,6 +8327,34 @@ fn parse_remote_process_metadata(
         });
     }
     None
+}
+
+fn parse_remote_exit_metadata(stderr: &str, expected_job_id: &str) -> Option<RemoteExitMetadata> {
+    let mut found = None;
+    for line in stderr.lines() {
+        let Some(marker_index) = line.find(SHELL_REMOTE_EXIT_MARKER) else {
+            continue;
+        };
+        let rest = &line[marker_index + SHELL_REMOTE_EXIT_MARKER.len()..];
+        let fields = parse_marker_fields(rest);
+        let job_id = fields.get("job_id")?;
+        if job_id != expected_job_id {
+            continue;
+        }
+        let pid = fields.get("pid")?;
+        let pgid = fields.get("pgid")?;
+        let exit_code = fields.get("exit_code")?.parse::<i32>().ok()?;
+        if !valid_remote_process_number(pid) || !valid_remote_process_number(pgid) {
+            continue;
+        }
+        found = Some(RemoteExitMetadata {
+            job_id: job_id.clone(),
+            pid: pid.clone(),
+            pgid: pgid.clone(),
+            exit_code,
+        });
+    }
+    found
 }
 
 fn apply_remote_process_metadata(job: &mut ActRunShellJobStatus, metadata: RemoteProcessMetadata) {
@@ -8345,6 +8670,30 @@ exit 1
     )
 }
 
+fn ssh_remote_liveness_command(pid: &str, pgid: &str) -> String {
+    const SCRIPT: &str = r#"pid=$1
+pgid=$2
+case "$pid:$pgid" in
+  *[!0123456789:]*|:*|*:)
+    printf '%s pid=%s pgid=%s status=invalid_metadata\n' SYNAPSE_REMOTE_LIVENESS_V1 "$pid" "$pgid"
+    exit 2
+    ;;
+esac
+actual_pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+if [ "$actual_pgid" = "$pgid" ]; then
+  printf '%s pid=%s pgid=%s status=alive\n' SYNAPSE_REMOTE_LIVENESS_V1 "$pid" "$pgid"
+else
+  printf '%s pid=%s pgid=%s status=already_gone\n' SYNAPSE_REMOTE_LIVENESS_V1 "$pid" "$pgid"
+fi
+"#;
+    format!(
+        "sh -c {} synapse-remote-liveness {} {}",
+        posix_single_quote(SCRIPT),
+        posix_single_quote(pid),
+        posix_single_quote(pgid)
+    )
+}
+
 fn parse_remote_cleanup_status(
     stdout: &str,
     expected_pid: &str,
@@ -8352,6 +8701,27 @@ fn parse_remote_cleanup_status(
 ) -> Option<String> {
     for line in stdout.lines() {
         let Some(rest) = line.strip_prefix(SHELL_REMOTE_CLEANUP_MARKER) else {
+            continue;
+        };
+        let fields = parse_marker_fields(rest);
+        if fields.get("pid").map(String::as_str) != Some(expected_pid) {
+            continue;
+        }
+        if fields.get("pgid").map(String::as_str) != Some(expected_pgid) {
+            continue;
+        }
+        return fields.get("status").cloned();
+    }
+    None
+}
+
+fn parse_remote_liveness_status(
+    stdout: &str,
+    expected_pid: &str,
+    expected_pgid: &str,
+) -> Option<String> {
+    for line in stdout.lines() {
+        let Some(rest) = line.strip_prefix(SHELL_REMOTE_LIVENESS_MARKER) else {
             continue;
         };
         let fields = parse_marker_fields(rest);
@@ -8648,6 +9018,26 @@ async fn monitor_shell_job(
         status.status =
             terminal_shell_job_status(status.exit_code, status.timed_out, status.cancel_requested)
                 .to_owned();
+    }
+    if let Err(error) = refresh_shell_job_remote_metadata_from_outputs(&mut status, &paths) {
+        mark_shell_job_remote_cleanup_failed(
+            &mut status,
+            "act_run_shell_start_remote_metadata_readback",
+            "remote_metadata_read_failed",
+            &format!("{error:?}"),
+        );
+    } else if let Err(error) = reconcile_shell_job_remote_exit_marker(
+        &mut status,
+        &paths,
+        false,
+        "act_run_shell_start_remote_exit_readback",
+    ) {
+        mark_shell_job_remote_cleanup_failed(
+            &mut status,
+            "act_run_shell_start_remote_exit_readback",
+            "remote_exit_marker_read_failed",
+            &format!("{error:?}"),
+        );
     }
     persist_shell_job_local_terminal_status(&paths, &status);
     verify_shell_job_remote_cleanup_after_terminal(
@@ -12782,6 +13172,197 @@ client_loop: send disconnect: Connection reset by peer\r\n";
         assert_eq!(
             no_transport.remote_process_scope.remote_cleanup_status,
             SHELL_REMOTE_CLEANUP_TRACKED
+        );
+    }
+
+    #[test]
+    fn issue1274_shell_status_marks_remote_already_gone_local_transport_stale() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = temp_shell_job_paths(&temp);
+        let mut status = issue1277_ssh_status("issue1274-stale", "running", &paths);
+        status.pid = Some(4242);
+        let metadata =
+            parse_remote_process_metadata(
+                "SYNAPSE_REMOTE_PROCESS_V1 job_id=issue1274-stale pid=2266815 pgid=2266815 sid=2266815\n",
+                "issue1274-stale",
+            )
+            .unwrap_or_else(|| panic!("remote marker should parse"));
+        apply_remote_process_metadata(&mut status, metadata);
+
+        mark_shell_job_remote_already_gone_local_stale(
+            &mut status,
+            "regression_status_remote_liveness",
+            "terminated",
+            &[],
+            None,
+        );
+
+        println!(
+            "readback=act_run_shell_status issue=1274 edge=remote_already_gone before=status:running remote:tracked after=status:{} cleanup:{} verified:{} required:{}",
+            status.status,
+            status.remote_process_scope.remote_cleanup_status,
+            status.remote_process_scope.remote_cleanup_verified,
+            status.remote_process_scope.remote_cleanup_required
+        );
+        assert_eq!(status.status, SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE);
+        assert!(shell_job_terminal_status(&status.status));
+        assert_eq!(status.exit_code, None);
+        assert!(status.completed_at.is_some());
+        assert!(status.duration_ms.is_some());
+        assert!(!status.remote_process_scope.remote_cleanup_required);
+        assert!(status.remote_process_scope.remote_cleanup_verified);
+        assert_eq!(
+            status.remote_process_scope.remote_cleanup_status,
+            SHELL_REMOTE_CLEANUP_ALREADY_GONE
+        );
+        assert_eq!(status.remote_process_scope.remote_cleanup_error_code, None);
+        assert_eq!(status.error_code, None);
+        assert!(
+            status
+                .remote_process_scope
+                .remote_cleanup_message
+                .as_deref()
+                .is_some_and(|message| message.contains("already gone"))
+        );
+        assert!(
+            status
+                .remote_process_scope
+                .detection_evidence
+                .iter()
+                .any(|evidence| evidence == "remote_process_already_gone_before_cancel")
+        );
+        assert!(
+            status
+                .remote_process_scope
+                .detection_evidence
+                .iter()
+                .any(|evidence| evidence == "local_transport_stale_termination:terminated")
+        );
+    }
+
+    #[test]
+    fn issue1274_remote_liveness_marker_parser_distinguishes_alive_and_gone() {
+        let alive =
+            format!("{SHELL_REMOTE_LIVENESS_MARKER} pid=2266815 pgid=2266815 status=alive\n");
+        let gone = format!(
+            "{SHELL_REMOTE_LIVENESS_MARKER} pid=2266815 pgid=2266815 status=already_gone\n"
+        );
+        let wrong_pid =
+            format!("{SHELL_REMOTE_LIVENESS_MARKER} pid=1 pgid=2266815 status=already_gone\n");
+        let command = ssh_remote_liveness_command("2266815", "2266815");
+
+        println!(
+            "readback=act_run_shell_status issue=1274 edge=liveness_parse alive={:?} gone={:?} command={command:?}",
+            parse_remote_liveness_status(&alive, "2266815", "2266815"),
+            parse_remote_liveness_status(&gone, "2266815", "2266815")
+        );
+        assert_eq!(
+            parse_remote_liveness_status(&alive, "2266815", "2266815").as_deref(),
+            Some("alive")
+        );
+        assert_eq!(
+            parse_remote_liveness_status(&gone, "2266815", "2266815").as_deref(),
+            Some("already_gone")
+        );
+        assert_eq!(
+            parse_remote_liveness_status(&wrong_pid, "2266815", "2266815"),
+            None
+        );
+        assert!(command.contains(SHELL_REMOTE_LIVENESS_MARKER));
+        assert!(command.contains("ps -o pgid="));
+        assert!(!command.contains("kill -TERM"));
+        assert!(!command.contains("kill -KILL"));
+    }
+
+    #[test]
+    fn issue1274_remote_exit_marker_zero_marks_stale_transport_success() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = temp_shell_job_paths(&temp);
+        let mut status = issue1277_ssh_status("issue1274-exit-zero", "exit_nonzero", &paths);
+        status.exit_code = Some(1);
+        let stderr = "\
+SYNAPSE_REMOTE_PROCESS_V1 job_id=issue1274-exit-zero pid=2266815 pgid=2266815 sid=2266815
+SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-zero pid=2266815 pgid=2266815 exit_code=0
+";
+        std::fs::write(&paths.stderr_path, stderr)
+            .unwrap_or_else(|error| panic!("write remote exit stderr: {error}"));
+        refresh_shell_job_remote_metadata_from_outputs(&mut status, &paths)
+            .unwrap_or_else(|error| panic!("remote process marker should read: {error}"));
+
+        let reconciled = reconcile_shell_job_remote_exit_marker(
+            &mut status,
+            &paths,
+            false,
+            "regression_remote_exit_marker",
+        )
+        .unwrap_or_else(|error| panic!("remote exit marker should read: {error}"));
+
+        println!(
+            "readback=act_run_shell_status issue=1274 edge=remote_exit_zero before=local_exit_nonzero after=status:{} exit_code:{:?} cleanup:{} reconciled:{reconciled}",
+            status.status, status.exit_code, status.remote_process_scope.remote_cleanup_status
+        );
+        assert!(reconciled);
+        assert_eq!(status.status, SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE);
+        assert_eq!(status.exit_code, Some(0));
+        assert!(status.remote_process_scope.remote_cleanup_verified);
+        assert_eq!(
+            status.remote_process_scope.remote_cleanup_status,
+            SHELL_REMOTE_CLEANUP_ALREADY_GONE
+        );
+        assert!(
+            status
+                .remote_process_scope
+                .detection_evidence
+                .iter()
+                .any(|evidence| evidence
+                    == "remote_exit_marker:SYNAPSE_REMOTE_EXIT_V1:pid=2266815:pgid=2266815:exit_code=0")
+        );
+    }
+
+    #[test]
+    fn issue1274_remote_exit_marker_nonzero_does_not_hide_remote_failure() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = temp_shell_job_paths(&temp);
+        let mut status = issue1277_ssh_status("issue1274-exit-nonzero", "exit_nonzero", &paths);
+        status.exit_code = Some(7);
+        let stderr = "\
+SYNAPSE_REMOTE_PROCESS_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 sid=2266815
+SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 exit_code=7
+";
+        std::fs::write(&paths.stderr_path, stderr)
+            .unwrap_or_else(|error| panic!("write remote exit stderr: {error}"));
+        refresh_shell_job_remote_metadata_from_outputs(&mut status, &paths)
+            .unwrap_or_else(|error| panic!("remote process marker should read: {error}"));
+
+        let reconciled = reconcile_shell_job_remote_exit_marker(
+            &mut status,
+            &paths,
+            false,
+            "regression_remote_exit_marker",
+        )
+        .unwrap_or_else(|error| panic!("remote exit marker should read: {error}"));
+
+        println!(
+            "readback=act_run_shell_status issue=1274 edge=remote_exit_nonzero before=exit_nonzero/7 after=status:{} exit_code:{:?} cleanup:{} reconciled:{reconciled}",
+            status.status, status.exit_code, status.remote_process_scope.remote_cleanup_status
+        );
+        assert!(!reconciled);
+        assert_eq!(status.status, "exit_nonzero");
+        assert_eq!(status.exit_code, Some(7));
+        assert_eq!(
+            status.remote_process_scope.remote_cleanup_status,
+            SHELL_REMOTE_CLEANUP_TRACKED
+        );
+        assert!(
+            status
+                .remote_process_scope
+                .detection_evidence
+                .iter()
+                .any(|evidence| evidence
+                    == "remote_exit_marker:SYNAPSE_REMOTE_EXIT_V1:pid=2266815:pgid=2266815:exit_code=7")
         );
     }
 
