@@ -65,6 +65,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "browser_inspect",
     "browser_locate",
     "browser_locale",
+    "browser_media",
     "browser_network_har",
     "browser_network_overrides",
     "browser_network_request",
@@ -162,6 +163,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "browser_inspect",
     "browser_locate",
     "browser_locale",
+    "browser_media",
     "browser_network_har",
     "browser_network_overrides",
     "browser_network_request",
@@ -1294,6 +1296,7 @@ mod tests {
                 "browser_geolocation",
                 "browser_handle_dialog",
                 "browser_locale",
+                "browser_media",
                 "browser_network_har",
                 "browser_network_overrides",
                 "browser_network_request",
@@ -1336,6 +1339,7 @@ mod tests {
         assert!(visible.contains(&"browser_geolocation".to_owned()));
         assert!(visible.contains(&"browser_handle_dialog".to_owned()));
         assert!(visible.contains(&"browser_locale".to_owned()));
+        assert!(visible.contains(&"browser_media".to_owned()));
         assert!(visible.contains(&"browser_network_har".to_owned()));
         assert!(visible.contains(&"browser_network_overrides".to_owned()));
         assert!(visible.contains(&"browser_network_request".to_owned()));
@@ -1416,6 +1420,7 @@ mod tests {
         assert!(visible.contains(&"browser_geolocation".to_owned()));
         assert!(visible.contains(&"browser_handle_dialog".to_owned()));
         assert!(visible.contains(&"browser_locale".to_owned()));
+        assert!(visible.contains(&"browser_media".to_owned()));
         assert!(visible.contains(&"browser_network_har".to_owned()));
         assert!(visible.contains(&"browser_network_overrides".to_owned()));
         assert!(visible.contains(&"browser_network_request".to_owned()));

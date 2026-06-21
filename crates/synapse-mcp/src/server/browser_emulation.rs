@@ -1,4 +1,4 @@
-//! Browser emulation tools (#1173/#1174/#1175/#1176).
+//! Browser emulation tools (#1173/#1174/#1175/#1176/#1177).
 
 use super::{
     ErrorData, Json, Parameters, SynapseService,
@@ -18,6 +18,7 @@ const RESIZE_TOOL: &str = "browser_resize";
 const DEVICE_TOOL: &str = "browser_device";
 const GEOLOCATION_TOOL: &str = "browser_geolocation";
 const LOCALE_TOOL: &str = "browser_locale";
+const MEDIA_TOOL: &str = "browser_media";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -45,6 +46,19 @@ pub enum BrowserGeolocationOperation {
 pub enum BrowserLocaleOperation {
     Set,
     Reset,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserMediaOperation {
+    Set,
+    Reset,
+}
+
+impl Default for BrowserMediaOperation {
+    fn default() -> Self {
+        Self::Set
+    }
 }
 
 impl Default for BrowserLocaleOperation {
@@ -199,6 +213,32 @@ pub struct BrowserLocaleParams {
     pub timezone_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserMediaParams {
+    /// CDP TargetID to emulate. Defaults to the active session CDP target. Must
+    /// be owned by this session; the human foreground tab is never a fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// `set` applies media/media-feature overrides; `reset` restores defaults.
+    #[serde(default)]
+    pub operation: BrowserMediaOperation,
+    /// CSS media type for operation=set: `screen` or `print`.
+    #[serde(default)]
+    pub media: Option<String>,
+    /// prefers-color-scheme for operation=set: `light`, `dark`, or
+    /// `no-preference`.
+    #[serde(default)]
+    pub color_scheme: Option<String>,
+    /// prefers-reduced-motion for operation=set: `reduce` or `no-preference`.
+    #[serde(default)]
+    pub reduced_motion: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserViewportOverride {
@@ -243,6 +283,17 @@ pub struct BrowserLocaleOverride {
     pub locale: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timezone_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserMediaOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_scheme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reduced_motion: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -344,6 +395,18 @@ pub struct BrowserLocaleReadback {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct BrowserMediaReadback {
+    pub media_screen: bool,
+    pub media_print: bool,
+    pub color_scheme_dark: bool,
+    pub color_scheme_light: bool,
+    pub color_scheme_no_preference: bool,
+    pub reduced_motion_reduce: bool,
+    pub reduced_motion_no_preference: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserDeviceResponse {
     pub session_id: String,
     pub window_hwnd: i64,
@@ -409,6 +472,27 @@ pub struct BrowserLocaleResponse {
     pub source_of_truth: String,
 }
 
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserMediaResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub operation: BrowserMediaOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested: Option<BrowserMediaOverride>,
+    pub page_url: String,
+    pub page_title: String,
+    pub ready_state: String,
+    pub media: BrowserMediaReadback,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+    pub source_of_truth: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 struct NormalizedBrowserResizeParams {
     operation: BrowserResizeOperation,
@@ -434,6 +518,12 @@ struct NormalizedBrowserGeolocationParams {
 struct NormalizedBrowserLocaleParams {
     operation: BrowserLocaleOperation,
     requested: Option<BrowserLocaleOverride>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NormalizedBrowserMediaParams {
+    operation: BrowserMediaOperation,
+    requested: Option<BrowserMediaOverride>,
 }
 
 #[tool_router(router = browser_emulation_tool_router, vis = "pub(super)")]
@@ -668,6 +758,62 @@ impl SynapseService {
         result.map(Json)
     }
 
+    #[tool(
+        description = "Set or reset CSS media emulation for the calling session's owned raw-CDP browser tab. operation=set applies media (`screen` or `print`) and/or prefers-color-scheme / prefers-reduced-motion through Emulation.setEmulatedMedia, then reads back matchMedia state for screen, print, color-scheme, and reduced-motion. Unspecified fields are cleared on each set so stale media features do not persist. operation=reset clears media and media-feature overrides. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; use browser_evaluate as an independent FSV readback for matchMedia('(prefers-color-scheme: dark)') and print media behavior."
+    )]
+    pub async fn browser_media(
+        &self,
+        params: Parameters<BrowserMediaParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserMediaResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = MEDIA_TOOL,
+            "tool.invocation kind=browser_media"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let media = validate_browser_media_params(&params.0)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "operation": media.operation,
+            "requested": &media.requested,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            MEDIA_TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            MEDIA_TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "operation": media.operation,
+            "requested": &media.requested,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(
+            MEDIA_TOOL,
+            &request_details,
+            &session_id,
+        )?;
+        let result = self
+            .browser_media_impl(&session_id, window_hwnd, &cdp_target_id, &media)
+            .await;
+        self.audit_action_result_for_session(MEDIA_TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
     #[cfg(windows)]
     async fn browser_resize_impl(
         &self,
@@ -897,6 +1043,56 @@ impl SynapseService {
         Ok(browser_locale_response(session_id, window_hwnd, result))
     }
 
+    #[cfg(windows)]
+    async fn browser_media_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        params: &NormalizedBrowserMediaParams,
+    ) -> Result<BrowserMediaResponse, ErrorData> {
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(MEDIA_TOOL, window_hwnd));
+        };
+        let result = match params.operation {
+            BrowserMediaOperation::Set => {
+                let requested = params.requested.as_ref().expect("validated media override");
+                synapse_a11y::cdp_set_media_override(
+                    &endpoint,
+                    cdp_target_id,
+                    synapse_a11y::CdpMediaOverride {
+                        media: requested.media.clone(),
+                        color_scheme: requested.color_scheme.clone(),
+                        reduced_motion: requested.reduced_motion.clone(),
+                    },
+                )
+                .await
+            }
+            BrowserMediaOperation::Reset => {
+                synapse_a11y::cdp_reset_media_override(&endpoint, cdp_target_id).await
+            }
+        }
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("{MEDIA_TOOL} raw CDP media emulation failed: {error}"),
+            )
+        })?;
+        tracing::info!(
+            code = "CDP_BACKGROUND_MEDIA_EMULATION",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id,
+            operation = ?params.operation,
+            media_print = result.readback.media_print,
+            color_scheme_dark = result.readback.color_scheme_dark,
+            reduced_motion_reduce = result.readback.reduced_motion_reduce,
+            "readback=Emulation.setEmulatedMedia+Runtime.evaluate outcome=media_state"
+        );
+        Ok(browser_media_response(session_id, window_hwnd, result))
+    }
+
     #[cfg(not(windows))]
     async fn browser_resize_impl(
         &self,
@@ -950,6 +1146,20 @@ impl SynapseService {
         Err(mcp_error(
             error_codes::A11Y_NOT_AVAILABLE,
             "browser_locale is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_media_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _params: &NormalizedBrowserMediaParams,
+    ) -> Result<BrowserMediaResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_media is only available on Windows in this build",
         ))
     }
 }
@@ -1201,6 +1411,50 @@ fn validate_browser_locale_params(
     })
 }
 
+fn validate_browser_media_params(
+    params: &BrowserMediaParams,
+) -> Result<NormalizedBrowserMediaParams, ErrorData> {
+    if let Some(target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(target_id)?;
+    }
+    if params.operation == BrowserMediaOperation::Reset {
+        reject_media_field(params.media.as_ref(), "media", "reset")?;
+        reject_media_field(params.color_scheme.as_ref(), "color_scheme", "reset")?;
+        reject_media_field(params.reduced_motion.as_ref(), "reduced_motion", "reset")?;
+        return Ok(NormalizedBrowserMediaParams {
+            operation: BrowserMediaOperation::Reset,
+            requested: None,
+        });
+    }
+
+    if params.media.is_none() && params.color_scheme.is_none() && params.reduced_motion.is_none() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{MEDIA_TOOL} operation=set requires media, color_scheme and/or reduced_motion"
+            ),
+        ));
+    }
+    if let Some(media) = params.media.as_deref() {
+        validate_media_type_value(media)?;
+    }
+    if let Some(color_scheme) = params.color_scheme.as_deref() {
+        validate_color_scheme_value(color_scheme)?;
+    }
+    if let Some(reduced_motion) = params.reduced_motion.as_deref() {
+        validate_reduced_motion_value(reduced_motion)?;
+    }
+
+    Ok(NormalizedBrowserMediaParams {
+        operation: BrowserMediaOperation::Set,
+        requested: Some(BrowserMediaOverride {
+            media: params.media.clone(),
+            color_scheme: params.color_scheme.clone(),
+            reduced_motion: params.reduced_motion.clone(),
+        }),
+    })
+}
+
 fn validate_dimension(field: &str, value: u32) -> Result<(), ErrorData> {
     if value == 0 || value > synapse_a11y::CDP_DEVICE_METRICS_MAX_DIMENSION {
         return Err(mcp_error(
@@ -1324,6 +1578,39 @@ fn validate_timezone_value(value: &str) -> Result<(), ErrorData> {
     Ok(())
 }
 
+fn validate_media_type_value(value: &str) -> Result<(), ErrorData> {
+    if matches!(value, "screen" | "print") {
+        Ok(())
+    } else {
+        Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{MEDIA_TOOL} media must be 'screen' or 'print'"),
+        ))
+    }
+}
+
+fn validate_color_scheme_value(value: &str) -> Result<(), ErrorData> {
+    if matches!(value, "light" | "dark" | "no-preference") {
+        Ok(())
+    } else {
+        Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{MEDIA_TOOL} color_scheme must be 'light', 'dark' or 'no-preference'"),
+        ))
+    }
+}
+
+fn validate_reduced_motion_value(value: &str) -> Result<(), ErrorData> {
+    if matches!(value, "reduce" | "no-preference") {
+        Ok(())
+    } else {
+        Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{MEDIA_TOOL} reduced_motion must be 'reduce' or 'no-preference'"),
+        ))
+    }
+}
+
 fn validate_device_user_agent(value: Option<&str>) -> Result<String, ErrorData> {
     let Some(value) = value else {
         return Err(mcp_error(
@@ -1399,6 +1686,17 @@ fn reject_locale_field<T>(value: Option<T>, field: &str, operation: &str) -> Res
         Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!("{LOCALE_TOOL} {field} is not valid for operation={operation}"),
+        ))
+    }
+}
+
+fn reject_media_field<T>(value: Option<T>, field: &str, operation: &str) -> Result<(), ErrorData> {
+    if value.is_none() {
+        Ok(())
+    } else {
+        Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{MEDIA_TOOL} {field} is not valid for operation={operation}"),
         ))
     }
 }
@@ -1600,6 +1898,45 @@ fn browser_locale_response(
         required_foreground: false,
         source_of_truth: "raw CDP Runtime.evaluate Intl.DateTimeFormat/NumberFormat and Date"
             .to_owned(),
+    }
+}
+
+fn browser_media_response(
+    session_id: &str,
+    window_hwnd: i64,
+    result: synapse_a11y::CdpMediaResult,
+) -> BrowserMediaResponse {
+    BrowserMediaResponse {
+        session_id: session_id.to_owned(),
+        window_hwnd,
+        transport: "raw_cdp".to_owned(),
+        endpoint: result.endpoint,
+        cdp_target_id: result.cdp_target_id,
+        operation: match result.operation.as_str() {
+            "reset" => BrowserMediaOperation::Reset,
+            _ => BrowserMediaOperation::Set,
+        },
+        requested: result.requested.map(|requested| BrowserMediaOverride {
+            media: requested.media,
+            color_scheme: requested.color_scheme,
+            reduced_motion: requested.reduced_motion,
+        }),
+        page_url: result.page_url,
+        page_title: result.page_title,
+        ready_state: result.ready_state,
+        media: BrowserMediaReadback {
+            media_screen: result.readback.media_screen,
+            media_print: result.readback.media_print,
+            color_scheme_dark: result.readback.color_scheme_dark,
+            color_scheme_light: result.readback.color_scheme_light,
+            color_scheme_no_preference: result.readback.color_scheme_no_preference,
+            reduced_motion_reduce: result.readback.reduced_motion_reduce,
+            reduced_motion_no_preference: result.readback.reduced_motion_no_preference,
+        },
+        readback_backend: "Emulation.setEmulatedMedia + Runtime.evaluate".to_owned(),
+        backend_tier_used: "cdp".to_owned(),
+        required_foreground: false,
+        source_of_truth: "raw CDP Runtime.evaluate matchMedia media queries".to_owned(),
     }
 }
 
@@ -2022,6 +2359,108 @@ mod tests {
                 .as_ref()
                 .and_then(|requested| requested.timezone_id.as_deref()),
             Some("Europe/Paris")
+        );
+        assert!(!response.required_foreground);
+    }
+
+    #[test]
+    fn browser_media_validation_edges() {
+        let full = validate_browser_media_params(&BrowserMediaParams {
+            media: Some("print".to_owned()),
+            color_scheme: Some("dark".to_owned()),
+            reduced_motion: Some("reduce".to_owned()),
+            ..BrowserMediaParams::default()
+        })
+        .expect("valid media override");
+        let requested = full.requested.expect("requested override");
+        assert_eq!(requested.media.as_deref(), Some("print"));
+        assert_eq!(requested.color_scheme.as_deref(), Some("dark"));
+        assert_eq!(requested.reduced_motion.as_deref(), Some("reduce"));
+
+        assert!(
+            validate_browser_media_params(&BrowserMediaParams {
+                ..BrowserMediaParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_browser_media_params(&BrowserMediaParams {
+                media: Some("tv".to_owned()),
+                ..BrowserMediaParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_browser_media_params(&BrowserMediaParams {
+                color_scheme: Some("sepia".to_owned()),
+                ..BrowserMediaParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_browser_media_params(&BrowserMediaParams {
+                reduced_motion: Some("always".to_owned()),
+                ..BrowserMediaParams::default()
+            })
+            .is_err()
+        );
+        assert!(
+            validate_browser_media_params(&BrowserMediaParams {
+                operation: BrowserMediaOperation::Reset,
+                media: Some("print".to_owned()),
+                ..BrowserMediaParams::default()
+            })
+            .is_err()
+        );
+
+        let reset = validate_browser_media_params(&BrowserMediaParams {
+            operation: BrowserMediaOperation::Reset,
+            ..BrowserMediaParams::default()
+        })
+        .expect("valid reset");
+        assert_eq!(reset.operation, BrowserMediaOperation::Reset);
+        assert!(reset.requested.is_none());
+    }
+
+    #[test]
+    fn browser_media_response_maps_readback() {
+        let response = browser_media_response(
+            "session-1",
+            0x2200,
+            synapse_a11y::CdpMediaResult {
+                endpoint: "ws://127.0.0.1/devtools/browser/1".to_owned(),
+                cdp_target_id: "target-1".to_owned(),
+                operation: "set".to_owned(),
+                requested: Some(synapse_a11y::CdpMediaOverride {
+                    media: Some("print".to_owned()),
+                    color_scheme: Some("dark".to_owned()),
+                    reduced_motion: Some("reduce".to_owned()),
+                }),
+                page_url: "https://example.test/".to_owned(),
+                page_title: "Example".to_owned(),
+                ready_state: "complete".to_owned(),
+                readback: synapse_a11y::CdpMediaReadback {
+                    media_screen: false,
+                    media_print: true,
+                    color_scheme_dark: true,
+                    color_scheme_light: false,
+                    color_scheme_no_preference: false,
+                    reduced_motion_reduce: true,
+                    reduced_motion_no_preference: false,
+                },
+            },
+        );
+
+        assert_eq!(response.operation, BrowserMediaOperation::Set);
+        assert!(response.media.media_print);
+        assert!(response.media.color_scheme_dark);
+        assert!(response.media.reduced_motion_reduce);
+        assert_eq!(
+            response
+                .requested
+                .as_ref()
+                .and_then(|requested| requested.media.as_deref()),
+            Some("print")
         );
         assert!(!response.required_foreground);
     }

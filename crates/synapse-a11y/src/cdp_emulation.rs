@@ -1,4 +1,4 @@
-//! Target-scoped raw-CDP browser emulation helpers (#1173/#1174/#1175/#1176).
+//! Target-scoped raw-CDP browser emulation helpers (#1173/#1174/#1175/#1176/#1177).
 
 use std::{
     collections::HashMap,
@@ -166,6 +166,36 @@ pub struct CdpLocaleTimezoneResult {
     pub readback: CdpLocaleTimezoneReadback,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CdpMediaOverride {
+    pub media: Option<String>,
+    pub color_scheme: Option<String>,
+    pub reduced_motion: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CdpMediaReadback {
+    pub media_screen: bool,
+    pub media_print: bool,
+    pub color_scheme_dark: bool,
+    pub color_scheme_light: bool,
+    pub color_scheme_no_preference: bool,
+    pub reduced_motion_reduce: bool,
+    pub reduced_motion_no_preference: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CdpMediaResult {
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub operation: String,
+    pub requested: Option<CdpMediaOverride>,
+    pub page_url: String,
+    pub page_title: String,
+    pub ready_state: String,
+    pub readback: CdpMediaReadback,
+}
+
 enum DeviceMetricsCommand {
     Set(CdpViewportOverride),
     Reset,
@@ -189,6 +219,11 @@ enum GeolocationCommand {
 
 enum LocaleTimezoneCommand {
     Set(CdpLocaleTimezoneOverride),
+    Reset,
+}
+
+enum MediaCommand {
+    Set(CdpMediaOverride),
     Reset,
 }
 
@@ -459,6 +494,47 @@ pub async fn cdp_reset_locale_timezone_override(
     })
 }
 
+/// Applies media type and/or media feature overrides to one CDP page target and
+/// reads back page-visible matchMedia state from the same target.
+pub async fn cdp_set_media_override(
+    endpoint: &str,
+    target_id: &str,
+    requested: CdpMediaOverride,
+) -> A11yResult<CdpMediaResult> {
+    validate_media_override(&requested)?;
+    run_media_command(endpoint, target_id, MediaCommand::Set(requested.clone())).await?;
+    let readback = media_readback(endpoint, target_id).await?;
+    Ok(CdpMediaResult {
+        endpoint: endpoint.to_owned(),
+        cdp_target_id: readback.target_id,
+        operation: "set".to_owned(),
+        requested: Some(requested),
+        page_url: readback.url,
+        page_title: readback.title,
+        ready_state: readback.ready_state,
+        readback: readback.metrics,
+    })
+}
+
+/// Clears media type and media feature overrides for one CDP page target.
+pub async fn cdp_reset_media_override(
+    endpoint: &str,
+    target_id: &str,
+) -> A11yResult<CdpMediaResult> {
+    run_media_command(endpoint, target_id, MediaCommand::Reset).await?;
+    let readback = media_readback(endpoint, target_id).await?;
+    Ok(CdpMediaResult {
+        endpoint: endpoint.to_owned(),
+        cdp_target_id: readback.target_id,
+        operation: "reset".to_owned(),
+        requested: None,
+        page_url: readback.url,
+        page_title: readback.title,
+        ready_state: readback.ready_state,
+        readback: readback.metrics,
+    })
+}
+
 fn validate_viewport_override(width: u32, height: u32, device_scale_factor: f64) -> A11yResult<()> {
     if width == 0 || width > CDP_DEVICE_METRICS_MAX_DIMENSION {
         return Err(A11yError::CdpAxtreeFailed {
@@ -659,6 +735,59 @@ fn validate_timezone_override(value: &str) -> A11yResult<()> {
         });
     }
     Ok(())
+}
+
+fn validate_media_override(requested: &CdpMediaOverride) -> A11yResult<()> {
+    if requested.media.is_none()
+        && requested.color_scheme.is_none()
+        && requested.reduced_motion.is_none()
+    {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: "media override requires media, color_scheme and/or reduced_motion".to_owned(),
+        });
+    }
+    if let Some(media) = requested.media.as_deref() {
+        validate_media_type(media)?;
+    }
+    if let Some(color_scheme) = requested.color_scheme.as_deref() {
+        validate_color_scheme(color_scheme)?;
+    }
+    if let Some(reduced_motion) = requested.reduced_motion.as_deref() {
+        validate_reduced_motion(reduced_motion)?;
+    }
+    Ok(())
+}
+
+fn validate_media_type(value: &str) -> A11yResult<()> {
+    if matches!(value, "screen" | "print") {
+        Ok(())
+    } else {
+        Err(A11yError::CdpAxtreeFailed {
+            detail: format!("media must be 'screen' or 'print', got {value:?}"),
+        })
+    }
+}
+
+fn validate_color_scheme(value: &str) -> A11yResult<()> {
+    if matches!(value, "light" | "dark" | "no-preference") {
+        Ok(())
+    } else {
+        Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "color_scheme must be 'light', 'dark' or 'no-preference', got {value:?}"
+            ),
+        })
+    }
+}
+
+fn validate_reduced_motion(value: &str) -> A11yResult<()> {
+    if matches!(value, "reduce" | "no-preference") {
+        Ok(())
+    } else {
+        Err(A11yError::CdpAxtreeFailed {
+            detail: format!("reduced_motion must be 'reduce' or 'no-preference', got {value:?}"),
+        })
+    }
 }
 
 async fn run_device_metrics_command(
@@ -1022,6 +1151,57 @@ async fn run_locale_timezone_command(
     result
 }
 
+async fn run_media_command(
+    endpoint: &str,
+    target_id: &str,
+    command: MediaCommand,
+) -> A11yResult<()> {
+    use chromiumoxide::Browser;
+    use chromiumoxide::cdp::browser_protocol::emulation::{MediaFeature, SetEmulatedMediaParams};
+    use futures_util::StreamExt as _;
+
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|err| A11yError::CdpAttachFailed {
+                detail: format!("connect {endpoint}: {err}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let result = async {
+        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let params = match command {
+            MediaCommand::Set(requested) => {
+                let mut features = Vec::new();
+                if let Some(color_scheme) = requested.color_scheme {
+                    features.push(MediaFeature::new("prefers-color-scheme", color_scheme));
+                }
+                if let Some(reduced_motion) = requested.reduced_motion {
+                    features.push(MediaFeature::new("prefers-reduced-motion", reduced_motion));
+                }
+                SetEmulatedMediaParams::builder()
+                    .media(requested.media.unwrap_or_default())
+                    .features(features)
+                    .build()
+            }
+            MediaCommand::Reset => SetEmulatedMediaParams::builder()
+                .media("")
+                .features(Vec::<MediaFeature>::new())
+                .build(),
+        };
+        page.execute(params)
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Emulation.setEmulatedMedia: {err}"),
+            })?;
+        Ok(())
+    }
+    .await;
+
+    handler_task.abort();
+    result
+}
+
 struct ViewportReadback {
     target_id: String,
     url: String,
@@ -1052,6 +1232,14 @@ struct LocaleTimezoneReadback {
     title: String,
     ready_state: String,
     metrics: CdpLocaleTimezoneReadback,
+}
+
+struct MediaReadback {
+    target_id: String,
+    url: String,
+    title: String,
+    ready_state: String,
+    metrics: CdpMediaReadback,
 }
 
 async fn viewport_readback(endpoint: &str, target_id: &str) -> A11yResult<ViewportReadback> {
@@ -1170,6 +1358,29 @@ async fn locale_timezone_readback(
             }
         })?;
     Ok(LocaleTimezoneReadback {
+        target_id: evaluated.target_id,
+        url: evaluated.url,
+        title: evaluated.title,
+        ready_state: evaluated.ready_state,
+        metrics,
+    })
+}
+
+async fn media_readback(endpoint: &str, target_id: &str) -> A11yResult<MediaReadback> {
+    let evaluated = crate::cdp_action::cdp_evaluate_expression(
+        endpoint,
+        target_id,
+        MEDIA_READBACK_JS,
+        false,
+        true,
+    )
+    .await?;
+    let metrics = serde_json::from_value::<CdpMediaReadback>(evaluated.value).map_err(|error| {
+        A11yError::CdpAxtreeFailed {
+            detail: format!("media readback decode: {error}"),
+        }
+    })?;
+    Ok(MediaReadback {
         target_id: evaluated.target_id,
         url: evaluated.url,
         title: evaluated.title,
@@ -1318,6 +1529,22 @@ const LOCALE_TIMEZONE_READBACK_JS: &str = r#"(() => {
   };
 })()"#;
 
+const MEDIA_READBACK_JS: &str = r#"(() => {
+  const media = query => {
+    try { return Boolean(globalThis.matchMedia && globalThis.matchMedia(query).matches); }
+    catch (_error) { return false; }
+  };
+  return {
+    media_screen: media("screen"),
+    media_print: media("print"),
+    color_scheme_dark: media("(prefers-color-scheme: dark)"),
+    color_scheme_light: media("(prefers-color-scheme: light)"),
+    color_scheme_no_preference: media("(prefers-color-scheme: no-preference)"),
+    reduced_motion_reduce: media("(prefers-reduced-motion: reduce)"),
+    reduced_motion_no_preference: media("(prefers-reduced-motion: no-preference)")
+  };
+})()"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1443,5 +1670,50 @@ mod tests {
             timezone_id: Some("Europe Paris".to_owned()),
         };
         assert!(validate_locale_timezone_override(&bad_timezone).is_err());
+    }
+
+    #[test]
+    fn media_override_validation_edges() {
+        let valid = CdpMediaOverride {
+            media: Some("print".to_owned()),
+            color_scheme: Some("dark".to_owned()),
+            reduced_motion: Some("reduce".to_owned()),
+        };
+        assert!(validate_media_override(&valid).is_ok());
+
+        let color_only = CdpMediaOverride {
+            media: None,
+            color_scheme: Some("light".to_owned()),
+            reduced_motion: None,
+        };
+        assert!(validate_media_override(&color_only).is_ok());
+
+        let empty = CdpMediaOverride {
+            media: None,
+            color_scheme: None,
+            reduced_motion: None,
+        };
+        assert!(validate_media_override(&empty).is_err());
+
+        let bad_media = CdpMediaOverride {
+            media: Some("tv".to_owned()),
+            color_scheme: Some("dark".to_owned()),
+            reduced_motion: None,
+        };
+        assert!(validate_media_override(&bad_media).is_err());
+
+        let bad_color = CdpMediaOverride {
+            media: Some("screen".to_owned()),
+            color_scheme: Some("sepia".to_owned()),
+            reduced_motion: None,
+        };
+        assert!(validate_media_override(&bad_color).is_err());
+
+        let bad_motion = CdpMediaOverride {
+            media: Some("screen".to_owned()),
+            color_scheme: None,
+            reduced_motion: Some("always".to_owned()),
+        };
+        assert!(validate_media_override(&bad_motion).is_err());
     }
 }
