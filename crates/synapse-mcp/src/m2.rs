@@ -72,12 +72,14 @@ pub use scroll::{ActScrollParams, ActScrollResponse, act_scroll_with_handle};
 #[cfg(windows)]
 pub(crate) use set_field_text::act_set_field_text_web;
 pub use set_field_text::{
-    ActSetFieldTextParams, ActSetFieldTextResponse, act_set_field_text_request_details,
+    ActSetFieldTextLocator, ActSetFieldTextParams, ActSetFieldTextResponse,
+    act_set_field_text_request_details,
 };
 pub(crate) use set_field_text::{
     METHOD_FOREGROUND_CLEAR, METHOD_FOREGROUND_REPLACE, SOURCE_UIA_PASSWORD_LENGTH,
     SOURCE_UIA_VALUE, SetFieldTextRoute, TIER_FOREGROUND_KEYS, act_set_field_text_native,
-    finish_replace_response, set_field_text_route, validate_set_field_text_params,
+    finish_replace_response, params_with_resolved_element, required_element_id,
+    set_field_text_route, validate_set_field_text_params,
 };
 pub use set_value::{
     ActSetValueParams, ActSetValueResponse, act_set_value, act_set_value_request_details,

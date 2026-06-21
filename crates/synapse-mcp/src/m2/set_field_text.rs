@@ -45,12 +45,36 @@ pub(crate) const SOURCE_UIA_PASSWORD_LENGTH: &str = "uia_value_pattern.password_
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActSetFieldTextParams {
-    pub element_id: ElementId,
+    #[serde(default)]
+    pub element_id: Option<ElementId>,
+    /// Durable action-time locator used to resolve a fresh UIA element in the
+    /// target window immediately before filling. Use this for SPA/Electron
+    /// controls whose UIA runtime ids can go stale between observe and act.
+    #[serde(default)]
+    pub locator: Option<ActSetFieldTextLocator>,
     /// Full replacement text. Empty clears the field.
     pub text: String,
     #[serde(default = "default_verify_timeout_ms")]
     #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
     pub verify_timeout_ms: u32,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActSetFieldTextLocator {
+    /// Explicit top-level target window. If omitted, Synapse uses the active
+    /// session window/CDP target, or the legacy element_id's HWND as a hint.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Exact accessible name match, case-insensitive.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub name_substring: Option<String>,
+    #[serde(default)]
+    pub automation_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -91,6 +115,15 @@ pub(crate) enum SetFieldTextRoute {
 pub(crate) fn validate_set_field_text_params(
     params: &ActSetFieldTextParams,
 ) -> Result<(), ErrorData> {
+    if params.element_id.is_none() && params.locator.is_none() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{TOOL} requires element_id or locator"),
+        ));
+    }
+    if let Some(locator) = &params.locator {
+        validate_set_field_text_locator(locator)?;
+    }
     if !(50..=5000).contains(&params.verify_timeout_ms) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -104,6 +137,42 @@ pub(crate) fn validate_set_field_text_params(
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!("{TOOL} text has more than u32::MAX chars"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_set_field_text_locator(
+    locator: &ActSetFieldTextLocator,
+) -> Result<(), ErrorData> {
+    if locator
+        .role
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        && locator
+            .name
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && locator
+            .name_substring
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && locator
+            .automation_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "{TOOL} locator requires at least one of role, name, name_substring, or automation_id"
+            ),
+        ));
+    }
+    if locator.name.is_some() && locator.name_substring.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{TOOL} locator accepts name or name_substring, not both"),
         ));
     }
     Ok(())
@@ -186,7 +255,7 @@ pub(crate) async fn act_set_field_text_web(
     backend_node_id: i64,
 ) -> Result<ActSetFieldTextResponse, ErrorData> {
     let started = std::time::Instant::now();
-    let element_id = &params.element_id;
+    let element_id = required_element_id(params)?;
     let hwnd = element_id
         .parts()
         .map_err(|err| {
@@ -286,7 +355,7 @@ pub(crate) async fn act_set_field_text_native(
 ) -> Result<ActSetFieldTextResponse, ErrorData> {
     let started = std::time::Instant::now();
     let response = act_set_value(ActSetValueParams {
-        element_id: params.element_id.clone(),
+        element_id: required_element_id(params)?.clone(),
         text: params.text.clone(),
         verify_timeout_ms: params.verify_timeout_ms,
     })
@@ -332,6 +401,7 @@ pub(crate) fn finish_replace_response(
     after: &str,
     evidence: Value,
 ) -> Result<ActSetFieldTextResponse, ErrorData> {
+    let element_id = required_element_id(params)?;
     let requested_len = u32::try_from(params.text.chars().count()).unwrap_or(u32::MAX);
     let before_len = u32::try_from(before.chars().count()).unwrap_or(u32::MAX);
     let after_len = u32::try_from(after.chars().count()).unwrap_or(u32::MAX);
@@ -344,7 +414,7 @@ pub(crate) fn finish_replace_response(
         tracing::error!(
             code = error_codes::ACTION_POSTCONDITION_FAILED,
             tool = TOOL,
-            element_id = %params.element_id,
+            element_id = %element_id,
             method,
             backend_tier_used,
             source_of_truth,
@@ -382,7 +452,7 @@ pub(crate) fn finish_replace_response(
 
     tracing::info!(
         code = "M2_ACT_SET_FIELD_TEXT_READBACK",
-        element_id = %params.element_id,
+        element_id = %element_id,
         method,
         backend_tier_used,
         source_of_truth,
@@ -473,7 +543,8 @@ fn cdp_tier_error(
 
 pub fn act_set_field_text_request_details(params: &ActSetFieldTextParams) -> Value {
     json!({
-        "element_id": params.element_id.to_string(),
+        "element_id": params.element_id.as_ref().map(ToString::to_string),
+        "locator": params.locator.as_ref().map(locator_request_details),
         "requested_len": params.text.chars().count(),
         "requested_sha256": text_signature(&params.text),
         "verify_timeout_ms": params.verify_timeout_ms,
@@ -486,13 +557,49 @@ pub fn act_set_field_text_request_details(params: &ActSetFieldTextParams) -> Val
     })
 }
 
+pub(crate) fn required_element_id(params: &ActSetFieldTextParams) -> Result<&ElementId, ErrorData> {
+    params.element_id.as_ref().ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("{TOOL} internal error: target element_id was not resolved before routing"),
+        )
+    })
+}
+
+pub(crate) fn params_with_resolved_element(
+    params: &ActSetFieldTextParams,
+    element_id: ElementId,
+) -> ActSetFieldTextParams {
+    let mut params = params.clone();
+    params.element_id = Some(element_id);
+    params
+}
+
+fn locator_request_details(locator: &ActSetFieldTextLocator) -> Value {
+    json!({
+        "window_hwnd": locator.window_hwnd,
+        "role": locator.role.as_deref(),
+        "name_sha256": locator.name.as_ref().map(|name| text_signature(name)),
+        "name_len": locator.name.as_ref().map(|name| name.chars().count()),
+        "name_substring_sha256": locator
+            .name_substring
+            .as_ref()
+            .map(|name| text_signature(name)),
+        "name_substring_len": locator
+            .name_substring
+            .as_ref()
+            .map(|name| name.chars().count()),
+        "automation_id_present": locator.automation_id.is_some(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use synapse_core::{Rect, UiaPattern};
 
     use super::{
-        ActSetFieldTextParams, chromium_editable_requires_foreground, normalize_field_text,
-        replaced_text_matches, validate_set_field_text_params,
+        ActSetFieldTextLocator, ActSetFieldTextParams, chromium_editable_requires_foreground,
+        normalize_field_text, replaced_text_matches, validate_set_field_text_params,
     };
 
     fn metadata(
@@ -601,5 +708,39 @@ mod tests {
             params.verify_timeout_ms
         );
         assert!(validate_set_field_text_params(&params).is_ok());
+    }
+
+    #[test]
+    fn locator_only_request_is_valid_when_identity_is_specific() {
+        let params: ActSetFieldTextParams = serde_json::from_value(serde_json::json!({
+            "locator": {
+                "window_hwnd": 0x2a,
+                "role": "document",
+                "name": "Message Body"
+            },
+            "text": "value"
+        }))
+        .expect("locator-only params should deserialize");
+        assert!(params.element_id.is_none());
+        assert!(validate_set_field_text_params(&params).is_ok());
+    }
+
+    #[test]
+    fn locator_rejects_empty_identity() {
+        let params = ActSetFieldTextParams {
+            element_id: None,
+            locator: Some(ActSetFieldTextLocator {
+                window_hwnd: Some(0x2a),
+                role: None,
+                name: None,
+                name_substring: None,
+                automation_id: None,
+            }),
+            text: "value".to_owned(),
+            verify_timeout_ms: crate::m2::default_verify_timeout_ms(),
+        };
+        let error =
+            validate_set_field_text_params(&params).expect_err("empty locator must fail closed");
+        assert!(error.message.contains("locator requires"));
     }
 }

@@ -12,7 +12,7 @@ use super::{
     action_preflight::{ActionPreflightReadback, ForegroundProof},
     release_all_with_handles, tool, tool_router, validate_act_stroke_params,
 };
-use crate::m1::mcp_error;
+use crate::m1::{FindParams, FindResult, FindResultKind, FindScope, mcp_error};
 use crate::m2::postcondition::{
     ActPostcondition, hash_json as verify_hash_json,
     no_observed_delta_error as source_no_observed_delta_error, postcondition_failed_error,
@@ -570,7 +570,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Set a field's text by REPLACING its full content — clear + type + verify in one call (the form-filling primitive; #882). Routing is decided up front from the target: CDP web element ids use a background select-all + insertText replace with a separate node-value readback; Chromium UIA editable targets (when CDP is unavailable) use the leased foreground tier — the target window must already be foreground (act_focus_window first), then click, Ctrl+A, type, and a separate UIA value readback; native elements route through the act_set_value background tiers. Empty text clears the field. Every tier fails closed with its own reason code — there is no cross-tier fallback and no append behavior."
+        description = "Set a field's text by REPLACING its full content — clear + type + verify in one call (the form-filling primitive; #882/#1299). Call with element_id, or with locator {window_hwnd?, role?, name?, name_substring?, automation_id?} so Synapse resolves a fresh UIA element at action time; when a locator-backed action hits A11Y_ELEMENT_STALE, Synapse re-resolves and retries once. CDP web element ids use a background select-all + insertText replace with a separate node-value readback; Chromium UIA editable targets (when CDP is unavailable) use the leased foreground tier — the target window must already be foreground (act_focus_window first), then click, Ctrl+A, type, and a separate UIA value readback; native elements route through the act_set_value background tiers. Empty text clears the field. Every tier fails closed with its own reason code — there is no cross-tier fallback and no append behavior."
     )]
     pub async fn act_set_field_text(
         &self,
@@ -609,15 +609,21 @@ impl SynapseService {
             self.audit_action_result_for_request("act_set_field_text", &result, &request_context)?;
             return result.map(Json);
         }
-        if let Err(error) = self.ensure_target_claim_allows_action(
-            "act_set_field_text",
-            element_claim_target(&params.element_id),
-            &request_context,
-        ) {
-            return audit_target_claim_denial(self, "act_set_field_text", error, &request_context);
-        }
-        let route = match crate::m2::set_field_text_route(&params.element_id) {
-            Ok(route) => route,
+        let params =
+            match self.act_set_field_text_resolve_params(&params, &request_context, "initial") {
+                Ok(params) => params,
+                Err(error) => {
+                    let result: Result<crate::m2::ActSetFieldTextResponse, ErrorData> = Err(error);
+                    self.audit_action_result_for_request(
+                        "act_set_field_text",
+                        &result,
+                        &request_context,
+                    )?;
+                    return result.map(Json);
+                }
+            };
+        let element_id = match crate::m2::required_element_id(&params) {
+            Ok(element_id) => element_id.clone(),
             Err(error) => {
                 let result: Result<crate::m2::ActSetFieldTextResponse, ErrorData> = Err(error);
                 self.audit_action_result_for_request(
@@ -628,10 +634,74 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
-        let result = match route {
+        if let Err(error) = self.ensure_target_claim_allows_action(
+            "act_set_field_text",
+            element_claim_target(&element_id),
+            &request_context,
+        ) {
+            return audit_target_claim_denial(self, "act_set_field_text", error, &request_context);
+        }
+        let result = self
+            .act_set_field_text_execute_resolved(&params, &preflight, &request_context, "initial")
+            .await;
+        let result = if set_field_text_error_is_stale(&result) && params.locator.is_some() {
+            tracing::warn!(
+                code = "M2_ACT_SET_FIELD_TEXT_STALE_RETRY",
+                element_id = %element_id,
+                "act_set_field_text target went stale; re-resolving locator and retrying once"
+            );
+            match self.act_set_field_text_resolve_params(&params, &request_context, "stale_retry") {
+                Ok(retry_params) => {
+                    let retry_element_id = crate::m2::required_element_id(&retry_params)?.clone();
+                    if let Err(error) = self.ensure_target_claim_allows_action(
+                        "act_set_field_text",
+                        element_claim_target(&retry_element_id),
+                        &request_context,
+                    ) {
+                        Err(error)
+                    } else {
+                        self.act_set_field_text_execute_resolved(
+                            &retry_params,
+                            &preflight,
+                            &request_context,
+                            "stale_retry",
+                        )
+                        .await
+                    }
+                }
+                Err(error) => Err(error),
+            }
+        } else {
+            result
+        };
+        self.audit_action_result_for_request("act_set_field_text", &result, &request_context)?;
+        result.map(Json)
+    }
+
+    async fn act_set_field_text_execute_resolved(
+        &self,
+        params: &crate::m2::ActSetFieldTextParams,
+        preflight: &ActionPreflightReadback,
+        request_context: &RequestContext<RoleServer>,
+        resolution_phase: &'static str,
+    ) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData> {
+        let element_id = crate::m2::required_element_id(params)?;
+        let route = match crate::m2::set_field_text_route(element_id) {
+            Ok(route) => route,
+            Err(error) => {
+                return Err(error);
+            }
+        };
+        tracing::debug!(
+            code = "M2_ACT_SET_FIELD_TEXT_ROUTE_RESOLVED",
+            element_id = %element_id,
+            resolution_phase,
+            "readback=act_set_field_text route resolved"
+        );
+        match route {
             #[cfg(windows)]
             crate::m2::SetFieldTextRoute::Web { backend_node_id } => {
-                self.act_set_field_text_background_guarded(&params, |params| {
+                self.act_set_field_text_background_guarded(params, |params| {
                     Box::pin(crate::m2::act_set_field_text_web(params, backend_node_id))
                 })
                 .await
@@ -647,24 +717,105 @@ impl SynapseService {
                 metadata,
             } => {
                 self.act_set_field_text_foreground_tier(
-                    &params,
+                    params,
                     root_hwnd,
                     &process_name,
                     metadata,
-                    &preflight,
-                    &request_context,
+                    preflight,
+                    request_context,
                 )
                 .await
             }
             crate::m2::SetFieldTextRoute::NativeBackground => {
-                self.act_set_field_text_background_guarded(&params, |params| {
+                self.act_set_field_text_background_guarded(params, |params| {
                     Box::pin(crate::m2::act_set_field_text_native(params))
                 })
                 .await
             }
+        }
+    }
+
+    fn act_set_field_text_resolve_params(
+        &self,
+        params: &crate::m2::ActSetFieldTextParams,
+        request_context: &RequestContext<RoleServer>,
+        resolution_phase: &'static str,
+    ) -> Result<crate::m2::ActSetFieldTextParams, ErrorData> {
+        let Some(locator) = params.locator.as_ref() else {
+            return if params.element_id.is_some() {
+                Ok(params.clone())
+            } else {
+                Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "act_set_field_text requires element_id or locator",
+                ))
+            };
         };
-        self.audit_action_result_for_request("act_set_field_text", &result, &request_context)?;
-        result.map(Json)
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
+        let target = if let Some(session_id) = session_id.as_deref() {
+            self.memory_session_target(session_id)?
+                .or(self.persisted_session_target_read_model(session_id)?)
+        } else {
+            None
+        };
+        let window_hwnd = set_field_text_locator_window_hwnd(params, locator, target.as_ref())?;
+        let element_id =
+            self.act_set_field_text_resolve_locator(locator, window_hwnd, resolution_phase)?;
+        Ok(crate::m2::params_with_resolved_element(params, element_id))
+    }
+
+    fn act_set_field_text_resolve_locator(
+        &self,
+        locator: &crate::m2::ActSetFieldTextLocator,
+        window_hwnd: i64,
+        resolution_phase: &'static str,
+    ) -> Result<ElementId, ErrorData> {
+        let find_params = set_field_text_locator_find_params(locator, window_hwnd);
+        let input = {
+            let mut state = self.m1_state()?;
+            crate::m1::build_find_input(&mut state, &find_params, Some(window_hwnd))?
+        };
+        let response = crate::m1::match_find_input(&input, &find_params);
+        let results = response
+            .results
+            .into_iter()
+            .filter(set_field_text_find_result_is_element)
+            .filter(|result| set_field_text_locator_exact_name_matches(locator, result))
+            .collect::<Vec<_>>();
+        match results.as_slice() {
+            [result] => {
+                let element_id = result.element_id.clone().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "act_set_field_text locator matched an element result without element_id",
+                    )
+                })?;
+                tracing::info!(
+                    code = "M2_ACT_SET_FIELD_TEXT_LOCATOR_RESOLVED",
+                    element_id = %element_id,
+                    window_hwnd,
+                    resolution_phase,
+                    role = result.role.as_deref().unwrap_or(""),
+                    automation_id_present = result.automation_id.is_some(),
+                    "readback=locator tool=act_set_field_text outcome=resolved"
+                );
+                Ok(element_id)
+            }
+            [] => Err(set_field_text_locator_resolution_error(
+                locator,
+                window_hwnd,
+                resolution_phase,
+                "not_found",
+                results.as_slice(),
+            )),
+            many => Err(set_field_text_locator_resolution_error(
+                locator,
+                window_hwnd,
+                resolution_phase,
+                "ambiguous",
+                many,
+            )),
+        }
     }
 
     #[tool(
@@ -2537,7 +2688,8 @@ impl SynapseService {
             >,
         >,
     {
-        let foreground_guard = act_set_value_target_foreground_guard(&params.element_id)?;
+        let element_id = crate::m2::required_element_id(params)?;
+        let foreground_guard = act_set_value_target_foreground_guard(element_id)?;
         let foreground_before = self
             .current_audit_foreground()
             .map_err(|error| act_set_value_foreground_read_error("before", "unknown", &error))?;
@@ -2578,8 +2730,9 @@ impl SynapseService {
         request_context: &RequestContext<RoleServer>,
     ) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData> {
         let started = Instant::now();
+        let element_id = crate::m2::required_element_id(params)?.clone();
         let target = ActTypeForegroundFallbackTarget {
-            element_id: params.element_id.to_string(),
+            element_id: element_id.to_string(),
             root_hwnd,
             process_name: process_name.to_owned(),
             role: metadata.role.clone(),
@@ -2614,14 +2767,14 @@ impl SynapseService {
             ));
         }
 
-        let before = synapse_a11y::element_value(&params.element_id).map_err(|error| {
+        let before = synapse_a11y::element_value(&element_id).map_err(|error| {
             set_field_text_foreground_error(
                 &target,
                 error.code(),
                 "before_value_read_failed",
                 format!(
                     "act_set_field_text before-value UIA readback failed for element {}: {error}",
-                    params.element_id
+                    element_id
                 ),
             )
         })?;
@@ -2636,18 +2789,18 @@ impl SynapseService {
         // click into another window.
         let mut target = target;
         if metadata.patterns.contains(&UiaPattern::ScrollItem) {
-            synapse_a11y::scroll_element_into_view(&params.element_id).map_err(|error| {
+            synapse_a11y::scroll_element_into_view(&element_id).map_err(|error| {
                 set_field_text_foreground_error(
                     &target,
                     error.code(),
                     "scroll_into_view_failed",
                     format!(
                         "act_set_field_text ScrollItemPattern scroll-into-view failed for element {}: {error}",
-                        params.element_id
+                        element_id
                     ),
                 )
             })?;
-            target.bbox = synapse_a11y::element_bounding_rect(&params.element_id).map_err(
+            target.bbox = synapse_a11y::element_bounding_rect(&element_id).map_err(
                 |error| {
                     set_field_text_foreground_error(
                         &target,
@@ -2655,14 +2808,14 @@ impl SynapseService {
                         "post_scroll_bbox_read_failed",
                         format!(
                             "act_set_field_text post-scroll bounding-rect readback failed for element {}: {error}",
-                            params.element_id
+                            element_id
                         ),
                     )
                 },
             )?;
             tracing::info!(
                 code = "M2_ACT_SET_FIELD_TEXT_SCROLLED_INTO_VIEW",
-                element_id = %params.element_id,
+                element_id = %element_id,
                 bbox_x = target.bbox.x,
                 bbox_y = target.bbox.y,
                 bbox_w = target.bbox.w,
@@ -2778,14 +2931,14 @@ impl SynapseService {
         })?;
 
         tokio::time::sleep(Duration::from_millis(u64::from(params.verify_timeout_ms))).await;
-        let after = synapse_a11y::element_value(&params.element_id).map_err(|error| {
+        let after = synapse_a11y::element_value(&element_id).map_err(|error| {
             set_field_text_foreground_error(
                 &target,
                 error.code(),
                 "after_value_read_failed",
                 format!(
                     "act_set_field_text after-value UIA readback failed for element {}: {error}",
-                    params.element_id
+                    element_id
                 ),
             )
         })?;
@@ -2803,7 +2956,7 @@ impl SynapseService {
             &before.value,
             &after.value,
             json!({
-                "element_id": params.element_id.to_string(),
+                "element_id": element_id.to_string(),
                 "root_hwnd": target.root_hwnd,
                 "process_name": target.process_name,
                 "role": target.role,
@@ -5265,6 +5418,7 @@ fn set_field_text_password_response(
     before: &synapse_a11y::ElementValueReadback,
     after: &synapse_a11y::ElementValueReadback,
 ) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData> {
+    let element_id = crate::m2::required_element_id(params)?;
     let expected_len = params.text.encode_utf16().count();
     let before_len = before.password_len.unwrap_or(0);
     let after_len = after.password_len.unwrap_or(0);
@@ -5274,7 +5428,7 @@ fn set_field_text_password_response(
         tracing::error!(
             code = error_codes::ACTION_POSTCONDITION_FAILED,
             tool = "act_set_field_text",
-            element_id = %params.element_id,
+            element_id = %element_id,
             method,
             before_len,
             after_len,
@@ -6058,6 +6212,178 @@ fn act_set_value_target_foreground_guard(
         element_hwnd: hwnd,
         root_hwnd,
     })
+}
+
+fn set_field_text_locator_window_hwnd(
+    params: &crate::m2::ActSetFieldTextParams,
+    locator: &crate::m2::ActSetFieldTextLocator,
+    target: Option<&SessionTarget>,
+) -> Result<i64, ErrorData> {
+    if let Some(window_hwnd) = locator.window_hwnd {
+        return Ok(window_hwnd);
+    }
+    if let Some(target) = target {
+        return Ok(match target {
+            SessionTarget::Window { hwnd } => *hwnd,
+            SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
+        });
+    }
+    if let Some(element_id) = params.element_id.as_ref() {
+        let hwnd = element_id
+            .parts()
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "act_set_field_text locator could not use element_id HWND hint from {element_id}: {error}"
+                    ),
+                )
+            })?
+            .hwnd;
+        return synapse_a11y::top_level_root_hwnd(hwnd).or(Ok(hwnd));
+    }
+    Err(mcp_error(
+        error_codes::TARGET_NOT_SET,
+        "act_set_field_text locator requires locator.window_hwnd, an active session target, or an element_id HWND hint; refusing to use the human foreground implicitly",
+    ))
+}
+
+fn set_field_text_locator_find_params(
+    locator: &crate::m2::ActSetFieldTextLocator,
+    window_hwnd: i64,
+) -> FindParams {
+    FindParams {
+        query: None,
+        role: trimmed_non_empty(locator.role.as_deref()),
+        name_substring: trimmed_non_empty(
+            locator
+                .name_substring
+                .as_deref()
+                .or(locator.name.as_deref()),
+        ),
+        automation_id: trimmed_non_empty(locator.automation_id.as_deref()),
+        scope: Some(FindScope::Elements),
+        limit: Some(20),
+        in_window: None,
+        window_hwnd: Some(window_hwnd),
+    }
+}
+
+fn set_field_text_find_result_is_element(result: &FindResult) -> bool {
+    result.kind == FindResultKind::Element && result.element_id.is_some()
+}
+
+fn set_field_text_locator_exact_name_matches(
+    locator: &crate::m2::ActSetFieldTextLocator,
+    result: &FindResult,
+) -> bool {
+    let Some(expected) = locator.name.as_deref().map(str::trim) else {
+        return true;
+    };
+    result
+        .name
+        .as_deref()
+        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+}
+
+fn set_field_text_locator_resolution_error(
+    locator: &crate::m2::ActSetFieldTextLocator,
+    window_hwnd: i64,
+    resolution_phase: &'static str,
+    reason: &'static str,
+    candidates: &[FindResult],
+) -> ErrorData {
+    let code = if reason == "ambiguous" {
+        error_codes::ACTION_TARGET_INVALID
+    } else {
+        error_codes::ACTION_ELEMENT_NOT_RESOLVED
+    };
+    let detail = if reason == "ambiguous" {
+        format!(
+            "act_set_field_text locator matched {} elements in window 0x{window_hwnd:x}; refine role/name/automation_id so exactly one element resolves",
+            candidates.len()
+        )
+    } else {
+        format!("act_set_field_text locator did not match any element in window 0x{window_hwnd:x}")
+    };
+    ErrorData::new(
+        ErrorCode(-32099),
+        detail,
+        Some(json!({
+            "code": code,
+            "tool": "act_set_field_text",
+            "reason": reason,
+            "resolution_phase": resolution_phase,
+            "window_hwnd": window_hwnd,
+            "locator": set_field_text_locator_error_details(locator),
+            "candidate_count": candidates.len(),
+            "candidates": candidates
+                .iter()
+                .take(5)
+                .map(set_field_text_locator_candidate_details)
+                .collect::<Vec<_>>(),
+        })),
+    )
+}
+
+fn set_field_text_locator_error_details(locator: &crate::m2::ActSetFieldTextLocator) -> Value {
+    json!({
+        "window_hwnd": locator.window_hwnd,
+        "role": locator.role.as_deref(),
+        "name_sha256": locator
+            .name
+            .as_deref()
+            .map(crate::m2::postcondition::text_signature),
+        "name_len": locator.name.as_ref().map(|name| name.chars().count()),
+        "name_substring_sha256": locator
+            .name_substring
+            .as_deref()
+            .map(crate::m2::postcondition::text_signature),
+        "name_substring_len": locator
+            .name_substring
+            .as_ref()
+            .map(|name| name.chars().count()),
+        "automation_id": locator.automation_id.as_deref(),
+    })
+}
+
+fn set_field_text_locator_candidate_details(result: &FindResult) -> Value {
+    json!({
+        "element_id": result.element_id.as_ref().map(ToString::to_string),
+        "role": result.role.as_deref(),
+        "name_sha256": result
+            .name
+            .as_deref()
+            .map(crate::m2::postcondition::text_signature),
+        "name_len": result.name.as_ref().map(|name| name.chars().count()),
+        "automation_id": result.automation_id.as_deref(),
+        "bbox": result.bbox,
+        "score": result.score,
+    })
+}
+
+fn set_field_text_error_is_stale(
+    result: &Result<crate::m2::ActSetFieldTextResponse, ErrorData>,
+) -> bool {
+    matches!(
+        result,
+        Err(error) if mcp_error_data_code(error) == Some(error_codes::A11Y_ELEMENT_STALE)
+    )
+}
+
+fn mcp_error_data_code(error: &ErrorData) -> Option<&str> {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+}
+
+fn trimmed_non_empty(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn act_click_target_foreground_guard(

@@ -19,8 +19,8 @@ use crate::m1::{
     CdpNavigateTabParams, CdpTargetInfoParams, ObserveParams, mcp_error,
 };
 use crate::m2::{
-    ActClickParams, ActFocusWindowParams, ActPressParams, ActSetFieldTextParams, ActTypeParams,
-    default_verify_timeout_ms,
+    ActClickParams, ActFocusWindowParams, ActPressParams, ActSetFieldTextLocator,
+    ActSetFieldTextParams, ActTypeParams, default_verify_timeout_ms,
 };
 use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
 use rmcp::schemars::JsonSchema;
@@ -110,12 +110,17 @@ pub struct TargetActParams {
     /// `set_selection`: zero-based selection end offset.
     #[serde(default, alias = "end")]
     pub selection_end: Option<u32>,
-    /// Browser DOM action: accessible/ARIA role to resolve.
+    /// `set_field`: native/UIA role to resolve at action time. Browser DOM
+    /// action: accessible/ARIA role to resolve.
     #[serde(default)]
     pub role: Option<String>,
+    /// `set_field`: native/UIA accessible name to resolve at action time.
     /// Browser DOM action: accessible name to resolve.
     #[serde(default)]
     pub name: Option<String>,
+    /// `set_field`: native/UIA automation id to resolve at action time.
+    #[serde(default)]
+    pub automation_id: Option<String>,
     /// Browser DOM action: value match. For `select`, this is the option value
     /// when `option` is omitted. `cleanup_notepad_tabs`: modified-tab policy
     /// (`discard_modified` default, or `refuse_modified`).
@@ -200,7 +205,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -360,7 +365,11 @@ impl SynapseService {
                         "target_act verb=set_field does not accept x/y because set_field is a replacement operation; use verb=type with x/y for coordinate focus + keyboard text",
                     ));
                 }
-                if let Some(selector) = params.selector.filter(|value| !value.trim().is_empty()) {
+                if let Some(selector) = params
+                    .selector
+                    .as_ref()
+                    .filter(|value| !value.trim().is_empty())
+                {
                     // Background-safe web field replace in the user's normal Chrome
                     // via the safe bridge (no foreground, no DOM/action debugger attach, no UIA) — the
                     // #1000/#1005 path for forms perceived UIA-only.
@@ -368,7 +377,7 @@ impl SynapseService {
                         .browser_set_value(
                             Parameters(BrowserSetValueParams {
                                 text: params.text.unwrap_or_default(),
-                                selector: Some(selector),
+                                selector: Some(selector.clone()),
                                 active_element: false,
                                 cdp_target_id: None,
                                 window_hwnd: None,
@@ -378,17 +387,31 @@ impl SynapseService {
                         .await;
                     target_act_delegate_response("browser_set_value", response)?
                 } else {
-                    let element_id = require_param(params.element_id, "set_field", "element_id")?;
-                    let element_id = ElementId::parse(&element_id).map_err(|error| {
-                        mcp_error(
+                    let element_id = match params.element_id.as_deref() {
+                        Some(value) if !value.trim().is_empty() => {
+                            Some(ElementId::parse(value).map_err(|error| {
+                                mcp_error(
+                                    error_codes::TOOL_PARAMS_INVALID,
+                                    format!(
+                                        "target_act verb=set_field element_id is invalid: {error}"
+                                    ),
+                                )
+                            })?)
+                        }
+                        _ => None,
+                    };
+                    let locator = target_act_set_field_locator(&params);
+                    if element_id.is_none() && locator.is_none() {
+                        return Err(mcp_error(
                             error_codes::TOOL_PARAMS_INVALID,
-                            format!("target_act verb=set_field element_id is invalid: {error}"),
-                        )
-                    })?;
+                            "target_act verb=set_field requires element_id, selector, or a native/UIA locator (role/name/automation_id)",
+                        ));
+                    }
                     let response = self
                         .act_set_field_text(
                             Parameters(ActSetFieldTextParams {
                                 element_id,
+                                locator,
                                 text: params.text.unwrap_or_default(),
                                 verify_timeout_ms: default_verify_timeout_ms(),
                             }),
@@ -2447,6 +2470,21 @@ fn target_act_has_any_locator(params: &TargetActParams) -> bool {
         || target_act_has_dom_locator(params)
 }
 
+fn target_act_set_field_locator(params: &TargetActParams) -> Option<ActSetFieldTextLocator> {
+    let role = trimmed_non_empty_string(params.role.as_deref());
+    let name = trimmed_non_empty_string(params.name.as_deref());
+    let automation_id = trimmed_non_empty_string(params.automation_id.as_deref());
+    (role.is_some() || name.is_some() || automation_id.is_some()).then_some(
+        ActSetFieldTextLocator {
+            window_hwnd: None,
+            role,
+            name,
+            name_substring: None,
+            automation_id,
+        },
+    )
+}
+
 fn target_act_has_dom_locator(params: &TargetActParams) -> bool {
     params
         .selector
@@ -2468,6 +2506,13 @@ fn target_act_has_dom_locator(params: &TargetActParams) -> bool {
             .option
             .as_ref()
             .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn trimmed_non_empty_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 fn target_act_coordinate(
@@ -3682,6 +3727,26 @@ mod tests {
         assert_eq!(params.selector.as_deref(), Some("input[name=\"q\"]"));
         assert_eq!(params.text.as_deref(), Some("hello"));
         assert!(params.element_id.is_none());
+    }
+
+    #[test]
+    fn target_act_set_field_accepts_native_locator() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "set_field",
+            "role": "document",
+            "name": "Message Body",
+            "automation_id": "compose-body",
+            "text": "hello"
+        }))
+        .expect("set_field native locator params should deserialize");
+        let locator =
+            target_act_set_field_locator(&params).expect("role/name/automation_id locator");
+
+        assert_eq!(params.verb.as_str(), "set_field");
+        assert_eq!(locator.role.as_deref(), Some("document"));
+        assert_eq!(locator.name.as_deref(), Some("Message Body"));
+        assert_eq!(locator.automation_id.as_deref(), Some("compose-body"));
+        assert!(locator.name_substring.is_none());
     }
 
     #[test]
