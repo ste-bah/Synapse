@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-select-option-v1";
-const BRIDGE_BUILD_SHA256 = "7766b118e7be6fa28cffe98d97fb993c1a0e229c98a8ec205d169045f3c7a5c9";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-check-uncheck-v1";
+const BRIDGE_BUILD_SHA256 = "a848cc84f03897822f0c37cb428eae220ca62c57ed47a5bf25c7ff850b2f7dd4";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -2839,12 +2839,12 @@ function normalizeDomAction(action) {
   if (normalized === "selecttext" || normalized === "select-text") {
     return "select_text";
   }
-  if (["click", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text"].includes(normalized)) {
+  if (["click", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck"].includes(normalized)) {
     return normalized;
   }
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `domAction action must be one of click, press, select, submit, dispatch_event, clear, focus, blur, select_text; got ${JSON.stringify(action)}`
+    `domAction action must be one of click, press, select, submit, dispatch_event, clear, focus, blur, select_text, check, uncheck; got ${JSON.stringify(action)}`
   );
 }
 
@@ -2992,7 +2992,7 @@ function performDomActionInPage(request) {
     ? Math.min(Math.max(request.maxPageTextChars, 0), 65536)
     : 4096;
 
-  if (!["click", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text"].includes(action)) {
+  if (!["click", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck"].includes(action)) {
     return fail(ERROR_ACTION_UNSUPPORTED, `unsupported DOM action ${JSON.stringify(action)}`);
   }
   if (action === "dispatch_event" && !eventType) {
@@ -3059,6 +3059,10 @@ function performDomActionInPage(request) {
       actionReadback = performBlur(element, eventsDispatched);
     } else if (action === "select_text") {
       actionReadback = performSelectText(element, eventsDispatched);
+    } else if (action === "check") {
+      actionReadback = performCheckState(element, true, eventsDispatched);
+    } else if (action === "uncheck") {
+      actionReadback = performCheckState(element, false, eventsDispatched);
     }
   } catch (error) {
     return fail(error?.code || ERROR_ACTION_UNSUPPORTED, errorMessageLocal(error), {
@@ -3150,6 +3154,9 @@ function performDomActionInPage(request) {
     }
     if (actionName === "clear") {
       return Array.from(document.querySelectorAll("input,textarea,[contenteditable],[role='textbox']"));
+    }
+    if (actionName === "check" || actionName === "uncheck") {
+      return Array.from(document.querySelectorAll("input[type='checkbox'],input[type='radio'],[role='checkbox'],[role='radio']"));
     }
     if (actionName === "select") {
       return Array.from(document.querySelectorAll("select,[role='combobox'],[role='listbox']"));
@@ -3367,6 +3374,55 @@ function performDomActionInPage(request) {
       before_selection: beforeSelection,
       after_selection: selectionSummary(element),
       ...readback
+    };
+  }
+
+  function performCheckState(element, desiredChecked, events) {
+    const checkable = checkableKind(element);
+    if (!checkable) {
+      throw actionError(
+        ERROR_ACTION_UNSUPPORTED,
+        `domAction ${desiredChecked ? "check" : "uncheck"} supports native checkbox/radio inputs only; resolved ${tag(element)} role=${inferRole(element)}`
+      );
+    }
+    if (checkable === "radio" && !desiredChecked) {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, "domAction uncheck does not support radio inputs; select another radio in the group");
+    }
+    const beforeChecked = Boolean(element.checked);
+    if (beforeChecked === desiredChecked) {
+      return {
+        desired_checked: desiredChecked,
+        before_checked: beforeChecked,
+        after_checked: beforeChecked,
+        changed: false,
+        no_op: true,
+        click_dispatched: false,
+        checkable_kind: checkable
+      };
+    }
+    scrollIntoViewIfPossible(element);
+    if (typeof element.click !== "function") {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, `resolved ${tag(element)} element has no click() method`);
+    }
+    element.click();
+    events.push("click");
+    const afterChecked = Boolean(element.checked);
+    if (afterChecked !== desiredChecked) {
+      throw actionError(
+        ERROR_POSTCONDITION_FAILED,
+        `check state postcondition failed: desired=${desiredChecked} after=${afterChecked}`
+      );
+    }
+    return {
+      desired_checked: desiredChecked,
+      before_checked: beforeChecked,
+      after_checked: afterChecked,
+      changed: true,
+      no_op: false,
+      click_dispatched: true,
+      checkable_kind: checkable,
+      name_attr: String(element.getAttribute("name") || ""),
+      value_attr: String(element.getAttribute("value") || "")
     };
   }
 
@@ -3630,6 +3686,17 @@ function performDomActionInPage(request) {
     const type = String(element.getAttribute("type") || "text").toLowerCase();
     const nonSelectable = ["button", "submit", "reset", "checkbox", "radio", "range", "color", "file", "image", "hidden"];
     return !nonSelectable.includes(type);
+  }
+
+  function checkableKind(element) {
+    if (!(element instanceof HTMLInputElement)) {
+      return null;
+    }
+    const type = String(element.getAttribute("type") || "").toLowerCase();
+    if (type === "checkbox" || type === "radio") {
+      return type;
+    }
+    return null;
   }
 
   function elementTextValue(element) {
