@@ -402,6 +402,7 @@ pub struct CdpFetchRouteRule {
     pub id: String,
     pub url: String,
     pub match_kind: CdpFetchRouteMatchKind,
+    pub method: Option<String>,
     pub resource_type: Option<String>,
     pub action: CdpFetchRouteAction,
 }
@@ -1894,6 +1895,11 @@ fn fetch_route_rule_matches(event: &FetchEventRequestPaused, rule: &CdpFetchRout
     if !fetch_route_url_matches(&event.request.url, rule) {
         return false;
     }
+    if let Some(method) = rule.method.as_deref()
+        && event.request.method != method
+    {
+        return false;
+    }
     if let Some(resource_type) = rule.resource_type.as_deref() {
         if !enum_str(&event.resource_type).eq_ignore_ascii_case(resource_type) {
             return false;
@@ -2041,6 +2047,9 @@ fn validate_fetch_route_rule(rule: &CdpFetchRouteRule) -> A11yResult<()> {
         Regex::new(&rule.url).map_err(|error| A11yError::CdpAttachFailed {
             detail: format!("Fetch route regex url is invalid: {error}"),
         })?;
+    }
+    if let Some(method) = rule.method.as_deref() {
+        validate_http_method(method)?;
     }
     if let Some(resource_type) = rule.resource_type.as_deref() {
         validate_fetch_resource_type(resource_type, "Fetch route resource_type")?;
@@ -2665,6 +2674,7 @@ mod tests {
             id: id.to_owned(),
             url: url.to_owned(),
             match_kind,
+            method: None,
             resource_type: None,
             action: CdpFetchRouteAction::Fulfill(CdpFetchRouteFulfill {
                 status: 201,
@@ -2918,6 +2928,26 @@ mod tests {
         let matched =
             fetch_route_match(&event, &[document_rule, xhr_rule]).expect("matched xhr route");
         assert_eq!(matched.id, "xhr");
+    }
+
+    #[test]
+    fn fetch_route_match_respects_method_when_present() {
+        let event = paused_event("fetch-1", "https://example.test/api/users", "XHR");
+        let mut post_rule = fulfill_rule(
+            "post",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        post_rule.method = Some("POST".to_owned());
+        let mut get_rule = fulfill_rule(
+            "get",
+            "https://example.test/api/*",
+            CdpFetchRouteMatchKind::Glob,
+        );
+        get_rule.method = Some("GET".to_owned());
+
+        let matched = fetch_route_match(&event, &[post_rule, get_rule]).expect("matched get route");
+        assert_eq!(matched.id, "get");
     }
 
     #[test]

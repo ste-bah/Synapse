@@ -1,6 +1,12 @@
 //! Network capture listing tools (#1081) backed by the a11y CDP Network buffer.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fs,
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use super::{
     ErrorData, Json, Parameters, SynapseService,
@@ -12,6 +18,7 @@ use super::{
 };
 use crate::m1::{BrowserNetworkWaitEntry, mcp_error};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use chrono::{DateTime, Utc};
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,6 +27,7 @@ use synapse_core::error_codes;
 const REQUESTS_TOOL: &str = "browser_network_requests";
 const REQUEST_TOOL: &str = "browser_network_request";
 const WEBSOCKETS_TOOL: &str = "browser_network_websockets";
+const HAR_TOOL: &str = "browser_network_har";
 const OVERRIDES_TOOL: &str = "browser_network_overrides";
 const ROUTE_TOOL: &str = "browser_route";
 const DEFAULT_NETWORK_REQUEST_LIMIT: usize = 100;
@@ -35,6 +43,11 @@ const MAX_ROUTE_HEADER_NAME_CHARS: usize = 256;
 const MAX_ROUTE_HEADER_VALUE_CHARS: usize = 8192;
 const MAX_ROUTE_BODY_CHARS: usize = 1_048_576;
 const MAX_NETWORK_USER_AGENT_CHARS: usize = 4096;
+const MAX_HAR_PATH_CHARS: usize = 4096;
+const MAX_HAR_REPLAY_ENTRIES: usize = 1000;
+const MAX_HAR_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const HAR_REPLAY_ROUTE_PREFIX: &str = "har-replay-";
+const HAR_REPLAY_MISS_ROUTE_ID: &str = "har-replay-missing";
 
 /// Parameters for `browser_network_requests` (#1081): return captured Network
 /// request records for the calling session's owned CDP target.
@@ -391,6 +404,135 @@ pub struct BrowserNetworkWebSocketFrame {
     pub error_message: Option<String>,
 }
 
+/// Operation for `browser_network_har` (#1088).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserNetworkHarOperation {
+    /// Serialize captured Network entries to a HAR 1.2 file.
+    #[default]
+    Record,
+    /// Install Fetch fulfill rules from a HAR file.
+    Replay,
+    /// Remove route rules previously installed by HAR replay.
+    ClearReplay,
+}
+
+/// Missing-entry policy for HAR replay.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserNetworkHarMissingPolicy {
+    /// Requests absent from the HAR continue to the network.
+    #[default]
+    Passthrough,
+    /// Requests absent from the HAR fail with `BlockedByClient`.
+    Abort,
+}
+
+/// Parameters for `browser_network_har` (#1088): record captured requests to a
+/// HAR file or replay a HAR through target-scoped Fetch fulfill routes.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserNetworkHarParams {
+    /// CDP TargetID to record/replay. Defaults to the active session CDP target.
+    /// Must be owned by this session; the human foreground tab is never an
+    /// implicit fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// HAR operation. Defaults to `record`.
+    #[serde(default)]
+    pub operation: BrowserNetworkHarOperation,
+    /// HAR file path. Required for `record` and `replay`.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Record only entries whose latest update sequence is >= this cursor.
+    #[serde(default)]
+    pub since_seq: Option<u64>,
+    /// Maximum entries to record/replay. Defaults to 100 for record and all HAR
+    /// entries for replay, capped at 1000.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Case-insensitive substring filter against request URL while recording.
+    #[serde(default)]
+    pub url_contains: Option<String>,
+    /// Regular expression filter against request URL while recording.
+    #[serde(default)]
+    pub url_regex: Option<String>,
+    /// Case-insensitive CDP Network resource type filter while recording.
+    #[serde(default)]
+    pub resource_type: Option<String>,
+    /// Minimum HTTP status, inclusive, while recording.
+    #[serde(default)]
+    pub status_min: Option<i64>,
+    /// Maximum HTTP status, inclusive, while recording.
+    #[serde(default)]
+    pub status_max: Option<i64>,
+    /// Include retained response bodies in recorded HAR content. Defaults true.
+    #[serde(default)]
+    pub include_bodies: Option<bool>,
+    /// Replay behavior for requests not present in the HAR. Defaults
+    /// `passthrough`.
+    #[serde(default)]
+    pub missing_policy: Option<BrowserNetworkHarMissingPolicy>,
+    /// Remove existing HAR replay rules for this target before replaying.
+    /// Defaults true.
+    #[serde(default)]
+    pub clear_existing_replay: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserNetworkHarFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_seq: Option<u64>,
+    pub limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_contains: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_regex: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_max: Option<i64>,
+    pub include_bodies: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserNetworkHarResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub operation: BrowserNetworkHarOperation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters: Option<BrowserNetworkHarFilters>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_policy: Option<BrowserNetworkHarMissingPolicy>,
+    pub capture_newly_armed: bool,
+    pub recorded_entry_count: usize,
+    pub skipped_entry_count: usize,
+    pub replay_entry_count: usize,
+    pub replay_route_count: usize,
+    pub cleared_replay_route_count: usize,
+    pub missing_abort_route_installed: bool,
+    pub har_bytes: u64,
+    pub route_count: usize,
+    pub routes: Vec<BrowserRouteRuleResponse>,
+    pub fetch_status: BrowserRouteFetchStatus,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+}
+
 /// Operation for `browser_network_overrides` (#1087).
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -623,6 +765,8 @@ pub struct BrowserRouteRuleResponse {
     pub url: String,
     pub match_kind: BrowserRouteMatchKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_type: Option<String>,
     pub action: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -683,6 +827,17 @@ struct NormalizedBrowserNetworkWebSocketsParams {
     limit: usize,
     request_id: Option<String>,
     url_contains: Option<String>,
+}
+
+#[derive(Debug)]
+struct NormalizedBrowserNetworkHarParams {
+    operation: BrowserNetworkHarOperation,
+    path: Option<PathBuf>,
+    path_display: Option<String>,
+    filters: NormalizedBrowserNetworkRequestsParams,
+    include_bodies: bool,
+    missing_policy: BrowserNetworkHarMissingPolicy,
+    clear_existing_replay: bool,
 }
 
 #[derive(Debug)]
@@ -831,6 +986,82 @@ impl SynapseService {
             .browser_network_websockets_impl(&session_id, window_hwnd, &cdp_target_id, &filters)
             .await;
         self.audit_action_result_for_session(WEBSOCKETS_TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Record captured Network requests to a HAR 1.2 file, replay a HAR through exact target-scoped Fetch fulfill routes, or clear HAR replay routes for the calling session's owned browser tab. Record reuses the raw CDP Network buffer and can include retained Network.getResponseBody payloads. Replay reads a local HAR file, installs exact URL fulfill routes, and makes the missing-entry policy explicit as passthrough or abort. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome bridge fails closed."
+    )]
+    pub async fn browser_network_har(
+        &self,
+        params: Parameters<BrowserNetworkHarParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserNetworkHarResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = HAR_TOOL,
+            "tool.invocation kind=browser_network_har"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let har = validate_browser_network_har_params(&params.0)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "operation": har.operation,
+            "path": har.path_display.as_deref(),
+            "since_seq": har.filters.since_seq,
+            "limit": har.filters.limit,
+            "url_contains_len": har.filters.url_contains.as_deref().map(str::len),
+            "url_regex_len": har.filters.url_regex_pattern.as_deref().map(str::len),
+            "resource_type": har.filters.resource_type.as_deref(),
+            "status_min": har.filters.status_min,
+            "status_max": har.filters.status_max,
+            "include_bodies": har.include_bodies,
+            "missing_policy": har.missing_policy,
+            "clear_existing_replay": har.clear_existing_replay,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            HAR_TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            HAR_TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "operation": har.operation,
+            "path": har.path_display.as_deref(),
+            "since_seq": har.filters.since_seq,
+            "limit": har.filters.limit,
+            "url_contains_len": har.filters.url_contains.as_deref().map(str::len),
+            "url_regex_len": har.filters.url_regex_pattern.as_deref().map(str::len),
+            "resource_type": har.filters.resource_type.as_deref(),
+            "status_min": har.filters.status_min,
+            "status_max": har.filters.status_max,
+            "include_bodies": har.include_bodies,
+            "missing_policy": har.missing_policy,
+            "clear_existing_replay": har.clear_existing_replay,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(
+            HAR_TOOL,
+            &request_details,
+            &session_id,
+        )?;
+        let result = self
+            .browser_network_har_impl(&session_id, window_hwnd, &cdp_target_id, &har)
+            .await;
+        self.audit_action_result_for_session(HAR_TOOL, &result, &session_id)?;
         result.map(Json)
     }
 
@@ -1162,6 +1393,181 @@ impl SynapseService {
             entries,
             readback_backend: "Network.webSocket* event buffer(browser_network_websockets)"
                 .to_owned(),
+            backend_tier_used: "cdp".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(windows)]
+    async fn browser_network_har_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        har: &NormalizedBrowserNetworkHarParams,
+    ) -> Result<BrowserNetworkHarResponse, ErrorData> {
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(HAR_TOOL, window_hwnd));
+        };
+
+        let mut capture_newly_armed = false;
+        let mut recorded_entry_count = 0usize;
+        let mut skipped_entry_count = 0usize;
+        let mut replay_entry_count = 0usize;
+        let mut replay_route_count = 0usize;
+        let mut cleared_replay_route_count = 0usize;
+        let mut missing_abort_route_installed = false;
+        let mut har_bytes = 0u64;
+
+        match har.operation {
+            BrowserNetworkHarOperation::Record => {
+                let capture = synapse_a11y::network_capture_ensure(
+                    &endpoint,
+                    cdp_target_id,
+                    synapse_a11y::DEFAULT_NETWORK_BUFFER_CAPACITY,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("{HAR_TOOL} raw CDP network capture failed: {error}"),
+                    )
+                })?;
+                capture_newly_armed = capture.newly_armed;
+                let read = synapse_a11y::network_capture_read(
+                    cdp_target_id,
+                    &synapse_a11y::CdpNetworkReadFilter {
+                        since_seq: har.filters.since_seq,
+                        max: 0,
+                        ..Default::default()
+                    },
+                )
+                .ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "{HAR_TOOL} network capture was not armed for target {cdp_target_id}"
+                        ),
+                    )
+                })?;
+                let entries = filter_network_entries(read.entries.into_iter(), &har.filters)
+                    .into_iter()
+                    .take(har.filters.limit)
+                    .collect::<Vec<_>>();
+                let path = har.path.as_ref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("{HAR_TOOL} record path was not normalized"),
+                    )
+                })?;
+                let record =
+                    write_har_record(cdp_target_id, path, &entries, har.include_bodies).await?;
+                recorded_entry_count = record.entry_count;
+                skipped_entry_count = record.skipped_count;
+                har_bytes = record.bytes_written;
+            }
+            BrowserNetworkHarOperation::Replay => {
+                let path = har.path.as_ref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("{HAR_TOOL} replay path was not normalized"),
+                    )
+                })?;
+                if har.clear_existing_replay {
+                    cleared_replay_route_count = clear_har_replay_routes(cdp_target_id)?;
+                }
+                let replay = load_har_replay(path, har.filters.limit, har.missing_policy)?;
+                har_bytes = replay.source_bytes;
+                replay_entry_count = replay.entry_count;
+                skipped_entry_count = replay.skipped_count;
+                replay_route_count = replay.rules.len();
+                missing_abort_route_installed = replay.missing_abort_route_installed;
+
+                let ensure =
+                    synapse_a11y::fetch_interception_ensure(&endpoint, cdp_target_id, Vec::new())
+                        .await
+                        .map_err(|error| {
+                            mcp_error(
+                                error.code(),
+                                format!("{HAR_TOOL} raw CDP Fetch interception failed: {error}"),
+                            )
+                        })?;
+                for rule in replay.rules {
+                    let mut status =
+                        synapse_a11y::fetch_route_add(cdp_target_id, rule).map_err(|error| {
+                            mcp_error(
+                                error.code(),
+                                format!("{HAR_TOOL} raw CDP Fetch route add failed: {error}"),
+                            )
+                        })?;
+                    status.newly_armed = ensure.newly_armed;
+                }
+            }
+            BrowserNetworkHarOperation::ClearReplay => {
+                cleared_replay_route_count = clear_har_replay_routes(cdp_target_id)?;
+                stop_fetch_if_no_routes(cdp_target_id).await?;
+            }
+        }
+
+        let route_rules = synapse_a11y::fetch_route_rules(cdp_target_id).unwrap_or_default();
+        let fetch_status_raw = synapse_a11y::fetch_interception_status(cdp_target_id);
+        let fetch_status = browser_route_fetch_status_from_a11y(
+            fetch_status_raw,
+            synapse_a11y::fetch_interception_status(cdp_target_id).is_some(),
+        );
+        let routes = route_rules
+            .iter()
+            .map(browser_route_rule_to_wire)
+            .collect::<Vec<_>>();
+
+        tracing::info!(
+            code = "CDP_BACKGROUND_NETWORK_HAR",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id,
+            operation = ?har.operation,
+            recorded_entry_count,
+            skipped_entry_count,
+            replay_entry_count,
+            replay_route_count,
+            cleared_replay_route_count,
+            missing_abort_route_installed,
+            "readback=HAR record/replay(browser_network_har) outcome=har_operation_returned"
+        );
+
+        Ok(BrowserNetworkHarResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: cdp_target_id.to_owned(),
+            operation: har.operation,
+            path: har.path_display.clone(),
+            filters: (har.operation == BrowserNetworkHarOperation::Record)
+                .then(|| har.to_record_filters_wire()),
+            missing_policy: (har.operation == BrowserNetworkHarOperation::Replay)
+                .then_some(har.missing_policy),
+            capture_newly_armed,
+            recorded_entry_count,
+            skipped_entry_count,
+            replay_entry_count,
+            replay_route_count,
+            cleared_replay_route_count,
+            missing_abort_route_installed,
+            har_bytes,
+            route_count: routes.len(),
+            routes,
+            fetch_status,
+            readback_backend: match har.operation {
+                BrowserNetworkHarOperation::Record => {
+                    "Network event buffer + Network.getResponseBody(browser_network_har)"
+                }
+                BrowserNetworkHarOperation::Replay | BrowserNetworkHarOperation::ClearReplay => {
+                    "HAR file + Fetch fulfill routes(browser_network_har)"
+                }
+            }
+            .to_owned(),
             backend_tier_used: "cdp".to_owned(),
             required_foreground: false,
         })
@@ -1552,6 +1958,20 @@ impl SynapseService {
             "browser_network_websockets is only available on Windows in this build",
         ))
     }
+
+    #[cfg(not(windows))]
+    async fn browser_network_har_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _har: &NormalizedBrowserNetworkHarParams,
+    ) -> Result<BrowserNetworkHarResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_network_har is only available on Windows in this build",
+        ))
+    }
 }
 
 impl NormalizedBrowserNetworkRequestsParams {
@@ -1575,6 +1995,21 @@ impl NormalizedBrowserNetworkWebSocketsParams {
             limit: self.limit,
             request_id: self.request_id.clone(),
             url_contains: self.url_contains.clone(),
+        }
+    }
+}
+
+impl NormalizedBrowserNetworkHarParams {
+    fn to_record_filters_wire(&self) -> BrowserNetworkHarFilters {
+        BrowserNetworkHarFilters {
+            since_seq: self.filters.since_seq,
+            limit: self.filters.limit,
+            url_contains: self.filters.url_contains.clone(),
+            url_regex: self.filters.url_regex_pattern.clone(),
+            resource_type: self.filters.resource_type.clone(),
+            status_min: self.filters.status_min,
+            status_max: self.filters.status_max,
+            include_bodies: self.include_bodies,
         }
     }
 }
@@ -1743,6 +2178,7 @@ fn normalize_route_fulfill(
             BrowserRouteMatchKind::Glob => synapse_a11y::CdpFetchRouteMatchKind::Glob,
             BrowserRouteMatchKind::Regex => synapse_a11y::CdpFetchRouteMatchKind::Regex,
         },
+        method: None,
         resource_type,
         action: synapse_a11y::CdpFetchRouteAction::Fulfill(synapse_a11y::CdpFetchRouteFulfill {
             status,
@@ -1779,6 +2215,7 @@ fn normalize_route_abort(
             BrowserRouteMatchKind::Glob => synapse_a11y::CdpFetchRouteMatchKind::Glob,
             BrowserRouteMatchKind::Regex => synapse_a11y::CdpFetchRouteMatchKind::Regex,
         },
+        method: None,
         resource_type,
         action: synapse_a11y::CdpFetchRouteAction::Abort(synapse_a11y::CdpFetchRouteAbort {
             error_reason: error_reason.as_cdp_str().to_owned(),
@@ -1835,6 +2272,7 @@ fn normalize_route_continue(
             BrowserRouteMatchKind::Glob => synapse_a11y::CdpFetchRouteMatchKind::Glob,
             BrowserRouteMatchKind::Regex => synapse_a11y::CdpFetchRouteMatchKind::Regex,
         },
+        method: None,
         resource_type,
         action: synapse_a11y::CdpFetchRouteAction::Continue(synapse_a11y::CdpFetchRouteContinue {
             url: continue_url,
@@ -1902,8 +2340,8 @@ fn validate_browser_network_requests_params(
         .transpose()?;
     let resource_type =
         validate_resource_type_for_tool(REQUESTS_TOOL, params.resource_type.as_deref())?;
-    validate_status_bound("status_min", params.status_min)?;
-    validate_status_bound("status_max", params.status_max)?;
+    validate_status_bound_for_tool(REQUESTS_TOOL, "status_min", params.status_min)?;
+    validate_status_bound_for_tool(REQUESTS_TOOL, "status_max", params.status_max)?;
     if let (Some(min), Some(max)) = (params.status_min, params.status_max)
         && min > max
     {
@@ -1953,6 +2391,156 @@ fn validate_browser_network_websockets_params(
         request_id,
         url_contains,
     })
+}
+
+fn validate_browser_network_har_params(
+    params: &BrowserNetworkHarParams,
+) -> Result<NormalizedBrowserNetworkHarParams, ErrorData> {
+    if let Some(target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(target_id)?;
+    }
+    let path = match params.operation {
+        BrowserNetworkHarOperation::Record | BrowserNetworkHarOperation::Replay => Some(
+            validate_har_path(params.path.as_deref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("{HAR_TOOL} path is required for {:?}", params.operation),
+                )
+            })?)?,
+        ),
+        BrowserNetworkHarOperation::ClearReplay => {
+            if params.path.is_some() {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("{HAR_TOOL} path is only valid for record and replay"),
+                ));
+            }
+            None
+        }
+    };
+    if params.operation != BrowserNetworkHarOperation::Record {
+        if params.since_seq.is_some()
+            || params.url_contains.is_some()
+            || params.url_regex.is_some()
+            || params.resource_type.is_some()
+            || params.status_min.is_some()
+            || params.status_max.is_some()
+            || params.include_bodies.is_some()
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{HAR_TOOL} capture filters and include_bodies are only valid for record"),
+            ));
+        }
+    }
+    if params.operation != BrowserNetworkHarOperation::Replay {
+        if params.missing_policy.is_some() || params.clear_existing_replay.is_some() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "{HAR_TOOL} missing_policy and clear_existing_replay are only valid for replay"
+                ),
+            ));
+        }
+        if params.operation == BrowserNetworkHarOperation::ClearReplay && params.limit.is_some() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{HAR_TOOL} limit is only valid for record and replay"),
+            ));
+        }
+    }
+    let limit = match params.operation {
+        BrowserNetworkHarOperation::Record => params.limit.unwrap_or(DEFAULT_NETWORK_REQUEST_LIMIT),
+        BrowserNetworkHarOperation::Replay => params.limit.unwrap_or(MAX_HAR_REPLAY_ENTRIES),
+        BrowserNetworkHarOperation::ClearReplay => 1,
+    };
+    let max_limit = match params.operation {
+        BrowserNetworkHarOperation::Record => MAX_NETWORK_REQUEST_LIMIT,
+        BrowserNetworkHarOperation::Replay => MAX_HAR_REPLAY_ENTRIES,
+        BrowserNetworkHarOperation::ClearReplay => 1,
+    };
+    if !(1..=max_limit).contains(&limit) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} limit must be 1..={max_limit}"),
+        ));
+    }
+    if params.url_contains.is_some() && params.url_regex.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} accepts url_contains or url_regex, not both"),
+        ));
+    }
+    let url_contains =
+        validate_text_filter_for_tool(HAR_TOOL, "url_contains", params.url_contains.as_deref())?;
+    let url_regex_pattern =
+        validate_text_filter_for_tool(HAR_TOOL, "url_regex", params.url_regex.as_deref())?;
+    let url_regex = url_regex_pattern
+        .as_deref()
+        .map(|pattern| {
+            regex::Regex::new(pattern).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("{HAR_TOOL} url_regex is invalid: {error}"),
+                )
+            })
+        })
+        .transpose()?;
+    let resource_type = validate_resource_type_for_tool(HAR_TOOL, params.resource_type.as_deref())?;
+    validate_status_bound_for_tool(HAR_TOOL, "status_min", params.status_min)?;
+    validate_status_bound_for_tool(HAR_TOOL, "status_max", params.status_max)?;
+    if let (Some(min), Some(max)) = (params.status_min, params.status_max)
+        && min > max
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} status_min must be <= status_max"),
+        ));
+    }
+    let (path, path_display) = match path {
+        Some((path, display)) => (Some(path), Some(display)),
+        None => (None, None),
+    };
+    Ok(NormalizedBrowserNetworkHarParams {
+        operation: params.operation,
+        path,
+        path_display,
+        filters: NormalizedBrowserNetworkRequestsParams {
+            since_seq: params.since_seq,
+            limit,
+            url_contains,
+            url_regex_pattern,
+            url_regex,
+            resource_type,
+            status_min: params.status_min,
+            status_max: params.status_max,
+        },
+        include_bodies: params.include_bodies.unwrap_or(true),
+        missing_policy: params.missing_policy.unwrap_or_default(),
+        clear_existing_replay: params.clear_existing_replay.unwrap_or(true),
+    })
+}
+
+fn validate_har_path(path: &str) -> Result<(PathBuf, String), ErrorData> {
+    if path.is_empty() || path.trim() != path {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} path must be non-empty without leading or trailing whitespace"),
+        ));
+    }
+    if path.contains('\0') || path.chars().any(char::is_control) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} path must not contain control characters"),
+        ));
+    }
+    if path.chars().count() > MAX_HAR_PATH_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} path must be at most {MAX_HAR_PATH_CHARS} Unicode scalar values"),
+        ));
+    }
+    Ok((PathBuf::from(path), path.to_owned()))
 }
 
 fn validate_browser_network_request_params(
@@ -2394,13 +2982,17 @@ fn generate_route_id() -> String {
     format!("route-{millis}-{}", std::process::id())
 }
 
-fn validate_status_bound(field: &str, value: Option<i64>) -> Result<(), ErrorData> {
+fn validate_status_bound_for_tool(
+    tool: &str,
+    field: &str,
+    value: Option<i64>,
+) -> Result<(), ErrorData> {
     if let Some(value) = value
         && !(0..=999).contains(&value)
     {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!("{REQUESTS_TOOL} {field} must be 0..=999"),
+            format!("{tool} {field} must be 0..=999"),
         ));
     }
     Ok(())
@@ -2454,6 +3046,581 @@ fn network_entry_matches(
         return false;
     }
     true
+}
+
+#[derive(Debug)]
+struct HarRecordWriteResult {
+    entry_count: usize,
+    skipped_count: usize,
+    bytes_written: u64,
+}
+
+#[derive(Debug)]
+struct HarReplayLoadResult {
+    entry_count: usize,
+    skipped_count: usize,
+    source_bytes: u64,
+    missing_abort_route_installed: bool,
+    rules: Vec<synapse_a11y::CdpFetchRouteRule>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HarFile {
+    log: HarLog,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HarLog {
+    #[serde(default = "har_version")]
+    version: String,
+    #[serde(default)]
+    creator: HarCreator,
+    #[serde(default)]
+    entries: Vec<HarEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HarCreator {
+    name: String,
+    version: String,
+}
+
+impl Default for HarCreator {
+    fn default() -> Self {
+        Self {
+            name: "Synapse".to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HarEntry {
+    #[serde(rename = "startedDateTime", default = "har_epoch_datetime")]
+    started_date_time: String,
+    #[serde(default = "har_unknown_time")]
+    time: f64,
+    #[serde(default)]
+    request: HarRequest,
+    #[serde(default)]
+    response: HarResponse,
+    #[serde(default)]
+    cache: Value,
+    #[serde(default)]
+    timings: HarTimings,
+    #[serde(
+        rename = "_synapseRequestId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    synapse_request_id: Option<String>,
+    #[serde(
+        rename = "_synapseResourceType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    synapse_resource_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HarRequest {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    url: String,
+    #[serde(rename = "httpVersion", default = "har_http_version")]
+    http_version: String,
+    #[serde(default)]
+    cookies: Vec<Value>,
+    #[serde(default)]
+    headers: Vec<HarHeader>,
+    #[serde(rename = "queryString", default)]
+    query_string: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    post_data: Option<HarPostData>,
+    #[serde(rename = "headersSize", default = "har_size_unknown")]
+    headers_size: i64,
+    #[serde(rename = "bodySize", default = "har_size_unknown")]
+    body_size: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HarPostData {
+    #[serde(rename = "mimeType", default)]
+    mime_type: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    params: Vec<Value>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HarResponse {
+    #[serde(default)]
+    status: i64,
+    #[serde(rename = "statusText", default)]
+    status_text: String,
+    #[serde(rename = "httpVersion", default = "har_http_version")]
+    http_version: String,
+    #[serde(default)]
+    cookies: Vec<Value>,
+    #[serde(default)]
+    headers: Vec<HarHeader>,
+    #[serde(default)]
+    content: HarContent,
+    #[serde(rename = "redirectURL", default)]
+    redirect_url: String,
+    #[serde(rename = "headersSize", default = "har_size_unknown")]
+    headers_size: i64,
+    #[serde(rename = "bodySize", default = "har_size_unknown")]
+    body_size: i64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HarHeader {
+    name: String,
+    value: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct HarContent {
+    #[serde(default)]
+    size: i64,
+    #[serde(rename = "mimeType", default)]
+    mime_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    encoding: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct HarTimings {
+    send: f64,
+    wait: f64,
+    receive: f64,
+}
+
+impl Default for HarTimings {
+    fn default() -> Self {
+        Self {
+            send: 0.0,
+            wait: 0.0,
+            receive: 0.0,
+        }
+    }
+}
+
+async fn write_har_record(
+    cdp_target_id: &str,
+    path: &PathBuf,
+    entries: &[synapse_a11y::CdpNetworkEntry],
+    include_bodies: bool,
+) -> Result<HarRecordWriteResult, ErrorData> {
+    let mut har_entries = Vec::new();
+    let mut skipped_count = 0usize;
+    for entry in entries {
+        let response_body = if include_bodies && entry.response_received && entry.loading_finished {
+            synapse_a11y::network_response_body(cdp_target_id, &entry.request_id)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let request_post_data = if include_bodies && entry.request_has_post_data == Some(true) {
+            synapse_a11y::network_request_post_data(cdp_target_id, &entry.request_id)
+                .await
+                .ok()
+        } else {
+            None
+        };
+        if let Some(har_entry) = har_entry_from_network(entry, response_body, request_post_data) {
+            har_entries.push(har_entry);
+        } else {
+            skipped_count = skipped_count.saturating_add(1);
+        }
+    }
+
+    let har = HarFile {
+        log: HarLog {
+            version: har_version(),
+            creator: HarCreator::default(),
+            entries: har_entries,
+        },
+    };
+    let bytes = serde_json::to_vec_pretty(&har).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("{HAR_TOOL} failed to serialize HAR: {error}"),
+        )
+    })?;
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("{HAR_TOOL} failed to create HAR parent directory: {error}"),
+            )
+        })?;
+    }
+    fs::write(path, &bytes).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("{HAR_TOOL} failed to write HAR {}: {error}", path.display()),
+        )
+    })?;
+    Ok(HarRecordWriteResult {
+        entry_count: har.log.entries.len(),
+        skipped_count,
+        bytes_written: bytes.len() as u64,
+    })
+}
+
+fn load_har_replay(
+    path: &PathBuf,
+    limit: usize,
+    missing_policy: BrowserNetworkHarMissingPolicy,
+) -> Result<HarReplayLoadResult, ErrorData> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} failed to stat HAR {}: {error}", path.display()),
+        )
+    })?;
+    if metadata.len() > MAX_HAR_FILE_BYTES {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} HAR file must be at most {MAX_HAR_FILE_BYTES} bytes"),
+        ));
+    }
+    let raw = fs::read_to_string(path).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} failed to read HAR {}: {error}", path.display()),
+        )
+    })?;
+    let har: HarFile = serde_json::from_str(&raw).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("{HAR_TOOL} failed to parse HAR JSON: {error}"),
+        )
+    })?;
+    let mut rules = Vec::new();
+    let mut entry_count = 0usize;
+    let mut skipped_count = 0usize;
+    for (index, entry) in har.log.entries.iter().take(limit).enumerate() {
+        match har_entry_to_route_rule(index, entry)? {
+            Some(rule) => {
+                entry_count = entry_count.saturating_add(1);
+                rules.push(rule);
+            }
+            None => skipped_count = skipped_count.saturating_add(1),
+        }
+    }
+    let mut missing_abort_route_installed = false;
+    if missing_policy == BrowserNetworkHarMissingPolicy::Abort {
+        rules.push(har_missing_abort_rule());
+        missing_abort_route_installed = true;
+    }
+    Ok(HarReplayLoadResult {
+        entry_count,
+        skipped_count,
+        source_bytes: metadata.len(),
+        missing_abort_route_installed,
+        rules,
+    })
+}
+
+fn har_entry_from_network(
+    entry: &synapse_a11y::CdpNetworkEntry,
+    response_body: Option<synapse_a11y::CdpNetworkResponseBody>,
+    request_post_data: Option<synapse_a11y::CdpNetworkRequestPostData>,
+) -> Option<HarEntry> {
+    let url = entry.url.clone()?;
+    let method = entry.method.clone().unwrap_or_else(|| "GET".to_owned());
+    let response = entry.response.as_ref();
+    let started_date_time = har_datetime(entry.request_wall_time_ms);
+    let time = match (entry.request_timestamp_s, entry.finished_timestamp_s) {
+        (Some(start), Some(finish)) if finish >= start => (finish - start) * 1000.0,
+        _ => -1.0,
+    };
+    let post_data = request_post_data.map(|post_data| HarPostData {
+        mime_type: header_lookup(entry.request_headers.as_ref(), "content-type")
+            .unwrap_or_default(),
+        text: post_data.post_data,
+        params: Vec::new(),
+    });
+    let response_status = response.map_or(0, |response| response.status);
+    let response_status_text = response
+        .map(|response| response.status_text.clone())
+        .unwrap_or_default();
+    let response_protocol = response
+        .and_then(|response| response.protocol.clone())
+        .unwrap_or_else(har_http_version);
+    let response_headers = response
+        .map(|response| har_headers_from_value(Some(&response.headers)))
+        .unwrap_or_default();
+    let content = har_content_from_response(response, response_body);
+    let body_size = content.size;
+    Some(HarEntry {
+        started_date_time,
+        time,
+        request: HarRequest {
+            method,
+            url,
+            http_version: har_http_version(),
+            cookies: Vec::new(),
+            headers: har_headers_from_value(entry.request_headers.as_ref()),
+            query_string: Vec::new(),
+            post_data,
+            headers_size: -1,
+            body_size: -1,
+        },
+        response: HarResponse {
+            status: response_status,
+            status_text: response_status_text,
+            http_version: response_protocol,
+            cookies: Vec::new(),
+            headers: response_headers,
+            content,
+            redirect_url: String::new(),
+            headers_size: -1,
+            body_size,
+        },
+        cache: json!({}),
+        timings: HarTimings::default(),
+        synapse_request_id: Some(entry.request_id.clone()),
+        synapse_resource_type: entry.resource_type.clone(),
+    })
+}
+
+fn har_entry_to_route_rule(
+    index: usize,
+    entry: &HarEntry,
+) -> Result<Option<synapse_a11y::CdpFetchRouteRule>, ErrorData> {
+    if entry.request.url.is_empty()
+        || entry.request.method.is_empty()
+        || !(100..=599).contains(&entry.response.status)
+    {
+        return Ok(None);
+    }
+    let body_base64 = har_content_body_base64(&entry.response.content)?;
+    Ok(Some(synapse_a11y::CdpFetchRouteRule {
+        id: har_route_id(index, &entry.request.method, &entry.request.url),
+        url: format!("^{}$", regex::escape(&entry.request.url)),
+        match_kind: synapse_a11y::CdpFetchRouteMatchKind::Regex,
+        method: Some(entry.request.method.clone()),
+        resource_type: None,
+        action: synapse_a11y::CdpFetchRouteAction::Fulfill(synapse_a11y::CdpFetchRouteFulfill {
+            status: entry.response.status,
+            response_phrase: (!entry.response.status_text.is_empty())
+                .then(|| entry.response.status_text.clone()),
+            headers: entry
+                .response
+                .headers
+                .iter()
+                .filter(|header| !har_replay_unsafe_response_header(&header.name))
+                .map(|header| (header.name.clone(), header.value.clone()))
+                .collect(),
+            body_base64,
+        }),
+    }))
+}
+
+fn har_replay_unsafe_response_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "content-encoding"
+            | "content-length"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+fn har_missing_abort_rule() -> synapse_a11y::CdpFetchRouteRule {
+    synapse_a11y::CdpFetchRouteRule {
+        id: HAR_REPLAY_MISS_ROUTE_ID.to_owned(),
+        url: "*".to_owned(),
+        match_kind: synapse_a11y::CdpFetchRouteMatchKind::Glob,
+        method: None,
+        resource_type: None,
+        action: synapse_a11y::CdpFetchRouteAction::Abort(synapse_a11y::CdpFetchRouteAbort {
+            error_reason: BrowserRouteErrorReason::BlockedByClient
+                .as_cdp_str()
+                .to_owned(),
+        }),
+    }
+}
+
+fn clear_har_replay_routes(cdp_target_id: &str) -> Result<usize, ErrorData> {
+    let routes = synapse_a11y::fetch_route_rules(cdp_target_id).unwrap_or_default();
+    let route_ids = routes
+        .into_iter()
+        .filter(|route| route.id.starts_with(HAR_REPLAY_ROUTE_PREFIX))
+        .map(|route| route.id)
+        .collect::<Vec<_>>();
+    let mut removed = 0usize;
+    for route_id in route_ids {
+        if synapse_a11y::fetch_route_remove(cdp_target_id, &route_id).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("{HAR_TOOL} raw CDP Fetch route remove failed: {error}"),
+            )
+        })? {
+            removed = removed.saturating_add(1);
+        }
+    }
+    Ok(removed)
+}
+
+async fn stop_fetch_if_no_routes(cdp_target_id: &str) -> Result<(), ErrorData> {
+    let routes = synapse_a11y::fetch_route_rules(cdp_target_id).unwrap_or_default();
+    if routes.is_empty() && synapse_a11y::fetch_interception_status(cdp_target_id).is_some() {
+        synapse_a11y::fetch_interception_stop(cdp_target_id)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("{HAR_TOOL} raw CDP Fetch disable failed: {error}"),
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn har_headers_from_value(value: Option<&Value>) -> Vec<HarHeader> {
+    let Some(Value::Object(headers)) = value else {
+        return Vec::new();
+    };
+    headers
+        .iter()
+        .map(|(name, value)| HarHeader {
+            name: name.clone(),
+            value: header_json_value_to_string(value),
+        })
+        .collect()
+}
+
+fn header_lookup(headers: Option<&Value>, name: &str) -> Option<String> {
+    let Value::Object(headers) = headers? else {
+        return None;
+    };
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| header_json_value_to_string(value))
+}
+
+fn header_json_value_to_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn har_content_from_response(
+    response: Option<&synapse_a11y::CdpNetworkResponseSnapshot>,
+    body: Option<synapse_a11y::CdpNetworkResponseBody>,
+) -> HarContent {
+    let mime_type = response
+        .map(|response| response.mime_type.clone())
+        .unwrap_or_default();
+    let mut content = HarContent {
+        size: response
+            .map(|response| response.encoded_data_length.max(0.0) as i64)
+            .unwrap_or(0),
+        mime_type,
+        text: None,
+        encoding: None,
+    };
+    if let Some(body) = body {
+        content.size = if body.base64_encoded {
+            BASE64_STANDARD
+                .decode(&body.body)
+                .map(|bytes| bytes.len() as i64)
+                .unwrap_or_else(|_| body.body.len() as i64)
+        } else {
+            body.body.len() as i64
+        };
+        content.text = Some(body.body);
+        content.encoding = body.base64_encoded.then(|| "base64".to_owned());
+    }
+    content
+}
+
+fn har_content_body_base64(content: &HarContent) -> Result<Option<String>, ErrorData> {
+    let Some(text) = content.text.as_deref() else {
+        return Ok(None);
+    };
+    if content
+        .encoding
+        .as_deref()
+        .is_some_and(|encoding| encoding.eq_ignore_ascii_case("base64"))
+    {
+        BASE64_STANDARD.decode(text).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{HAR_TOOL} HAR response content is not valid base64: {error}"),
+            )
+        })?;
+        return Ok(Some(text.to_owned()));
+    }
+    Ok(Some(BASE64_STANDARD.encode(text.as_bytes())))
+}
+
+fn har_route_id(index: usize, method: &str, url: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    method.hash(&mut hasher);
+    url.hash(&mut hasher);
+    format!(
+        "{HAR_REPLAY_ROUTE_PREFIX}{index:04x}-{:016x}",
+        hasher.finish()
+    )
+}
+
+fn har_datetime(unix_ms: Option<f64>) -> String {
+    let unix_ms = unix_ms.unwrap_or_else(current_unix_ms);
+    let secs = (unix_ms / 1000.0).floor() as i64;
+    let nanos = ((unix_ms - (secs as f64 * 1000.0)) * 1_000_000.0)
+        .round()
+        .clamp(0.0, 999_999_999.0) as u32;
+    DateTime::<Utc>::from_timestamp(secs, nanos)
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn current_unix_ms() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs_f64() * 1000.0)
+        .unwrap_or(0.0)
+}
+
+fn har_version() -> String {
+    "1.2".to_owned()
+}
+
+fn har_http_version() -> String {
+    "HTTP/2".to_owned()
+}
+
+fn har_epoch_datetime() -> String {
+    "1970-01-01T00:00:00.000Z".to_owned()
+}
+
+fn har_unknown_time() -> f64 {
+    -1.0
+}
+
+fn har_size_unknown() -> i64 {
+    -1
 }
 
 fn browser_network_entry_to_wire(entry: &synapse_a11y::CdpNetworkEntry) -> BrowserNetworkWaitEntry {
@@ -2768,6 +3935,7 @@ fn browser_route_rule_to_wire(rule: &synapse_a11y::CdpFetchRouteRule) -> Browser
                 synapse_a11y::CdpFetchRouteMatchKind::Glob => BrowserRouteMatchKind::Glob,
                 synapse_a11y::CdpFetchRouteMatchKind::Regex => BrowserRouteMatchKind::Regex,
             },
+            method: rule.method.clone(),
             resource_type: rule.resource_type.clone(),
             action: "fulfill".to_owned(),
             status: Some(fulfill.status),
@@ -2796,6 +3964,7 @@ fn browser_route_rule_to_wire(rule: &synapse_a11y::CdpFetchRouteRule) -> Browser
                 synapse_a11y::CdpFetchRouteMatchKind::Glob => BrowserRouteMatchKind::Glob,
                 synapse_a11y::CdpFetchRouteMatchKind::Regex => BrowserRouteMatchKind::Regex,
             },
+            method: rule.method.clone(),
             resource_type: rule.resource_type.clone(),
             action: "abort".to_owned(),
             status: None,
@@ -2814,6 +3983,7 @@ fn browser_route_rule_to_wire(rule: &synapse_a11y::CdpFetchRouteRule) -> Browser
                 synapse_a11y::CdpFetchRouteMatchKind::Glob => BrowserRouteMatchKind::Glob,
                 synapse_a11y::CdpFetchRouteMatchKind::Regex => BrowserRouteMatchKind::Regex,
             },
+            method: rule.method.clone(),
             resource_type: rule.resource_type.clone(),
             action: "continue".to_owned(),
             status: None,
@@ -3060,6 +4230,168 @@ mod tests {
             assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
         }
         println!("readback=browser_network_websockets validation edges rejected invalid params");
+    }
+
+    #[test]
+    fn browser_network_har_validation_edges() {
+        let record = validate_browser_network_har_params(&BrowserNetworkHarParams {
+            cdp_target_id: Some("target-123".to_owned()),
+            operation: BrowserNetworkHarOperation::Record,
+            path: Some(r"C:\tmp\capture.har".to_owned()),
+            since_seq: Some(3),
+            limit: Some(50),
+            url_contains: Some("api".to_owned()),
+            include_bodies: Some(false),
+            ..Default::default()
+        })
+        .expect("valid HAR record params pass");
+        assert_eq!(record.operation, BrowserNetworkHarOperation::Record);
+        assert_eq!(record.filters.since_seq, Some(3));
+        assert_eq!(record.filters.limit, 50);
+        assert!(!record.include_bodies);
+
+        let replay = validate_browser_network_har_params(&BrowserNetworkHarParams {
+            operation: BrowserNetworkHarOperation::Replay,
+            path: Some(r"C:\tmp\capture.har".to_owned()),
+            limit: Some(25),
+            missing_policy: Some(BrowserNetworkHarMissingPolicy::Abort),
+            clear_existing_replay: Some(false),
+            ..Default::default()
+        })
+        .expect("valid HAR replay params pass");
+        assert_eq!(replay.operation, BrowserNetworkHarOperation::Replay);
+        assert_eq!(replay.filters.limit, 25);
+        assert_eq!(replay.missing_policy, BrowserNetworkHarMissingPolicy::Abort);
+        assert!(!replay.clear_existing_replay);
+
+        let clear = validate_browser_network_har_params(&BrowserNetworkHarParams {
+            operation: BrowserNetworkHarOperation::ClearReplay,
+            ..Default::default()
+        })
+        .expect("valid HAR clear params pass");
+        assert_eq!(clear.operation, BrowserNetworkHarOperation::ClearReplay);
+
+        for error in [
+            validate_browser_network_har_params(&BrowserNetworkHarParams {
+                operation: BrowserNetworkHarOperation::Record,
+                ..Default::default()
+            })
+            .expect_err("record requires path"),
+            validate_browser_network_har_params(&BrowserNetworkHarParams {
+                operation: BrowserNetworkHarOperation::Replay,
+                path: Some("capture.har".to_owned()),
+                url_contains: Some("api".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("replay rejects record filters"),
+            validate_browser_network_har_params(&BrowserNetworkHarParams {
+                operation: BrowserNetworkHarOperation::ClearReplay,
+                path: Some("capture.har".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("clear rejects path"),
+            validate_browser_network_har_params(&BrowserNetworkHarParams {
+                operation: BrowserNetworkHarOperation::Record,
+                path: Some("capture.har".to_owned()),
+                url_contains: Some("api".to_owned()),
+                url_regex: Some("api".to_owned()),
+                ..Default::default()
+            })
+            .expect_err("record rejects ambiguous URL filters"),
+        ] {
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+        println!("readback=browser_network_har validation edges rejected invalid params");
+    }
+
+    #[tokio::test]
+    async fn browser_network_har_record_writes_har_and_replay_rules() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("capture.har");
+        let entries = vec![entry(
+            1,
+            "req-1",
+            "https://example.test/api/data?x=1",
+            "Fetch",
+            Some(200),
+        )];
+
+        let written = write_har_record("target-1", &path, &entries, false)
+            .await
+            .expect("write HAR");
+        assert_eq!(written.entry_count, 1);
+        assert_eq!(written.skipped_count, 0);
+        assert!(written.bytes_written > 0);
+        let raw = fs::read_to_string(&path).expect("read HAR");
+        assert!(raw.contains("\"version\": \"1.2\""));
+        assert!(raw.contains("\"_synapseRequestId\": \"req-1\""));
+
+        let replay = load_har_replay(&path, 10, BrowserNetworkHarMissingPolicy::Abort)
+            .expect("load HAR replay");
+        assert_eq!(replay.entry_count, 1);
+        assert_eq!(replay.skipped_count, 0);
+        assert!(replay.missing_abort_route_installed);
+        assert_eq!(replay.rules.len(), 2);
+        assert_eq!(replay.rules[0].method.as_deref(), Some("GET"));
+        assert!(replay.rules[0].url.starts_with('^'));
+        assert_eq!(replay.rules[1].id, HAR_REPLAY_MISS_ROUTE_ID);
+        println!(
+            "readback=browser_network_har record_entries={} replay_rules={}",
+            written.entry_count,
+            replay.rules.len()
+        );
+    }
+
+    #[test]
+    fn browser_network_har_replay_encodes_text_content() {
+        let har_entry = HarEntry {
+            request: HarRequest {
+                method: "POST".to_owned(),
+                url: "https://example.test/submit".to_owned(),
+                ..Default::default()
+            },
+            response: HarResponse {
+                status: 201,
+                status_text: "Created".to_owned(),
+                headers: vec![
+                    HarHeader {
+                        name: "content-type".to_owned(),
+                        value: "text/plain".to_owned(),
+                    },
+                    HarHeader {
+                        name: "content-length".to_owned(),
+                        value: "999".to_owned(),
+                    },
+                ],
+                content: HarContent {
+                    size: 5,
+                    mime_type: "text/plain".to_owned(),
+                    text: Some("hello".to_owned()),
+                    encoding: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let rule = har_entry_to_route_rule(0, &har_entry)
+            .expect("HAR route")
+            .expect("route exists");
+        assert_eq!(rule.method.as_deref(), Some("POST"));
+        match rule.action {
+            synapse_a11y::CdpFetchRouteAction::Fulfill(fulfill) => {
+                assert_eq!(fulfill.status, 201);
+                assert_eq!(fulfill.body_base64.as_deref(), Some("aGVsbG8="));
+                assert_eq!(fulfill.headers.len(), 1);
+                assert_eq!(fulfill.headers[0].0, "content-type");
+            }
+            _ => panic!("expected fulfill rule"),
+        }
+        println!("readback=browser_network_har replay text content encoded as base64");
     }
 
     #[test]
@@ -3489,6 +4821,7 @@ mod tests {
             id: "api-users".to_owned(),
             url: "https://example.test/api/*".to_owned(),
             match_kind: synapse_a11y::CdpFetchRouteMatchKind::Regex,
+            method: None,
             resource_type: Some("XHR".to_owned()),
             action: synapse_a11y::CdpFetchRouteAction::Fulfill(
                 synapse_a11y::CdpFetchRouteFulfill {
@@ -3516,6 +4849,7 @@ mod tests {
             id: "block-images".to_owned(),
             url: "https://example.test/assets/*".to_owned(),
             match_kind: synapse_a11y::CdpFetchRouteMatchKind::Glob,
+            method: None,
             resource_type: Some("Image".to_owned()),
             action: synapse_a11y::CdpFetchRouteAction::Abort(synapse_a11y::CdpFetchRouteAbort {
                 error_reason: "BlockedByClient".to_owned(),
@@ -3538,6 +4872,7 @@ mod tests {
             id: "rewrite-api".to_owned(),
             url: "https://example.test/api/*".to_owned(),
             match_kind: synapse_a11y::CdpFetchRouteMatchKind::Glob,
+            method: None,
             resource_type: Some("Fetch".to_owned()),
             action: synapse_a11y::CdpFetchRouteAction::Continue(
                 synapse_a11y::CdpFetchRouteContinue {
