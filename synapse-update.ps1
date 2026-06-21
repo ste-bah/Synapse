@@ -212,7 +212,13 @@ if (-not $env:CMAKE_BUILD_PARALLEL_LEVEL) {
 # ---------------------------------------------------------------------------
 Step "Rebuilding and reconnecting (scripts\synapse-setup.ps1)"
 $setupParams = @{ SourceDir = $RepoRoot }
-& $SetupScript @setupParams @SetupArgs
+# Forward only real pass-through args. When no -SetupArgs are given, $SetupArgs is
+# $null; splatting it as `@SetupArgs` passes a stray positional $null that binds to
+# synapse-setup.ps1's first positional parameter (-Bind), coercing it to '' and
+# failing with "Cannot bind argument to parameter 'Bind' because it is an empty
+# string." Filtering to a clean array (empty when none) splats to nothing instead.
+$forwardSetupArgs = @($SetupArgs | Where-Object { $null -ne $_ })
+& $SetupScript @setupParams @forwardSetupArgs
 if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne $null) {
     Die "synapse-setup.ps1 exited with code $LASTEXITCODE."
 }

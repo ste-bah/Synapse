@@ -164,11 +164,22 @@ function Get-ProcessLineage {
     $lineage = @()
     $seen = @{}
     $current = $StartPid
+    $child = $null
     while ($current -and -not $seen.ContainsKey($current)) {
         $seen[$current] = $true
         $p = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
         if (-not $p) { break }
+        # Guard against Windows PID reuse: ParentProcessId is a bare number, so
+        # once a real parent exits its PID can be recycled by an unrelated, newer
+        # process. A genuine parent always starts no later than its child; if the
+        # candidate "parent" started after the child it is a recycled PID, not a
+        # true ancestor, so stop the walk rather than climb into a phantom chain
+        # (e.g. wininit.exe <- cmd.exe, which falsely tripped the cmd-ancestor guard).
+        if ($child -and $p.CreationDate -and $child.CreationDate -and $p.CreationDate -gt $child.CreationDate) {
+            break
+        }
         $lineage += $p
+        $child = $p
         $current = [int]$p.ParentProcessId
     }
     return $lineage
