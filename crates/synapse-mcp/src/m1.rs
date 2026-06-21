@@ -1213,6 +1213,111 @@ pub struct BrowserEvaluateResponse {
     pub required_foreground: bool,
 }
 
+/// Operation for `browser_expose_binding`.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserExposeBindingOperation {
+    /// Install Runtime.addBinding and arm the per-target binding event buffer.
+    #[default]
+    Add,
+    /// Read the existing buffer without adding or removing a binding.
+    Read,
+    /// Stop receiving Runtime.bindingCalled notifications for this binding.
+    Remove,
+}
+
+/// Parameters for `browser_expose_binding` (#1069): expose/read/remove a
+/// page-callable Runtime binding on the calling session's owned CDP page target.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserExposeBindingParams {
+    /// Add, read, or remove the binding. Defaults to add.
+    #[serde(default)]
+    pub operation: BrowserExposeBindingOperation,
+    /// Binding function name exposed on `window`. Synapse accepts JavaScript
+    /// identifier names so page code can call `window.name("payload")`.
+    pub name: String,
+    /// CDP TargetID to mutate/read. Defaults to the active session CDP target.
+    /// Must be owned by this session; the human foreground tab is never an
+    /// implicit fallback.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only with an explicit
+    /// `cdp_target_id` and no active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Optional execution context name for Runtime.addBinding, matching CDP
+    /// `executionContextName` / init-script `worldName`.
+    #[serde(default)]
+    pub execution_context_name: Option<String>,
+    /// Return only entries with `seq >= since_seq` (delta semantics). Pass the
+    /// prior response's `next_cursor` to receive only newer entries.
+    #[serde(default)]
+    pub since_seq: Option<u64>,
+    /// Maximum calls to return (default 200), oldest-first after the cursor.
+    #[serde(default)]
+    pub max_calls: Option<usize>,
+}
+
+/// One captured Runtime.bindingCalled payload.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserBindingCall {
+    /// Monotonic per-target sequence number; the cursor for delta reads.
+    pub seq: u64,
+    pub name: String,
+    /// String payload passed by page code to the binding function.
+    pub payload: String,
+    /// Full payload length in Unicode scalar values before truncation.
+    pub payload_len: usize,
+    pub payload_truncated: bool,
+    /// JSON-decoded payload when the string is valid JSON and not truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_json: Option<serde_json::Value>,
+    pub execution_context_id: i64,
+    pub timestamp_ms: f64,
+}
+
+/// Response for `browser_expose_binding`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserExposeBindingResponse {
+    pub session_id: String,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub operation: BrowserExposeBindingOperation,
+    pub name: String,
+    /// `true` if this call established the long-lived target listener.
+    pub newly_armed: bool,
+    /// `true` when Runtime.addBinding was sent on this call.
+    pub binding_newly_added: bool,
+    /// `true` when Runtime.removeBinding was sent on this call.
+    pub binding_removed: bool,
+    /// When the persistent target listener was armed (Unix ms), or 0 when no
+    /// listener exists for an idempotent remove on an unarmed target.
+    pub armed_at_unix_ms: f64,
+    /// Whether this binding remains active for future Runtime.bindingCalled
+    /// delivery after this operation.
+    pub binding_active: bool,
+    pub active_binding_count: usize,
+    pub active_binding_names: Vec<String>,
+    pub url: String,
+    pub title: String,
+    pub ready_state: String,
+    /// Filtered, cursor-delimited binding calls.
+    pub calls: Vec<BrowserBindingCall>,
+    /// Highest assigned target buffer seq. Pass back as `since_seq` next call.
+    pub next_cursor: u64,
+    pub returned: usize,
+    pub total_buffered: usize,
+    pub dropped: u64,
+    pub readback_backend: String,
+    pub backend_tier_used: String,
+    pub required_foreground: bool,
+}
+
 /// Operation for `browser_add_init_script`.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

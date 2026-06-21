@@ -3,6 +3,7 @@ use super::{
     BrowserAddStyleTagParams, BrowserAddTagResponse, BrowserAdoptActiveTabParams,
     BrowserAdoptActiveTabResponse, BrowserConsoleMessagesParams, BrowserConsoleMessagesResponse,
     BrowserContentParams, BrowserContentResponse, BrowserEvaluateParams, BrowserEvaluateResponse,
+    BrowserExposeBindingOperation, BrowserExposeBindingParams, BrowserExposeBindingResponse,
     BrowserInitScriptOperation, BrowserInspectParams, BrowserInspectResponse,
     BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
     BrowserNetworkWaitEntry, BrowserSetContentParams, BrowserSetContentResponse, BrowserTabEntry,
@@ -1800,6 +1801,71 @@ impl SynapseService {
                 &args,
                 await_promise,
                 return_by_value,
+            )
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Expose, read, or remove a Playwright-style page binding on the calling session's owned browser tab via raw CDP Runtime.addBinding / Runtime.bindingCalled / Runtime.removeBinding. operation=add installs a string-argument function on window and arms a persistent per-target event listener; operation=read returns the buffered payloads without mutating the page; operation=remove unsubscribes this Synapse runtime agent so future calls stop being delivered to the buffer. CDP removeBinding does not delete the JavaScript function object from existing page globals, so removal is verified by no new Runtime.bindingCalled delivery. Pair with browser_add_init_script when page code should re-wire helper wrappers across navigation. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; read-only payload capture, no host callback execution."
+    )]
+    pub async fn browser_expose_binding(
+        &self,
+        params: Parameters<BrowserExposeBindingParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserExposeBindingResponse>, ErrorData> {
+        const TOOL: &str = "browser_expose_binding";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_expose_binding"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let max_calls = validate_browser_expose_binding_params(&params.0)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(params.0.cdp_target_id.as_deref()),
+            "operation": params.0.operation,
+            "name": &params.0.name,
+            "execution_context_name": params.0.execution_context_name.as_deref(),
+            "since_seq": params.0.since_seq,
+            "max_calls": max_calls,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            params.0.cdp_target_id.as_deref(),
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "operation": params.0.operation,
+            "name": &params.0.name,
+            "execution_context_name": params.0.execution_context_name.as_deref(),
+            "since_seq": params.0.since_seq,
+            "max_calls": max_calls,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_expose_binding_impl(
+                &session_id,
+                window_hwnd,
+                &cdp_target_id,
+                &params.0,
+                max_calls,
             )
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
@@ -4642,6 +4708,171 @@ impl SynapseService {
     }
 
     #[cfg(windows)]
+    async fn browser_expose_binding_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        params: &BrowserExposeBindingParams,
+        max_calls: usize,
+    ) -> Result<BrowserExposeBindingResponse, ErrorData> {
+        let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            return Err(browser_raw_cdp_required_error(
+                "browser_expose_binding",
+                window_hwnd,
+            ));
+        };
+        let mut status = synapse_a11y::CdpBindingCaptureStatus {
+            newly_armed: false,
+            binding_newly_added: false,
+            binding_removed: false,
+            endpoint: endpoint.clone(),
+            cdp_target_id: cdp_target_id.to_owned(),
+            name: params.name.clone(),
+            armed_at_unix_ms: 0.0,
+            capacity: 0,
+            binding_active: false,
+            active_binding_count: 0,
+            active_binding_names: Vec::new(),
+        };
+        match params.operation {
+            BrowserExposeBindingOperation::Add => {
+                status = synapse_a11y::binding_capture_add(
+                    &endpoint,
+                    cdp_target_id,
+                    &params.name,
+                    params.execution_context_name.as_deref(),
+                    synapse_a11y::DEFAULT_BINDING_BUFFER_CAPACITY,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("browser_expose_binding Runtime.addBinding failed: {error}"),
+                    )
+                })?;
+            }
+            BrowserExposeBindingOperation::Read => {}
+            BrowserExposeBindingOperation::Remove => {
+                status =
+                    synapse_a11y::binding_capture_remove(&endpoint, cdp_target_id, &params.name)
+                        .await
+                        .map_err(|error| {
+                            mcp_error(
+                                error.code(),
+                                format!(
+                                    "browser_expose_binding Runtime.removeBinding failed: {error}"
+                                ),
+                            )
+                        })?;
+            }
+        }
+
+        let state =
+            synapse_a11y::cdp_evaluate_expression(&endpoint, cdp_target_id, "null", false, true)
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("browser_expose_binding page state read-back failed: {error}"),
+                    )
+                })?;
+        let filter = synapse_a11y::CdpBindingReadFilter {
+            since_seq: params.since_seq,
+            max: max_calls,
+        };
+        let read =
+            synapse_a11y::binding_capture_read(&endpoint, cdp_target_id, &params.name, &filter);
+        let read = match read {
+            Some(read) => read,
+            None if params.operation == BrowserExposeBindingOperation::Read => {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "browser_expose_binding read requested binding {:?} on target {cdp_target_id}, but no capture is armed; call operation=add first",
+                        params.name
+                    ),
+                ));
+            }
+            None => synapse_a11y::CdpBindingReadResult {
+                calls: Vec::new(),
+                next_cursor: 0,
+                returned: 0,
+                total_buffered: 0,
+                dropped: 0,
+                armed_at_unix_ms: status.armed_at_unix_ms,
+                binding_active: status.binding_active,
+                active_binding_count: status.active_binding_count,
+                active_binding_names: status.active_binding_names.clone(),
+            },
+        };
+        tracing::info!(
+            code = "CDP_BACKGROUND_BINDING",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            endpoint = %endpoint,
+            cdp_target_id = %state.target_id,
+            operation = ?params.operation,
+            name = %params.name,
+            newly_armed = status.newly_armed,
+            binding_newly_added = status.binding_newly_added,
+            binding_removed = status.binding_removed,
+            returned = read.returned,
+            total_buffered = read.total_buffered,
+            dropped = read.dropped,
+            target_url = %state.url,
+            "readback=Runtime.addBinding+Runtime.bindingCalled+Runtime.removeBinding outcome=binding_buffer_read"
+        );
+        Ok(BrowserExposeBindingResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "raw_cdp".to_owned(),
+            endpoint,
+            cdp_target_id: state.target_id,
+            operation: params.operation,
+            name: params.name.clone(),
+            newly_armed: status.newly_armed,
+            binding_newly_added: status.binding_newly_added,
+            binding_removed: status.binding_removed,
+            armed_at_unix_ms: read.armed_at_unix_ms,
+            binding_active: read.binding_active,
+            active_binding_count: read.active_binding_count,
+            active_binding_names: read.active_binding_names,
+            url: state.url,
+            title: state.title,
+            ready_state: state.ready_state,
+            calls: read
+                .calls
+                .into_iter()
+                .map(browser_binding_call_from_entry)
+                .collect(),
+            next_cursor: read.next_cursor,
+            returned: read.returned,
+            total_buffered: read.total_buffered,
+            dropped: read.dropped,
+            readback_backend: "Runtime.addBinding+Runtime.bindingCalled+Runtime.removeBinding"
+                .to_owned(),
+            backend_tier_used: "cdp".to_owned(),
+            required_foreground: false,
+        })
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_expose_binding_impl(
+        &self,
+        _session_id: &str,
+        _window_hwnd: i64,
+        _cdp_target_id: &str,
+        _params: &BrowserExposeBindingParams,
+        _max_calls: usize,
+    ) -> Result<BrowserExposeBindingResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_expose_binding is only available on Windows in this build",
+        ))
+    }
+
+    #[cfg(windows)]
     async fn browser_add_init_script_impl(
         &self,
         session_id: &str,
@@ -6898,6 +7129,9 @@ pub(super) fn validate_cdp_target_id(cdp_target_id: &str) -> Result<(), ErrorDat
 /// Default and ceiling on `browser_console_messages` entries returned per call.
 const DEFAULT_BROWSER_CONSOLE_MESSAGES: usize = 200;
 const MAX_BROWSER_CONSOLE_MESSAGES: usize = 5_000;
+const DEFAULT_BROWSER_BINDING_CALLS: usize = 200;
+const MAX_BROWSER_BINDING_CALLS: usize = 5_000;
+const BROWSER_BINDING_NAME_MAX_CHARS: usize = 128;
 
 /// Projects a captured [`synapse_a11y::ConsoleEntry`] into the MCP response shape.
 #[cfg(windows)]
@@ -6913,6 +7147,22 @@ fn console_message_from_entry(entry: synapse_a11y::ConsoleEntry) -> ConsoleMessa
         column: entry.column,
         stack: entry.stack,
         category: entry.category,
+        timestamp_ms: entry.timestamp_ms,
+    }
+}
+
+#[cfg(windows)]
+fn browser_binding_call_from_entry(
+    entry: synapse_a11y::CdpBindingCall,
+) -> super::BrowserBindingCall {
+    super::BrowserBindingCall {
+        seq: entry.seq,
+        name: entry.name,
+        payload: entry.payload,
+        payload_len: entry.payload_len,
+        payload_truncated: entry.payload_truncated,
+        payload_json: entry.payload_json,
+        execution_context_id: entry.execution_context_id,
         timestamp_ms: entry.timestamp_ms,
     }
 }
@@ -8382,6 +8632,70 @@ fn validate_browser_add_init_script_params(
         }
     }
     Ok(())
+}
+
+fn validate_browser_expose_binding_params(
+    params: &BrowserExposeBindingParams,
+) -> Result<usize, ErrorData> {
+    if let Some(target_id) = params.cdp_target_id.as_deref() {
+        validate_cdp_target_id(target_id)?;
+    }
+    validate_browser_binding_name(&params.name)?;
+    if let Some(execution_context_name) = params.execution_context_name.as_deref() {
+        validate_browser_init_script_world_name(execution_context_name)?;
+    }
+    if params.operation != BrowserExposeBindingOperation::Add
+        && params.execution_context_name.is_some()
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_expose_binding execution_context_name is only valid for operation=add",
+        ));
+    }
+    let max_calls = params
+        .max_calls
+        .unwrap_or(DEFAULT_BROWSER_BINDING_CALLS)
+        .min(MAX_BROWSER_BINDING_CALLS);
+    Ok(max_calls)
+}
+
+fn validate_browser_binding_name(name: &str) -> Result<(), ErrorData> {
+    if name.trim() != name || name.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_expose_binding name must be a non-empty JavaScript identifier without leading or trailing whitespace",
+        ));
+    }
+    if name.chars().count() > BROWSER_BINDING_NAME_MAX_CHARS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_expose_binding name must be at most {BROWSER_BINDING_NAME_MAX_CHARS} Unicode scalar values"
+            ),
+        ));
+    }
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_expose_binding name must not be empty",
+        ));
+    };
+    if !is_js_identifier_start(first) || !chars.all(is_js_identifier_continue) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_expose_binding name must be an ASCII JavaScript identifier, e.g. myBinding",
+        ));
+    }
+    Ok(())
+}
+
+fn is_js_identifier_start(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphabetic()
+}
+
+fn is_js_identifier_continue(ch: char) -> bool {
+    is_js_identifier_start(ch) || ch.is_ascii_digit()
 }
 
 fn validate_browser_init_script_identifier(identifier: &str) -> Result<(), ErrorData> {
@@ -11229,17 +11543,17 @@ mod tests {
         target_wire, template_value, unavailable_page_vitals_info,
         validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
         validate_browser_add_style_tag_params, validate_browser_evaluate_params,
-        validate_browser_set_content_params, validate_browser_wait_for_function_params,
-        validate_browser_wait_for_load_state_params, validate_browser_wait_for_params,
-        validate_browser_wait_for_request_params, validate_browser_wait_for_response_params,
-        validate_browser_wait_for_selector_params, validate_browser_wait_for_url_params,
-        validate_target_window,
+        validate_browser_expose_binding_params, validate_browser_set_content_params,
+        validate_browser_wait_for_function_params, validate_browser_wait_for_load_state_params,
+        validate_browser_wait_for_params, validate_browser_wait_for_request_params,
+        validate_browser_wait_for_response_params, validate_browser_wait_for_selector_params,
+        validate_browser_wait_for_url_params, validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
-        BrowserEvaluateParams, BrowserInitScriptOperation, BrowserSetContentParams,
-        BrowserTabEntry, BrowserTabsResponse, BrowserWaitForFunctionParams,
-        BrowserWaitForLoadStateParams, BrowserWaitForLoadStateState,
+        BrowserEvaluateParams, BrowserExposeBindingOperation, BrowserExposeBindingParams,
+        BrowserInitScriptOperation, BrowserSetContentParams, BrowserTabEntry, BrowserTabsResponse,
+        BrowserWaitForFunctionParams, BrowserWaitForLoadStateParams, BrowserWaitForLoadStateState,
         BrowserWaitForNetworkResponseParams, BrowserWaitForParams, BrowserWaitForRequestParams,
         BrowserWaitForSelectorParams, BrowserWaitForSelectorState, BrowserWaitForState,
         BrowserWaitForUrlMatchKind, BrowserWaitForUrlParams, CdpActivateTabParams,
@@ -11479,6 +11793,71 @@ mod tests {
         println!(
             "readback=browser_evaluate validation edges all rejected with TOOL_PARAMS_INVALID"
         );
+    }
+
+    #[test]
+    fn browser_expose_binding_params_validation_edges() {
+        let max = validate_browser_expose_binding_params(&BrowserExposeBindingParams {
+            operation: BrowserExposeBindingOperation::Add,
+            name: "myBinding".to_owned(),
+            cdp_target_id: Some("target-123".to_owned()),
+            window_hwnd: None,
+            execution_context_name: Some("synapse_world".to_owned()),
+            since_seq: None,
+            max_calls: Some(usize::MAX),
+        })
+        .expect("valid add params must pass");
+        assert_eq!(max, super::MAX_BROWSER_BINDING_CALLS);
+
+        assert!(
+            validate_browser_expose_binding_params(&BrowserExposeBindingParams {
+                operation: BrowserExposeBindingOperation::Read,
+                name: "$binding_1".to_owned(),
+                cdp_target_id: None,
+                window_hwnd: None,
+                execution_context_name: None,
+                since_seq: Some(7),
+                max_calls: Some(10),
+            })
+            .is_ok()
+        );
+
+        for invalid in ["", " bad", "bad-name", "1bad", "bad.name"] {
+            let error = validate_browser_expose_binding_params(&BrowserExposeBindingParams {
+                operation: BrowserExposeBindingOperation::Add,
+                name: invalid.to_owned(),
+                cdp_target_id: None,
+                window_hwnd: None,
+                execution_context_name: None,
+                since_seq: None,
+                max_calls: None,
+            })
+            .expect_err("invalid binding name must be rejected");
+            let code = error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(serde_json::Value::as_str);
+            assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        }
+
+        let error = validate_browser_expose_binding_params(&BrowserExposeBindingParams {
+            operation: BrowserExposeBindingOperation::Remove,
+            name: "myBinding".to_owned(),
+            cdp_target_id: None,
+            window_hwnd: None,
+            execution_context_name: Some("synapse_world".to_owned()),
+            since_seq: None,
+            max_calls: None,
+        })
+        .expect_err("execution_context_name is add-only");
+        let code = error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
+        println!("readback=browser_expose_binding validation edges rejected invalid params");
     }
 
     #[test]

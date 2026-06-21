@@ -24,9 +24,10 @@ use crate::{
     m1::{
         BrowserAddInitScriptParams, BrowserAddInitScriptResponse, BrowserAddScriptTagParams,
         BrowserAddStyleTagParams, BrowserAddTagResponse, BrowserAdoptActiveTabParams,
-        BrowserAdoptActiveTabResponse, BrowserConsoleMessagesParams,
+        BrowserAdoptActiveTabResponse, BrowserBindingCall, BrowserConsoleMessagesParams,
         BrowserConsoleMessagesResponse, BrowserContentParams, BrowserContentResponse,
-        BrowserEvaluateParams, BrowserEvaluateResponse, BrowserInitScriptOperation,
+        BrowserEvaluateParams, BrowserEvaluateResponse, BrowserExposeBindingOperation,
+        BrowserExposeBindingParams, BrowserExposeBindingResponse, BrowserInitScriptOperation,
         BrowserInspectParams, BrowserInspectResponse, BrowserLayoutRelation, BrowserLocateEngine,
         BrowserLocateParams, BrowserLocateResponse, BrowserNetworkWaitEntry,
         BrowserSetContentParams, BrowserSetContentResponse, BrowserTabEntry, BrowserTabsParams,
