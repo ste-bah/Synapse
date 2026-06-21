@@ -11,10 +11,16 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    ContinueRequestParams as FetchContinueRequestParams, DisableParams as FetchDisableParams,
+    EnableParams as FetchEnableParams, EventRequestPaused as FetchEventRequestPaused,
+    RequestId as FetchRequestId, RequestPattern as FetchRequestPattern,
+    RequestStage as FetchRequestStage,
+};
 use chromiumoxide::cdp::browser_protocol::network::{
     EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
     EventRequestWillBeSent, EventResponseReceived, GetRequestPostDataParams, GetResponseBodyParams,
-    Headers, Response,
+    Headers, ResourceType as NetworkResourceType, Response,
 };
 use chromiumoxide::{Browser, Page};
 use futures_util::StreamExt as _;
@@ -174,6 +180,39 @@ pub struct CdpNetworkResponseBody {
 pub struct CdpNetworkRequestPostData {
     pub request_id: String,
     pub post_data: String,
+}
+
+/// Fetch interception stage for [`CdpFetchInterceptionPattern`].
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+pub enum CdpFetchInterceptionStage {
+    #[default]
+    Request,
+    Response,
+}
+
+/// CDP Fetch interception pattern. An empty pattern list passed to
+/// [`fetch_interception_ensure`] means "intercept all requests".
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct CdpFetchInterceptionPattern {
+    pub url_pattern: Option<String>,
+    pub resource_type: Option<String>,
+    pub request_stage: CdpFetchInterceptionStage,
+}
+
+/// Status/readback for the continue-by-default Fetch interception scaffold.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CdpFetchInterceptionStatus {
+    pub newly_armed: bool,
+    pub endpoint: String,
+    pub cdp_target_id: String,
+    pub armed_at_unix_ms: u64,
+    pub pattern_count: usize,
+    pub paused_count: u64,
+    pub continued_count: u64,
+    pub continue_error_count: u64,
+    pub last_request_id: Option<String>,
+    pub last_url: Option<String>,
+    pub last_error: Option<String>,
 }
 
 struct RingBuffer {
@@ -338,9 +377,48 @@ struct NetworkCaptureRegistry {
     slots: Mutex<HashMap<String, Arc<NetworkCaptureSlot>>>,
 }
 
+#[derive(Default)]
+struct FetchInterceptionCounters {
+    paused_count: u64,
+    continued_count: u64,
+    continue_error_count: u64,
+    last_request_id: Option<String>,
+    last_url: Option<String>,
+    last_error: Option<String>,
+}
+
+struct FetchInterceptionSlot {
+    endpoint: String,
+    target_id: String,
+    armed_at_unix_ms: u64,
+    patterns: Vec<CdpFetchInterceptionPattern>,
+    counters: Arc<Mutex<FetchInterceptionCounters>>,
+    page: Page,
+    _browser: Browser,
+    handler_task: JoinHandle<()>,
+    listener_task: JoinHandle<()>,
+}
+
+impl Drop for FetchInterceptionSlot {
+    fn drop(&mut self) {
+        self.handler_task.abort();
+        self.listener_task.abort();
+    }
+}
+
+#[derive(Default)]
+struct FetchInterceptionRegistry {
+    slots: Mutex<HashMap<String, Arc<FetchInterceptionSlot>>>,
+}
+
 fn registry() -> &'static NetworkCaptureRegistry {
     static REGISTRY: OnceLock<NetworkCaptureRegistry> = OnceLock::new();
     REGISTRY.get_or_init(NetworkCaptureRegistry::default)
+}
+
+fn fetch_registry() -> &'static FetchInterceptionRegistry {
+    static REGISTRY: OnceLock<FetchInterceptionRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(FetchInterceptionRegistry::default)
 }
 
 /// Arms (or re-arms) persistent CDP Network capture for `target_id`.
@@ -617,6 +695,155 @@ pub async fn network_request_post_data(
     })
 }
 
+/// Enables the Fetch domain for a target and continues every paused request by
+/// default. This is the route/interception substrate; rules are layered later.
+pub async fn fetch_interception_ensure(
+    endpoint: &str,
+    target_id: &str,
+    patterns: Vec<CdpFetchInterceptionPattern>,
+) -> A11yResult<CdpFetchInterceptionStatus> {
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "fetch interception target id must not be empty".to_owned(),
+        });
+    }
+
+    if let Some(slot) = lookup_fetch_live(target_id) {
+        if slot.patterns == patterns {
+            return Ok(fetch_interception_status_from_slot(&slot, false));
+        }
+        let _ = fetch_interception_stop(target_id).await?;
+    }
+
+    let fetch_patterns = fetch_patterns_to_cdp(&patterns)?;
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|err| A11yError::CdpAttachFailed {
+                detail: format!("fetch interception connect {endpoint}: {err}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+
+    let armed = async {
+        let page = crate::cdp_action::get_target_page_with_discovery(&browser, target_id).await?;
+        let mut enable = FetchEnableParams::builder().handle_auth_requests(false);
+        if !fetch_patterns.is_empty() {
+            enable = enable.patterns(fetch_patterns);
+        }
+        page.execute(enable.build())
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("Fetch.enable for interception scaffold: {err}"),
+            })?;
+        let request_paused = page
+            .event_listener::<FetchEventRequestPaused>()
+            .await
+            .map_err(|err| A11yError::CdpAxtreeFailed {
+                detail: format!("subscribe Fetch.requestPaused: {err}"),
+            })?;
+        Ok::<_, A11yError>((page, request_paused))
+    }
+    .await;
+
+    let (page, mut request_paused) = match armed {
+        Ok(armed) => armed,
+        Err(err) => {
+            handler_task.abort();
+            return Err(err);
+        }
+    };
+
+    let counters = Arc::new(Mutex::new(FetchInterceptionCounters::default()));
+    let pump_counters = Arc::clone(&counters);
+    let slot_page = page.clone();
+    let listener_page = page.clone();
+    let listener_task = tokio::spawn(async move {
+        let _page = page;
+        while let Some(event) = request_paused.next().await {
+            let event = event.as_ref();
+            let request_id = fetch_request_id_string(&event.request_id);
+            if let Ok(mut counters) = pump_counters.lock() {
+                counters.paused_count = counters.paused_count.saturating_add(1);
+                counters.last_request_id = Some(request_id.clone());
+                counters.last_url = Some(event.request.url.clone());
+            }
+            let continued = listener_page
+                .execute(FetchContinueRequestParams::new(event.request_id.clone()))
+                .await;
+            if let Ok(mut counters) = pump_counters.lock() {
+                match continued {
+                    Ok(_) => {
+                        counters.continued_count = counters.continued_count.saturating_add(1);
+                    }
+                    Err(error) => {
+                        counters.continue_error_count =
+                            counters.continue_error_count.saturating_add(1);
+                        counters.last_error = Some(format!(
+                            "Fetch.continueRequest request_id={request_id}: {error}"
+                        ));
+                    }
+                }
+            }
+        }
+    });
+
+    let armed_at_unix_ms = now_unix_ms() as u64;
+    let slot = Arc::new(FetchInterceptionSlot {
+        endpoint: endpoint.to_owned(),
+        target_id: target_id.to_owned(),
+        armed_at_unix_ms,
+        patterns,
+        counters,
+        page: slot_page,
+        _browser: browser,
+        handler_task,
+        listener_task,
+    });
+    if let Ok(mut slots) = fetch_registry().slots.lock() {
+        if let Some(existing) = slots.get(target_id)
+            && !existing.listener_task.is_finished()
+        {
+            return Ok(fetch_interception_status_from_slot(existing, false));
+        }
+        slots.insert(target_id.to_owned(), Arc::clone(&slot));
+    }
+    Ok(fetch_interception_status_from_slot(&slot, true))
+}
+
+/// Returns the current Fetch interception scaffold status for a target.
+#[must_use]
+pub fn fetch_interception_status(target_id: &str) -> Option<CdpFetchInterceptionStatus> {
+    lookup_fetch_live(target_id.trim())
+        .map(|slot| fetch_interception_status_from_slot(&slot, false))
+}
+
+/// Disables Fetch interception for a target. Returns false when no slot exists.
+pub async fn fetch_interception_stop(target_id: &str) -> A11yResult<bool> {
+    let target_id = target_id.trim();
+    let slot = fetch_registry()
+        .slots
+        .lock()
+        .ok()
+        .and_then(|mut slots| slots.remove(target_id));
+    let Some(slot) = slot else {
+        return Ok(false);
+    };
+    slot.page
+        .execute(FetchDisableParams::default())
+        .await
+        .map_err(|err| A11yError::CdpAxtreeFailed {
+            detail: format!("Fetch.disable for target {target_id}: {err}"),
+        })?;
+    Ok(true)
+}
+
+/// Number of targets with an active Fetch interception scaffold.
+#[must_use]
+pub fn fetch_interception_active_count() -> usize {
+    fetch_registry().slots.lock().map(|s| s.len()).unwrap_or(0)
+}
+
 /// Tears down network capture for a target. Idempotent.
 pub fn network_capture_stop(target_id: &str) -> bool {
     registry()
@@ -664,6 +891,88 @@ fn lookup_live(target_id: &str) -> Option<Arc<NetworkCaptureSlot>> {
         }
         None => None,
     }
+}
+
+fn lookup_fetch_live(target_id: &str) -> Option<Arc<FetchInterceptionSlot>> {
+    let mut slots = fetch_registry().slots.lock().ok()?;
+    match slots.get(target_id) {
+        Some(slot) if !slot.listener_task.is_finished() => Some(Arc::clone(slot)),
+        Some(_) => {
+            slots.remove(target_id);
+            None
+        }
+        None => None,
+    }
+}
+
+fn fetch_interception_status_from_slot(
+    slot: &FetchInterceptionSlot,
+    newly_armed: bool,
+) -> CdpFetchInterceptionStatus {
+    let counters = slot.counters.lock().ok();
+    CdpFetchInterceptionStatus {
+        newly_armed,
+        endpoint: slot.endpoint.clone(),
+        cdp_target_id: slot.target_id.clone(),
+        armed_at_unix_ms: slot.armed_at_unix_ms,
+        pattern_count: slot.patterns.len(),
+        paused_count: counters.as_ref().map_or(0, |c| c.paused_count),
+        continued_count: counters.as_ref().map_or(0, |c| c.continued_count),
+        continue_error_count: counters.as_ref().map_or(0, |c| c.continue_error_count),
+        last_request_id: counters.as_ref().and_then(|c| c.last_request_id.clone()),
+        last_url: counters.as_ref().and_then(|c| c.last_url.clone()),
+        last_error: counters.as_ref().and_then(|c| c.last_error.clone()),
+    }
+}
+
+fn fetch_patterns_to_cdp(
+    patterns: &[CdpFetchInterceptionPattern],
+) -> A11yResult<Vec<FetchRequestPattern>> {
+    patterns
+        .iter()
+        .map(fetch_pattern_to_cdp)
+        .collect::<A11yResult<Vec<_>>>()
+}
+
+fn fetch_pattern_to_cdp(pattern: &CdpFetchInterceptionPattern) -> A11yResult<FetchRequestPattern> {
+    let mut builder = FetchRequestPattern::builder().request_stage(match pattern.request_stage {
+        CdpFetchInterceptionStage::Request => FetchRequestStage::Request,
+        CdpFetchInterceptionStage::Response => FetchRequestStage::Response,
+    });
+    if let Some(url_pattern) = pattern.url_pattern.as_deref() {
+        if url_pattern.is_empty() {
+            return Err(A11yError::CdpAttachFailed {
+                detail: "Fetch request pattern url_pattern must not be empty".to_owned(),
+            });
+        }
+        if url_pattern.contains('\0') {
+            return Err(A11yError::CdpAttachFailed {
+                detail: "Fetch request pattern url_pattern must not contain NUL".to_owned(),
+            });
+        }
+        builder = builder.url_pattern(url_pattern.to_owned());
+    }
+    if let Some(resource_type) = pattern.resource_type.as_deref() {
+        if resource_type.trim() != resource_type || resource_type.is_empty() {
+            return Err(A11yError::CdpAttachFailed {
+                detail: "Fetch request pattern resource_type must be non-empty without surrounding whitespace"
+                    .to_owned(),
+            });
+        }
+        let resource_type = resource_type
+            .parse::<NetworkResourceType>()
+            .map_err(|error| A11yError::CdpAttachFailed {
+                detail: format!(
+                    "Fetch request pattern resource_type {resource_type:?} is invalid: {error}"
+                ),
+            })?;
+        builder = builder.resource_type(resource_type);
+    }
+    Ok(builder.build())
+}
+
+fn fetch_request_id_string(request_id: &FetchRequestId) -> String {
+    <FetchRequestId as std::borrow::Borrow<str>>::borrow(request_id).to_owned()
 }
 
 fn normalize_request_id(request_id: &str) -> A11yResult<&str> {
@@ -913,5 +1222,43 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["r2", "r1"]);
         assert_eq!(entries[1].response.as_ref().map(|r| r.status), Some(201));
+    }
+
+    #[test]
+    fn fetch_pattern_conversion_preserves_url_resource_type_and_stage() {
+        let converted = fetch_pattern_to_cdp(&CdpFetchInterceptionPattern {
+            url_pattern: Some("https://example.test/api/*".to_owned()),
+            resource_type: Some("XHR".to_owned()),
+            request_stage: CdpFetchInterceptionStage::Response,
+        })
+        .expect("pattern converts");
+        let value = serde_json::to_value(converted).expect("pattern json");
+        assert_eq!(value["urlPattern"], "https://example.test/api/*");
+        assert_eq!(value["resourceType"], "XHR");
+        assert_eq!(value["requestStage"], "Response");
+    }
+
+    #[test]
+    fn fetch_pattern_conversion_rejects_invalid_values() {
+        assert!(
+            fetch_pattern_to_cdp(&CdpFetchInterceptionPattern {
+                url_pattern: Some(String::new()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+        assert!(
+            fetch_pattern_to_cdp(&CdpFetchInterceptionPattern {
+                resource_type: Some("NotAResource".to_owned()),
+                ..Default::default()
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn fetch_request_id_string_round_trips_generated_id() {
+        let request_id = FetchRequestId::from("intercept-1".to_owned());
+        assert_eq!(fetch_request_id_string(&request_id), "intercept-1");
     }
 }
