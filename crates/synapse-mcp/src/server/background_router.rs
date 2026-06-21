@@ -130,6 +130,17 @@ pub struct TargetActParams {
     /// `select`: option text or option value.
     #[serde(default)]
     pub option: Option<String>,
+    /// `select`: option label/text. Use when the select element itself is
+    /// located separately and the option must be matched by label.
+    #[serde(default, alias = "optionLabel", alias = "label")]
+    pub option_label: Option<String>,
+    /// `select`: zero-based option index.
+    #[serde(default, alias = "optionIndex", alias = "index")]
+    pub option_index: Option<i32>,
+    /// `select`: one or more explicit option specs for single or multi-select.
+    /// Each entry must contain exactly one of `value`, `label`, or `index`.
+    #[serde(default)]
+    pub options: Vec<TargetActSelectOption>,
     /// `dispatch_event`: DOM event type to dispatch on the matched element.
     #[serde(default, alias = "eventType")]
     pub event_type: Option<String>,
@@ -169,6 +180,17 @@ pub struct TargetActParams {
     /// `run_shell`: inline wait budget (ms). Defaults to 30000.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TargetActSelectOption {
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub index: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, Deserialize, JsonSchema, Eq, PartialEq)]
@@ -214,7 +236,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a raw-CDP browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a raw-CDP browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -2293,10 +2315,16 @@ fn target_act_validate_dom_primitive_params(
         .option
         .as_ref()
         .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .option_label
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params.option_index.is_some()
+        || !params.options.is_empty()
     {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!("target_act verb={action} does not accept option"),
+            format!("target_act verb={action} does not accept select option fields"),
         ));
     }
     if params
@@ -2543,6 +2571,9 @@ async fn target_act_browser_dom_action(
         "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "value_present": params.value.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "option_present": params.option.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "option_label_present": params.option_label.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "option_index": params.option_index,
+        "options_count": params.options.len(),
         "event_type": params.event_type.as_deref(),
         "event_init_present": params.event_init.is_some(),
         "clicks": params.clicks,
@@ -2596,6 +2627,9 @@ async fn target_act_browser_dom_action(
         "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "value_present": params.value.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "option_present": params.option.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "option_label_present": params.option_label.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "option_index": params.option_index,
+        "options_count": params.options.len(),
         "event_type": params.event_type.as_deref(),
         "event_init_present": params.event_init.is_some(),
         "clicks": params.clicks,
@@ -2607,6 +2641,15 @@ async fn target_act_browser_dom_action(
         &request_details,
         &session_id,
     )?;
+    let options_value = (!params.options.is_empty())
+        .then(|| serde_json::to_value(&params.options))
+        .transpose()
+        .map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("target_act select options encode failed: {error}"),
+            )
+        })?;
     let result = crate::chrome_debugger_bridge::dom_action(
         crate::chrome_debugger_bridge::ChromeDebuggerDomActionRequest {
             hwnd: window_hwnd,
@@ -2618,6 +2661,9 @@ async fn target_act_browser_dom_action(
             name: params.name.as_deref(),
             value: params.value.as_deref(),
             option: params.option.as_deref(),
+            option_label: params.option_label.as_deref(),
+            option_index: params.option_index,
+            options: options_value.as_ref(),
             event_type: params.event_type.as_deref(),
             event_init: params.event_init.as_ref(),
             clicks: params.clicks,
@@ -3360,16 +3406,13 @@ fn target_act_validate_dom_locator(
             ),
         ));
     }
-    if action == "select"
-        && !params
-            .option
-            .as_ref()
-            .or(params.value.as_ref())
-            .is_some_and(|value| !value.trim().is_empty())
-    {
+    if action == "select" {
+        target_act_validate_select_options(params)?;
+    }
+    if action == "select" && !target_act_has_select_option_spec(params) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=select requires option or value",
+            "target_act verb=select requires option, value, option_label, option_index, or options[]",
         ));
     }
     if action == "dispatch_event"
@@ -3396,6 +3439,65 @@ fn target_act_validate_dom_locator(
     }
     if matches!(action, "click" | "press") {
         let _ = target_act_click_count(params.clicks)?;
+    }
+    Ok(())
+}
+
+fn target_act_has_select_option_spec(params: &TargetActParams) -> bool {
+    params
+        .option
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .value
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .option_label
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params.option_index.is_some()
+        || !params.options.is_empty()
+}
+
+fn target_act_validate_select_options(params: &TargetActParams) -> Result<(), ErrorData> {
+    if let Some(index) = params.option_index
+        && index < 0
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("target_act verb=select option_index must be >= 0, got {index}"),
+        ));
+    }
+    for (entry_index, option) in params.options.iter().enumerate() {
+        let has_value = option
+            .value
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let has_label = option
+            .label
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty());
+        let has_index = option.index.is_some();
+        let present = usize::from(has_value) + usize::from(has_label) + usize::from(has_index);
+        if present != 1 {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "target_act verb=select options[{entry_index}] must contain exactly one of value, label, or index"
+                ),
+            ));
+        }
+        if let Some(index) = option.index
+            && index < 0
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "target_act verb=select options[{entry_index}].index must be >= 0, got {index}"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -5270,6 +5372,60 @@ mod tests {
         .expect("select params should deserialize");
         assert_eq!(select.verb.as_str(), "select");
         target_act_validate_dom_locator("select", &select).expect("select locator should validate");
+
+        let select_by_label: TargetActParams = serde_json::from_value(json!({
+            "verb": "select",
+            "selector": "#scope",
+            "option_label": "Workers KV Storage"
+        }))
+        .expect("select by label params should deserialize");
+        assert_eq!(
+            select_by_label.option_label.as_deref(),
+            Some("Workers KV Storage")
+        );
+        target_act_validate_dom_locator("select", &select_by_label)
+            .expect("select label should validate");
+
+        let select_by_index: TargetActParams = serde_json::from_value(json!({
+            "verb": "select",
+            "selector": "#scope",
+            "option_index": 2
+        }))
+        .expect("select by index params should deserialize");
+        assert_eq!(select_by_index.option_index, Some(2));
+        target_act_validate_dom_locator("select", &select_by_index)
+            .expect("select index should validate");
+
+        let select_many: TargetActParams = serde_json::from_value(json!({
+            "verb": "select",
+            "selector": "#scope",
+            "options": [
+                { "value": "read" },
+                { "label": "Write" },
+                { "index": 3 }
+            ]
+        }))
+        .expect("multi-select params should deserialize");
+        assert_eq!(select_many.options.len(), 3);
+        target_act_validate_dom_locator("select", &select_many)
+            .expect("multi-select options should validate");
+
+        let bad_select_option: TargetActParams = serde_json::from_value(json!({
+            "verb": "select",
+            "selector": "#scope",
+            "options": [
+                { "value": "read", "label": "Read" }
+            ]
+        }))
+        .expect("bad select option shape should deserialize");
+        let error = target_act_validate_dom_locator("select", &bad_select_option)
+            .expect_err("ambiguous select option spec should be rejected");
+        assert!(
+            error
+                .message
+                .contains("exactly one of value, label, or index"),
+            "select validation should reject ambiguous option specs: {error:?}"
+        );
 
         let submit: TargetActParams = serde_json::from_value(json!({
             "verb": "submit",

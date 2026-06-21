@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-21-element-primitives-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-21-select-option-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "4f94fd969f23e3cb64b01ce58b4e6da262e562951a83cae8f68e6cddc8678d06";
+    "7766b118e7be6fa28cffe98d97fb993c1a0e229c98a8ec205d169045f3c7a5c9";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -3735,6 +3735,9 @@ pub(crate) struct ChromeDebuggerDomActionRequest<'a> {
     pub name: Option<&'a str>,
     pub value: Option<&'a str>,
     pub option: Option<&'a str>,
+    pub option_label: Option<&'a str>,
+    pub option_index: Option<i32>,
+    pub options: Option<&'a Value>,
     pub event_type: Option<&'a str>,
     pub event_init: Option<&'a Value>,
     pub clicks: Option<u8>,
@@ -3758,6 +3761,9 @@ pub(crate) async fn dom_action(
                 "name": request.name,
                 "value": request.value,
                 "option": request.option,
+                "optionLabel": request.option_label,
+                "optionIndex": request.option_index,
+                "options": request.options,
                 "eventType": request.event_type,
                 "eventInit": request.event_init,
                 "clicks": request.clicks,

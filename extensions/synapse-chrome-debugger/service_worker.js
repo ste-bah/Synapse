@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-element-primitives-v1";
-const BRIDGE_BUILD_SHA256 = "4f94fd969f23e3cb64b01ce58b4e6da262e562951a83cae8f68e6cddc8678d06";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-select-option-v1";
+const BRIDGE_BUILD_SHA256 = "7766b118e7be6fa28cffe98d97fb993c1a0e229c98a8ec205d169045f3c7a5c9";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -1141,6 +1141,9 @@ async function handleDomAction(params) {
     name: stringOrNull(params.name),
     value: stringOrNull(params.value),
     option: stringOrNull(params.option),
+    optionLabel: stringOrNull(params.optionLabel),
+    optionIndex: params.optionIndex === null || params.optionIndex === undefined ? null : normalizeInteger(params.optionIndex, "optionIndex"),
+    options: action === "select" ? normalizeSelectOptions(params.options) : [],
     eventType: action === "dispatch_event" ? normalizeEventType(params.eventType) : null,
     eventInit: action === "dispatch_event" ? normalizeEventInit(params.eventInit) : null,
     clicks: normalizeClickCount(params.clicks),
@@ -2897,6 +2900,48 @@ function normalizeEventInit(value) {
   return value;
 }
 
+function normalizeInteger(value, fieldName) {
+  const number = Number(value);
+  if (!Number.isSafeInteger(number)) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `domAction ${fieldName} must be a safe integer; got ${JSON.stringify(value)}`
+    );
+  }
+  return number;
+}
+
+function normalizeSelectOptions(value) {
+  if (value === null || value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `domAction select options must be an array of {value,label,index}; got ${JSON.stringify(value)}`
+    );
+  }
+  return value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      throw bridgeError(
+        ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+        `domAction select options[${index}] must be an object; got ${JSON.stringify(item)}`
+      );
+    }
+    const spec = {};
+    if (item.value !== null && item.value !== undefined) {
+      spec.value = String(item.value);
+    }
+    if (item.label !== null && item.label !== undefined) {
+      spec.label = String(item.label);
+    }
+    if (item.index !== null && item.index !== undefined) {
+      spec.index = normalizeInteger(item.index, `options[${index}].index`);
+    }
+    return spec;
+  });
+}
+
 function normalizeCoordinateValue(value, fieldName) {
   const coordinate = Number(value);
   if (!Number.isSafeInteger(coordinate)) {
@@ -2934,7 +2979,10 @@ function performDomActionInPage(request) {
     role: normalizeText(request?.role),
     name: normalizeText(request?.name),
     value: stringOrEmpty(request?.value),
-    option: stringOrEmpty(request?.option)
+    option: stringOrEmpty(request?.option),
+    optionLabel: stringOrEmpty(request?.optionLabel),
+    optionIndex: Number.isSafeInteger(request?.optionIndex) ? request.optionIndex : null,
+    options: Array.isArray(request?.options) ? request.options : []
   };
   const clicks = Number.isSafeInteger(request?.clicks) ? request.clicks : 1;
   const eventType = stringOrEmpty(request?.eventType);
@@ -2998,7 +3046,7 @@ function performDomActionInPage(request) {
     if (action === "click" || action === "press") {
       actionReadback = performClick(element, clicks, eventsDispatched);
     } else if (action === "select") {
-      actionReadback = performNativeSelect(element, locator.option || locator.value, eventsDispatched);
+      actionReadback = performNativeSelect(element, locator, eventsDispatched);
     } else if (action === "submit") {
       actionReadback = performSubmit(element, eventsDispatched);
     } else if (action === "dispatch_event") {
@@ -3368,45 +3416,142 @@ function performDomActionInPage(request) {
     return ["focus", "blur", "focusin", "focusout"].includes(lower);
   }
 
-  function performNativeSelect(element, requested, events) {
+  function performNativeSelect(element, loc, events) {
     if (tag(element) !== "select") {
       throw actionError(
         ERROR_ACTION_UNSUPPORTED,
         `domAction select supports native <select> only; resolved ${tag(element)} role=${inferRole(element)}`
       );
     }
-    const optionNeedle = stringOrEmpty(requested);
-    if (!optionNeedle) {
-      throw actionError(ERROR_ACTION_UNSUPPORTED, "domAction select requires option or value");
+    const specs = selectOptionSpecs(loc);
+    if (specs.length === 0) {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, "domAction select requires option, value, option_label, option_index, or options[]");
+    }
+    if (specs.length > 1 && !element.multiple) {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, "domAction select received multiple option specs for a non-multiple <select>");
     }
     const options = Array.from(element.options || []);
-    const exactValue = options.filter((option) => String(option.value ?? "") === optionNeedle);
-    const exactText = options.filter((option) => normalizeText(option.textContent) === normalizeText(optionNeedle));
-    const matches = exactValue.length > 0 ? exactValue : exactText;
-    if (matches.length === 0) {
-      throw actionError(ERROR_ELEMENT_NOT_FOUND, `no <option> matched ${JSON.stringify(optionNeedle)}`);
+    const resolved = specs.map((spec) => resolveSelectOption(options, spec));
+    if (element.multiple) {
+      for (const option of options) {
+        option.selected = false;
+      }
+      for (const option of resolved) {
+        option.selected = true;
+      }
+    } else {
+      for (const option of options) {
+        option.selected = false;
+      }
+      resolved[0].selected = true;
+      element.selectedIndex = resolved[0].index;
     }
-    if (matches.length > 1) {
-      throw actionError(ERROR_ELEMENT_AMBIGUOUS, `${matches.length} <option> elements matched ${JSON.stringify(optionNeedle)}`);
-    }
-    const option = matches[0];
-    element.value = String(option.value ?? "");
-    option.selected = true;
     element.dispatchEvent(new Event("input", { bubbles: true }));
     events.push("input");
     element.dispatchEvent(new Event("change", { bubbles: true }));
     events.push("change");
-    if (element.value !== String(option.value ?? "")) {
-      throw actionError(
-        ERROR_POSTCONDITION_FAILED,
-        `select value readback ${JSON.stringify(element.value)} did not equal requested option value ${JSON.stringify(option.value)}`
-      );
+    const selectedOptions = Array.from(element.selectedOptions || []).map(optionReadback);
+    const requested = specs.map(selectSpecReadback);
+    for (const spec of specs) {
+      const found = selectedOptions.some((option) => option.index === spec.resolvedIndex);
+      if (!found) {
+        throw actionError(
+          ERROR_POSTCONDITION_FAILED,
+          `select postcondition failed: option index ${spec.resolvedIndex} was not selected`
+        );
+      }
     }
     return {
-      selected_value: String(option.value ?? ""),
-      selected_text: trimForReadback(option.textContent, 160),
+      multiple: Boolean(element.multiple),
+      requested_options: requested,
+      selected_options: selectedOptions,
+      selected_values: selectedOptions.map((option) => option.value),
+      selected_labels: selectedOptions.map((option) => option.label),
+      selected_indices: selectedOptions.map((option) => option.index),
+      selected_value: String(element.value ?? ""),
       selected_index: element.selectedIndex
     };
+  }
+
+  function selectOptionSpecs(loc) {
+    const specs = [];
+    if (loc.option) {
+      specs.push({ kind: "value_or_label", value: loc.option });
+    }
+    if (loc.value) {
+      specs.push({ kind: "value_or_label", value: loc.value });
+    }
+    if (loc.optionLabel) {
+      specs.push({ kind: "label", label: loc.optionLabel });
+    }
+    if (loc.optionIndex !== null) {
+      specs.push({ kind: "index", index: loc.optionIndex });
+    }
+    for (const raw of loc.options) {
+      const value = raw && raw.value !== null && raw.value !== undefined ? String(raw.value) : "";
+      const label = raw && raw.label !== null && raw.label !== undefined ? String(raw.label) : "";
+      const hasIndex = raw && Number.isSafeInteger(raw.index);
+      const present = [value !== "", label !== "", hasIndex].filter(Boolean).length;
+      if (present !== 1) {
+        throw actionError(ERROR_ACTION_UNSUPPORTED, `select options[] entries must contain exactly one of value, label, or index; got ${JSON.stringify(raw)}`);
+      }
+      if (value !== "") {
+        specs.push({ kind: "value", value });
+      } else if (label !== "") {
+        specs.push({ kind: "label", label });
+      } else {
+        specs.push({ kind: "index", index: raw.index });
+      }
+    }
+    return specs;
+  }
+
+  function resolveSelectOption(options, spec) {
+    let matches = [];
+    if (spec.kind === "index") {
+      if (!Number.isSafeInteger(spec.index) || spec.index < 0 || spec.index >= options.length) {
+        throw actionError(ERROR_ELEMENT_NOT_FOUND, `no <option> matched index ${JSON.stringify(spec.index)}; option_count=${options.length}`);
+      }
+      const option = options[spec.index];
+      spec.resolvedIndex = option.index;
+      return option;
+    }
+    if (spec.kind === "value") {
+      matches = options.filter((option) => String(option.value ?? "") === spec.value);
+    } else if (spec.kind === "label") {
+      matches = options.filter((option) => normalizeText(option.textContent) === normalizeText(spec.label));
+    } else {
+      const exactValue = options.filter((option) => String(option.value ?? "") === spec.value);
+      const exactText = options.filter((option) => normalizeText(option.textContent) === normalizeText(spec.value));
+      matches = exactValue.length > 0 ? exactValue : exactText;
+    }
+    if (matches.length === 0) {
+      throw actionError(ERROR_ELEMENT_NOT_FOUND, `no <option> matched ${JSON.stringify(selectSpecReadback(spec))}`);
+    }
+    if (matches.length > 1) {
+      throw actionError(ERROR_ELEMENT_AMBIGUOUS, `${matches.length} <option> elements matched ${JSON.stringify(selectSpecReadback(spec))}`);
+    }
+    spec.resolvedIndex = matches[0].index;
+    return matches[0];
+  }
+
+  function optionReadback(option) {
+    return {
+      value: String(option.value ?? ""),
+      label: trimForReadback(option.textContent, 160),
+      index: option.index,
+      disabled: Boolean(option.disabled)
+    };
+  }
+
+  function selectSpecReadback(spec) {
+    if (spec.kind === "index") {
+      return { index: spec.index };
+    }
+    if (spec.kind === "label") {
+      return { label: spec.label };
+    }
+    return { value: spec.value };
   }
 
   function performSubmit(element, events) {
@@ -3742,7 +3887,10 @@ function performDomActionInPage(request) {
       role: loc.role || null,
       name: loc.name || null,
       value: loc.value || null,
-      option: loc.option || null
+      option: loc.option || null,
+      optionLabel: loc.optionLabel || null,
+      optionIndex: loc.optionIndex,
+      options_count: Array.isArray(loc.options) ? loc.options.length : 0
     });
   }
 
