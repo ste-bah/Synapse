@@ -47,7 +47,7 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, tap, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window";
+const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, tap, dispatch_event, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window";
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -129,6 +129,14 @@ pub struct TargetActParams {
     /// `select`: option text or option value.
     #[serde(default)]
     pub option: Option<String>,
+    /// `dispatch_event`: DOM event type to dispatch on the matched element.
+    #[serde(default, alias = "eventType")]
+    pub event_type: Option<String>,
+    /// `dispatch_event`: EventInit/CustomEventInit-style JSON object. `detail`
+    /// creates a CustomEvent; common mouse/keyboard/input event types use their
+    /// specialized constructors when available.
+    #[serde(default, alias = "eventInit")]
+    pub event_init: Option<Value>,
     /// `click`: click count for target element clicks. Defaults to 1; valid range is 1..=3.
     #[serde(default)]
     pub clicks: Option<u8>,
@@ -205,7 +213,7 @@ pub struct TargetActResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a raw-CDP browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd and never falls back to mouse click; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a raw-CDP browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses a native dropdown option; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -456,6 +464,10 @@ impl SynapseService {
                 }
             }
             "tap" => target_act_touch_tap(self, &params, &request_context).await?,
+            "dispatch_event" | "dispatchevent" => {
+                target_act_browser_dom_action(self, "dispatch_event", &params, &request_context)
+                    .await?
+            }
             "type" => {
                 if target_act_has_any_locator(&params) {
                     return Err(mcp_error(
@@ -2217,6 +2229,8 @@ async fn target_act_browser_dom_action(
         "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "value_present": params.value.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "option_present": params.option.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "event_type": params.event_type.as_deref(),
+        "event_init_present": params.event_init.is_some(),
         "clicks": params.clicks,
         "wait_timeout_ms": wait_timeout_ms,
         "required_foreground": false,
@@ -2268,6 +2282,8 @@ async fn target_act_browser_dom_action(
         "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "value_present": params.value.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "option_present": params.option.as_ref().is_some_and(|value| !value.trim().is_empty()),
+        "event_type": params.event_type.as_deref(),
+        "event_init_present": params.event_init.is_some(),
         "clicks": params.clicks,
         "wait_timeout_ms": wait_timeout_ms,
         "required_foreground": false,
@@ -2288,6 +2304,8 @@ async fn target_act_browser_dom_action(
             name: params.name.as_deref(),
             value: params.value.as_deref(),
             option: params.option.as_deref(),
+            event_type: params.event_type.as_deref(),
+            event_init: params.event_init.as_ref(),
             clicks: params.clicks,
             wait_timeout_ms,
         },
@@ -3038,6 +3056,28 @@ fn target_act_validate_dom_locator(
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "target_act verb=select requires option or value",
+        ));
+    }
+    if action == "dispatch_event"
+        && !params
+            .event_type
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=dispatch_event requires non-empty event_type",
+        ));
+    }
+    if action == "dispatch_event"
+        && params
+            .event_init
+            .as_ref()
+            .is_some_and(|value| !value.is_object())
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=dispatch_event event_init must be a JSON object when supplied",
         ));
     }
     if matches!(action, "click" | "press") {
@@ -4924,6 +4964,33 @@ mod tests {
         .expect("submit params should deserialize");
         assert_eq!(submit.verb.as_str(), "submit");
         target_act_validate_dom_locator("submit", &submit).expect("submit locator should validate");
+
+        let dispatch_event: TargetActParams = serde_json::from_value(json!({
+            "verb": "dispatch_event",
+            "selector": "#token",
+            "event_type": "synapse-ready",
+            "event_init": {
+                "bubbles": true,
+                "cancelable": true,
+                "detail": {
+                    "ok": true
+                }
+            }
+        }))
+        .expect("dispatch_event params should deserialize");
+        assert_eq!(dispatch_event.verb.as_str(), "dispatch_event");
+        assert_eq!(dispatch_event.event_type.as_deref(), Some("synapse-ready"));
+        assert_eq!(
+            dispatch_event
+                .event_init
+                .as_ref()
+                .and_then(|value| value.get("detail"))
+                .and_then(|value| value.get("ok"))
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        target_act_validate_dom_locator("dispatch_event", &dispatch_event)
+            .expect("dispatch_event locator should validate");
     }
 
     #[test]

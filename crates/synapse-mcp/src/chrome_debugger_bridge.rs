@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-21-tab-adopt-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-21-dispatch-event-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "f6927e7983989158827f91fafe195c7d2aba88eed01681f8f87bbb4e835ae5bf";
+    "6927167c6562db4dc9f09d659b14e14b9331b3cf6e1cd476302a3a5b58869b33";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -3735,6 +3735,8 @@ pub(crate) struct ChromeDebuggerDomActionRequest<'a> {
     pub name: Option<&'a str>,
     pub value: Option<&'a str>,
     pub option: Option<&'a str>,
+    pub event_type: Option<&'a str>,
+    pub event_init: Option<&'a Value>,
     pub clicks: Option<u8>,
     pub wait_timeout_ms: u64,
 }
@@ -3756,6 +3758,8 @@ pub(crate) async fn dom_action(
                 "name": request.name,
                 "value": request.value,
                 "option": request.option,
+                "eventType": request.event_type,
+                "eventInit": request.event_init,
                 "clicks": request.clicks,
                 "waitTimeoutMs": request.wait_timeout_ms,
             }),
@@ -4599,6 +4603,12 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
             "action": result.get("action"),
+            "event_type": result
+                .get("action_readback")
+                .and_then(|value| value.get("event_type")),
+            "default_allowed": result
+                .get("action_readback")
+                .and_then(|value| value.get("default_allowed")),
             "matched_count": result.get("matched_count"),
             "resolved_by": result.get("resolved_by"),
             "readback_backend": result.get("readback_backend"),

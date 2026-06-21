@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-tab-adopt-v1";
-const BRIDGE_BUILD_SHA256 = "f6927e7983989158827f91fafe195c7d2aba88eed01681f8f87bbb4e835ae5bf";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-21-dispatch-event-v1";
+const BRIDGE_BUILD_SHA256 = "6927167c6562db4dc9f09d659b14e14b9331b3cf6e1cd476302a3a5b58869b33";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -1141,6 +1141,8 @@ async function handleDomAction(params) {
     name: stringOrNull(params.name),
     value: stringOrNull(params.value),
     option: stringOrNull(params.option),
+    eventType: action === "dispatch_event" ? normalizeEventType(params.eventType) : null,
+    eventInit: action === "dispatch_event" ? normalizeEventInit(params.eventInit) : null,
     clicks: normalizeClickCount(params.clicks),
     maxPageTextChars: MAX_PAGE_TEXT_CHARS
   };
@@ -2828,12 +2830,15 @@ function setFieldValueInPage(request) {
 
 function normalizeDomAction(action) {
   const normalized = String(action || "").trim().toLowerCase();
-  if (["click", "press", "select", "submit"].includes(normalized)) {
+  if (normalized === "dispatchevent" || normalized === "dispatch-event") {
+    return "dispatch_event";
+  }
+  if (["click", "press", "select", "submit", "dispatch_event"].includes(normalized)) {
     return normalized;
   }
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `domAction action must be one of click, press, select, submit; got ${JSON.stringify(action)}`
+    `domAction action must be one of click, press, select, submit, dispatch_event; got ${JSON.stringify(action)}`
   );
 }
 
@@ -2857,6 +2862,36 @@ function normalizeClickCount(value) {
     );
   }
   return clicks;
+}
+
+function normalizeEventType(value) {
+  const eventType = String(value || "").trim();
+  if (!eventType) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `domAction dispatch_event requires non-empty eventType; got ${JSON.stringify(value)}`
+    );
+  }
+  if ([...eventType].some((ch) => ch < " " || ch === "\u007f")) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `domAction dispatch_event eventType contains control characters: ${JSON.stringify(value)}`
+    );
+  }
+  return eventType;
+}
+
+function normalizeEventInit(value) {
+  if (value === null || value === undefined) {
+    return {};
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `domAction dispatch_event eventInit must be a JSON object; got ${JSON.stringify(value)}`
+    );
+  }
+  return value;
 }
 
 function normalizeCoordinateValue(value, fieldName) {
@@ -2899,13 +2934,18 @@ function performDomActionInPage(request) {
     option: stringOrEmpty(request?.option)
   };
   const clicks = Number.isSafeInteger(request?.clicks) ? request.clicks : 1;
+  const eventType = stringOrEmpty(request?.eventType);
+  const eventInit = plainObjectOrEmpty(request?.eventInit);
   const resolveOnly = Boolean(request?.resolveOnly);
   const maxPageTextChars = Number.isSafeInteger(request?.maxPageTextChars)
     ? Math.min(Math.max(request.maxPageTextChars, 0), 65536)
     : 4096;
 
-  if (!["click", "press", "select", "submit"].includes(action)) {
+  if (!["click", "press", "select", "submit", "dispatch_event"].includes(action)) {
     return fail(ERROR_ACTION_UNSUPPORTED, `unsupported DOM action ${JSON.stringify(action)}`);
+  }
+  if (action === "dispatch_event" && !eventType) {
+    return fail(ERROR_ACTION_UNSUPPORTED, "dispatch_event requires a non-empty eventType");
   }
 
   const beforeUrl = String(location.href || "");
@@ -2917,14 +2957,14 @@ function performDomActionInPage(request) {
   const element = resolved.element;
   const beforeElement = elementSummary(element);
 
-  if (!isElementEnabled(element)) {
+  if (action !== "dispatch_event" && !isElementEnabled(element)) {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is disabled or aria-disabled", {
       matched_count: resolved.matchedCount,
       resolved_by: resolved.resolvedBy,
       before_element: beforeElement
     });
   }
-  if (!isElementVisible(element) && action !== "submit") {
+  if (action !== "dispatch_event" && !isElementVisible(element) && action !== "submit") {
     return fail(ERROR_ELEMENT_NOT_ACTIONABLE, "resolved element is not visible/actionable", {
       matched_count: resolved.matchedCount,
       resolved_by: resolved.resolvedBy,
@@ -2957,6 +2997,8 @@ function performDomActionInPage(request) {
       actionReadback = performNativeSelect(element, locator.option || locator.value, eventsDispatched);
     } else if (action === "submit") {
       actionReadback = performSubmit(element, eventsDispatched);
+    } else if (action === "dispatch_event") {
+      actionReadback = performDispatchEvent(element, eventType, eventInit, eventsDispatched);
     }
   } catch (error) {
     return fail(error?.code || ERROR_ACTION_UNSUPPORTED, errorMessageLocal(error), {
@@ -3043,6 +3085,9 @@ function performDomActionInPage(request) {
   }
 
   function semanticCandidates(actionName) {
+    if (actionName === "dispatch_event") {
+      return Array.from(document.querySelectorAll("*"));
+    }
     if (actionName === "select") {
       return Array.from(document.querySelectorAll("select,[role='combobox'],[role='listbox']"));
     }
@@ -3065,6 +3110,73 @@ function performDomActionInPage(request) {
     return {
       click_count: bounded
     };
+  }
+
+  function performDispatchEvent(element, requestedType, requestedInit, events) {
+    const eventType = stringOrEmpty(requestedType);
+    if (!eventType) {
+      throw actionError(ERROR_ACTION_UNSUPPORTED, "dispatch_event requires a non-empty event type");
+    }
+    const eventInit = plainObjectOrEmpty(requestedInit);
+    const event = createDomEvent(eventType, eventInit);
+    const defaultAllowed = element.dispatchEvent(event);
+    events.push(eventType);
+    return {
+      event_type: eventType,
+      constructor_used: event.constructor && event.constructor.name ? String(event.constructor.name) : "Event",
+      default_allowed: Boolean(defaultAllowed),
+      default_prevented: Boolean(event.defaultPrevented),
+      bubbles: Boolean(event.bubbles),
+      cancelable: Boolean(event.cancelable),
+      composed: Boolean(event.composed),
+      detail: "detail" in event ? event.detail : null
+    };
+  }
+
+  function createDomEvent(eventType, eventInit) {
+    const lower = eventType.toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(eventInit, "detail") && typeof CustomEvent === "function") {
+      return new CustomEvent(eventType, eventInit);
+    }
+    if (isPointerEventType(lower) && typeof PointerEvent === "function") {
+      return new PointerEvent(eventType, eventInit);
+    }
+    if (isMouseEventType(lower) && typeof MouseEvent === "function") {
+      return new MouseEvent(eventType, eventInit);
+    }
+    if (isKeyboardEventType(lower) && typeof KeyboardEvent === "function") {
+      return new KeyboardEvent(eventType, eventInit);
+    }
+    if (isInputEventType(lower) && typeof InputEvent === "function") {
+      return new InputEvent(eventType, eventInit);
+    }
+    if (isFocusEventType(lower) && typeof FocusEvent === "function") {
+      return new FocusEvent(eventType, eventInit);
+    }
+    if (lower === "wheel" && typeof WheelEvent === "function") {
+      return new WheelEvent(eventType, eventInit);
+    }
+    return new Event(eventType, eventInit);
+  }
+
+  function isPointerEventType(lower) {
+    return ["pointerover", "pointerenter", "pointerdown", "pointermove", "pointerup", "pointercancel", "pointerout", "pointerleave", "gotpointercapture", "lostpointercapture"].includes(lower);
+  }
+
+  function isMouseEventType(lower) {
+    return ["click", "dblclick", "mousedown", "mouseup", "mouseover", "mousemove", "mouseout", "mouseenter", "mouseleave", "contextmenu", "auxclick"].includes(lower);
+  }
+
+  function isKeyboardEventType(lower) {
+    return ["keydown", "keypress", "keyup"].includes(lower);
+  }
+
+  function isInputEventType(lower) {
+    return ["beforeinput", "input"].includes(lower);
+  }
+
+  function isFocusEventType(lower) {
+    return ["focus", "blur", "focusin", "focusout"].includes(lower);
   }
 
   function performNativeSelect(element, requested, events) {
@@ -3331,6 +3443,20 @@ function performDomActionInPage(request) {
 
   function stringOrEmpty(value) {
     return value === null || value === undefined ? "" : String(value).trim();
+  }
+
+  function plainObjectOrEmpty(value) {
+    if (value === null || value === undefined) {
+      return {};
+    }
+    if (typeof value !== "object" || Array.isArray(value)) {
+      return {};
+    }
+    const out = {};
+    for (const [key, val] of Object.entries(value)) {
+      out[key] = val;
+    }
+    return out;
   }
 
   function trimForReadback(value, maxChars) {
