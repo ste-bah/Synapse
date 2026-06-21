@@ -380,6 +380,8 @@ pub async fn fetch_dom_snapshot(
     target_id_hint: Option<&str>,
     max_nodes: usize,
 ) -> crate::A11yResult<CdpDomSnapshot> {
+    use std::collections::HashSet;
+
     use chromiumoxide::Browser;
     use chromiumoxide::cdp::browser_protocol::target::GetTargetsParams;
     use futures_util::StreamExt as _;
@@ -454,57 +456,78 @@ pub async fn fetch_dom_snapshot(
         let mut frame_tree_frame_count = main_read.frame_tree_frame_count;
         let mut attached_frame_target_count = 0_u32;
         let mut blocked_frame_targets = Vec::new();
-        let related_iframe_targets = related_iframe_targets(&target_infos, &main_read.frame_ids);
-        for target in related_iframe_targets {
-            if nodes.len() >= max_nodes {
-                blocked_frame_targets.push(format!(
-                    "iframe target {} ({}) skipped because max_nodes={} was already reached",
-                    target.target_id.inner(),
-                    target.url,
-                    max_nodes
-                ));
-                continue;
+        let mut known_frame_ids = main_read.frame_ids.clone();
+        let mut seen_oopif_targets = HashSet::from([selection.target_id.clone()]);
+
+        loop {
+            let mut related_targets = related_iframe_targets(&target_infos, &known_frame_ids)
+                .into_iter()
+                .filter(|target| seen_oopif_targets.insert(target.target_id.inner().clone()))
+                .cloned()
+                .collect::<Vec<_>>();
+            related_targets.sort_by(|a, b| a.target_id.inner().cmp(b.target_id.inner()));
+            if related_targets.is_empty() {
+                break;
             }
-            let iframe_page = match wait_for_page_target(&browser, target.target_id.clone()).await {
-                Ok(page) => page,
-                Err(error) => {
+
+            for target in related_targets {
+                if nodes.len() >= max_nodes {
                     blocked_frame_targets.push(format!(
-                        "iframe target {} parentFrameId={} url={} was discovered in Target.getTargets but did not expose a callable flat session through chromiumoxide: {error}",
+                        "iframe target {} ({}) skipped because max_nodes={} was already reached",
                         target.target_id.inner(),
-                        target
-                            .parent_frame_id
-                            .as_ref()
-                            .map_or("", |frame_id| frame_id.inner().as_str()),
-                        target.url
+                        target.url,
+                        max_nodes
                     ));
                     continue;
                 }
-            };
-            let remaining = max_nodes.saturating_sub(nodes.len());
-            match fetch_target_dom_read(&iframe_page, target.target_id.inner(), remaining).await {
-                Ok(read) => {
-                    attached_frame_target_count = attached_frame_target_count.saturating_add(1);
-                    total_ax_nodes = total_ax_nodes.saturating_add(read.total_ax_nodes);
-                    frame_tree_frame_count =
-                        frame_tree_frame_count.saturating_add(read.frame_tree_frame_count);
-                    frame_snapshot_errors.extend(read.frame_snapshot_errors.clone());
-                    nodes.extend(build_accessible_nodes_for_target(
-                        hwnd,
-                        Some(target.target_id.inner()),
-                        &read.dom_nodes,
-                        remaining,
-                    ));
-                }
-                Err(error) => {
-                    blocked_frame_targets.push(format!(
-                        "iframe target {} parentFrameId={} url={} attached but DOM/AX snapshot failed: {error}",
-                        target.target_id.inner(),
-                        target
-                            .parent_frame_id
-                            .as_ref()
-                            .map_or("", |frame_id| frame_id.inner().as_str()),
-                        target.url
-                    ));
+                let iframe_page = match wait_for_page_target(&browser, target.target_id.clone()).await
+                {
+                    Ok(page) => page,
+                    Err(error) => {
+                        blocked_frame_targets.push(format!(
+                            "iframe target {} parentFrameId={} url={} was discovered in Target.getTargets but did not expose a callable flat session through chromiumoxide: {error}",
+                            target.target_id.inner(),
+                            target
+                                .parent_frame_id
+                                .as_ref()
+                                .map_or("", |frame_id| frame_id.inner().as_str()),
+                            target.url
+                        ));
+                        continue;
+                    }
+                };
+                let remaining = max_nodes.saturating_sub(nodes.len());
+                match fetch_target_dom_read(&iframe_page, target.target_id.inner(), remaining).await
+                {
+                    Ok(read) => {
+                        attached_frame_target_count = attached_frame_target_count.saturating_add(1);
+                        total_ax_nodes = total_ax_nodes.saturating_add(read.total_ax_nodes);
+                        frame_tree_frame_count =
+                            frame_tree_frame_count.saturating_add(read.frame_tree_frame_count);
+                        frame_snapshot_errors.extend(read.frame_snapshot_errors.clone());
+                        for frame_id in &read.frame_ids {
+                            if !known_frame_ids.contains(frame_id) {
+                                known_frame_ids.push(frame_id.clone());
+                            }
+                        }
+                        nodes.extend(build_accessible_nodes_for_target(
+                            hwnd,
+                            Some(target.target_id.inner()),
+                            &read.dom_nodes,
+                            remaining,
+                        ));
+                    }
+                    Err(error) => {
+                        blocked_frame_targets.push(format!(
+                            "iframe target {} parentFrameId={} url={} attached but DOM/AX snapshot failed: {error}",
+                            target.target_id.inner(),
+                            target
+                                .parent_frame_id
+                                .as_ref()
+                                .map_or("", |frame_id| frame_id.inner().as_str()),
+                            target.url
+                        ));
+                    }
                 }
             }
         }
@@ -1674,6 +1697,55 @@ mod tests {
             Some(target_id)
         );
         assert_eq!(cdp_backend_from_element_id(&mapped[1].element_id), Some(6));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn related_iframe_targets_exposes_nested_targets_after_child_frame_known() {
+        use chromiumoxide::cdp::browser_protocol::page::FrameId;
+        use chromiumoxide::cdp::browser_protocol::target::{TargetId, TargetInfo};
+
+        fn target_info(id: &str, target_type: &str, parent_frame_id: Option<&str>) -> TargetInfo {
+            let mut builder = TargetInfo::builder()
+                .target_id(TargetId::new(id))
+                .r#type(target_type)
+                .title(id)
+                .url(format!("https://{id}.example/"))
+                .attached(true)
+                .can_access_opener(false);
+            if let Some(parent_frame_id) = parent_frame_id {
+                builder = builder.parent_frame_id(FrameId::new(parent_frame_id));
+            }
+            builder.build().expect("valid target info")
+        }
+
+        let target_infos = vec![
+            target_info("page-target", "page", None),
+            target_info("child-target", "iframe", Some("child-frame")),
+            target_info("nested-target", "iframe", Some("nested-frame")),
+            target_info("worker-target", "worker", Some("child-frame")),
+        ];
+
+        let first_pass = related_iframe_targets(&target_infos, &["child-frame".to_owned()]);
+        assert_eq!(
+            first_pass
+                .iter()
+                .map(|target| target.target_id.inner().as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-target"]
+        );
+
+        let second_pass = related_iframe_targets(
+            &target_infos,
+            &["child-frame".to_owned(), "nested-frame".to_owned()],
+        );
+        assert_eq!(
+            second_pass
+                .iter()
+                .map(|target| target.target_id.inner().as_str())
+                .collect::<Vec<_>>(),
+            vec!["child-target", "nested-target"]
+        );
     }
 
     #[cfg(windows)]
