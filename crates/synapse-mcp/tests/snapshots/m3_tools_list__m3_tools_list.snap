@@ -3,7 +3,7 @@ source: crates/synapse-mcp/tests/m3_tools_list.rs
 expression: snapshot
 ---
 {
-  "count": 49,
+  "count": 51,
   "m3_defaults": [
     {
       "actual": 33,
@@ -384,6 +384,8 @@ expression: snapshot
     "audit_export_bundle",
     "audit_intelligence_query",
     "capture_screenshot",
+    "demo_record_start",
+    "demo_record_stop",
     "find",
     "health",
     "hidden_desktop_pip_frame",

@@ -58,6 +58,7 @@ use tokio::{
 };
 
 use super::{
+    demo_recording::DemoRecordControl,
     interaction_cadence::{
         InteractionEvent, InteractionEventKind, InteractionHook, InteractionKeySignal,
     },
@@ -147,6 +148,7 @@ struct TimelineWriter {
     write_failures: Arc<AtomicU64>,
     rows_suppressed_paused: Arc<AtomicU64>,
     rows_suppressed_excluded: Arc<AtomicU64>,
+    demo_recording: Arc<DemoRecordControl>,
 }
 
 impl TimelineWriter {
@@ -1875,6 +1877,7 @@ impl ActivityRecorder {
         db: Arc<Db>,
         config: RecorderConfig,
         control: Arc<RecorderControl>,
+        demo_recording: Arc<DemoRecordControl>,
         event_bus: EventBus,
     ) -> Result<Self> {
         let initial_idle_ms = synapse_a11y::millis_since_last_input()
@@ -1896,6 +1899,7 @@ impl ActivityRecorder {
             write_failures: Arc::new(AtomicU64::new(0)),
             rows_suppressed_paused: Arc::new(AtomicU64::new(0)),
             rows_suppressed_excluded: Arc::new(AtomicU64::new(0)),
+            demo_recording,
         };
         if writer.control.is_paused() {
             tracing::info!(
@@ -1982,6 +1986,7 @@ impl ActivityRecorder {
     /// Cheap, non-blocking sink for the WinEvent bridge. Irrelevant kinds are
     /// filtered before crossing the channel.
     pub fn record_accessible_event(&self, event: &AccessibleEvent) {
+        self.writer.demo_recording.record_accessible_event(event);
         if !matches!(
             event.kind,
             AccessibleEventKind::ForegroundChanged | AccessibleEventKind::NameChanged
@@ -2514,6 +2519,10 @@ mod tests {
         let control = Arc::new(
             RecorderControl::hydrate(&db).unwrap_or_else(|error| panic!("hydrate: {error:#}")),
         );
+        let demo_recording = Arc::new(
+            crate::m3::demo_recording::DemoRecordControl::hydrate(Arc::clone(&db))
+                .unwrap_or_else(|error| panic!("hydrate demo control: {error:#}")),
+        );
         let writer = TimelineWriter {
             db,
             control,
@@ -2522,6 +2531,7 @@ mod tests {
             write_failures: Arc::new(AtomicU64::new(0)),
             rows_suppressed_paused: Arc::new(AtomicU64::new(0)),
             rows_suppressed_excluded: Arc::new(AtomicU64::new(0)),
+            demo_recording,
         };
         (dir, writer)
     }
@@ -3318,9 +3328,18 @@ mod tests {
             crate::m3::timeline_control::RecorderControl::hydrate(&db)
                 .unwrap_or_else(|error| panic!("hydrate control: {error:#}")),
         );
-        let recorder =
-            ActivityRecorder::spawn(Arc::clone(&db), config, control, EventBus::default())
-                .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
+        let demo_control = Arc::new(
+            crate::m3::demo_recording::DemoRecordControl::hydrate(Arc::clone(&db))
+                .unwrap_or_else(|error| panic!("hydrate demo control: {error:#}")),
+        );
+        let recorder = ActivityRecorder::spawn(
+            Arc::clone(&db),
+            config,
+            control,
+            demo_control,
+            EventBus::default(),
+        )
+        .unwrap_or_else(|error| panic!("spawn recorder: {error}"));
         let (after_start, _failures) = recorder.readback();
         assert_eq!(
             after_start, 1,
@@ -3468,10 +3487,15 @@ mod tests {
         let control = Arc::new(
             RecorderControl::hydrate(&db).unwrap_or_else(|error| panic!("hydrate: {error:#}")),
         );
+        let demo_control = Arc::new(
+            crate::m3::demo_recording::DemoRecordControl::hydrate(Arc::clone(&db))
+                .unwrap_or_else(|error| panic!("hydrate demo control: {error:#}")),
+        );
         let recorder = ActivityRecorder::spawn(
             Arc::clone(&db),
             config,
             Arc::clone(&control),
+            demo_control,
             EventBus::default(),
         )
         .unwrap_or_else(|error| panic!("spawn recorder: {error}"));

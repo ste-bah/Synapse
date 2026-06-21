@@ -108,6 +108,8 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | control_lease_handoff | normal_agent | no | no | no | no | none - default-safe |
 | control_lease_release | normal_agent | no | no | no | no | none - default-safe |
 | control_lease_status | normal_agent | no | no | no | no | none - default-safe |
+| demo_record_start | break_glass | yes | no | no | no | profile_authoring_generate with existing replay_path |
+| demo_record_stop | break_glass | yes | no | no | no | profile_authoring_generate with existing replay_path |
 | find | normal_agent | no | no | no | no | none - default-safe |
 | fleet_stop | normal_agent | no | no | no | no | none - default-safe |
 | get_target | normal_agent | no | no | no | no | none - default-safe |
@@ -234,6 +236,8 @@ Research basis:
 | control_lease_handoff | lease control | current holder MCP session id + named live recipient session id | shared lease registry owner transfer under the lease mutex, with CF_SESSIONS old-row delete/new-row write in one batch | lease handoff is the operation; caller must already hold the lease | control | #719 #798 | control_lease_status/session_list before and after plus CF_SESSIONS lease rows |
 | control_lease_release | lease control | current MCP session id | shared lease registry mutation | releases only held lease state | control | #719 #798 | control_lease_status before and after |
 | control_lease_status | lease control | lease registry | read-only lease registry read | no foreground lease | control | #719 | control_lease_status response and lease rows |
+| demo_record_start | perception control | explicit operator-armed profile_id and replay path | persists active demo state in CF_KV and writes a DemoMarker start row; the existing WinEvent bridge captures UIA events without installing a second hook or activating windows | no foreground lease; explicitly armed recording observes the current human UIA stream but does not seize foreground or cursor | control | #844 | CF_KV timeline/demo-record/v1, CF_TIMELINE DemoMarker start/event rows, and command audit rows |
+| demo_record_stop | perception control | active demo_id in CF_KV | writes a stop/expired DemoMarker row, scans CF_TIMELINE for matching demo rows, and exports replay JSONL for profile_authoring_generate | no foreground lease; stop/export reads stored rows and file metadata only | control | #844 | CF_KV inactive state, CF_TIMELINE DemoMarker rows, replay JSONL bytes/hash, and command audit rows |
 | find | perception | explicit window_hwnd, session target, or compatibility foreground | UIA tree plus CDP and browser OCR enrichment | no foreground lease | background-pass | #720 #789 | returned element set and target hwnd/title readback |
 | fleet_stop | session control | every live spawned agent in the session registry, optionally filtered by agent_kind | snapshots the live fleet then interrupts or force-kills each via the agent_interrupt/agent_kill paths; requires confirm="STOP-FLEET"; per-agent outcome table with surviving pids | no foreground lease | control | none (#907) | OS process table per agent, CF_AGENT_EVENTS killed/interrupted rows, and CF_ACTION_LOG fleet_stop + per-agent command-audit rows |
 | get_target | target control | current MCP session id | per-session target registry read | no foreground lease | control | #720 | returned session id and current target |

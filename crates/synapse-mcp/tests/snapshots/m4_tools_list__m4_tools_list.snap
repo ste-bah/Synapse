@@ -1,10 +1,9 @@
 ---
 source: crates/synapse-mcp/tests/m4_tools_list.rs
-assertion_line: 56
 expression: snapshot
 ---
 {
-  "count": 215,
+  "count": 217,
   "m4_defaults": [
     {
       "actual": 33,
@@ -299,6 +298,8 @@ expression: snapshot
     "control_lease_handoff",
     "control_lease_release",
     "control_lease_status",
+    "demo_record_start",
+    "demo_record_stop",
     "episode_get",
     "episode_list",
     "episode_segment",

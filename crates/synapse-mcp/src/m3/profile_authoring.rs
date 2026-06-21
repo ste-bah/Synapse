@@ -1683,6 +1683,33 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use synapse_core::{Backend, PerceptionMode, ProfileBackends, ProfileUseScope};
+
+    fn test_profile_status(profile_id: &str) -> ProfileStatus {
+        ProfileStatus {
+            id: profile_id.to_owned(),
+            label: "Test profile".to_owned(),
+            use_scope: ProfileUseScope::OperatorOwnedTest,
+            mode: PerceptionMode::A11yOnly,
+            detection_model_id: None,
+            detection_classes: Vec::new(),
+            hud_fields: Vec::new(),
+            keymap_actions: Vec::new(),
+            backends: ProfileBackends {
+                default: Backend::Auto,
+                keyboard_default: Backend::Auto,
+                mouse_default: Backend::Auto,
+                pad_default: Backend::Auto,
+            },
+            event_extensions: Vec::new(),
+            active: false,
+            schema_version: 2,
+            matches: Vec::new(),
+            metadata: BTreeMap::new(),
+            source_path: PathBuf::from("notepad.toml"),
+        }
+    }
 
     fn params(decision: ProfileAuthoringDecision) -> ProfileAuthoringDecideParams {
         ProfileAuthoringDecideParams {
@@ -1732,5 +1759,54 @@ mod tests {
             .expect_err("operator_note must not be accepted with decision=reject");
         assert_eq!(error_code(&error), Some(error_codes::TOOL_PARAMS_INVALID));
         assert_eq!(invalid_field(&error), Some("operator_note"));
+    }
+
+    #[test]
+    fn demo_record_replay_rows_generate_authoring_patch() {
+        let profile = test_profile_status("notepad");
+        let mut builder = EvidenceBuilder::new(&profile);
+        builder.record_replay_record(&json!({
+            "record": {
+                "type": "demo_record",
+                "demo_id": "demo.notepad.test",
+                "profile_id": "notepad",
+                "foreground": {
+                    "profile_id": "notepad",
+                    "process_name": "notepad.exe"
+                },
+                "uia": {
+                    "event_kind": "value_changed",
+                    "element_id": "cdcd:42:0000002a",
+                    "name": "Document",
+                    "value": "hello",
+                    "previous_value": ""
+                },
+                "profile_authoring": {
+                    "matches": {
+                        "exe": ["notepad.exe"]
+                    },
+                    "metadata": {
+                        "demo_recording": "true",
+                        "demo_id": "demo.notepad.test"
+                    }
+                }
+            }
+        }));
+
+        let built = builder
+            .finish(Some("demo-recordings/notepad.jsonl".to_owned()), 123)
+            .unwrap_or_else(|error| panic!("demo replay evidence should build a patch: {error:?}"));
+
+        println!(
+            "readback=profile_authoring source=demo_record replay_rows_relevant={} patch={}",
+            built.source.replay_rows_relevant, built.patch
+        );
+        assert_eq!(built.source.replay_rows_scanned, 1);
+        assert_eq!(built.source.replay_rows_relevant, 1);
+        assert_eq!(built.patch["matches"]["add_exe"], json!(["notepad.exe"]));
+        assert_eq!(
+            built.patch["safety"]["metadata"]["demo_recording"],
+            json!("true")
+        );
     }
 }

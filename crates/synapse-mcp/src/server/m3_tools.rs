@@ -7,6 +7,7 @@ use super::{
     ApprovalRequestParams, ApprovalRequestResponse, ApprovalToastDelivery, AudioTailParams,
     AudioTailResponse, AudioTranscribeParams, AudioTranscribeResponse, AuditExportBundleParams,
     AuditExportBundleResponse, AuditIntelligenceQueryParams, AuditIntelligenceQueryResponse,
+    DemoRecordStartParams, DemoRecordStartResponse, DemoRecordStopParams, DemoRecordStopResponse,
     EpisodeGetParams, EpisodeGetResponse, EpisodeListParams, EpisodeListResponse,
     EpisodeSegmentParams, EpisodeSegmentResponse, ErrorData, HygieneFlagsParams,
     HygieneFlagsResponse, HygieneScanStorageParams, HygieneScanStorageResponse,
@@ -47,8 +48,9 @@ use super::{
     query_registry, record_replay, refresh_profile_quality, register_local_model, register_reflex,
     remove_local_model, request_approval, resume_timeline, rollback_registry_profile,
     run_storage_gc_once, scan_storage, scan_text_tool, search_timeline, segment_episodes,
-    subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
-    update_approval_toast_state, update_local_model, update_routine, update_timeline_exclusions,
+    start_demo_recording, stop_demo_recording, subscribe_to_events, tail_audio, tool, tool_router,
+    transcribe_audio, update_approval_toast_state, update_local_model, update_routine,
+    update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
 use serde_json::{Value, json};
@@ -645,6 +647,159 @@ impl SynapseService {
         record_replay(self.m1_state.clone(), sse_state, &params.0)
             .await
             .map(Json)
+    }
+
+    #[tool(
+        description = "Arm an explicit high-fidelity UIA demonstration recording for profile authoring. While active, the existing WinEvent bridge writes TimelineKind::DemoMarker rows for focus/value/name/selection/menu/alert events; demo_record_stop exports a replay JSONL bundle consumable by profile_authoring_generate."
+    )]
+    pub async fn demo_record_start(
+        &self,
+        params: Parameters<DemoRecordStartParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<DemoRecordStartResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "demo_record_start",
+            profile_id = %params.0.profile_id,
+            duration_ms = params.0.duration_ms,
+            path = ?params.0.path,
+            "tool.invocation kind=demo_record_start"
+        );
+        self.require_m3_permissions(
+            "demo_record_start",
+            &crate::m3::demo_recording::required_permissions_start(&params.0),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        let params = params.0;
+        let command_payload = json!({
+            "profile_id": &params.profile_id,
+            "duration_ms": params.duration_ms,
+            "path": &params.path,
+            "label": &params.label,
+        });
+        let command_before = json!({
+            "source_of_truth": "CF_KV timeline/demo-record/v1 plus CF_TIMELINE DemoMarker rows",
+            "by_session": &by_session,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "demo_record_start",
+            "demo_record_start",
+            Some(by_session.clone()),
+            Some(by_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let result = start_demo_recording(&self.m3_state, &params, &by_session);
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "demo_record_start",
+                    "demo_record_start",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV timeline/demo-record/v1 plus CF_TIMELINE DemoMarker rows",
+                        "response": response,
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "demo_record_start",
+                    "demo_record_start",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV timeline/demo-record/v1 plus CF_TIMELINE DemoMarker rows",
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "Stop the active explicit UIA demonstration recording and export its DemoMarker rows to replay JSONL. The returned replay_path can be passed directly to profile_authoring_generate for the same profile_id."
+    )]
+    pub async fn demo_record_stop(
+        &self,
+        params: Parameters<DemoRecordStopParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<DemoRecordStopResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "demo_record_stop",
+            demo_id = ?params.0.demo_id,
+            "tool.invocation kind=demo_record_stop"
+        );
+        self.require_m3_permissions(
+            "demo_record_stop",
+            &crate::m3::demo_recording::required_permissions_stop(&params.0),
+        )?;
+        let by_session = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+        let params = params.0;
+        let command_payload = json!({
+            "demo_id": &params.demo_id,
+        });
+        let command_before = json!({
+            "source_of_truth": "CF_KV timeline/demo-record/v1, CF_TIMELINE DemoMarker rows, and replay JSONL file",
+            "by_session": &by_session,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "demo_record_stop",
+            "demo_record_stop",
+            Some(by_session.clone()),
+            Some(by_session.clone()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        let result = stop_demo_recording(&self.m3_state, &params, &by_session);
+        match &result {
+            Ok(response) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "demo_record_stop",
+                    "demo_record_stop",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV timeline/demo-record/v1, CF_TIMELINE DemoMarker rows, and replay JSONL file",
+                        "response": response,
+                    }),
+                    "ok",
+                ),
+            )?,
+            Err(error) => self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "demo_record_stop",
+                    "demo_record_stop",
+                    Some(by_session.clone()),
+                    Some(by_session.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": "CF_KV timeline/demo-record/v1, CF_TIMELINE DemoMarker rows, and replay JSONL file",
+                    }),
+                    "error",
+                )
+                .with_error(super::command_audit::command_audit_error_from_error_data(error)),
+            )?,
+        };
+        result.map(Json)
     }
 
     #[tool(description = "Return the latest loopback audio tail as PCM s16le bytes")]

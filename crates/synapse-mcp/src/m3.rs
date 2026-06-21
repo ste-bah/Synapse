@@ -4,6 +4,7 @@ pub mod approvals;
 pub mod audio;
 pub mod audit_export;
 pub mod audit_retention;
+pub mod demo_recording;
 pub mod episodes;
 pub mod hygiene;
 pub mod intent;
@@ -48,6 +49,7 @@ use tokio_util::sync::CancellationToken;
 
 use self::a11y_events::A11yEventBridge;
 use self::activity_recorder::{ActivityRecorder, RecorderConfig};
+use self::demo_recording::DemoRecordControl;
 use self::permissions::{PermissionGrants, configured_grants_from_parts};
 use self::timeline_control::RecorderControl;
 use crate::http::sse::SseState;
@@ -193,6 +195,7 @@ pub struct M3State {
     pub a11y_event_bridge: Option<A11yEventBridge>,
     pub activity_recorder: Option<Arc<ActivityRecorder>>,
     pub recorder_control: Option<Arc<RecorderControl>>,
+    pub demo_record_control: Option<Arc<DemoRecordControl>>,
     pub audio_runtime: Option<Arc<AudioRuntime>>,
     pub audit_session: Option<AuditSessionState>,
     pub mcp_audit_sessions: BTreeMap<SessionId, AuditSessionState>,
@@ -321,6 +324,7 @@ impl M3State {
             a11y_event_bridge: None,
             activity_recorder: None,
             recorder_control: None,
+            demo_record_control: None,
             audio_runtime: None,
             audit_session: None,
             mcp_audit_sessions: BTreeMap::new(),
@@ -479,10 +483,14 @@ impl M3State {
         let control = self
             .ensure_recorder_control()
             .context("hydrate recorder control state for the activity recorder")?;
+        let demo_control = self
+            .ensure_demo_record_control()
+            .context("hydrate demo record control state for the activity recorder")?;
         let recorder = Arc::new(ActivityRecorder::spawn(
             db,
             config,
             control,
+            demo_control,
             event_bus.clone(),
         )?);
         self.activity_recorder = Some(Arc::clone(&recorder));
@@ -511,6 +519,28 @@ impl M3State {
             .context("open storage for timeline recorder control state")?;
         let control = Arc::new(RecorderControl::hydrate(&db)?);
         self.recorder_control = Some(Arc::clone(&control));
+        Ok(control)
+    }
+
+    /// Hydrates the shared explicitly-armed demo recorder state (#844). The
+    /// persisted `CF_KV` row is the source of truth for whether a demo is
+    /// active; the activity recorder receives this handle so UIA events are
+    /// captured by the existing WinEvent bridge without installing another
+    /// process-global hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when storage cannot open or the persisted demo control
+    /// row is corrupt.
+    pub fn ensure_demo_record_control(&mut self) -> Result<Arc<DemoRecordControl>> {
+        if let Some(control) = &self.demo_record_control {
+            return Ok(Arc::clone(control));
+        }
+        let db = self
+            .ensure_storage()
+            .context("open storage for demo record control state")?;
+        let control = Arc::new(DemoRecordControl::hydrate(db)?);
+        self.demo_record_control = Some(Arc::clone(&control));
         Ok(control)
     }
 
@@ -581,7 +611,7 @@ impl M3ToolStub {
 }
 
 #[must_use]
-pub const fn m3_tool_stubs() -> [M3ToolStub; 54] {
+pub const fn m3_tool_stubs() -> [M3ToolStub; 56] {
     [
         subscribe::subscribe(),
         subscribe::subscribe_cancel(),
@@ -606,6 +636,8 @@ pub const fn m3_tool_stubs() -> [M3ToolStub; 54] {
         profile_registry::audit_intelligence_query(),
         audit_export::audit_export_bundle(),
         replay::replay_record(),
+        demo_recording::demo_record_start(),
+        demo_recording::demo_record_stop(),
         audio::audio_tail(),
         audio::audio_transcribe(),
         approvals::approval_request(),

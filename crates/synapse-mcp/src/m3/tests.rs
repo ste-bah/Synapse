@@ -97,6 +97,8 @@ fn m3_tool_stub_names_are_stable() {
         "audit_intelligence_query",
         "audit_export_bundle",
         "replay_record",
+        "demo_record_start",
+        "demo_record_stop",
         "audio_tail",
         "audio_transcribe",
         "approval_request",
