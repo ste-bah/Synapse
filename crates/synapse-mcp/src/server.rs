@@ -210,6 +210,9 @@ pub(crate) mod codex_app_server_bridge;
 pub(crate) mod command_audit;
 mod context;
 pub(crate) use context::AgentTranscriptSnapshotRow;
+pub(crate) use context::{
+    APPROVAL_DECISION_EVENT_KIND, APPROVAL_REQUEST_EVENT_KIND, APPROVAL_TIMEOUT_EVENT_KIND,
+};
 mod background_router;
 mod browser_assert;
 mod browser_clock_events;

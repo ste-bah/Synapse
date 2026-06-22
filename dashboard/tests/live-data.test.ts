@@ -14,9 +14,12 @@ class FakeEventSource implements DashboardEventSourceLike {
   static created: FakeEventSource[] = [];
   onopen: ((event: Event) => void) | null = null;
   onerror: ((event: Event) => void) | null = null;
+  closed = false;
+  readonly url: string;
   private listeners = new Map<string, ((event: MessageEvent) => void)[]>();
 
-  constructor(readonly url: string) {
+  constructor(url: string) {
+    this.url = url;
     FakeEventSource.created.push(this);
   }
 
@@ -26,10 +29,16 @@ class FakeEventSource implements DashboardEventSourceLike {
     this.listeners.set(type, listeners);
   }
 
-  close(): void {}
+  close(): void {
+    this.closed = true;
+  }
 
   open(): void {
     this.onopen?.(new Event("open"));
+  }
+
+  error(): void {
+    this.onerror?.(new Event("error"));
   }
 
   emit(type: string, data: unknown, lastEventId = "1"): void {
@@ -133,6 +142,58 @@ describe("dashboard live-data scope routing", () => {
     assert.equal(state.fleet.eventCount, 1);
     assert.equal(state.fleet.resyncCount, 1);
     assert.equal(state.fleet.lastResyncUnixMs, 1_800_000_000_000);
+
+    controller.stop();
+  });
+
+  test("controller schedules a replacement subscription after a hard stream error", async () => {
+    FakeEventSource.created = [];
+    let state: DashboardLiveState = initialDashboardLiveState(["fleet"]);
+    const timers: { callback: () => void; cancelled: boolean }[] = [];
+    let subscriptionOrdinal = 0;
+    const controller = createDashboardLiveController({
+      scopes: ["fleet"],
+      setTimer: (callback) => {
+        const timer = { callback, cancelled: false };
+        timers.push(timer);
+        return timer;
+      },
+      clearTimer: (timer) => {
+        (timer as { cancelled: boolean }).cancelled = true;
+      },
+      subscribe: async (scope) => {
+        subscriptionOrdinal += 1;
+        return {
+          ok: true,
+          source_of_truth: "test",
+          scope,
+          subscription_id: `sub-${scope}-${subscriptionOrdinal}`,
+          event_url: `/dashboard/events?subscription_id=sub-${scope}-${subscriptionOrdinal}`,
+          replay_contract: "test"
+        };
+      },
+      eventSourceFactory: (url) => new FakeEventSource(url),
+      onStateChange: (next) => {
+        state = next;
+      }
+    });
+
+    controller.start();
+    await Promise.resolve();
+    const first = FakeEventSource.created[0];
+    first.open();
+    assert.equal(state.fleet.status, "open");
+
+    first.error();
+    assert.equal(state.fleet.status, "disconnected");
+    assert.equal(timers.length, 1);
+    assert.equal(FakeEventSource.created.length, 1);
+
+    timers[0].callback();
+    await Promise.resolve();
+    assert.equal(first.closed, true);
+    assert.equal(FakeEventSource.created.length, 2);
+    assert.equal(FakeEventSource.created[1].url, "/dashboard/events?subscription_id=sub-fleet-2");
 
     controller.stop();
   });

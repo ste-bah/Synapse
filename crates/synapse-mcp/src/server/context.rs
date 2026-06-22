@@ -37,11 +37,15 @@ type M2ReleaseAllContext = (
 
 const PROFILE_CHANGED_KIND: &str = "profile-changed";
 const SCOPE_TRANSITIONED_KIND: &str = "scope-transitioned";
+pub(crate) const APPROVAL_REQUEST_EVENT_KIND: &str = "approval_request";
+pub(crate) const APPROVAL_DECISION_EVENT_KIND: &str = "approval_decision";
+pub(crate) const APPROVAL_TIMEOUT_EVENT_KIND: &str = "approval_timeout";
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 // Match observe's default shallow tree so targets selected from an observation
 // can be resolved on scheduler ticks without requiring a deep UIA walk.
 const AIM_TRACK_TARGET_SOURCE_DEPTH: u32 = 2;
 static NEXT_PROFILE_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
+static NEXT_APPROVAL_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct AgentTranscriptSnapshotRow {
@@ -400,6 +404,60 @@ impl SynapseService {
         crate::m3::approvals::approval_snapshot(&db, kind)
     }
 
+    pub(crate) fn publish_approval_queue_event(
+        &self,
+        kind: &'static str,
+        approval_id: &str,
+        status: Option<&str>,
+        by_session: &str,
+        trigger: &'static str,
+        extra: serde_json::Value,
+    ) {
+        let event_seq = NEXT_APPROVAL_EVENT_SEQ.fetch_add(1, Ordering::Relaxed);
+        let event = Event {
+            seq: event_seq,
+            at: Utc::now(),
+            source: EventSource::System,
+            kind: kind.to_owned(),
+            data: json!({
+                "approval_id": approval_id,
+                "status": status,
+                "by_session": by_session,
+                "trigger": trigger,
+                "source_of_truth": "CF_KV approval queue rows plus approval audit rows",
+                "extra": extra,
+            }),
+            correlations: Vec::new(),
+        };
+        match self.sse_state() {
+            Ok(sse_state) => {
+                let report = sse_state.event_bus().publish(event);
+                tracing::debug!(
+                    code = "APPROVAL_QUEUE_EVENT_PUBLISHED",
+                    kind,
+                    approval_id,
+                    status = status.unwrap_or(""),
+                    trigger,
+                    matched = report.matched,
+                    queued = report.queued,
+                    dropped = report.dropped,
+                    event_seq,
+                    "approval queue SSE event published"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    code = "APPROVAL_QUEUE_EVENT_PUBLISH_FAILED",
+                    kind,
+                    approval_id,
+                    trigger,
+                    detail = %error.message,
+                    "approval queue changed but SSE event could not be published"
+                );
+            }
+        }
+    }
+
     pub(crate) fn acked_open_attention_anchors_snapshot(
         &self,
     ) -> Result<BTreeSet<String>, ErrorData> {
@@ -562,6 +620,21 @@ impl SynapseService {
                 .with_error(super::command_audit::command_audit_error_from_error_data(error)),
             )?,
         };
+        if let Ok(response) = &result {
+            self.publish_approval_queue_event(
+                APPROVAL_DECISION_EVENT_KIND,
+                &response.decision.approval_id,
+                Some(response.decision.after_status.as_str()),
+                by_session,
+                "approval_activate",
+                json!({
+                    "activation_id": &response.activation_id,
+                    "before_status": response.decision.before_status.as_str(),
+                    "after_status": response.decision.after_status.as_str(),
+                    "activation_row": &response.activation_row,
+                }),
+            );
+        }
         result
     }
 
@@ -686,6 +759,21 @@ impl SynapseService {
                 ),
             )?,
         };
+        if let Ok(response) = &result {
+            self.publish_approval_queue_event(
+                APPROVAL_DECISION_EVENT_KIND,
+                &response.approval_id,
+                Some(response.after_status.as_str()),
+                by_session,
+                "dashboard.approval_decide",
+                json!({
+                    "before_status": response.before_status.as_str(),
+                    "after_status": response.after_status.as_str(),
+                    "item_row": &response.item_row,
+                    "audit_row": &response.audit_row,
+                }),
+            );
+        }
         result
     }
 

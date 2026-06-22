@@ -1232,6 +1232,20 @@ impl SynapseService {
             }),
             "ok",
         ))?;
+        self.publish_approval_queue_event(
+            crate::server::APPROVAL_REQUEST_EVENT_KIND,
+            &response.item.approval_id,
+            Some(response.item.status.as_str()),
+            &by_session,
+            "approval_request",
+            json!({
+                "kind": response.item.kind.as_str(),
+                "deduped": response.deduped,
+                "item_row": &response.item_row,
+                "audit_row": &response.audit_row,
+                "toast_audit_row": &response.toast_audit_row,
+            }),
+        );
         Ok(Json(response))
     }
 
@@ -1364,6 +1378,21 @@ impl SynapseService {
                 .with_error(super::command_audit::command_audit_error_from_error_data(error)),
             )?,
         };
+        if let Ok(response) = &result {
+            self.publish_approval_queue_event(
+                crate::server::APPROVAL_DECISION_EVENT_KIND,
+                &response.approval_id,
+                Some(response.after_status.as_str()),
+                &by_session,
+                "approval_decide",
+                json!({
+                    "before_status": response.before_status.as_str(),
+                    "after_status": response.after_status.as_str(),
+                    "item_row": &response.item_row,
+                    "audit_row": &response.audit_row,
+                }),
+            );
+        }
         result.map(Json)
     }
 

@@ -220,6 +220,12 @@ export function createDashboardLiveController(options: DashboardLiveControllerOp
     }, reconnectDelayMs);
     timers.set(scope, timer);
   };
+  const clearReconnect = (scope: DashboardPanelScope) => {
+    const timer = timers.get(scope);
+    if (!timer) return;
+    clearTimer(timer);
+    timers.delete(scope);
+  };
 
   const connect = async (scope: DashboardPanelScope) => {
     if (stopped) return;
@@ -235,12 +241,16 @@ export function createDashboardLiveController(options: DashboardLiveControllerOp
         error: undefined
       });
       const source = eventSourceFactory(subscription.event_url);
-      source.onopen = () => updateScope(scope, { status: "open", error: undefined });
+      source.onopen = () => {
+        clearReconnect(scope);
+        updateScope(scope, { status: "open", error: undefined });
+      };
       source.onerror = () => {
         updateScope(scope, {
           status: "disconnected",
           error: "event stream disconnected"
         });
+        scheduleReconnect(scope);
       };
       source.addEventListener("subscription_started", (message) => {
         handleSubscriptionStarted(scope, message);

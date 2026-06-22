@@ -545,6 +545,7 @@ fn router(
             post(dashboard_events_subscribe)
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
         )
+        .route("/dashboard/events", get(dashboard_events))
         .route(
             "/dashboard/agent-terminal/{spawn_id}/ws",
             get(dashboard_agent_terminal_ws),
@@ -1582,14 +1583,26 @@ impl DashboardPanel {
 fn dashboard_event_subscription(
     scope: DashboardEventScope,
 ) -> (EventFilter, Vec<String>, &'static str) {
+    let approval_kinds = || {
+        vec![
+            crate::server::APPROVAL_REQUEST_EVENT_KIND.to_owned(),
+            crate::server::APPROVAL_DECISION_EVENT_KIND.to_owned(),
+            crate::server::APPROVAL_TIMEOUT_EVENT_KIND.to_owned(),
+        ]
+    };
+    let fleet_attention_kinds = || {
+        let mut kinds = vec![
+            crate::server::agent_state::AGENT_STATE_EVENT_KIND.to_owned(),
+            "workspace.put".to_owned(),
+        ];
+        kinds.extend(approval_kinds());
+        kinds
+    };
     match scope {
         DashboardEventScope::Fleet => (
             EventFilter::All,
-            vec![
-                crate::server::agent_state::AGENT_STATE_EVENT_KIND.to_owned(),
-                "workspace.put".to_owned(),
-            ],
-            "agent state + workspace events",
+            fleet_attention_kinds(),
+            "agent state + workspace + approval events",
         ),
         DashboardEventScope::Agent => (
             EventFilter::All,
@@ -1603,11 +1616,8 @@ fn dashboard_event_subscription(
         ),
         DashboardEventScope::Tasks => (
             EventFilter::All,
-            vec![
-                crate::server::agent_state::AGENT_STATE_EVENT_KIND.to_owned(),
-                "workspace.put".to_owned(),
-            ],
-            "task/attention state events",
+            fleet_attention_kinds(),
+            "task/attention/approval state events",
         ),
         DashboardEventScope::System => (
             EventFilter::Or {
@@ -1653,7 +1663,7 @@ fn dashboard_event_subscription(
 }
 
 fn dashboard_event_url(subscription_id: &str) -> String {
-    format!("/events?subscription_id={subscription_id}")
+    format!("/dashboard/events?subscription_id={subscription_id}")
 }
 
 #[derive(Serialize)]
@@ -2926,6 +2936,17 @@ async fn dashboard_events_subscribe(
         })
         .into_response(),
     )
+}
+
+async fn dashboard_events(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(query): Query<sse::EventsQuery>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    with_dashboard_security_headers(state.sse_state.open(&headers, query))
 }
 
 async fn dashboard_audit_query(
@@ -4753,11 +4774,11 @@ fn dashboard_unix_time_ms() -> u64 {
 }
 
 const DASHBOARD_CSS_FILE: &str = "dashboard-C95PIXH6.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-B_4_Y-7p.js";
+const DASHBOARD_JS_FILE: &str = "dashboard-Cf7by0u3.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
     include_str!("../../../../dashboard/dist/assets/dashboard-C95PIXH6.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-B_4_Y-7p.js");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-Cf7by0u3.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]
@@ -5117,6 +5138,18 @@ mod tests {
         let profile_changed = dashboard_scope_test_event(EventSource::System, "profile-changed");
         let audit = dashboard_scope_test_event(EventSource::ActionEmitter, "command_finished");
         let filesystem = dashboard_scope_test_event(EventSource::Filesystem, "file_changed");
+        let approval_request = dashboard_scope_test_event(
+            EventSource::System,
+            crate::server::APPROVAL_REQUEST_EVENT_KIND,
+        );
+        let approval_decision = dashboard_scope_test_event(
+            EventSource::System,
+            crate::server::APPROVAL_DECISION_EVENT_KIND,
+        );
+        let approval_timeout = dashboard_scope_test_event(
+            EventSource::System,
+            crate::server::APPROVAL_TIMEOUT_EVENT_KIND,
+        );
 
         assert!(dashboard_scope_matches(
             DashboardEventScope::Fleet,
@@ -5130,6 +5163,18 @@ mod tests {
             DashboardEventScope::Tasks,
             &agent_state
         ));
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::Fleet,
+            &approval_request
+        ));
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::Fleet,
+            &approval_decision
+        ));
+        assert!(dashboard_scope_matches(
+            DashboardEventScope::Tasks,
+            &approval_timeout
+        ));
         assert!(dashboard_scope_matches(DashboardEventScope::Audit, &audit));
         assert!(dashboard_scope_matches(
             DashboardEventScope::System,
@@ -5142,6 +5187,10 @@ mod tests {
             &profile_changed
         ));
         assert!(!dashboard_scope_matches(
+            DashboardEventScope::Agent,
+            &approval_request
+        ));
+        assert!(!dashboard_scope_matches(
             DashboardEventScope::Audit,
             &filesystem
         ));
@@ -5151,7 +5200,7 @@ mod tests {
     fn dashboard_event_url_keeps_subscription_id_for_last_event_id_replay() {
         assert_eq!(
             dashboard_event_url("sub-01234567-89ab-cdef"),
-            "/events?subscription_id=sub-01234567-89ab-cdef"
+            "/dashboard/events?subscription_id=sub-01234567-89ab-cdef"
         );
     }
 

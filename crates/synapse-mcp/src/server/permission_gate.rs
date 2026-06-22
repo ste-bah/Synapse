@@ -200,6 +200,20 @@ impl SynapseService {
         let request = build_request(tool_name, input, tool_use_id, spawn_id, decision)?;
         let created = approvals::request_approval(&db, &request, by_session)?;
         let approval_id = created.item.approval_id.clone();
+        self.publish_approval_queue_event(
+            crate::server::APPROVAL_REQUEST_EVENT_KIND,
+            &approval_id,
+            Some(created.item.status.as_str()),
+            by_session,
+            "approval_gate",
+            json!({
+                "tool_name": tool_name,
+                "spawn_id": spawn_id,
+                "deduped": created.deduped,
+                "item_row": &created.item_row,
+                "audit_row": &created.audit_row,
+            }),
+        );
         tracing::warn!(
             code = "APPROVAL_GATE_PENDING",
             approval_id = %approval_id,
@@ -274,15 +288,28 @@ impl SynapseService {
                     edited_args: None,
                     response: None,
                 };
-                if let Err(error) =
-                    approvals::decide_approval(db, &decline, "approval_gate_timeout")
-                {
-                    tracing::error!(
-                        code = "APPROVAL_GATE_TIMEOUT_DECLINE_FAILED",
-                        approval_id = %approval_id,
-                        detail = %error.message,
-                        "approval_gate could not record its timeout decline; returning deny anyway"
-                    );
+                match approvals::decide_approval(db, &decline, "approval_gate_timeout") {
+                    Ok(decision) => self.publish_approval_queue_event(
+                        crate::server::APPROVAL_TIMEOUT_EVENT_KIND,
+                        approval_id,
+                        Some(decision.after_status.as_str()),
+                        "approval_gate_timeout",
+                        "approval_gate_timeout",
+                        json!({
+                            "before_status": decision.before_status.as_str(),
+                            "after_status": decision.after_status.as_str(),
+                            "item_row": &decision.item_row,
+                            "audit_row": &decision.audit_row,
+                        }),
+                    ),
+                    Err(error) => {
+                        tracing::error!(
+                            code = "APPROVAL_GATE_TIMEOUT_DECLINE_FAILED",
+                            approval_id = %approval_id,
+                            detail = %error.message,
+                            "approval_gate could not record its timeout decline; returning deny anyway"
+                        );
+                    }
                 }
                 break Ok(deny_result(&message));
             }
