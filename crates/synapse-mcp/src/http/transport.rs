@@ -611,6 +611,46 @@ fn router(
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/dashboard/timeline/get",
+            post(dashboard_timeline_get)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/timeline/search",
+            post(dashboard_timeline_search)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/timeline/digest",
+            post(dashboard_timeline_digest)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/episodes/list",
+            post(dashboard_episode_list)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/episodes/get",
+            post(dashboard_episode_get)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/routines/list",
+            post(dashboard_routine_list)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/routines/inspect",
+            post(dashboard_routine_inspect)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/routines/update",
+            post(dashboard_routine_update)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/dashboard/storage/timeline-purge",
             post(dashboard_storage_timeline_purge)
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
@@ -1722,6 +1762,58 @@ struct DashboardCdpAttachmentSurface {
 struct DashboardTimelinePauseRequest {
     #[serde(default)]
     duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardTimelineQueryRequest {
+    #[serde(default)]
+    start_ts_ns: Option<String>,
+    #[serde(default)]
+    end_ts_ns: Option<String>,
+    #[serde(default)]
+    apps: Option<Vec<String>>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    kinds: Option<Vec<String>>,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardEpisodeListRequest {
+    #[serde(default)]
+    start_ts_ns: Option<String>,
+    #[serde(default)]
+    end_ts_ns: Option<String>,
+    #[serde(default)]
+    apps: Option<Vec<String>>,
+    #[serde(default)]
+    actor: Option<String>,
+    #[serde(default)]
+    min_duration_ms: Option<u64>,
+    #[serde(default)]
+    limit: Option<u32>,
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardEpisodeGetRequest {
+    episode_id: String,
+    #[serde(default)]
+    start_ts_ns: Option<String>,
+    #[serde(default)]
+    refs_limit: Option<u32>,
+    #[serde(default)]
+    refs_cursor: Option<String>,
 }
 
 /// Dashboard Approvals-inbox decision (#927). Resolves one pending approval —
@@ -3747,6 +3839,283 @@ async fn dashboard_timeline_resume(State(state): State<HttpState>, headers: Head
     }
 }
 
+async fn dashboard_timeline_get(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardTimelineQueryRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let start_ts_ns = match parse_optional_ns(request.start_ts_ns.as_deref(), "start_ts_ns") {
+        Ok(value) => value,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    let end_ts_ns = match parse_optional_ns(request.end_ts_ns.as_deref(), "end_ts_ns") {
+        Ok(value) => value,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    let params = crate::m3::timeline::TimelineGetParams {
+        start_ts_ns,
+        end_ts_ns,
+        kinds: request.kinds,
+        actor: request.actor,
+        limit: request.limit,
+        cursor: request.cursor,
+    };
+    match state.health_service.dashboard_timeline_get(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardTimelineControlResponse {
+                ok: true,
+                trigger: "dashboard.timeline_get",
+                source_of_truth: "timeline_get bounded read over CF_TIMELINE",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_timeline_search(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardTimelineQueryRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let start_ts_ns = match parse_optional_ns(request.start_ts_ns.as_deref(), "start_ts_ns") {
+        Ok(value) => value,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    let end_ts_ns = match parse_optional_ns(request.end_ts_ns.as_deref(), "end_ts_ns") {
+        Ok(value) => value,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    let params = crate::m3::timeline::TimelineSearchParams {
+        start_ts_ns,
+        end_ts_ns,
+        apps: request.apps,
+        text: request.text,
+        kinds: request.kinds,
+        actor: request.actor,
+        limit: request.limit,
+        cursor: request.cursor,
+    };
+    match state.health_service.dashboard_timeline_search(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardTimelineControlResponse {
+                ok: true,
+                trigger: "dashboard.timeline_search",
+                source_of_truth: "timeline_search scan over CF_TIMELINE",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_timeline_digest(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(params): Json<crate::server::timeline_digest::TimelineDigestParams>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_timeline_digest(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardTimelineControlResponse {
+                ok: true,
+                trigger: "dashboard.timeline_digest",
+                source_of_truth: "timeline_digest derived from CF_EPISODES plus CF_ROUTINES",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_episode_list(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardEpisodeListRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let start_ts_ns = match parse_optional_ns(request.start_ts_ns.as_deref(), "start_ts_ns") {
+        Ok(value) => value,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    let end_ts_ns = match parse_optional_ns(request.end_ts_ns.as_deref(), "end_ts_ns") {
+        Ok(value) => value,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    let params = crate::m3::episodes::EpisodeListParams {
+        start_ts_ns,
+        end_ts_ns,
+        apps: request.apps,
+        actor: request.actor,
+        min_duration_ms: request.min_duration_ms,
+        limit: request.limit,
+        cursor: request.cursor,
+    };
+    match state.health_service.dashboard_episode_list(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardTimelineControlResponse {
+                ok: true,
+                trigger: "dashboard.episode_list",
+                source_of_truth: "episode_list read over CF_EPISODES",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_episode_get(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardEpisodeGetRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let start_ts_ns = match parse_optional_ns(request.start_ts_ns.as_deref(), "start_ts_ns") {
+        Ok(value) => value,
+        Err(response) => return with_dashboard_security_headers(response),
+    };
+    let params = crate::m3::episodes::EpisodeGetParams {
+        episode_id: request.episode_id,
+        start_ts_ns,
+        refs_limit: request.refs_limit,
+        refs_cursor: request.refs_cursor,
+    };
+    match state.health_service.dashboard_episode_get(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardTimelineControlResponse {
+                ok: true,
+                trigger: "dashboard.episode_get",
+                source_of_truth: "episode_get read over CF_EPISODES plus CF_TIMELINE refs",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_routine_list(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(params): Json<crate::m3::routines::RoutineListParams>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_routine_list(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardTimelineControlResponse {
+                ok: true,
+                trigger: "dashboard.routine_list",
+                source_of_truth: "routine_list read over CF_ROUTINES joined to CF_ROUTINE_STATE",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_routine_inspect(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(params): Json<crate::m3::routines::RoutineInspectParams>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_routine_inspect(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardTimelineControlResponse {
+                ok: true,
+                trigger: "dashboard.routine_inspect",
+                source_of_truth: "routine_inspect read over CF_ROUTINES, CF_ROUTINE_STATE, and armed rows",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_routine_update(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(params): Json<crate::m3::routines::RoutineUpdateParams>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_routine_update(params) {
+        Ok(readback) => with_dashboard_security_headers(
+            Json(DashboardTimelineControlResponse {
+                ok: true,
+                trigger: "dashboard.routine_update",
+                source_of_truth: "routine_update write/readback over CF_ROUTINE_STATE and armed_routine/v1 rows",
+                readback,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
 /// Parses an optional decimal epoch-nanosecond string into `Option<u64>`,
 /// returning a `TOOL_PARAMS_INVALID` response on a malformed value. ns values
 /// arrive as strings because they exceed JS `Number.MAX_SAFE_INTEGER`.
@@ -4896,12 +5265,12 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-const DASHBOARD_CSS_FILE: &str = "dashboard-C95PIXH6.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-Cf7by0u3.js";
+const DASHBOARD_CSS_FILE: &str = "dashboard-wxEBnmwL.css";
+const DASHBOARD_JS_FILE: &str = "dashboard-BIabgr0o.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
-    include_str!("../../../../dashboard/dist/assets/dashboard-C95PIXH6.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-Cf7by0u3.js");
+    include_str!("../../../../dashboard/dist/assets/dashboard-wxEBnmwL.css");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-BIabgr0o.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

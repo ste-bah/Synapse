@@ -81,11 +81,17 @@ import {
   putTemplate,
   deleteTemplate,
   fetchDashboardState,
+  fetchEpisodeDetail,
+  fetchEpisodes,
   fetchModels,
+  fetchRoutines,
   fetchSavedViews,
+  fetchTimelineDigest,
+  fetchTimelineRows,
   forceReleaseLease,
   handoffLease,
   dispatchAgentTaskOnce,
+  inspectRoutine,
   killAgent,
   panelData,
   pauseTimeline,
@@ -95,8 +101,10 @@ import {
   resumeTimeline,
   runStorageGc,
   saveDashboardView,
+  searchTimelineRows,
   spawnAgent,
   updateAgentTask,
+  updateRoutine,
   type AgentTaskAttempt,
   type AgentTaskRow,
   type AgentTaskState,
@@ -110,14 +118,20 @@ import {
   type DashboardRouteReadback,
   type DashboardSavedView,
   type DashboardState,
+  type EpisodeRow,
   type FleetStatus,
   type ModelRow,
   type AgentKillResponse,
+  type RoutineEntry,
+  type RoutineUpdateAction,
+  type RoutineUpdateReadback,
   type SpawnAgentResponse,
   type StorageGcReadback,
   type TimelineControlResponse,
+  type TimelineDigestReadback,
   type TimelinePurgeReadback,
   type TimelinePurgeRequest,
+  type TimelineRow,
   agentUsageFromTranscriptRecord
 } from "@/lib/dashboard-state";
 import {
@@ -2399,6 +2413,132 @@ function msToNsString(ms: number): string {
   return (BigInt(Math.floor(ms)) * 1_000_000n).toString();
 }
 
+function localDateInput(date = new Date()): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function dateInputToNsRange(dateInput: string): { start_ts_ns: string; end_ts_ns: string } | null {
+  if (!dateInput) return null;
+  const startMs = Date.parse(`${dateInput}T00:00:00`);
+  const endMs = Date.parse(`${dateInput}T23:59:59.999`);
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs > endMs) return null;
+  return { start_ts_ns: msToNsString(startMs), end_ts_ns: msToNsString(endMs) };
+}
+
+function formatDurationMs(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0m";
+  const seconds = Math.floor(value / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+type TimelineRenderItem =
+  | { kind: "row"; row: TimelineRow }
+  | { kind: "gap"; id: string; startNs: number; durationMs: number };
+
+interface TimelineRenderGroup {
+  label: string;
+  items: TimelineRenderItem[];
+}
+
+function groupTimelineRows(rows: TimelineRow[]): TimelineRenderGroup[] {
+  const groups = new Map<string, TimelineRenderItem[]>();
+  let previousTs = 0;
+  for (const row of rows) {
+    const ts = Number(row.ts_ns || 0);
+    const label = hourLabel(ts);
+    const group = groups.get(label) ?? [];
+    if (previousTs > 0 && ts > previousTs) {
+      const gapMs = Math.floor((ts - previousTs) / 1_000_000);
+      if (gapMs >= 5 * 60 * 1000) {
+        group.push({ kind: "gap", id: `gap-${previousTs}-${ts}`, startNs: previousTs, durationMs: gapMs });
+      }
+    }
+    group.push({ kind: "row", row });
+    groups.set(label, group);
+    previousTs = ts;
+  }
+  return [...groups.entries()].map(([label, items]) => ({ label, items }));
+}
+
+function hourLabel(tsNs: number): string {
+  if (!Number.isFinite(tsNs) || tsNs <= 0) return "Unknown";
+  return new Date(Math.floor(tsNs / 1_000_000)).toLocaleTimeString([], { hour: "numeric" });
+}
+
+function timelineRowTitle(row: TimelineRow): string {
+  const payload = asRecord(row.payload);
+  return (
+    firstPayloadText(payload, ["title", "window_title", "document", "path", "url", "text", "summary", "file_path", "clipboard_text"]) ||
+    row.app ||
+    row.kind
+  );
+}
+
+function timelineRowDetail(row: TimelineRow): string {
+  const payload = asRecord(row.payload);
+  const detail = firstPayloadText(payload, ["url", "path", "document", "target", "reason", "event", "app", "process"]);
+  if (detail && detail !== timelineRowTitle(row)) return detail;
+  return rawText(payload);
+}
+
+function firstPayloadText(payload: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = payload[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+    if (typeof value === "number" || typeof value === "boolean") return String(value);
+  }
+  for (const value of Object.values(payload)) {
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      const nested = firstPayloadText(value as Record<string, unknown>, keys);
+      if (nested) return nested;
+    }
+  }
+  return "";
+}
+
+function HighlightedText({ text, needle }: { text: string; needle: string }) {
+  if (!needle) return <>{text}</>;
+  const haystack = text || "";
+  const lower = haystack.toLowerCase();
+  const index = lower.indexOf(needle.toLowerCase());
+  if (index < 0) return <>{haystack}</>;
+  const end = index + needle.length;
+  return (
+    <>
+      {haystack.slice(0, index)}
+      <mark className="rounded-sm bg-warning px-0.5 text-inherit">{haystack.slice(index, end)}</mark>
+      {haystack.slice(end)}
+    </>
+  );
+}
+
+function episodeTitle(episode: EpisodeRow): string {
+  return episode.title_last || episode.title_first || episode.document || episode.url || episode.app || episode.episode_id;
+}
+
+function routineDisplayName(routine: RoutineEntry): string {
+  return routine.label || routine.schedule_label || routine.routine_id;
+}
+
+function formatConfidence(value?: number): string {
+  if (!Number.isFinite(value ?? NaN)) return "no confidence";
+  return `${Math.round((value ?? 0) * 100)}%`;
+}
+
+function routineLifecycleClass(lifecycle: string): string {
+  if (lifecycle === "confirmed") return "border border-success-border bg-success-bg text-success-fg";
+  if (lifecycle === "disabled" || lifecycle === "archived") return "border border-warning-border bg-warning-bg text-warning-fg";
+  return "border border-info-border bg-info-bg text-info-fg";
+}
+
 // Mirrors synapse-storage gc.rs `remove_count` (Rows unit): an explicit row cap
 // evicts EXACTLY the overage, landing the store precisely on the cap (no minimum
 // batch), so the dashboard's predicted count is the count GC will delete.
@@ -2754,6 +2894,460 @@ function RecordingsOverTime({ state }: { state?: DashboardState }) {
         <RawValue value={byKind} label="Recordings by kind" />
         <RawValue value={byDay} label="Recordings by day (UTC)" />
       </div>
+    </div>
+  );
+}
+
+function TimelineRoutineExplorer({ state, onRefresh }: { state?: DashboardState; onRefresh: () => void | Promise<unknown> }) {
+  const queryClient = useQueryClient();
+  const [selectedDate, setSelectedDate] = useState(localDateInput());
+  const [kindFilter, setKindFilter] = useState("");
+  const [searchText, setSearchText] = useState("");
+  const [selectedEpisodeId, setSelectedEpisodeId] = useState("");
+  const [selectedRoutineId, setSelectedRoutineId] = useState("");
+  const [routineLabelDraft, setRoutineLabelDraft] = useState("");
+  const [routineBusy, setRoutineBusy] = useState<RoutineUpdateAction | "">("");
+  const [routineError, setRoutineError] = useState("");
+  const [lastRoutineUpdate, setLastRoutineUpdate] = useState<RoutineUpdateReadback | null>(null);
+  const dayBounds = useMemo(() => dateInputToNsRange(selectedDate), [selectedDate]);
+  const byKind = asRecord(asRecord(panelData(state?.timeline)).rows_by_kind);
+  const kindOptions = Object.keys(byKind).filter((kind) => kind !== "purge").sort();
+  const trimmedSearch = searchText.trim();
+
+  const timelineQuery = useQuery({
+    queryKey: ["dashboard-timeline-day", selectedDate, kindFilter],
+    enabled: Boolean(dayBounds),
+    queryFn: () => {
+      if (!dayBounds) throw new Error("Invalid date");
+      return fetchTimelineRows({
+        ...dayBounds,
+        actor: "human",
+        kinds: kindFilter ? [kindFilter] : undefined,
+        limit: 500
+      });
+    }
+  });
+  const searchQuery = useQuery({
+    queryKey: ["dashboard-timeline-search", selectedDate, kindFilter, trimmedSearch],
+    enabled: Boolean(dayBounds && trimmedSearch),
+    queryFn: () => {
+      if (!dayBounds) throw new Error("Invalid date");
+      return searchTimelineRows({
+        ...dayBounds,
+        actor: "human",
+        text: trimmedSearch,
+        kinds: kindFilter ? [kindFilter] : undefined,
+        limit: 100
+      });
+    }
+  });
+  const digestQuery = useQuery({
+    queryKey: ["dashboard-timeline-digest", selectedDate],
+    enabled: Boolean(dayBounds),
+    queryFn: () => fetchTimelineDigest({ period: "day", date: selectedDate, top_n: 8 })
+  });
+  const episodeQuery = useQuery({
+    queryKey: ["dashboard-episodes", selectedDate],
+    enabled: Boolean(dayBounds),
+    queryFn: () => {
+      if (!dayBounds) throw new Error("Invalid date");
+      return fetchEpisodes({ ...dayBounds, actor: "human", limit: 200 });
+    }
+  });
+  const routineQuery = useQuery({
+    queryKey: ["dashboard-routines"],
+    queryFn: () => fetchRoutines({ include_unmined: true, limit: 200 })
+  });
+  const episodeRows = episodeQuery.data?.episodes ?? [];
+  const routineRows = routineQuery.data?.entries ?? [];
+  const selectedEpisode = episodeRows.find((episode) => episode.episode_id === selectedEpisodeId) ?? episodeRows[0];
+  const selectedRoutine = routineRows.find((routine) => routine.routine_id === selectedRoutineId) ?? routineRows[0];
+  const episodeDetailQuery = useQuery({
+    queryKey: ["dashboard-episode-detail", selectedEpisode?.episode_id],
+    enabled: Boolean(selectedEpisode?.episode_id),
+    queryFn: () => fetchEpisodeDetail({ episode_id: selectedEpisode!.episode_id, start_ts_ns: String(selectedEpisode!.start_ts_ns), refs_limit: 200 })
+  });
+  const routineInspectQuery = useQuery({
+    queryKey: ["dashboard-routine-inspect", selectedRoutine?.routine_id],
+    enabled: Boolean(selectedRoutine?.routine_id),
+    queryFn: () => inspectRoutine({ routine_id: selectedRoutine!.routine_id })
+  });
+
+  useEffect(() => {
+    if (episodeRows.length && !episodeRows.some((episode) => episode.episode_id === selectedEpisodeId)) {
+      setSelectedEpisodeId(episodeRows[0].episode_id);
+    }
+    if (!episodeRows.length && selectedEpisodeId) setSelectedEpisodeId("");
+  }, [episodeRows, selectedEpisodeId]);
+
+  useEffect(() => {
+    if (routineRows.length && !routineRows.some((routine) => routine.routine_id === selectedRoutineId)) {
+      setSelectedRoutineId(routineRows[0].routine_id);
+    }
+    if (!routineRows.length && selectedRoutineId) setSelectedRoutineId("");
+  }, [routineRows, selectedRoutineId]);
+
+  useEffect(() => {
+    setRoutineLabelDraft(selectedRoutine ? routineDisplayName(selectedRoutine) : "");
+  }, [selectedRoutine?.routine_id, selectedRoutine?.label]);
+
+  const searchHitKeys = useMemo(() => new Set((searchQuery.data?.matches ?? []).map((row) => row.key_hex)), [searchQuery.data]);
+  const groupedTimeline = useMemo(() => groupTimelineRows(timelineQuery.data?.rows ?? []), [timelineQuery.data]);
+  const digest = digestQuery.data;
+  const timelineRows = timelineQuery.data?.rows ?? [];
+
+  const runRoutineAction = async (action: RoutineUpdateAction, extras: Partial<{ label: string; arm_schedule: boolean; arm_intent: boolean; failure_threshold: number }> = {}) => {
+    if (!selectedRoutine) return;
+    setRoutineBusy(action);
+    setRoutineError("");
+    try {
+      const readback = await updateRoutine({
+        routine_id: selectedRoutine.routine_id,
+        action,
+        note: "dashboard timeline routine management",
+        ...extras
+      });
+      setLastRoutineUpdate(readback);
+      await Promise.all([
+        routineQuery.refetch(),
+        routineInspectQuery.refetch(),
+        queryClient.invalidateQueries({ queryKey: ["dashboard-timeline-digest"] }),
+        Promise.resolve(onRefresh())
+      ]);
+    } catch (error) {
+      setRoutineError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setRoutineBusy("");
+    }
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3 md:grid-cols-[12rem_minmax(0,1fr)_12rem_auto]">
+        <label className="block text-sm text-secondary">
+          <span className="mb-1 block text-label font-medium uppercase text-muted">Day</span>
+          <input
+            type="date"
+            value={selectedDate}
+            onChange={(event) => setSelectedDate(event.target.value)}
+            className="h-10 w-full rounded-md border border-border bg-surface-2 px-3 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+          />
+        </label>
+        <label className="block text-sm text-secondary">
+          <span className="mb-1 block text-label font-medium uppercase text-muted">Search</span>
+          <input
+            value={searchText}
+            onChange={(event) => setSearchText(event.target.value)}
+            className="h-10 w-full rounded-md border border-border bg-surface-2 px-3 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+            placeholder="title, doc, path, url"
+          />
+        </label>
+        <label className="block text-sm text-secondary">
+          <span className="mb-1 block text-label font-medium uppercase text-muted">Kind</span>
+          <select
+            value={kindFilter}
+            onChange={(event) => setKindFilter(event.target.value)}
+            className="h-10 w-full rounded-md border border-border bg-surface-2 px-3 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+          >
+            <option value="">All kinds</option>
+            {kindOptions.map((kind) => (
+              <option key={kind} value={kind}>{kind}</option>
+            ))}
+          </select>
+        </label>
+        <div className="flex items-end">
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={() => {
+              timelineQuery.refetch();
+              searchQuery.refetch();
+              digestQuery.refetch();
+              episodeQuery.refetch();
+              routineQuery.refetch();
+            }}
+          >
+            <RefreshCw aria-hidden="true" className="h-4 w-4" />
+            Refresh
+          </Button>
+        </div>
+      </div>
+
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <StatCard label="Timeline rows" value={timelineRows.length} status={timelineQuery.data?.next_cursor ? "needs_input" : "done"} delta={timelineQuery.data?.stopped_because || "timeline_get"} />
+        <StatCard label="Search hits" value={searchQuery.data?.matches.length ?? 0} status={trimmedSearch ? "working" : "idle"} delta={trimmedSearch || "no filter"} />
+        <StatCard label="Episodes" value={digest?.episode_count ?? episodeRows.length} status={episodeRows.length ? "working" : "idle"} delta={`${formatDurationMs(digest?.active_ms ?? 0)} active`} />
+        <StatCard label="Routines" value={routineQuery.data?.returned ?? 0} status={routineRows.length ? "working" : "idle"} delta={`${routineQuery.data?.total_mined ?? 0} mined`} />
+      </div>
+
+      <div className="grid gap-4 2xl:grid-cols-[minmax(0,1.25fr)_minmax(22rem,0.75fr)]">
+        <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+          <div className="mb-3 flex items-center gap-2 text-primary">
+            <Rows3 aria-hidden="true" className="h-4 w-4 text-info" />
+            <h3 className="text-md font-medium tracking-normal">Day Rows</h3>
+          </div>
+          {timelineQuery.isError ? <div className="rounded-md border border-danger-border bg-danger-bg p-3 text-sm text-danger-fg">{rawText(timelineQuery.error)}</div> : null}
+          {groupedTimeline.length ? (
+            <div className="space-y-4">
+              {groupedTimeline.map((group) => (
+                <div key={group.label} className="grid gap-2">
+                  <div className="sticky top-0 z-10 border-b border-border-subtle bg-surface-1 py-1 text-label font-medium uppercase text-muted">{group.label}</div>
+                  {group.items.map((item) =>
+                    item.kind === "gap" ? (
+                      <div key={item.id} className="grid grid-cols-[5.5rem_minmax(0,1fr)] rounded-md border border-border-subtle bg-surface-2 px-3 py-2 text-sm text-secondary">
+                        <span className="font-mono text-xs text-muted">{nsToTime(item.startNs)}</span>
+                        <span>Idle gap · {formatDurationMs(item.durationMs)}</span>
+                      </div>
+                    ) : (
+                      <TimelineRowCard key={item.row.key_hex} row={item.row} searchText={trimmedSearch} hit={searchHitKeys.has(item.row.key_hex)} />
+                    )
+                  )}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyStateArt title={timelineQuery.isFetching ? "Loading timeline rows" : "No timeline rows for day"} />
+          )}
+        </div>
+
+        <div className="grid gap-4">
+          <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+            <div className="mb-3 flex items-center gap-2 text-primary">
+              <Gauge aria-hidden="true" className="h-4 w-4 text-info" />
+              <h3 className="text-md font-medium tracking-normal">Digest</h3>
+            </div>
+            {digestQuery.isError ? <div className="rounded-md border border-danger-border bg-danger-bg p-3 text-sm text-danger-fg">{rawText(digestQuery.error)}</div> : null}
+            {digest ? <DigestSummary digest={digest} /> : <EmptyState title={digestQuery.isFetching ? "Loading digest" : "No digest rows"} />}
+          </div>
+
+          {trimmedSearch ? (
+            <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+              <div className="mb-3 flex items-center gap-2 text-primary">
+                <Search aria-hidden="true" className="h-4 w-4 text-info" />
+                <h3 className="text-md font-medium tracking-normal">Search Hits</h3>
+              </div>
+              {searchQuery.isError ? <div className="rounded-md border border-danger-border bg-danger-bg p-3 text-sm text-danger-fg">{rawText(searchQuery.error)}</div> : null}
+              {(searchQuery.data?.matches ?? []).length ? (
+                <div className="space-y-2">
+                  {searchQuery.data!.matches.slice(0, 8).map((row) => <TimelineRowCard key={row.key_hex} row={row} searchText={trimmedSearch} hit />)}
+                </div>
+              ) : (
+                <EmptyState title={searchQuery.isFetching ? "Searching" : "No matching rows"} />
+              )}
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      <div className="grid gap-4 xl:grid-cols-2">
+        <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+          <div className="mb-3 flex items-center gap-2 text-primary">
+            <FileSearch aria-hidden="true" className="h-4 w-4 text-info" />
+            <h3 className="text-md font-medium tracking-normal">Episodes</h3>
+          </div>
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,0.55fr)_minmax(0,0.45fr)]">
+            <div className="max-h-[32rem] overflow-auto rounded-md border border-border-subtle">
+              {episodeRows.length ? episodeRows.map((episode) => (
+                <button
+                  key={episode.episode_id}
+                  type="button"
+                  onClick={() => setSelectedEpisodeId(episode.episode_id)}
+                  className={cn(
+                    "grid w-full gap-1 border-b border-border-subtle px-3 py-2 text-left last:border-b-0 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
+                    selectedEpisode?.episode_id === episode.episode_id && "bg-surface-2"
+                  )}
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="truncate text-sm font-medium text-primary">{episodeTitle(episode)}</span>
+                    <span className="font-mono text-xs text-muted">{formatDurationMs(episode.duration_ms)}</span>
+                  </span>
+                  <span className="truncate text-xs text-secondary">{nsToTime(episode.start_ts_ns)} · {episode.app || "unknown"} · {episode.document || episode.url || "no document"}</span>
+                </button>
+              )) : <EmptyState title={episodeQuery.isFetching ? "Loading episodes" : "No episodes for day"} />}
+            </div>
+            <div>
+              {selectedEpisode ? (
+                <>
+                  <MetricRow label="Episode" value={<span className="font-mono">{shortKey(selectedEpisode.episode_id)}</span>} />
+                  <MetricRow label="Start" value={nsToTime(selectedEpisode.start_ts_ns)} />
+                  <MetricRow label="Duration" value={formatDurationMs(selectedEpisode.duration_ms)} />
+                  <MetricRow label="Rows" value={rawText(selectedEpisode.row_count)} />
+                  <MetricRow label="Input" value={`${selectedEpisode.keystroke_count} keys · ${selectedEpisode.click_count} clicks`} />
+                  <div className="mt-3">
+                    <RawValue value={episodeDetailQuery.data ?? selectedEpisode} label="Episode readback" />
+                  </div>
+                </>
+              ) : (
+                <EmptyState title="No episode selected" />
+              )}
+            </div>
+          </div>
+        </div>
+
+        <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+          <div className="mb-3 flex items-center gap-2 text-primary">
+            <Rocket aria-hidden="true" className="h-4 w-4 text-info" />
+            <h3 className="text-md font-medium tracking-normal">Routines</h3>
+          </div>
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,0.5fr)_minmax(0,0.5fr)]">
+            <div className="max-h-[32rem] overflow-auto rounded-md border border-border-subtle">
+              {routineRows.length ? routineRows.map((routine) => (
+                <button
+                  key={routine.routine_id}
+                  type="button"
+                  data-testid={`routine-row-${routine.routine_id}`}
+                  onClick={() => setSelectedRoutineId(routine.routine_id)}
+                  className={cn(
+                    "grid w-full gap-1 border-b border-border-subtle px-3 py-2 text-left last:border-b-0 hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
+                    selectedRoutine?.routine_id === routine.routine_id && "bg-surface-2"
+                  )}
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span className="truncate text-sm font-medium text-primary">{routineDisplayName(routine)}</span>
+                    <span className={cn("rounded-sm px-2 py-0.5 text-xs", routineLifecycleClass(routine.lifecycle))}>{routine.lifecycle}</span>
+                  </span>
+                  <span className="truncate text-xs text-secondary">
+                    {routine.schedule_label || "no schedule"} · {formatConfidence(routine.confidence)} · {routine.steps.length} steps
+                  </span>
+                </button>
+              )) : <EmptyState title={routineQuery.isFetching ? "Loading routines" : "No mined routines"} />}
+            </div>
+            <div>
+              {selectedRoutine ? (
+                <div className="space-y-3">
+                  <MetricRow label="Routine" value={<span className="font-mono">{shortKey(selectedRoutine.routine_id)}</span>} />
+                  <MetricRow label="Lifecycle" value={selectedRoutine.lifecycle} />
+                  <MetricRow label="Evidence" value={`${selectedRoutine.occurrence_count ?? 0} occurrences · ${selectedRoutine.support_days ?? 0} days`} />
+                  <MetricRow label="Armed" value={rawText(asRecord(routineInspectQuery.data).armed ? "yes" : "no")} />
+                  <label className="block text-sm text-secondary">
+                    <span className="mb-1 block text-label font-medium uppercase text-muted">Label</span>
+                    <input
+                      data-testid="routine-label-input"
+                      value={routineLabelDraft}
+                      onChange={(event) => setRoutineLabelDraft(event.target.value)}
+                      className="h-10 w-full rounded-md border border-border bg-surface-2 px-3 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+                    />
+                  </label>
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="button" variant="secondary" size="sm" data-testid="routine-action-rename" disabled={routineBusy === "rename" || !routineLabelDraft.trim()} onClick={() => runRoutineAction("rename", { label: routineLabelDraft.trim() })}>
+                      <Pencil aria-hidden="true" className="h-4 w-4" />
+                      {routineBusy === "rename" ? "Renaming" : "Rename"}
+                    </Button>
+                    {selectedRoutine.lifecycle === "candidate" ? (
+                      <Button type="button" variant="secondary" size="sm" data-testid="routine-action-confirm" disabled={routineBusy === "confirm"} onClick={() => runRoutineAction("confirm")}>
+                        <CheckCircle2 aria-hidden="true" className="h-4 w-4" />
+                        {routineBusy === "confirm" ? "Confirming" : "Confirm"}
+                      </Button>
+                    ) : null}
+                    {selectedRoutine.lifecycle === "disabled" || selectedRoutine.lifecycle === "archived" ? (
+                      <Button type="button" variant="secondary" size="sm" data-testid="routine-action-enable" disabled={routineBusy === "enable"} onClick={() => runRoutineAction("enable")}>
+                        <Play aria-hidden="true" className="h-4 w-4" />
+                        {routineBusy === "enable" ? "Enabling" : "Enable"}
+                      </Button>
+                    ) : (
+                      <Button type="button" variant="danger" size="sm" data-testid="routine-action-disable" disabled={routineBusy === "disable"} onClick={() => runRoutineAction("disable")}>
+                        <Pause aria-hidden="true" className="h-4 w-4" />
+                        {routineBusy === "disable" ? "Disabling" : "Disable"}
+                      </Button>
+                    )}
+                    {asRecord(routineInspectQuery.data).armed ? (
+                      <Button type="button" variant="secondary" size="sm" data-testid="routine-action-disarm" disabled={routineBusy === "disarm"} onClick={() => runRoutineAction("disarm")}>
+                        <Moon aria-hidden="true" className="h-4 w-4" />
+                        {routineBusy === "disarm" ? "Disarming" : "Disarm"}
+                      </Button>
+                    ) : (
+                      <Button type="button" variant="secondary" size="sm" data-testid="routine-action-arm" disabled={routineBusy === "arm"} onClick={() => runRoutineAction("arm", { arm_schedule: true, arm_intent: true, failure_threshold: 3 })}>
+                        <Sun aria-hidden="true" className="h-4 w-4" />
+                        {routineBusy === "arm" ? "Arming" : "Arm"}
+                      </Button>
+                    )}
+                    {selectedRoutine.lifecycle !== "archived" ? (
+                      <Button type="button" variant="danger" size="sm" data-testid="routine-action-purge" disabled={routineBusy === "archive"} onClick={() => runRoutineAction("archive")}>
+                        <Trash2 aria-hidden="true" className="h-4 w-4" />
+                        {routineBusy === "archive" ? "Purging" : "Purge"}
+                      </Button>
+                    ) : null}
+                  </div>
+                  {routineError ? <div className="rounded-md border border-danger-border bg-danger-bg p-3 text-sm text-danger-fg">{routineError}</div> : null}
+                  {lastRoutineUpdate ? <RawValue value={lastRoutineUpdate} label="Last routine_update readback" /> : null}
+                  <RawValue value={routineInspectQuery.data ?? selectedRoutine} label="Routine inspect readback" />
+                </div>
+              ) : (
+                <EmptyState title="No routine selected" />
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TimelineRowCard({ row, searchText, hit }: { row: TimelineRow; searchText: string; hit: boolean }) {
+  const payload = asRecord(row.payload);
+  const title = timelineRowTitle(row);
+  const detail = timelineRowDetail(row);
+  return (
+    <div
+      className={cn(
+        "grid grid-cols-[5.5rem_minmax(7rem,0.24fr)_minmax(0,1fr)] gap-3 rounded-md border px-3 py-2 text-sm",
+        hit ? "border-warning-border bg-warning-bg text-warning-fg" : "border-border-subtle bg-surface-2 text-secondary"
+      )}
+    >
+      <span className="font-mono text-xs text-muted">{nsToTime(row.ts_ns)}</span>
+      <span className="min-w-0">
+        <span className="block truncate font-mono text-xs text-primary">{row.kind}</span>
+        <span className="block truncate text-xs">{row.app || row.actor}</span>
+      </span>
+      <span className="min-w-0">
+        <span className="block truncate font-medium text-primary"><HighlightedText text={title} needle={searchText} /></span>
+        <span className="line-clamp-2 text-xs"><HighlightedText text={detail || rawText(payload)} needle={searchText} /></span>
+      </span>
+    </div>
+  );
+}
+
+function DigestSummary({ digest }: { digest: TimelineDigestReadback }) {
+  const topApps = digest.by_app.slice(0, 5);
+  const topDocs = digest.top_documents.slice(0, 5);
+  return (
+    <div className="space-y-3">
+      <div className="grid grid-cols-2 gap-3">
+        <MetricRow label="Active" value={formatDurationMs(digest.active_ms)} />
+        <MetricRow label="Idle" value={formatDurationMs(digest.idle_ms)} />
+        <MetricRow label="Input" value={`${digest.total_keystrokes} keys · ${digest.total_clicks} clicks`} />
+        <MetricRow label="Scans" value={`${digest.episodes_scanned_rows} episodes · ${digest.routines_scanned_rows} routines`} />
+      </div>
+      <div>
+        <div className="mb-1 text-label font-medium uppercase text-muted">Apps</div>
+        <div className="space-y-1">
+          {topApps.map((row) => <DigestUsageBar key={rawText(row.key)} row={row} totalMs={digest.active_ms} />)}
+          {!topApps.length ? <EmptyState title="No app rows" /> : null}
+        </div>
+      </div>
+      <div>
+        <div className="mb-1 text-label font-medium uppercase text-muted">Documents</div>
+        <div className="space-y-1">
+          {topDocs.map((row) => <DigestUsageBar key={rawText(row.key)} row={row} totalMs={digest.active_ms} />)}
+          {!topDocs.length ? <EmptyState title="No document rows" /> : null}
+        </div>
+      </div>
+      <RawValue value={digest.routines_touched} label="Routines touched" />
+    </div>
+  );
+}
+
+function DigestUsageBar({ row, totalMs }: { row: Record<string, unknown>; totalMs: number }) {
+  const activeMs = Number(row.active_ms || 0);
+  const pct = totalMs > 0 ? Math.max(2, Math.min(100, (activeMs / totalMs) * 100)) : 0;
+  return (
+    <div className="grid grid-cols-[minmax(0,1fr)_5rem] items-center gap-2 text-xs">
+      <span className="relative h-7 overflow-hidden rounded-md border border-border-subtle bg-surface-2">
+        <span className="absolute inset-y-0 left-0 bg-info-bg" style={{ width: `${pct}%` }} />
+        <span className="absolute inset-0 flex items-center px-2 text-primary"><span className="truncate">{rawText(row.key)}</span></span>
+      </span>
+      <span className="text-right font-mono text-secondary">{formatDurationMs(activeMs)}</span>
     </div>
   );
 }
@@ -3228,6 +3822,14 @@ function SystemView({
         questions={["How fast are recordings accumulating?", "Which days and kinds dominate?", "How much disk do recordings hold?"]}
       >
         <RecordingsOverTime state={state} />
+      </Section>
+
+      <Section
+        title="Timeline & Routines"
+        tier="triage"
+        questions={["Can a real day be scanned from timeline_get?", "Do search hits line up with the rows?", "Do routine lifecycle changes round-trip?"]}
+      >
+        <TimelineRoutineExplorer state={state} onRefresh={onRefresh} />
       </Section>
 
       <Section

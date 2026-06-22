@@ -12,19 +12,37 @@
 //! recorder control gate, never a parallel cache.
 
 use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
+use crate::m3::episodes::{
+    EpisodeGetParams, EpisodeGetResponse, EpisodeListParams, EpisodeListResponse, get_episode,
+    list_episodes, required_permissions_get as episode_required_permissions_get,
+    required_permissions_list as episode_required_permissions_list,
+};
+use crate::m3::routines::{
+    RoutineInspectParams, RoutineInspectResponse, RoutineListParams, RoutineListResponse,
+    RoutineUpdateParams, RoutineUpdateResponse, inspect_routine, list_routines,
+    required_permissions_inspect as routine_required_permissions_inspect,
+    required_permissions_list as routine_required_permissions_list,
+    required_permissions_update as routine_required_permissions_update, update_routine,
+};
 use crate::m3::storage::{
     StorageGcOnceParams, StorageGcOnceResponse, required_permissions_gc, run_storage_gc_once,
 };
 use crate::m3::timeline::{
     RecorderStatus, TimelineGetParams, TimelineGetResponse, TimelinePurgeParams,
-    TimelinePurgeResponse, TimelineStatsParams, TimelineStatsResponse, get_timeline,
-    purge_timeline, required_permissions_get, required_permissions_purge,
-    required_permissions_stats, timeline_stats_data,
+    TimelinePurgeResponse, TimelineSearchParams, TimelineSearchResponse, TimelineStatsParams,
+    TimelineStatsResponse, get_timeline, purge_timeline,
+    required_permissions as timeline_required_permissions_search,
+    required_permissions_get as timeline_required_permissions_get, required_permissions_purge,
+    required_permissions_stats, search_timeline, timeline_stats_data,
 };
 use crate::m3::timeline_control::{
     TimelinePauseParams, TimelinePauseResponse, TimelineResumeParams, TimelineResumeResponse,
     pause_timeline, recorder_control_handle, required_permissions_pause,
     required_permissions_resume, resume_timeline,
+};
+use crate::server::timeline_digest::{
+    TimelineDigestParams, TimelineDigestResponse, build_digest,
+    required_permissions as timeline_digest_required_permissions,
 };
 
 #[tool_router(router = timeline_query_tool_router, vis = "pub(super)")]
@@ -36,6 +54,90 @@ impl SynapseService {
         let recorder = RecorderStatus::from_control(&control);
         let runtime = self.reflex_runtime()?;
         timeline_stats_data(&runtime, recorder, &params)
+    }
+
+    pub(crate) fn dashboard_timeline_get(
+        &self,
+        params: TimelineGetParams,
+    ) -> Result<TimelineGetResponse, ErrorData> {
+        self.require_m3_permissions("timeline_get", &timeline_required_permissions_get(&params))?;
+        let runtime = self.reflex_runtime()?;
+        get_timeline(&runtime, &params)
+    }
+
+    pub(crate) fn dashboard_timeline_search(
+        &self,
+        params: TimelineSearchParams,
+    ) -> Result<TimelineSearchResponse, ErrorData> {
+        self.require_m3_permissions(
+            "timeline_search",
+            &timeline_required_permissions_search(&params),
+        )?;
+        let runtime = self.reflex_runtime()?;
+        search_timeline(&runtime, &params)
+    }
+
+    pub(crate) fn dashboard_timeline_digest(
+        &self,
+        params: TimelineDigestParams,
+    ) -> Result<TimelineDigestResponse, ErrorData> {
+        self.require_m3_permissions(
+            "timeline_digest",
+            &timeline_digest_required_permissions(&params),
+        )?;
+        let runtime = self.reflex_runtime()?;
+        build_digest(&runtime, &params)
+    }
+
+    pub(crate) fn dashboard_episode_list(
+        &self,
+        params: EpisodeListParams,
+    ) -> Result<EpisodeListResponse, ErrorData> {
+        self.require_m3_permissions("episode_list", &episode_required_permissions_list(&params))?;
+        let runtime = self.reflex_runtime()?;
+        list_episodes(&runtime, &params)
+    }
+
+    pub(crate) fn dashboard_episode_get(
+        &self,
+        params: EpisodeGetParams,
+    ) -> Result<EpisodeGetResponse, ErrorData> {
+        self.require_m3_permissions("episode_get", &episode_required_permissions_get(&params))?;
+        let runtime = self.reflex_runtime()?;
+        get_episode(&runtime, &params)
+    }
+
+    pub(crate) fn dashboard_routine_list(
+        &self,
+        params: RoutineListParams,
+    ) -> Result<RoutineListResponse, ErrorData> {
+        self.require_m3_permissions("routine_list", &routine_required_permissions_list(&params))?;
+        let db = self.m3_storage()?;
+        list_routines(&db, &params)
+    }
+
+    pub(crate) fn dashboard_routine_inspect(
+        &self,
+        params: RoutineInspectParams,
+    ) -> Result<RoutineInspectResponse, ErrorData> {
+        self.require_m3_permissions(
+            "routine_inspect",
+            &routine_required_permissions_inspect(&params),
+        )?;
+        let db = self.m3_storage()?;
+        inspect_routine(&db, &params)
+    }
+
+    pub(crate) fn dashboard_routine_update(
+        &self,
+        params: RoutineUpdateParams,
+    ) -> Result<RoutineUpdateResponse, ErrorData> {
+        self.require_m3_permissions(
+            "routine_update",
+            &routine_required_permissions_update(&params),
+        )?;
+        let db = self.m3_storage()?;
+        update_routine(&db, &params, "dashboard")
     }
 
     pub(crate) fn dashboard_timeline_pause(
@@ -100,7 +202,10 @@ impl SynapseService {
             has_cursor = params.0.cursor.is_some(),
             "tool.invocation kind=timeline_get"
         );
-        self.require_m3_permissions("timeline_get", &required_permissions_get(&params.0))?;
+        self.require_m3_permissions(
+            "timeline_get",
+            &timeline_required_permissions_get(&params.0),
+        )?;
         let runtime = self.reflex_runtime()?;
         get_timeline(&runtime, &params.0).map(Json)
     }

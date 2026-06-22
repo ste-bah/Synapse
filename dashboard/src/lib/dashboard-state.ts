@@ -474,6 +474,197 @@ export interface TimelineControlResponse {
   readback: Record<string, unknown>;
 }
 
+export interface TimelineQueryRequest {
+  start_ts_ns?: string;
+  end_ts_ns?: string;
+  apps?: string[];
+  text?: string;
+  kinds?: string[];
+  actor?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface TimelineRow {
+  key_hex: string;
+  ts_ns: number;
+  seq?: number;
+  kind: string;
+  actor: string;
+  app?: string;
+  payload: Record<string, unknown>;
+}
+
+export interface TimelineGetReadback {
+  rows: TimelineRow[];
+  scanned_rows: number;
+  invalid_rows: number;
+  next_cursor?: string;
+  stopped_because: string;
+}
+
+export interface TimelineSearchReadback {
+  matches: TimelineRow[];
+  scanned_rows: number;
+  invalid_rows: number;
+  next_cursor?: string;
+  stopped_because: string;
+}
+
+export interface TimelineDigestRequest {
+  period: "day" | "week";
+  date?: string;
+  anchor_ts_ns?: number;
+  include_agent_activity?: boolean;
+  top_n?: number;
+}
+
+export interface TimelineDigestReadback {
+  period: string;
+  period_start_ns: number;
+  period_end_ns: number;
+  days_covered: number;
+  actor_filter: string;
+  episode_count: number;
+  active_ms: number;
+  idle_ms: number;
+  first_activity_ns?: number;
+  last_activity_ns?: number;
+  total_keystrokes: number;
+  total_clicks: number;
+  total_interruptions: number;
+  total_interrupted_ms: number;
+  by_app: Array<Record<string, unknown>>;
+  by_app_other: Record<string, unknown>;
+  top_documents: Array<Record<string, unknown>>;
+  top_documents_other: Record<string, unknown>;
+  per_day: Array<Record<string, unknown>>;
+  routines_touched: Array<Record<string, unknown>>;
+  episodes_scanned_rows: number;
+  routines_scanned_rows: number;
+}
+
+export interface EpisodeListRequest {
+  start_ts_ns?: string;
+  end_ts_ns?: string;
+  apps?: string[];
+  actor?: string;
+  min_duration_ms?: number;
+  limit?: number;
+  cursor?: string;
+}
+
+export interface EpisodeRow {
+  key_hex: string;
+  ordinal: number;
+  episode_id: string;
+  start_ts_ns: number;
+  end_ts_ns: number;
+  duration_ms: number;
+  actor: string;
+  app?: string;
+  document?: string;
+  url?: string;
+  title_first?: string;
+  title_last?: string;
+  distinct_title_count: number;
+  row_count: number;
+  keystroke_count: number;
+  click_count: number;
+  interruption_count: number;
+  interrupted_ms: number;
+  started_because: Record<string, unknown> | string;
+  ended_because: Record<string, unknown> | string;
+}
+
+export interface EpisodeListReadback {
+  episodes: EpisodeRow[];
+  scanned_rows: number;
+  next_cursor?: string;
+  stopped_because: string;
+}
+
+export interface EpisodeGetRequest {
+  episode_id: string;
+  start_ts_ns?: string;
+  refs_limit?: number;
+  refs_cursor?: string;
+}
+
+export interface EpisodeGetReadback {
+  episode: EpisodeRow;
+  episode_scanned_rows: number;
+  timeline_refs: Array<Record<string, unknown>>;
+  refs_scanned_rows: number;
+  refs_invalid_rows: number;
+  next_refs_cursor?: string;
+  refs_stopped_because: string;
+}
+
+export interface RoutineListRequest {
+  lifecycle?: string[];
+  min_confidence?: number;
+  app?: string;
+  granularity?: string;
+  include_unmined?: boolean;
+  limit?: number;
+}
+
+export interface RoutineEntry {
+  routine_id: string;
+  lifecycle: string;
+  label?: string;
+  mined: boolean;
+  state_row_exists: boolean;
+  granularity?: string;
+  steps: Array<Record<string, unknown>>;
+  schedule_label?: string;
+  confidence?: number;
+  support_days?: number;
+  occurrence_count?: number;
+  last_mined_ts_ns?: number;
+  updated_ts_ns: number;
+  tainted: boolean;
+  taint?: Record<string, unknown>;
+}
+
+export interface RoutineListReadback {
+  total_mined: number;
+  total_state_rows: number;
+  matched: number;
+  returned: number;
+  truncated: boolean;
+  entries: RoutineEntry[];
+}
+
+export interface RoutineInspectRequest {
+  routine_id: string;
+}
+
+export type RoutineUpdateAction = "confirm" | "disable" | "enable" | "archive" | "rename" | "arm" | "disarm";
+
+export interface RoutineUpdateRequest {
+  routine_id: string;
+  action: RoutineUpdateAction;
+  label?: string;
+  note?: string;
+  arm_schedule?: boolean;
+  arm_intent?: boolean;
+  failure_threshold?: number;
+}
+
+export interface RoutineUpdateReadback {
+  routine_id: string;
+  action: RoutineUpdateAction;
+  lifecycle_before: string;
+  lifecycle_after: string;
+  label_before?: string;
+  label_after?: string;
+  state_row_created: boolean;
+  state: Record<string, unknown>;
+  armed?: Record<string, unknown>;
+}
+
 export interface LeaseForceReleaseRequest {
   owner_session_id: string;
   confirmed: boolean;
@@ -726,6 +917,102 @@ export async function resumeTimeline(): Promise<TimelineControlResponse> {
     headers: jsonHeaders()
   });
   return (await readJsonOrThrow(response)) as unknown as TimelineControlResponse;
+}
+
+export async function fetchTimelineRows(request: TimelineQueryRequest): Promise<TimelineGetReadback> {
+  const response = await fetch("/dashboard/timeline/get", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as TimelineGetReadback;
+}
+
+export async function searchTimelineRows(request: TimelineQueryRequest): Promise<TimelineSearchReadback> {
+  const response = await fetch("/dashboard/timeline/search", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as TimelineSearchReadback;
+}
+
+export async function fetchTimelineDigest(request: TimelineDigestRequest): Promise<TimelineDigestReadback> {
+  const response = await fetch("/dashboard/timeline/digest", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as TimelineDigestReadback;
+}
+
+export async function fetchEpisodes(request: EpisodeListRequest): Promise<EpisodeListReadback> {
+  const response = await fetch("/dashboard/episodes/list", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as EpisodeListReadback;
+}
+
+export async function fetchEpisodeDetail(request: EpisodeGetRequest): Promise<EpisodeGetReadback> {
+  const response = await fetch("/dashboard/episodes/get", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as EpisodeGetReadback;
+}
+
+export async function fetchRoutines(request: RoutineListRequest): Promise<RoutineListReadback> {
+  const response = await fetch("/dashboard/routines/list", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as RoutineListReadback;
+}
+
+export async function inspectRoutine(request: RoutineInspectRequest): Promise<Record<string, unknown>> {
+  const response = await fetch("/dashboard/routines/inspect", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as Record<string, unknown>;
+}
+
+export async function updateRoutine(request: RoutineUpdateRequest): Promise<RoutineUpdateReadback> {
+  const response = await fetch("/dashboard/routines/update", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  const body = await readJsonOrThrow(response);
+  return body.readback as RoutineUpdateReadback;
 }
 
 export async function forceReleaseLease(

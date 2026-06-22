@@ -271,7 +271,7 @@ mod target_policy;
 pub(crate) mod terminal_capture;
 #[cfg(test)]
 mod tests;
-mod timeline_digest;
+pub(crate) mod timeline_digest;
 mod timeline_query;
 mod tool_profiles;
 mod workspace_blackboard;
