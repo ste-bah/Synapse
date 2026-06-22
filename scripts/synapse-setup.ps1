@@ -133,6 +133,24 @@ function Invoke-SynapseChromeBridgeVerifier {
     if (-not $readback.ok) {
         Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_FAILED path=$InstallerPath remediation=installer did not return ok=true"
     }
+    $autoInstall = $readback.synapse_chrome_auto_install
+    if (-not $autoInstall) {
+        Die "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_READBACK_MISSING path=$InstallerPath remediation=setup requires the bridge installer to report synapse_chrome_auto_install so skipped or failed active-profile installation cannot pass silently"
+    }
+    if ([string]$autoInstall.reason -eq 'skip_auto_install_requested') {
+        Die "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_SKIPPED path=$InstallerPath remediation=setup must auto-install the bundled Chrome bridge into the already-open active profile; remove -SkipAutoInstall and rerun from the interactive Windows desktop"
+    }
+    $profileInstallState = $readback.synapse_chrome_profile_install_state
+    if (-not $profileInstallState) {
+        Die "SYNAPSE_CHROME_BRIDGE_PROFILE_INSTALL_STATE_MISSING path=$InstallerPath remediation=setup requires active Chrome profile installation readback after bridge verification"
+    }
+    if ($profileInstallState.active_profile_installed -ne $true) {
+        Die ("SYNAPSE_CHROME_BRIDGE_ACTIVE_PROFILE_NOT_INSTALLED active_profile={0} installed_profiles={1} auto_install_attempted={2} auto_install_reason={3} remediation=setup must auto-install extensions\\synapse-chrome-debugger into the already-open active Chrome profile before daemon handoff can continue" -f `
+            $profileInstallState.active_profile,
+            (@($profileInstallState.installed_profiles) -join ','),
+            $autoInstall.attempted,
+            $autoInstall.reason)
+    }
     return $readback
 }
 
