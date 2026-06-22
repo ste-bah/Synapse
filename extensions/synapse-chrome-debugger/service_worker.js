@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-22-waits-v1";
-const BRIDGE_BUILD_SHA256 = "46ca3905f1c8a9ad3c24d06a79cd3c0aa6124328bf3157c779e32bc17eb0117a";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-22-wait-function-v1";
+const BRIDGE_BUILD_SHA256 = "ddc78a20ea4310e18fbb1d220f506006b22f56869fe58c08cfc83ea07f7cdde8";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -20,6 +20,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "inspectElement",
   "scrollIntoView",
   "waitForText",
+  "waitForFunction",
   "waitForSelector",
   "clock",
   "pageEvents",
@@ -323,6 +324,7 @@ function commandRequiresExternalPopupSuppression(kind) {
     "inspectElement",
     "scrollIntoView",
     "waitForText",
+    "waitForFunction",
     "waitForSelector",
     "clock",
     "pageEvents",
@@ -775,6 +777,8 @@ async function handleCommand(command) {
       result = await handleScrollIntoView(params);
     } else if (kind === "waitForText") {
       result = await handleWaitForText(params);
+    } else if (kind === "waitForFunction") {
+      result = await handleWaitForFunction(params);
     } else if (kind === "waitForSelector") {
       result = await handleWaitForSelector(params);
     } else if (kind === "clock") {
@@ -1617,6 +1621,59 @@ async function handleWaitForText(params) {
     pollCount,
     lastTextLen
   );
+}
+
+async function handleWaitForFunction(params) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const expression = String(params.expression ?? "");
+  if (expression.trim().length === 0) {
+    throw bridgeError(ERROR_ATTACH_FAILED, "waitForFunction expression must be non-empty");
+  }
+  const args = Array.isArray(params.args) ? params.args : [];
+  const timeoutMs = normalizeWaitTimeout(params.timeoutMs);
+  const pollingIntervalMs = normalizePollingInterval(params.pollingIntervalMs);
+  const startedAt = Date.now();
+  let pollCount = 0;
+  let last = null;
+  while (true) {
+    pollCount += 1;
+    const poll = await waitForFunctionProbe(selected, expression, args);
+    last = poll;
+    if (poll.condition_met) {
+      const pageState = await tabPageState(selected.tabId, selected.target);
+      return waitForFunctionResult(
+        selected,
+        pageState,
+        poll,
+        true,
+        false,
+        elapsedSince(startedAt),
+        timeoutMs,
+        pollingIntervalMs,
+        pollCount,
+        expression,
+        args
+      );
+    }
+    const elapsed = elapsedSince(startedAt);
+    if (elapsed >= timeoutMs) {
+      const pageState = await tabPageState(selected.tabId, selected.target);
+      return waitForFunctionResult(
+        selected,
+        pageState,
+        last,
+        false,
+        true,
+        elapsed,
+        timeoutMs,
+        pollingIntervalMs,
+        pollCount,
+        expression,
+        args
+      );
+    }
+    await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsed)));
+  }
 }
 
 async function handleWaitForSelector(params) {
@@ -3110,6 +3167,83 @@ function waitForTextResult(
   };
 }
 
+async function waitForFunctionProbe(selected, expression, args) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId: selected.tabId },
+      world: "MAIN",
+      func: runWaitForFunctionProbeInPage,
+      args: [{ expression, args }]
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript waitForFunction(${selected.tabId}) failed: ${errorMessage(error)}`
+    );
+  }
+  const frames = frameExecutionResults(injected);
+  const first = frames.find((frame) => frame.result && typeof frame.result === "object");
+  if (!first) {
+    throw bridgeError(ERROR_CHROME_SCRIPTING_EXECUTE_FAILED, "chrome.scripting.executeScript waitForFunction returned no structured result");
+  }
+  if (first.result.ok === false) {
+    throw bridgeError(
+      String(first.result.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
+      `waitForFunction failed: ${String(first.result.error_detail || "")}`
+    );
+  }
+  return first.result;
+}
+
+function waitForFunctionResult(
+  selected,
+  pageState,
+  poll,
+  conditionMet,
+  timedOut,
+  elapsedMs,
+  timeoutMs,
+  pollingIntervalMs,
+  pollCount,
+  expression,
+  args
+) {
+  const current = poll && typeof poll === "object" ? poll : {};
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: pageState.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: pageState.chrome_window_id,
+    url: current.url || pageState.url || "",
+    title: current.title || pageState.title || "",
+    ready_state: current.ready_state || pageState.ready_state || "",
+    condition_met: Boolean(conditionMet),
+    timed_out: Boolean(timedOut),
+    elapsed_ms: elapsedMs,
+    timeout_ms: timeoutMs,
+    polling_interval_ms: pollingIntervalMs,
+    poll_count: pollCount,
+    expression_len: expression.length,
+    arg_count: args.length,
+    value: Object.prototype.hasOwnProperty.call(current, "value") ? current.value : null,
+    value_type: String(current.value_type || "undefined"),
+    value_description: current.value_description ?? null,
+    unserializable_value: current.unserializable_value ?? null,
+    readback_backend: "chrome.scripting.executeScript(MAIN waitForFunction predicate polling)",
+    backend_tier_used: "chrome_tabs_extension",
+    required_foreground: false,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
 async function waitForSelectorPoll(selected, locator, limit, root, state) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
@@ -3312,6 +3446,87 @@ function delay(timeoutMs) {
 
 function elapsedSince(startedAt) {
   return Math.max(0, Date.now() - startedAt);
+}
+
+async function runWaitForFunctionProbeInPage(request) {
+  const expression = String(request?.expression ?? "");
+  const args = Array.isArray(request?.args) ? request.args : [];
+  const serializeValue = (value) => {
+    const valueType = typeof value;
+    if (value === undefined) {
+      return {
+        value: null,
+        value_type: "undefined",
+        value_description: "undefined",
+        unserializable_value: null
+      };
+    }
+    if (valueType === "bigint") {
+      return {
+        value: String(value),
+        value_type: valueType,
+        value_description: `${String(value)}n`,
+        unserializable_value: `${String(value)}n`
+      };
+    }
+    if (valueType === "number" && !Number.isFinite(value)) {
+      return {
+        value: null,
+        value_type: valueType,
+        value_description: String(value),
+        unserializable_value: String(value)
+      };
+    }
+    if (valueType === "function" || valueType === "symbol") {
+      return {
+        value: null,
+        value_type: valueType,
+        value_description: String(value),
+        unserializable_value: null
+      };
+    }
+    try {
+      return {
+        value: JSON.parse(JSON.stringify(value)),
+        value_type: valueType,
+        value_description: null,
+        unserializable_value: null
+      };
+    } catch (_error) {
+      return {
+        value: null,
+        value_type: valueType,
+        value_description: String(value),
+        unserializable_value: null
+      };
+    }
+  };
+  try {
+    const candidate = (0, eval)(`(${expression})`);
+    const value = typeof candidate === "function" ? candidate(...args) : candidate;
+    const resolved = await Promise.resolve(value);
+    const serialized = serializeValue(resolved);
+    return {
+      ok: true,
+      condition_met: Boolean(resolved),
+      value: serialized.value,
+      value_type: serialized.value_type,
+      value_description: serialized.value_description,
+      unserializable_value: serialized.unserializable_value,
+      url: String(location.href || ""),
+      title: document && typeof document.title === "string" ? document.title : "",
+      ready_state: document && typeof document.readyState === "string" ? document.readyState : ""
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
+      error_detail: error && error.stack ? String(error.stack) : String(error && error.message ? error.message : error),
+      url: String(location.href || ""),
+      title: document && typeof document.title === "string" ? document.title : "",
+      ready_state: document && typeof document.readyState === "string" ? document.readyState : ""
+    };
+  }
 }
 
 async function tabPageVitalsState(tabId) {

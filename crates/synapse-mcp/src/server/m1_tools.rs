@@ -2545,7 +2545,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Poll a JavaScript predicate/expression in the calling session's owned browser tab until it resolves truthy, returning the final JSON-safe value. If expression evaluates to a function, it is called as fn(...args) each poll; otherwise the expression value is re-read each poll. Timed-out predicates return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+        description = "Poll a JavaScript predicate/expression in the calling session's owned browser tab until it resolves truthy, returning the final JSON-safe value. If expression evaluates to a function, it is called as fn(...args) each poll; otherwise the expression value is re-read each poll. Timed-out predicates return BROWSER_WAIT_TIMEOUT. Uses raw CDP Runtime.evaluate when available or the debugger-free normal Chrome bridge MAIN-world predicate polling helper for chrome-tab:* targets. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_wait_for_function(
         &self,
@@ -6269,6 +6269,83 @@ impl SynapseService {
     ) -> Result<BrowserWaitForFunctionResponse, ErrorData> {
         const TOOL: &str = "browser_wait_for_function";
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with("chrome-tab:") {
+                let waited = crate::chrome_debugger_bridge::wait_for_function(
+                    window_hwnd,
+                    cdp_target_id,
+                    &wait.expression,
+                    wait.args.clone(),
+                    wait.timeout_ms,
+                    wait.polling_interval_ms,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_wait_for_function Chrome bridge wait failed: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                if waited.timed_out {
+                    return Err(mcp_error(
+                        error_codes::BROWSER_WAIT_TIMEOUT,
+                        format!(
+                            "browser_wait_for_function timed out after {} ms; poll_count={} value_type={} value_description={:?}",
+                            wait.timeout_ms,
+                            waited.poll_count,
+                            waited.value_type,
+                            waited.value_description
+                        ),
+                    ));
+                }
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_WAIT_FOR_FUNCTION",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    cdp_target_id = %waited.target_id,
+                    expression_len = wait.expression.len(),
+                    arg_count = wait.args.len(),
+                    elapsed_ms = waited.elapsed_ms,
+                    poll_count = waited.poll_count,
+                    value_type = %waited.value_type,
+                    target_url = %waited.url,
+                    "readback=chrome.scripting.executeScript(MAIN waitForFunction predicate polling) outcome=wait_satisfied"
+                );
+                return Ok(BrowserWaitForFunctionResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint: "chrome_bridge".to_owned(),
+                    cdp_target_id: waited.target_id,
+                    condition_met: waited.condition_met,
+                    elapsed_ms: waited.elapsed_ms,
+                    timeout_ms: wait.timeout_ms,
+                    polling_interval_ms: wait.polling_interval_ms,
+                    poll_count: waited.poll_count,
+                    expression_len: if waited.expression_len > 0 {
+                        waited.expression_len
+                    } else {
+                        wait.expression.len()
+                    },
+                    arg_count: if waited.arg_count > 0 {
+                        waited.arg_count
+                    } else {
+                        wait.args.len()
+                    },
+                    value: waited.value,
+                    value_type: waited.value_type,
+                    value_description: waited.value_description,
+                    unserializable_value: waited.unserializable_value,
+                    url: waited.url,
+                    title: waited.title,
+                    ready_state: waited.ready_state,
+                    readback_backend: waited.readback_backend,
+                    backend_tier_used: "chrome_tabs_extension".to_owned(),
+                    required_foreground: false,
+                });
+            }
             return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
         };
         let expression = build_browser_wait_for_function_expression(wait)?;
