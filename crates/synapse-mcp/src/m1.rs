@@ -2333,6 +2333,11 @@ pub struct ElementInspection {
     pub is_editable: bool,
     pub bounding_box: BrowserBoundingBox,
     pub device_pixel_ratio: f64,
+    /// Protocol-backed actionability predicates (#1122): attached, visible,
+    /// stable, enabled, editable, and receives-events, with structured failure
+    /// reasons. Omitted only by older/non-Windows implementations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actionability: Option<serde_json::Value>,
 }
 
 /// Response for `browser_inspect`.

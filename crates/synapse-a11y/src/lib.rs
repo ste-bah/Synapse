@@ -2,6 +2,7 @@
 
 mod cdp;
 mod cdp_action;
+mod cdp_actionability;
 mod cdp_binding;
 mod cdp_clock;
 mod cdp_console;
@@ -24,6 +25,8 @@ pub use cdp::*;
 pub use cdp_action::*;
 #[cfg(windows)]
 pub use cdp_action::{CdpMouseStrokePoint, cdp_mouse_stroke_target};
+#[cfg(windows)]
+pub use cdp_actionability::*;
 pub use cdp_binding::*;
 pub use cdp_clock::*;
 pub use cdp_console::*;

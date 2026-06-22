@@ -2790,7 +2790,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Typed introspection of a single DOM element in the calling session's owned background browser tab via raw CDP: tag_name, outer_html/inner_html/inner_text/text_content, the live attribute map, input value, the boolean state queries (is_visible/is_enabled/is_checked/is_editable), and the page-relative bounding_box. The element id (from find/observe) carries its CDP target, which must be owned by this session; never the human foreground tab. Read-only, background-safe. HTML/text fields are truncated to max_html_bytes. Raw CDP only."
+        description = "Typed introspection of a single DOM element in the calling session's owned background browser tab via raw CDP: tag_name, outer_html/inner_html/inner_text/text_content, the live attribute map, input value, boolean state queries (is_visible/is_enabled/is_checked/is_editable), page-relative bounding_box, and protocol-backed actionability predicates (attached, visible, stable, enabled, editable, receives_events) with structured failure reasons from DOM.getBoxModel + DOM.getNodeForLocation/elementFromPoint. The element id (from find/observe) carries its CDP target, which must be owned by this session; never the human foreground tab. Read-only, background-safe. HTML/text fields are truncated to max_html_bytes. Raw CDP only."
     )]
     pub async fn browser_inspect(
         &self,
@@ -6361,13 +6361,28 @@ impl SynapseService {
                 format!("browser_inspect raw CDP Runtime.callFunctionOn failed: {error}"),
             )
         })?;
-        let inspection: ElementInspection =
+        let mut inspection: ElementInspection =
             serde_json::from_value(evaluated.value).map_err(|error| {
                 mcp_error(
                     error_codes::OBSERVE_INTERNAL,
                     format!("browser_inspect payload decode failed: {error}"),
                 )
             })?;
+        let actionability =
+            synapse_a11y::cdp_actionability(&endpoint, cdp_target_id, backend_node_id)
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("browser_inspect actionability readback failed: {error}"),
+                    )
+                })?;
+        inspection.actionability = Some(serde_json::to_value(&actionability).map_err(|error| {
+            mcp_error(
+                error_codes::OBSERVE_INTERNAL,
+                format!("browser_inspect actionability payload encode failed: {error}"),
+            )
+        })?);
         tracing::info!(
             code = "CDP_BACKGROUND_INSPECT",
             session_id = %session_id,
@@ -6377,8 +6392,10 @@ impl SynapseService {
             element_id = element_id,
             tag_name = %inspection.tag_name,
             is_visible = inspection.is_visible,
+            action_ready = actionability.action_ready,
+            receives_events = actionability.receives_events,
             target_url = %evaluated.url,
-            "readback=Runtime.callFunctionOn outcome=element_inspected"
+            "readback=Runtime.callFunctionOn+DOM.getBoxModel+DOM.getNodeForLocation+elementFromPoint outcome=element_inspected"
         );
         Ok(BrowserInspectResponse {
             session_id: session_id.to_owned(),
@@ -6391,7 +6408,9 @@ impl SynapseService {
             title: evaluated.title,
             ready_state: evaluated.ready_state,
             element: inspection,
-            readback_backend: "Runtime.callFunctionOn".to_owned(),
+            readback_backend:
+                "Runtime.callFunctionOn + DOM.getBoxModel + DOM.getNodeForLocation + elementFromPoint"
+                    .to_owned(),
             required_foreground: false,
         })
     }
