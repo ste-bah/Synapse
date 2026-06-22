@@ -3889,10 +3889,15 @@ dependencies = [
 name = "synapse-overlay"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "reqwest",
+ "serde",
+ "serde_json",
  "synapse-core",
  "synapse-telemetry",
  "tokio",
  "tracing",
+ "windows 0.62.2",
 ]
 
 [[package]]

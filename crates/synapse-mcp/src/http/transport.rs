@@ -540,6 +540,7 @@ fn router(
         .route("/dashboard", get(dashboard_index))
         .route("/dashboard/assets/{asset}", get(dashboard_asset))
         .route("/dashboard/state.json", get(dashboard_state))
+        .route("/dashboard/tray-state.json", get(dashboard_tray_state))
         .route(
             "/dashboard/events/subscribe",
             post(dashboard_events_subscribe)
@@ -1525,6 +1526,7 @@ struct DashboardStateResponse {
     storage: DashboardPanel,
     target_claims: DashboardPanel,
     timeline: DashboardPanel,
+    demo_recording: DashboardPanel,
     events: DashboardPanel,
     hidden_desktops: DashboardPanel,
     cdp_attachments: DashboardPanel,
@@ -1537,6 +1539,21 @@ struct DashboardStateResponse {
     agent_transcripts: DashboardPanel,
     hygiene: DashboardPanel,
     local_models: DashboardPanel,
+}
+
+#[derive(Serialize)]
+struct DashboardTrayStateResponse {
+    schema_version: u32,
+    generated_at_unix_ms: u64,
+    bind_addr: String,
+    token_policy: &'static str,
+    source_of_truth: &'static str,
+    timings: DashboardStateTimings,
+    sessions: DashboardPanel,
+    lease: DashboardPanel,
+    timeline: DashboardPanel,
+    approvals: DashboardPanel,
+    demo_recording: DashboardPanel,
 }
 
 #[derive(Serialize)]
@@ -2908,6 +2925,77 @@ fn dashboard_valid_agent_spawn_id(spawn_id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
+async fn dashboard_tray_state(State(state): State<HttpState>, headers: HeaderMap) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let state_started = Instant::now();
+    let mut timing_segments = Vec::new();
+    let sessions = dashboard_timed_state_segment(&mut timing_segments, "sessions", || match state
+        .health_service
+        .session_list_impl(false)
+    {
+        Ok(sessions) => DashboardPanel::ok(
+            "session_list dashboard primary agent feed + acknowledged escalation suppression",
+            dashboard_primary_session_list_data(
+                &sessions,
+                state.health_service.acked_open_attention_anchors_snapshot(),
+            ),
+        ),
+        Err(error) => DashboardPanel::error("session_list", format!("{error:?}")),
+    });
+    let lease = dashboard_timed_state_segment(&mut timing_segments, "lease", || {
+        DashboardPanel::ok("control_lease_status", synapse_action::lease::status())
+    });
+    let timeline = dashboard_timed_state_segment(&mut timing_segments, "timeline", || match state
+        .health_service
+        .timeline_stats_snapshot()
+    {
+        Ok(snapshot) => DashboardPanel::ok("timeline_stats", snapshot),
+        Err(error) => DashboardPanel::error("timeline_stats", format!("{error:?}")),
+    });
+    let approvals =
+        dashboard_timed_state_segment(&mut timing_segments, "approvals", || {
+            match state.health_service.approval_queue_snapshot(None) {
+                Ok(rows) => DashboardPanel::ok(
+                    "approval_list",
+                    DashboardApprovalSurface {
+                        tool: "approval_list",
+                        available: true,
+                        rows,
+                    },
+                ),
+                Err(error) => DashboardPanel::error("approval_list", format!("{error:?}")),
+            }
+        });
+    let demo_recording =
+        dashboard_timed_state_segment(&mut timing_segments, "demo_recording", || {
+            match state.health_service.demo_record_status_snapshot() {
+                Ok(snapshot) => DashboardPanel::ok("demo_record_status", snapshot),
+                Err(error) => DashboardPanel::error("demo_record_status", format!("{error:?}")),
+            }
+        });
+    let timings = DashboardStateTimings {
+        source_of_truth: "daemon Instant wall-clock around dashboard_tray_state segments",
+        total_elapsed_ms: dashboard_elapsed_ms(state_started.elapsed()),
+        segments: timing_segments,
+    };
+    let response = DashboardTrayStateResponse {
+        schema_version: 1,
+        generated_at_unix_ms: dashboard_unix_time_ms(),
+        bind_addr: state.bind_addr.to_string(),
+        token_policy: "dashboard responses never include bearer tokens",
+        source_of_truth: "same dashboard/MCP snapshot methods as /dashboard/state.json, limited to tray companion panels",
+        timings,
+        sessions,
+        lease,
+        timeline,
+        approvals,
+        demo_recording,
+    };
+    with_dashboard_security_headers(Json(response).into_response())
+}
+
 async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return with_dashboard_security_headers(response);
@@ -2975,6 +3063,13 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         Ok(snapshot) => DashboardPanel::ok("timeline_stats", snapshot),
         Err(error) => DashboardPanel::error("timeline_stats", format!("{error:?}")),
     });
+    let demo_recording =
+        dashboard_timed_state_segment(&mut timing_segments, "demo_recording", || {
+            match state.health_service.demo_record_status_snapshot() {
+                Ok(snapshot) => DashboardPanel::ok("demo_record_status", snapshot),
+                Err(error) => DashboardPanel::error("demo_record_status", format!("{error:?}")),
+            }
+        });
     let events = dashboard_timed_state_segment(&mut timing_segments, "events", || {
         dashboard_events_panel(&state)
     });
@@ -3074,6 +3169,7 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         storage,
         target_claims,
         timeline,
+        demo_recording,
         events,
         hidden_desktops,
         cdp_attachments,

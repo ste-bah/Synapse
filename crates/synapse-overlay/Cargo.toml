@@ -15,10 +15,25 @@ name = "synapse-overlay"
 path = "src/main.rs"
 
 [dependencies]
+anyhow.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 tokio.workspace = true
 tracing.workspace = true
 
-[lints]
-workspace = true
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+unused = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = "deny"
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"

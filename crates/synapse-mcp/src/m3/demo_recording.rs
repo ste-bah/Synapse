@@ -115,6 +115,28 @@ impl DemoRecordControl {
         lock_unpoisoned(&self.active).clone()
     }
 
+    #[must_use]
+    pub fn status_snapshot(&self, now_ns: u64) -> DemoRecordStatusResponse {
+        let stored_active = lock_unpoisoned(&self.active).clone();
+        let active = stored_active
+            .clone()
+            .filter(|active| now_ns < active.expires_at_ns);
+        let expires_in_ms = active
+            .as_ref()
+            .map(|active| active.expires_at_ns.saturating_sub(now_ns) / 1_000_000);
+        DemoRecordStatusResponse {
+            schema_version: 1,
+            source_of_truth: "CF_KV timeline/demo-record/v1 hydrated DemoRecordControl",
+            armed: active.is_some(),
+            active,
+            expires_in_ms,
+            expired_active_row: stored_active
+                .as_ref()
+                .is_some_and(|active| now_ns >= active.expires_at_ns),
+            now_ns,
+        }
+    }
+
     /// Records one UIA event if a demo is armed and not expired.
     ///
     /// This is deliberately best-effort and non-panicking because it is called
@@ -429,6 +451,20 @@ pub struct DemoRecordStopResponse {
     pub cleared_active_state: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DemoRecordStatusResponse {
+    pub schema_version: u32,
+    pub source_of_truth: &'static str,
+    pub armed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<DemoRecordActiveState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_ms: Option<u64>,
+    pub expired_active_row: bool,
+    pub now_ns: u64,
+}
+
 #[must_use]
 pub const fn demo_record_start() -> M3ToolStub {
     M3ToolStub::new("demo_record_start")
@@ -489,6 +525,21 @@ pub fn stop_demo_recording(
 ) -> Result<DemoRecordStopResponse, ErrorData> {
     let (control, _recorder_live) = demo_context(m3_state)?;
     control.stop(params, by_session)
+}
+
+pub fn demo_record_status_snapshot(
+    m3_state: &SharedM3State,
+) -> Result<DemoRecordStatusResponse, ErrorData> {
+    let mut guard = m3_state.lock().map_err(|_poisoned| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "M3 service state lock poisoned",
+        )
+    })?;
+    let control = guard
+        .ensure_demo_record_control()
+        .map_err(|error| mcp_error(error_codes::TOOL_INTERNAL_ERROR, format!("{error:#}")))?;
+    Ok(control.status_snapshot(now_ts_ns()))
 }
 
 fn load_persisted(db: &Db) -> Result<PersistedDemoRecordState> {
@@ -946,6 +997,32 @@ mod tests {
             rows.len()
         );
         assert!(expired, "expired marker must be written");
+    }
+
+    #[test]
+    fn demo_record_status_reports_expired_rows_as_not_armed() {
+        let (_dir, control) = temp_control();
+        let params = DemoRecordStartParams {
+            profile_id: "notepad".to_owned(),
+            duration_ms: 1,
+            path: Some("demo-recordings/status-expired-demo.jsonl".to_owned()),
+            label: None,
+        };
+        let started = control
+            .start(&params, "test-session", true)
+            .unwrap_or_else(|error| panic!("start: {error:?}"));
+
+        let armed = control.status_snapshot(started.started_at_ns.saturating_add(1));
+        assert!(armed.armed);
+        assert_eq!(
+            armed.active.as_ref().map(|active| active.demo_id.as_str()),
+            Some(started.demo_id.as_str())
+        );
+
+        let expired = control.status_snapshot(started.expires_at_ns);
+        assert!(!expired.armed);
+        assert!(expired.active.is_none());
+        assert!(expired.expired_active_row);
     }
 
     #[test]

@@ -519,6 +519,12 @@ impl SynapseService {
         )
     }
 
+    pub(crate) fn demo_record_status_snapshot(
+        &self,
+    ) -> Result<crate::m3::demo_recording::DemoRecordStatusResponse, ErrorData> {
+        crate::m3::demo_recording::demo_record_status_snapshot(&self.m3_state)
+    }
+
     pub(crate) fn approval_decide_from_activation(
         &self,
         params: &crate::m3::approvals::ApprovalActivationParams,
