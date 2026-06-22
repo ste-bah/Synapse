@@ -519,7 +519,15 @@ export function App() {
       {normalizedRoute === "agent" ? <AgentView state={state} selectedAgent={selectedAgent} toolCalls={toolCalls} onAuditKeySelect={focusAuditKey} /> : null}
       {normalizedRoute === "tasks" ? <TasksView agents={agents} attentionCount={attentionCount} /> : null}
       {normalizedRoute === "system" ? (
-        <SystemView state={state} agents={agents} attentionCount={attentionCount} toolCalls={toolCalls} stale={stale} onRefresh={() => query.refetch()} />
+        <SystemView
+          state={state}
+          agents={agents}
+          attentionCount={attentionCount}
+          toolCalls={toolCalls}
+          stale={stale}
+          onRefresh={() => query.refetch()}
+          onAuditKeySelect={focusAuditKey}
+        />
       ) : null}
       {normalizedRoute === "audit" ? (
         <AuditView state={state} toolCalls={toolCalls} filters={auditFilters} onFiltersChange={setAuditFilters} />
@@ -2579,7 +2587,8 @@ function SystemView({
   attentionCount,
   toolCalls,
   stale,
-  onRefresh
+  onRefresh,
+  onAuditKeySelect
 }: {
   state?: DashboardState;
   agents: AgentSummary[];
@@ -2587,6 +2596,7 @@ function SystemView({
   toolCalls: ReturnType<typeof buildToolCalls>;
   stale: boolean;
   onRefresh: () => void | Promise<unknown>;
+  onAuditKeySelect: (keyHex: string) => void;
 }) {
   const health = asRecord(panelData(state?.daemon));
   const subsystems = asRecord(health.subsystems);
@@ -2840,6 +2850,7 @@ function SystemView({
         ) : null}
       </Section>
 
+      <TraceWaterfall state={state} onAuditKeySelect={onAuditKeySelect} />
       <ToolActivity toolCalls={toolCalls} />
       <TranscriptSamples state={state} />
 
@@ -4329,6 +4340,174 @@ function FleetTable({
       ]}
     />
   );
+}
+
+type TraceZoom = "compact" | "full";
+
+interface TraceSpanRow {
+  id: string;
+  keyHex: string;
+  lane: string;
+  label: string;
+  status: FleetStatus;
+  startNs: number;
+  endNs: number;
+  count: number;
+  raw: Record<string, unknown>;
+}
+
+function TraceWaterfall({ state, onAuditKeySelect }: { state?: DashboardState; onAuditKeySelect: (keyHex: string) => void }) {
+  const [zoom, setZoom] = useState<TraceZoom>("compact");
+  const auditRows = asArray<Record<string, unknown>>(asRecord(panelData(state?.command_audit)).rows)
+    .map((row, index) => auditRowToTraceSpan(row, index))
+    .filter((row): row is TraceSpanRow => Boolean(row))
+    .sort((a, b) => a.startNs - b.startNs);
+  const spans = zoom === "compact" ? compactTraceSpans(auditRows) : auditRows;
+  const [selectedId, setSelectedId] = useState("");
+  const selected = spans.find((span) => span.id === selectedId) ?? spans[0];
+  const minNs = spans.reduce((min, span) => Math.min(min, span.startNs), Number.POSITIVE_INFINITY);
+  const maxNs = spans.reduce((max, span) => Math.max(max, span.endNs), 0);
+  const rangeNs = Number.isFinite(minNs) && maxNs > minNs ? maxNs - minNs : 1;
+
+  return (
+    <Section
+      title="Trace Waterfall"
+      tier="triage"
+      questions={["Which command spans are slow or failing?", "Does compact mode reconcile with full rows?", "Which audit row proves the selected span?"]}
+      actions={
+        <div className="inline-flex rounded-md border border-border bg-surface-1 p-1">
+          <Button type="button" variant={zoom === "compact" ? "secondary" : "ghost"} size="sm" onClick={() => setZoom("compact")}>
+            <Rows3 aria-hidden="true" className="h-4 w-4" />
+            Compact
+          </Button>
+          <Button type="button" variant={zoom === "full" ? "secondary" : "ghost"} size="sm" onClick={() => setZoom("full")}>
+            <Search aria-hidden="true" className="h-4 w-4" />
+            Full
+          </Button>
+        </div>
+      }
+    >
+      {spans.length ? (
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,0.38fr)]">
+          <div className="rounded-lg border border-border bg-surface-1 p-3">
+            <div className="mb-3 grid grid-cols-[minmax(7rem,0.22fr)_minmax(0,1fr)_4rem] gap-3 text-label uppercase text-muted">
+              <span>Lane</span>
+              <span>Span</span>
+              <span className="text-right">Rows</span>
+            </div>
+            <div className="space-y-2">
+              {spans.map((span) => {
+                const left = ((span.startNs - minNs) / rangeNs) * 100;
+                const width = Math.max(((span.endNs - span.startNs) / rangeNs) * 100, 3);
+                return (
+                  <button
+                    key={span.id}
+                    type="button"
+                    onClick={() => setSelectedId(span.id)}
+                    className={cn(
+                      "grid w-full grid-cols-[minmax(7rem,0.22fr)_minmax(0,1fr)_4rem] items-center gap-3 rounded-md px-2 py-1.5 text-left hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus-ring",
+                      selected?.id === span.id && "bg-surface-2"
+                    )}
+                  >
+                    <span className="truncate font-mono text-xs text-secondary">{shortKey(span.lane)}</span>
+                    <span className="relative h-8 min-w-0 overflow-hidden rounded-md border border-border-subtle bg-surface-2">
+                      <span
+                        className="absolute top-1/2 h-4 -translate-y-1/2 rounded-sm"
+                        style={{
+                          left: `${Math.min(left, 97)}%`,
+                          width: `${Math.min(width, 100 - Math.min(left, 97))}%`,
+                          background: traceSpanColor(span.status)
+                        }}
+                      />
+                      <span className="absolute inset-0 flex items-center px-2 text-xs text-primary">
+                        <span className="truncate">{span.label}</span>
+                      </span>
+                    </span>
+                    <span className="text-right font-mono text-xs text-secondary">{span.count}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <div className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+            <h3 className="mb-2 text-md font-medium tracking-normal text-primary">Span Inspector</h3>
+            {selected ? (
+              <>
+                <MetricRow label="Span" value={selected.label} />
+                <MetricRow label="Lane" value={selected.lane || "unknown"} />
+                <MetricRow label="Status" value={selected.status} />
+                <MetricRow label="Rows" value={selected.count} />
+                <MetricRow label="Start" value={nsToTime(selected.startNs) || rawText(selected.startNs)} />
+                <MetricRow label="End" value={selected.endNs === selected.startNs ? "open/truncated" : nsToTime(selected.endNs) || rawText(selected.endNs)} />
+                {selected.keyHex ? (
+                  <Button type="button" variant="secondary" size="sm" className="mt-3" onClick={() => onAuditKeySelect(selected.keyHex)}>
+                    <FileSearch aria-hidden="true" className="h-4 w-4" />
+                    Audit Row
+                  </Button>
+                ) : null}
+                <div className="mt-3">
+                  <RawValue value={selected.raw} label="Selected span raw row" />
+                </div>
+              </>
+            ) : (
+              <EmptyState title="No span selected" />
+            )}
+          </div>
+        </div>
+      ) : (
+        <EmptyStateArt title="No command audit rows for trace" />
+      )}
+    </Section>
+  );
+}
+
+function traceSpanColor(status: FleetStatus): string {
+  if (status === "stuck" || status === "failed") return "var(--danger)";
+  if (status === "needs_input" || status === "awaiting_approval") return "var(--warning)";
+  if (status === "done" || status === "ready_for_review") return "var(--success)";
+  return "var(--info)";
+}
+
+function auditRowToTraceSpan(row: Record<string, unknown>, index: number): TraceSpanRow | null {
+  const startNs = Number(row.ts_ns || row.start_ts_ns || 0);
+  if (!Number.isFinite(startNs) || startNs <= 0) return null;
+  const durationNs = Number(row.duration_ns || row.elapsed_ns || 0);
+  const endNs = durationNs > 0 ? startNs + durationNs : startNs;
+  const error = rawText(row.error_code);
+  const outcome = rawText(row.outcome || row.status);
+  const phase = rawText(row.phase);
+  const status: FleetStatus = error ? "stuck" : outcome === "ok" || outcome === "success" ? "done" : phase === "before" ? "needs_input" : "working";
+  const tool = rawText(row.tool || row.verb || row.kind || "command");
+  const actor = rawText(row.actor_session_id || row.session_id || row.target_session_id || "daemon");
+  const keyHex = rawText(row.key_hex || row.audit_key_hex);
+  return {
+    id: keyHex || `${actor}-${tool}-${index}`,
+    keyHex,
+    lane: actor,
+    label: error ? `${tool} / ${error}` : tool,
+    status,
+    startNs,
+    endNs,
+    count: 1,
+    raw: row
+  };
+}
+
+function compactTraceSpans(rows: TraceSpanRow[]): TraceSpanRow[] {
+  const groups = new Map<string, TraceSpanRow>();
+  for (const row of rows) {
+    const key = `${row.lane}\u0000${row.label}\u0000${row.status}`;
+    const group = groups.get(key);
+    if (!group) {
+      groups.set(key, { ...row });
+      continue;
+    }
+    group.startNs = Math.min(group.startNs, row.startNs);
+    group.endNs = Math.max(group.endNs, row.endNs);
+    group.count += row.count;
+    group.raw = { compact_group: true, rows: group.count, first: group.raw, latest: row.raw };
+  }
+  return [...groups.values()].sort((a, b) => a.startNs - b.startNs);
 }
 
 function ToolActivity({
