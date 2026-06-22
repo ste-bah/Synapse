@@ -291,20 +291,30 @@ fn parse_env_list(name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
-        Ok(code) => code,
-        Err(err) => {
-            if let Err(lifecycle_error) =
-                daemon_lifecycle::record_top_level_error(&format!("{err:#}"))
-            {
-                eprintln!("synapse-mcp lifecycle error: {lifecycle_error:#}");
-            }
-            eprintln!("synapse-mcp error: {err:#}");
-            ExitCode::from(1)
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return top_level_error_exit(anyhow::anyhow!("initialize tokio runtime: {error:#}"));
         }
+    };
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    match result {
+        Ok(code) => code,
+        Err(err) => top_level_error_exit(err),
     }
+}
+
+fn top_level_error_exit(err: anyhow::Error) -> ExitCode {
+    if let Err(lifecycle_error) = daemon_lifecycle::record_top_level_error(&format!("{err:#}")) {
+        eprintln!("synapse-mcp lifecycle error: {lifecycle_error:#}");
+    }
+    eprintln!("synapse-mcp error: {err:#}");
+    ExitCode::from(1)
 }
 
 async fn run() -> anyhow::Result<ExitCode> {
