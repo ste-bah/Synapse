@@ -93,6 +93,7 @@ import {
   saveDashboardView,
   spawnAgent,
   type AgentSummary,
+  type AgentUsageSummary,
   type AuditQueryFilters,
   type AuditQueryResponse,
   type AuditQueryRow,
@@ -108,7 +109,8 @@ import {
   type StorageGcReadback,
   type TimelineControlResponse,
   type TimelinePurgeReadback,
-  type TimelinePurgeRequest
+  type TimelinePurgeRequest,
+  agentUsageFromTranscriptRecord
 } from "@/lib/dashboard-state";
 import {
   DASHBOARD_LIVE_SCOPES,
@@ -2077,6 +2079,173 @@ function StorageUsage({ state }: { state?: DashboardState }) {
   );
 }
 
+function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents: AgentSummary[] }) {
+  const usagePoints = transcriptUsagePoints(state);
+  const agentRows = agents
+    .filter((agent) => agent.usage)
+    .map((agent) => ({
+      id: agent.id,
+      kind: agent.kind,
+      status: agent.status,
+      tokens: agentUsageTotal(agent.usage),
+      cacheTokens: agent.usage?.cacheReadInputTokens ?? 0,
+      cost: agent.usage?.totalCostMicroUsd,
+      usage: agent.usage
+    }))
+    .sort((a, b) => b.tokens - a.tokens);
+  const totals = agentRows.reduce(
+    (acc, row) => {
+      if (!row.usage) return acc;
+      acc.input += row.usage.inputTokens;
+      acc.output += row.usage.outputTokens;
+      acc.cache += row.usage.cacheReadInputTokens + row.usage.cacheCreationInputTokens;
+      acc.reasoning += row.usage.reasoningOutputTokens;
+      if (row.cost === undefined) acc.unpriced += 1;
+      else acc.cost += row.cost;
+      return acc;
+    },
+    { input: 0, output: 0, cache: 0, reasoning: 0, cost: 0, unpriced: 0 }
+  );
+  const tokenTotal = totals.input + totals.output + totals.cache + totals.reasoning;
+  const splitData = [
+    { kind: "input", tokens: totals.input },
+    { kind: "output", tokens: totals.output },
+    { kind: "cache", tokens: totals.cache },
+    { kind: "reasoning", tokens: totals.reasoning }
+  ].filter((row) => row.tokens > 0);
+  const recentUsage = usagePoints.slice(0, 12).reverse();
+  const runawayRows = agentRows.filter((row) => {
+    const usage = row.usage;
+    if (!usage) return false;
+    return row.status === "stuck" || row.tokens > 200_000 || usage.cacheReadInputTokens > Math.max(usage.inputTokens + usage.outputTokens, 1) * 5;
+  });
+
+  return (
+    <Section
+      title="Cost & Token Analytics"
+      tier="overview"
+      questions={["What is the current fleet token burn?", "Which agents are expensive or unpriced?", "Which transcript rows prove the numbers?"]}
+    >
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
+        <StatCard label="Tokens" value={formatTokenCount(tokenTotal)} status={tokenTotal ? "working" : "idle"} delta={`${formatTokenCount(totals.cache)} cache`} />
+        <StatCard label="Reported Cost" value={formatMicroUsd(totals.cost)} status={totals.cost ? "working" : "idle"} delta={totals.unpriced ? `${totals.unpriced} tokens only - unpriced` : "all priced rows"} />
+        <StatCard label="Usage Rows" value={usagePoints.length} status={usagePoints.length ? "working" : "idle"} delta={state?.agent_transcripts.source || "CF_AGENT_TRANSCRIPTS"} />
+        <StatCard label="Runaway Watch" value={runawayRows.length} status={runawayRows.length ? "needs_input" : "done"} delta="stuck / high token / cache-heavy" />
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        <div className="h-56 rounded-lg border border-border bg-surface-1 p-3">
+          {splitData.length ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={splitData} margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+                <CartesianGrid stroke="var(--border-subtle)" vertical={false} />
+                <XAxis dataKey="kind" stroke="var(--text-muted)" tickLine={false} axisLine={false} fontSize={12} />
+                <YAxis stroke="var(--text-muted)" tickLine={false} axisLine={false} fontSize={12} />
+                <ChartTooltip contentStyle={{ background: "var(--surface-3)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
+                <Bar dataKey="tokens" fill="var(--info)" radius={[4, 4, 0, 0]} name="tokens" />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <EmptyState title="No priced or tokenized agent rows" />
+          )}
+        </div>
+        <div className="h-56 rounded-lg border border-border bg-surface-1 p-3">
+          {recentUsage.length ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={recentUsage} margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+                <CartesianGrid stroke="var(--border-subtle)" vertical={false} />
+                <XAxis dataKey="label" stroke="var(--text-muted)" tickLine={false} axisLine={false} fontSize={12} />
+                <YAxis stroke="var(--text-muted)" tickLine={false} axisLine={false} fontSize={12} />
+                <ChartTooltip contentStyle={{ background: "var(--surface-3)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
+                <Bar dataKey="tokens" fill="var(--success)" radius={[4, 4, 0, 0]} name="recent usage" />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <EmptyState title="No usage-bearing transcript rows" />
+          )}
+        </div>
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        {agentRows.length ? (
+          <DataTable
+            data={agentRows}
+            getRowId={(row) => row.id}
+            columns={[
+              { id: "agent", header: "Agent", cell: ({ row }) => row.original.id },
+              { id: "kind", header: "Kind", cell: ({ row }) => row.original.kind },
+              { id: "tokens", header: "Tokens", cell: ({ row }) => formatTokenCount(row.original.tokens) },
+              {
+                id: "cost",
+                header: "Cost",
+                cell: ({ row }) => (row.original.cost === undefined ? "tokens only - unpriced" : formatMicroUsd(row.original.cost))
+              }
+            ]}
+          />
+        ) : (
+          <EmptyStateArt title="No per-agent usage rows" />
+        )}
+        {runawayRows.length ? (
+          <DataTable
+            data={runawayRows}
+            getRowId={(row) => row.id}
+            columns={[
+              { id: "agent", header: "Agent", cell: ({ row }) => row.original.id },
+              { id: "status", header: "Status", cell: ({ row }) => <StatusBadge status={row.original.status} /> },
+              { id: "tokens", header: "Tokens", cell: ({ row }) => formatTokenCount(row.original.tokens) },
+              { id: "cache", header: "Cache", cell: ({ row }) => formatTokenCount(row.original.cacheTokens) }
+            ]}
+          />
+        ) : (
+          <EmptyStateArt title="No runaway candidates" />
+        )}
+      </div>
+
+      <div className="mt-4">
+        <RawValue value={{ transcript_usage_rows: usagePoints, per_agent: agentRows }} label="Cost analytics readback" />
+      </div>
+    </Section>
+  );
+}
+
+function transcriptUsagePoints(state?: DashboardState) {
+  return asArray<Record<string, unknown>>(asRecord(panelData(state?.agent_transcripts)).rows)
+    .map((row, index) => {
+      const record = asRecord(row.record);
+      const line = Number(row.line_no ?? index);
+      const usage = agentUsageFromTranscriptRecord(record, Number.isFinite(line) ? line : index);
+      if (!usage) return null;
+      const spawnId = rawText(row.spawn_id || row.session_id || "unknown");
+      return {
+        spawnId,
+        model: rawText(record.model || "unknown"),
+        line: usage.sourceLine ?? index,
+        label: `${spawnId.slice(-6)}:${usage.sourceLine ?? index}`,
+        tokens: agentUsageTotal(usage),
+        cost: usage.totalCostMicroUsd,
+        usage
+      };
+    })
+    .filter((row): row is NonNullable<typeof row> => Boolean(row));
+}
+
+function agentUsageTotal(usage?: AgentUsageSummary): number {
+  if (!usage) return 0;
+  return usage.inputTokens + usage.outputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens + usage.reasoningOutputTokens;
+}
+
+function formatTokenCount(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0";
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 1, notation: "compact" }).format(value);
+}
+
+function formatMicroUsd(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "$0.00";
+  const usd = value / 1_000_000;
+  if (usd < 0.01) return `$${usd.toFixed(4)}`;
+  return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(usd);
+}
+
 function RecordingsOverTime({ state }: { state?: DashboardState }) {
   const timeline = asRecord(panelData(state?.timeline));
   const byDay = asRecord(timeline.rows_by_day_utc);
@@ -2561,6 +2730,8 @@ function SystemView({
   return (
     <>
       <OverviewBand state={state} agents={agents} attentionCount={attentionCount} stale={stale} />
+
+      <CostTokenAnalytics state={state} agents={agents} />
 
       <Section title="Substrate" tier="overview" questions={["Is the daemon healthy?", "Is storage refusing work?", "Is the recorder paused?"]}>
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">

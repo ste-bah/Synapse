@@ -989,7 +989,7 @@ function buildTranscriptStats(rows: Record<string, unknown>[]): Map<string, Tran
       current.latestSummary = summary;
     }
 
-    const usage = transcriptUsage(record, line);
+    const usage = agentUsageFromTranscriptRecord(record, line);
     if (usage && line >= current.usageLine) {
       current.usageLine = line;
       current.usage = usage;
@@ -1025,7 +1025,7 @@ function transcriptSummary(record: Record<string, unknown>): string {
   return "";
 }
 
-function transcriptUsage(record: Record<string, unknown>, sourceLine: number): AgentUsageSummary | undefined {
+export function agentUsageFromTranscriptRecord(record: Record<string, unknown>, sourceLine?: number): AgentUsageSummary | undefined {
   const usage = asRecord(record.usage);
   if (Object.keys(usage).length === 0) return undefined;
   const summary: AgentUsageSummary = {
