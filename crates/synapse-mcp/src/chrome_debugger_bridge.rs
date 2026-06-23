@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-23-page-pdf-v2";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-23-downloads-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "5edb3b608b74420b0d3716f1d0fc087f038b4ab02126181c45569f0b88e6c4f3";
+    "93d0223ce4035eaaa95ac51f21b22420de4ca29e3da48e93ee83523e8662fab4";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -50,6 +50,7 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "closeTab",
     "coordinateClick",
     "cookies",
+    "downloads",
     "domAction",
     "externalPopupRiskSuppression",
     "frameLocators",
@@ -100,7 +101,7 @@ const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
-const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the installer auto-loads the unpacked extension into the already-open active Chrome profile and refuses to launch a second Chrome profile; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake, exposes debugger-free pageScreenshot capture through chrome.tabs.captureVisibleTab stitching, and exposes narrow chrome.debugger lanes for target-scoped hover/tap/active-tab drag, Page.printToPDF PDF rendering, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
+const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the installer auto-loads the unpacked extension into the already-open active Chrome profile and refuses to launch a second Chrome profile; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.downloads/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake, exposes debugger-free pageScreenshot capture through chrome.tabs.captureVisibleTab stitching, exposes chrome.downloads list/wait/event capture for browser_downloads save/move, and exposes narrow chrome.debugger lanes for target-scoped hover/tap/active-tab drag, Page.printToPDF PDF rendering, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
 const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=use the already-open authenticated Chrome profile only; do not launch a second Chrome process/profile; wait for the installed bridge worker alarmReconnect registration and re-read health; if an active stale host appears call cdp_bridge_reload; if no host registers, run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop so it auto-loads the bundled unpacked extension into the existing active Chrome profile; if health reports installed=false, cdp_bridge_reload cannot repair because Chrome has no loaded extension host to receive reloadSelf";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
@@ -3302,6 +3303,118 @@ pub(crate) struct ChromeDebuggerPagePdfResult {
     pub extension_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerDownloadsResult {
+    #[serde(default)]
+    pub extension_id: Option<String>,
+    #[serde(default)]
+    pub operation: String,
+    #[serde(default)]
+    pub items: Vec<ChromeDebuggerDownloadEntry>,
+    #[serde(default)]
+    pub selected_item: Option<ChromeDebuggerDownloadEntry>,
+    #[serde(default)]
+    pub returned: u32,
+    #[serde(default)]
+    pub event_count: u32,
+    #[serde(default)]
+    pub next_event_cursor: u64,
+    #[serde(default)]
+    pub events: Vec<ChromeDebuggerDownloadEvent>,
+    #[serde(default)]
+    pub condition_met: bool,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub timeout_ms: u64,
+    #[serde(default)]
+    pub readback_backend: String,
+    #[serde(default)]
+    pub backend_tier_used: String,
+    #[serde(default)]
+    pub required_foreground: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerDownloadEntry {
+    #[serde(default)]
+    pub id: i64,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub final_url: String,
+    #[serde(default)]
+    pub filename: String,
+    #[serde(default)]
+    pub filename_basename: String,
+    #[serde(default)]
+    pub mime: String,
+    #[serde(default)]
+    pub start_time: String,
+    #[serde(default)]
+    pub end_time: String,
+    #[serde(default)]
+    pub estimated_end_time: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub can_resume: bool,
+    #[serde(default)]
+    pub danger: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub bytes_received: u64,
+    #[serde(default)]
+    pub total_bytes: i64,
+    #[serde(default)]
+    pub file_size: i64,
+    #[serde(default)]
+    pub exists: Option<bool>,
+    #[serde(default)]
+    pub incognito: bool,
+    #[serde(default)]
+    pub referrer: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerDownloadEvent {
+    #[serde(default)]
+    pub seq: u64,
+    #[serde(default)]
+    pub event_kind: String,
+    #[serde(default)]
+    pub timestamp_unix_ms: u64,
+    #[serde(default)]
+    pub download_id: i64,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub final_url: String,
+    #[serde(default)]
+    pub filename: String,
+    #[serde(default)]
+    pub filename_basename: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub danger: String,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub bytes_received: u64,
+    #[serde(default)]
+    pub total_bytes: i64,
+    #[serde(default)]
+    pub file_size: i64,
+    #[serde(default)]
+    pub delta: Option<Value>,
+}
+
 #[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ChromeDebuggerPageScreenshotRect {
     #[serde(default)]
@@ -5447,6 +5560,25 @@ pub(crate) async fn page_pdf(
     })
 }
 
+pub(crate) async fn downloads(
+    hwnd: i64,
+    params: Value,
+) -> Result<ChromeDebuggerDownloadsResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "downloads")?;
+    let mut payload = if params.is_object() {
+        params
+    } else {
+        json!({})
+    };
+    payload["hwnd"] = json!(hwnd);
+    let result = bridge().send_command("downloads", payload).await?;
+    serde_json::from_value::<ChromeDebuggerDownloadsResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger downloads response: {error}"
+        ))
+    })
+}
+
 pub(crate) async fn type_active_element(
     hwnd: i64,
     target_id: &str,
@@ -6956,6 +7088,26 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_selection_reason": result.get("target_selection_reason"),
             "extension_id": result.get("extension_id"),
         }),
+        "downloads" => json!({
+            "operation": result.get("operation"),
+            "returned": result.get("returned"),
+            "event_count": result.get("event_count"),
+            "condition_met": result.get("condition_met"),
+            "timed_out": result.get("timed_out"),
+            "elapsed_ms": result.get("elapsed_ms"),
+            "timeout_ms": result.get("timeout_ms"),
+            "selected_download_id": result
+                .get("selected_item")
+                .and_then(|value| value.get("id")),
+            "selected_state": result
+                .get("selected_item")
+                .and_then(|value| value.get("state")),
+            "selected_bytes_received": result
+                .get("selected_item")
+                .and_then(|value| value.get("bytes_received")),
+            "readback_backend": result.get("readback_backend"),
+            "extension_id": result.get("extension_id"),
+        }),
         "evaluateScript" => json!({
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
@@ -8232,11 +8384,14 @@ mod tests {
         assert!(reason.contains("debugger_api_available=not_seen_yet"));
 
         host.extension_debugger_api_available = Some(true);
-        let reason = bridge_command_stale_reason(&host, "openTab")
-            .expect("runtime debugger API availability is unsafe");
-        assert!(reason.contains("debugger_api_available=true"));
+        assert_eq!(bridge_command_stale_reason(&host, "openTab"), None);
 
         host.extension_debugger_api_available = Some(false);
+        let reason = bridge_command_stale_reason(&host, "openTab")
+            .expect("runtime debugger API availability false is unsafe");
+        assert!(reason.contains("debugger_api_available=false"));
+
+        host.extension_debugger_api_available = Some(true);
         host.extension_capabilities.clear();
         let reason = bridge_command_stale_reason(&host, "openTab")
             .expect("exact identity without capability readback is still unsafe");

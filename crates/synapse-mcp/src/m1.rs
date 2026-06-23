@@ -519,6 +519,162 @@ pub struct BrowserPdfResponse {
     pub source_of_truth: String,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserDownloadsOperation {
+    /// Return matching Chrome download rows immediately.
+    #[default]
+    List,
+    /// Block until a matching download reaches the requested state.
+    Wait,
+    /// Copy a completed matching download to `path`.
+    Save,
+    /// Move a completed matching download to `path` after a verified copy.
+    Move,
+}
+
+/// Parameters for `browser_downloads` (#1106-#1109): enumerate, wait for, save,
+/// or move normal-profile Chrome downloads through the bundled extension.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserDownloadsParams {
+    /// Operation to perform. Defaults to `list`.
+    #[serde(default)]
+    pub operation: BrowserDownloadsOperation,
+    /// Browser HWND used to reach the already-open normal Chrome bridge. If
+    /// omitted, the active session target's browser window is used; if no
+    /// session target is set, the current human foreground Chromium window is
+    /// used only as an explicit bridge discovery source and reported back.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Chrome download id. Use this for exact save/move of a prior list/wait row.
+    #[serde(default)]
+    pub download_id: Option<i64>,
+    #[serde(default)]
+    pub url_contains: Option<String>,
+    #[serde(default)]
+    pub filename_contains: Option<String>,
+    #[serde(default)]
+    pub mime_contains: Option<String>,
+    /// Chrome download state filter: `in_progress`, `interrupted`, or `complete`.
+    #[serde(default)]
+    pub state: Option<String>,
+    /// Only include downloads whose Chrome startTime is at or after this Unix
+    /// timestamp in milliseconds.
+    #[serde(default)]
+    pub since_unix_ms: Option<u64>,
+    /// Only include extension event rows at or after this cursor.
+    #[serde(default)]
+    pub since_event_seq: Option<u64>,
+    /// Maximum matching rows/events to return. Default 50, max 500.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Wait budget for `wait`, `save`, and `move`. Default 30000, max 300000.
+    #[serde(default)]
+    pub wait_timeout_ms: Option<u64>,
+    /// Absolute destination file path for `save` or `move`.
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub overwrite: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserDownloadEntry {
+    pub id: i64,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub final_url: String,
+    pub filename: String,
+    pub filename_basename: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mime: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub start_time: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub end_time: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub estimated_end_time: String,
+    pub state: String,
+    pub paused: bool,
+    pub can_resume: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub danger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub bytes_received: u64,
+    pub total_bytes: i64,
+    pub file_size: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exists: Option<bool>,
+    pub incognito: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub referrer: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserDownloadEvent {
+    pub seq: u64,
+    pub event_kind: String,
+    pub timestamp_unix_ms: u64,
+    pub download_id: i64,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub final_url: String,
+    pub filename: String,
+    pub filename_basename: String,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub danger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub bytes_received: u64,
+    pub total_bytes: i64,
+    pub file_size: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delta: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserDownloadsResponse {
+    pub session_id: String,
+    pub operation: BrowserDownloadsOperation,
+    pub window_hwnd: i64,
+    pub transport: String,
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_focused: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_state: Option<String>,
+    pub used_human_os_foreground_window: bool,
+    pub condition_met: bool,
+    pub timed_out: bool,
+    pub elapsed_ms: u64,
+    pub timeout_ms: u64,
+    pub returned: u32,
+    pub event_count: u32,
+    pub next_event_cursor: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_item: Option<BrowserDownloadEntry>,
+    pub items: Vec<BrowserDownloadEntry>,
+    pub events: Vec<BrowserDownloadEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_sha256: Option<String>,
+    pub moved_file: bool,
+    pub required_foreground: bool,
+    pub backend_tier_used: String,
+    pub source_of_truth: String,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HiddenDesktopPipFrameParams {

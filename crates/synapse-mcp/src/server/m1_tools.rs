@@ -2,9 +2,11 @@ use super::{
     BrowserAddInitScriptParams, BrowserAddInitScriptResponse, BrowserAddScriptTagParams,
     BrowserAddStyleTagParams, BrowserAddTagResponse, BrowserAdoptActiveTabParams,
     BrowserAdoptActiveTabResponse, BrowserConsoleMessagesParams, BrowserConsoleMessagesResponse,
-    BrowserContentParams, BrowserContentResponse, BrowserEvaluateParams, BrowserEvaluateResponse,
-    BrowserExposeBindingOperation, BrowserExposeBindingParams, BrowserExposeBindingResponse,
-    BrowserFrameLocator, BrowserInitScriptOperation, BrowserInspectParams, BrowserInspectResponse,
+    BrowserContentParams, BrowserContentResponse, BrowserDownloadEntry, BrowserDownloadEvent,
+    BrowserDownloadsOperation, BrowserDownloadsParams, BrowserDownloadsResponse,
+    BrowserEvaluateParams, BrowserEvaluateResponse, BrowserExposeBindingOperation,
+    BrowserExposeBindingParams, BrowserExposeBindingResponse, BrowserFrameLocator,
+    BrowserInitScriptOperation, BrowserInspectParams, BrowserInspectResponse,
     BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
     BrowserLocatedFrame, BrowserNetworkWaitEntry, BrowserPdfParams, BrowserPdfResponse,
     BrowserScreenshotParams, BrowserScreenshotResponse, BrowserScreenshotScope,
@@ -45,6 +47,7 @@ use rmcp::{RoleServer, service::RequestContext};
 
 use std::{
     collections::HashMap,
+    io::Read as _,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -690,6 +693,58 @@ impl SynapseService {
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
         let result = self
             .browser_pdf_impl(&params.0, &validation, window_hwnd, &cdp_target_id)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
+    }
+
+    #[tool(
+        description = "List, wait for, save, or move downloads from the already-open normal Chrome profile through the bundled chrome.downloads bridge (#1106-#1109). operation=list is read-only; operation=wait blocks until a matching download reaches state=complete by default or the requested state; operation=save/move waits for a completed match then copies or moves it to an absolute path with byte count and SHA-256 readback. Never launches a second Chrome profile, never uses nativeMessaging, and never takes OS foreground."
+    )]
+    pub async fn browser_downloads(
+        &self,
+        params: Parameters<BrowserDownloadsParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserDownloadsResponse>, ErrorData> {
+        const TOOL: &str = "browser_downloads";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_downloads"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let validation = validate_browser_downloads_params(params.0)?;
+        let (window_context, used_human_os_foreground_window) = self
+            .resolve_browser_tabs_window_context(
+                TOOL,
+                &session_id,
+                validation.params.window_hwnd,
+            )?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "operation": validation.params.operation,
+            "window_hwnd": window_context.hwnd,
+            "window_title": &window_context.window_title,
+            "process_name": &window_context.process_name,
+            "used_human_os_foreground_window": used_human_os_foreground_window,
+            "download_id": validation.params.download_id,
+            "url_contains": validation.params.url_contains.as_deref(),
+            "filename_contains": validation.params.filename_contains.as_deref(),
+            "mime_contains": validation.params.mime_contains.as_deref(),
+            "state": validation.params.state.as_deref(),
+            "path": validation.output_path.as_ref().map(|path| path.display().to_string()),
+            "overwrite": validation.params.overwrite,
+            "required_foreground": false,
+            "no_debugger_attach": true,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_downloads_impl(
+                &session_id,
+                window_context,
+                used_human_os_foreground_window,
+                &validation,
+            )
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
@@ -1497,8 +1552,146 @@ impl SynapseService {
             backend_tier_used: captured.backend_tier_used,
             source_of_truth:
                 "normal Chrome bridge narrow chrome.debugger Page.printToPDF lane returning base64 PDF bytes written by synapse-mcp"
-                    .to_owned(),
+                .to_owned(),
         })
+    }
+
+    #[cfg(windows)]
+    async fn browser_downloads_impl(
+        &self,
+        session_id: &str,
+        window_context: ForegroundContext,
+        used_human_os_foreground_window: bool,
+        validation: &BrowserDownloadsValidation,
+    ) -> Result<BrowserDownloadsResponse, ErrorData> {
+        if synapse_a11y::endpoint_for_window(window_context.hwnd).is_some() {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser_downloads targets the normal Chrome extension bridge, but window {:#x} exposes a raw CDP debug endpoint; use the already-open normal Chrome profile",
+                    window_context.hwnd
+                ),
+            ));
+        }
+        let bridge_payload = browser_downloads_bridge_payload(&validation.params);
+        let captured =
+            crate::chrome_debugger_bridge::downloads(window_context.hwnd, bridge_payload)
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_downloads Chrome bridge chrome.downloads failed: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+        let endpoint = captured
+            .extension_id
+            .as_deref()
+            .map(chrome_debugger_endpoint)
+            .unwrap_or_else(chrome_debugger_default_endpoint);
+        let selected_item = captured
+            .selected_item
+            .clone()
+            .map(browser_download_entry_from_bridge);
+        let items = captured
+            .items
+            .into_iter()
+            .map(browser_download_entry_from_bridge)
+            .collect::<Vec<_>>();
+        let events = captured
+            .events
+            .into_iter()
+            .map(browser_download_event_from_bridge)
+            .collect::<Vec<_>>();
+        let mut response = BrowserDownloadsResponse {
+            session_id: session_id.to_owned(),
+            operation: validation.params.operation,
+            window_hwnd: window_context.hwnd,
+            transport: "chrome_downloads_extension".to_owned(),
+            endpoint,
+            chrome_window_id: None,
+            chrome_window_focused: None,
+            chrome_window_state: None,
+            used_human_os_foreground_window,
+            condition_met: captured.condition_met,
+            timed_out: captured.timed_out,
+            elapsed_ms: captured.elapsed_ms,
+            timeout_ms: captured.timeout_ms,
+            returned: captured.returned,
+            event_count: captured.event_count,
+            next_event_cursor: captured.next_event_cursor,
+            selected_item,
+            items,
+            events,
+            saved_path: None,
+            saved_bytes: None,
+            saved_sha256: None,
+            moved_file: false,
+            required_foreground: captured.required_foreground,
+            backend_tier_used: if captured.backend_tier_used.is_empty() {
+                "chrome_downloads_api".to_owned()
+            } else {
+                captured.backend_tier_used
+            },
+            source_of_truth:
+                "normal Chrome bridge chrome.downloads event/search readback plus daemon filesystem metadata and SHA-256 for save/move"
+                    .to_owned(),
+        };
+        if matches!(
+            validation.params.operation,
+            BrowserDownloadsOperation::Save | BrowserDownloadsOperation::Move
+        ) {
+            let output_path = validation.output_path.as_ref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "browser_downloads save/move validation did not retain output path",
+                )
+            })?;
+            let selected = response.selected_item.as_ref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    "browser_downloads save/move found no matching completed download",
+                )
+            })?;
+            if selected.state != "complete" {
+                return Err(mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!(
+                        "browser_downloads save/move requires state=complete; selected download {} state={}",
+                        selected.id, selected.state
+                    ),
+                ));
+            }
+            let source_path = browser_download_source_path(selected)?;
+            let moved = validation.params.operation == BrowserDownloadsOperation::Move;
+            let (saved_bytes, saved_sha256) = copy_or_move_download_file(
+                &source_path,
+                output_path,
+                validation.params.overwrite,
+                moved,
+            )?;
+            response.saved_path = Some(output_path.to_string_lossy().into_owned());
+            response.saved_bytes = Some(saved_bytes);
+            response.saved_sha256 = Some(saved_sha256);
+            response.moved_file = moved;
+        }
+        Ok(response)
+    }
+
+    #[cfg(not(windows))]
+    async fn browser_downloads_impl(
+        &self,
+        _session_id: &str,
+        _window_context: ForegroundContext,
+        _used_human_os_foreground_window: bool,
+        _validation: &BrowserDownloadsValidation,
+    ) -> Result<BrowserDownloadsResponse, ErrorData> {
+        Err(mcp_error(
+            error_codes::A11Y_NOT_AVAILABLE,
+            "browser_downloads is only available on Windows in this build",
+        ))
     }
 
     fn hidden_desktop_pip_frame_to_file(
@@ -8931,6 +9124,195 @@ fn validate_browser_tabs_params(params: BrowserTabsParams) -> Result<BrowserTabs
     Ok(params)
 }
 
+#[derive(Debug)]
+struct BrowserDownloadsValidation {
+    params: BrowserDownloadsParams,
+    output_path: Option<PathBuf>,
+}
+
+fn validate_browser_downloads_params(
+    mut params: BrowserDownloadsParams,
+) -> Result<BrowserDownloadsValidation, ErrorData> {
+    if let Some(download_id) = params.download_id {
+        if download_id < 0 {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("browser_downloads download_id must be non-negative; got {download_id}"),
+            ));
+        }
+    }
+    validate_browser_downloads_optional_string(&params.url_contains, "url_contains", 2048)?;
+    validate_browser_downloads_optional_string(
+        &params.filename_contains,
+        "filename_contains",
+        1024,
+    )?;
+    validate_browser_downloads_optional_string(&params.mime_contains, "mime_contains", 256)?;
+    if let Some(state) = params.state.as_deref() {
+        validate_browser_download_state(state)?;
+    }
+    if let Some(limit) = params.limit {
+        if !(1..=500).contains(&limit) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("browser_downloads limit must be in 1..=500; got {limit}"),
+            ));
+        }
+    }
+    if let Some(wait_timeout_ms) = params.wait_timeout_ms {
+        if !(1..=300_000).contains(&wait_timeout_ms) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "browser_downloads wait_timeout_ms must be in 1..=300000; got {wait_timeout_ms}"
+                ),
+            ));
+        }
+    }
+    let output_path = match params.operation {
+        BrowserDownloadsOperation::List | BrowserDownloadsOperation::Wait => {
+            if params.path.is_some() {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "browser_downloads operation=list/wait does not accept path",
+                ));
+            }
+            None
+        }
+        BrowserDownloadsOperation::Save | BrowserDownloadsOperation::Move => {
+            let Some(path) = params.path.as_deref() else {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "browser_downloads operation=save/move requires path",
+                ));
+            };
+            if let Some(state) = params.state.as_deref() {
+                if state != "complete" {
+                    return Err(mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        "browser_downloads operation=save/move requires state omitted or complete",
+                    ));
+                }
+            }
+            params.state = Some("complete".to_owned());
+            let output_path = browser_download_output_path(path)?;
+            ensure_download_output_path_available(&output_path, params.overwrite)?;
+            Some(output_path)
+        }
+    };
+    Ok(BrowserDownloadsValidation {
+        params,
+        output_path,
+    })
+}
+
+fn validate_browser_downloads_optional_string(
+    value: &Option<String>,
+    field_name: &str,
+    max_chars: usize,
+) -> Result<(), ErrorData> {
+    if let Some(value) = value.as_deref() {
+        if value.contains('\0') {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("browser_downloads {field_name} must not contain NUL"),
+            ));
+        }
+        if value.chars().count() > max_chars {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("browser_downloads {field_name} must be at most {max_chars} characters"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_browser_download_state(state: &str) -> Result<(), ErrorData> {
+    if matches!(state, "in_progress" | "interrupted" | "complete") {
+        return Ok(());
+    }
+    Err(mcp_error(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!(
+            "browser_downloads state must be one of in_progress, interrupted, or complete; got {state:?}"
+        ),
+    ))
+}
+
+fn browser_downloads_bridge_payload(params: &BrowserDownloadsParams) -> Value {
+    json!({
+        "operation": browser_downloads_operation_wire(params.operation),
+        "downloadId": params.download_id,
+        "urlContains": params.url_contains,
+        "filenameContains": params.filename_contains,
+        "mimeContains": params.mime_contains,
+        "state": params.state,
+        "sinceUnixMs": params.since_unix_ms,
+        "sinceEventSeq": params.since_event_seq,
+        "limit": params.limit,
+        "waitTimeoutMs": params.wait_timeout_ms,
+    })
+}
+
+fn browser_downloads_operation_wire(operation: BrowserDownloadsOperation) -> &'static str {
+    match operation {
+        BrowserDownloadsOperation::List => "list",
+        BrowserDownloadsOperation::Wait => "wait",
+        BrowserDownloadsOperation::Save => "save",
+        BrowserDownloadsOperation::Move => "move",
+    }
+}
+
+fn browser_download_entry_from_bridge(
+    entry: crate::chrome_debugger_bridge::ChromeDebuggerDownloadEntry,
+) -> BrowserDownloadEntry {
+    BrowserDownloadEntry {
+        id: entry.id,
+        url: entry.url,
+        final_url: entry.final_url,
+        filename: entry.filename,
+        filename_basename: entry.filename_basename,
+        mime: entry.mime,
+        start_time: entry.start_time,
+        end_time: entry.end_time,
+        estimated_end_time: entry.estimated_end_time,
+        state: entry.state,
+        paused: entry.paused,
+        can_resume: entry.can_resume,
+        danger: entry.danger,
+        error: entry.error,
+        bytes_received: entry.bytes_received,
+        total_bytes: entry.total_bytes,
+        file_size: entry.file_size,
+        exists: entry.exists,
+        incognito: entry.incognito,
+        referrer: entry.referrer,
+    }
+}
+
+fn browser_download_event_from_bridge(
+    event: crate::chrome_debugger_bridge::ChromeDebuggerDownloadEvent,
+) -> BrowserDownloadEvent {
+    BrowserDownloadEvent {
+        seq: event.seq,
+        event_kind: event.event_kind,
+        timestamp_unix_ms: event.timestamp_unix_ms,
+        download_id: event.download_id,
+        url: event.url,
+        final_url: event.final_url,
+        filename: event.filename,
+        filename_basename: event.filename_basename,
+        state: event.state,
+        danger: event.danger,
+        error: event.error,
+        bytes_received: event.bytes_received,
+        total_bytes: event.total_bytes,
+        file_size: event.file_size,
+        delta: event.delta,
+    }
+}
+
 /// Default and ceiling on `browser_console_messages` entries returned per call.
 const DEFAULT_BROWSER_CONSOLE_MESSAGES: usize = 200;
 const MAX_BROWSER_CONSOLE_MESSAGES: usize = 5_000;
@@ -12438,6 +12820,27 @@ fn browser_pdf_output_path(raw_path: &str) -> Result<PathBuf, ErrorData> {
     Ok(path)
 }
 
+fn browser_download_output_path(raw_path: &str) -> Result<PathBuf, ErrorData> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_downloads path must be a non-empty absolute file path",
+        ));
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_downloads path must be absolute: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
 fn screenshot_format_from_path(path: &Path) -> Result<CaptureScreenshotFormat, ErrorData> {
     let Some(extension) = path
         .extension()
@@ -12502,6 +12905,52 @@ fn ensure_screenshot_path_available(path: &Path, overwrite: bool) -> Result<(), 
                 error_codes::STORAGE_WRITE_FAILED,
                 format!(
                     "capture_screenshot failed to create parent directory {}: {error}",
+                    parent.display()
+                ),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn ensure_download_output_path_available(path: &Path, overwrite: bool) -> Result<(), ErrorData> {
+    if path.try_exists().map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "browser_downloads output path existence check failed for {}: {error}",
+                path.display()
+            ),
+        )
+    })? {
+        if path.is_dir() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "browser_downloads output path is a directory: {}",
+                    path.display()
+                ),
+            ));
+        }
+        if !overwrite {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "browser_downloads output file already exists and overwrite=false: {}",
+                    path.display()
+                ),
+            ));
+        }
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "browser_downloads failed to create parent directory {}: {error}",
                     parent.display()
                 ),
             )
@@ -12590,6 +13039,188 @@ fn save_screenshot_bitmap_with_quality(
             ),
         )
     })
+}
+
+fn browser_download_source_path(selected: &BrowserDownloadEntry) -> Result<PathBuf, ErrorData> {
+    if selected.filename.trim().is_empty() {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_downloads selected download {} did not report a local filename",
+                selected.id
+            ),
+        ));
+    }
+    let path = PathBuf::from(selected.filename.trim());
+    if !path.is_absolute() {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_downloads selected download {} filename is not absolute: {}",
+                selected.id,
+                path.display()
+            ),
+        ));
+    }
+    if selected.exists == Some(false) {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_downloads selected download {} reports exists=false: {}",
+                selected.id,
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+fn copy_or_move_download_file(
+    source_path: &Path,
+    output_path: &Path,
+    overwrite: bool,
+    move_file: bool,
+) -> Result<(u64, String), ErrorData> {
+    let source_metadata = std::fs::metadata(source_path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "browser_downloads source metadata readback failed for {}: {error}",
+                source_path.display()
+            ),
+        )
+    })?;
+    if source_metadata.is_dir() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_downloads source path is a directory: {}",
+                source_path.display()
+            ),
+        ));
+    }
+    ensure_download_output_path_available(output_path, overwrite)?;
+    let temp_path = screenshot_temp_path(output_path);
+    if temp_path.try_exists().map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "browser_downloads temp path existence check failed for {}: {error}",
+                temp_path.display()
+            ),
+        )
+    })? {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "browser_downloads temp path already exists: {}",
+                temp_path.display()
+            ),
+        ));
+    }
+    std::fs::copy(source_path, &temp_path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "browser_downloads failed to copy {} to {}: {error}",
+                source_path.display(),
+                temp_path.display()
+            ),
+        )
+    })?;
+    install_download_file(&temp_path, output_path, overwrite)?;
+    let (saved_bytes, saved_sha256) = sha256_file(output_path)?;
+    if saved_bytes != source_metadata.len() {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_downloads byte-count mismatch after save: source={} output={}",
+                source_metadata.len(),
+                saved_bytes
+            ),
+        ));
+    }
+    if move_file {
+        std::fs::remove_file(source_path).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "browser_downloads saved {}, but failed to remove source {} for move: {error}",
+                    output_path.display(),
+                    source_path.display()
+                ),
+            )
+        })?;
+    }
+    Ok((saved_bytes, saved_sha256))
+}
+
+fn install_download_file(
+    temp_path: &Path,
+    output_path: &Path,
+    overwrite: bool,
+) -> Result<(), ErrorData> {
+    if overwrite && output_path.exists() {
+        std::fs::remove_file(output_path).map_err(|error| {
+            let _ = std::fs::remove_file(temp_path);
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "browser_downloads failed to replace existing file {}: {error}",
+                    output_path.display()
+                ),
+            )
+        })?;
+    }
+    std::fs::rename(temp_path, output_path).map_err(|error| {
+        let _ = std::fs::remove_file(temp_path);
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "browser_downloads failed to move {} to {}: {error}",
+                temp_path.display(),
+                output_path.display()
+            ),
+        )
+    })
+}
+
+fn sha256_file(path: &Path) -> Result<(u64, String), ErrorData> {
+    let mut file = std::fs::File::open(path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "browser_downloads failed to open {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file.read(&mut buf).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "browser_downloads failed to read {}: {error}",
+                    path.display()
+                ),
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+        total = total.saturating_add(read as u64);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    Ok((total, hex))
 }
 
 fn install_screenshot_file(
@@ -14357,19 +14988,21 @@ mod tests {
         resolve_capture_target_window_context, select_single_active_browser_tab, sha256_hex,
         target_wire, template_value, unavailable_page_vitals_info,
         validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
-        validate_browser_add_style_tag_params, validate_browser_evaluate_params,
-        validate_browser_expose_binding_params, validate_browser_frame_locator,
-        validate_browser_set_content_params, validate_browser_tabs_params,
-        validate_browser_wait_for_function_params, validate_browser_wait_for_load_state_params,
-        validate_browser_wait_for_params, validate_browser_wait_for_request_params,
-        validate_browser_wait_for_response_params, validate_browser_wait_for_selector_params,
-        validate_browser_wait_for_url_params, validate_target_window,
+        validate_browser_add_style_tag_params, validate_browser_downloads_params,
+        validate_browser_evaluate_params, validate_browser_expose_binding_params,
+        validate_browser_frame_locator, validate_browser_set_content_params,
+        validate_browser_tabs_params, validate_browser_wait_for_function_params,
+        validate_browser_wait_for_load_state_params, validate_browser_wait_for_params,
+        validate_browser_wait_for_request_params, validate_browser_wait_for_response_params,
+        validate_browser_wait_for_selector_params, validate_browser_wait_for_url_params,
+        validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
-        BrowserEvaluateParams, BrowserExposeBindingOperation, BrowserExposeBindingParams,
-        BrowserFrameLocator, BrowserInitScriptOperation, BrowserSetContentParams, BrowserTabEntry,
-        BrowserTabsOperation, BrowserTabsParams, BrowserTabsResponse, BrowserWaitForFunctionParams,
+        BrowserDownloadsOperation, BrowserDownloadsParams, BrowserEvaluateParams,
+        BrowserExposeBindingOperation, BrowserExposeBindingParams, BrowserFrameLocator,
+        BrowserInitScriptOperation, BrowserSetContentParams, BrowserTabEntry, BrowserTabsOperation,
+        BrowserTabsParams, BrowserTabsResponse, BrowserWaitForFunctionParams,
         BrowserWaitForLoadStateParams, BrowserWaitForLoadStateState,
         BrowserWaitForNetworkResponseParams, BrowserWaitForParams, BrowserWaitForRequestParams,
         BrowserWaitForSelectorParams, BrowserWaitForSelectorState, BrowserWaitForState,
@@ -14844,6 +15477,84 @@ mod tests {
                 .contains("operation=close does not accept url"),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn browser_downloads_params_validate_operation_fields() {
+        let defaulted = validate_browser_downloads_params(BrowserDownloadsParams::default())
+            .expect("list is default");
+        assert_eq!(defaulted.params.operation, BrowserDownloadsOperation::List);
+        assert!(defaulted.output_path.is_none());
+
+        validate_browser_downloads_params(BrowserDownloadsParams {
+            operation: BrowserDownloadsOperation::Wait,
+            filename_contains: Some("report.csv".to_owned()),
+            state: Some("complete".to_owned()),
+            ..BrowserDownloadsParams::default()
+        })
+        .expect("wait accepts filters and state");
+
+        let temp = TempDir::new().expect("tempdir");
+        let output = temp.path().join("download.bin");
+        let save = validate_browser_downloads_params(BrowserDownloadsParams {
+            operation: BrowserDownloadsOperation::Save,
+            path: Some(output.to_string_lossy().into_owned()),
+            ..BrowserDownloadsParams::default()
+        })
+        .expect("save requires only path");
+        assert_eq!(save.params.state.as_deref(), Some("complete"));
+        assert_eq!(save.output_path.as_deref(), Some(output.as_path()));
+
+        let error = validate_browser_downloads_params(BrowserDownloadsParams {
+            operation: BrowserDownloadsOperation::Save,
+            ..BrowserDownloadsParams::default()
+        })
+        .expect_err("save path is required");
+        assert!(
+            error.message.contains("operation=save/move requires path"),
+            "{error:?}"
+        );
+
+        let error = validate_browser_downloads_params(BrowserDownloadsParams {
+            operation: BrowserDownloadsOperation::List,
+            path: Some(output.to_string_lossy().into_owned()),
+            ..BrowserDownloadsParams::default()
+        })
+        .expect_err("list rejects path");
+        assert!(
+            error
+                .message
+                .contains("operation=list/wait does not accept path"),
+            "{error:?}"
+        );
+
+        let error = validate_browser_downloads_params(BrowserDownloadsParams {
+            operation: BrowserDownloadsOperation::Move,
+            path: Some(output.to_string_lossy().into_owned()),
+            state: Some("interrupted".to_owned()),
+            ..BrowserDownloadsParams::default()
+        })
+        .expect_err("move rejects non-complete state");
+        assert!(
+            error
+                .message
+                .contains("operation=save/move requires state omitted or complete"),
+            "{error:?}"
+        );
+
+        let error = validate_browser_downloads_params(BrowserDownloadsParams {
+            state: Some("done".to_owned()),
+            ..BrowserDownloadsParams::default()
+        })
+        .expect_err("invalid state rejected");
+        assert!(error.message.contains("state must be one of"), "{error:?}");
+
+        let error = validate_browser_downloads_params(BrowserDownloadsParams {
+            limit: Some(501),
+            ..BrowserDownloadsParams::default()
+        })
+        .expect_err("limit cap rejected");
+        assert!(error.message.contains("limit must be in 1..=500"));
     }
 
     fn browser_tabs_response_for_test(tabs: Vec<BrowserTabEntry>) -> BrowserTabsResponse {

@@ -15,6 +15,10 @@ drops in page script. `pageScreenshot` uses typed page metrics/masks/scroll via
 viewport, full-page, clip, and element screenshots without `Page.captureScreenshot`.
 `pagePdf` uses a narrow `chrome.debugger` `Page.printToPDF` lane for PDF output
 from the same already-open Chrome profile.
+`downloads` uses `chrome.downloads` to capture real download created/changed/
+erased events, list profile downloads, wait for completion/interruption, and let
+the daemon save or move completed files to caller-chosen paths with byte/hash
+readback.
 It does not require `nativeMessaging`. Page-scoped evaluation uses
 `chrome.scripting.executeScript`; arbitrary eval or deep CDP work must use raw CDP
 from a dedicated Synapse-launched automation profile started with
@@ -81,7 +85,10 @@ The verifier also opens the already-running Chrome profile's extensions page
 and loads this directory as an unpacked extension when the active profile does
 not already contain the expected stable extension row. It refuses to launch a
 second Chrome profile as the repair path; open the intended authenticated
-profile first, then run the installer. The extension registers with the
+profile first, then run the installer. This setup script is the canonical
+auto-install path for the Chrome bridge; it verifies required permissions,
+including `downloads`, and prompts Chrome to accept new permissions when an
+existing unpacked row needs repair. The extension registers with the
 loopback daemon at `http://127.0.0.1:7700`,
 then keeps an authenticated WebSocket open at `ws://127.0.0.1:7700` with a 20s
 keepalive. Commands execute only after the daemon asks through the fixed

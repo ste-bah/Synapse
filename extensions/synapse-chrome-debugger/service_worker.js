@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-page-pdf-v2";
-const BRIDGE_BUILD_SHA256 = "5edb3b608b74420b0d3716f1d0fc087f038b4ab02126181c45569f0b88e6c4f3";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-downloads-v1";
+const BRIDGE_BUILD_SHA256 = "93d0223ce4035eaaa95ac51f21b22420de4ca29e3da48e93ee83523e8662fab4";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 let captureVisibleTabQueue = Promise.resolve();
@@ -16,6 +16,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "frames",
   "frameLocators",
   "cookies",
+  "downloads",
   "storageState",
   "navigateTab",
   "activateTab",
@@ -84,6 +85,7 @@ const MAX_RECENT_NAVIGATION_KEYS = 128;
 const MAX_PAGE_TEXT_CHARS = 4096;
 const MAX_PAGE_EVENT_BUFFER = 1000;
 const MAX_NETWORK_EVENT_BUFFER = 2000;
+const MAX_DOWNLOAD_EVENT_BUFFER = 1000;
 const OPEN_WINDOW_BOUNDS_TOLERANCE_PX = 96;
 const EXTERNAL_POPUP_RISK_PERMISSIONS = Object.freeze(["debugger", "nativeMessaging"]);
 const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
@@ -106,6 +108,8 @@ const agentNavigationClaims = new Map();
 const recentNavigationKeys = [];
 const pageEventBuffers = new Map();
 const networkEventBuffers = new Map();
+const downloadEventBuffer = [];
+let downloadEventSeq = 0;
 let popupRiskSuppressionInFlight = null;
 let popupRiskSuppressionState = {
   ok: false,
@@ -777,6 +781,24 @@ if (chrome.webRequest?.onErrorOccurred?.addListener) {
     { urls: ["<all_urls>"] }
   );
 }
+if (chrome.downloads?.onCreated?.addListener) {
+  chrome.downloads.onCreated.addListener((item) => recordDownloadEvent("created", item, null));
+}
+if (chrome.downloads?.onChanged?.addListener) {
+  chrome.downloads.onChanged.addListener((delta) => {
+    const id = Number(delta && delta.id);
+    if (chrome.downloads?.search && Number.isSafeInteger(id)) {
+      chrome.downloads.search({ id }).then((items) => {
+        recordDownloadEvent("changed", items && items[0] ? items[0] : { id }, delta);
+      }).catch(() => recordDownloadEvent("changed", { id }, delta));
+    } else {
+      recordDownloadEvent("changed", { id }, delta);
+    }
+  });
+}
+if (chrome.downloads?.onErased?.addListener) {
+  chrome.downloads.onErased.addListener((id) => recordDownloadEvent("erased", { id }, null));
+}
 
 startBridgeFromEvent();
 
@@ -818,6 +840,8 @@ async function handleCommand(command) {
       result = await handlePageScreenshot(params);
     } else if (kind === "pagePdf") {
       result = await handlePagePdf(params);
+    } else if (kind === "downloads") {
+      result = await handleDownloads(params);
     } else if (kind === "cookies") {
       result = await handleCookies(params);
     } else if (kind === "storageState") {
@@ -3055,6 +3079,364 @@ function pageScreenshotCleanupInPage(request) {
     scroll_x: Number(window.scrollX || 0),
     scroll_y: Number(window.scrollY || 0)
   };
+}
+
+function recordDownloadEvent(eventKind, item, delta) {
+  const entry = downloadEntryFromItem(item || {});
+  downloadEventSeq += 1;
+  downloadEventBuffer.push({
+    seq: downloadEventSeq,
+    event_kind: String(eventKind || "unknown"),
+    timestamp_unix_ms: Date.now(),
+    download_id: entry.id,
+    url: entry.url,
+    final_url: entry.final_url,
+    filename: entry.filename,
+    filename_basename: entry.filename_basename,
+    state: entry.state,
+    danger: entry.danger,
+    error: entry.error,
+    bytes_received: entry.bytes_received,
+    total_bytes: entry.total_bytes,
+    file_size: entry.file_size,
+    delta: downloadDeltaToPlain(delta)
+  });
+  while (downloadEventBuffer.length > MAX_DOWNLOAD_EVENT_BUFFER) {
+    downloadEventBuffer.shift();
+  }
+}
+
+function downloadDeltaToPlain(delta) {
+  if (!delta || typeof delta !== "object") {
+    return null;
+  }
+  const out = {};
+  for (const key of ["id", "url", "finalUrl", "filename", "state", "danger", "mime", "startTime", "endTime", "error", "paused", "canResume", "exists"]) {
+    if (Object.prototype.hasOwnProperty.call(delta, key)) {
+      const value = delta[key];
+      out[key] = value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "current")
+        ? value.current
+        : value;
+    }
+  }
+  for (const key of ["bytesReceived", "totalBytes", "fileSize"]) {
+    if (Object.prototype.hasOwnProperty.call(delta, key)) {
+      const value = delta[key];
+      const raw = value && typeof value === "object" && Object.prototype.hasOwnProperty.call(value, "current")
+        ? value.current
+        : value;
+      out[key] = Number(raw || 0);
+    }
+  }
+  return out;
+}
+
+async function handleDownloads(params) {
+  ensureDownloadsApiAvailable();
+  const request = normalizeDownloadsRequest(params);
+  const startedAt = Date.now();
+  let items = await queryMatchingDownloads(request);
+  let selected = selectDownloadItem(items, request);
+  let timedOut = false;
+  let conditionMet = request.operation === "list" || downloadItemSatisfiesWait(selected, request);
+
+  if (request.operation !== "list" && !conditionMet) {
+    const deadline = startedAt + request.waitTimeoutMs;
+    while (Date.now() < deadline) {
+      await sleep(Math.min(250, Math.max(25, deadline - Date.now())));
+      items = await queryMatchingDownloads(request);
+      selected = selectDownloadItem(items, request);
+      conditionMet = downloadItemSatisfiesWait(selected, request);
+      if (conditionMet) {
+        break;
+      }
+    }
+    if (!conditionMet) {
+      timedOut = true;
+    }
+  }
+
+  const elapsedMs = Math.max(0, Date.now() - startedAt);
+  const events = matchingDownloadEvents(request);
+  return {
+    extension_id: chrome.runtime.id,
+    operation: request.operation,
+    items,
+    selected_item: selected || null,
+    returned: items.length,
+    event_count: events.length,
+    next_event_cursor: downloadEventSeq + 1,
+    events,
+    condition_met: conditionMet,
+    timed_out: timedOut,
+    elapsed_ms: elapsedMs,
+    timeout_ms: request.operation === "list" ? 0 : request.waitTimeoutMs,
+    readback_backend: "chrome.downloads",
+    backend_tier_used: "chrome_downloads_api",
+    required_foreground: false
+  };
+}
+
+function ensureDownloadsApiAvailable() {
+  if (!chrome.downloads || typeof chrome.downloads.search !== "function") {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      "chrome.downloads.search unavailable; extension is missing the downloads permission"
+    );
+  }
+}
+
+function normalizeDownloadsRequest(params) {
+  const operation = normalizeDownloadsOperation(params.operation);
+  const request = {
+    operation,
+    downloadId: normalizeOptionalDownloadId(params.downloadId ?? params.download_id),
+    urlContains: normalizeOptionalDownloadString(params.urlContains ?? params.url_contains, "urlContains", 2048),
+    filenameContains: normalizeOptionalDownloadString(params.filenameContains ?? params.filename_contains, "filenameContains", 1024),
+    mimeContains: normalizeOptionalDownloadString(params.mimeContains ?? params.mime_contains, "mimeContains", 256),
+    state: normalizeOptionalDownloadState(params.state),
+    sinceUnixMs: normalizeOptionalUnixMs(params.sinceUnixMs ?? params.since_unix_ms),
+    limit: normalizeDownloadsLimit(params.limit),
+    waitTimeoutMs: normalizeDownloadsTimeout(params.waitTimeoutMs ?? params.wait_timeout_ms),
+    sinceEventSeq: normalizeOptionalEventSeq(params.sinceEventSeq ?? params.since_event_seq)
+  };
+  if (operation === "save" || operation === "move") {
+    request.state = "complete";
+  }
+  return request;
+}
+
+function normalizeDownloadsOperation(value) {
+  const raw = value === null || value === undefined ? "list" : String(value).trim().toLowerCase();
+  if (["list", "wait", "save", "move"].includes(raw)) {
+    return raw;
+  }
+  throw bridgeError(ERROR_ATTACH_FAILED, `downloads operation must be list, wait, save, or move; got ${JSON.stringify(value)}`);
+}
+
+function normalizeOptionalDownloadId(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    throw bridgeError(ERROR_ATTACH_FAILED, `downloads downloadId must be a non-negative integer; got ${JSON.stringify(value)}`);
+  }
+  return number;
+}
+
+function normalizeOptionalDownloadString(value, fieldName, maxLength) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw bridgeError(ERROR_ATTACH_FAILED, `downloads ${fieldName} must be a string`);
+  }
+  if (value.length > maxLength) {
+    throw bridgeError(ERROR_ATTACH_FAILED, `downloads ${fieldName} exceeds ${maxLength} bytes`);
+  }
+  const trimmed = value.trim();
+  return trimmed.length === 0 ? null : trimmed;
+}
+
+function normalizeOptionalDownloadState(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const raw = String(value).trim().toLowerCase();
+  if (["in_progress", "interrupted", "complete"].includes(raw)) {
+    return raw;
+  }
+  throw bridgeError(ERROR_ATTACH_FAILED, `downloads state must be in_progress, interrupted, or complete; got ${JSON.stringify(value)}`);
+}
+
+function normalizeOptionalUnixMs(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    throw bridgeError(ERROR_ATTACH_FAILED, `downloads sinceUnixMs must be a non-negative integer; got ${JSON.stringify(value)}`);
+  }
+  return number;
+}
+
+function normalizeOptionalEventSeq(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 0) {
+    throw bridgeError(ERROR_ATTACH_FAILED, `downloads sinceEventSeq must be a non-negative integer; got ${JSON.stringify(value)}`);
+  }
+  return number;
+}
+
+function normalizeDownloadsLimit(value) {
+  if (value === null || value === undefined) {
+    return 50;
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1 || number > 500) {
+    throw bridgeError(ERROR_ATTACH_FAILED, `downloads limit must be an integer in 1..=500; got ${JSON.stringify(value)}`);
+  }
+  return number;
+}
+
+function normalizeDownloadsTimeout(value) {
+  if (value === null || value === undefined) {
+    return 30000;
+  }
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1 || number > 300000) {
+    throw bridgeError(ERROR_ATTACH_FAILED, `downloads waitTimeoutMs must be an integer in 1..=300000; got ${JSON.stringify(value)}`);
+  }
+  return number;
+}
+
+async function queryMatchingDownloads(request) {
+  const query = {};
+  if (request.downloadId !== null) {
+    query.id = request.downloadId;
+  }
+  const items = await chrome.downloads.search(query);
+  return Array.from(items || [])
+    .map(downloadEntryFromItem)
+    .filter((item) => downloadEntryMatchesRequest(item, request))
+    .sort(compareDownloadEntriesNewestFirst)
+    .slice(0, request.limit);
+}
+
+function downloadEntryFromItem(item) {
+  const id = Number(item && item.id);
+  const filename = String(item && item.filename || "");
+  return {
+    id: Number.isSafeInteger(id) ? id : -1,
+    url: String(item && item.url || ""),
+    final_url: String(item && (item.finalUrl || item.final_url) || ""),
+    filename,
+    filename_basename: filenameBasename(filename),
+    mime: String(item && item.mime || ""),
+    start_time: String(item && item.startTime || ""),
+    end_time: String(item && item.endTime || ""),
+    estimated_end_time: String(item && item.estimatedEndTime || ""),
+    state: String(item && item.state || ""),
+    paused: Boolean(item && item.paused),
+    can_resume: Boolean(item && item.canResume),
+    danger: String(item && item.danger || ""),
+    error: item && item.error ? String(item.error) : null,
+    bytes_received: nonNegativeNumber(item && item.bytesReceived),
+    total_bytes: signedNumber(item && item.totalBytes),
+    file_size: signedNumber(item && item.fileSize),
+    exists: item && typeof item.exists === "boolean" ? item.exists : null,
+    incognito: Boolean(item && item.incognito),
+    referrer: String(item && item.referrer || "")
+  };
+}
+
+function filenameBasename(filename) {
+  const raw = String(filename || "");
+  if (!raw) {
+    return "";
+  }
+  const slashIndex = Math.max(raw.lastIndexOf("/"), raw.lastIndexOf("\\"));
+  return slashIndex >= 0 ? raw.slice(slashIndex + 1) : raw;
+}
+
+function nonNegativeNumber(value) {
+  const number = Number(value || 0);
+  return Number.isFinite(number) && number > 0 ? number : 0;
+}
+
+function signedNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : -1;
+}
+
+function downloadEntryMatchesRequest(item, request) {
+  if (request.downloadId !== null && item.id !== request.downloadId) {
+    return false;
+  }
+  if (request.state && item.state !== request.state) {
+    return false;
+  }
+  if (request.sinceUnixMs !== null && downloadEntryStartUnixMs(item) < request.sinceUnixMs) {
+    return false;
+  }
+  if (request.urlContains && !downloadFieldContains(`${item.url}\n${item.final_url}\n${item.referrer}`, request.urlContains)) {
+    return false;
+  }
+  if (request.filenameContains && !downloadFieldContains(`${item.filename}\n${item.filename_basename}`, request.filenameContains)) {
+    return false;
+  }
+  if (request.mimeContains && !downloadFieldContains(item.mime, request.mimeContains)) {
+    return false;
+  }
+  return true;
+}
+
+function downloadFieldContains(value, needle) {
+  return String(value || "").toLowerCase().includes(String(needle || "").toLowerCase());
+}
+
+function downloadEntryStartUnixMs(item) {
+  const parsed = Date.parse(String(item && item.start_time || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function compareDownloadEntriesNewestFirst(a, b) {
+  const byStart = downloadEntryStartUnixMs(b) - downloadEntryStartUnixMs(a);
+  if (byStart !== 0) {
+    return byStart;
+  }
+  return Number(b.id || 0) - Number(a.id || 0);
+}
+
+function selectDownloadItem(items, request) {
+  if (!items || items.length === 0) {
+    return null;
+  }
+  if (request.downloadId !== null) {
+    return items.find((item) => item.id === request.downloadId) || null;
+  }
+  return items[0] || null;
+}
+
+function downloadItemSatisfiesWait(item, request) {
+  if (!item) {
+    return false;
+  }
+  const desiredState = request.state || "complete";
+  return item.state === desiredState;
+}
+
+function matchingDownloadEvents(request) {
+  return downloadEventBuffer
+    .filter((event) => request.sinceEventSeq === null || event.seq >= request.sinceEventSeq)
+    .filter((event) => {
+      const item = {
+        id: event.download_id,
+        url: event.url,
+        final_url: event.final_url,
+        filename: event.filename,
+        filename_basename: event.filename_basename,
+        mime: "",
+        start_time: "",
+        state: event.state || "",
+        referrer: ""
+      };
+      if (request.downloadId !== null && item.id !== request.downloadId) {
+        return false;
+      }
+      if (request.urlContains && !downloadFieldContains(`${item.url}\n${item.final_url}`, request.urlContains)) {
+        return false;
+      }
+      if (request.filenameContains && !downloadFieldContains(`${item.filename}\n${item.filename_basename}`, request.filenameContains)) {
+        return false;
+      }
+      return true;
+    })
+    .slice(-request.limit);
 }
 
 async function handlePagePdf(params) {
