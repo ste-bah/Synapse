@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 const FRAMES_TOOL: &str = "browser_frames";
+const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -86,7 +87,7 @@ pub struct BrowserFramesResponse {
 #[tool_router(router = browser_frames_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Enumerate the composed frame tree for the calling session's owned raw-CDP browser tab. Returns stable Page.FrameId values, parent frame ids, target ids, frame URLs, names, origins, nesting depth, sibling order, OOPIF target metadata, and owning iframe/frame element ids when Chromium exposes DOM.Node.frameId. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; use browser_locate or browser_aria_snapshot for element-level readback inside a selected frame target."
+        description = "Enumerate the composed frame tree for the calling session's owned browser tab. Raw CDP returns stable Page.FrameId values, parent frame ids, target ids, frame URLs, names, origins, nesting depth, sibling order, OOPIF target metadata, and owning iframe/frame element ids when Chromium exposes DOM.Node.frameId. The normal Chrome bridge supports chrome-tab:* targets through debugger-free chrome.webNavigation.getAllFrames plus optional chrome.scripting metadata, with frame owner element ids unavailable. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_frames(
         &self,
@@ -144,6 +145,55 @@ impl SynapseService {
         cdp_target_id: &str,
     ) -> Result<BrowserFramesResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+                let result = crate::chrome_debugger_bridge::frames(window_hwnd, cdp_target_id)
+                    .await
+                    .map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!(
+                                "{FRAMES_TOOL} normal bridge frame enumeration failed for target {cdp_target_id:?}: {}",
+                                error.detail()
+                            ),
+                        )
+                    })?;
+                tracing::info!(
+                    code = "CHROME_BRIDGE_BACKGROUND_FRAME_ENUMERATION",
+                    session_id = %session_id,
+                    hwnd = window_hwnd,
+                    cdp_target_id = %result.target_id,
+                    frame_count = result.frame_count,
+                    oopif_target_count = result.oopif_target_count,
+                    attached_frame_target_count = result.attached_frame_target_count,
+                    target_url = %result.url,
+                    "readback=chrome.webNavigation.getAllFrames+chrome.scripting.executeScript outcome=frames_returned"
+                );
+                return Ok(BrowserFramesResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "chrome_tabs_extension".to_owned(),
+                    endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.webNavigation".to_owned(),
+                    cdp_target_id: result.target_id,
+                    page_url: result.url,
+                    page_title: result.title,
+                    frame_count: result.frame_count,
+                    oopif_target_count: result.oopif_target_count,
+                    attached_frame_target_count: result.attached_frame_target_count,
+                    frames: result
+                        .frames
+                        .into_iter()
+                        .map(|frame| browser_bridge_frame_entry(window_hwnd, frame))
+                        .collect(),
+                    blocked_frame_targets: result.blocked_frame_targets,
+                    frame_snapshot_errors: result.frame_snapshot_errors,
+                    readback_backend: result.readback_backend,
+                    backend_tier_used: result.backend_tier_used,
+                    required_foreground: false,
+                    source_of_truth:
+                        "normal Chrome bridge chrome.webNavigation.getAllFrames plus content-script frame metadata"
+                            .to_owned(),
+                });
+            }
             return Err(browser_raw_cdp_required_error(FRAMES_TOOL, window_hwnd));
         };
         let result = synapse_a11y::cdp_list_frames(&endpoint, window_hwnd, cdp_target_id)
@@ -243,6 +293,46 @@ fn browser_frame_entry(
     }
 }
 
+#[cfg(windows)]
+fn browser_bridge_frame_entry(
+    window_hwnd: i64,
+    frame: crate::chrome_debugger_bridge::ChromeDebuggerFrameEntry,
+) -> BrowserFrameEntry {
+    let frame_element_target =
+        frame
+            .frame_element_cdp_target_id
+            .as_ref()
+            .map(|target_id| TargetWire::Cdp {
+                window_hwnd,
+                cdp_target_id: target_id.clone(),
+            });
+    BrowserFrameEntry {
+        frame_id: frame.frame_id,
+        parent_frame_id: frame.parent_frame_id,
+        target: TargetWire::Cdp {
+            window_hwnd,
+            cdp_target_id: frame.cdp_target_id.clone(),
+        },
+        cdp_target_id: frame.cdp_target_id,
+        target_type: frame.target_type,
+        target_attached: frame.target_attached,
+        url: frame.url,
+        name: frame.name,
+        origin: frame.origin,
+        security_origin: frame.security_origin,
+        loader_id: frame.loader_id,
+        depth: frame.depth,
+        sibling_index: frame.sibling_index,
+        child_count: frame.child_count,
+        is_out_of_process: frame.is_out_of_process,
+        frame_element_id: frame.frame_element_id,
+        frame_element_backend_node_id: frame.frame_element_backend_node_id,
+        frame_element_cdp_target_id: frame.frame_element_cdp_target_id,
+        frame_element_target,
+        frame_element_source: frame.frame_element_source,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +384,52 @@ mod tests {
                 assert_eq!(cdp_target_id, "root-target");
             }
             other => panic!("expected CDP owner target, got {other:?}"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn browser_bridge_frame_entry_maps_normal_tab_frame() {
+        let frame = crate::chrome_debugger_bridge::ChromeDebuggerFrameEntry {
+            frame_id: "2".to_owned(),
+            parent_frame_id: Some("0".to_owned()),
+            cdp_target_id: "chrome-tab:44".to_owned(),
+            target_type: "iframe".to_owned(),
+            target_attached: Some(false),
+            url: "http://localhost:7700/health".to_owned(),
+            name: Some("health-frame".to_owned()),
+            origin: "http://localhost:7700".to_owned(),
+            security_origin: Some("http://localhost:7700".to_owned()),
+            loader_id: None,
+            depth: 1,
+            sibling_index: 0,
+            child_count: 0,
+            is_out_of_process: false,
+            frame_element_id: None,
+            frame_element_backend_node_id: None,
+            frame_element_cdp_target_id: None,
+            frame_element_source: "chrome.webNavigation.getAllFrames".to_owned(),
+        };
+
+        let wire = browser_bridge_frame_entry(0x3300, frame);
+
+        assert_eq!(wire.frame_id, "2");
+        assert_eq!(wire.parent_frame_id.as_deref(), Some("0"));
+        assert_eq!(wire.cdp_target_id, "chrome-tab:44");
+        assert_eq!(wire.depth, 1);
+        assert_eq!(
+            wire.frame_element_source,
+            "chrome.webNavigation.getAllFrames"
+        );
+        match wire.target {
+            TargetWire::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            } => {
+                assert_eq!(window_hwnd, 0x3300);
+                assert_eq!(cdp_target_id, "chrome-tab:44");
+            }
+            TargetWire::Window { .. } => panic!("expected CDP frame target"),
         }
     }
 }

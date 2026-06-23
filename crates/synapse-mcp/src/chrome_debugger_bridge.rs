@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-23-storage-state-v2";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-23-frame-enum-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "54c77d578de467dc7a23e4166620e6b1f714d6358c97461720f4474047dd2980";
+    "71fda694403bfb0752ccf271042a30e2e0d4389b9c3217466a5c768c17f986ba";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -52,6 +52,7 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "cookies",
     "domAction",
     "externalPopupRiskSuppression",
+    "frames",
     "listTabs",
     "navigateTab",
     "openTab",
@@ -2621,6 +2622,84 @@ pub(crate) struct ChromeDebuggerTargetInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerFrameEntry {
+    #[serde(default)]
+    pub frame_id: String,
+    #[serde(default)]
+    pub parent_frame_id: Option<String>,
+    #[serde(default)]
+    pub cdp_target_id: String,
+    #[serde(default)]
+    pub target_type: String,
+    #[serde(default)]
+    pub target_attached: Option<bool>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub security_origin: Option<String>,
+    #[serde(default)]
+    pub loader_id: Option<String>,
+    #[serde(default)]
+    pub depth: u32,
+    #[serde(default)]
+    pub sibling_index: u32,
+    #[serde(default)]
+    pub child_count: u32,
+    #[serde(default)]
+    pub is_out_of_process: bool,
+    #[serde(default)]
+    pub frame_element_id: Option<String>,
+    #[serde(default)]
+    pub frame_element_backend_node_id: Option<i64>,
+    #[serde(default)]
+    pub frame_element_cdp_target_id: Option<String>,
+    #[serde(default)]
+    pub frame_element_source: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerFramesResult {
+    pub target_id: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub ready_state: String,
+    #[serde(default)]
+    pub frame_count: usize,
+    #[serde(default)]
+    pub oopif_target_count: u32,
+    #[serde(default)]
+    pub attached_frame_target_count: u32,
+    #[serde(default)]
+    pub frames: Vec<ChromeDebuggerFrameEntry>,
+    #[serde(default)]
+    pub blocked_frame_targets: Vec<String>,
+    #[serde(default)]
+    pub frame_snapshot_errors: Vec<String>,
+    #[serde(default)]
+    pub readback_backend: String,
+    #[serde(default)]
+    pub backend_tier_used: String,
+    #[serde(default)]
+    pub required_foreground: bool,
+    #[serde(default)]
+    pub target_candidate_count: u32,
+    #[serde(default)]
+    pub target_selection_reason: String,
+    #[serde(default)]
+    pub extension_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ChromeDebuggerCaptureVisibleTabResult {
     pub target_id: String,
     pub tab_id: u32,
@@ -4465,6 +4544,27 @@ pub(crate) async fn target_info(
     serde_json::from_value::<ChromeDebuggerTargetInfo>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger target info response: {error}"
+        ))
+    })
+}
+
+pub(crate) async fn frames(
+    hwnd: i64,
+    target_id: &str,
+) -> Result<ChromeDebuggerFramesResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "frames")?;
+    let result = bridge()
+        .send_command(
+            "frames",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerFramesResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger frames response: {error}"
         ))
     })
 }

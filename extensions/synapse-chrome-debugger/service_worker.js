@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-storage-state-v2";
-const BRIDGE_BUILD_SHA256 = "54c77d578de467dc7a23e4166620e6b1f714d6358c97461720f4474047dd2980";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-frame-enum-v1";
+const BRIDGE_BUILD_SHA256 = "71fda694403bfb0752ccf271042a30e2e0d4389b9c3217466a5c768c17f986ba";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -9,6 +9,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "closeTab",
   "targetInfo",
   "targetInfoPageText",
+  "frames",
   "cookies",
   "storageState",
   "navigateTab",
@@ -321,6 +322,7 @@ function commandRequiresExternalPopupSuppression(kind) {
     "closeTab",
     "targetInfo",
     "targetInfoPageText",
+    "frames",
     "typeActiveElement",
     "setFieldValue",
     "pageVitals",
@@ -793,6 +795,8 @@ async function handleCommand(command) {
       result = rejectAttachCommand(kind, params);
     } else if (kind === "targetInfo" || kind === "targetInfoPageText") {
       result = await handleTargetInfo(params);
+    } else if (kind === "frames") {
+      result = await handleFrames(params);
     } else if (kind === "pageContent") {
       result = await handlePageContent(params);
     } else if (kind === "cookies") {
@@ -1046,6 +1050,57 @@ async function handleTargetInfo(params) {
     active_element: activeElement,
     page_text: pageText,
     page_vitals: pageVitals,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
+async function handleFrames(params) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const state = await tabPageState(selected.tabId, selected.target);
+  if (!chrome.webNavigation || typeof chrome.webNavigation.getAllFrames !== "function") {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      "chrome.webNavigation.getAllFrames unavailable; extension is missing webNavigation permission"
+    );
+  }
+
+  let navigationFrames;
+  try {
+    navigationFrames = await chrome.webNavigation.getAllFrames({ tabId: selected.tabId });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `chrome.webNavigation.getAllFrames(${selected.tabId}) failed: ${errorMessage(error)}`
+    );
+  }
+  if (!Array.isArray(navigationFrames)) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `chrome.webNavigation.getAllFrames(${selected.tabId}) returned non-array frame data`
+    );
+  }
+
+  const frameMetadata = await tabFrameMetadata(selected.tabId);
+  const targetId = state.target_id || selected.target.id;
+  const built = buildFrameTreeEntries(navigationFrames, frameMetadata.byFrameId, targetId);
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: targetId,
+    tab_id: selected.tabId,
+    chrome_window_id: state.chrome_window_id,
+    url: state.url || "",
+    title: state.title || "",
+    ready_state: state.ready_state || "",
+    frame_count: built.frames.length,
+    oopif_target_count: built.frames.filter((frame) => frame.is_out_of_process).length,
+    attached_frame_target_count: 0,
+    frames: built.frames,
+    blocked_frame_targets: [],
+    frame_snapshot_errors: [...frameMetadata.errors, ...built.errors],
+    readback_backend: "chrome.webNavigation.getAllFrames+chrome.scripting.executeScript(frame metadata)",
+    backend_tier_used: "chrome_tabs_extension",
+    required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
@@ -3503,6 +3558,202 @@ function summarizeFrameExecutionResult(frame) {
     text_truncated: result.text_truncated == null ? null : Boolean(result.text_truncated),
     text_sample: text == null ? null : trimForReadback(text, 240)
   };
+}
+
+async function tabFrameMetadata(tabId) {
+  const byFrameId = new Map();
+  const errors = [];
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    errors.push("chrome.scripting.executeScript unavailable for frame metadata enrichment");
+    return { byFrameId, errors };
+  }
+  try {
+    const injected = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: readFrameMetadataInPage
+    });
+    for (const frame of frameExecutionResults(injected)) {
+      if (!Number.isSafeInteger(frame.frame_id) || !frame.result || typeof frame.result !== "object") {
+        continue;
+      }
+      byFrameId.set(String(frame.frame_id), frame.result);
+      if (!frame.result.ok) {
+        errors.push(
+          `frame_id=${String(frame.frame_id)} metadata_error=${trimForReadback(frame.result.error_detail, 240)}`
+        );
+      }
+    }
+  } catch (error) {
+    errors.push(`chrome.scripting.executeScript(frame metadata): ${trimForReadback(errorMessage(error), 240)}`);
+  }
+  return { byFrameId, errors };
+}
+
+function readFrameMetadataInPage() {
+  try {
+    return {
+      ok: true,
+      url: String(location.href || ""),
+      name: String(window.name || ""),
+      origin: String(location.origin || ""),
+      security_origin: String(location.origin || ""),
+      title: String(document.title || ""),
+      ready_state: String(document.readyState || "")
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error_code: "CHROME_FRAME_METADATA_FAILED",
+      error_detail: error && error.message ? String(error.message) : String(error)
+    };
+  }
+}
+
+function buildFrameTreeEntries(navigationFrames, metadataByFrameId, targetId) {
+  const errors = [];
+  const rows = [];
+  const seen = new Set();
+  for (const [navigationIndex, raw] of navigationFrames.entries()) {
+    if (!Number.isSafeInteger(raw?.frameId)) {
+      errors.push(`skipped frame at index=${navigationIndex}: missing numeric frameId`);
+      continue;
+    }
+    const frameId = String(raw.frameId);
+    if (seen.has(frameId)) {
+      errors.push(`skipped duplicate frame_id=${frameId}`);
+      continue;
+    }
+    seen.add(frameId);
+    const parentFrameId = Number.isSafeInteger(raw.parentFrameId) && raw.parentFrameId >= 0
+      ? String(raw.parentFrameId)
+      : null;
+    const metadata = metadataByFrameId.get(frameId) || {};
+    const url = stringOrEmptyPreserve(metadata.url || raw.url || "");
+    const origin = normalizeFrameOrigin(metadata.origin, url);
+    rows.push({
+      frame_id: frameId,
+      parent_frame_id: parentFrameId,
+      cdp_target_id: targetId,
+      target_type: parentFrameId ? "iframe" : "page",
+      target_attached: false,
+      url,
+      name: nullableNonemptyString(metadata.name),
+      origin,
+      security_origin: origin ? origin : null,
+      loader_id: null,
+      depth: 0,
+      sibling_index: 0,
+      child_count: 0,
+      is_out_of_process: false,
+      frame_element_id: null,
+      frame_element_backend_node_id: null,
+      frame_element_cdp_target_id: null,
+      frame_element_source: "chrome.webNavigation.getAllFrames",
+      navigation_index: navigationIndex,
+      process_id: Number.isSafeInteger(raw.processId) ? raw.processId : null,
+      error_occurred: Boolean(raw.errorOccurred)
+    });
+  }
+
+  const byId = new Map(rows.map((row) => [row.frame_id, row]));
+  for (const row of rows) {
+    if (row.parent_frame_id && !byId.has(row.parent_frame_id)) {
+      errors.push(`frame_id=${row.frame_id} references missing parent_frame_id=${row.parent_frame_id}`);
+      row.parent_frame_id = null;
+      row.target_type = "page";
+    }
+    if (row.error_occurred) {
+      errors.push(`frame_id=${row.frame_id} url=${JSON.stringify(row.url)} reported navigation error`);
+    }
+  }
+
+  const childrenByParent = new Map();
+  for (const row of rows) {
+    const key = row.parent_frame_id || "";
+    if (!childrenByParent.has(key)) {
+      childrenByParent.set(key, []);
+    }
+    childrenByParent.get(key).push(row);
+  }
+  for (const children of childrenByParent.values()) {
+    children.sort((left, right) => left.navigation_index - right.navigation_index);
+    children.forEach((child, index) => {
+      child.sibling_index = index;
+    });
+  }
+
+  const roots = (childrenByParent.get("") || []).slice();
+  const rootProcessId = roots.find((row) => Number.isSafeInteger(row.process_id))?.process_id ?? null;
+  for (const row of rows) {
+    row.child_count = (childrenByParent.get(row.frame_id) || []).length;
+    row.depth = frameTreeDepth(row, byId);
+    row.is_out_of_process =
+      row.parent_frame_id !== null &&
+      Number.isSafeInteger(rootProcessId) &&
+      Number.isSafeInteger(row.process_id) &&
+      row.process_id !== rootProcessId;
+  }
+
+  const ordered = [];
+  const visited = new Set();
+  function visit(row) {
+    if (!row || visited.has(row.frame_id)) {
+      return;
+    }
+    visited.add(row.frame_id);
+    ordered.push(row);
+    for (const child of childrenByParent.get(row.frame_id) || []) {
+      visit(child);
+    }
+  }
+  for (const root of roots.sort((left, right) => left.navigation_index - right.navigation_index)) {
+    visit(root);
+  }
+  for (const row of rows.sort((left, right) => left.navigation_index - right.navigation_index)) {
+    visit(row);
+  }
+
+  return {
+    frames: ordered.map(({ navigation_index, process_id, error_occurred, ...frame }) => frame),
+    errors
+  };
+}
+
+function frameTreeDepth(row, byId) {
+  let depth = 0;
+  let current = row;
+  const seen = new Set();
+  while (current?.parent_frame_id && byId.has(current.parent_frame_id)) {
+    if (seen.has(current.frame_id)) {
+      return depth;
+    }
+    seen.add(current.frame_id);
+    depth += 1;
+    current = byId.get(current.parent_frame_id);
+  }
+  return depth;
+}
+
+function normalizeFrameOrigin(rawOrigin, url) {
+  const origin = stringOrEmptyPreserve(rawOrigin);
+  if (origin && origin !== "null") {
+    return origin;
+  }
+  try {
+    const parsed = new URL(String(url || ""));
+    return parsed.origin === "null" ? "" : parsed.origin;
+  } catch (_) {
+    return "";
+  }
+}
+
+function nullableNonemptyString(value) {
+  const text = stringOrEmptyPreserve(value);
+  return text ? text : null;
+}
+
+function stringOrEmptyPreserve(value) {
+  return value === null || value === undefined ? "" : String(value);
 }
 
 function frameResolvedMatchCount(frame) {
