@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-binding-v1";
-const BRIDGE_BUILD_SHA256 = "2e104bff573efa8501c7fadf62f010488101a01587e9b5ace20b70f658d4300c";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-dialog-v1";
+const BRIDGE_BUILD_SHA256 = "8141eae98afbbc1d3bcfd5b807fb7f8d069addf08708ac99a62f18b3546722fc";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 let captureVisibleTabQueue = Promise.resolve();
@@ -42,6 +42,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "evaluateScript",
   "initScript",
   "exposeBinding",
+  "handleDialog",
   "cdpInput",
   "viewportEmulation",
   "deviceEmulation",
@@ -92,6 +93,8 @@ const MAX_NETWORK_EVENT_BUFFER = 2000;
 const MAX_DOWNLOAD_EVENT_BUFFER = 1000;
 const MAX_BINDING_EVENT_BUFFER = 1000;
 const MAX_BINDING_PAYLOAD_CHARS = 65536;
+const MAX_DIALOG_EVENT_BUFFER = 1000;
+const MAX_DIALOG_PROMPT_TEXT_CHARS = 8192;
 const OPEN_WINDOW_BOUNDS_TOLERANCE_PX = 96;
 const EXTERNAL_POPUP_RISK_PERMISSIONS = Object.freeze(["debugger", "nativeMessaging"]);
 const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
@@ -102,6 +105,7 @@ const MEDIA_BASELINE_BY_TAB = new Map();
 const NETWORK_BASELINE_BY_TAB = new Map();
 const INIT_SCRIPT_DEBUGGER_SESSIONS = new Map();
 const BINDING_DEBUGGER_SESSIONS = new Map();
+const DIALOG_DEBUGGER_SESSIONS = new Map();
 
 let hostId = null;
 let bridgeToken = null;
@@ -362,6 +366,7 @@ function commandRequiresExternalPopupSuppression(kind) {
     "evaluateScript",
     "initScript",
     "exposeBinding",
+    "handleDialog",
     "cdpInput",
     "viewportEmulation",
     "deviceEmulation",
@@ -732,12 +737,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   recordTabRemovedForPageEvents(tabId);
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
   BINDING_DEBUGGER_SESSIONS.delete(tabId);
+  DIALOG_DEBUGGER_SESSIONS.delete(tabId);
 });
 if (chrome.debugger?.onDetach?.addListener) {
   chrome.debugger.onDetach.addListener((source, reason) => {
     if (Number.isInteger(source?.tabId)) {
       INIT_SCRIPT_DEBUGGER_SESSIONS.delete(source.tabId);
       markBindingDebuggerDetached(source.tabId);
+      markDialogDebuggerDetached(source.tabId);
       console.warn(`Synapse persistent debugger session detached for tab ${source.tabId}: ${String(reason || "unknown")}`);
     }
   });
@@ -746,6 +753,10 @@ if (chrome.debugger?.onEvent?.addListener) {
   chrome.debugger.onEvent.addListener((source, method, params) => {
     if (method === "Runtime.bindingCalled" && Number.isInteger(source?.tabId)) {
       recordBindingCalledEvent(source.tabId, params || {});
+    } else if (method === "Page.javascriptDialogOpening" && Number.isInteger(source?.tabId)) {
+      recordDialogOpeningEvent(source.tabId, params || {});
+    } else if (method === "Page.javascriptDialogClosed" && Number.isInteger(source?.tabId)) {
+      recordDialogClosedEvent(source.tabId, params || {});
     }
   });
 }
@@ -929,6 +940,8 @@ async function handleCommand(command) {
       result = await handleInitScript(params);
     } else if (kind === "exposeBinding") {
       result = await handleExposeBinding(params);
+    } else if (kind === "handleDialog") {
+      result = await handleDialog(params);
     } else if (kind === "pageVitals") {
       result = await handlePageVitals(params);
     } else if (kind === "navigateTab") {
@@ -1393,6 +1406,115 @@ async function handleExposeBinding(params) {
     total_buffered: read.total_buffered,
     dropped: read.dropped,
     readback_backend: "chrome.debugger.Runtime.addBinding+Runtime.bindingCalled+Runtime.removeBinding",
+    backend_tier_used: "chrome_tabs_extension",
+    required_foreground: false,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
+async function handleDialog(params) {
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const operation = normalizeDialogOperation(params.operation);
+  const policy = normalizeDialogDefaultPolicy(params.defaultPolicy);
+  const sinceSeq = normalizeOptionalNonNegativeInteger(params.sinceSeq, "sinceSeq");
+  const limit = normalizeDialogLimit(params.limit);
+  const promptText = normalizeDialogPromptText(params.promptText);
+  if (operation === "set_policy" && !policy) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "handleDialog operation=set_policy requires defaultPolicy"
+    );
+  }
+  if (operation !== "accept" && promptText !== null) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "handleDialog promptText is only valid for operation=accept"
+    );
+  }
+
+  let session = DIALOG_DEBUGGER_SESSIONS.get(selected.tabId) || null;
+  let captureNewlyArmed = false;
+  let handledDialog = null;
+  let handleAction = null;
+  let effectivePromptText = null;
+  try {
+    if (operation === "status" || operation === "set_policy") {
+      const defaultPolicy = policy || "dismiss";
+      const ensured = await ensureDialogDebuggerSession(selected.tabId, defaultPolicy);
+      session = ensured.session;
+      captureNewlyArmed = ensured.newlyArmed;
+    } else {
+      if (!session?.attached) {
+        throw bridgeError(
+          ERROR_ACTION_TARGET_INVALID,
+          `browser_handle_dialog ${operation} requested for tab ${selected.tabId}, but dialog capture is not armed; call operation=status first`
+        );
+      }
+      const pending = dialogPendingEntry(session);
+      if (!pending) {
+        throw bridgeError(
+          ERROR_ACTION_TARGET_INVALID,
+          `browser_handle_dialog ${operation} requested for tab ${selected.tabId}, but no JavaScript dialog is pending`
+        );
+      }
+      const debuggee = { tabId: selected.tabId };
+      handleAction = operation;
+      effectivePromptText = operation === "accept"
+        ? (promptText ?? pending.default_prompt ?? "")
+        : null;
+      await sendDebuggerCommand(debuggee, "Page.handleJavaScriptDialog", dialogManualHandleParams(
+        operation,
+        effectivePromptText
+      ));
+      handledDialog = markDialogManualHandled(session, pending.seq, operation, effectivePromptText);
+    }
+  } catch (error) {
+    if (error?.code) {
+      throw error;
+    }
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger handleDialog ${operation} failed for tab ${selected.tabId}: ${errorMessage(error)}`
+    );
+  }
+
+  session = DIALOG_DEBUGGER_SESSIONS.get(selected.tabId) || session;
+  const read = session
+    ? readDialogEntries(session, sinceSeq, limit)
+    : emptyDialogRead();
+  const state = await tabPageState(selected.tabId, selected.target);
+  const pendingDialog = read.pending_dialog || dialogPendingEntry(session);
+  const lastDialog = session?.entries?.length
+    ? session.entries[session.entries.length - 1]
+    : null;
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: state.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: state.chrome_window_id,
+    operation,
+    default_policy: session?.defaultPolicy || policy || "dismiss",
+    capture_newly_armed: Boolean(captureNewlyArmed),
+    handled: Boolean(handledDialog),
+    handle_action: handleAction,
+    prompt_text: effectivePromptText,
+    pending_dialog: pendingDialog,
+    handled_dialog: handledDialog,
+    last_dialog: lastDialog,
+    entries: read.entries,
+    next_cursor: read.next_cursor,
+    returned: read.returned,
+    total_buffered: read.total_buffered,
+    dropped: read.dropped,
+    opened_count: Number(session?.openedCount || 0),
+    closed_count: Number(session?.closedCount || 0),
+    auto_handled_count: Number(session?.autoHandledCount || 0),
+    error_count: Number(session?.errorCount || 0),
+    url: state.url || "",
+    title: state.title || "",
+    ready_state: state.ready_state || "",
+    readback_backend: "chrome.debugger.Page.javascriptDialogOpening+Page.handleJavaScriptDialog",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
@@ -8749,7 +8871,7 @@ async function sendDebuggerCommand(debuggee, method, params, timeoutMs = DEBUGGE
 
 async function attachDebuggerForCommand(tabId, protocolVersion = "1.3") {
   const debuggee = { tabId };
-  if (INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId) || bindingSessionIsAttached(tabId)) {
+  if (persistentDebuggerSessionIsAttached(tabId)) {
     return { debuggee, shouldDetach: false, persistent: true, protocolVersion };
   }
   await chrome.debugger.attach(debuggee, protocolVersion);
@@ -8762,8 +8884,8 @@ async function ensureInitScriptDebuggerSession(tabId, protocolVersion = "1.3") {
   if (session) {
     return { debuggee, session, newlyAttached: false, newlyCreated: false, protocolVersion };
   }
-  const reuseBindingDebugger = bindingSessionIsAttached(tabId);
-  if (!reuseBindingDebugger) {
+  const reusePersistentDebugger = persistentDebuggerSessionIsAttached(tabId);
+  if (!reusePersistentDebugger) {
     await chrome.debugger.attach(debuggee, protocolVersion);
   }
   session = {
@@ -8774,7 +8896,7 @@ async function ensureInitScriptDebuggerSession(tabId, protocolVersion = "1.3") {
     attachedAtUnixMs: Date.now()
   };
   INIT_SCRIPT_DEBUGGER_SESSIONS.set(tabId, session);
-  return { debuggee, session, newlyAttached: !reuseBindingDebugger, newlyCreated: true, protocolVersion };
+  return { debuggee, session, newlyAttached: !reusePersistentDebugger, newlyCreated: true, protocolVersion };
 }
 
 async function ensureInitScriptPageDomainEnabled(debuggee, session) {
@@ -8797,12 +8919,13 @@ async function maybeDetachInitScriptDebuggerSession(tabId, debuggee, identifier)
     return false;
   }
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
-  if (bindingSessionHasActiveNames(tabId)) {
+  if (bindingSessionHasActiveNames(tabId) || dialogSessionIsActive(tabId)) {
     return false;
   }
   try {
     await chrome.debugger.detach(debuggee);
     markBindingDebuggerDetached(tabId, false);
+    markDialogDebuggerDetached(tabId, false);
     return true;
   } catch (error) {
     console.warn(`Synapse chrome.debugger detach failed for initScript cleanup tab ${tabId}: ${errorMessage(error)}`);
@@ -8815,6 +8938,17 @@ function bindingSessionIsAttached(tabId) {
   return Boolean(session?.attached);
 }
 
+function dialogSessionIsAttached(tabId) {
+  const session = DIALOG_DEBUGGER_SESSIONS.get(tabId);
+  return Boolean(session?.attached);
+}
+
+function persistentDebuggerSessionIsAttached(tabId) {
+  return INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId) ||
+    bindingSessionIsAttached(tabId) ||
+    dialogSessionIsAttached(tabId);
+}
+
 function bindingSessionHasActiveNames(tabId) {
   const session = BINDING_DEBUGGER_SESSIONS.get(tabId);
   return Boolean(session?.activeNames?.size);
@@ -8823,6 +8957,10 @@ function bindingSessionHasActiveNames(tabId) {
 function hasActiveInitScriptDebuggerSession(tabId) {
   const session = INIT_SCRIPT_DEBUGGER_SESSIONS.get(tabId);
   return Boolean(session?.identifiers?.size);
+}
+
+function dialogSessionIsActive(tabId) {
+  return dialogSessionIsAttached(tabId);
 }
 
 async function ensureBindingDebuggerSession(tabId, protocolVersion = "1.3") {
@@ -8844,7 +8982,7 @@ async function ensureBindingDebuggerSession(tabId, protocolVersion = "1.3") {
   }
   let newlyArmed = false;
   if (!session.attached) {
-    if (!INIT_SCRIPT_DEBUGGER_SESSIONS.has(tabId)) {
+    if (!persistentDebuggerSessionIsAttached(tabId)) {
       await chrome.debugger.attach(debuggee, protocolVersion);
     }
     session.attached = true;
@@ -8873,12 +9011,13 @@ async function addBindingToSession(debuggee, session, name, executionContextName
 }
 
 async function detachBindingDebuggerSession(tabId, debuggee, session) {
-  if (hasActiveInitScriptDebuggerSession(tabId)) {
+  if (hasActiveInitScriptDebuggerSession(tabId) || dialogSessionIsActive(tabId)) {
     return false;
   }
   try {
     await chrome.debugger.detach(debuggee);
     markBindingDebuggerDetached(tabId, false);
+    markDialogDebuggerDetached(tabId, false);
     return true;
   } catch (error) {
     console.warn(`Synapse chrome.debugger detach failed for binding cleanup tab ${tabId}: ${errorMessage(error)}`);
@@ -8983,6 +9122,231 @@ function emptyBindingRead(status) {
   return {
     ...status,
     calls: [],
+    next_cursor: 0,
+    returned: 0,
+    total_buffered: 0,
+    dropped: 0
+  };
+}
+
+async function ensureDialogDebuggerSession(tabId, defaultPolicy, protocolVersion = "1.3") {
+  const debuggee = { tabId };
+  let session = DIALOG_DEBUGGER_SESSIONS.get(tabId);
+  if (!session) {
+    session = {
+      protocolVersion,
+      pageEnabled: false,
+      attached: false,
+      entries: [],
+      nextSeq: 0,
+      dropped: 0,
+      capacity: MAX_DIALOG_EVENT_BUFFER,
+      armedAtUnixMs: 0,
+      defaultPolicy: defaultPolicy || "dismiss",
+      pendingSeq: null,
+      openedCount: 0,
+      closedCount: 0,
+      autoHandledCount: 0,
+      errorCount: 0
+    };
+    DIALOG_DEBUGGER_SESSIONS.set(tabId, session);
+  }
+  session.defaultPolicy = defaultPolicy || session.defaultPolicy || "dismiss";
+  let newlyArmed = false;
+  if (!session.attached) {
+    if (!persistentDebuggerSessionIsAttached(tabId)) {
+      await chrome.debugger.attach(debuggee, protocolVersion);
+    }
+    session.attached = true;
+    session.protocolVersion = protocolVersion;
+    session.armedAtUnixMs = Date.now();
+    newlyArmed = true;
+  }
+  if (!session.pageEnabled) {
+    await sendDebuggerCommand(debuggee, "Page.enable", {});
+    session.pageEnabled = true;
+  }
+  return { debuggee, session, newlyArmed, protocolVersion };
+}
+
+function markDialogDebuggerDetached(tabId, clearPending = true) {
+  const session = DIALOG_DEBUGGER_SESSIONS.get(tabId);
+  if (!session) {
+    return;
+  }
+  session.attached = false;
+  session.pageEnabled = false;
+  if (clearPending) {
+    session.pendingSeq = null;
+  }
+}
+
+function recordDialogOpeningEvent(tabId, params) {
+  const session = DIALOG_DEBUGGER_SESSIONS.get(tabId);
+  if (!session?.attached) {
+    return;
+  }
+  const defaultPrompt = params?.defaultPrompt === undefined || params?.defaultPrompt === null
+    ? null
+    : String(params.defaultPrompt);
+  const policy = session.defaultPolicy || "dismiss";
+  const entry = {
+    seq: Number(session.nextSeq || 0),
+    url: String(params?.url || ""),
+    frame_id: String(params?.frameId || ""),
+    dialog_type: String(params?.type || ""),
+    message: String(params?.message || ""),
+    default_prompt: defaultPrompt,
+    has_browser_handler: Boolean(params?.hasBrowserHandler),
+    opened_at_unix_ms: Date.now(),
+    pending: true,
+    default_policy: policy,
+    auto_action: null,
+    auto_handled_at_unix_ms: null,
+    auto_handle_error: null,
+    manual_action: null,
+    manual_prompt_text: null,
+    manual_handled_at_unix_ms: null,
+    manual_handle_error: null,
+    closed_at_unix_ms: null,
+    close_result: null,
+    user_input: null
+  };
+  session.nextSeq += 1;
+  while (session.entries.length >= session.capacity) {
+    session.entries.shift();
+    session.dropped += 1;
+  }
+  session.pendingSeq = entry.seq;
+  session.openedCount += 1;
+  session.entries.push(entry);
+
+  const action = dialogAutoActionForPolicy(policy);
+  if (!action) {
+    return;
+  }
+  sendDebuggerCommand({ tabId }, "Page.handleJavaScriptDialog", dialogAutoHandleParams(policy, defaultPrompt))
+    .then(() => markDialogAutoHandled(session, entry.seq, action))
+    .catch((error) => markDialogAutoError(
+      session,
+      entry.seq,
+      action,
+      `Page.handleJavaScriptDialog default policy failed: ${errorMessage(error)}`
+    ));
+}
+
+function recordDialogClosedEvent(tabId, params) {
+  const session = DIALOG_DEBUGGER_SESSIONS.get(tabId);
+  if (!session) {
+    return;
+  }
+  const entry = dialogPendingEntry(session);
+  if (!entry) {
+    return;
+  }
+  entry.pending = false;
+  entry.closed_at_unix_ms = Date.now();
+  entry.close_result = Boolean(params?.result);
+  entry.user_input = params?.userInput === undefined || params?.userInput === null
+    ? ""
+    : String(params.userInput);
+  session.pendingSeq = null;
+  session.closedCount += 1;
+}
+
+function dialogPendingEntry(session) {
+  if (!session || session.pendingSeq === null || session.pendingSeq === undefined) {
+    return null;
+  }
+  return session.entries.find((entry) => entry.seq === session.pendingSeq) || null;
+}
+
+function markDialogAutoHandled(session, seq, action) {
+  const entry = session.entries.find((candidate) => candidate.seq === seq);
+  if (!entry) {
+    return;
+  }
+  entry.auto_action = action;
+  entry.auto_handled_at_unix_ms = Date.now();
+  entry.auto_handle_error = null;
+  session.autoHandledCount += 1;
+}
+
+function markDialogAutoError(session, seq, action, error) {
+  const entry = session.entries.find((candidate) => candidate.seq === seq);
+  if (entry) {
+    entry.auto_action = action;
+    entry.auto_handle_error = error;
+  }
+  session.errorCount += 1;
+}
+
+function markDialogManualHandled(session, seq, action, promptText) {
+  const entry = session.entries.find((candidate) => candidate.seq === seq);
+  if (!entry) {
+    return null;
+  }
+  const handledAt = Date.now();
+  entry.pending = false;
+  entry.manual_action = action;
+  entry.manual_prompt_text = action === "accept" ? promptText : null;
+  entry.manual_handled_at_unix_ms = handledAt;
+  entry.manual_handle_error = null;
+  entry.closed_at_unix_ms = handledAt;
+  entry.close_result = action === "accept";
+  entry.user_input = action === "accept" ? String(promptText ?? "") : "";
+  session.pendingSeq = null;
+  session.closedCount += 1;
+  return { ...entry };
+}
+
+function dialogAutoActionForPolicy(policy) {
+  if (policy === "accept") {
+    return "accepted";
+  }
+  if (policy === "dismiss") {
+    return "dismissed";
+  }
+  return null;
+}
+
+function dialogAutoHandleParams(policy, defaultPrompt) {
+  const params = { accept: policy === "accept" };
+  if (params.accept && defaultPrompt !== null && defaultPrompt !== undefined) {
+    params.promptText = String(defaultPrompt);
+  }
+  return params;
+}
+
+function dialogManualHandleParams(operation, promptText) {
+  const params = { accept: operation === "accept" };
+  if (params.accept && promptText !== null && promptText !== undefined) {
+    params.promptText = String(promptText);
+  }
+  return params;
+}
+
+function readDialogEntries(session, sinceSeq, limit) {
+  const cursor = sinceSeq === null ? 0 : sinceSeq;
+  const entries = session.entries
+    .filter((entry) => entry.seq >= cursor)
+    .slice(0, limit)
+    .map((entry) => ({ ...entry }));
+  const pending = dialogPendingEntry(session);
+  return {
+    entries,
+    pending_dialog: pending ? { ...pending } : null,
+    next_cursor: Number(session.nextSeq || 0),
+    returned: entries.length,
+    total_buffered: session.entries.length,
+    dropped: Number(session.dropped || 0)
+  };
+}
+
+function emptyDialogRead() {
+  return {
+    entries: [],
+    pending_dialog: null,
     next_cursor: 0,
     returned: 0,
     total_buffered: 0,
@@ -18760,6 +19124,63 @@ function normalizeBindingMaxCalls(value) {
     );
   }
   return Math.min(value, 5000);
+}
+
+function normalizeDialogOperation(value) {
+  const operation = String(value || "status").trim().toLowerCase();
+  if (operation === "status" || operation === "accept" || operation === "dismiss" || operation === "set_policy") {
+    return operation;
+  }
+  throw bridgeError(
+    ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+    `handleDialog operation must be status, accept, dismiss, or set_policy; got ${JSON.stringify(value)}`
+  );
+}
+
+function normalizeDialogDefaultPolicy(value) {
+  if (value === undefined || value === null || value === "") {
+    return null;
+  }
+  const policy = String(value).trim().toLowerCase();
+  if (policy === "accept" || policy === "dismiss" || policy === "manual") {
+    return policy;
+  }
+  throw bridgeError(
+    ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+    `handleDialog defaultPolicy must be accept, dismiss, or manual; got ${JSON.stringify(value)}`
+  );
+}
+
+function normalizeDialogPromptText(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw bridgeError(ERROR_CHROME_DOM_ACTION_UNSUPPORTED, "handleDialog promptText must be a string when supplied");
+  }
+  if (value.includes("\u0000")) {
+    throw bridgeError(ERROR_CHROME_DOM_ACTION_UNSUPPORTED, "handleDialog promptText must not contain NUL");
+  }
+  if (Array.from(value).length > MAX_DIALOG_PROMPT_TEXT_CHARS) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `handleDialog promptText must be at most ${MAX_DIALOG_PROMPT_TEXT_CHARS} Unicode scalar values`
+    );
+  }
+  return value;
+}
+
+function normalizeDialogLimit(value) {
+  if (value === undefined || value === null) {
+    return 20;
+  }
+  if (!Number.isInteger(value) || value < 1 || value > 100) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `handleDialog limit must be an integer from 1 through 100; got ${JSON.stringify(value)}`
+    );
+  }
+  return value;
 }
 
 function formatDebuggerExceptionDetails(details) {

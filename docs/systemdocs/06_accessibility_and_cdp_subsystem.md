@@ -296,7 +296,7 @@ Types: `ConsoleEntry`, `ConsoleReadResult`, `ConsoleCaptureStatus`, `ConsoleRead
 
 ### 5.7 `cdp_dialog.rs` — JavaScript Dialog Capture (#1097)
 
-`Page.javascriptDialogOpening` is live. Keeps a long-lived connection per armed target, records dialog open/close state, and immediately applies a configured default policy so an unhandled dialog cannot silently block page execution.
+`Page.javascriptDialogOpening` is live. Keeps a long-lived connection per armed target, records dialog open/close state, and immediately applies a configured default policy so an unhandled dialog cannot silently block page execution. The MCP `browser_handle_dialog` tool uses these raw-CDP helpers for raw targets and the normal Chrome bridge's narrow `chrome.debugger` `Page.javascriptDialogOpening`/`Page.handleJavaScriptDialog` lane for session-owned `chrome-tab:*` targets in the already-open profile.
 
 | Function | Signature |
 |---|---|

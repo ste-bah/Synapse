@@ -20,7 +20,10 @@ from the same already-open Chrome profile. Page-scope `browser_evaluate`,
 `chrome.debugger` `Runtime.evaluate`,
 `Page.addScriptToEvaluateOnNewDocument`, and
 `Runtime.addBinding`/`Runtime.bindingCalled` lanes against the same already-open
-Chrome profile.
+Chrome profile. `browser_handle_dialog` uses the same target-scoped bridge to
+listen for `Page.javascriptDialogOpening`/`Page.javascriptDialogClosed` and call
+`Page.handleJavaScriptDialog` for alert, confirm, prompt, and beforeunload
+dialogs.
 `downloads` uses `chrome.downloads` to capture real download created/changed/
 erased events, list profile downloads, wait for completion/interruption, and let
 the daemon save or move completed files to caller-chosen paths with byte/hash
@@ -75,7 +78,8 @@ extensions or native hosts that request `debugger`/`nativeMessaging`. It also
 preserves a nativeMessaging-only self-shield for the stable Synapse extension
 ID. The current bridge intentionally requests `debugger` for narrow
 target-scoped `Runtime.evaluate`, `Page.addScriptToEvaluateOnNewDocument`,
-`Runtime.addBinding`/`Runtime.bindingCalled`, `cdpInput`,
+`Runtime.addBinding`/`Runtime.bindingCalled`, `Page.handleJavaScriptDialog`,
+`cdpInput`,
 `viewportEmulation`, `deviceEmulation`, and
 `geolocationEmulation` / `localeEmulation` / `mediaEmulation` /
 `networkConditions` lanes in the already-open
@@ -126,7 +130,8 @@ with `A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED` before queueing any browser work.
 
 Background tab commands (`listTabs`, `openTab`, `closeTab`, `navigateTab`, `activateTab`,
 `targetInfoPageText`, `pageVitals`, `pageContent`, `pageScreenshot`, `setContent`, `clock`, `pageEvents`, `domAction`, `setFieldValue`, and
-`typeActiveElement`, `evaluateScript`, `initScript`, and `exposeBinding`) use `chrome.windows.getAll`,
+`typeActiveElement`, `evaluateScript`, `initScript`, `exposeBinding`, and
+`handleDialog`) use `chrome.windows.getAll`,
 `chrome.tabs.query`, `chrome.tabs.create`, `chrome.tabs.remove`, `chrome.tabs.update`,
 `chrome.tabs.reload`, `chrome.tabs.goBack`, `chrome.tabs.goForward`,
 `chrome.tabs.captureVisibleTab`, and
@@ -147,11 +152,13 @@ not a normal-bridge capability; the daemon refuses that debugger-backed command
 before queueing any Chrome command because Chrome's debugger infobar changes
 viewport/layout and breaks coordinate truth. Use `browser_screenshot`, which
 routes to `pageScreenshot`, for normal-profile page screenshots. `evaluateScript`
-and `exposeBinding` are also normal-bridge capabilities through narrow
-target-scoped `chrome.debugger` `Runtime.evaluate` and
-`Runtime.addBinding`/`Runtime.bindingCalled` lanes for session-owned
-`chrome-tab:*` targets. Use raw CDP in a dedicated silent automation profile for
-element-scoped evaluation and broader DevTools-domain work.
+`exposeBinding`, and `handleDialog` are also normal-bridge capabilities through
+narrow target-scoped `chrome.debugger` `Runtime.evaluate`,
+`Runtime.addBinding`/`Runtime.bindingCalled`, and
+`Page.javascriptDialogOpening`/`Page.handleJavaScriptDialog` lanes for
+session-owned `chrome-tab:*` targets. Use raw CDP in a dedicated silent
+automation profile for element-scoped evaluation and broader DevTools-domain
+work.
 `pageScreenshot` temporarily activates only the requested tab inside its existing
 Chrome window so `chrome.tabs.captureVisibleTab` captures the right page. On
 Windows builds where Chrome refuses image readback for an unfocused Chrome
@@ -228,8 +235,8 @@ worker rejects them immediately. The bridge's only `chrome.debugger` use is the
 target-scoped `cdpInput` hover/tap/active-tab mouse-drag lane and the
 `viewportEmulation` / `deviceEmulation` / `geolocationEmulation` /
 `localeEmulation` / `mediaEmulation` / `networkConditions` metrics lanes,
-page-scope `Runtime.evaluate`, init-script mutation, binding capture, and
-inactive-tab synthetic MouseEvent drag fallback; DOM attach and debugger-backed
+page-scope `Runtime.evaluate`, init-script mutation, binding capture, dialog
+handling, and inactive-tab synthetic MouseEvent drag fallback; DOM attach and debugger-backed
 `Page.captureScreenshot` require raw CDP on a dedicated Synapse-launched
 automation profile.
 
@@ -301,6 +308,7 @@ over localhost WebSocket, no `nativeMessaging` permission, no helper Chrome
 windows, tabs/scripting for DOM work, and narrow `chrome.debugger` lanes for
 page-scope `Runtime.evaluate`, init-script mutation,
 `Runtime.addBinding`/`Runtime.bindingCalled` binding capture,
+`Page.handleJavaScriptDialog` dialog handling,
 `cdpInput` hover/tap/active-tab mouse-drag, `viewportEmulation`,
 `deviceEmulation`, `geolocationEmulation`, `localeEmulation`, and
 `mediaEmulation` / `networkConditions` plus

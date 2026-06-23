@@ -291,7 +291,7 @@ All target a session-owned tab via `cdp_target_id?` + `window_hwnd?` (default ac
 | `browser_assert` | browser_assert.rs | Assert locator with bounded retry (visible/text/value/checked/enabled/attribute/count) | `locator` (req), `matcher` (req), expected_*, `timeout_ms=5000`, `interval_ms=100`, `negate?` |
 | `browser_clock` | browser_clock_events.rs | Fake page clock (install/set/fast-forward/status) | `operation` (Status), `time_unix_ms?`, `delta_ms?` |
 | `browser_page_events` | browser_clock_events.rs | Arm/read page lifecycle, popup, worker events | `since_seq?`, `limit=100`, `event_kind?`, `worker_type?` |
-| `browser_handle_dialog` | browser_dialog.rs | Read/accept/dismiss JS dialogs | `operation` (Status), `default_policy?`, `prompt_text?`, `since_seq?`, `limit=20` |
+| `browser_handle_dialog` | browser_dialog.rs | Read/accept/dismiss JS dialogs via raw CDP or normal Chrome bridge | `operation` (Status), `default_policy?`, `prompt_text?`, `since_seq?`, `limit=20` |
 | `browser_drag` | browser_dnd.rs | Drag element->element (CDP mouse default) | `source_selector`, `target_selector` (req), `mode?`, `steps=12`, `duration_ms=350`, `auto_wait=true` |
 | `browser_drop` | browser_dnd.rs | HTML5 DragEvent drop (mode=mouse optional) | same `BrowserDndParams` (default mode Html5) |
 | `browser_emulate` | browser_emulate.rs | Set/reset multiple emulation overrides in one call | `operation` (Set), `domains` (req), `viewport?`/`device?`/`geolocation?`/`locale?`/`media?`/`network?` |
