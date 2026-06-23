@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-frame-enum-v1";
-const BRIDGE_BUILD_SHA256 = "71fda694403bfb0752ccf271042a30e2e0d4389b9c3217466a5c768c17f986ba";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-frame-locators-v1";
+const BRIDGE_BUILD_SHA256 = "5328a0a7d021732a2dfcf58e1f332c2b2517f08d168cf5abdd4736f4c9cd1689";
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
   "externalPopupRiskSuppression",
@@ -10,6 +10,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "targetInfo",
   "targetInfoPageText",
   "frames",
+  "frameLocators",
   "cookies",
   "storageState",
   "navigateTab",
@@ -1670,6 +1671,32 @@ async function handleLocateElements(params) {
   const locator = plainObjectOrEmpty(params.locator);
   const limit = normalizeAssertLimit(params.limit);
   const root = parseChromeBridgeElementId(locator.root_element_id, selected.tabId, "locateElements");
+  const frameScope = await resolveBridgeLocatorFrameScope(selected, locator, root, "locateElements");
+  if (!frameScope.resolved) {
+    return {
+      extension_id: chrome.runtime.id,
+      target_id: state.target_id || selected.target.id,
+      tab_id: selected.tabId,
+      chrome_window_id: state.chrome_window_id,
+      url: state.url || "",
+      title: state.title || "",
+      ready_state: state.ready_state || "",
+      engine: String(locator.engine || "css").toLowerCase(),
+      query: String(locator.query || ""),
+      match_count: 0,
+      returned_count: 0,
+      truncated: false,
+      element_ids: [],
+      frame: frameScope.frame,
+      readback_backend: "chrome.webNavigation.getAllFrames frame locator",
+      backend_tier_used: "chrome_tabs_extension",
+      required_foreground: false,
+      frame_result_count: frameScope.frame_result_count || 0,
+      frame_results: frameScope.frame_results || [],
+      target_candidate_count: selected.targetCandidateCount,
+      target_selection_reason: selected.selectionReason
+    };
+  }
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -1679,7 +1706,7 @@ async function handleLocateElements(params) {
   let results;
   try {
     results = await chrome.scripting.executeScript({
-      target: root.frameId === null ? { tabId: selected.tabId, allFrames: true } : { tabId: selected.tabId, frameIds: [root.frameId] },
+      target: frameScope.target,
       func: runAssertPollInPage,
       args: [{ locator, limit, rootPath: root.path }]
     });
@@ -1744,7 +1771,10 @@ async function handleLocateElements(params) {
     returned_count: elementIds.length,
     truncated: !nthSet && matchCount > elementIds.length,
     element_ids: elementIds,
-    readback_backend: "chrome.scripting.executeScript(debugger-free DOM locator)",
+    frame: frameScope.frame,
+    readback_backend: frameScope.frame
+      ? "chrome.webNavigation.getAllFrames frame locator + chrome.scripting.executeScript(debugger-free DOM locator)"
+      : "chrome.scripting.executeScript(debugger-free DOM locator)",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,
     frame_result_count: frames.length,
@@ -3756,6 +3786,171 @@ function stringOrEmptyPreserve(value) {
   return value === null || value === undefined ? "" : String(value);
 }
 
+async function bridgeFrameEntriesForTab(tabId, targetId, commandName) {
+  if (!chrome.webNavigation || typeof chrome.webNavigation.getAllFrames !== "function") {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `${commandName} frame locator requires chrome.webNavigation.getAllFrames`
+    );
+  }
+  let navigationFrames;
+  try {
+    navigationFrames = await chrome.webNavigation.getAllFrames({ tabId });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `${commandName} chrome.webNavigation.getAllFrames(${tabId}) failed: ${errorMessage(error)}`
+    );
+  }
+  if (!Array.isArray(navigationFrames)) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `${commandName} chrome.webNavigation.getAllFrames(${tabId}) returned non-array frame data`
+    );
+  }
+  const frameMetadata = await tabFrameMetadata(tabId);
+  return buildFrameTreeEntries(navigationFrames, frameMetadata.byFrameId, targetId);
+}
+
+function bridgeFrameLocator(locator) {
+  const frame = locator && typeof locator.frame === "object" && !Array.isArray(locator.frame)
+    ? locator.frame
+    : null;
+  if (!frame) {
+    return null;
+  }
+  const selectors = [
+    normalizedFrameLocatorValue(frame.frame_id),
+    normalizedFrameLocatorValue(frame.frame_element_id),
+    normalizedFrameLocatorValue(frame.name),
+    normalizedFrameLocatorValue(frame.url),
+    Number.isSafeInteger(frame.index) ? frame.index : null
+  ].filter((value) => value !== null);
+  return selectors.length > 0 ? frame : null;
+}
+
+function matchingBridgeFrames(locator, frames) {
+  if (Number.isSafeInteger(locator.index)) {
+    const frame = frames[locator.index];
+    return frame ? [frame] : [];
+  }
+  const frameId = normalizedFrameLocatorValue(locator.frame_id);
+  if (frameId !== null) {
+    return frames.filter((frame) => frame.frame_id === frameId);
+  }
+  const frameElementId = normalizedFrameLocatorValue(locator.frame_element_id);
+  if (frameElementId !== null) {
+    return frames.filter((frame) => frame.frame_element_id === frameElementId);
+  }
+  const name = normalizedFrameLocatorValue(locator.name);
+  if (name !== null) {
+    return frames.filter((frame) => frame.name === name);
+  }
+  const url = normalizedFrameLocatorValue(locator.url);
+  if (url !== null) {
+    return frames.filter((frame) => frame.url === url);
+  }
+  return [];
+}
+
+function normalizedFrameLocatorValue(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const text = String(value).trim();
+  return text ? text : null;
+}
+
+function bridgeLocatedFrame(frame, matchedFrameCount) {
+  return {
+    resolved: true,
+    matched_frame_count: matchedFrameCount,
+    frame_id: frame.frame_id || null,
+    parent_frame_id: frame.parent_frame_id || null,
+    cdp_target_id: frame.cdp_target_id || null,
+    url: frame.url || null,
+    name: frame.name || null,
+    origin: frame.origin || null,
+    is_out_of_process: Boolean(frame.is_out_of_process),
+    frame_element_id: frame.frame_element_id || null,
+    frame_element_cdp_target_id: frame.frame_element_cdp_target_id || null,
+    frame_element_source: frame.frame_element_source || "chrome.webNavigation.getAllFrames"
+  };
+}
+
+function unresolvedBridgeLocatedFrame(locator) {
+  return {
+    resolved: false,
+    matched_frame_count: 0,
+    frame_id: null,
+    parent_frame_id: null,
+    cdp_target_id: null,
+    url: null,
+    name: null,
+    origin: null,
+    is_out_of_process: false,
+    frame_element_id: normalizedFrameLocatorValue(locator?.frame_element_id),
+    frame_element_cdp_target_id: null,
+    frame_element_source: "not_found"
+  };
+}
+
+async function resolveBridgeLocatorFrameScope(selected, locator, root, commandName) {
+  const frameLocator = bridgeFrameLocator(locator);
+  if (!frameLocator) {
+    return {
+      resolved: true,
+      target: root.frameId === null
+        ? { tabId: selected.tabId, allFrames: true }
+        : { tabId: selected.tabId, frameIds: [root.frameId] },
+      frame: null,
+      frame_result_count: 0,
+      frame_results: []
+    };
+  }
+  const targetId = selected.target?.id || `${TAB_TARGET_PREFIX}${selected.tabId}`;
+  const built = await bridgeFrameEntriesForTab(selected.tabId, targetId, commandName);
+  const matches = matchingBridgeFrames(frameLocator, built.frames);
+  if (matches.length === 0) {
+    return {
+      resolved: false,
+      target: null,
+      frame: unresolvedBridgeLocatedFrame(frameLocator),
+      frame_result_count: built.frames.length,
+      frame_results: [],
+      frame_snapshot_errors: built.errors
+    };
+  }
+  if (matches.length > 1) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `${commandName} frame locator matched ${matches.length} frames; refine by frame_id, frame_element_id, or index`
+    );
+  }
+  const selectedFrame = matches[0];
+  const frameId = Number(selectedFrame.frame_id);
+  if (!Number.isSafeInteger(frameId) || frameId < 0) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `${commandName} selected frame_id=${JSON.stringify(selectedFrame.frame_id)} is not targetable by chrome.scripting.executeScript`
+    );
+  }
+  if (root.frameId !== null && root.frameId !== frameId) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `${commandName} root_element_id frame ${root.frameId} does not match frame locator frame ${frameId}`
+    );
+  }
+  return {
+    resolved: true,
+    target: { tabId: selected.tabId, frameIds: [frameId] },
+    frame: bridgeLocatedFrame(selectedFrame, matches.length),
+    frame_result_count: built.frames.length,
+    frame_results: [],
+    frame_snapshot_errors: built.errors
+  };
+}
+
 function frameResolvedMatchCount(frame) {
   const result = frame?.result && typeof frame.result === "object" ? frame.result : {};
   for (const key of ["matched_count", "match_count", "editable_match_count"]) {
@@ -4223,10 +4418,33 @@ async function waitForSelectorPoll(selected, locator, limit, root, state) {
       "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
     );
   }
+  const frameScope = await resolveBridgeLocatorFrameScope(selected, locator, root, "waitForSelector");
+  if (!frameScope.resolved) {
+    const normalized = {
+      match_count: 0,
+      returned_count: 0,
+      visible_count: 0,
+      truncated: false,
+      returned: [],
+      visible: [],
+      url: "",
+      title: "",
+      ready_state: "",
+      frame: frameScope.frame,
+      frame_result_count: frameScope.frame_result_count || 0,
+      frame_results: frameScope.frame_results || []
+    };
+    const condition = waitForSelectorCondition(state, normalized);
+    return {
+      ...normalized,
+      condition_met: condition.conditionMet,
+      element_id: condition.elementId
+    };
+  }
   let injected;
   try {
     injected = await chrome.scripting.executeScript({
-      target: root.frameId === null ? { tabId: selected.tabId, allFrames: true } : { tabId: selected.tabId, frameIds: [root.frameId] },
+      target: frameScope.target,
       func: runAssertPollInPage,
       args: [{ locator, limit, rootPath: root.path }]
     });
@@ -4248,7 +4466,7 @@ async function waitForSelectorPoll(selected, locator, limit, root, state) {
       `waitForSelector failed: ${String(failingFrame.result.error_detail || "")}`
     );
   }
-  const normalized = selectorPollSummary(selected, resultFrames, limit);
+  const normalized = selectorPollSummary(selected, resultFrames, limit, frameScope);
   const condition = waitForSelectorCondition(state, normalized);
   return {
     ...normalized,
@@ -4259,7 +4477,7 @@ async function waitForSelectorPoll(selected, locator, limit, root, state) {
   };
 }
 
-function selectorPollSummary(selected, resultFrames, limit) {
+function selectorPollSummary(selected, resultFrames, limit, frameScope = null) {
   let matchCount = 0;
   let truncated = false;
   let url = "";
@@ -4302,7 +4520,8 @@ function selectorPollSummary(selected, resultFrames, limit) {
     visible,
     url,
     title,
-    ready_state: readyState
+    ready_state: readyState,
+    frame: frameScope?.frame || null
   };
 }
 
@@ -4355,6 +4574,7 @@ function waitForSelectorResult(
     url: "",
     title: "",
     ready_state: "",
+    frame: null,
     frame_result_count: 0,
     frame_results: []
   };
@@ -4380,6 +4600,7 @@ function waitForSelectorResult(
     visible_count: current.visible_count || 0,
     truncated: Boolean(current.truncated),
     element_id: current.element_id || null,
+    frame: current.frame || null,
     readback_backend: "chrome.scripting.executeScript(locator polling)",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,

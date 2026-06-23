@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-23-frame-enum-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-23-frame-locators-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "71fda694403bfb0752ccf271042a30e2e0d4389b9c3217466a5c768c17f986ba";
+    "5328a0a7d021732a2dfcf58e1f332c2b2517f08d168cf5abdd4736f4c9cd1689";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -52,6 +52,7 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "cookies",
     "domAction",
     "externalPopupRiskSuppression",
+    "frameLocators",
     "frames",
     "listTabs",
     "navigateTab",
@@ -1867,6 +1868,8 @@ pub(crate) struct ChromeDebuggerLocateElementsResult {
     #[serde(default)]
     pub element_ids: Vec<String>,
     #[serde(default)]
+    pub frame: Option<ChromeDebuggerLocatedFrame>,
+    #[serde(default)]
     pub readback_backend: String,
     #[serde(default)]
     pub backend_tier_used: String,
@@ -2194,6 +2197,8 @@ pub(crate) struct ChromeDebuggerWaitForSelectorResult {
     pub truncated: bool,
     #[serde(default)]
     pub element_id: Option<String>,
+    #[serde(default)]
+    pub frame: Option<ChromeDebuggerLocatedFrame>,
     #[serde(default)]
     pub readback_backend: String,
     #[serde(default)]
@@ -2655,6 +2660,34 @@ pub(crate) struct ChromeDebuggerFrameEntry {
     pub frame_element_id: Option<String>,
     #[serde(default)]
     pub frame_element_backend_node_id: Option<i64>,
+    #[serde(default)]
+    pub frame_element_cdp_target_id: Option<String>,
+    #[serde(default)]
+    pub frame_element_source: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerLocatedFrame {
+    #[serde(default)]
+    pub resolved: bool,
+    #[serde(default)]
+    pub matched_frame_count: usize,
+    #[serde(default)]
+    pub frame_id: Option<String>,
+    #[serde(default)]
+    pub parent_frame_id: Option<String>,
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub is_out_of_process: bool,
+    #[serde(default)]
+    pub frame_element_id: Option<String>,
     #[serde(default)]
     pub frame_element_cdp_target_id: Option<String>,
     #[serde(default)]

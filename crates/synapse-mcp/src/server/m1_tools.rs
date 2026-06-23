@@ -2415,7 +2415,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Wait for a Playwright-style selector in the calling session's owned browser tab to reach state attached | visible | hidden | detached. Uses the same selector engines/options as browser_locate (css/xpath/text/role/label/placeholder/alttext/title/testid/layout), with raw CDP frame scoping when available and debugger-free normal Chrome bridge all-frame polling for chrome-tab:* targets. Returns an element_id when the satisfied state has a concrete matched element, and returns BROWSER_WAIT_TIMEOUT on timeout. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Wait for a Playwright-style selector in the calling session's owned browser tab to reach state attached | visible | hidden | detached. Uses the same selector engines/options as browser_locate (css/xpath/text/role/label/placeholder/alttext/title/testid/layout), with raw CDP frame scoping when available and debugger-free normal Chrome bridge all-frame or explicit frame_id/name/url/index polling for chrome-tab:* targets. Returns an element_id when the satisfied state has a concrete matched element, and returns BROWSER_WAIT_TIMEOUT on timeout. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_wait_for_selector(
         &self,
@@ -2979,7 +2979,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Resolve any Playwright-style selector to element ids in the calling session's owned background browser tab. Uses raw CDP when available or the debugger-free normal Chrome bridge for chrome-tab:* targets. engine ∈ css | xpath | text | role | label | placeholder | alttext | title | testid | layout (default css); `query` is the CSS/XPath text, visible text (getByText), ARIA role token (getByRole), label/placeholder/alt/title text, test-id value, or (layout) the base CSS. Options: exact/regex (text & attribute engines), name/name_exact/name_regex + ARIA state filters checked/pressed/expanded/selected/disabled/level/include_hidden (role), testid_attribute (testid, default data-testid), relation+anchor+max_distance (layout), has_text filter, nth (.first/.last via 0/-1, negative counts from end), strict (error on >1 unless nth), root_element_id (scope/chain within an element), frame {frame_id|frame_element_id|name|url|index} for raw-CDP frame scoping. Returns match_count (Playwright count()), the resolved element_ids (capped at limit) that feed directly into browser_inspect / target_act / etc., frame readback when scoped, and url/title. Requires an active session CDP target or an explicit cdp_target_id owned by this session; never the human foreground tab. Read-only, background-safe."
+        description = "Resolve any Playwright-style selector to element ids in the calling session's owned background browser tab. Uses raw CDP when available or the debugger-free normal Chrome bridge for chrome-tab:* targets. engine ∈ css | xpath | text | role | label | placeholder | alttext | title | testid | layout (default css); `query` is the CSS/XPath text, visible text (getByText), ARIA role token (getByRole), label/placeholder/alt/title text, test-id value, or (layout) the base CSS. Options: exact/regex (text & attribute engines), name/name_exact/name_regex + ARIA state filters checked/pressed/expanded/selected/disabled/level/include_hidden (role), testid_attribute (testid, default data-testid), relation+anchor+max_distance (layout), has_text filter, nth (.first/.last via 0/-1, negative counts from end), strict (error on >1 unless nth), root_element_id (scope/chain within an element), frame {frame_id|frame_element_id|name|url|index}; the normal Chrome bridge supports explicit frame_id/name/url/index scoping and reports frame_element_id locators as unresolved when owner ids are unavailable. Returns match_count (Playwright count()), the resolved element_ids (capped at limit) that feed directly into browser_inspect / target_act / etc., frame readback when scoped, and url/title. Requires an active session CDP target or an explicit cdp_target_id owned by this session; never the human foreground tab. Read-only, background-safe."
     )]
     pub async fn browser_locate(
         &self,
@@ -6369,12 +6369,6 @@ impl SynapseService {
         const TOOL: &str = "browser_wait_for_selector";
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if cdp_target_id.starts_with("chrome-tab:") {
-                if wait.locate.frame.is_some() {
-                    return Err(mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
-                        "browser_wait_for_selector normal Chrome bridge path does not support explicit frame locator parameters yet; omit frame for bridge all-frame search or use a raw-CDP target for explicit frame scoping",
-                    ));
-                }
                 if root_backend_node_id.is_some() {
                     return Err(mcp_error(
                         error_codes::TOOL_PARAMS_INVALID,
@@ -6457,7 +6451,7 @@ impl SynapseService {
                     visible_count: waited.visible_count,
                     truncated: waited.truncated,
                     element_id: waited.element_id,
-                    frame: None,
+                    frame: waited.frame.map(browser_chrome_bridge_located_frame),
                     url: waited.url,
                     title: waited.title,
                     readback_backend: waited.readback_backend,
@@ -7469,12 +7463,6 @@ impl SynapseService {
     ) -> Result<BrowserLocateResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if cdp_target_id.starts_with("chrome-tab:") {
-                if params.frame.is_some() {
-                    return Err(mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
-                        "browser_locate normal Chrome bridge path does not support frame locator parameters yet; omit frame for bridge all-frame search or use a raw-CDP target for explicit frame scoping",
-                    ));
-                }
                 let locator = serde_json::to_value(params).map_err(|error| {
                     mcp_error(
                         error_codes::OBSERVE_INTERNAL,
@@ -7523,7 +7511,7 @@ impl SynapseService {
                     returned_count: located.returned_count,
                     truncated: located.truncated,
                     element_ids: located.element_ids,
-                    frame: None,
+                    frame: located.frame.map(browser_chrome_bridge_located_frame),
                     url: located.url,
                     title: located.title,
                     readback_backend: located.readback_backend,
@@ -10593,6 +10581,26 @@ fn browser_located_frame(
         frame_element_id: frame.frame_element_id.clone(),
         frame_element_cdp_target_id: frame.frame_element_cdp_target_id.clone(),
         frame_element_source: frame.frame_element_source.clone(),
+    }
+}
+
+#[cfg(windows)]
+fn browser_chrome_bridge_located_frame(
+    frame: crate::chrome_debugger_bridge::ChromeDebuggerLocatedFrame,
+) -> BrowserLocatedFrame {
+    BrowserLocatedFrame {
+        resolved: frame.resolved,
+        matched_frame_count: frame.matched_frame_count,
+        frame_id: frame.frame_id,
+        parent_frame_id: frame.parent_frame_id,
+        cdp_target_id: frame.cdp_target_id,
+        url: frame.url,
+        name: frame.name,
+        origin: frame.origin,
+        is_out_of_process: frame.is_out_of_process,
+        frame_element_id: frame.frame_element_id,
+        frame_element_cdp_target_id: frame.frame_element_cdp_target_id,
+        frame_element_source: frame.frame_element_source,
     }
 }
 
