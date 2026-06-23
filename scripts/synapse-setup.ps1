@@ -1469,7 +1469,8 @@ function Invoke-SynapseMcpHttpPost {
         [Parameter(Mandatory=$true)][string]$Method,
         [Parameter(Mandatory=$true)]$Params,
         [int]$Id = 0,
-        [string]$SessionId
+        [string]$SessionId,
+        [int]$TimeoutSec = 8
     )
 
     $headers = @{
@@ -1497,7 +1498,7 @@ function Invoke-SynapseMcpHttpPost {
             -Headers $headers `
             -ContentType 'application/json' `
             -Body $body `
-            -TimeoutSec 8 `
+            -TimeoutSec $TimeoutSec `
             -UseBasicParsing `
             -ErrorAction Stop
         return [pscustomobject]@{
@@ -1528,6 +1529,125 @@ function Close-SynapseMcpSetupSession {
     } catch {
         Info "WARN: SYNAPSE_MCP_TOOL_SURFACE_SESSION_DELETE_FAILED bind=$Bind session_id=$SessionId error=$($_.Exception.Message) remediation=inspect health active_sessions and daemon logs; setup did not leave a process behind"
     }
+}
+
+function Invoke-SynapseSetupMcpTool {
+    param(
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [Parameter(Mandatory=$true)][string]$Name,
+        [Parameter(Mandatory=$true)]$Arguments,
+        [int]$TimeoutSec = 8
+    )
+
+    $sessionId = $null
+    try {
+        $initParams = [ordered]@{
+            protocolVersion = '2025-06-18'
+            capabilities = @{}
+            clientInfo = [ordered]@{ name = 'synapse-setup'; version = '0' }
+        }
+        $initResponse = Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -Method 'initialize' -Params $initParams -Id 1
+        $sessionId = @($initResponse.Headers['Mcp-Session-Id'])[0]
+        if ([string]::IsNullOrWhiteSpace($sessionId)) {
+            Die "SYNAPSE_MCP_TOOL_SESSION_MISSING bind=$Bind tool=$Name remediation=streamable HTTP initialize did not return Mcp-Session-Id"
+        }
+        $initMessage = Read-SynapseMcpSseJsonResponse -Content $initResponse.Content -Operation 'initialize' -ExpectedId 1
+        if ($null -eq $initMessage.result -or $null -eq $initMessage.result.capabilities) {
+            Die "SYNAPSE_MCP_TOOL_INITIALIZE_INVALID bind=$Bind session_id=$sessionId tool=$Name remediation=daemon initialize response is missing capabilities"
+        }
+
+        Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -SessionId $sessionId -Method 'notifications/initialized' -Params @{} | Out-Null
+
+        $requestId = 2
+        $callParams = @{ name = $Name; arguments = $Arguments }
+        $callResponse = Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -SessionId $sessionId -Method 'tools/call' -Params $callParams -Id $requestId -TimeoutSec $TimeoutSec
+        $callMessage = Read-SynapseMcpSseJsonResponse -Content $callResponse.Content -Operation "tools/call $Name" -ExpectedId $requestId
+        if ($callMessage.result.isError -eq $true) {
+            $errorText = @($callMessage.result.content | Where-Object { [string]$_.type -eq 'text' } | Select-Object -First 1).text
+            Die "SYNAPSE_MCP_TOOL_CALL_ERROR bind=$Bind session_id=$sessionId tool=$Name error=$errorText remediation=repair the live daemon/bridge before accepting setup"
+        }
+        $text = @($callMessage.result.content | Where-Object { [string]$_.type -eq 'text' } | Select-Object -First 1).text
+        $json = $null
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            try {
+                $json = $text | ConvertFrom-Json
+            } catch {
+                $json = $null
+            }
+        }
+        return [pscustomobject]@{
+            SessionId = $sessionId
+            Message = $callMessage
+            Text = $text
+            Json = $json
+        }
+    } finally {
+        if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
+            Close-SynapseMcpSetupSession -Bind $Bind -Token $Token -SessionId $sessionId
+        }
+    }
+}
+
+function Assert-SynapseChromeBridgeLiveAfterSetup {
+    param(
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [Parameter(Mandatory=$true)]$Health
+    )
+
+    $chromeBridge = $Health.subsystems.chrome_bridge
+    $status = [string]$chromeBridge.status
+    $detail = [string]$chromeBridge.detail
+    $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'pageScreenshot'
+    if ($isClean) {
+        Info "Chrome bridge OK after daemon start: stale=false capability=pageScreenshot"
+        return $Health
+    }
+
+    $currentHealth = $Health
+    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+        if ($detail -notmatch 'no_active_chrome_bridge_host') {
+            break
+        }
+        Info "Chrome bridge host absent after daemon start; waiting for alarmReconnect readback attempt=$($attempt + 1)/15"
+        Start-Sleep -Seconds 2
+        try {
+            $currentHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4
+        } catch {
+            Die "SYNAPSE_CHROME_BRIDGE_WAIT_HEALTH_FAILED bind=$Bind error=$($_.Exception.Message) remediation=daemon was live before Chrome bridge wait but /health failed during reconnect wait"
+        }
+        $chromeBridge = $currentHealth.subsystems.chrome_bridge
+        $status = [string]$chromeBridge.status
+        $detail = [string]$chromeBridge.detail
+        $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'pageScreenshot'
+        if ($isClean) {
+            Info "Chrome bridge OK after daemon start wait: stale=false capability=pageScreenshot"
+            return $currentHealth
+        }
+    }
+    if ($detail -match 'no_active_chrome_bridge_host') {
+        Die "SYNAPSE_CHROME_BRIDGE_HOST_ABSENT_AFTER_SETUP_WAIT status=$status detail=$detail remediation=setup waited for the already-installed bridge host to reconnect after daemon start; keep the active Chrome profile open and rerun scripts\\install-synapse-chrome-debugger.ps1 if the host does not register"
+    }
+
+    Info "WARN: Chrome bridge not clean after daemon start; requesting in-place cdp_bridge_reload through the new live MCP daemon. status=$status detail=$detail"
+    $reload = Invoke-SynapseSetupMcpTool -Bind $Bind -Token $Token -Name 'cdp_bridge_reload' -Arguments @{ wait_timeout_ms = 30000 } -TimeoutSec 45
+    $afterBuild = if ($reload.Json -and $reload.Json.after) { [string]$reload.Json.after.extension_build_id } else { 'unknown' }
+    Info "Chrome bridge reload completed through MCP after_build_id=$afterBuild"
+
+    try {
+        $afterHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4
+    } catch {
+        Die "SYNAPSE_CHROME_BRIDGE_POST_RELOAD_HEALTH_FAILED bind=$Bind error=$($_.Exception.Message) remediation=daemon was live before bridge reload but /health failed afterward"
+    }
+    $afterBridge = $afterHealth.subsystems.chrome_bridge
+    $afterStatus = [string]$afterBridge.status
+    $afterDetail = [string]$afterBridge.detail
+    if ($afterStatus -ne 'ok' -or $afterDetail -notmatch 'extension_stale=false' -or $afterDetail -notmatch 'pageScreenshot') {
+        Die "SYNAPSE_CHROME_BRIDGE_STALE_AFTER_SETUP_RELOAD status=$afterStatus detail=$afterDetail remediation=setup requires the already-open Chrome profile to load the bundled bridge build; run scripts\\install-synapse-chrome-debugger.ps1 from the interactive desktop and keep normal bridge commands failed closed until health is clean"
+    }
+    Info "Chrome bridge OK after setup reload: stale=false capability=pageScreenshot"
+    return $afterHealth
 }
 
 function Read-SynapseDaemonToolSurface {
@@ -3118,6 +3238,8 @@ if (-not $ok) {
 
     Die $failureDetail
 }
+$h = Assert-SynapseChromeBridgeLiveAfterSetup -Bind $Bind -Token $token -Health $h
+$healthPid = [int]$h.pid
 $daemonLineage = Get-ProcessLineage -StartPid $healthPid
 $cmdAncestor = $daemonLineage | Where-Object { $_.Name -ieq 'cmd.exe' } | Select-Object -First 1
 if ($cmdAncestor) {

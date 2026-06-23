@@ -6,7 +6,8 @@ use super::{
     BrowserExposeBindingOperation, BrowserExposeBindingParams, BrowserExposeBindingResponse,
     BrowserFrameLocator, BrowserInitScriptOperation, BrowserInspectParams, BrowserInspectResponse,
     BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
-    BrowserLocatedFrame, BrowserNetworkWaitEntry, BrowserScrollIntoViewParams,
+    BrowserLocatedFrame, BrowserNetworkWaitEntry, BrowserScreenshotParams,
+    BrowserScreenshotResponse, BrowserScreenshotScope, BrowserScrollIntoViewParams,
     BrowserScrollIntoViewResponse, BrowserSetContentParams, BrowserSetContentResponse,
     BrowserTabEntry, BrowserTabsParams, BrowserTabsResponse, BrowserWaitForFunctionParams,
     BrowserWaitForFunctionResponse, BrowserWaitForLoadStateParams, BrowserWaitForLoadStateResponse,
@@ -52,7 +53,7 @@ use std::time::Instant;
 
 #[cfg(windows)]
 use chrono::{DateTime, Utc};
-use image::{DynamicImage, ImageFormat, RgbaImage};
+use image::{DynamicImage, ImageFormat, RgbaImage, codecs::jpeg::JpegEncoder};
 #[cfg(windows)]
 use image::{GrayImage, Luma};
 #[cfg(windows)]
@@ -560,6 +561,78 @@ impl SynapseService {
                 )
             })?;
         capture_screen_screenshot_to_file(&params.0, region, foreground).map(Json)
+    }
+
+    #[tool(
+        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without Page.captureScreenshot or debugger screenshot attach. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks restored after capture. Uses chrome.scripting for page metrics/masks/scroll plus chrome.tabs.captureVisibleTab tile stitching, temporarily activates only the requested tab inside its existing Chrome window, and may focus that Chrome window on Windows because captureVisibleTab can fail image readback otherwise; the response reports required_foreground and restore readback."
+    )]
+    pub async fn browser_screenshot(
+        &self,
+        params: Parameters<BrowserScreenshotParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserScreenshotResponse>, ErrorData> {
+        const TOOL: &str = "browser_screenshot";
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = TOOL,
+            "tool.invocation kind=browser_screenshot"
+        );
+        let session_id = require_target_session_id(&request_context)?;
+        let validation = validate_browser_screenshot_params(&params.0)?;
+        let resolution_target = params
+            .0
+            .cdp_target_id
+            .as_deref()
+            .or(validation.element_target.as_deref())
+            .or(validation.mask_target.as_deref());
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": params.0.window_hwnd,
+            "requested_cdp_target": cdp_target_id_audit_ref(resolution_target),
+            "path": &params.0.path,
+            "scope": params.0.scope,
+            "clip": params.0.clip,
+            "element_id": params.0.element_id.as_deref(),
+            "mask_count": params.0.masks.len(),
+            "format": validation.format,
+            "quality": params.0.quality,
+            "omit_background": params.0.omit_background,
+            "required_foreground": false,
+            "phase": "target_resolution",
+        });
+        let resolution = self.resolve_cdp_tab_mutation_target(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            resolution_target,
+        );
+        let (window_hwnd, cdp_target_id) = self.audit_cdp_target_resolution_result(
+            TOOL,
+            &session_id,
+            &request_details,
+            resolution,
+        )?;
+        validate_browser_screenshot_target_ids(&validation, &cdp_target_id)?;
+        let request_details = json!({
+            "session_id": &session_id,
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": &cdp_target_id,
+            "path": &params.0.path,
+            "scope": params.0.scope,
+            "clip": params.0.clip,
+            "element_id": params.0.element_id.as_deref(),
+            "mask_count": params.0.masks.len(),
+            "format": validation.format,
+            "quality": params.0.quality,
+            "omit_background": params.0.omit_background,
+            "required_foreground": false,
+        });
+        self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
+        let result = self
+            .browser_screenshot_impl(&params.0, &validation, window_hwnd, &cdp_target_id)
+            .await;
+        self.audit_action_result_for_session(TOOL, &result, &session_id)?;
+        result.map(Json)
     }
 
     #[tool(
@@ -1190,6 +1263,98 @@ impl SynapseService {
             error_codes::A11Y_NOT_AVAILABLE,
             "capture_screenshot CDP target screenshots are only available on Windows in this build",
         ))
+    }
+
+    async fn browser_screenshot_impl(
+        &self,
+        params: &BrowserScreenshotParams,
+        validation: &BrowserScreenshotValidation,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+    ) -> Result<BrowserScreenshotResponse, ErrorData> {
+        if !cdp_target_id.starts_with("chrome-tab:") {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser_screenshot requires a normal Chrome bridge target shaped like chrome-tab:<id>; got {cdp_target_id:?}"
+                ),
+            ));
+        }
+        ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
+        let bridge_payload = browser_screenshot_bridge_payload(params, validation.format)?;
+        let captured = crate::chrome_debugger_bridge::page_screenshot(
+            window_hwnd,
+            cdp_target_id,
+            bridge_payload,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "browser_screenshot Chrome bridge capture failed: {}",
+                    error.detail()
+                ),
+            )
+        })?;
+        if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "browser_screenshot Chrome bridge returned target {:?} for requested target {:?}",
+                    captured.target_id, cdp_target_id
+                ),
+            ));
+        }
+        let bitmap =
+            stitch_browser_screenshot_tiles(&captured, validation.format, params.omit_background)?;
+        let bitmap_sha256 = sha256_hex(&bitmap.bytes);
+        let write_params = CaptureScreenshotParams {
+            path: params.path.clone(),
+            region: Some(bitmap.region),
+            window_hwnd: None,
+            overwrite: params.overwrite,
+        };
+        let screenshot = write_screenshot_bitmap_with_quality(
+            &write_params,
+            validation.output_path.clone(),
+            validation.format,
+            bitmap,
+            "chrome_tabs_capture_visible_tab_stitched_bgra",
+            bitmap_sha256,
+            None,
+            params.quality,
+        )?;
+        let page_region = browser_screenshot_page_region(captured.clip_css)?;
+        Ok(BrowserScreenshotResponse {
+            path: screenshot.path,
+            format: screenshot.format,
+            capture_backend: screenshot.capture_backend,
+            scope: params.scope,
+            page_region,
+            width: screenshot.width,
+            height: screenshot.height,
+            bytes_written: screenshot.bytes_written,
+            bitmap_sha256: screenshot.bitmap_sha256,
+            cdp_target_id: captured.target_id,
+            tab_id: captured.tab_id,
+            chrome_window_id: captured.chrome_window_id,
+            url: captured.url,
+            title: captured.title,
+            device_pixel_ratio: captured.device_pixel_ratio,
+            viewport_width_css: captured.viewport_width_css,
+            viewport_height_css: captured.viewport_height_css,
+            scroll_width_css: captured.scroll_width_css,
+            scroll_height_css: captured.scroll_height_css,
+            tile_count: captured.tile_count,
+            mask_count: captured.mask_count,
+            omit_background: captured.omit_background,
+            required_foreground: captured.required_foreground,
+            backend_tier_used: captured.backend_tier_used,
+            source_of_truth:
+                "normal Chrome bridge chrome.scripting page metrics/masks/scroll plus chrome.tabs.captureVisibleTab tiles stitched by synapse-mcp"
+                    .to_owned(),
+        })
     }
 
     fn hidden_desktop_pip_frame_to_file(
@@ -11280,6 +11445,451 @@ fn cdp_page_bitmap_to_captured_bgra(
     })
 }
 
+struct BrowserScreenshotValidation {
+    output_path: PathBuf,
+    format: CaptureScreenshotFormat,
+    element_target: Option<String>,
+    mask_target: Option<String>,
+}
+
+fn validate_browser_screenshot_params(
+    params: &BrowserScreenshotParams,
+) -> Result<BrowserScreenshotValidation, ErrorData> {
+    let output_path = screenshot_output_path(&params.path)?;
+    let path_format = screenshot_format_from_path(&output_path)?;
+    let format = params.format.unwrap_or(path_format);
+    if format != path_format {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_screenshot format {format:?} does not match output extension for {}",
+                output_path.display()
+            ),
+        ));
+    }
+    if let Some(quality) = params.quality
+        && quality > 100
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("browser_screenshot quality must be 0..=100; got {quality}"),
+        ));
+    }
+    match params.scope {
+        BrowserScreenshotScope::Viewport | BrowserScreenshotScope::FullPage => {
+            if params.clip.is_some() || params.element_id.is_some() {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "browser_screenshot scope=viewport/full_page rejects clip and element_id",
+                ));
+            }
+        }
+        BrowserScreenshotScope::Clip => {
+            let Some(clip) = params.clip else {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "browser_screenshot scope=clip requires clip",
+                ));
+            };
+            if params.element_id.is_some() {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "browser_screenshot scope=clip rejects element_id",
+                ));
+            }
+            validate_browser_screenshot_clip(clip)?;
+        }
+        BrowserScreenshotScope::Element => {
+            if params.clip.is_some() {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "browser_screenshot scope=element rejects clip",
+                ));
+            }
+            if params.element_id.as_deref().is_none_or(str::is_empty) {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "browser_screenshot scope=element requires element_id",
+                ));
+            }
+        }
+    }
+    let element_target = params
+        .element_id
+        .as_deref()
+        .map(parse_chrome_bridge_element_target)
+        .transpose()?
+        .flatten();
+    let mut mask_target: Option<String> = None;
+    for (index, mask) in params.masks.iter().enumerate() {
+        let has_selector = mask
+            .selector
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+        let has_element = mask
+            .element_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty());
+        if has_selector == has_element {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "browser_screenshot masks[{index}] requires exactly one of selector or element_id"
+                ),
+            ));
+        }
+        if let Some(selector) = mask.selector.as_deref()
+            && selector.chars().count() > 4096
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("browser_screenshot masks[{index}].selector exceeds 4096 characters"),
+            ));
+        }
+        if let Some(color) = mask.color.as_deref()
+            && (color.is_empty() || color.chars().count() > 128 || color.contains('\0'))
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("browser_screenshot masks[{index}].color is invalid"),
+            ));
+        }
+        if let Some(element_id) = mask.element_id.as_deref() {
+            let target = parse_chrome_bridge_element_target(element_id)?.ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "browser_screenshot masks[{index}].element_id must be a normal Chrome bridge element id"
+                    ),
+                )
+            })?;
+            if let Some(existing) = mask_target.as_ref() {
+                if !cdp_target_ids_equal(existing, &target) {
+                    return Err(mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        format!(
+                            "browser_screenshot mask element ids span multiple targets: {existing:?} and {target:?}"
+                        ),
+                    ));
+                }
+            } else {
+                mask_target = Some(target);
+            }
+        }
+    }
+    Ok(BrowserScreenshotValidation {
+        output_path,
+        format,
+        element_target,
+        mask_target,
+    })
+}
+
+fn validate_browser_screenshot_clip(clip: Rect) -> Result<(), ErrorData> {
+    if clip.x < 0 || clip.y < 0 || clip.w <= 0 || clip.h <= 0 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_screenshot clip must be page-CSS non-negative and non-empty: bbox=({}, {}, {}, {})",
+                clip.x, clip.y, clip.w, clip.h
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_browser_screenshot_target_ids(
+    validation: &BrowserScreenshotValidation,
+    cdp_target_id: &str,
+) -> Result<(), ErrorData> {
+    for (label, target) in [
+        ("element_id", validation.element_target.as_deref()),
+        ("mask element_id", validation.mask_target.as_deref()),
+    ] {
+        if let Some(target) = target
+            && !cdp_target_ids_equal(target, cdp_target_id)
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser_screenshot {label} resolves to target {target:?}, but capture target is {cdp_target_id:?}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn browser_screenshot_bridge_payload(
+    params: &BrowserScreenshotParams,
+    format: CaptureScreenshotFormat,
+) -> Result<Value, ErrorData> {
+    let masks = params
+        .masks
+        .iter()
+        .map(|mask| {
+            json!({
+                "selector": mask.selector.as_deref(),
+                "elementId": mask.element_id.as_deref(),
+                "color": mask.color.as_deref(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "scope": browser_screenshot_scope_str(params.scope),
+        "clip": params.clip.map(|clip| json!({
+            "x": clip.x,
+            "y": clip.y,
+            "w": clip.w,
+            "h": clip.h,
+        })),
+        "elementId": params.element_id.as_deref(),
+        "masks": masks,
+        "format": match format {
+            CaptureScreenshotFormat::Png => "png",
+            CaptureScreenshotFormat::Jpeg => "jpeg",
+        },
+        "quality": params.quality.unwrap_or(90),
+        "omitBackground": params.omit_background,
+        "waitTimeoutMs": params.wait_timeout_ms,
+    }))
+}
+
+fn browser_screenshot_scope_str(scope: BrowserScreenshotScope) -> &'static str {
+    match scope {
+        BrowserScreenshotScope::Viewport => "viewport",
+        BrowserScreenshotScope::FullPage => "full_page",
+        BrowserScreenshotScope::Clip => "clip",
+        BrowserScreenshotScope::Element => "element",
+    }
+}
+
+fn browser_screenshot_page_region(
+    clip: crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotRect,
+) -> Result<Rect, ErrorData> {
+    let x = f64_to_i32_rounded(clip.x, "browser_screenshot clip.x")?;
+    let y = f64_to_i32_rounded(clip.y, "browser_screenshot clip.y")?;
+    let w = f64_to_i32_rounded(clip.w, "browser_screenshot clip.w")?;
+    let h = f64_to_i32_rounded(clip.h, "browser_screenshot clip.h")?;
+    validate_browser_screenshot_clip(Rect { x, y, w, h })?;
+    Ok(Rect { x, y, w, h })
+}
+
+fn f64_to_i32_rounded(value: f64, label: &str) -> Result<i32, ErrorData> {
+    if !value.is_finite() || value < f64::from(i32::MIN) || value > f64::from(i32::MAX) {
+        return Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("{label} is not a finite i32-compatible value: {value}"),
+        ));
+    }
+    Ok(value.round() as i32)
+}
+
+fn stitch_browser_screenshot_tiles(
+    captured: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult,
+    format: CaptureScreenshotFormat,
+    omit_background: bool,
+) -> Result<synapse_capture::CapturedBgraBitmap, ErrorData> {
+    if captured.tiles.is_empty() {
+        return Err(mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            "browser_screenshot Chrome bridge returned no screenshot tiles",
+        ));
+    }
+    let first = &captured.tiles[0];
+    let first_image = browser_screenshot_data_url_to_rgba(&first.image_data_url)?;
+    let scale_x = browser_screenshot_tile_scale(
+        first_image.width(),
+        first.viewport_width_css,
+        "viewport_width_css",
+    )?;
+    let scale_y = browser_screenshot_tile_scale(
+        first_image.height(),
+        first.viewport_height_css,
+        "viewport_height_css",
+    )?;
+    let output_width = f64_to_u32_ceil(captured.clip_css.w * scale_x, "output width")?;
+    let output_height = f64_to_u32_ceil(captured.clip_css.h * scale_y, "output height")?;
+    let mut output = RgbaImage::new(output_width, output_height);
+    blit_browser_screenshot_tile(
+        &mut output,
+        &first_image,
+        first,
+        captured.clip_css,
+        scale_x,
+        scale_y,
+    )?;
+    for tile in captured.tiles.iter().skip(1) {
+        let image = browser_screenshot_data_url_to_rgba(&tile.image_data_url)?;
+        blit_browser_screenshot_tile(
+            &mut output,
+            &image,
+            tile,
+            captured.clip_css,
+            scale_x,
+            scale_y,
+        )?;
+    }
+    if omit_background && matches!(format, CaptureScreenshotFormat::Png) {
+        browser_screenshot_omit_background_by_corner(&mut output);
+    }
+    let mut bgra = output.into_raw();
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    Ok(synapse_capture::CapturedBgraBitmap {
+        region: Rect {
+            x: 0,
+            y: 0,
+            w: i32::try_from(output_width).map_err(|_| {
+                mcp_error(
+                    error_codes::CAPTURE_TARGET_INVALID,
+                    format!("browser_screenshot output width {output_width} exceeds i32"),
+                )
+            })?,
+            h: i32::try_from(output_height).map_err(|_| {
+                mcp_error(
+                    error_codes::CAPTURE_TARGET_INVALID,
+                    format!("browser_screenshot output height {output_height} exceeds i32"),
+                )
+            })?,
+        },
+        width: output_width,
+        height: output_height,
+        bytes: bgra,
+    })
+}
+
+fn browser_screenshot_tile_scale(
+    image_extent: u32,
+    viewport_extent_css: f64,
+    label: &str,
+) -> Result<f64, ErrorData> {
+    if image_extent == 0 || !viewport_extent_css.is_finite() || viewport_extent_css <= 0.0 {
+        return Err(mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            format!(
+                "browser_screenshot tile has invalid {label}: image_extent={image_extent} viewport_extent_css={viewport_extent_css}"
+            ),
+        ));
+    }
+    Ok(f64::from(image_extent) / viewport_extent_css)
+}
+
+fn f64_to_u32_ceil(value: f64, label: &str) -> Result<u32, ErrorData> {
+    if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
+        return Err(mcp_error(
+            error_codes::CAPTURE_TARGET_INVALID,
+            format!("browser_screenshot {label} is invalid: {value}"),
+        ));
+    }
+    Ok(value.ceil() as u32)
+}
+
+fn browser_screenshot_data_url_to_rgba(data_url: &str) -> Result<RgbaImage, ErrorData> {
+    let (header, encoded) = data_url.split_once(',').ok_or_else(|| {
+        mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            "browser_screenshot Chrome bridge returned malformed image data URL",
+        )
+    })?;
+    let header_lower = header.to_ascii_lowercase();
+    if !header_lower.starts_with("data:image/") || !header_lower.contains(";base64") {
+        return Err(mcp_error(
+            error_codes::A11Y_CDP_AXTREE_FAILED,
+            format!(
+                "browser_screenshot Chrome bridge returned unsupported image data URL header {header:?}"
+            ),
+        ));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .map_err(|error| {
+            mcp_error(
+                error_codes::A11Y_CDP_AXTREE_FAILED,
+                format!("browser_screenshot could not decode tile base64: {error}"),
+            )
+        })?;
+    Ok(image::load_from_memory(&bytes)
+        .map_err(|error| {
+            mcp_error(
+                error_codes::A11Y_CDP_AXTREE_FAILED,
+                format!("browser_screenshot could not decode tile image: {error}"),
+            )
+        })?
+        .to_rgba8())
+}
+
+fn blit_browser_screenshot_tile(
+    output: &mut RgbaImage,
+    tile_image: &RgbaImage,
+    tile: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotTile,
+    clip: crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotRect,
+    output_scale_x: f64,
+    output_scale_y: f64,
+) -> Result<(), ErrorData> {
+    let tile_scale_x = browser_screenshot_tile_scale(
+        tile_image.width(),
+        tile.viewport_width_css,
+        "tile viewport_width_css",
+    )?;
+    let tile_scale_y = browser_screenshot_tile_scale(
+        tile_image.height(),
+        tile.viewport_height_css,
+        "tile viewport_height_css",
+    )?;
+    let left = clip.x.max(tile.scroll_x_css);
+    let top = clip.y.max(tile.scroll_y_css);
+    let right = (clip.x + clip.w).min(tile.scroll_x_css + tile.viewport_width_css);
+    let bottom = (clip.y + clip.h).min(tile.scroll_y_css + tile.viewport_height_css);
+    if right <= left || bottom <= top {
+        return Ok(());
+    }
+    let dest_x0 = ((left - clip.x) * output_scale_x).floor().max(0.0) as u32;
+    let dest_y0 = ((top - clip.y) * output_scale_y).floor().max(0.0) as u32;
+    let dest_x1 = ((right - clip.x) * output_scale_x)
+        .ceil()
+        .min(f64::from(output.width())) as u32;
+    let dest_y1 = ((bottom - clip.y) * output_scale_y)
+        .ceil()
+        .min(f64::from(output.height())) as u32;
+    for dest_y in dest_y0..dest_y1 {
+        let css_y = clip.y + (f64::from(dest_y) + 0.5) / output_scale_y;
+        let source_y = ((css_y - tile.scroll_y_css) * tile_scale_y)
+            .floor()
+            .clamp(0.0, f64::from(tile_image.height().saturating_sub(1)))
+            as u32;
+        for dest_x in dest_x0..dest_x1 {
+            let css_x = clip.x + (f64::from(dest_x) + 0.5) / output_scale_x;
+            let source_x = ((css_x - tile.scroll_x_css) * tile_scale_x)
+                .floor()
+                .clamp(0.0, f64::from(tile_image.width().saturating_sub(1)))
+                as u32;
+            let pixel = *tile_image.get_pixel(source_x, source_y);
+            output.put_pixel(dest_x, dest_y, pixel);
+        }
+    }
+    Ok(())
+}
+
+fn browser_screenshot_omit_background_by_corner(image: &mut RgbaImage) {
+    if image.width() == 0 || image.height() == 0 {
+        return;
+    }
+    let bg = *image.get_pixel(0, 0);
+    if bg[3] < 255 {
+        return;
+    }
+    for pixel in image.pixels_mut() {
+        let close = pixel[0].abs_diff(bg[0]) <= 2
+            && pixel[1].abs_diff(bg[1]) <= 2
+            && pixel[2].abs_diff(bg[2]) <= 2;
+        if close {
+            pixel[3] = 0;
+        }
+    }
+}
+
 fn bitmap_full_region(width: u32, height: u32) -> Result<Rect, ErrorData> {
     Ok(Rect {
         x: 0,
@@ -11439,6 +12049,28 @@ fn write_screenshot_bitmap(
     bitmap_sha256: String,
     foreground: Option<ForegroundContext>,
 ) -> Result<CaptureScreenshotResponse, ErrorData> {
+    write_screenshot_bitmap_with_quality(
+        params,
+        output_path,
+        format,
+        captured,
+        capture_backend,
+        bitmap_sha256,
+        foreground,
+        None,
+    )
+}
+
+fn write_screenshot_bitmap_with_quality(
+    params: &CaptureScreenshotParams,
+    output_path: PathBuf,
+    format: CaptureScreenshotFormat,
+    captured: synapse_capture::CapturedBgraBitmap,
+    capture_backend: &str,
+    bitmap_sha256: String,
+    foreground: Option<ForegroundContext>,
+    jpeg_quality: Option<u8>,
+) -> Result<CaptureScreenshotResponse, ErrorData> {
     let temp_path = screenshot_temp_path(&output_path);
     if temp_path.try_exists().map_err(|error| {
         mcp_error(
@@ -11457,7 +12089,7 @@ fn write_screenshot_bitmap(
             ),
         ));
     }
-    save_screenshot_bitmap(&captured, &temp_path, format)?;
+    save_screenshot_bitmap_with_quality(&captured, &temp_path, format, jpeg_quality)?;
     install_screenshot_file(&temp_path, &output_path, params.overwrite)?;
     let metadata = std::fs::metadata(&output_path).map_err(|error| {
         mcp_error(
@@ -11626,10 +12258,11 @@ fn ensure_screenshot_path_available(path: &Path, overwrite: bool) -> Result<(), 
     Ok(())
 }
 
-fn save_screenshot_bitmap(
+fn save_screenshot_bitmap_with_quality(
     captured: &synapse_capture::CapturedBgraBitmap,
     path: &Path,
     format: CaptureScreenshotFormat,
+    jpeg_quality: Option<u8>,
 ) -> Result<(), ErrorData> {
     let expected_len = usize::try_from(captured.width)
         .ok()
@@ -11672,9 +12305,29 @@ fn save_screenshot_bitmap(
     })?;
     let result = match format {
         CaptureScreenshotFormat::Png => image.save_with_format(path, ImageFormat::Png),
-        CaptureScreenshotFormat::Jpeg => DynamicImage::ImageRgba8(image)
-            .to_rgb8()
-            .save_with_format(path, ImageFormat::Jpeg),
+        CaptureScreenshotFormat::Jpeg => {
+            let rgb = DynamicImage::ImageRgba8(image).to_rgb8();
+            let file = std::fs::File::create(path).map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "capture_screenshot failed to create {}: {error}",
+                        path.display()
+                    ),
+                )
+            })?;
+            let quality = jpeg_quality.unwrap_or(90);
+            let mut encoder = JpegEncoder::new_with_quality(file, quality);
+            return encoder.encode_image(&rgb).map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "capture_screenshot failed to encode {}: {error}",
+                        path.display()
+                    ),
+                )
+            });
+        }
     };
     result.map_err(|error| {
         mcp_error(

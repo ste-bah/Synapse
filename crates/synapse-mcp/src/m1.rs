@@ -279,7 +279,7 @@ pub struct FindResult {
     pub score: f32,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FindResultKind {
     Element,
@@ -336,11 +336,106 @@ pub struct CaptureScreenshotResponse {
     pub foreground: Option<ForegroundContext>,
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureScreenshotFormat {
     Png,
     Jpeg,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserScreenshotParams {
+    /// Output PNG/JPEG file path. Must be absolute.
+    pub path: String,
+    /// CDP/normal-bridge target id. Defaults to this MCP session's active CDP
+    /// target. Normal Chrome bridge targets are shaped like `chrome-tab:<id>`.
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    /// Browser HWND that owns the target. Required only when passing an
+    /// explicit `cdp_target_id` without an active session target.
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    #[serde(default)]
+    pub scope: BrowserScreenshotScope,
+    /// Page CSS-coordinate clip. Required with `scope=clip`; rejected for other
+    /// scopes. Uses page/document coordinates, not viewport or screen coords.
+    #[serde(default)]
+    pub clip: Option<Rect>,
+    /// Normal bridge element id returned by `browser_locate` /
+    /// `browser_aria_snapshot`. Required with `scope=element`.
+    #[serde(default)]
+    pub element_id: Option<String>,
+    /// Elements to obscure before capture. Restored after capture.
+    #[serde(default)]
+    pub masks: Vec<BrowserScreenshotMask>,
+    /// Image format. Defaults to the file extension.
+    #[serde(default)]
+    pub format: Option<CaptureScreenshotFormat>,
+    /// JPEG quality 0..=100. Ignored for PNG.
+    #[serde(default)]
+    pub quality: Option<u8>,
+    /// Request transparent page background for PNG. The normal bridge also
+    /// restores any inline background changes after capture.
+    #[serde(default)]
+    pub omit_background: bool,
+    #[serde(default)]
+    pub overwrite: bool,
+    /// Optional caller wait budget, capped by the bridge command timeout.
+    #[serde(default)]
+    pub wait_timeout_ms: Option<u64>,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserScreenshotScope {
+    #[default]
+    Viewport,
+    FullPage,
+    Clip,
+    Element,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserScreenshotMask {
+    #[serde(default)]
+    pub selector: Option<String>,
+    #[serde(default)]
+    pub element_id: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserScreenshotResponse {
+    pub path: String,
+    pub format: CaptureScreenshotFormat,
+    pub capture_backend: String,
+    pub scope: BrowserScreenshotScope,
+    pub page_region: Rect,
+    pub width: u32,
+    pub height: u32,
+    pub bytes_written: u64,
+    pub bitmap_sha256: String,
+    pub cdp_target_id: String,
+    pub tab_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chrome_window_id: Option<i64>,
+    pub url: String,
+    pub title: String,
+    pub device_pixel_ratio: f64,
+    pub viewport_width_css: f64,
+    pub viewport_height_css: f64,
+    pub scroll_width_css: f64,
+    pub scroll_height_css: f64,
+    pub tile_count: usize,
+    pub mask_count: usize,
+    pub omit_background: bool,
+    pub required_foreground: bool,
+    pub backend_tier_used: String,
+    pub source_of_truth: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

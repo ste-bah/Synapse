@@ -579,20 +579,69 @@ namespace SynapseChromeBridgeAutoInstall {
 function Get-SynapseActiveChromeProfileName {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$ChromeUserDataRoot
+        [string]$ChromeUserDataRoot,
+        [string]$ExtensionId,
+        [string]$ExtensionDir
     )
 
     $localStatePath = Join-Path $ChromeUserDataRoot 'Local State'
-    if (-not (Test-Path -LiteralPath $localStatePath -PathType Leaf)) {
-        return $null
-    }
-    try {
-        $localState = Get-Content -Raw -LiteralPath $localStatePath | ConvertFrom-Json -ErrorAction Stop
-        if ($localState.profile -and $localState.profile.last_used) {
-            return [string]$localState.profile.last_used
+    $candidates = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -LiteralPath $localStatePath -PathType Leaf) {
+        try {
+            $localState = Get-Content -Raw -LiteralPath $localStatePath | ConvertFrom-Json -ErrorAction Stop
+            if ($localState.profile -and $localState.profile.last_used) {
+                $candidates.Add([string]$localState.profile.last_used) | Out-Null
+            }
+            if ($localState.profile -and $localState.profile.last_active_profiles) {
+                foreach ($candidate in @($localState.profile.last_active_profiles)) {
+                    $candidates.Add([string]$candidate) | Out-Null
+                }
+            }
+        } catch {
+            $candidates.Clear()
         }
-    } catch {
-        return $null
+    }
+
+    $uniqueCandidates = @($candidates | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    if (-not [string]::IsNullOrWhiteSpace($ExtensionId) -and -not [string]::IsNullOrWhiteSpace($ExtensionDir)) {
+        foreach ($candidate in $uniqueCandidates) {
+            if (-not (Test-Path -LiteralPath (Join-Path $ChromeUserDataRoot $candidate) -PathType Container)) {
+                continue
+            }
+            $row = Test-SynapseChromeBridgeProfileRow `
+                -ChromeUserDataRoot $ChromeUserDataRoot `
+                -ProfileName $candidate `
+                -ExtensionId $ExtensionId `
+                -ExtensionDir $ExtensionDir
+            if ($row.installed -and $row.manifest_path_matches) {
+                return $candidate
+            }
+        }
+
+        $installedProfiles = @()
+        foreach ($profileDir in @(Get-ChildItem -LiteralPath $ChromeUserDataRoot -Directory -ErrorAction SilentlyContinue)) {
+            if ([string]$profileDir.Name -eq 'Snapshots') {
+                continue
+            }
+            $row = Test-SynapseChromeBridgeProfileRow `
+                -ChromeUserDataRoot $ChromeUserDataRoot `
+                -ProfileName $profileDir.Name `
+                -ExtensionId $ExtensionId `
+                -ExtensionDir $ExtensionDir
+            if ($row.installed -and $row.manifest_path_matches) {
+                $installedProfiles += [string]$profileDir.Name
+            }
+        }
+        $installedProfiles = @($installedProfiles | Sort-Object -Unique)
+        if ($installedProfiles.Count -eq 1) {
+            return [string]$installedProfiles[0]
+        }
+    }
+
+    foreach ($candidate in $uniqueCandidates) {
+        if (Test-Path -LiteralPath (Join-Path $ChromeUserDataRoot $candidate) -PathType Container) {
+            return $candidate
+        }
     }
     return $null
 }
@@ -970,7 +1019,8 @@ function Invoke-SynapseChromeBridgeExistingExtensionRepair {
         [Parameter(Mandatory = $true)]
         [int]$TimeoutSeconds,
         [Parameter(Mandatory = $true)]
-        [pscustomobject]$Before
+        [pscustomobject]$Before,
+        [string]$SuccessReason = 'repaired_existing_unpacked_extension_permissions'
     )
 
     $actions = New-Object System.Collections.Generic.List[string]
@@ -1051,7 +1101,7 @@ function Invoke-SynapseChromeBridgeExistingExtensionRepair {
             return [pscustomobject]@{
                 attempted = $true
                 changed = $true
-                reason = 'repaired_existing_unpacked_extension_permissions'
+                reason = $SuccessReason
                 active_profile = $ProfileName
                 chrome_window_hwnd = $ChromeWindow.hwnd
                 repair_actions = @($actions)
@@ -1097,7 +1147,10 @@ function Invoke-SynapseChromeBridgeAutoInstall {
         [int]$TimeoutSeconds
     )
 
-    $activeProfile = Get-SynapseActiveChromeProfileName -ChromeUserDataRoot $ChromeUserDataRoot
+    $activeProfile = Get-SynapseActiveChromeProfileName `
+        -ChromeUserDataRoot $ChromeUserDataRoot `
+        -ExtensionId $ExtensionId `
+        -ExtensionDir $ExtensionDir
     if ([string]::IsNullOrWhiteSpace($activeProfile)) {
         throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_ACTIVE_PROFILE_UNKNOWN user_data_root=$ChromeUserDataRoot remediation=open the intended authenticated Chrome profile, then rerun setup"
     }
@@ -1106,16 +1159,6 @@ function Invoke-SynapseChromeBridgeAutoInstall {
         -ProfileName $activeProfile `
         -ExtensionId $ExtensionId `
         -ExtensionDir $ExtensionDir
-    if ($before.installed -and $before.manifest_path_matches -and $before.ready) {
-        return [pscustomobject]@{
-            attempted = $false
-            changed = $false
-            reason = 'active_profile_already_has_ready_unpacked_extension'
-            active_profile = $activeProfile
-            before = $before
-            after = $before
-        }
-    }
     if ($SkipAutoInstall) {
         return [pscustomobject]@{
             attempted = $false
@@ -1150,6 +1193,11 @@ function Invoke-SynapseChromeBridgeAutoInstall {
             $restoreClipboard = $false
         }
         if ($before.installed -and $before.manifest_path_matches) {
+            $successReason = if ($before.ready) {
+                'reloaded_existing_ready_unpacked_extension'
+            } else {
+                'repaired_existing_unpacked_extension_permissions'
+            }
             return Invoke-SynapseChromeBridgeExistingExtensionRepair `
                 -ChromeUserDataRoot $ChromeUserDataRoot `
                 -ProfileName $activeProfile `
@@ -1158,7 +1206,8 @@ function Invoke-SynapseChromeBridgeAutoInstall {
                 -ChromeWindow $chromeWindow `
                 -Deadline $deadline `
                 -TimeoutSeconds $TimeoutSeconds `
-                -Before $before
+                -Before $before `
+                -SuccessReason $successReason
         }
         Set-Clipboard -Value 'chrome://extensions'
         Send-SynapseNativeKeyTap -VirtualKey 0x1B
@@ -1522,18 +1571,10 @@ if (Test-Path -LiteralPath $chromeUserDataRoot -PathType Container) {
         }
     }
 }
-$activeChromeProfile = $null
-$chromeLocalStatePath = Join-Path $chromeUserDataRoot 'Local State'
-if (Test-Path -LiteralPath $chromeLocalStatePath -PathType Leaf) {
-    try {
-        $chromeLocalState = Get-Content -Raw -LiteralPath $chromeLocalStatePath | ConvertFrom-Json -ErrorAction Stop
-        if ($chromeLocalState.profile -and $chromeLocalState.profile.last_used) {
-            $activeChromeProfile = [string]$chromeLocalState.profile.last_used
-        }
-    } catch {
-        $activeChromeProfile = $null
-    }
-}
+$activeChromeProfile = Get-SynapseActiveChromeProfileName `
+    -ChromeUserDataRoot $chromeUserDataRoot `
+    -ExtensionId $ExtensionId `
+    -ExtensionDir $extensionDir
 $synapseChromeInstalledProfiles = @(
     $synapseChromeProfileReadback |
         Where-Object { $_.PSObject.Properties.Name -contains 'manifest_path' } |
@@ -1677,10 +1718,10 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     daemon_bridge_transport = 'direct_localhost_websocket'
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
     bridge_self_reload_command = 'cdp_bridge_reload'
-    bridge_build_id_expected = 'synapse-chrome-bridge-2026-06-23-network-v1'
-    bridge_build_sha256_expected = '39f69f13a4004fbde2a2fce78fe50b09588edd6d4773e23b70871febad7c3d0a'
-    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'domAction', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
-    background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_plus_chrome.cookies_plus_chrome.webNavigation_plus_chrome.webRequest_for_typed_dom_actions_storage_cookies_waits_and_chrome_debugger_cdp_input_hover_tap_drag_viewport_emulation_device_emulation_geolocation_emulation_locale_emulation_media_emulation_and_network_conditions_no_native_messaging_plus_chrome.management_external_popup_suppression'
+    bridge_build_id_expected = 'synapse-chrome-bridge-2026-06-23-page-screenshot-focus-v4'
+    bridge_build_sha256_expected = '3fe36d3eab7f9e3b34bfc9b8caa741beff496e267bf94c669a21db3bc883a86a'
+    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'domAction', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'pageScreenshot', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
+    background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_plus_chrome.cookies_plus_chrome.webNavigation_plus_chrome.webRequest_plus_chrome_tabs_captureVisibleTab_for_typed_dom_actions_storage_cookies_waits_page_screenshots_and_chrome_debugger_cdp_input_hover_tap_drag_viewport_emulation_device_emulation_geolocation_emulation_locale_emulation_media_emulation_and_network_conditions_no_native_messaging_plus_chrome.management_external_popup_suppression'
     reconnect_driver = 'bounded_websocket_reconnect_with_chrome_alarms_mv3_wake'
     attach_popup_prevention = 'normal_bridge_debugger_permission_scoped_to_cdpInput_hover_tap_active_drag_viewportEmulation_deviceEmulation_geolocationEmulation_localeEmulation_mediaEmulation_and_networkConditions_inactive_synthetic_drag_no_helper_windows_no_nativeMessaging_permission_plus_external_popup_risk_suppression'
     normal_bridge_attach_commands_available = $true

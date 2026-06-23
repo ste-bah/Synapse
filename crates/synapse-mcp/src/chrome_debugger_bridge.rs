@@ -40,9 +40,10 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-23-network-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str =
+    "synapse-chrome-bridge-2026-06-23-page-screenshot-focus-v4";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "39f69f13a4004fbde2a2fce78fe50b09588edd6d4773e23b70871febad7c3d0a";
+    "3fe36d3eab7f9e3b34bfc9b8caa741beff496e267bf94c669a21db3bc883a86a";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -59,6 +60,7 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "openTab",
     "pageVitals",
     "pageContent",
+    "pageScreenshot",
     "setContent",
     "storageState",
     "ariaSnapshot",
@@ -98,7 +100,7 @@ const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
-const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the installer auto-loads the unpacked extension into the already-open active Chrome profile and refuses to launch a second Chrome profile; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake, and exposes narrow chrome.debugger lanes for target-scoped hover/tap/active-tab drag, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
+const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the installer auto-loads the unpacked extension into the already-open active Chrome profile and refuses to launch a second Chrome profile; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake, exposes debugger-free pageScreenshot capture through chrome.tabs.captureVisibleTab stitching, and exposes narrow chrome.debugger lanes for target-scoped hover/tap/active-tab drag, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
 const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=use the already-open authenticated Chrome profile only; do not launch a second Chrome process/profile; wait for the installed bridge worker alarmReconnect registration and re-read health; if an active stale host appears call cdp_bridge_reload; if no host registers, run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop so it auto-loads the bundled unpacked extension into the existing active Chrome profile; if health reports installed=false, cdp_bridge_reload cannot repair because Chrome has no loaded extension host to receive reloadSelf";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
@@ -438,7 +440,7 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
         .join("Google")
         .join("Chrome")
         .join("User Data");
-    let active_profile = chrome_last_used_profile(&user_data_root);
+    let active_profile_candidates = chrome_active_profile_candidates(&user_data_root);
     let Ok(profile_dirs) = std::fs::read_dir(&user_data_root) else {
         return SynapseChromeProfileInstallState {
             detail: format!(
@@ -492,6 +494,11 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
 
     let installed_profile_count = installed_profiles.len();
     let installed = installed_profile_count > 0;
+    let active_profile = resolve_synapse_active_chrome_profile(
+        &user_data_root,
+        &active_profile_candidates,
+        &installed_profiles,
+    );
     let active_profile_installed = active_profile
         .as_ref()
         .map(|profile| installed_profiles.contains(profile));
@@ -537,14 +544,52 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
     }
 }
 
-fn chrome_last_used_profile(user_data_root: &std::path::Path) -> Option<String> {
-    let raw = std::fs::read_to_string(user_data_root.join("Local State")).ok()?;
-    let parsed = serde_json::from_str::<Value>(&raw).ok()?;
-    parsed
+fn chrome_active_profile_candidates(user_data_root: &std::path::Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(user_data_root.join("Local State")) else {
+        return Vec::new();
+    };
+    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
+        return Vec::new();
+    };
+    let mut candidates = Vec::new();
+    if let Some(last_used) = parsed
         .get("profile")
         .and_then(|profile| profile.get("last_used"))
         .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
+    {
+        candidates.push(last_used.to_owned());
+    }
+    if let Some(last_active_profiles) = parsed
+        .get("profile")
+        .and_then(|profile| profile.get("last_active_profiles"))
+        .and_then(Value::as_array)
+    {
+        for candidate in last_active_profiles.iter().filter_map(Value::as_str) {
+            candidates.push(candidate.to_owned());
+        }
+    }
+    let mut seen = BTreeSet::new();
+    candidates.retain(|candidate| seen.insert(candidate.clone()));
+    candidates
+}
+
+fn resolve_synapse_active_chrome_profile(
+    user_data_root: &std::path::Path,
+    active_profile_candidates: &[String],
+    installed_profiles: &BTreeSet<String>,
+) -> Option<String> {
+    for candidate in active_profile_candidates {
+        if installed_profiles.contains(candidate) {
+            return Some(candidate.clone());
+        }
+    }
+    if installed_profiles.len() == 1 {
+        return installed_profiles.iter().next().cloned();
+    }
+    active_profile_candidates
+        .iter()
+        .find(|candidate| user_data_root.join(candidate).is_dir())
+        .cloned()
 }
 
 #[derive(Clone, Debug)]
@@ -3137,6 +3182,100 @@ pub(crate) struct ChromeDebuggerCaptureVisibleTabResult {
     pub extension_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerPageScreenshotResult {
+    pub target_id: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub ready_state: String,
+    #[serde(default)]
+    pub before_active: bool,
+    #[serde(default)]
+    pub active_for_capture: bool,
+    #[serde(default)]
+    pub previous_active_tab_id: Option<u32>,
+    #[serde(default)]
+    pub restored_previous_active: bool,
+    #[serde(default)]
+    pub image_format: String,
+    #[serde(default)]
+    pub quality: Option<u8>,
+    #[serde(default)]
+    pub omit_background: bool,
+    #[serde(default)]
+    pub scope: String,
+    pub clip_css: ChromeDebuggerPageScreenshotRect,
+    #[serde(default)]
+    pub output_css_width: f64,
+    #[serde(default)]
+    pub output_css_height: f64,
+    #[serde(default)]
+    pub device_pixel_ratio: f64,
+    #[serde(default)]
+    pub scroll_width_css: f64,
+    #[serde(default)]
+    pub scroll_height_css: f64,
+    #[serde(default)]
+    pub viewport_width_css: f64,
+    #[serde(default)]
+    pub viewport_height_css: f64,
+    #[serde(default)]
+    pub tile_count: usize,
+    #[serde(default)]
+    pub tiles: Vec<ChromeDebuggerPageScreenshotTile>,
+    #[serde(default)]
+    pub capture_attempt_count: usize,
+    #[serde(default)]
+    pub capture_attempts: Vec<ChromeDebuggerCaptureAttempt>,
+    #[serde(default)]
+    pub mask_count: usize,
+    #[serde(default)]
+    pub readback_backend: String,
+    #[serde(default)]
+    pub backend_tier_used: String,
+    #[serde(default)]
+    pub required_foreground: bool,
+    #[serde(default)]
+    pub target_candidate_count: u32,
+    #[serde(default)]
+    pub target_selection_reason: String,
+    #[serde(default)]
+    pub extension_id: Option<String>,
+}
+
+#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerPageScreenshotRect {
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+    #[serde(default, alias = "width")]
+    pub w: f64,
+    #[serde(default, alias = "height")]
+    pub h: f64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerPageScreenshotTile {
+    #[serde(default)]
+    pub scroll_x_css: f64,
+    #[serde(default)]
+    pub scroll_y_css: f64,
+    #[serde(default)]
+    pub viewport_width_css: f64,
+    #[serde(default)]
+    pub viewport_height_css: f64,
+    pub image_data_url: String,
+    #[serde(default)]
+    pub image_data_url_len: usize,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ChromeDebuggerCaptureAttempt {
     #[serde(default)]
@@ -3145,10 +3284,17 @@ pub(crate) struct ChromeDebuggerCaptureAttempt {
     pub ok: bool,
     #[serde(default)]
     pub elapsed_ms: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default_string")]
     pub error_detail: String,
     #[serde(default)]
     pub retryable: bool,
+}
+
+fn deserialize_null_default_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -5206,6 +5352,27 @@ pub(crate) async fn capture_visible_tab(
     ))
 }
 
+pub(crate) async fn page_screenshot(
+    hwnd: i64,
+    target_id: &str,
+    params: Value,
+) -> Result<ChromeDebuggerPageScreenshotResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "pageScreenshot")?;
+    let mut payload = if params.is_object() {
+        params
+    } else {
+        json!({})
+    };
+    payload["hwnd"] = json!(hwnd);
+    payload["targetIdHint"] = json!(target_id);
+    let result = bridge().send_command("pageScreenshot", payload).await?;
+    serde_json::from_value::<ChromeDebuggerPageScreenshotResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger pageScreenshot response: {error}"
+        ))
+    })
+}
+
 pub(crate) async fn type_active_element(
     hwnd: i64,
     target_id: &str,
@@ -6673,6 +6840,27 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "restored_previous_active": result.get("restored_previous_active"),
             "image_format": result.get("image_format"),
             "image_data_url_len": result.get("image_data_url_len"),
+            "readback_backend": result.get("readback_backend"),
+            "target_selection_reason": result.get("target_selection_reason"),
+            "extension_id": result.get("extension_id"),
+        }),
+        "pageScreenshot" => json!({
+            "target_id": result.get("target_id"),
+            "tab_id": result.get("tab_id"),
+            "chrome_window_id": result.get("chrome_window_id"),
+            "scope": result.get("scope"),
+            "image_format": result.get("image_format"),
+            "quality": result.get("quality"),
+            "omit_background": result.get("omit_background"),
+            "clip_css": result.get("clip_css"),
+            "output_css_width": result.get("output_css_width"),
+            "output_css_height": result.get("output_css_height"),
+            "device_pixel_ratio": result.get("device_pixel_ratio"),
+            "tile_count": result.get("tile_count"),
+            "mask_count": result.get("mask_count"),
+            "before_active": result.get("before_active"),
+            "active_for_capture": result.get("active_for_capture"),
+            "restored_previous_active": result.get("restored_previous_active"),
             "readback_backend": result.get("readback_backend"),
             "target_selection_reason": result.get("target_selection_reason"),
             "extension_id": result.get("extension_id"),

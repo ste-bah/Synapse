@@ -52,6 +52,7 @@ Source-of-truth observation, OCR, screenshots, window enumeration, and the CDP/C
 | `find` | Search visible a11y nodes & detected entities; flags suspected prompt injection | `query?`, `role?`, `name_substring?`, `automation_id?`, `scope?`, `limit?`, `in_window?`, `window_hwnd?` | read-only |
 | `read_text` | OCR a region/element | `region?`, `element_id?`, `window_hwnd?`, `backend` (default Auto), `lang_hint?` | read-only |
 | `capture_screenshot` | Write PNG/JPEG of target/region | `path` (req), `region?`, `window_hwnd?`, `overwrite=false` | writes file |
+| `browser_screenshot` | Write PNG/JPEG page screenshot from a normal Chrome bridge tab | `path` (req), `scope` (Viewport), `clip?`, `element_id?`, `masks?`, `format?`, `quality?`, `omit_background=false`, `cdp_target_id?`, `window_hwnd?`, `overwrite=false` | writes file; queues `captureVisibleTab` calls to avoid Chrome capture quota; restores tab/scroll/masks; reports `required_foreground` when Chrome window focus is needed |
 | `hidden_desktop_pip_frame` | Read-only PiP frame of a session-owned hidden desktop window | `window_hwnd` (req), `path` (req), `watched_session_id?`, `region?`, `overwrite=false` | writes PNG; never forwards input |
 | `set_capture_target` | Set active capture target | `target: CaptureTargetParam` (req), `min_update_interval_ms?`, `cursor_visible?`, `dirty_region_only?` | session state |
 | `set_perception_mode` | Set active perception mode | `mode: String` (req) | session state |

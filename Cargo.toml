@@ -110,7 +110,7 @@ sysinfo = { version = "0.39.2", default-features = false, features = ["system"] 
 notify = "9.0.0-rc.4"
 fs2 = "0.4.3"
 reqwest = "0.13.3"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 proptest = "1.11.0"
 criterion = "0.8.2"
 insta = { version = "1.47.2", features = ["json"] }

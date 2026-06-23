@@ -10,9 +10,12 @@ extension requests `debugger` only for narrow target-scoped lanes:
 `networkConditions`. Inactive normal-profile tabs use a strict
 selector-scoped synthetic MouseEvent drag path through `chrome.scripting` so
 drag FSV stays background-safe. It also dispatches HTML5 DragEvent/DataTransfer
-drops in page script. It does not require `nativeMessaging`. Page-scoped evaluation
-uses `chrome.scripting.executeScript`; screenshot or deep CDP work must use raw
-CDP from a dedicated Synapse-launched automation profile started with
+drops in page script. `pageScreenshot` uses typed page metrics/masks/scroll via
+`chrome.scripting` plus queued `chrome.tabs.captureVisibleTab` tile stitching for
+viewport, full-page, clip, and element screenshots without `Page.captureScreenshot`.
+It does not require `nativeMessaging`. Page-scoped evaluation uses
+`chrome.scripting.executeScript`; arbitrary eval or deep CDP work must use raw CDP
+from a dedicated Synapse-launched automation profile started with
 `--silent-debugger-extension-api`, or fail closed before touching the normal
 browser. It requires `chrome.alarms` so Chrome can wake the MV3 service worker
 after the daemon restarts or the worker is suspended, and
@@ -106,10 +109,11 @@ registration for the expected Synapse extension so the worker can report its
 with `A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED` before queueing any browser work.
 
 Background tab commands (`listTabs`, `openTab`, `closeTab`, `navigateTab`, `activateTab`,
-`targetInfoPageText`, `pageVitals`, `pageContent`, `setContent`, `clock`, `pageEvents`, `domAction`, `setFieldValue`, and
+`targetInfoPageText`, `pageVitals`, `pageContent`, `pageScreenshot`, `setContent`, `clock`, `pageEvents`, `domAction`, `setFieldValue`, and
 `typeActiveElement`) use `chrome.windows.getAll`,
 `chrome.tabs.query`, `chrome.tabs.create`, `chrome.tabs.remove`, `chrome.tabs.update`,
-`chrome.tabs.reload`, `chrome.tabs.goBack`, `chrome.tabs.goForward`, and
+`chrome.tabs.reload`, `chrome.tabs.goBack`, `chrome.tabs.goForward`,
+`chrome.tabs.captureVisibleTab`, and
 `chrome.webNavigation` plus `chrome.scripting.executeScript`. `setContent` writes through a typed
 precompiled `chrome.scripting.executeScript(document.open/write/close)` helper
 in MAIN world so script tags in replacement HTML use normal page execution
@@ -122,16 +126,26 @@ the daemon's passive window bounds/title readback before using `windowId`. If
 that mapping does not identify exactly one Chrome window, `openTab` and
 target-scoped readback fail before accepting the tab/window pair. It never
 creates a helper Chrome window and never treats the most-recently-focused Chrome
-window as a substitute for the requested HWND. `capturePageScreenshot` is not a
-normal-bridge capability; the daemon
-refuses it before queueing any Chrome command because Chrome's debugger infobar
-changes viewport/layout and breaks coordinate truth. `evaluateScript` is also
+window as a substitute for the requested HWND. `capturePageScreenshot` is still
+not a normal-bridge capability; the daemon refuses that debugger-backed command
+before queueing any Chrome command because Chrome's debugger infobar changes
+viewport/layout and breaks coordinate truth. Use `browser_screenshot`, which
+routes to `pageScreenshot`, for normal-profile page screenshots. `evaluateScript` is also
 not a normal-bridge capability: arbitrary string evaluation needs raw CDP
 Runtime.evaluate, while `chrome.scripting.executeScript` can safely provide only
 typed, precompiled DOM helpers under normal page/extension CSP. Use
 `targetInfoPageText`, `pageVitals`, `pageContent`, `setContent`, `clock`, `pageEvents`, `domAction`, `setFieldValue`, and
 `typeActiveElement` for popup-free normal-profile read/action work, and use raw
 CDP in a dedicated silent automation profile for arbitrary JavaScript eval.
+`pageScreenshot` temporarily activates only the requested tab inside its existing
+Chrome window so `chrome.tabs.captureVisibleTab` captures the right page. On
+Windows builds where Chrome refuses image readback for an unfocused Chrome
+window, it focuses that Chrome window during capture, reports
+`required_foreground=true`, restores the previous Chrome tab/window focus when
+Chrome can report one, and always restores scroll position and masks. It queues
+`captureVisibleTab` calls to stay under Chrome's per-second capture quota for
+tiled full-page screenshots and back-to-back screenshot requests. It never
+launches a helper profile.
 `clock` uses the same typed MAIN-world execution model for current-document
 Date/timer control in an owned tab; future-document init-script clock injection
 remains a raw-CDP-only capability.
@@ -197,7 +211,7 @@ worker rejects them immediately. The bridge's only `chrome.debugger` use is the
 target-scoped `cdpInput` hover/tap/active-tab mouse-drag lane and the
 `viewportEmulation` / `deviceEmulation` / `geolocationEmulation` /
 `localeEmulation` / `mediaEmulation` / `networkConditions` metrics lanes plus inactive-tab synthetic MouseEvent drag fallback; DOM attach and
-debugger-backed screenshots require raw CDP on a dedicated Synapse-launched
+debugger-backed `Page.captureScreenshot` require raw CDP on a dedicated Synapse-launched
 automation profile.
 
 The install verifier also reads whether the live Chrome profile contains an
