@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-locale-v2";
-const BRIDGE_BUILD_SHA256 = "c2c338820f57545c3be0545e901df7522fdfd39aeb608350f81fcbf292a06d44";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-media-v1";
+const BRIDGE_BUILD_SHA256 = "9d48260852a636266af4920c19d7bea4506885fe932ecd83697d510fa4e6f9f4";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
@@ -38,6 +38,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "deviceEmulation",
   "geolocationEmulation",
   "localeEmulation",
+  "mediaEmulation",
   "domAction",
   "coordinateClick",
   "reloadSelf",
@@ -83,6 +84,7 @@ const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
 const VIEWPORT_BASELINE_BY_TAB = new Map();
 const DEVICE_BASELINE_BY_TAB = new Map();
 const LOCALE_BASELINE_BY_TAB = new Map();
+const MEDIA_BASELINE_BY_TAB = new Map();
 
 let hostId = null;
 let bridgeToken = null;
@@ -343,6 +345,7 @@ function commandRequiresExternalPopupSuppression(kind) {
     "deviceEmulation",
     "geolocationEmulation",
     "localeEmulation",
+    "mediaEmulation",
     "navigateTab",
     "activateTab",
     "domAction",
@@ -847,6 +850,8 @@ async function handleCommand(command) {
       result = await handleGeolocationEmulation(params);
     } else if (kind === "localeEmulation") {
       result = await handleLocaleEmulation(params);
+    } else if (kind === "mediaEmulation") {
+      result = await handleMediaEmulation(params);
     } else if (kind === "typeActiveElement") {
       result = await handleTypeActiveElement(params);
     } else if (kind === "setFieldValue") {
@@ -3252,6 +3257,64 @@ async function handleLocaleEmulation(params) {
   };
 }
 
+async function handleMediaEmulation(params) {
+  requireDebuggerApiAvailable("mediaEmulation", params);
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const operation = normalizeMediaEmulationOperation(params.operation);
+  const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
+  const before = await tabPageState(selected.tabId, selected.target);
+  const beforeMedia = await tabMediaState(selected.tabId);
+  let requested = null;
+  let dispatch;
+  if (operation === "set") {
+    requested = normalizeMediaOverride(params);
+    if (!MEDIA_BASELINE_BY_TAB.has(selected.tabId)) {
+      MEDIA_BASELINE_BY_TAB.set(selected.tabId, beforeMedia);
+    }
+    dispatch = await dispatchMediaEmulationSet(selected.tabId, requested);
+    await applyMediaEmulationShim(selected.tabId, requested);
+  } else {
+    rejectMediaResetField(params.media, "media");
+    rejectMediaResetField(params.colorScheme, "colorScheme");
+    rejectMediaResetField(params.reducedMotion, "reducedMotion");
+    dispatch = await dispatchMediaEmulationReset(selected.tabId);
+    await clearMediaEmulationShim(selected.tabId);
+  }
+  const after = requested
+    ? await waitForMediaReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
+    : await waitForMediaResetReadback(
+      selected.tabId,
+      selected.target,
+      waitTimeoutMs,
+      MEDIA_BASELINE_BY_TAB.get(selected.tabId)
+    );
+  if (!requested) {
+    MEDIA_BASELINE_BY_TAB.delete(selected.tabId);
+  }
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: after.page.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: after.page.chrome_window_id,
+    operation,
+    requested,
+    page_url: after.page.url || "",
+    page_title: after.page.title || "",
+    ready_state: after.page.ready_state || "",
+    media: after.media,
+    before_page: before,
+    before_media: beforeMedia,
+    readback_backend: "chrome.debugger.Emulation.setEmulatedMedia + chrome.scripting.executeScript(MAIN matchMedia shim/readback)",
+    backend_tier_used: "chrome_tabs_extension_debugger",
+    required_foreground: false,
+    source_of_truth: "normal Chrome bridge page script matchMedia shim/readback",
+    method: dispatch.method,
+    debugger_protocol_version: dispatch.protocol_version,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
 function normalizeCdpInputAction(value) {
   const action = String(value || "").trim().toLowerCase();
   if (action === "hover" || action === "tap" || action === "drag" || action === "html5_drag") {
@@ -3548,6 +3611,63 @@ function rejectLocaleResetField(value, fieldName) {
   }
 }
 
+function normalizeMediaEmulationOperation(value) {
+  const operation = String(value || "set").trim().toLowerCase();
+  if (operation === "set" || operation === "reset") {
+    return operation;
+  }
+  throw bridgeError(
+    ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+    `mediaEmulation operation must be set or reset; got ${JSON.stringify(value)}`
+  );
+}
+
+function normalizeMediaOverride(params) {
+  const media = normalizeMediaToken(params.media, "media", ["screen", "print"]);
+  const colorScheme = normalizeMediaToken(params.colorScheme, "colorScheme", ["light", "dark", "no-preference"]);
+  const reducedMotion = normalizeMediaToken(params.reducedMotion, "reducedMotion", ["reduce", "no-preference"]);
+  if (!media && !colorScheme && !reducedMotion) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "mediaEmulation operation=set requires media, colorScheme and/or reducedMotion"
+    );
+  }
+  return {
+    media,
+    color_scheme: colorScheme,
+    reduced_motion: reducedMotion
+  };
+}
+
+function normalizeMediaToken(value, fieldName, allowed) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `mediaEmulation ${fieldName} must be a string; got ${JSON.stringify(value)}`
+    );
+  }
+  const normalized = value.trim().toLowerCase();
+  if (normalized !== value || !allowed.includes(normalized)) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `mediaEmulation ${fieldName} must be one of ${allowed.join(", ")}`
+    );
+  }
+  return normalized;
+}
+
+function rejectMediaResetField(value, fieldName) {
+  if (value !== null && value !== undefined) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `mediaEmulation ${fieldName} is not valid for operation=reset`
+    );
+  }
+}
+
 async function dispatchDeviceEmulationSet(tabId, descriptor) {
   const debuggee = { tabId };
   const protocolVersion = "1.3";
@@ -3803,6 +3923,75 @@ async function dispatchLocaleEmulationReset(tabId) {
         await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for localeEmulation reset tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+}
+
+async function dispatchMediaEmulationSet(tabId, requested) {
+  const debuggee = { tabId };
+  const protocolVersion = "1.3";
+  let attached = false;
+  try {
+    await chrome.debugger.attach(debuggee, protocolVersion);
+    attached = true;
+    const features = [];
+    if (requested.color_scheme) {
+      features.push({ name: "prefers-color-scheme", value: requested.color_scheme });
+    }
+    if (requested.reduced_motion) {
+      features.push({ name: "prefers-reduced-motion", value: requested.reduced_motion });
+    }
+    await sendDebuggerCommand(debuggee, "Emulation.setEmulatedMedia", {
+      media: requested.media || "",
+      features
+    });
+    return {
+      method: "Emulation.setEmulatedMedia(media,features)",
+      protocol_version: protocolVersion
+    };
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger mediaEmulation set failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch (error) {
+        console.warn(`Synapse chrome.debugger detach failed for mediaEmulation set tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+}
+
+async function dispatchMediaEmulationReset(tabId) {
+  const debuggee = { tabId };
+  const protocolVersion = "1.3";
+  let attached = false;
+  try {
+    await chrome.debugger.attach(debuggee, protocolVersion);
+    attached = true;
+    await sendDebuggerCommand(debuggee, "Emulation.setEmulatedMedia", {
+      media: "",
+      features: []
+    });
+    return {
+      method: "Emulation.setEmulatedMedia(default)",
+      protocol_version: protocolVersion
+    };
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger mediaEmulation reset failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch (error) {
+        console.warn(`Synapse chrome.debugger detach failed for mediaEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
     }
   }
@@ -4205,6 +4394,105 @@ function localeReadbackMatchesRequestedLocale(actual, requested) {
   );
 }
 
+async function waitForMediaReadback(tabId, fallbackTarget, waitTimeoutMs, requested) {
+  const started = Date.now();
+  let last = null;
+  let lastError = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    try {
+      const page = await tabPageState(tabId, fallbackTarget);
+      const media = await tabMediaState(tabId);
+      last = { page, media };
+      lastError = null;
+      if (mediaMatchesRequest(media, requested)) {
+        return last;
+      }
+    } catch (error) {
+      lastError = error?.message ? String(error.message) : String(error);
+    }
+    await sleep(100);
+  }
+  const detail = last
+    ? `last media=${JSON.stringify(last.media)} requested=${JSON.stringify(requested)}`
+    : lastError
+      ? `last readback error=${JSON.stringify(lastError)}`
+      : "no media readback";
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `mediaEmulation readback did not settle within ${waitTimeoutMs} ms; ${detail}`);
+}
+
+function mediaMatchesRequest(media, requested) {
+  if (!media || !requested) {
+    return false;
+  }
+  if (requested.media === "print" && !media.media_print) {
+    return false;
+  }
+  if (requested.media === "screen" && !media.media_screen) {
+    return false;
+  }
+  if (requested.color_scheme === "dark" && !media.color_scheme_dark) {
+    return false;
+  }
+  if (requested.color_scheme === "light" && !media.color_scheme_light) {
+    return false;
+  }
+  if (requested.color_scheme === "no-preference" && !media.color_scheme_no_preference) {
+    return false;
+  }
+  if (requested.reduced_motion === "reduce" && !media.reduced_motion_reduce) {
+    return false;
+  }
+  if (requested.reduced_motion === "no-preference" && !media.reduced_motion_no_preference) {
+    return false;
+  }
+  return true;
+}
+
+async function waitForMediaResetReadback(tabId, fallbackTarget, waitTimeoutMs, baseline) {
+  if (!baseline) {
+    const page = await tabPageState(tabId, fallbackTarget);
+    const media = await tabMediaState(tabId);
+    return { page, media };
+  }
+  const started = Date.now();
+  let last = null;
+  let lastError = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    try {
+      const page = await tabPageState(tabId, fallbackTarget);
+      const media = await tabMediaState(tabId);
+      last = { page, media };
+      lastError = null;
+      if (sameMediaReadback(media, baseline)) {
+        return last;
+      }
+    } catch (error) {
+      lastError = error?.message ? String(error.message) : String(error);
+    }
+    await sleep(100);
+  }
+  const detail = last
+    ? `last media=${JSON.stringify(last.media)} baseline=${JSON.stringify(baseline)}`
+    : lastError
+      ? `last readback error=${JSON.stringify(lastError)}`
+      : "no media readback";
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `mediaEmulation reset readback did not settle within ${waitTimeoutMs} ms; ${detail}`);
+}
+
+function sameMediaReadback(left, right) {
+  return (
+    left &&
+    right &&
+    Boolean(left.media_screen) === Boolean(right.media_screen) &&
+    Boolean(left.media_print) === Boolean(right.media_print) &&
+    Boolean(left.color_scheme_dark) === Boolean(right.color_scheme_dark) &&
+    Boolean(left.color_scheme_light) === Boolean(right.color_scheme_light) &&
+    Boolean(left.color_scheme_no_preference) === Boolean(right.color_scheme_no_preference) &&
+    Boolean(left.reduced_motion_reduce) === Boolean(right.reduced_motion_reduce) &&
+    Boolean(left.reduced_motion_no_preference) === Boolean(right.reduced_motion_no_preference)
+  );
+}
+
 async function applyViewportDprShim(tabId, deviceScaleFactor) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
@@ -4352,6 +4640,49 @@ async function clearLocaleEmulationShim(tabId) {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
       `chrome.scripting.executeScript localeEmulation(${tabId}) locale shim reset failed: ${errorMessage(error)}`
+    );
+  }
+}
+
+async function applyMediaEmulationShim(tabId, requested) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "MAIN",
+      func: installMediaEmulationShimInPage,
+      args: [requested]
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript mediaEmulation(${tabId}) media shim failed: ${errorMessage(error)}`
+    );
+  }
+}
+
+async function clearMediaEmulationShim(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "MAIN",
+      func: clearMediaEmulationShimInPage
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript mediaEmulation(${tabId}) media shim reset failed: ${errorMessage(error)}`
     );
   }
 }
@@ -4619,6 +4950,36 @@ async function tabLocaleState(tabId) {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
       `chrome.scripting.executeScript localeEmulation(${tabId}) returned no locale metrics`
+    );
+  }
+  return metrics;
+}
+
+async function tabMediaState(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "MAIN",
+      func: readMediaStateInPage
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript mediaEmulation(${tabId}) readback failed: ${errorMessage(error)}`
+    );
+  }
+  const metrics = results?.[0]?.result;
+  if (!metrics || typeof metrics !== "object") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript mediaEmulation(${tabId}) returned no media metrics`
     );
   }
   return metrics;
@@ -5257,6 +5618,186 @@ function clearLocaleEmulationShimInPage() {
   };
 }
 
+function installMediaEmulationShimInPage(requested) {
+  const stateKey = "__synapseMediaEmulationOverride";
+  const requestedState = requested && typeof requested === "object" ? requested : {};
+  const media = requestedState.media === null || requestedState.media === undefined
+    ? null
+    : String(requestedState.media);
+  const colorScheme = requestedState.color_scheme === null || requestedState.color_scheme === undefined
+    ? null
+    : String(requestedState.color_scheme);
+  const reducedMotion = requestedState.reduced_motion === null || requestedState.reduced_motion === undefined
+    ? null
+    : String(requestedState.reduced_motion);
+  let state = globalThis[stateKey];
+  if (!state || typeof state !== "object") {
+    state = {
+      original_match_media: typeof globalThis.matchMedia === "function"
+        ? globalThis.matchMedia.bind(globalThis)
+        : null,
+      match_media_had_own_descriptor: Object.prototype.hasOwnProperty.call(globalThis, "matchMedia"),
+      match_media_descriptor: Object.getOwnPropertyDescriptor(globalThis, "matchMedia") || null,
+      value: {}
+    };
+    Object.defineProperty(globalThis, stateKey, {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: state
+    });
+  }
+  state.value = { media, color_scheme: colorScheme, reduced_motion: reducedMotion };
+  function normalizeQuery(query) {
+    return String(query || "").trim().toLowerCase().replace(/\s+/g, " ");
+  }
+  function currentState() {
+    const current = globalThis[stateKey];
+    return current && current.value ? current.value : state.value;
+  }
+  function overrideMatch(query) {
+    const value = currentState();
+    const normalized = normalizeQuery(query);
+    if (value.media === "print") {
+      if (normalized === "print") {
+        return true;
+      }
+      if (normalized === "screen") {
+        return false;
+      }
+    } else if (value.media === "screen") {
+      if (normalized === "screen") {
+        return true;
+      }
+      if (normalized === "print") {
+        return false;
+      }
+    }
+    if (value.color_scheme === "dark" && normalized === "(prefers-color-scheme: dark)") {
+      return true;
+    }
+    if (value.color_scheme === "dark" && (normalized === "(prefers-color-scheme: light)" || normalized === "(prefers-color-scheme: no-preference)")) {
+      return false;
+    }
+    if (value.color_scheme === "light" && normalized === "(prefers-color-scheme: light)") {
+      return true;
+    }
+    if (value.color_scheme === "light" && (normalized === "(prefers-color-scheme: dark)" || normalized === "(prefers-color-scheme: no-preference)")) {
+      return false;
+    }
+    if (value.color_scheme === "no-preference" && normalized === "(prefers-color-scheme: no-preference)") {
+      return true;
+    }
+    if (value.color_scheme === "no-preference" && (normalized === "(prefers-color-scheme: dark)" || normalized === "(prefers-color-scheme: light)")) {
+      return false;
+    }
+    if (value.reduced_motion === "reduce" && normalized === "(prefers-reduced-motion: reduce)") {
+      return true;
+    }
+    if (value.reduced_motion === "reduce" && normalized === "(prefers-reduced-motion: no-preference)") {
+      return false;
+    }
+    if (value.reduced_motion === "no-preference" && normalized === "(prefers-reduced-motion: no-preference)") {
+      return true;
+    }
+    if (value.reduced_motion === "no-preference" && normalized === "(prefers-reduced-motion: reduce)") {
+      return false;
+    }
+    return null;
+  }
+  function nativeMatch(query) {
+    if (typeof state.original_match_media !== "function") {
+      return null;
+    }
+    try {
+      return state.original_match_media(query);
+    } catch (_) {
+      return null;
+    }
+  }
+  function mediaQueryList(query, forcedMatch, nativeResult) {
+    const mediaText = String(query || "");
+    const listeners = [];
+    const result = {
+      matches: Boolean(forcedMatch),
+      media: nativeResult && typeof nativeResult.media === "string" ? nativeResult.media : mediaText,
+      onchange: null,
+      addListener(listener) {
+        if (typeof listener === "function" && !listeners.includes(listener)) {
+          listeners.push(listener);
+        }
+      },
+      removeListener(listener) {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) {
+          listeners.splice(index, 1);
+        }
+      },
+      addEventListener(_type, listener) {
+        this.addListener(listener);
+      },
+      removeEventListener(_type, listener) {
+        this.removeListener(listener);
+      },
+      dispatchEvent(event) {
+        for (const listener of listeners.slice()) {
+          try {
+            listener.call(result, event || result);
+          } catch (_) {}
+        }
+        if (typeof result.onchange === "function") {
+          try {
+            result.onchange.call(result, event || result);
+          } catch (_) {}
+        }
+        return true;
+      }
+    };
+    return result;
+  }
+  Object.defineProperty(globalThis, "matchMedia", {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value(query) {
+      const forced = overrideMatch(query);
+      const nativeResult = nativeMatch(query);
+      if (forced === null && nativeResult) {
+        return nativeResult;
+      }
+      return mediaQueryList(query, forced === null ? false : forced, nativeResult);
+    }
+  });
+  try {
+    globalThis.dispatchEvent(new Event("resize"));
+  } catch (_) {}
+  return {
+    applied: true,
+    requested: state.value
+  };
+}
+
+function clearMediaEmulationShimInPage() {
+  const stateKey = "__synapseMediaEmulationOverride";
+  const state = globalThis[stateKey];
+  if (state && typeof state === "object") {
+    if (state.match_media_had_own_descriptor && state.match_media_descriptor) {
+      Object.defineProperty(globalThis, "matchMedia", state.match_media_descriptor);
+    } else {
+      try {
+        delete globalThis.matchMedia;
+      } catch (_) {}
+    }
+    delete globalThis[stateKey];
+  }
+  try {
+    globalThis.dispatchEvent(new Event("resize"));
+  } catch (_) {}
+  return {
+    cleared: Boolean(state)
+  };
+}
+
 async function readGeolocationStateInPage() {
   const permissionState = await (async () => {
     try {
@@ -5343,6 +5884,25 @@ function readLocaleStateInPage() {
     sample_date: dateFormatter.format(sampleDate),
     date_string: sampleDate.toString(),
     timezone_offset_minutes: Number(sampleDate.getTimezoneOffset())
+  };
+}
+
+function readMediaStateInPage() {
+  const matches = query => {
+    try {
+      return Boolean(globalThis.matchMedia && globalThis.matchMedia(query).matches);
+    } catch (_) {
+      return false;
+    }
+  };
+  return {
+    media_screen: matches("screen"),
+    media_print: matches("print"),
+    color_scheme_dark: matches("(prefers-color-scheme: dark)"),
+    color_scheme_light: matches("(prefers-color-scheme: light)"),
+    color_scheme_no_preference: matches("(prefers-color-scheme: no-preference)"),
+    reduced_motion_reduce: matches("(prefers-reduced-motion: reduce)"),
+    reduced_motion_no_preference: matches("(prefers-reduced-motion: no-preference)")
   };
 }
 

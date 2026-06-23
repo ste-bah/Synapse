@@ -769,7 +769,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Set or reset CSS media emulation for the calling session's owned raw-CDP browser tab. operation=set applies media (`screen` or `print`) and/or prefers-color-scheme / prefers-reduced-motion through Emulation.setEmulatedMedia, then reads back matchMedia state for screen, print, color-scheme, and reduced-motion. Unspecified fields are cleared on each set so stale media features do not persist. operation=reset clears media and media-feature overrides. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Raw CDP only; use browser_evaluate as an independent FSV readback for matchMedia('(prefers-color-scheme: dark)') and print media behavior."
+        description = "Set or reset CSS media emulation for the calling session's owned browser tab. Raw CDP targets use Emulation.setEmulatedMedia; normal Chrome bridge chrome-tab:* targets use the mediaEmulation bridge lane in the already-open authenticated profile with MAIN-world matchMedia readback. operation=set applies media (`screen` or `print`) and/or prefers-color-scheme / prefers-reduced-motion, then reads back matchMedia state for screen, print, color-scheme, and reduced-motion. Unspecified fields are cleared on each set so stale media features do not persist. operation=reset clears media and media-feature overrides. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Use browser_evaluate or cdp_target_info page text as an independent FSV readback for matchMedia('(prefers-color-scheme: dark)') and print media behavior."
     )]
     pub async fn browser_media(
         &self,
@@ -1306,6 +1306,11 @@ impl SynapseService {
         params: &NormalizedBrowserMediaParams,
     ) -> Result<BrowserMediaResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+                return self
+                    .browser_media_bridge_impl(session_id, window_hwnd, cdp_target_id, params)
+                    .await;
+            }
             return Err(browser_raw_cdp_required_error(MEDIA_TOOL, window_hwnd));
         };
         let result = match params.operation {
@@ -1345,6 +1350,58 @@ impl SynapseService {
             "readback=Emulation.setEmulatedMedia+Runtime.evaluate outcome=media_state"
         );
         Ok(browser_media_response(session_id, window_hwnd, result))
+    }
+
+    #[cfg(windows)]
+    async fn browser_media_bridge_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        params: &NormalizedBrowserMediaParams,
+    ) -> Result<BrowserMediaResponse, ErrorData> {
+        let operation = match params.operation {
+            BrowserMediaOperation::Set => "set",
+            BrowserMediaOperation::Reset => "reset",
+        };
+        let requested = params.requested.as_ref();
+        let result = crate::chrome_debugger_bridge::media_emulation(
+            crate::chrome_debugger_bridge::ChromeDebuggerMediaEmulationRequest {
+                hwnd: window_hwnd,
+                target_id: cdp_target_id,
+                operation,
+                media: requested.and_then(|value| value.media.as_deref()),
+                color_scheme: requested.and_then(|value| value.color_scheme.as_deref()),
+                reduced_motion: requested.and_then(|value| value.reduced_motion.as_deref()),
+                wait_timeout_ms: DEFAULT_BRIDGE_VIEWPORT_WAIT_TIMEOUT_MS,
+            },
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "{MEDIA_TOOL} normal Chrome bridge media emulation failed for target {cdp_target_id:?}: {}",
+                    error.detail()
+                ),
+            )
+        })?;
+        tracing::info!(
+            code = "CHROME_BRIDGE_MEDIA_EMULATION",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            cdp_target_id,
+            operation = ?params.operation,
+            media_print = result.media.media_print,
+            color_scheme_dark = result.media.color_scheme_dark,
+            reduced_motion_reduce = result.media.reduced_motion_reduce,
+            "readback=chrome.debugger.Emulation+chrome.scripting.executeScript outcome=media_state"
+        );
+        Ok(browser_media_bridge_response(
+            session_id,
+            window_hwnd,
+            result,
+        ))
     }
 
     #[cfg(not(windows))]
@@ -2444,6 +2501,57 @@ fn browser_media_response(
     }
 }
 
+fn browser_media_bridge_response(
+    session_id: &str,
+    window_hwnd: i64,
+    result: crate::chrome_debugger_bridge::ChromeDebuggerMediaEmulationResult,
+) -> BrowserMediaResponse {
+    BrowserMediaResponse {
+        session_id: session_id.to_owned(),
+        window_hwnd,
+        transport: "chrome_tabs_extension".to_owned(),
+        endpoint: chrome_debugger_default_endpoint(),
+        cdp_target_id: result.target_id,
+        operation: match result.operation.as_str() {
+            "reset" => BrowserMediaOperation::Reset,
+            _ => BrowserMediaOperation::Set,
+        },
+        requested: result.requested.map(|requested| BrowserMediaOverride {
+            media: requested.media,
+            color_scheme: requested.color_scheme,
+            reduced_motion: requested.reduced_motion,
+        }),
+        page_url: result.page_url,
+        page_title: result.page_title,
+        ready_state: result.ready_state,
+        media: BrowserMediaReadback {
+            media_screen: result.media.media_screen,
+            media_print: result.media.media_print,
+            color_scheme_dark: result.media.color_scheme_dark,
+            color_scheme_light: result.media.color_scheme_light,
+            color_scheme_no_preference: result.media.color_scheme_no_preference,
+            reduced_motion_reduce: result.media.reduced_motion_reduce,
+            reduced_motion_no_preference: result.media.reduced_motion_no_preference,
+        },
+        readback_backend: if result.readback_backend.is_empty() {
+            "chrome.debugger.Emulation.setEmulatedMedia + chrome.scripting.executeScript".to_owned()
+        } else {
+            result.readback_backend
+        },
+        backend_tier_used: if result.backend_tier_used.is_empty() {
+            "chrome_tabs_extension_debugger".to_owned()
+        } else {
+            result.backend_tier_used
+        },
+        required_foreground: result.required_foreground,
+        source_of_truth: if result.source_of_truth.is_empty() {
+            "normal Chrome bridge page script matchMedia media queries".to_owned()
+        } else {
+            result.source_of_truth
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3242,6 +3350,61 @@ mod tests {
                 .and_then(|requested| requested.media.as_deref()),
             Some("print")
         );
+        assert!(!response.required_foreground);
+    }
+
+    #[test]
+    fn browser_media_bridge_response_maps_readback() {
+        let response = browser_media_bridge_response(
+            "session-1",
+            0x2200,
+            crate::chrome_debugger_bridge::ChromeDebuggerMediaEmulationResult {
+                extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+                target_id: "chrome-tab:7".to_owned(),
+                tab_id: 7,
+                chrome_window_id: Some(3),
+                operation: "set".to_owned(),
+                requested: Some(crate::chrome_debugger_bridge::ChromeDebuggerMediaOverride {
+                    media: Some("print".to_owned()),
+                    color_scheme: Some("dark".to_owned()),
+                    reduced_motion: Some("reduce".to_owned()),
+                }),
+                page_url: "https://example.test/".to_owned(),
+                page_title: "Example".to_owned(),
+                ready_state: "complete".to_owned(),
+                media: crate::chrome_debugger_bridge::ChromeDebuggerMediaReadback {
+                    media_screen: false,
+                    media_print: true,
+                    color_scheme_dark: true,
+                    color_scheme_light: false,
+                    color_scheme_no_preference: false,
+                    reduced_motion_reduce: true,
+                    reduced_motion_no_preference: false,
+                },
+                readback_backend: String::new(),
+                backend_tier_used: String::new(),
+                required_foreground: false,
+                source_of_truth: String::new(),
+                method: "Emulation.setEmulatedMedia(media,features)".to_owned(),
+                debugger_protocol_version: Some("1.3".to_owned()),
+                target_candidate_count: 1,
+                target_selection_reason: "targetIdHint".to_owned(),
+            },
+        );
+
+        assert_eq!(response.transport, "chrome_tabs_extension");
+        assert_eq!(response.operation, BrowserMediaOperation::Set);
+        assert!(response.media.media_print);
+        assert!(response.media.color_scheme_dark);
+        assert!(response.media.reduced_motion_reduce);
+        assert_eq!(
+            response
+                .requested
+                .as_ref()
+                .and_then(|requested| requested.media.as_deref()),
+            Some("print")
+        );
+        assert_eq!(response.backend_tier_used, "chrome_tabs_extension_debugger");
         assert!(!response.required_foreground);
     }
 }

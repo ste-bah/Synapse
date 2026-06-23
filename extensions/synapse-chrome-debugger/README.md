@@ -6,7 +6,7 @@ extension service worker to the Synapse daemon. The normal end-user bridge is
 tabs-first: background tab open/close/navigation use `chrome.tabs` APIs, and the
 extension requests `debugger` only for narrow target-scoped lanes:
 `cdpInput` hover/tap/active-tab drag, `viewportEmulation`, `deviceEmulation`,
-`geolocationEmulation`, and `localeEmulation`. Inactive normal-profile tabs use a strict
+`geolocationEmulation`, `localeEmulation`, and `mediaEmulation`. Inactive normal-profile tabs use a strict
 selector-scoped synthetic MouseEvent drag path through `chrome.scripting` so
 drag FSV stays background-safe. It also dispatches HTML5 DragEvent/DataTransfer
 drops in page script. It does not require `nativeMessaging`. Page-scoped evaluation
@@ -60,7 +60,7 @@ extensions or native hosts that request `debugger`/`nativeMessaging`. It also
 preserves a nativeMessaging-only self-shield for the stable Synapse extension
 ID. The current bridge intentionally requests `debugger` for narrow
 target-scoped `cdpInput`, `viewportEmulation`, `deviceEmulation`, and
-`geolocationEmulation` / `localeEmulation` lanes in the already-open
+`geolocationEmulation` / `localeEmulation` / `mediaEmulation` lanes in the already-open
 Chrome profile, and it still never requests `nativeMessaging` or creates helper
 Chrome windows. The shield is identified by Synapse's
 `blocked_install_message` marker and can be removed with the maintenance command
@@ -168,6 +168,10 @@ the debugger lane and uses a narrow MAIN-world shim for
 `localeEmulation` applies target-scoped locale/timezone override/clear through
 the debugger lane and reads `Intl.DateTimeFormat`, `Intl.NumberFormat`, and
 `Date` behavior back through a typed MAIN-world script.
+`mediaEmulation` applies target-scoped CSS media type and media-feature
+override/clear through the debugger lane and reads `matchMedia` screen/print,
+prefers-color-scheme, and prefers-reduced-motion state back through a typed
+MAIN-world script.
 The HTML5 drag path uses typed `chrome.scripting.executeScript` to create
 `DragEvent` plus `DataTransfer` in page MAIN world. The daemon refuses other
 attach-capable debugger commands before queueing them. External
@@ -186,7 +190,7 @@ Attach-capable DOM commands (`snapshot`, `clickNode`, `typeNode`, and
 worker rejects them immediately. The bridge's only `chrome.debugger` use is the
 target-scoped `cdpInput` hover/tap/active-tab mouse-drag lane and the
 `viewportEmulation` / `deviceEmulation` / `geolocationEmulation` /
-`localeEmulation` metrics lanes plus inactive-tab synthetic MouseEvent drag fallback; DOM attach and
+`localeEmulation` / `mediaEmulation` metrics lanes plus inactive-tab synthetic MouseEvent drag fallback; DOM attach and
 debugger-backed screenshots require raw CDP on a dedicated Synapse-launched
 automation profile.
 
@@ -202,8 +206,8 @@ started with `--silent-debugger-extension-api`. If the policy key is ACL-locked,
 setup reports the denied write with ACL evidence instead of assuming the shield
 exists. Granted-only stale Synapse nativeMessaging rows remain advisory when the
 loaded bridge is current, `debuggerApiAvailable=true`, and `cdpInput`,
-`viewportEmulation`, `deviceEmulation`, `geolocationEmulation`, and
-`localeEmulation` are
+`viewportEmulation`, `deviceEmulation`, `geolocationEmulation`,
+`localeEmulation`, and `mediaEmulation` are
 advertised; active/manifest Synapse `nativeMessaging` hazards still fail closed.
 External hazards rely on the loaded bridge's `chrome.management`
 suppression readback. If Chrome rejects that suppression, normal-profile commands
@@ -219,8 +223,8 @@ or remote debugging without `--silent-debugger-extension-api`. A remaining
 end-user debugger/native-host/banner popup is therefore attributed to a concrete
 extension or process instead of being reported as an ambiguous Synapse bridge
 failure. Background normal-profile tab, typed DOM commands, and the target-scoped
-`cdpInput` hover/tap/drag, `viewportEmulation`, `deviceEmulation`, and
-`geolocationEmulation` / `localeEmulation` lanes require those warnings to be cleared or
+`cdpInput` hover/tap/drag, `viewportEmulation`, `deviceEmulation`,
+`geolocationEmulation` / `localeEmulation` / `mediaEmulation` lanes require those warnings to be cleared or
 suppressed before they run. Use raw CDP on a dedicated Synapse-launched
 automation profile started with `--silent-debugger-extension-api` for full
 attach-capable CDP work outside the bridge's narrow input lane.
@@ -256,6 +260,7 @@ Background automation is achieved on Synapse's own side with the bundled bridge
 over localhost WebSocket, no `nativeMessaging` permission, no helper Chrome
 windows, tabs/scripting for DOM work, and narrow `chrome.debugger` lanes for
 `cdpInput` hover/tap/active-tab mouse-drag, `viewportEmulation`,
-`deviceEmulation`, `geolocationEmulation`, and `localeEmulation` plus
+`deviceEmulation`, `geolocationEmulation`, `localeEmulation`, and
+`mediaEmulation` plus
 inactive-tab synthetic mouse drag and HTML5 DataTransfer dispatch. Deeper DOM/action CDP still runs in a dedicated
 Synapse-launched automation profile started with `--silent-debugger-extension-api`.
