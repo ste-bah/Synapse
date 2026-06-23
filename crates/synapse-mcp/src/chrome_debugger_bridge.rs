@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-23-media-v2";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-23-network-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "65bbc9f360d56f9d02aaad3cc5ed5ae4cf38563983b28cb99b86750793ef6e1e";
+    "39f69f13a4004fbde2a2fce78fe50b09588edd6d4773e23b70871febad7c3d0a";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -81,6 +81,7 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "geolocationEmulation",
     "localeEmulation",
     "mediaEmulation",
+    "networkConditions",
     "reloadSelf",
     "targetInfo",
     "targetInfoPageText",
@@ -97,7 +98,7 @@ const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
-const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the installer auto-loads the unpacked extension into the already-open active Chrome profile and refuses to launch a second Chrome profile; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake, and exposes narrow chrome.debugger lanes for target-scoped hover/tap/active-tab drag, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, and media emulation plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
+const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension from extensions\\synapse-chrome-debugger with scripts\\install-synapse-chrome-debugger.ps1; the installer auto-loads the unpacked extension into the already-open active Chrome profile and refuses to launch a second Chrome profile; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake, and exposes narrow chrome.debugger lanes for target-scoped hover/tap/active-tab drag, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
 const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=use the already-open authenticated Chrome profile only; do not launch a second Chrome process/profile; wait for the installed bridge worker alarmReconnect registration and re-read health; if an active stale host appears call cdp_bridge_reload; if no host registers, run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop so it auto-loads the bundled unpacked extension into the existing active Chrome profile; if health reports installed=false, cdp_bridge_reload cannot repair because Chrome has no loaded extension host to receive reloadSelf";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
@@ -262,7 +263,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
             detail: format!(
-                "Synapse Chrome Bridge refused unsupported attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=current normal-profile bridge exposes only narrow chrome.debugger lanes for cdpInput target-scoped hover/tap/active-tab drag, viewportEmulation, deviceEmulation, geolocationEmulation, localeEmulation, and mediaEmulation plus inactive-tab synthetic mouse drag, while this command still requires a dedicated raw-CDP automation profile{external_surface_hint} remediation=run scripts\\install-synapse-chrome-debugger.ps1 and cdp_bridge_reload to ensure the current bridge is installed, or use raw CDP from a dedicated Synapse-launched automation profile for full DOM/action CDP or screenshots"
+                "Synapse Chrome Bridge refused unsupported attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=current normal-profile bridge exposes only narrow chrome.debugger lanes for cdpInput target-scoped hover/tap/active-tab drag, viewportEmulation, deviceEmulation, geolocationEmulation, localeEmulation, mediaEmulation, and networkConditions plus inactive-tab synthetic mouse drag, while this command still requires a dedicated raw-CDP automation profile{external_surface_hint} remediation=run scripts\\install-synapse-chrome-debugger.ps1 and cdp_bridge_reload to ensure the current bridge is installed, or use raw CDP from a dedicated Synapse-launched automation profile for full DOM/action CDP or screenshots"
             ),
         }
     }
@@ -2932,6 +2933,61 @@ pub(crate) struct ChromeDebuggerMediaEmulationResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerNetworkConditionsOverride {
+    pub offline: bool,
+    pub latency_ms: f64,
+    pub download_throughput_bytes_per_sec: f64,
+    pub upload_throughput_bytes_per_sec: f64,
+    #[serde(default)]
+    pub connection_type: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerNetworkConditionsReadback {
+    pub online: bool,
+    #[serde(default)]
+    pub connection_type: Option<String>,
+    #[serde(default)]
+    pub effective_type: Option<String>,
+    #[serde(default)]
+    pub downlink_mbps: Option<f64>,
+    #[serde(default)]
+    pub rtt_ms: Option<f64>,
+    #[serde(default)]
+    pub save_data: Option<bool>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeDebuggerNetworkConditionsResult {
+    pub extension_id: Option<String>,
+    pub target_id: String,
+    pub tab_id: u32,
+    #[serde(default)]
+    pub chrome_window_id: Option<i64>,
+    pub operation: String,
+    #[serde(default)]
+    pub requested: Option<ChromeDebuggerNetworkConditionsOverride>,
+    pub page_url: String,
+    pub page_title: String,
+    pub ready_state: String,
+    pub network: ChromeDebuggerNetworkConditionsReadback,
+    #[serde(default)]
+    pub readback_backend: String,
+    #[serde(default)]
+    pub backend_tier_used: String,
+    #[serde(default)]
+    pub required_foreground: bool,
+    #[serde(default)]
+    pub source_of_truth: String,
+    #[serde(default)]
+    pub method: String,
+    #[serde(default)]
+    pub debugger_protocol_version: Option<String>,
+    pub target_candidate_count: u32,
+    pub target_selection_reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct ChromeDebuggerFrameEntry {
     #[serde(default)]
     pub frame_id: String,
@@ -5079,6 +5135,45 @@ pub(crate) async fn media_emulation(
     })
 }
 
+pub(crate) struct ChromeDebuggerNetworkConditionsRequest<'a> {
+    pub hwnd: i64,
+    pub target_id: &'a str,
+    pub operation: &'a str,
+    pub offline: Option<bool>,
+    pub latency_ms: Option<f64>,
+    pub download_throughput_bytes_per_sec: Option<f64>,
+    pub upload_throughput_bytes_per_sec: Option<f64>,
+    pub connection_type: Option<&'a str>,
+    pub wait_timeout_ms: u64,
+}
+
+pub(crate) async fn network_conditions(
+    request: ChromeDebuggerNetworkConditionsRequest<'_>,
+) -> Result<ChromeDebuggerNetworkConditionsResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "networkConditions")?;
+    let result = bridge()
+        .send_command(
+            "networkConditions",
+            json!({
+                "hwnd": request.hwnd,
+                "targetIdHint": request.target_id,
+                "operation": request.operation,
+                "offline": request.offline,
+                "latencyMs": request.latency_ms,
+                "downloadThroughputBytesPerSec": request.download_throughput_bytes_per_sec,
+                "uploadThroughputBytesPerSec": request.upload_throughput_bytes_per_sec,
+                "connectionType": request.connection_type,
+                "waitTimeoutMs": request.wait_timeout_ms,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerNetworkConditionsResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger networkConditions response: {error}"
+        ))
+    })
+}
+
 pub(crate) async fn frames(
     hwnd: i64,
     target_id: &str,
@@ -6765,6 +6860,31 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "reduced_motion_reduce": result
                 .get("media")
                 .and_then(|value| value.get("reduced_motion_reduce")),
+            "readback_backend": result.get("readback_backend"),
+            "target_candidate_count": result.get("target_candidate_count"),
+            "target_selection_reason": result.get("target_selection_reason"),
+            "extension_id": result.get("extension_id"),
+        }),
+        "networkConditions" => json!({
+            "target_id": result.get("target_id"),
+            "tab_id": result.get("tab_id"),
+            "operation": result.get("operation"),
+            "requested": result.get("requested"),
+            "online": result
+                .get("network")
+                .and_then(|value| value.get("online")),
+            "connection_type": result
+                .get("network")
+                .and_then(|value| value.get("connection_type")),
+            "effective_type": result
+                .get("network")
+                .and_then(|value| value.get("effective_type")),
+            "downlink_mbps": result
+                .get("network")
+                .and_then(|value| value.get("downlink_mbps")),
+            "rtt_ms": result
+                .get("network")
+                .and_then(|value| value.get("rtt_ms")),
             "readback_backend": result.get("readback_backend"),
             "target_candidate_count": result.get("target_candidate_count"),
             "target_selection_reason": result.get("target_selection_reason"),

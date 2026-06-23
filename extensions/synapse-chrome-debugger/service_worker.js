@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-media-v2";
-const BRIDGE_BUILD_SHA256 = "65bbc9f360d56f9d02aaad3cc5ed5ae4cf38563983b28cb99b86750793ef6e1e";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-23-network-v1";
+const BRIDGE_BUILD_SHA256 = "39f69f13a4004fbde2a2fce78fe50b09588edd6d4773e23b70871febad7c3d0a";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
@@ -39,6 +39,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "geolocationEmulation",
   "localeEmulation",
   "mediaEmulation",
+  "networkConditions",
   "domAction",
   "coordinateClick",
   "reloadSelf",
@@ -85,6 +86,7 @@ const VIEWPORT_BASELINE_BY_TAB = new Map();
 const DEVICE_BASELINE_BY_TAB = new Map();
 const LOCALE_BASELINE_BY_TAB = new Map();
 const MEDIA_BASELINE_BY_TAB = new Map();
+const NETWORK_BASELINE_BY_TAB = new Map();
 
 let hostId = null;
 let bridgeToken = null;
@@ -346,6 +348,7 @@ function commandRequiresExternalPopupSuppression(kind) {
     "geolocationEmulation",
     "localeEmulation",
     "mediaEmulation",
+    "networkConditions",
     "navigateTab",
     "activateTab",
     "domAction",
@@ -852,6 +855,8 @@ async function handleCommand(command) {
       result = await handleLocaleEmulation(params);
     } else if (kind === "mediaEmulation") {
       result = await handleMediaEmulation(params);
+    } else if (kind === "networkConditions") {
+      result = await handleNetworkConditions(params);
     } else if (kind === "typeActiveElement") {
       result = await handleTypeActiveElement(params);
     } else if (kind === "setFieldValue") {
@@ -3315,6 +3320,66 @@ async function handleMediaEmulation(params) {
   };
 }
 
+async function handleNetworkConditions(params) {
+  requireDebuggerApiAvailable("networkConditions", params);
+  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const operation = normalizeNetworkConditionsOperation(params.operation);
+  const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
+  const before = await tabPageState(selected.tabId, selected.target);
+  const beforeNetwork = await tabNetworkState(selected.tabId);
+  let requested = null;
+  let dispatch;
+  if (operation === "set") {
+    requested = normalizeNetworkConditionsOverride(params);
+    if (!NETWORK_BASELINE_BY_TAB.has(selected.tabId)) {
+      NETWORK_BASELINE_BY_TAB.set(selected.tabId, beforeNetwork);
+    }
+    dispatch = await dispatchNetworkConditionsSet(selected.tabId, requested);
+    await applyNetworkConditionsShim(selected.tabId, requested);
+  } else {
+    rejectNetworkConditionsResetField(params.offline, "offline");
+    rejectNetworkConditionsResetField(params.latencyMs, "latencyMs");
+    rejectNetworkConditionsResetField(params.downloadThroughputBytesPerSec, "downloadThroughputBytesPerSec");
+    rejectNetworkConditionsResetField(params.uploadThroughputBytesPerSec, "uploadThroughputBytesPerSec");
+    rejectNetworkConditionsResetField(params.connectionType, "connectionType");
+    dispatch = await dispatchNetworkConditionsReset(selected.tabId);
+    await clearNetworkConditionsShim(selected.tabId);
+  }
+  const after = requested
+    ? await waitForNetworkConditionsReadback(selected.tabId, selected.target, waitTimeoutMs, requested)
+    : await waitForNetworkConditionsResetReadback(
+      selected.tabId,
+      selected.target,
+      waitTimeoutMs,
+      NETWORK_BASELINE_BY_TAB.get(selected.tabId)
+    );
+  if (!requested) {
+    NETWORK_BASELINE_BY_TAB.delete(selected.tabId);
+  }
+  return {
+    extension_id: chrome.runtime.id,
+    target_id: after.page.target_id || selected.target.id,
+    tab_id: selected.tabId,
+    chrome_window_id: after.page.chrome_window_id,
+    operation,
+    requested,
+    page_url: after.page.url || "",
+    page_title: after.page.title || "",
+    ready_state: after.page.ready_state || "",
+    network: after.network,
+    before_page: before,
+    before_network: beforeNetwork,
+    readback_backend: "chrome.debugger.Network.emulateNetworkConditions + chrome.scripting.executeScript(MAIN navigator/fetch shim/readback)",
+    backend_tier_used: "chrome_tabs_extension_debugger",
+    required_foreground: false,
+    source_of_truth: "normal Chrome bridge page script navigator.onLine/fetch/networkInformation shim/readback",
+    method: dispatch.method,
+    debugger_protocol_version: dispatch.protocol_version,
+    target_candidate_count: selected.targetCandidateCount,
+    target_selection_reason: selected.selectionReason
+  };
+}
+
 function normalizeCdpInputAction(value) {
   const action = String(value || "").trim().toLowerCase();
   if (action === "hover" || action === "tap" || action === "drag" || action === "html5_drag") {
@@ -3668,6 +3733,113 @@ function rejectMediaResetField(value, fieldName) {
   }
 }
 
+function normalizeNetworkConditionsOperation(value) {
+  const operation = String(value || "set").trim().toLowerCase();
+  if (operation === "set" || operation === "reset") {
+    return operation;
+  }
+  throw bridgeError(
+    ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+    `networkConditions operation must be set or reset; got ${JSON.stringify(value)}`
+  );
+}
+
+function normalizeNetworkConditionsOverride(params) {
+  const offline = normalizeNetworkBoolean(params.offline, "offline", false);
+  const latencyMs = normalizeNetworkNumber(params.latencyMs, "latencyMs", 0, 0, 300000);
+  const downloadThroughputBytesPerSec = normalizeNetworkNumber(
+    params.downloadThroughputBytesPerSec,
+    "downloadThroughputBytesPerSec",
+    -1,
+    -1,
+    1000000000000
+  );
+  const uploadThroughputBytesPerSec = normalizeNetworkNumber(
+    params.uploadThroughputBytesPerSec,
+    "uploadThroughputBytesPerSec",
+    -1,
+    -1,
+    1000000000000
+  );
+  const connectionType = normalizeNetworkConnectionType(params.connectionType);
+  if (
+    !offline &&
+    latencyMs === 0 &&
+    downloadThroughputBytesPerSec === -1 &&
+    uploadThroughputBytesPerSec === -1 &&
+    !connectionType
+  ) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      "networkConditions operation=set requires offline=true, latencyMs, throughput and/or connectionType"
+    );
+  }
+  return {
+    offline,
+    latency_ms: latencyMs,
+    download_throughput_bytes_per_sec: downloadThroughputBytesPerSec,
+    upload_throughput_bytes_per_sec: uploadThroughputBytesPerSec,
+    connection_type: connectionType
+  };
+}
+
+function normalizeNetworkBoolean(value, fieldName, defaultValue) {
+  if (value === null || value === undefined) {
+    return defaultValue;
+  }
+  if (typeof value !== "boolean") {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `networkConditions ${fieldName} must be a boolean; got ${JSON.stringify(value)}`
+    );
+  }
+  return value;
+}
+
+function normalizeNetworkNumber(value, fieldName, defaultValue, minimum, maximum) {
+  if (value === null || value === undefined) {
+    return defaultValue;
+  }
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < minimum || number > maximum || (minimum === -1 && number < 0 && number !== -1)) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `networkConditions ${fieldName} must be finite and in ${minimum}..=${maximum}${minimum === -1 ? " or -1" : ""}; got ${JSON.stringify(value)}`
+    );
+  }
+  return number;
+}
+
+function normalizeNetworkConnectionType(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value !== "string") {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `networkConditions connectionType must be a string; got ${JSON.stringify(value)}`
+    );
+  }
+  const normalized = value.trim().toLowerCase();
+  const allowed = ["none", "cellular2g", "cellular3g", "cellular4g", "bluetooth", "ethernet", "wifi", "wimax", "other"];
+  if (normalized !== value || !allowed.includes(normalized)) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `networkConditions connectionType must be one of ${allowed.join(", ")}`
+    );
+  }
+  return normalized;
+}
+
+function rejectNetworkConditionsResetField(value, fieldName) {
+  if (value !== null && value !== undefined) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `networkConditions ${fieldName} is not valid for operation=reset`
+    );
+  }
+}
+
 async function dispatchDeviceEmulationSet(tabId, descriptor) {
   const debuggee = { tabId };
   const protocolVersion = "1.3";
@@ -3992,6 +4164,78 @@ async function dispatchMediaEmulationReset(tabId) {
         await chrome.debugger.detach(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for mediaEmulation reset tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+}
+
+async function dispatchNetworkConditionsSet(tabId, requested) {
+  const debuggee = { tabId };
+  const protocolVersion = "1.3";
+  let attached = false;
+  try {
+    await chrome.debugger.attach(debuggee, protocolVersion);
+    attached = true;
+    await sendDebuggerCommand(debuggee, "Network.enable", {});
+    const params = {
+      offline: Boolean(requested.offline),
+      latency: Number(requested.latency_ms),
+      downloadThroughput: Number(requested.download_throughput_bytes_per_sec),
+      uploadThroughput: Number(requested.upload_throughput_bytes_per_sec)
+    };
+    if (requested.connection_type) {
+      params.connectionType = requested.connection_type;
+    }
+    await sendDebuggerCommand(debuggee, "Network.emulateNetworkConditions", params);
+    return {
+      method: "Network.enable+Network.emulateNetworkConditions",
+      protocol_version: protocolVersion
+    };
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger networkConditions set failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch (error) {
+        console.warn(`Synapse chrome.debugger detach failed for networkConditions set tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+}
+
+async function dispatchNetworkConditionsReset(tabId) {
+  const debuggee = { tabId };
+  const protocolVersion = "1.3";
+  let attached = false;
+  try {
+    await chrome.debugger.attach(debuggee, protocolVersion);
+    attached = true;
+    await sendDebuggerCommand(debuggee, "Network.enable", {});
+    await sendDebuggerCommand(debuggee, "Network.emulateNetworkConditions", {
+      offline: false,
+      latency: 0,
+      downloadThroughput: -1,
+      uploadThroughput: -1
+    });
+    return {
+      method: "Network.enable+Network.emulateNetworkConditions(default)",
+      protocol_version: protocolVersion
+    };
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger networkConditions reset failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attached) {
+      try {
+        await chrome.debugger.detach(debuggee);
+      } catch (error) {
+        console.warn(`Synapse chrome.debugger detach failed for networkConditions reset tab ${tabId}: ${errorMessage(error)}`);
       }
     }
   }
@@ -4493,6 +4737,105 @@ function sameMediaReadback(left, right) {
   );
 }
 
+async function waitForNetworkConditionsReadback(tabId, fallbackTarget, waitTimeoutMs, requested) {
+  const started = Date.now();
+  let last = null;
+  let lastError = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    try {
+      const page = await tabPageState(tabId, fallbackTarget);
+      const network = await tabNetworkState(tabId);
+      last = { page, network };
+      lastError = null;
+      if (networkConditionsMatchRequest(network, requested)) {
+        return last;
+      }
+    } catch (error) {
+      lastError = error?.message ? String(error.message) : String(error);
+    }
+    await sleep(100);
+  }
+  const detail = last
+    ? `last network=${JSON.stringify(last.network)} requested=${JSON.stringify(requested)}`
+    : lastError
+      ? `last readback error=${JSON.stringify(lastError)}`
+      : "no network readback";
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `networkConditions readback did not settle within ${waitTimeoutMs} ms; ${detail}`);
+}
+
+function networkConditionsMatchRequest(network, requested) {
+  if (!network || !requested) {
+    return false;
+  }
+  if (Boolean(network.online) === Boolean(requested.offline)) {
+    return false;
+  }
+  if (requested.connection_type && String(network.connection_type || "") !== requested.connection_type) {
+    return false;
+  }
+  if (requested.latency_ms > 0 && Math.abs(Number(network.rtt_ms || 0) - Number(requested.latency_ms)) > 1) {
+    return false;
+  }
+  if (requested.download_throughput_bytes_per_sec > 0) {
+    const expectedDownlink = requested.download_throughput_bytes_per_sec * 8 / 1000000;
+    if (Math.abs(Number(network.downlink_mbps || 0) - expectedDownlink) > 0.01) {
+      return false;
+    }
+  }
+  return true;
+}
+
+async function waitForNetworkConditionsResetReadback(tabId, fallbackTarget, waitTimeoutMs, baseline) {
+  if (!baseline) {
+    const page = await tabPageState(tabId, fallbackTarget);
+    const network = await tabNetworkState(tabId);
+    return { page, network };
+  }
+  const started = Date.now();
+  let last = null;
+  let lastError = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    try {
+      const page = await tabPageState(tabId, fallbackTarget);
+      const network = await tabNetworkState(tabId);
+      last = { page, network };
+      lastError = null;
+      if (sameNetworkConditionsReadback(network, baseline)) {
+        return last;
+      }
+    } catch (error) {
+      lastError = error?.message ? String(error.message) : String(error);
+    }
+    await sleep(100);
+  }
+  const detail = last
+    ? `last network=${JSON.stringify(last.network)} baseline=${JSON.stringify(baseline)}`
+    : lastError
+      ? `last readback error=${JSON.stringify(lastError)}`
+      : "no network readback";
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `networkConditions reset readback did not settle within ${waitTimeoutMs} ms; ${detail}`);
+}
+
+function sameNetworkConditionsReadback(left, right) {
+  return (
+    left &&
+    right &&
+    Boolean(left.online) === Boolean(right.online) &&
+    String(left.connection_type || "") === String(right.connection_type || "") &&
+    String(left.effective_type || "") === String(right.effective_type || "") &&
+    optionalNumberSame(left.downlink_mbps, right.downlink_mbps) &&
+    optionalNumberSame(left.rtt_ms, right.rtt_ms) &&
+    Boolean(left.save_data) === Boolean(right.save_data)
+  );
+}
+
+function optionalNumberSame(left, right) {
+  if ((left === null || left === undefined) && (right === null || right === undefined)) {
+    return true;
+  }
+  return Math.abs(Number(left) - Number(right)) <= 0.01;
+}
+
 async function applyViewportDprShim(tabId, deviceScaleFactor) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
@@ -4683,6 +5026,49 @@ async function clearMediaEmulationShim(tabId) {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
       `chrome.scripting.executeScript mediaEmulation(${tabId}) media shim reset failed: ${errorMessage(error)}`
+    );
+  }
+}
+
+async function applyNetworkConditionsShim(tabId, requested) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "MAIN",
+      func: installNetworkConditionsShimInPage,
+      args: [requested]
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript networkConditions(${tabId}) network shim failed: ${errorMessage(error)}`
+    );
+  }
+}
+
+async function clearNetworkConditionsShim(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "MAIN",
+      func: clearNetworkConditionsShimInPage
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript networkConditions(${tabId}) network shim reset failed: ${errorMessage(error)}`
     );
   }
 }
@@ -4980,6 +5366,36 @@ async function tabMediaState(tabId) {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
       `chrome.scripting.executeScript mediaEmulation(${tabId}) returned no media metrics`
+    );
+  }
+  return metrics;
+}
+
+async function tabNetworkState(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
+    );
+  }
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: false },
+      world: "MAIN",
+      func: readNetworkConditionsStateInPage
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript networkConditions(${tabId}) readback failed: ${errorMessage(error)}`
+    );
+  }
+  const metrics = results?.[0]?.result;
+  if (!metrics || typeof metrics !== "object") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript networkConditions(${tabId}) returned no network metrics`
     );
   }
   return metrics;
@@ -5866,6 +6282,219 @@ function clearMediaEmulationShimInPage() {
   };
 }
 
+function installNetworkConditionsShimInPage(requested) {
+  const stateKey = "__synapseNetworkConditionsOverride";
+  const requestedState = requested && typeof requested === "object" ? requested : {};
+  const offline = Boolean(requestedState.offline);
+  const latencyMs = Number.isFinite(Number(requestedState.latency_ms)) ? Number(requestedState.latency_ms) : 0;
+  const downloadThroughput = Number.isFinite(Number(requestedState.download_throughput_bytes_per_sec))
+    ? Number(requestedState.download_throughput_bytes_per_sec)
+    : -1;
+  const uploadThroughput = Number.isFinite(Number(requestedState.upload_throughput_bytes_per_sec))
+    ? Number(requestedState.upload_throughput_bytes_per_sec)
+    : -1;
+  const connectionType = requestedState.connection_type === null || requestedState.connection_type === undefined
+    ? null
+    : String(requestedState.connection_type);
+  const navigatorObject = globalThis.navigator || null;
+  const navigatorProto = navigatorObject ? Object.getPrototypeOf(navigatorObject) : null;
+  let state = globalThis[stateKey];
+  if (!state || typeof state !== "object") {
+    const connection = navigatorObject && navigatorObject.connection ? navigatorObject.connection : null;
+    state = {
+      native_fetch: typeof globalThis.fetch === "function" ? globalThis.fetch : null,
+      fetch_had_own_descriptor: Object.prototype.hasOwnProperty.call(globalThis, "fetch"),
+      fetch_descriptor: Object.getOwnPropertyDescriptor(globalThis, "fetch") || null,
+      navigator_object: navigatorObject,
+      navigator_proto: navigatorProto,
+      navigator_online_had_own_descriptor: navigatorProto ? Object.prototype.hasOwnProperty.call(navigatorProto, "onLine") : false,
+      navigator_online_descriptor: navigatorProto ? Object.getOwnPropertyDescriptor(navigatorProto, "onLine") || null : null,
+      navigator_connection_had_own_descriptor: navigatorObject ? Object.prototype.hasOwnProperty.call(navigatorObject, "connection") : false,
+      navigator_connection_descriptor: navigatorObject ? Object.getOwnPropertyDescriptor(navigatorObject, "connection") || null : null,
+      connection,
+      connection_descriptors: {},
+      synthetic_connection: null,
+      value: {}
+    };
+    Object.defineProperty(globalThis, stateKey, {
+      configurable: true,
+      enumerable: false,
+      writable: true,
+      value: state
+    });
+  }
+  state.value = {
+    offline,
+    latency_ms: Math.max(0, latencyMs),
+    download_throughput_bytes_per_sec: downloadThroughput,
+    upload_throughput_bytes_per_sec: uploadThroughput,
+    connection_type: connectionType
+  };
+  function currentState() {
+    const current = globalThis[stateKey];
+    return current && current.value ? current.value : state.value;
+  }
+  function effectiveType(value) {
+    if (value.connection_type === "cellular2g") {
+      return "2g";
+    }
+    if (value.connection_type === "cellular3g") {
+      return "3g";
+    }
+    if (value.connection_type === "cellular4g") {
+      return "4g";
+    }
+    if (value.offline || value.connection_type === "none") {
+      return "slow-2g";
+    }
+    return null;
+  }
+  function downlinkMbps(value) {
+    const throughput = Number(value.download_throughput_bytes_per_sec);
+    return Number.isFinite(throughput) && throughput > 0 ? throughput * 8 / 1000000 : null;
+  }
+  function delayMs(value) {
+    const latency = Math.max(0, Number(value.latency_ms) || 0);
+    const throughput = Number(value.download_throughput_bytes_per_sec);
+    if (Number.isFinite(throughput) && throughput > 0) {
+      const sampleBytes = 65536;
+      return Math.max(latency, Math.min(5000, Math.max(100, Math.round(sampleBytes / throughput * 1000))));
+    }
+    return latency;
+  }
+  function offlineError() {
+    try {
+      return new TypeError("Failed to fetch");
+    } catch (_) {
+      return new Error("Failed to fetch");
+    }
+  }
+  if (state.navigator_proto) {
+    try {
+      Object.defineProperty(state.navigator_proto, "onLine", {
+        configurable: true,
+        enumerable: true,
+        get() {
+          return !currentState().offline;
+        }
+      });
+    } catch (_) {}
+  }
+  function defineConnectionGetter(target, field, getter) {
+    if (!target) {
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(state.connection_descriptors, field)) {
+      state.connection_descriptors[field] = {
+        had_own: Object.prototype.hasOwnProperty.call(target, field),
+        descriptor: Object.getOwnPropertyDescriptor(target, field) || null
+      };
+    }
+    try {
+      Object.defineProperty(target, field, {
+        configurable: true,
+        enumerable: true,
+        get: getter
+      });
+    } catch (_) {}
+  }
+  let connectionTarget = state.connection;
+  if (!connectionTarget) {
+    state.synthetic_connection = state.synthetic_connection || {};
+    connectionTarget = state.synthetic_connection;
+    if (state.navigator_object) {
+      try {
+        Object.defineProperty(state.navigator_object, "connection", {
+          configurable: true,
+          enumerable: true,
+          get() {
+            return state.synthetic_connection;
+          }
+        });
+      } catch (_) {}
+    }
+  }
+  defineConnectionGetter(connectionTarget, "type", () => currentState().connection_type);
+  defineConnectionGetter(connectionTarget, "effectiveType", () => effectiveType(currentState()));
+  defineConnectionGetter(connectionTarget, "downlink", () => downlinkMbps(currentState()));
+  defineConnectionGetter(connectionTarget, "rtt", () => Math.max(0, Number(currentState().latency_ms) || 0));
+  defineConnectionGetter(connectionTarget, "saveData", () => false);
+  if (typeof state.native_fetch === "function") {
+    Object.defineProperty(globalThis, "fetch", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value(...args) {
+        const value = currentState();
+        const wait = delayMs(value);
+        return new Promise((resolve, reject) => {
+          globalThis.setTimeout(() => {
+            if (currentState().offline) {
+              reject(offlineError());
+              return;
+            }
+            try {
+              Promise.resolve(state.native_fetch.apply(globalThis, args)).then(resolve, reject);
+            } catch (error) {
+              reject(error);
+            }
+          }, wait);
+        });
+      }
+    });
+  }
+  try {
+    globalThis.dispatchEvent(new Event(offline ? "offline" : "online"));
+  } catch (_) {}
+  return {
+    applied: true,
+    requested: state.value
+  };
+}
+
+function clearNetworkConditionsShimInPage() {
+  const stateKey = "__synapseNetworkConditionsOverride";
+  const state = globalThis[stateKey];
+  function restoreDescriptor(target, field, hadOwn, descriptor) {
+    if (!target) {
+      return;
+    }
+    if (hadOwn && descriptor) {
+      try {
+        Object.defineProperty(target, field, descriptor);
+      } catch (_) {}
+    } else {
+      try {
+        delete target[field];
+      } catch (_) {}
+    }
+  }
+  if (state && typeof state === "object") {
+    restoreDescriptor(globalThis, "fetch", state.fetch_had_own_descriptor, state.fetch_descriptor);
+    restoreDescriptor(state.navigator_proto, "onLine", state.navigator_online_had_own_descriptor, state.navigator_online_descriptor);
+    if (state.connection) {
+      for (const [field, saved] of Object.entries(state.connection_descriptors || {})) {
+        restoreDescriptor(state.connection, field, saved.had_own, saved.descriptor);
+      }
+    }
+    if (state.navigator_object && state.synthetic_connection) {
+      restoreDescriptor(
+        state.navigator_object,
+        "connection",
+        state.navigator_connection_had_own_descriptor,
+        state.navigator_connection_descriptor
+      );
+    }
+    delete globalThis[stateKey];
+  }
+  try {
+    globalThis.dispatchEvent(new Event("online"));
+  } catch (_) {}
+  return {
+    cleared: Boolean(state)
+  };
+}
+
 async function readGeolocationStateInPage() {
   const permissionState = await (async () => {
     try {
@@ -5971,6 +6600,27 @@ function readMediaStateInPage() {
     color_scheme_no_preference: matches("(prefers-color-scheme: no-preference)"),
     reduced_motion_reduce: matches("(prefers-reduced-motion: reduce)"),
     reduced_motion_no_preference: matches("(prefers-reduced-motion: no-preference)")
+  };
+}
+
+function readNetworkConditionsStateInPage() {
+  const connection = globalThis.navigator && navigator.connection ? navigator.connection : null;
+  function stringOrNull(value) {
+    return value === null || value === undefined ? null : String(value);
+  }
+  function numberOrNull(value) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
+  }
+  return {
+    online: Boolean(globalThis.navigator ? navigator.onLine : true),
+    connection_type: connection ? stringOrNull(connection.type) : null,
+    effective_type: connection ? stringOrNull(connection.effectiveType) : null,
+    downlink_mbps: connection ? numberOrNull(connection.downlink) : null,
+    rtt_ms: connection ? numberOrNull(connection.rtt) : null,
+    save_data: connection && connection.saveData !== undefined && connection.saveData !== null
+      ? Boolean(connection.saveData)
+      : null
   };
 }
 

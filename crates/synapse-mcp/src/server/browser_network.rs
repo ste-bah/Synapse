@@ -11,8 +11,8 @@ use std::{
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
-        browser_raw_cdp_required_error, cdp_target_id_audit_ref, require_target_session_id,
-        validate_cdp_target_id,
+        browser_raw_cdp_required_error, cdp_target_id_audit_ref, chrome_debugger_default_endpoint,
+        require_target_session_id, validate_cdp_target_id,
     },
     tool, tool_router,
 };
@@ -31,6 +31,7 @@ const HAR_TOOL: &str = "browser_network_har";
 const OVERRIDES_TOOL: &str = "browser_network_overrides";
 const CONDITIONS_TOOL: &str = "browser_network_conditions";
 const ROUTE_TOOL: &str = "browser_route";
+const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const DEFAULT_NETWORK_REQUEST_LIMIT: usize = 100;
 const MAX_NETWORK_REQUEST_LIMIT: usize = 1000;
 const MAX_NETWORK_FILTER_CHARS: usize = 8192;
@@ -1282,7 +1283,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Set or reset target-scoped offline/throttled network conditions for the calling session's owned browser tab. operation=set uses raw CDP Network.emulateNetworkConditions with offline, latency_ms, download_throughput_bytes_per_sec, upload_throughput_bytes_per_sec, and optional connection_type; omitted numeric fields default to online/full-speed values. operation=reset restores online/full-speed defaults. Returns same-target navigator.onLine and Network Information API readback; use browser_network_requests or browser_wait_for_request/response as independent FSV timing evidence. Target-scoped and foreground-capable without activating the human OS foreground tab; never falls back to the human foreground tab. Raw CDP only; the popup-safe normal Chrome extension bridge fails closed."
+        description = "Set or reset target-scoped offline/throttled network conditions for the calling session's owned browser tab. Raw CDP targets use Network.emulateNetworkConditions; normal Chrome bridge chrome-tab:* targets use the networkConditions bridge lane in the already-open authenticated profile with MAIN-world navigator/fetch/networkInformation readback. operation=set applies offline, latency_ms, download_throughput_bytes_per_sec, upload_throughput_bytes_per_sec, and optional connection_type; omitted numeric fields default to online/full-speed values. operation=reset restores online/full-speed defaults. Returns same-target navigator.onLine and Network Information API readback; use page text/fetch timing or browser_network_requests on raw-CDP targets as independent FSV timing evidence. Target-scoped and foreground-capable without activating the human OS foreground tab; never falls back to the human foreground tab."
     )]
     pub async fn browser_network_conditions(
         &self,
@@ -1937,6 +1938,16 @@ impl SynapseService {
         conditions: &NormalizedBrowserNetworkConditionsParams,
     ) -> Result<BrowserNetworkConditionsResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
+            if cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+                return self
+                    .browser_network_conditions_bridge_impl(
+                        session_id,
+                        window_hwnd,
+                        cdp_target_id,
+                        conditions,
+                    )
+                    .await;
+            }
             return Err(browser_raw_cdp_required_error(CONDITIONS_TOOL, window_hwnd));
         };
         let result = match conditions.operation {
@@ -1981,6 +1992,61 @@ impl SynapseService {
             "readback=Network.emulateNetworkConditions+Runtime.evaluate outcome=network_state"
         );
         Ok(browser_network_conditions_response(
+            session_id,
+            window_hwnd,
+            result,
+        ))
+    }
+
+    #[cfg(windows)]
+    async fn browser_network_conditions_bridge_impl(
+        &self,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        conditions: &NormalizedBrowserNetworkConditionsParams,
+    ) -> Result<BrowserNetworkConditionsResponse, ErrorData> {
+        let operation = match conditions.operation {
+            BrowserNetworkConditionsOperation::Set => "set",
+            BrowserNetworkConditionsOperation::Reset => "reset",
+        };
+        let requested = conditions.requested.as_ref();
+        let result = crate::chrome_debugger_bridge::network_conditions(
+            crate::chrome_debugger_bridge::ChromeDebuggerNetworkConditionsRequest {
+                hwnd: window_hwnd,
+                target_id: cdp_target_id,
+                operation,
+                offline: requested.map(|value| value.offline),
+                latency_ms: requested.map(|value| value.latency_ms),
+                download_throughput_bytes_per_sec: requested
+                    .map(|value| value.download_throughput_bytes_per_sec),
+                upload_throughput_bytes_per_sec: requested
+                    .map(|value| value.upload_throughput_bytes_per_sec),
+                connection_type: requested.and_then(|value| value.connection_type.as_deref()),
+                wait_timeout_ms: 10_000,
+            },
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "{CONDITIONS_TOOL} normal Chrome bridge network conditions failed for target {cdp_target_id:?}: {}",
+                    error.detail()
+                ),
+            )
+        })?;
+        tracing::info!(
+            code = "CHROME_BRIDGE_NETWORK_CONDITIONS",
+            session_id = %session_id,
+            hwnd = window_hwnd,
+            cdp_target_id,
+            operation = ?conditions.operation,
+            online = result.network.online,
+            requested_offline = conditions.requested.as_ref().map(|requested| requested.offline),
+            "readback=chrome.debugger.Network+chrome.scripting.executeScript outcome=network_state"
+        );
+        Ok(browser_network_conditions_bridge_response(
             session_id,
             window_hwnd,
             result,
@@ -4250,6 +4316,56 @@ fn browser_network_conditions_response(
     }
 }
 
+fn browser_network_conditions_bridge_response(
+    session_id: &str,
+    window_hwnd: i64,
+    result: crate::chrome_debugger_bridge::ChromeDebuggerNetworkConditionsResult,
+) -> BrowserNetworkConditionsResponse {
+    BrowserNetworkConditionsResponse {
+        session_id: session_id.to_owned(),
+        window_hwnd,
+        transport: "chrome_tabs_extension".to_owned(),
+        endpoint: chrome_debugger_default_endpoint(),
+        cdp_target_id: result.target_id,
+        operation: match result.operation.as_str() {
+            "reset" => BrowserNetworkConditionsOperation::Reset,
+            _ => BrowserNetworkConditionsOperation::Set,
+        },
+        requested: result
+            .requested
+            .map(|requested| BrowserNetworkConditionsOverride {
+                offline: requested.offline,
+                latency_ms: requested.latency_ms,
+                download_throughput_bytes_per_sec: requested.download_throughput_bytes_per_sec,
+                upload_throughput_bytes_per_sec: requested.upload_throughput_bytes_per_sec,
+                connection_type: requested.connection_type,
+            }),
+        page_url: result.page_url,
+        page_title: result.page_title,
+        ready_state: result.ready_state,
+        network: BrowserNetworkConditionsReadback {
+            online: result.network.online,
+            connection_type: result.network.connection_type,
+            effective_type: result.network.effective_type,
+            downlink_mbps: result.network.downlink_mbps,
+            rtt_ms: result.network.rtt_ms,
+            save_data: result.network.save_data,
+        },
+        readback_backend: if result.readback_backend.is_empty() {
+            "chrome.debugger.Network.emulateNetworkConditions + chrome.scripting.executeScript"
+                .to_owned()
+        } else {
+            result.readback_backend
+        },
+        backend_tier_used: if result.backend_tier_used.is_empty() {
+            "chrome_tabs_extension_debugger".to_owned()
+        } else {
+            result.backend_tier_used
+        },
+        required_foreground: result.required_foreground,
+    }
+}
+
 fn require_response_body_available(entry: &synapse_a11y::CdpNetworkEntry) -> Result<(), ErrorData> {
     if !entry.response_received {
         return Err(mcp_error(
@@ -5111,6 +5227,64 @@ mod tests {
             response.readback_backend,
             "Network.emulateNetworkConditions + Runtime.evaluate"
         );
+    }
+
+    #[test]
+    fn browser_network_conditions_bridge_response_maps_readback() {
+        let response = browser_network_conditions_bridge_response(
+            "session-1",
+            100,
+            crate::chrome_debugger_bridge::ChromeDebuggerNetworkConditionsResult {
+                extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+                target_id: "chrome-tab:7".to_owned(),
+                tab_id: 7,
+                chrome_window_id: Some(3),
+                operation: "set".to_owned(),
+                requested: Some(
+                    crate::chrome_debugger_bridge::ChromeDebuggerNetworkConditionsOverride {
+                        offline: true,
+                        latency_ms: 100.0,
+                        download_throughput_bytes_per_sec: 50_000.0,
+                        upload_throughput_bytes_per_sec: 20_000.0,
+                        connection_type: Some("cellular3g".to_owned()),
+                    },
+                ),
+                page_url: "https://example.test/".to_owned(),
+                page_title: "Example".to_owned(),
+                ready_state: "complete".to_owned(),
+                network: crate::chrome_debugger_bridge::ChromeDebuggerNetworkConditionsReadback {
+                    online: false,
+                    connection_type: Some("cellular3g".to_owned()),
+                    effective_type: Some("3g".to_owned()),
+                    downlink_mbps: Some(0.4),
+                    rtt_ms: Some(100.0),
+                    save_data: Some(false),
+                },
+                readback_backend: String::new(),
+                backend_tier_used: String::new(),
+                required_foreground: false,
+                source_of_truth: String::new(),
+                method: "Network.enable+Network.emulateNetworkConditions".to_owned(),
+                debugger_protocol_version: Some("1.3".to_owned()),
+                target_candidate_count: 1,
+                target_selection_reason: "targetIdHint".to_owned(),
+            },
+        );
+        assert_eq!(response.transport, "chrome_tabs_extension");
+        assert_eq!(response.operation, BrowserNetworkConditionsOperation::Set);
+        assert!(!response.network.online);
+        assert_eq!(response.network.effective_type.as_deref(), Some("3g"));
+        assert_eq!(
+            response
+                .requested
+                .as_ref()
+                .unwrap()
+                .connection_type
+                .as_deref(),
+            Some("cellular3g")
+        );
+        assert_eq!(response.backend_tier_used, "chrome_tabs_extension_debugger");
+        assert!(!response.required_foreground);
     }
 
     #[test]
