@@ -48,6 +48,8 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "approval_request",
     "armed_routine_tick",
     "audit_intelligence_query",
+    "demo_record_start",
+    "demo_record_stop",
     "browser_add_init_script",
     "browser_add_script_tag",
     "browser_add_style_tag",
@@ -125,6 +127,9 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "local_model_update",
     "observe",
     "observe_delta",
+    "profile_authoring_generate",
+    "profile_authoring_inspect",
+    "profile_authoring_list",
     "profile_list",
     "read_text",
     "reality_audit",
@@ -811,6 +816,15 @@ impl SynapseService {
                         None,
                     );
                 }
+                if !self.tool_profile_assignment_surface_is_current(&row.record)? {
+                    return self.write_tool_profile_assignment(
+                        session_id,
+                        row.record.profile,
+                        row.record.source.clone(),
+                        row.record.reason.clone(),
+                        row.record.set_by_session_id.clone(),
+                    );
+                }
                 Ok(row)
             }
             None => {
@@ -825,6 +839,17 @@ impl SynapseService {
                 self.write_tool_profile_assignment(session_id, profile, source, None, None)
             }
         }
+    }
+
+    fn tool_profile_assignment_surface_is_current(
+        &self,
+        record: &ToolProfileAssignment,
+    ) -> Result<bool, ErrorData> {
+        let full_tool_names = self.full_tool_names();
+        let allowed_tool_names = visible_tool_names_for_profile(record.profile, &full_tool_names);
+        Ok(record.allowed_tool_count == allowed_tool_names.len()
+            && record.allowed_tool_sha256 == sha256_json_hex(&allowed_tool_names)?
+            && record.denied_break_glass_tools == denied_break_glass_tools(&allowed_tool_names))
     }
 
     /// True when `session_id` belongs to a Synapse-spawned local-model agent
@@ -1574,6 +1599,11 @@ mod tests {
         assert!(tools.contains(&"suggestion_list".to_owned()));
         assert!(tools.contains(&"suggestion_accept".to_owned()));
         assert!(tools.contains(&"tool_profile_status".to_owned()));
+        assert!(tools.contains(&"demo_record_start".to_owned()));
+        assert!(tools.contains(&"demo_record_stop".to_owned()));
+        assert!(tools.contains(&"profile_authoring_generate".to_owned()));
+        assert!(tools.contains(&"profile_authoring_inspect".to_owned()));
+        assert!(tools.contains(&"profile_authoring_list".to_owned()));
         assert!(!tools.contains(&"act_click".to_owned()));
         assert!(!tools.contains(&"act_type".to_owned()));
         assert!(!tools.contains(&"release_all".to_owned()));
@@ -1595,6 +1625,86 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(hex_lower(&stored[0].0), row.key_hex);
         assert_eq!(sha256_hex(&stored[0].1), row.value_sha256);
+    }
+
+    #[test]
+    fn existing_profile_assignment_self_heals_stale_allowed_surface() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let session_id = "issue844-stale-surface-session";
+        let fresh = service
+            .write_tool_profile_assignment(
+                session_id,
+                ToolProfileKind::NormalAgent,
+                "operator_selected_normal",
+                Some("preserve explicit source while refreshing surface".to_owned()),
+                Some("operator-session".to_owned()),
+            )
+            .expect("write fresh row");
+
+        let mut stale = fresh.record.clone();
+        stale.allowed_tool_count = 1;
+        stale.allowed_tool_sha256 = "sha256:stale-tool-surface".to_owned();
+        stale.denied_break_glass_tools = vec!["demo_record_start".to_owned()];
+        let stale_encoded = synapse_storage::encode_json(&stale).expect("encode stale row");
+        let db = service.m3_storage().expect("storage");
+        db.put_batch_pressure_bypass(
+            cf::CF_SESSIONS,
+            [(tool_profile_key(session_id), stale_encoded.clone())],
+        )
+        .expect("write stale row");
+
+        let stale_readback = service
+            .read_tool_profile_assignment(session_id)
+            .expect("read stale row")
+            .expect("stale row exists");
+        assert_eq!(
+            stale_readback.record.allowed_tool_sha256,
+            stale.allowed_tool_sha256
+        );
+        assert_eq!(stale_readback.value_sha256, sha256_hex(&stale_encoded));
+
+        let snapshot = service
+            .tool_profile_snapshot(Some(session_id))
+            .expect("snapshot self-heals stale surface");
+        let row = snapshot.policy_row.as_ref().expect("policy row readback");
+        assert_eq!(row.record.profile, ToolProfileKind::NormalAgent);
+        assert_eq!(row.record.source, "operator_selected_normal");
+        assert_eq!(
+            row.record.reason.as_deref(),
+            Some("preserve explicit source while refreshing surface")
+        );
+        assert_eq!(
+            row.record.set_by_session_id.as_deref(),
+            Some("operator-session")
+        );
+        assert_eq!(row.record.allowed_tool_count, snapshot.visible_tool_count);
+        assert_eq!(row.record.allowed_tool_sha256, snapshot.visible_tool_sha256);
+        assert_eq!(
+            row.record.denied_break_glass_tools,
+            snapshot.denied_break_glass_tools
+        );
+        assert_ne!(row.value_sha256, sha256_hex(&stale_encoded));
+        assert!(
+            snapshot
+                .visible_tool_names
+                .contains(&"demo_record_start".to_owned())
+        );
+        assert!(
+            snapshot
+                .visible_tool_names
+                .contains(&"profile_authoring_generate".to_owned())
+        );
+
+        let persisted = service
+            .read_tool_profile_assignment(session_id)
+            .expect("read healed row")
+            .expect("healed row exists");
+        assert_eq!(
+            persisted.record.allowed_tool_sha256,
+            snapshot.visible_tool_sha256
+        );
+        assert_eq!(persisted.value_sha256, row.value_sha256);
     }
 
     #[test]
