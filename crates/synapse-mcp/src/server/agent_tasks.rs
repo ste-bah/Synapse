@@ -66,6 +66,9 @@ const MAX_LIST_TASKS: usize = 1000;
 /// Default global cap on concurrently in-flight (`in_progress`) tasks the
 /// dispatcher will allow. Operators override per call.
 const DEFAULT_CONCURRENCY_CAP: usize = 8;
+/// Dashboard dispatches are often approval-gated by a human; keep them above
+/// the generic MCP spawn default so permission prompts do not exhaust readback.
+const DASHBOARD_TASK_DISPATCH_WAIT_TIMEOUT_MS: u64 = 600_000;
 
 /// The lifecycle states a task moves through. `done`/`cancelled` are terminal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -566,6 +569,14 @@ pub(crate) fn dispatch_decision(tasks: &[AgentTask], concurrency_cap: usize) -> 
     winner.map_or(DispatchDecision::Empty, |task| DispatchDecision::Dispatch {
         task_id: task.task_id.clone(),
     })
+}
+
+const fn dashboard_task_dispatch_wait_timeout_ms(requested: u64) -> u64 {
+    if requested < DASHBOARD_TASK_DISPATCH_WAIT_TIMEOUT_MS {
+        DASHBOARD_TASK_DISPATCH_WAIT_TIMEOUT_MS
+    } else {
+        requested
+    }
 }
 
 /// Orders tasks for the queue view: todo tasks in dispatch order, then the rest
@@ -1216,6 +1227,7 @@ impl SynapseService {
         };
 
         let task = Self::read_task(&db, &task_id)?.ok_or_else(|| task_not_found(&task_id))?;
+        let wait_timeout_ms = dashboard_task_dispatch_wait_timeout_ms(params.wait_timeout_ms);
         let request = ActSpawnAgentRequest {
             template_id: Some(task.template_id.clone()),
             template_version: None,
@@ -1228,7 +1240,7 @@ impl SynapseService {
             target: None,
             working_dir: None,
             mcp_url: params.mcp_url,
-            wait_timeout_ms: params.wait_timeout_ms,
+            wait_timeout_ms,
             hold_open_ms: default_agent_spawn_hold_open_ms(),
             require_approval_gate: crate::m4::default_require_approval_gate(),
         };
@@ -1844,6 +1856,18 @@ mod tests {
         assert_eq!(
             dispatch_decision(&tasks, 2),
             DispatchDecision::AtCapacity { in_flight: 2 }
+        );
+    }
+
+    #[test]
+    fn dashboard_dispatch_wait_timeout_floors_human_approval_budget() {
+        assert_eq!(
+            dashboard_task_dispatch_wait_timeout_ms(default_agent_spawn_wait_timeout_ms()),
+            DASHBOARD_TASK_DISPATCH_WAIT_TIMEOUT_MS
+        );
+        assert_eq!(
+            dashboard_task_dispatch_wait_timeout_ms(DASHBOARD_TASK_DISPATCH_WAIT_TIMEOUT_MS + 1),
+            DASHBOARD_TASK_DISPATCH_WAIT_TIMEOUT_MS + 1
         );
     }
 

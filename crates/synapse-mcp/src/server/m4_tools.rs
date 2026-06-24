@@ -1736,7 +1736,7 @@ impl SynapseService {
         timing.mark_session_wait_started();
         let session_wait_deadline =
             agent_spawn_wait_deadline_from(Instant::now(), params.wait_timeout_ms)?;
-        let matched = match self
+        let mut matched = match self
             .wait_for_spawned_agent_session(
                 &params,
                 agent_kind,
@@ -1801,7 +1801,9 @@ impl SynapseService {
                 &params,
                 agent_kind,
                 &spawn_id,
-                &matched,
+                &mut matched,
+                &before_session_ids,
+                launched_at_unix_ms,
                 launch_response.pid,
                 &files,
                 task_wait_deadline,
@@ -2262,7 +2264,9 @@ impl SynapseService {
         params: &ActSpawnAgentParams,
         agent_kind: ActSpawnAgentCli,
         spawn_id: &str,
-        matched: &MatchedSpawnSession,
+        matched: &mut MatchedSpawnSession,
+        before_session_ids: &BTreeSet<String>,
+        launched_at_unix_ms: u64,
         launcher_pid: u32,
         files: &AgentSpawnFiles,
         deadline: Instant,
@@ -2272,7 +2276,48 @@ impl SynapseService {
             "task_started_path": files.task_started_path.display().to_string(),
         });
         while !agent_spawn_deadline_remaining(deadline).is_zero() {
-            self.require_spawned_agent_session_live(&matched.session_id, files, agent_kind)?;
+            if let Err(liveness_error) =
+                self.require_spawned_agent_session_live(&matched.session_id, files, agent_kind)
+            {
+                match self.rebind_spawned_agent_session_for_task_start(
+                    params,
+                    agent_kind,
+                    spawn_id,
+                    before_session_ids,
+                    launched_at_unix_ms,
+                    launcher_pid,
+                    files,
+                    &liveness_error,
+                )? {
+                    Some(rebound) => {
+                        *matched = rebound;
+                    }
+                    None => {
+                        last_observed = json!({
+                            "reason": "matched_session_not_live_waiting_for_replacement",
+                            "matched_session_id": matched.session_id,
+                            "task_started_path": files.task_started_path.display().to_string(),
+                            "session_liveness_error": liveness_error,
+                            "readiness_files": agent_spawn_readiness_file_readback(files),
+                            "observed_task_progress": agent_spawn_observed_task_progress(files, agent_kind),
+                        });
+                        if process_has_exited(launcher_pid) {
+                            return Err(json!({
+                                "reason": "launcher_process_exited_after_matched_session_closed",
+                                "launcher_process_id": launcher_pid,
+                                "task_started_path": files.task_started_path.display().to_string(),
+                                "completion_status": read_json_file_lossy(&files.completion_status_path),
+                                "stdout_tail": tail_file_lossy(&files.stdout_path, AGENT_SPAWN_LOG_TAIL_BYTES),
+                                "stderr_tail": tail_file_lossy(&files.stderr_path, AGENT_SPAWN_LOG_TAIL_BYTES),
+                                "final_message_tail": tail_file_lossy(&files.final_message_path, AGENT_SPAWN_LOG_TAIL_BYTES),
+                                "last_observed": last_observed,
+                            }));
+                        }
+                        sleep_agent_spawn_poll(deadline).await;
+                        continue;
+                    }
+                }
+            }
             match read_agent_spawn_task_start_artifact(
                 files, params, agent_kind, spawn_id, matched,
             )? {
@@ -2314,6 +2359,105 @@ impl SynapseService {
             "reason": "task_start_artifact_timeout",
             "task_started_path": files.task_started_path.display().to_string(),
             "last_observed": last_observed,
+        }))
+    }
+
+    fn rebind_spawned_agent_session_for_task_start(
+        &self,
+        params: &ActSpawnAgentParams,
+        agent_kind: ActSpawnAgentCli,
+        spawn_id: &str,
+        before_session_ids: &BTreeSet<String>,
+        launched_at_unix_ms: u64,
+        launcher_pid: u32,
+        files: &AgentSpawnFiles,
+        liveness_error: &serde_json::Value,
+    ) -> Result<Option<MatchedSpawnSession>, serde_json::Value> {
+        let candidates = self
+            .spawn_session_candidates_for_readiness(params.target.is_some())
+            .map_err(|error| {
+                json!({
+                    "reason": "spawn_rebind_candidate_read_failed",
+                    "error": error.message,
+                    "data": error.data,
+                    "session_liveness_error": liveness_error,
+                })
+            })?;
+        let explicit_task_session_id = task_start_session_id_for_spawn(files, spawn_id);
+        let observed_task_progress = agent_spawn_observed_task_progress(files, agent_kind);
+        let mut ready_candidates = Vec::new();
+        let mut lenient_candidates = Vec::new();
+        let mut candidate_readiness = Vec::new();
+        for candidate in &candidates {
+            let readiness = spawn_session_candidate_readiness_from_read(
+                &candidate.registry,
+                candidate.active_target.as_ref(),
+                agent_kind,
+                params.target.as_ref(),
+                before_session_ids,
+                launched_at_unix_ms,
+            );
+            let reason = readiness
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            if candidate_readiness.len() < AGENT_SPAWN_RECORDED_ATTEMPT_LIMIT
+                && reason != "session_existed_before_spawn"
+            {
+                candidate_readiness.push(json!({
+                    "session_id": candidate.registry.session_id,
+                    "started_at_unix_ms": candidate.registry.started_at_unix_ms,
+                    "last_action": candidate.registry.last_action,
+                    "active_target": candidate.active_target,
+                    "readiness": readiness.clone(),
+                }));
+            }
+            if explicit_task_session_id.as_deref() == Some(candidate.registry.session_id.as_str())
+                && spawn_session_identity_matches_from_read(
+                    &candidate.registry,
+                    agent_kind,
+                    before_session_ids,
+                    launched_at_unix_ms,
+                )
+            {
+                return Ok(Some(MatchedSpawnSession {
+                    session_id: candidate.registry.session_id.clone(),
+                    registered_at_unix_ms: unix_time_ms_now(),
+                    agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
+                }));
+            }
+            if readiness.get("ready").and_then(Value::as_bool) == Some(true) {
+                ready_candidates.push(candidate.registry.session_id.clone());
+            } else if reason == "tool_call_not_observed" && observed_task_progress.is_some() {
+                lenient_candidates.push(candidate.registry.session_id.clone());
+            }
+        }
+
+        let bind = if ready_candidates.len() == 1 {
+            Some(ready_candidates[0].clone())
+        } else if ready_candidates.is_empty() && lenient_candidates.len() == 1 {
+            Some(lenient_candidates[0].clone())
+        } else if ready_candidates.len() + lenient_candidates.len() > 1 {
+            return Err(json!({
+                "reason": "spawn_rebind_ambiguous",
+                "explicit_task_session_id": explicit_task_session_id,
+                "ready_candidate_count": ready_candidates.len(),
+                "lenient_candidate_count": lenient_candidates.len(),
+                "ready_candidates": ready_candidates,
+                "lenient_candidates": lenient_candidates,
+                "candidate_readiness": candidate_readiness,
+                "session_liveness_error": liveness_error,
+                "readiness_files": agent_spawn_readiness_file_readback(files),
+                "observed_task_progress": observed_task_progress,
+            }));
+        } else {
+            None
+        };
+
+        Ok(bind.map(|session_id| MatchedSpawnSession {
+            session_id,
+            registered_at_unix_ms: unix_time_ms_now(),
+            agent_process_id: discover_agent_process_id(launcher_pid, agent_kind),
         }))
     }
 
@@ -6068,6 +6212,104 @@ mod tests {
             &before_session_ids,
             1_000,
         ));
+    }
+
+    #[test]
+    fn task_start_rebinds_from_closed_codex_bootstrap_session_to_live_reconnect() {
+        let service = SynapseService::new();
+        let dir = tempfile::TempDir::new().expect("temp");
+        let files = observed_progress_test_files(dir.path());
+        let params = test_spawn_params();
+        let launch_ms = unix_time_ms_now();
+        let spawn_id = "agent-spawn-rebind-test";
+        let old_session_id = "codex-bootstrap-closed";
+        let new_session_id = "codex-live-reconnect";
+        let mut before_session_ids = BTreeSet::new();
+        before_session_ids.insert("operator-session".to_owned());
+
+        let spawned_metadata = || SpawnedAgentRead {
+            spawn_id: spawn_id.to_owned(),
+            cli: "codex".to_owned(),
+            launcher_process_id: 4242,
+            agent_process_id: Some(5252),
+            started_by_session_id: Some("operator-session".to_owned()),
+            launched_at_unix_ms: launch_ms,
+            launch_target: "none".to_owned(),
+            log_dir: dir.path().display().to_string(),
+            template_id: None,
+            template_version: None,
+            control: None,
+        };
+
+        {
+            let mut registry = service
+                .session_registry_ref()
+                .lock()
+                .expect("session registry");
+            registry.record_spawned_agent(old_session_id, spawned_metadata(), launch_ms + 10);
+            registry.record_seen(
+                old_session_id,
+                Some("tools/list".to_owned()),
+                launch_ms + 20,
+            );
+            registry.record_closed_with_reason(
+                old_session_id,
+                launch_ms + 30,
+                Some("http_session_store_deleted"),
+            );
+            registry.record_spawned_agent(new_session_id, spawned_metadata(), launch_ms + 40);
+            registry.record_seen(
+                new_session_id,
+                Some("tools/list".to_owned()),
+                launch_ms + 50,
+            );
+        }
+
+        let liveness_error = json!({
+            "reason": "spawned_session_not_live",
+            "session_id": old_session_id,
+        });
+        let no_progress = service
+            .rebind_spawned_agent_session_for_task_start(
+                &params,
+                ActSpawnAgentCli::Codex,
+                spawn_id,
+                &before_session_ids,
+                launch_ms,
+                4242,
+                &files,
+                &liveness_error,
+            )
+            .expect("rebind read succeeds");
+        assert!(
+            no_progress.is_none(),
+            "a live replacement without daemon-observed task progress must not be rebound"
+        );
+
+        fs::write(
+            files.codex_app_server_control_path.as_ref().unwrap(),
+            serde_json::to_vec(&json!({
+                "thread_id": "019ef79d-abb2-71e0-9e91-3d1f5a34dd9b",
+                "turn_status": "inProgress"
+            }))
+            .expect("encode codex control"),
+        )
+        .expect("write codex control");
+        let rebound = service
+            .rebind_spawned_agent_session_for_task_start(
+                &params,
+                ActSpawnAgentCli::Codex,
+                spawn_id,
+                &before_session_ids,
+                launch_ms,
+                4242,
+                &files,
+                &liveness_error,
+            )
+            .expect("rebind read succeeds")
+            .expect("progress-backed replacement session binds");
+
+        assert_eq!(rebound.session_id, new_session_id);
     }
 
     #[test]

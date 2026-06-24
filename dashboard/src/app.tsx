@@ -168,6 +168,8 @@ const routeDefinitions: RouteDefinition[] = [
   { id: "audit", label: "Audit", title: "Audit Explorer", icon: ShieldCheck }
 ];
 
+const TASK_BOARD_DISPATCH_WAIT_TIMEOUT_MS = 600000;
+
 // Alias routes resolve to a canonical view but stay valid as deep-link / stored
 // route ids (so bookmarks, saved views, and persisted UI state never land on a
 // blank route).
@@ -263,6 +265,8 @@ export function App() {
     queryKey: ["dashboard-saved-views"],
     queryFn: fetchSavedViews
   });
+  const normalizedRoute = normalizeRoute(route);
+  const activeLiveScope = dashboardLiveScopeForRoute(normalizedRoute);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -276,12 +280,13 @@ export function App() {
 
   useEffect(() => {
     const controller = createDashboardLiveController({
+      scopes: [activeLiveScope],
       onStateChange: setLiveState,
       onScopeEvent: (scope) => invalidateDashboardScope(queryClient, scope)
     });
     controller.start();
     return () => controller.stop();
-  }, [queryClient]);
+  }, [activeLiveScope, queryClient]);
 
   useEffect(() => {
     const syncFromHash = () => {
@@ -377,9 +382,7 @@ export function App() {
   const state = query.data;
   const freshnessMs = state ? nowMs - state.generated_at_unix_ms : undefined;
   const stale = query.isError || (freshnessMs !== undefined && freshnessMs > 10000);
-  const normalizedRoute = normalizeRoute(route);
   const activeRoute = routeDefinitions.find((item) => item.id === normalizedRoute) ?? routeDefinitions[0];
-  const activeLiveScope = dashboardLiveScopeForRoute(normalizedRoute);
   const activeLive = dashboardLiveLabel(liveState[activeLiveScope], nowMs);
 
   const commands = useMemo(
@@ -527,7 +530,7 @@ export function App() {
         }
       />
 
-      <LiveDataStrip liveState={liveState} nowMs={nowMs} />
+      <LiveDataStrip liveState={liveState} activeScope={activeLiveScope} nowMs={nowMs} />
 
       {normalizedRoute === "fleet" ? (
         <FleetView
@@ -584,11 +587,22 @@ function invalidateDashboardScope(queryClient: QueryClient, scope: DashboardPane
   }
 }
 
-function LiveDataStrip({ liveState, nowMs }: { liveState: DashboardLiveState; nowMs: number }) {
+function LiveDataStrip({
+  liveState,
+  activeScope,
+  nowMs
+}: {
+  liveState: DashboardLiveState;
+  activeScope: DashboardPanelScope;
+  nowMs: number;
+}) {
   return (
     <div className="mb-4 flex flex-wrap items-center gap-2" role="status" aria-live="polite">
       {DASHBOARD_LIVE_SCOPES.map((scope) => {
-        const label = dashboardLiveLabel(liveState[scope], nowMs);
+        const label =
+          scope === activeScope
+            ? dashboardLiveLabel(liveState[scope], nowMs)
+            : { text: "SSE paused", tone: "muted" as const };
         return (
           <span
             key={scope}
@@ -1665,7 +1679,10 @@ function TasksView({
       if (task && nextTaskId && nextTaskId !== task.task_id) {
         throw new Error(`dispatcher will select ${nextTaskId} before ${task.task_id}`);
       }
-      const readback = await dispatchAgentTaskOnce({ concurrency_cap: cap || undefined });
+      const readback = await dispatchAgentTaskOnce({
+        concurrency_cap: cap || undefined,
+        wait_timeout_ms: TASK_BOARD_DISPATCH_WAIT_TIMEOUT_MS
+      });
       return readback.task ? `Dispatched ${readback.task.task_id}` : `Dispatch ${readback.decision}`;
     });
 
