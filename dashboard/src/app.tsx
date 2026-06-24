@@ -76,6 +76,7 @@ import {
   dashboardAssetReloadUrl,
   decideApproval,
   deleteDashboardView,
+  fetchAgentEvents,
   fetchAuditQuery,
   fetchTemplates,
   putTemplate,
@@ -107,6 +108,8 @@ import {
   updateAgentPlan,
   updateAgentTask,
   updateRoutine,
+  type AgentEventQueryRow,
+  type AgentEventsQueryResponse,
   type AgentTaskAttempt,
   type AgentTaskRow,
   type AgentTaskState,
@@ -3183,7 +3186,11 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
       const tokens = asRecord(stats.tokens);
       return {
         anchor: rawText(row.anchor || row.spawn_id || row.session_id || "unknown"),
+        spawnId: rawText(row.spawn_id),
+        sessionId: rawText(row.session_id),
         events: numberOrZero(stats.events_total),
+        firstEventNs: numberOrUndefined(stats.first_event_ns),
+        lastEventNs: numberOrUndefined(stats.last_event_ns),
         startedPerMin: numberOrUndefined(actions.tool_calls_started_per_min),
         finished: numberOrZero(actions.tool_calls_finished),
         errorRate: numberOrUndefined(errors.error_rate),
@@ -3211,6 +3218,36 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
   const visibleSpawnRows = perSpawnRows.slice(0, 12);
   const visibleAgentStatsRows = perAgentStatsRows.slice(0, 24);
   const visibleStatsWatchRows = statsWatchRows.slice(0, 12);
+  const zeroTurnRows = perSpawnRows.filter((row) => row.turnCount === 0);
+  const burnBuckets = agentBurnBuckets(perAgentStatsRows, perSpawnRows);
+  const emptyBurnWindow = emptyAgentBurnWindow(burnBuckets, perAgentStatsRows);
+  const [selectedBurnId, setSelectedBurnId] = useState("");
+  useEffect(() => {
+    if (selectedBurnId === "empty-window") return;
+    if (!burnBuckets.length) {
+      if (selectedBurnId) setSelectedBurnId("");
+      return;
+    }
+    if (!burnBuckets.some((bucket) => bucket.bucketId === selectedBurnId)) {
+      setSelectedBurnId(burnBuckets[0].bucketId);
+    }
+  }, [burnBuckets, selectedBurnId]);
+  const selectedBurnBucket = burnBuckets.find((bucket) => bucket.bucketId === selectedBurnId);
+  const selectedBurnWindow = selectedBurnId === "empty-window" ? emptyBurnWindow : selectedBurnBucket;
+  const eventWindowQuery = useQuery<AgentEventsQueryResponse>({
+    queryKey: ["dashboard-agent-events-window", selectedBurnWindow?.bucketId, selectedBurnWindow?.startNs, selectedBurnWindow?.endNs],
+    enabled: Boolean(selectedBurnWindow),
+    queryFn: () => {
+      if (!selectedBurnWindow) throw new Error("No burn window selected");
+      return fetchAgentEvents({
+        start_ts_ns: Math.floor(selectedBurnWindow.startNs),
+        end_ts_ns: Math.floor(selectedBurnWindow.endNs),
+        limit: 100,
+        scan_limit: 20_000
+      });
+    }
+  });
+  const eventRows: AgentEventQueryRow[] = eventWindowQuery.data?.rows ?? [];
   const costReadback = {
     agent_cost: {
       status: costPanel?.status,
@@ -3234,7 +3271,8 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
       per_agent_total: perAgentStatsRows.length,
       per_agent_visible: visibleAgentStatsRows.map((row) => row.raw),
       watch_total: statsWatchRows.length,
-      watch_visible: visibleStatsWatchRows.map((row) => row.raw)
+      watch_visible: visibleStatsWatchRows.map((row) => row.raw),
+      burn_buckets: burnBuckets
     },
     transcript_fallback: {
       usage_rows_total: usagePoints.length,
@@ -3264,9 +3302,10 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
         <StatCard label="Error Rate" value={formatPercentValue(numberOrUndefined(statsErrors.error_rate))} status={numberOrZero(statsErrors.errored_tool_calls) ? "needs_input" : "done"} delta={`${numberOrZero(statsErrors.errored_tool_calls)} errored calls`} />
         <StatCard label="Usage Rows" value={usagePoints.length} status={usagePoints.length ? "working" : "idle"} delta={state?.agent_transcripts.source || "CF_AGENT_TRANSCRIPTS"} />
         <StatCard label="Runaway Watch" value={runawayRows.length + statsWatchRows.length} status={runawayRows.length || statsWatchRows.length ? "needs_input" : "done"} delta="stuck / error / high burn" />
+        <StatCard label="Zero-turn Spawns" value={zeroTurnRows.length} status={zeroTurnRows.length ? "needs_input" : "done"} delta="edge coverage" />
       </div>
 
-      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+      <div className="mt-4 grid gap-4 xl:grid-cols-3">
         <div className="h-56 rounded-lg border border-border bg-surface-1 p-3">
           {splitData.length ? (
             <ResponsiveContainer width="100%" height="100%">
@@ -3297,6 +3336,95 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
             <EmptyState title="No usage-bearing transcript rows" />
           )}
         </div>
+        <div className="h-56 rounded-lg border border-border bg-surface-1 p-3">
+          {burnBuckets.length ? (
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={burnBuckets} margin={{ top: 8, right: 8, bottom: 8, left: 8 }}>
+                <CartesianGrid stroke="var(--border-subtle)" vertical={false} />
+                <XAxis dataKey="label" stroke="var(--text-muted)" tickLine={false} axisLine={false} fontSize={12} />
+                <YAxis stroke="var(--text-muted)" tickLine={false} axisLine={false} fontSize={12} />
+                <ChartTooltip contentStyle={{ background: "var(--surface-3)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
+                <Bar
+                  dataKey="tokens"
+                  fill="var(--accent)"
+                  radius={[4, 4, 0, 0]}
+                  name="burn tokens"
+                  cursor="pointer"
+                  minPointSize={3}
+                  onClick={(entry) => {
+                    const payload = asRecord(asRecord(entry).payload || entry);
+                    const bucketId = rawText(payload.bucketId);
+                    if (bucketId) setSelectedBurnId(bucketId);
+                  }}
+                />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <EmptyState title="No event-time burn buckets" />
+          )}
+        </div>
+      </div>
+
+      <div className="mt-4 rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-primary">
+              <Rows3 aria-hidden="true" className="h-4 w-4 text-info" />
+              <h3 className="text-md font-medium tracking-normal">Burn Window Journal</h3>
+            </div>
+            <p className="mt-1 truncate text-xs text-muted">
+              {selectedBurnWindow ? `${selectedBurnWindow.label} · ${formatNsWindow(selectedBurnWindow.startNs, selectedBurnWindow.endNs)}` : "No burn window selected"}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {burnBuckets.slice(0, 6).map((bucket) => (
+              <Button
+                key={bucket.bucketId}
+                type="button"
+                variant={bucket.bucketId === selectedBurnId ? "secondary" : "ghost"}
+                size="sm"
+                onClick={() => setSelectedBurnId(bucket.bucketId)}
+              >
+                {bucket.label}
+              </Button>
+            ))}
+            <Button
+              type="button"
+              variant={selectedBurnId === "empty-window" ? "secondary" : "ghost"}
+              size="sm"
+              onClick={() => setSelectedBurnId("empty-window")}
+            >
+              Empty window
+            </Button>
+            <Button type="button" variant="ghost" size="sm" onClick={() => eventWindowQuery.refetch()} disabled={!selectedBurnWindow || eventWindowQuery.isFetching}>
+              <RefreshCw aria-hidden="true" className="h-4 w-4" />
+              Refresh
+            </Button>
+          </div>
+        </div>
+        {eventWindowQuery.isError ? <div className="mb-3 rounded-md border border-danger-border bg-danger-bg p-3 text-sm text-danger-fg">{rawText(eventWindowQuery.error)}</div> : null}
+        <div className="mb-3 grid gap-3 md:grid-cols-4">
+          <MetricRow label="Rows" value={`${eventRows.length}/${eventWindowQuery.data?.matched_rows ?? 0}`} />
+          <MetricRow label="Scanned" value={rawText(eventWindowQuery.data?.scanned_rows ?? 0)} />
+          <MetricRow label="Partial" value={eventWindowQuery.data?.partial ? "yes" : "no"} />
+          <MetricRow label="Source" value={eventWindowQuery.data?.source_of_truth || "CF_AGENT_EVENTS"} />
+        </div>
+        {eventRows.length ? (
+          <DataTable
+            data={eventRows}
+            getRowId={(row) => row.key_hex}
+            columns={[
+              { id: "time", header: "Time", cell: ({ row }) => nsToTime(row.original.ts_ns) || rawText(row.original.ts_ns) },
+              { id: "kind", header: "Kind", cell: ({ row }) => row.original.kind },
+              { id: "spawn", header: "Spawn", cell: ({ row }) => row.original.spawn_id || "-" },
+              { id: "session", header: "Session", cell: ({ row }) => row.original.session_id || "-" },
+              { id: "key", header: "Key", cell: ({ row }) => shortKey(row.original.key_hex) }
+            ]}
+          />
+        ) : (
+          <EmptyStateArt title={eventWindowQuery.isFetching ? "Loading event rows" : "No agent events in selected burn window"} />
+        )}
+        <RawValue value={{ selected_window: selectedBurnWindow, query: eventWindowQuery.data }} label="Burn window readback" />
       </div>
 
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
@@ -3478,6 +3606,82 @@ function agentCostGroupRows(value: unknown) {
       raw: row
     }))
     .sort((a, b) => b.tokens - a.tokens);
+}
+
+function agentBurnBuckets(
+  statsRows: Array<{
+    anchor: string;
+    spawnId: string;
+    sessionId: string;
+    events: number;
+    finished: number;
+    firstEventNs?: number;
+    lastEventNs?: number;
+  }>,
+  spawnRows: Array<{ spawnId: string; tokens: number }>
+) {
+  const tokensBySpawn = new Map(spawnRows.map((row) => [row.spawnId, row.tokens]));
+  const buckets = new Map<string, {
+    bucketId: string;
+    label: string;
+    startNs: number;
+    endNs: number;
+    tokens: number;
+    events: number;
+    actions: number;
+    agents: string[];
+  }>();
+  const bucketNs = 60 * 60 * 1_000_000_000;
+  for (const row of statsRows) {
+    if (row.firstEventNs === undefined || row.lastEventNs === undefined) continue;
+    const startNs = Math.floor(row.firstEventNs / bucketNs) * bucketNs;
+    const endNs = startNs + bucketNs;
+    const bucketId = String(startNs);
+    const bucket = buckets.get(bucketId) ?? {
+      bucketId,
+      label: nsToTime(startNs) || shortKey(bucketId),
+      startNs,
+      endNs,
+      tokens: 0,
+      events: 0,
+      actions: 0,
+      agents: []
+    };
+    const tokenKey = row.spawnId || row.anchor;
+    bucket.tokens += tokensBySpawn.get(tokenKey) ?? 0;
+    bucket.events += row.events;
+    bucket.actions += row.finished;
+    if (bucket.agents.length < 12) bucket.agents.push(row.anchor);
+    buckets.set(bucketId, bucket);
+  }
+  return Array.from(buckets.values()).sort((a, b) => a.startNs - b.startNs);
+}
+
+function emptyAgentBurnWindow(
+  buckets: ReturnType<typeof agentBurnBuckets>,
+  statsRows: Array<{ lastEventNs?: number }>
+) {
+  const bucketNs = 60 * 60 * 1_000_000_000;
+  const latest = Math.max(
+    0,
+    ...buckets.map((bucket) => bucket.endNs),
+    ...statsRows.map((row) => row.lastEventNs ?? 0)
+  );
+  const startNs = Math.floor(latest / bucketNs) * bucketNs + bucketNs;
+  return {
+    bucketId: "empty-window",
+    label: "Empty window",
+    startNs,
+    endNs: startNs + bucketNs,
+    tokens: 0,
+    events: 0,
+    actions: 0,
+    agents: []
+  };
+}
+
+function formatNsWindow(startNs: number, endNs: number): string {
+  return `${nsToTime(startNs) || rawText(startNs)}-${nsToTime(endNs) || rawText(endNs)}`;
 }
 
 function costOutcome(value: unknown): { label: string; microUsd?: number } {

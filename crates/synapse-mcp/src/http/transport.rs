@@ -31,7 +31,7 @@ use sha2::{Digest as _, Sha256};
 #[cfg(test)]
 use synapse_action::ActionHandle;
 use synapse_action::ActionStateSnapshot;
-use synapse_core::{EventFilter, EventSource, Health};
+use synapse_core::{AgentEventKind, AgentEventRecord, EventFilter, EventSource, Health};
 use synapse_storage::{Db, cf};
 use tokio::{
     net::TcpListener,
@@ -555,6 +555,10 @@ fn router(
             get(dashboard_agent_terminal_ws),
         )
         .route("/dashboard/audit/query", get(dashboard_audit_query))
+        .route(
+            "/dashboard/agent-events/query",
+            get(dashboard_agent_events_query),
+        )
         .route(
             "/dashboard/saved-views",
             get(dashboard_saved_views)
@@ -2377,6 +2381,53 @@ struct DashboardAuditQueryRequest {
     row_kind: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DashboardAgentEventsQueryRequest {
+    limit: Option<usize>,
+    scan_limit: Option<usize>,
+    start_ts_ns: Option<u64>,
+    end_ts_ns: Option<u64>,
+    spawn_id: Option<String>,
+    session_id: Option<String>,
+    kind: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardAgentEventRow {
+    key_hex: String,
+    ts_ns: u64,
+    seq: u32,
+    kind: String,
+    spawn_id: Option<String>,
+    session_id: Option<String>,
+    record: AgentEventRecord,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardAgentEventsQueryResponse {
+    ok: bool,
+    source_of_truth: &'static str,
+    filters: DashboardAgentEventsQueryFilters,
+    limit: usize,
+    scan_limit: usize,
+    scanned_rows: usize,
+    matched_rows: usize,
+    returned_count: usize,
+    corrupt_row_count: usize,
+    partial: bool,
+    exhausted: bool,
+    rows: Vec<DashboardAgentEventRow>,
+}
+
+#[derive(Debug, Serialize)]
+struct DashboardAgentEventsQueryFilters {
+    start_ts_ns: Option<u64>,
+    end_ts_ns: Option<u64>,
+    spawn_id: Option<String>,
+    session_id: Option<String>,
+    kind: Option<String>,
+}
+
 async fn dashboard_index(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     if let Err(response) = dashboard_local_only(&state, &headers) {
         return with_dashboard_security_headers(response);
@@ -3435,6 +3486,166 @@ async fn dashboard_audit_query(
             ))
         }
     }
+}
+
+async fn dashboard_agent_events_query(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(request): Query<DashboardAgentEventsQueryRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match dashboard_agent_event_rows(&state.agent_events_db, request) {
+        Ok(response) => with_dashboard_security_headers(Json(response).into_response()),
+        Err(response) => with_dashboard_security_headers(response),
+    }
+}
+
+fn dashboard_agent_event_rows(
+    db: &Db,
+    request: DashboardAgentEventsQueryRequest,
+) -> Result<DashboardAgentEventsQueryResponse, Response> {
+    let limit = request.limit.unwrap_or(100).clamp(1, 500);
+    let scan_limit = request.scan_limit.unwrap_or(10_000).clamp(limit, 50_000);
+    if let (Some(start), Some(end)) = (request.start_ts_ns, request.end_ts_ns)
+        && start >= end
+    {
+        return Err(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            "DASHBOARD_AGENT_EVENTS_RANGE_INVALID",
+            "start_ts_ns must be less than end_ts_ns",
+            Some(serde_json::json!({
+                "start_ts_ns": start,
+                "end_ts_ns": end,
+            })),
+        ));
+    }
+    let spawn_id = request
+        .spawn_id
+        .and_then(|value| trim_optional_non_empty(&value));
+    let session_id = request
+        .session_id
+        .and_then(|value| trim_optional_non_empty(&value));
+    let kind = request
+        .kind
+        .and_then(|value| trim_optional_non_empty(&value));
+    let filters = DashboardAgentEventsQueryFilters {
+        start_ts_ns: request.start_ts_ns,
+        end_ts_ns: request.end_ts_ns,
+        spawn_id,
+        session_id,
+        kind,
+    };
+
+    let mut scanned_rows = 0_usize;
+    let mut matched_rows = 0_usize;
+    let mut corrupt_row_count = 0_usize;
+    let mut rows = Vec::with_capacity(limit.min(128));
+    let mut start =
+        synapse_storage::agent_events::agent_event_scan_start(filters.start_ts_ns.unwrap_or(0));
+    let mut exhausted = true;
+
+    'paging: loop {
+        if scanned_rows >= scan_limit {
+            exhausted = false;
+            break;
+        }
+        let (batch, more) = db
+            .scan_cf_from(cf::CF_AGENT_EVENTS, &start, 512)
+            .map_err(|error| dashboard_storage_error_response("agent events read failed", error))?;
+        if batch.is_empty() {
+            break;
+        }
+        for (key, value) in &batch {
+            let (ts_ns, seq) = match synapse_storage::agent_events::decode_agent_event_key(key) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    corrupt_row_count += 1;
+                    tracing::warn!(
+                        code = synapse_core::error_codes::STORAGE_CORRUPTED,
+                        detail = %error,
+                        "dashboard agent event key decode failed"
+                    );
+                    continue;
+                }
+            };
+            if let Some(end) = filters.end_ts_ns
+                && ts_ns >= end
+            {
+                break 'paging;
+            }
+            scanned_rows += 1;
+            if scanned_rows > scan_limit {
+                exhausted = false;
+                break 'paging;
+            }
+            let record: AgentEventRecord = match synapse_storage::decode_json(value) {
+                Ok(record) => record,
+                Err(error) => {
+                    corrupt_row_count += 1;
+                    tracing::warn!(
+                        code = synapse_core::error_codes::STORAGE_CORRUPTED,
+                        ts_ns,
+                        seq,
+                        detail = %error,
+                        "dashboard agent event row decode failed"
+                    );
+                    continue;
+                }
+            };
+            if let Some(want) = filters.spawn_id.as_deref()
+                && record.spawn_id.as_deref() != Some(want)
+            {
+                continue;
+            }
+            if let Some(want) = filters.session_id.as_deref()
+                && record.session_id.as_deref() != Some(want)
+            {
+                continue;
+            }
+            let kind_label = dashboard_agent_event_kind(record.kind);
+            if let Some(want) = filters.kind.as_deref()
+                && kind_label != want
+            {
+                continue;
+            }
+            matched_rows += 1;
+            if rows.len() < limit {
+                rows.push(DashboardAgentEventRow {
+                    key_hex: dashboard_hex_encode(key),
+                    ts_ns,
+                    seq,
+                    kind: kind_label.to_owned(),
+                    spawn_id: record.spawn_id.clone(),
+                    session_id: record.session_id.clone(),
+                    record,
+                });
+            }
+        }
+        if !more {
+            break;
+        }
+        let Some((last_key, _value)) = batch.last() else {
+            break;
+        };
+        start = dashboard_key_after(last_key);
+    }
+    let partial = !exhausted || matched_rows > rows.len();
+    Ok(DashboardAgentEventsQueryResponse {
+        ok: true,
+        source_of_truth: "CF_AGENT_EVENTS bounded physical row scan",
+        filters,
+        limit,
+        scan_limit,
+        scanned_rows,
+        matched_rows,
+        returned_count: rows.len(),
+        corrupt_row_count,
+        partial,
+        exhausted,
+        rows,
+    })
 }
 
 fn dashboard_saved_view_rows(db: &Db) -> Result<(Vec<DashboardSavedViewRow>, usize), Response> {
@@ -5164,6 +5375,39 @@ fn dashboard_error_code(error: &rmcp::ErrorData) -> String {
         .unwrap_or_else(|| format!("{:?}", error.code))
 }
 
+fn dashboard_agent_event_kind(kind: AgentEventKind) -> &'static str {
+    match kind {
+        AgentEventKind::SpawnRequested => "spawn_requested",
+        AgentEventKind::SpawnReady => "spawn_ready",
+        AgentEventKind::StateChanged => "state_changed",
+        AgentEventKind::ToolCallStarted => "tool_call_started",
+        AgentEventKind::ToolCallFinished => "tool_call_finished",
+        AgentEventKind::TurnStarted => "turn_started",
+        AgentEventKind::TurnFinished => "turn_finished",
+        AgentEventKind::MessageSent => "message_sent",
+        AgentEventKind::MessageReceived => "message_received",
+        AgentEventKind::LeaseAcquired => "lease_acquired",
+        AgentEventKind::LeaseReleased => "lease_released",
+        AgentEventKind::Interrupted => "interrupted",
+        AgentEventKind::Killed => "killed",
+        AgentEventKind::Exited => "exited",
+    }
+}
+
+fn dashboard_key_after(key: &[u8]) -> Vec<u8> {
+    let mut next = key.to_vec();
+    next.push(0);
+    next
+}
+
+fn dashboard_hex_encode(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}
+
 fn dashboard_context_resolve_live_session_id(
     state: &HttpState,
     requested_session_id: &str,
@@ -5884,11 +6128,11 @@ fn dashboard_unix_time_ms() -> u64 {
 }
 
 const DASHBOARD_CSS_FILE: &str = "dashboard-MWT7M6XZ.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-DsFDcxvx.js";
+const DASHBOARD_JS_FILE: &str = "dashboard-CffunRjo.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
     include_str!("../../../../dashboard/dist/assets/dashboard-MWT7M6XZ.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-DsFDcxvx.js");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-CffunRjo.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

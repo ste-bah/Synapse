@@ -240,6 +240,41 @@ export interface AuditQueryResponse {
   rows: AuditQueryRow[];
 }
 
+export interface AgentEventsQueryRequest {
+  limit?: number | string;
+  scan_limit?: number | string;
+  start_ts_ns?: number | string;
+  end_ts_ns?: number | string;
+  spawn_id?: string;
+  session_id?: string;
+  kind?: string;
+}
+
+export interface AgentEventQueryRow {
+  key_hex: string;
+  ts_ns: number;
+  seq: number;
+  kind: string;
+  spawn_id?: string | null;
+  session_id?: string | null;
+  record: Record<string, unknown>;
+}
+
+export interface AgentEventsQueryResponse {
+  ok: boolean;
+  source_of_truth: string;
+  filters: Record<string, unknown>;
+  limit: number;
+  scan_limit: number;
+  scanned_rows: number;
+  matched_rows: number;
+  returned_count: number;
+  corrupt_row_count: number;
+  partial: boolean;
+  exhausted: boolean;
+  rows: AgentEventQueryRow[];
+}
+
 export interface SaveDashboardViewRequest {
   view_id?: string;
   name: string;
@@ -780,6 +815,24 @@ export async function fetchAuditQuery(filters: AuditQueryFilters): Promise<Audit
   return {
     ...query,
     rows: asArray<AuditQueryRow>(query.rows)
+  };
+}
+
+export async function fetchAgentEvents(filters: AgentEventsQueryRequest): Promise<AgentEventsQueryResponse> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(filters)) {
+    if (value === undefined || value === null || value === "") continue;
+    params.set(key, String(value));
+  }
+  const suffix = params.toString();
+  const response = await fetch(`/dashboard/agent-events/query${suffix ? `?${suffix}` : ""}`, {
+    cache: "no-store",
+    credentials: "same-origin"
+  });
+  const body = await readJsonOrThrow(response);
+  return {
+    ...(body as unknown as AgentEventsQueryResponse),
+    rows: asArray<AgentEventQueryRow>(body.rows)
   };
 }
 
