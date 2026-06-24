@@ -1707,7 +1707,7 @@ fn build_session_summary(
             || has_persisted_cdp_owner)
             .then(|| synthetic_registry_read(session_id, now_unix_ms, stale_after_ms))
     })?;
-    let agent_state = super::agent_state::read_for_session(session_id, now_unix_ms);
+    let raw_agent_state = super::agent_state::read_for_session(session_id, now_unix_ms);
     let lease = SessionLeaseReadback {
         held: lease_status.held,
         owner_session_id: lease_status.owner_session_id.clone(),
@@ -1724,9 +1724,10 @@ fn build_session_summary(
         &target_claims,
         all_target_claims,
         &lease,
-        agent_state.as_ref(),
+        raw_agent_state.as_ref(),
         has_persisted_cdp_owner,
     );
+    let agent_state = session_agent_state_readback(&registry, raw_agent_state);
     Some(SessionSummary {
         registry,
         active_target: active_target_wire,
@@ -1805,6 +1806,17 @@ fn recent_live_session_supersedes_terminal_history(
         && registry.last_action.is_some()
         && registry.last_seen_ms_ago < DEAD_LIVE_SESSION_CLEANUP_MIN_QUIET_MS
         && agent_state.is_some_and(|read| read.attention_class.is_terminal_history())
+}
+
+fn session_agent_state_readback(
+    registry: &SessionRegistryRead,
+    agent_state: Option<AgentStateRead>,
+) -> Option<AgentStateRead> {
+    if recent_live_session_supersedes_terminal_history(registry, agent_state.as_ref()) {
+        None
+    } else {
+        agent_state
+    }
 }
 
 fn terminal_dead_agent_state(agent_state: Option<&AgentStateRead>) -> bool {
@@ -3056,6 +3068,48 @@ mod tests {
                 &status_response(Some(leased))
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn session_agent_state_readback_hides_terminal_history_for_recent_live_sessions() {
+        let now_unix_ms = 1_000_000;
+        let mut recent_live = synthetic_registry_read("recent-live", now_unix_ms, 500);
+        recent_live.lifecycle = "live".to_owned();
+        recent_live.last_seen_ms_ago = DEAD_LIVE_SESSION_CLEANUP_MIN_QUIET_MS - 1;
+        recent_live.last_seen_unix_ms = now_unix_ms.saturating_sub(recent_live.last_seen_ms_ago);
+        recent_live.last_action = Some("tools/call:session_list".to_owned());
+
+        let mut terminal = agent_read(
+            "recent-live",
+            AgentLifecycleState::Dead,
+            Some("unprobeable_silent_ended"),
+        );
+        terminal.session_id = Some("recent-live".to_owned());
+        terminal.spawn_id = None;
+
+        assert!(recent_live_session_supersedes_terminal_history(
+            &recent_live,
+            Some(&terminal)
+        ));
+        assert!(session_agent_state_readback(&recent_live, Some(terminal)).is_none());
+
+        let mut quiet_live = recent_live;
+        quiet_live.last_action = None;
+        let mut quiet_terminal = agent_read(
+            "quiet-live",
+            AgentLifecycleState::Dead,
+            Some("unprobeable_silent_ended"),
+        );
+        quiet_terminal.session_id = Some("quiet-live".to_owned());
+        quiet_terminal.spawn_id = None;
+
+        let preserved = session_agent_state_readback(&quiet_live, Some(quiet_terminal))
+            .expect("quiet live terminal history remains visible for cleanup decisions");
+        assert_eq!(preserved.state, AgentLifecycleState::Dead);
+        assert_eq!(
+            preserved.attention_class,
+            AgentAttentionClass::TerminalRuntimeFailure
         );
     }
 
