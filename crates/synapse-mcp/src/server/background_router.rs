@@ -361,32 +361,61 @@ impl SynapseService {
             "read" => {
                 let session_id = target_act_session_id(&request_context, "read")?;
                 let target = self.session_target(Some(&session_id))?;
-                if target_act_read_delegated_tool(target.as_ref()) == "cdp_target_info" {
-                    let response = self
-                        .cdp_target_info(
-                            Parameters(CdpTargetInfoParams {
-                                window_hwnd: None,
-                                cdp_target_id: None,
-                            }),
-                            request_context,
+                let request_details = json!({
+                    "session_id": &session_id,
+                    "verb": "read",
+                    "requires_agent_logical_foreground": true,
+                    "no_human_os_foreground_fallback": true,
+                });
+                match target_act_read_delegated_tool(target.as_ref()) {
+                    Ok("cdp_target_info") => {
+                        let response = self
+                            .cdp_target_info(
+                                Parameters(CdpTargetInfoParams {
+                                    window_hwnd: None,
+                                    cdp_target_id: None,
+                                }),
+                                request_context,
+                            )
+                            .await?;
+                        (
+                            "cdp_target_info",
+                            true,
+                            TARGET_ACT_STATUS_OK,
+                            target_act_result(&response.0)?,
                         )
-                        .await?;
-                    (
-                        "cdp_target_info",
-                        true,
-                        TARGET_ACT_STATUS_OK,
-                        target_act_result(&response.0)?,
-                    )
-                } else {
-                    let response = self
-                        .observe(Parameters(ObserveParams::default()), request_context)
-                        .await?;
-                    (
-                        "observe",
-                        true,
-                        TARGET_ACT_STATUS_OK,
-                        target_act_result(&response.0)?,
-                    )
+                    }
+                    Ok("observe") => {
+                        let response = self
+                            .observe(Parameters(ObserveParams::default()), request_context)
+                            .await?;
+                        (
+                            "observe",
+                            true,
+                            TARGET_ACT_STATUS_OK,
+                            target_act_result(&response.0)?,
+                        )
+                    }
+                    Ok(other) => {
+                        return Err(mcp_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            format!("target_act read resolved unknown delegated tool {other:?}"),
+                        ));
+                    }
+                    Err(error) => {
+                        self.audit_action_denied_with_details_for_session(
+                            "target_act",
+                            &error,
+                            &request_details,
+                            &session_id,
+                        );
+                        (
+                            "observe",
+                            false,
+                            target_act_error_status(&error),
+                            target_act_error_result("target_act", error),
+                        )
+                    }
                 }
             }
             "screenshot" => {
@@ -4415,10 +4444,16 @@ fn target_act_focus_window_preflight(
     }
 }
 
-fn target_act_read_delegated_tool(target: Option<&SessionTarget>) -> &'static str {
+fn target_act_read_delegated_tool(
+    target: Option<&SessionTarget>,
+) -> Result<&'static str, ErrorData> {
     match target {
-        Some(SessionTarget::Cdp { .. }) => "cdp_target_info",
-        Some(SessionTarget::Window { .. }) | None => "observe",
+        Some(SessionTarget::Cdp { .. }) => Ok("cdp_target_info"),
+        Some(SessionTarget::Window { .. }) => Ok("observe"),
+        None => Err(mcp_error(
+            error_codes::TARGET_NOT_SET,
+            "target_act verb=read requires this MCP session to have an agent_logical_foreground/foreground_lane target; refusing observe's legacy human OS foreground fallback",
+        )),
     }
 }
 
@@ -6252,17 +6287,32 @@ mod tests {
         };
 
         assert_eq!(
-            target_act_read_delegated_tool(Some(&target)),
+            target_act_read_delegated_tool(Some(&target))
+                .expect("cdp target routes to target info"),
             "cdp_target_info"
         );
     }
 
     #[test]
-    fn target_act_read_routes_window_and_unset_targets_to_observe() {
+    fn target_act_read_routes_window_targets_to_observe() {
         let target = SessionTarget::Window { hwnd: 0x1234 };
 
-        assert_eq!(target_act_read_delegated_tool(Some(&target)), "observe");
-        assert_eq!(target_act_read_delegated_tool(None), "observe");
+        assert_eq!(
+            target_act_read_delegated_tool(Some(&target)).expect("window target routes to observe"),
+            "observe"
+        );
+    }
+
+    #[test]
+    fn target_act_read_without_target_refuses_foreground_fallback() {
+        let error =
+            target_act_read_delegated_tool(None).expect_err("missing target should fail closed");
+
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TARGET_NOT_SET)
+        );
+        assert_eq!(target_act_error_status(&error), TARGET_ACT_STATUS_REFUSED);
     }
 
     #[test]
