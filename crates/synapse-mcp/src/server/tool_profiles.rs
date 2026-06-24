@@ -111,6 +111,9 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "control_lease_handoff",
     "control_lease_release",
     "control_lease_status",
+    "episode_get",
+    "episode_list",
+    "episode_segment",
     "escalation_ack",
     "escalation_list",
     "find",
@@ -118,6 +121,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "get_target",
     "health",
     "hygiene_flags",
+    "hygiene_report",
     "hygiene_scan_storage",
     "hygiene_scan_text",
     "local_model_list",
@@ -134,6 +138,9 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "read_text",
     "reality_audit",
     "reality_baseline",
+    "routine_inspect",
+    "routine_list",
+    "routine_mine",
     "session_end",
     "session_list",
     "session_status",
@@ -156,6 +163,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "timeline_get",
     "timeline_pause",
     "timeline_purge",
+    "timeline_redact",
     "timeline_resume",
     "timeline_search",
     "timeline_stats",
@@ -1610,10 +1618,16 @@ mod tests {
         assert!(tools.contains(&"profile_authoring_generate".to_owned()));
         assert!(tools.contains(&"profile_authoring_inspect".to_owned()));
         assert!(tools.contains(&"profile_authoring_list".to_owned()));
+        assert!(tools.contains(&"hygiene_report".to_owned()));
+        assert!(tools.contains(&"episode_segment".to_owned()));
+        assert!(tools.contains(&"routine_mine".to_owned()));
+        assert!(tools.contains(&"routine_list".to_owned()));
+        assert!(tools.contains(&"routine_inspect".to_owned()));
         assert!(tools.contains(&"timeline_pause".to_owned()));
         assert!(tools.contains(&"timeline_resume".to_owned()));
         assert!(tools.contains(&"timeline_exclusions".to_owned()));
         assert!(tools.contains(&"timeline_purge".to_owned()));
+        assert!(tools.contains(&"timeline_redact".to_owned()));
         assert!(tools.contains(&"storage_put_probe_rows".to_owned()));
         assert!(tools.contains(&"storage_gc_once".to_owned()));
         assert!(!tools.contains(&"act_click".to_owned()));

@@ -412,6 +412,7 @@ const DESTRUCTIVE_MCP_TOOLS: &[&str] = &[
     "storage_gc_once",
     "storage_put_probe_rows",
     "timeline_purge",
+    "timeline_redact",
     "target_release",
     "release_all",
     "session_end",
@@ -502,6 +503,7 @@ mod tests {
         assert!(classify("mcp__synapse__storage_gc_once", &json!({})).destructive());
         assert!(classify("mcp__synapse__storage_put_probe_rows", &json!({})).destructive());
         assert!(classify("mcp__synapse__timeline_purge", &json!({})).destructive());
+        assert!(classify("mcp__synapse__timeline_redact", &json!({})).destructive());
         assert!(classify("mcp__synapse__act_click", &json!({})).is_gate());
     }
 }
