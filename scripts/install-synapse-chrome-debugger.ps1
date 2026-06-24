@@ -1005,139 +1005,6 @@ function Get-SynapseChromeWindowByHwnd {
     @(Get-SynapseChromeTopLevelWindows | Where-Object { $_.hwnd -eq $Hwnd } | Select-Object -First 1)[0]
 }
 
-function Invoke-SynapseChromeBridgeExistingExtensionRepair {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$ChromeUserDataRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$ProfileName,
-        [Parameter(Mandatory = $true)]
-        [string]$ExtensionId,
-        [Parameter(Mandatory = $true)]
-        [string]$ExtensionDir,
-        [Parameter(Mandatory = $true)]
-        [pscustomobject]$ChromeWindow,
-        [Parameter(Mandatory = $true)]
-        [datetime]$Deadline,
-        [Parameter(Mandatory = $true)]
-        [int]$TimeoutSeconds,
-        [Parameter(Mandatory = $true)]
-        [pscustomobject]$Before,
-        [string]$SuccessReason = 'repaired_existing_unpacked_extension_permissions'
-    )
-
-    $actions = New-Object System.Collections.Generic.List[string]
-    [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$ChromeWindow.hwnd, 5) | Out-Null
-    [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$ChromeWindow.hwnd) | Out-Null
-    Start-Sleep -Milliseconds 300
-    Set-Clipboard -Value "chrome://extensions/?id=$ExtensionId"
-    Send-SynapseNativeKeyTap -VirtualKey 0x1B
-    Start-Sleep -Milliseconds 200
-    Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x4C))
-    Start-Sleep -Milliseconds 250
-    Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x56))
-    Start-Sleep -Milliseconds 250
-    Send-SynapseNativeKeyTap -VirtualKey 0x0D
-
-    $detailWindow = Wait-SynapseUntil -Deadline $Deadline -Probe {
-        $currentWindow = Get-SynapseChromeWindowByHwnd -Hwnd $ChromeWindow.hwnd
-        if (-not $currentWindow) {
-            return $null
-        }
-        $reloadButton = Find-SynapseAutomationElementByAutomationId `
-            -Root $currentWindow.element `
-            -AutomationId 'dev-reload-button' `
-            -ControlType ([System.Windows.Automation.ControlType]::Button)
-        $enableToggle = Find-SynapseAutomationElementByAutomationId `
-            -Root $currentWindow.element `
-            -AutomationId 'enableToggle' `
-            -ControlType ([System.Windows.Automation.ControlType]::Button)
-        if ($reloadButton -or $enableToggle) {
-            return $currentWindow
-        }
-        return $null
-    }
-    if (-not $detailWindow) {
-        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_DETAIL_NOT_FOUND active_profile=$ProfileName timeout_s=$TimeoutSeconds remediation=Chrome did not expose the existing Synapse extension detail page for permission repair"
-    }
-
-    for ($attempt = 0; $attempt -lt 3; $attempt++) {
-        $currentWindow = Get-SynapseChromeWindowByHwnd -Hwnd $ChromeWindow.hwnd
-        if (-not $currentWindow) {
-            break
-        }
-
-        $acceptPermissions = Find-SynapseAutomationElementByName `
-            -Root $currentWindow.element `
-            -Name 'Accept permissions' `
-            -ControlType ([System.Windows.Automation.ControlType]::Button)
-        if ($acceptPermissions) {
-            Invoke-SynapseAutomationElement -Element $acceptPermissions -Description 'Accept permissions'
-            $actions.Add('accept_permissions') | Out-Null
-            Start-Sleep -Seconds 2
-        }
-
-        foreach ($automationId in @('updateNow', 'dev-reload-button')) {
-            $button = Find-SynapseAutomationElementByAutomationId `
-                -Root $currentWindow.element `
-                -AutomationId $automationId `
-                -ControlType ([System.Windows.Automation.ControlType]::Button)
-            if ($button) {
-                Invoke-SynapseAutomationElement -Element $button -Description $automationId
-                $actions.Add($automationId) | Out-Null
-                Start-Sleep -Seconds 3
-            }
-        }
-
-        $readyRow = Wait-SynapseUntil -Deadline ((Get-Date).AddSeconds(8)) -Probe {
-            $row = Test-SynapseChromeBridgeProfileRow `
-                -ChromeUserDataRoot $ChromeUserDataRoot `
-                -ProfileName $ProfileName `
-                -ExtensionId $ExtensionId `
-                -ExtensionDir $ExtensionDir
-            if ($row.ready) {
-                return $row
-            }
-            return $null
-        }
-        if ($readyRow) {
-            return [pscustomobject]@{
-                attempted = $true
-                changed = $true
-                reason = $SuccessReason
-                active_profile = $ProfileName
-                chrome_window_hwnd = $ChromeWindow.hwnd
-                repair_actions = @($actions)
-                before = $Before
-                after = $readyRow
-            }
-        }
-
-        $currentWindow = Get-SynapseChromeWindowByHwnd -Hwnd $ChromeWindow.hwnd
-        if (-not $currentWindow) {
-            break
-        }
-        $enableToggle = Find-SynapseAutomationElementByAutomationId `
-            -Root $currentWindow.element `
-            -AutomationId 'enableToggle' `
-            -ControlType ([System.Windows.Automation.ControlType]::Button)
-        if ($enableToggle -and [string]$enableToggle.Current.Name -eq 'Off') {
-            Invoke-SynapseAutomationElementMouseClick -Element $enableToggle -Description 'enableToggle'
-            $actions.Add('enableToggle') | Out-Null
-            Start-Sleep -Seconds 3
-        }
-    }
-
-    $latest = Test-SynapseChromeBridgeProfileRow `
-        -ChromeUserDataRoot $ChromeUserDataRoot `
-        -ProfileName $ProfileName `
-        -ExtensionId $ExtensionId `
-        -ExtensionDir $ExtensionDir
-    $missing = if ($latest.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $latest.missing_active_api_permissions -join ',' }
-    $disableReasons = if ($latest.disable_reasons.Count -eq 0) { '<none>' } else { $latest.disable_reasons -join ',' }
-    throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_REPAIR_FAILED active_profile=$ProfileName ready=$($latest.ready) missing_active_api_permissions=$missing disable_reasons=$disableReasons actions=$($actions -join ',') remediation=on chrome://extensions/?id=$ExtensionId click Accept permissions if present, click Update, then reload the Synapse Chrome Bridge card"
-}
-
 function Invoke-SynapseChromeBridgeAutoInstall {
     param(
         [Parameter(Mandatory = $true)]
@@ -1173,6 +1040,25 @@ function Invoke-SynapseChromeBridgeAutoInstall {
         }
     }
 
+    if ($before.installed -and $before.manifest_path_matches) {
+        if ($before.ready) {
+            return [pscustomobject]@{
+                attempted = $true
+                changed = $false
+                reason = 'existing_ready_extension_code_reload_deferred_to_daemon_reloadself'
+                active_profile = $activeProfile
+                required_foreground = $false
+                bridge_self_reload_command = 'cdp_bridge_reload'
+                before = $before
+                after = $before
+            }
+        }
+
+        $missing = if ($before.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $before.missing_active_api_permissions -join ',' }
+        $disableReasons = if ($before.disable_reasons.Count -eq 0) { '<none>' } else { $before.disable_reasons -join ',' }
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_NOT_READY active_profile=$activeProfile ready=$($before.ready) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=existing Synapse Chrome Bridge row is installed from the expected path but is not active/permissioned; setup refuses to steal foreground for chrome://extensions repair. Enable/permission the existing extension in the already-open profile or remove it and rerun setup for a first-time Load unpacked install; once a live bridge host exists, setup uses cdp_bridge_reload for code reconvergence."
+    }
+
     Initialize-SynapseChromeBridgeAutoInstallInterop
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $windows = @(Get-SynapseChromeTopLevelWindows | Where-Object {
@@ -1194,23 +1080,6 @@ function Invoke-SynapseChromeBridgeAutoInstall {
             $restoreClipboard = $true
         } catch {
             $restoreClipboard = $false
-        }
-        if ($before.installed -and $before.manifest_path_matches) {
-            $successReason = if ($before.ready) {
-                'reloaded_existing_ready_unpacked_extension'
-            } else {
-                'repaired_existing_unpacked_extension_permissions'
-            }
-            return Invoke-SynapseChromeBridgeExistingExtensionRepair `
-                -ChromeUserDataRoot $ChromeUserDataRoot `
-                -ProfileName $activeProfile `
-                -ExtensionId $ExtensionId `
-                -ExtensionDir $ExtensionDir `
-                -ChromeWindow $chromeWindow `
-                -Deadline $deadline `
-                -TimeoutSeconds $TimeoutSeconds `
-                -Before $before `
-                -SuccessReason $successReason
         }
         Set-Clipboard -Value 'chrome://extensions'
         Send-SynapseNativeKeyTap -VirtualKey 0x1B
