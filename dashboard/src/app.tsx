@@ -3096,6 +3096,14 @@ function StorageUsage({ state }: { state?: DashboardState }) {
 
 function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents: AgentSummary[] }) {
   const usagePoints = transcriptUsagePoints(state);
+  const costPanel = state?.agent_cost;
+  const statsPanel = state?.agent_stats;
+  const costData = asRecord(panelData(costPanel));
+  const statsData = asRecord(panelData(statsPanel));
+  const fleetCost = asRecord(costData.fleet);
+  const fleetStats = asRecord(statsData.fleet);
+  const fleetUsage = usageFromBillableRecord(fleetCost.usage);
+  const hasCostRollup = costPanel?.status === "ok" && Boolean(Object.keys(fleetCost).length);
   const agentRows = agents
     .filter((agent) => agent.usage)
     .map((agent) => ({
@@ -3108,7 +3116,7 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
       usage: agent.usage
     }))
     .sort((a, b) => b.tokens - a.tokens);
-  const totals = agentRows.reduce(
+  const transcriptTotals = agentRows.reduce(
     (acc, row) => {
       if (!row.usage) return acc;
       acc.input += row.usage.inputTokens;
@@ -3121,31 +3129,141 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
     },
     { input: 0, output: 0, cache: 0, reasoning: 0, cost: 0, unpriced: 0 }
   );
+  const totals = hasCostRollup
+    ? {
+      input: fleetUsage.inputTokens,
+      output: fleetUsage.outputTokens,
+      cache: fleetUsage.cacheReadInputTokens + fleetUsage.cacheCreationInputTokens,
+      reasoning: fleetUsage.reasoningOutputTokens,
+      cost: numberOrZero(fleetCost.computed_micro_usd),
+      unpriced: asArray(fleetCost.unpriced_models).length
+    }
+    : transcriptTotals;
   const tokenTotal = totals.input + totals.output + totals.cache + totals.reasoning;
+  const sourceReportedCost = numberOrZero(fleetCost.source_reported_micro_usd);
+  const scannedTranscriptRows = numberOrUndefined(costData.scanned_rows);
+  const scannedEventRows = numberOrUndefined(statsData.scanned_rows);
+  const perModelRows = asArray<Record<string, unknown>>(costData.per_model)
+    .map((row) => ({
+      model: rawText(row.model || "unknown"),
+      priced: Boolean(row.priced),
+      spawns: numberOrZero(row.spawns),
+      tokens: numberOrZero(row.total_tokens),
+      computedCost: numberOrUndefined(row.computed_micro_usd),
+      sourceCost: numberOrUndefined(row.source_reported_micro_usd),
+      usage: usageFromBillableRecord(row.usage),
+      raw: row
+    }))
+    .sort((a, b) => b.tokens - a.tokens);
+  const perSpawnRows = asArray<Record<string, unknown>>(costData.per_spawn)
+    .map((row) => {
+      const cost = costOutcome(row.cost);
+      return {
+        spawnId: rawText(row.spawn_id || "unknown"),
+        model: rawText(row.model || "unknown"),
+        status: rawText(row.status || "unknown"),
+        tokens: numberOrZero(row.total_tokens),
+        costLabel: cost.label,
+        computedCost: cost.microUsd,
+        authoritativeLine: numberOrUndefined(row.authoritative_line_no),
+        turnCount: asArray(row.turns).length,
+        raw: row
+      };
+    })
+    .sort((a, b) => b.tokens - a.tokens);
+  const perTemplateRows = agentCostGroupRows(costData.per_template);
+  const perTaskRows = agentCostGroupRows(costData.per_task);
+  const perAgentStatsRows = asArray<Record<string, unknown>>(statsData.per_agent)
+    .map((row) => {
+      const stats = asRecord(row.stats);
+      const actions = asRecord(stats.actions);
+      const errors = asRecord(stats.errors);
+      const latency = asRecord(stats.tool_latency_ms);
+      const leases = asRecord(stats.leases);
+      const tokens = asRecord(stats.tokens);
+      return {
+        anchor: rawText(row.anchor || row.spawn_id || row.session_id || "unknown"),
+        events: numberOrZero(stats.events_total),
+        startedPerMin: numberOrUndefined(actions.tool_calls_started_per_min),
+        finished: numberOrZero(actions.tool_calls_finished),
+        errorRate: numberOrUndefined(errors.error_rate),
+        p95Ms: numberOrUndefined(latency.p95_ms),
+        heldOpenLeases: numberOrZero(leases.held_open),
+        tokensPerMin: numberOrUndefined(tokens.tokens_per_min),
+        raw: row
+      };
+    })
+    .sort((a, b) => b.events - a.events);
   const splitData = [
     { kind: "input", tokens: totals.input },
     { kind: "output", tokens: totals.output },
     { kind: "cache", tokens: totals.cache },
     { kind: "reasoning", tokens: totals.reasoning }
   ].filter((row) => row.tokens > 0);
-  const recentUsage = usagePoints.slice(0, 12).reverse();
+  const costTurnPoints = agentCostTurnPoints(costData);
+  const recentUsage = (costTurnPoints.length ? costTurnPoints : usagePoints).slice(0, 12).reverse();
   const runawayRows = agentRows.filter((row) => {
     const usage = row.usage;
     if (!usage) return false;
     return row.status === "stuck" || row.tokens > 200_000 || usage.cacheReadInputTokens > Math.max(usage.inputTokens + usage.outputTokens, 1) * 5;
   });
+  const statsWatchRows = perAgentStatsRows.filter((row) => (row.errorRate ?? 0) > 0.2 || row.heldOpenLeases > 0 || (row.tokensPerMin ?? 0) > 100_000);
+  const visibleSpawnRows = perSpawnRows.slice(0, 12);
+  const visibleAgentStatsRows = perAgentStatsRows.slice(0, 24);
+  const visibleStatsWatchRows = statsWatchRows.slice(0, 12);
+  const costReadback = {
+    agent_cost: {
+      status: costPanel?.status,
+      source: costPanel?.source,
+      scanned_rows: scannedTranscriptRows,
+      scanned_event_rows: scannedEventRows,
+      fleet: fleetCost,
+      per_model: perModelRows.map((row) => row.raw),
+      per_spawn_total: perSpawnRows.length,
+      per_spawn_visible: visibleSpawnRows.map((row) => row.raw),
+      per_template_total: perTemplateRows.length,
+      per_template_visible: perTemplateRows.slice(0, 12).map((row) => row.raw),
+      per_task_total: perTaskRows.length,
+      per_task_visible: perTaskRows.slice(0, 12).map((row) => row.raw)
+    },
+    agent_stats: {
+      status: statsPanel?.status,
+      source: statsPanel?.source,
+      scanned_rows: scannedEventRows,
+      fleet: fleetStats,
+      per_agent_total: perAgentStatsRows.length,
+      per_agent_visible: visibleAgentStatsRows.map((row) => row.raw),
+      watch_total: statsWatchRows.length,
+      watch_visible: visibleStatsWatchRows.map((row) => row.raw)
+    },
+    transcript_fallback: {
+      usage_rows_total: usagePoints.length,
+      usage_rows_visible: usagePoints.slice(0, 12),
+      per_agent_total: agentRows.length,
+      per_agent_visible: agentRows.slice(0, 12)
+    }
+  };
+  const statsActions = asRecord(fleetStats.actions);
+  const statsErrors = asRecord(fleetStats.errors);
+  const unpricedModels = asArray(fleetCost.unpriced_models).map(rawText).filter(Boolean);
+  const rollupSource = costPanel?.status === "ok" ? costPanel.source : costPanel?.error || "transcript fallback";
+  const sourceComputedDelta = sourceReportedCost - totals.cost;
 
   return (
     <Section
       title="Cost & Token Analytics"
       tier="overview"
-      questions={["What is the current fleet token burn?", "Which agents are expensive or unpriced?", "Which transcript rows prove the numbers?"]}
+      questions={["What is the current fleet token burn?", "Which model/template/task/agent groups are expensive?", "Which physical rows prove the numbers?"]}
     >
       <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
         <StatCard label="Tokens" value={formatTokenCount(tokenTotal)} status={tokenTotal ? "working" : "idle"} delta={`${formatTokenCount(totals.cache)} cache`} />
-        <StatCard label="Reported Cost" value={formatMicroUsd(totals.cost)} status={totals.cost ? "working" : "idle"} delta={totals.unpriced ? `${totals.unpriced} tokens only - unpriced` : "all priced rows"} />
+        <StatCard label="Computed Cost" value={formatMicroUsd(totals.cost)} status={totals.cost ? "working" : "idle"} delta={unpricedModels.length ? `${unpricedModels.length} unpriced models` : "priced rows only"} />
+        <StatCard label="Source Cost" value={formatMicroUsd(sourceReportedCost)} status={sourceReportedCost ? "working" : "idle"} delta={sourceReportedCost && totals.cost ? `${formatSignedMicroUsd(sourceComputedDelta)} delta` : rollupSource} />
+        <StatCard label="Rollup Rows" value={scannedTranscriptRows ?? usagePoints.length} status={hasCostRollup ? "done" : "needs_input"} delta={`${scannedEventRows ?? 0} event rows`} />
+        <StatCard label="Actions / min" value={formatRate(numberOrUndefined(statsActions.tool_calls_started_per_min))} status={statsPanel?.status === "ok" ? "working" : "idle"} delta={`${numberOrZero(statsActions.tool_calls_finished)} finished`} />
+        <StatCard label="Error Rate" value={formatPercentValue(numberOrUndefined(statsErrors.error_rate))} status={numberOrZero(statsErrors.errored_tool_calls) ? "needs_input" : "done"} delta={`${numberOrZero(statsErrors.errored_tool_calls)} errored calls`} />
         <StatCard label="Usage Rows" value={usagePoints.length} status={usagePoints.length ? "working" : "idle"} delta={state?.agent_transcripts.source || "CF_AGENT_TRANSCRIPTS"} />
-        <StatCard label="Runaway Watch" value={runawayRows.length} status={runawayRows.length ? "needs_input" : "done"} delta="stuck / high token / cache-heavy" />
+        <StatCard label="Runaway Watch" value={runawayRows.length + statsWatchRows.length} status={runawayRows.length || statsWatchRows.length ? "needs_input" : "done"} delta="stuck / error / high burn" />
       </div>
 
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
@@ -3172,7 +3290,7 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
                 <XAxis dataKey="label" stroke="var(--text-muted)" tickLine={false} axisLine={false} fontSize={12} />
                 <YAxis stroke="var(--text-muted)" tickLine={false} axisLine={false} fontSize={12} />
                 <ChartTooltip contentStyle={{ background: "var(--surface-3)", border: "1px solid var(--border)", color: "var(--text-primary)" }} />
-                <Bar dataKey="tokens" fill="var(--success)" radius={[4, 4, 0, 0]} name="recent usage" />
+                <Bar dataKey="tokens" fill="var(--success)" radius={[4, 4, 0, 0]} name={costTurnPoints.length ? "turn usage" : "recent usage"} />
               </BarChart>
             </ResponsiveContainer>
           ) : (
@@ -3182,7 +3300,88 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
       </div>
 
       <div className="mt-4 grid gap-4 xl:grid-cols-2">
-        {agentRows.length ? (
+        {perModelRows.length ? (
+          <DataTable
+            data={perModelRows}
+            getRowId={(row) => row.model}
+            columns={[
+              { id: "model", header: "Model", cell: ({ row }) => row.original.model },
+              { id: "spawns", header: "Spawns", cell: ({ row }) => row.original.spawns },
+              { id: "tokens", header: "Tokens", cell: ({ row }) => formatTokenCount(row.original.tokens) },
+              {
+                id: "cost",
+                header: "Cost",
+                cell: ({ row }) => (row.original.computedCost === undefined ? "tokens only - unpriced" : formatMicroUsd(row.original.computedCost))
+              }
+            ]}
+          />
+        ) : (
+          <EmptyStateArt title="No per-model cost rows" />
+        )}
+        {visibleSpawnRows.length ? (
+          <DataTable
+            data={visibleSpawnRows}
+            getRowId={(row) => row.spawnId}
+            columns={[
+              { id: "spawn", header: "Spawn", cell: ({ row }) => row.original.spawnId },
+              { id: "model", header: "Model", cell: ({ row }) => row.original.model },
+              { id: "status", header: "Status", cell: ({ row }) => row.original.status },
+              { id: "tokens", header: "Tokens", cell: ({ row }) => formatTokenCount(row.original.tokens) },
+              { id: "turns", header: "Turns", cell: ({ row }) => row.original.turnCount },
+              { id: "cost", header: "Cost", cell: ({ row }) => row.original.costLabel }
+            ]}
+          />
+        ) : (
+          <EmptyStateArt title="No per-spawn cost rows" />
+        )}
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        {perTemplateRows.length ? (
+          <DataTable
+            data={perTemplateRows}
+            getRowId={(row) => row.key}
+            columns={[
+              { id: "template", header: "Template", cell: ({ row }) => row.original.key },
+              { id: "spawns", header: "Spawns", cell: ({ row }) => `${row.original.completeSpawns}/${row.original.spawns}` },
+              { id: "tokens", header: "Tokens", cell: ({ row }) => formatTokenCount(row.original.tokens) },
+              { id: "cost", header: "Cost", cell: ({ row }) => formatMicroUsd(row.original.cost) }
+            ]}
+          />
+        ) : (
+          <EmptyStateArt title="No per-template attribution rows" />
+        )}
+        {perTaskRows.length ? (
+          <DataTable
+            data={perTaskRows}
+            getRowId={(row) => row.key}
+            columns={[
+              { id: "task", header: "Task", cell: ({ row }) => row.original.key },
+              { id: "template", header: "Template", cell: ({ row }) => row.original.templateId || "-" },
+              { id: "spawns", header: "Spawns", cell: ({ row }) => `${row.original.completeSpawns}/${row.original.spawns}` },
+              { id: "tokens", header: "Tokens", cell: ({ row }) => formatTokenCount(row.original.tokens) },
+              { id: "cost", header: "Cost", cell: ({ row }) => formatMicroUsd(row.original.cost) }
+            ]}
+          />
+        ) : (
+          <EmptyStateArt title="No per-task attribution rows" />
+        )}
+      </div>
+
+      <div className="mt-4 grid gap-4 xl:grid-cols-2">
+        {visibleAgentStatsRows.length ? (
+          <DataTable
+            data={visibleAgentStatsRows}
+            getRowId={(row) => row.anchor}
+            columns={[
+              { id: "agent", header: "Agent", cell: ({ row }) => row.original.anchor },
+              { id: "events", header: "Events", cell: ({ row }) => row.original.events.toLocaleString() },
+              { id: "actions", header: "Actions/min", cell: ({ row }) => formatRate(row.original.startedPerMin) },
+              { id: "p95", header: "P95", cell: ({ row }) => (row.original.p95Ms === undefined ? "-" : `${row.original.p95Ms}ms`) },
+              { id: "errors", header: "Errors", cell: ({ row }) => formatPercentValue(row.original.errorRate) }
+            ]}
+          />
+        ) : agentRows.length ? (
           <DataTable
             data={agentRows}
             getRowId={(row) => row.id}
@@ -3198,7 +3397,7 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
             ]}
           />
         ) : (
-          <EmptyStateArt title="No per-agent usage rows" />
+          <EmptyStateArt title="No per-agent stats rows" />
         )}
         {runawayRows.length ? (
           <DataTable
@@ -3211,16 +3410,95 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
               { id: "cache", header: "Cache", cell: ({ row }) => formatTokenCount(row.original.cacheTokens) }
             ]}
           />
+        ) : visibleStatsWatchRows.length ? (
+          <DataTable
+            data={visibleStatsWatchRows}
+            getRowId={(row) => row.anchor}
+            columns={[
+              { id: "agent", header: "Agent", cell: ({ row }) => row.original.anchor },
+              { id: "errors", header: "Error rate", cell: ({ row }) => formatPercentValue(row.original.errorRate) },
+              { id: "leases", header: "Held leases", cell: ({ row }) => row.original.heldOpenLeases },
+              { id: "burn", header: "Tokens/min", cell: ({ row }) => formatRate(row.original.tokensPerMin) }
+            ]}
+          />
         ) : (
           <EmptyStateArt title="No runaway candidates" />
         )}
       </div>
 
       <div className="mt-4">
-        <RawValue value={{ transcript_usage_rows: usagePoints, per_agent: agentRows }} label="Cost analytics readback" />
+        <RawValue value={costReadback} label="Cost analytics readback" />
       </div>
     </Section>
   );
+}
+
+function usageFromBillableRecord(value: unknown): AgentUsageSummary {
+  const usage = asRecord(value);
+  return {
+    inputTokens: numberOrZero(usage.input_tokens),
+    outputTokens: numberOrZero(usage.output_tokens),
+    cacheReadInputTokens: numberOrZero(usage.cache_read_tokens),
+    cacheCreationInputTokens: numberOrZero(usage.cache_creation_tokens),
+    reasoningOutputTokens: 0
+  };
+}
+
+function agentCostTurnPoints(costData: Record<string, unknown>) {
+  return asArray<Record<string, unknown>>(costData.per_spawn).flatMap((spawn) => {
+    const spawnId = rawText(spawn.spawn_id || "unknown");
+    const model = rawText(spawn.model || "unknown");
+    return asArray<Record<string, unknown>>(spawn.turns).map((turn) => {
+      const usage = usageFromBillableRecord(turn.usage);
+      const turnIndex = numberOrZero(turn.turn_index);
+      return {
+        spawnId,
+        model,
+        line: numberOrZero(turn.line_no),
+        label: `${spawnId.slice(-6)}:${turnIndex}`,
+        tokens: numberOrZero(turn.total_tokens) || agentUsageTotal(usage),
+        cost: costOutcome(turn.cost).microUsd,
+        usage
+      };
+    });
+  });
+}
+
+function agentCostGroupRows(value: unknown) {
+  return asArray<Record<string, unknown>>(value)
+    .map((row) => ({
+      key: rawText(row.key || "unknown"),
+      templateId: rawText(row.template_id),
+      spawns: numberOrZero(row.spawns),
+      completeSpawns: numberOrZero(row.spawns_complete),
+      tokens: numberOrZero(row.total_tokens),
+      cost: numberOrZero(row.computed_micro_usd),
+      sourceCost: numberOrZero(row.source_reported_micro_usd),
+      unpricedModels: asArray(row.unpriced_models).map(rawText).filter(Boolean),
+      raw: row
+    }))
+    .sort((a, b) => b.tokens - a.tokens);
+}
+
+function costOutcome(value: unknown): { label: string; microUsd?: number } {
+  const outcome = asRecord(value);
+  const status = rawText(outcome.status);
+  if (status === "priced") {
+    const microUsd = numberOrZero(asRecord(outcome.cost).total_micro_usd);
+    return { label: formatMicroUsd(microUsd), microUsd };
+  }
+  const modelId = rawText(outcome.model_id);
+  return { label: modelId ? `tokens only - unpriced (${modelId})` : "tokens only - unpriced" };
+}
+
+function numberOrZero(value: unknown): number {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : 0;
+}
+
+function numberOrUndefined(value: unknown): number | undefined {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : undefined;
 }
 
 function transcriptUsagePoints(state?: DashboardState) {
@@ -3259,6 +3537,22 @@ function formatMicroUsd(value: number): string {
   const usd = value / 1_000_000;
   if (usd < 0.01) return `$${usd.toFixed(4)}`;
   return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 }).format(usd);
+}
+
+function formatSignedMicroUsd(value: number): string {
+  if (!Number.isFinite(value) || value === 0) return "$0.00";
+  const sign = value > 0 ? "+" : "-";
+  return `${sign}${formatMicroUsd(Math.abs(value))}`;
+}
+
+function formatRate(value?: number): string {
+  if (value === undefined || !Number.isFinite(value)) return "-";
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 1, notation: "compact" }).format(value);
+}
+
+function formatPercentValue(value?: number): string {
+  if (value === undefined || !Number.isFinite(value)) return "-";
+  return `${(value * 100).toFixed(1)}%`;
 }
 
 function RecordingsOverTime({ state }: { state?: DashboardState }) {

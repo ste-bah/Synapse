@@ -30,6 +30,8 @@ export interface DashboardState {
   suggestions: DashboardPanel;
   armed_runs: DashboardPanel;
   agent_transcripts: DashboardPanel;
+  agent_cost?: DashboardPanel;
+  agent_stats?: DashboardPanel;
   context: DashboardPanel;
   hygiene: DashboardPanel;
   local_models: DashboardPanel;

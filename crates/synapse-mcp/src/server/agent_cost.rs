@@ -514,6 +514,16 @@ impl SynapseService {
 }
 
 impl SynapseService {
+    pub(crate) fn dashboard_agent_cost_snapshot(&self) -> Result<AgentCostResponse, ErrorData> {
+        self.agent_cost_impl(AgentCostParams {
+            spawn_id: None,
+            since_ns: None,
+            until_ns: None,
+            include_per_turn: true,
+            group_by: vec![AgentCostGroupBy::Template, AgentCostGroupBy::Task],
+        })
+    }
+
     fn agent_cost_db(&self) -> Result<std::sync::Arc<Db>, ErrorData> {
         let state = self.m3_state_handle();
         let mut guard = state.lock().map_err(|_error| {

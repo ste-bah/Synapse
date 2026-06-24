@@ -264,6 +264,16 @@ impl SynapseService {
 }
 
 impl SynapseService {
+    pub(crate) fn dashboard_agent_stats_snapshot(&self) -> Result<AgentStatsResponse, ErrorData> {
+        self.agent_stats_impl(AgentStatsParams {
+            since_ns: None,
+            until_ns: None,
+            spawn_id: None,
+            session_id: None,
+            group_by: Some("agent".to_owned()),
+        })
+    }
+
     fn agent_stats_db(&self) -> Result<std::sync::Arc<Db>, ErrorData> {
         let state = self.m3_state_handle();
         let mut guard = state.lock().map_err(|_error| {

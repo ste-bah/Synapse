@@ -1550,6 +1550,8 @@ struct DashboardStateResponse {
     suggestions: DashboardPanel,
     armed_runs: DashboardPanel,
     agent_transcripts: DashboardPanel,
+    agent_cost: DashboardPanel,
+    agent_stats: DashboardPanel,
     context: DashboardPanel,
     hygiene: DashboardPanel,
     local_models: DashboardPanel,
@@ -3249,6 +3251,24 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         dashboard_timed_state_segment(&mut timing_segments, "agent_transcripts", || {
             agent_transcript_panel(&state)
         });
+    let agent_cost = dashboard_timed_state_segment(&mut timing_segments, "agent_cost", || {
+        match state.health_service.dashboard_agent_cost_snapshot() {
+            Ok(snapshot) => DashboardPanel::ok(
+                "agent_cost transcript-authoritative fleet/model/template/task rollup",
+                snapshot,
+            ),
+            Err(error) => DashboardPanel::error("agent_cost", format!("{error:?}")),
+        }
+    });
+    let agent_stats = dashboard_timed_state_segment(&mut timing_segments, "agent_stats", || {
+        match state.health_service.dashboard_agent_stats_snapshot() {
+            Ok(snapshot) => DashboardPanel::ok(
+                "agent_stats CF_AGENT_EVENTS fleet/per-agent rollup",
+                snapshot,
+            ),
+            Err(error) => DashboardPanel::error("agent_stats", format!("{error:?}")),
+        }
+    });
     let context = dashboard_timed_state_segment(&mut timing_segments, "context", || {
         context_panel(&state, &tool_names, &sessions)
     });
@@ -3288,6 +3308,8 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
         suggestions,
         armed_runs,
         agent_transcripts,
+        agent_cost,
+        agent_stats,
         context,
         hygiene,
         local_models,
@@ -5862,11 +5884,11 @@ fn dashboard_unix_time_ms() -> u64 {
 }
 
 const DASHBOARD_CSS_FILE: &str = "dashboard-MWT7M6XZ.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-CM35ZLIZ.js";
+const DASHBOARD_JS_FILE: &str = "dashboard-DsFDcxvx.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
     include_str!("../../../../dashboard/dist/assets/dashboard-MWT7M6XZ.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-CM35ZLIZ.js");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-DsFDcxvx.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]
