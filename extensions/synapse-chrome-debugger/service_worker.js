@@ -1,8 +1,9 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-25-browser-debugger-profile-v1";
-const BRIDGE_BUILD_SHA256 = "4f226f4a5f8e8a2d2f6a1f5c42f0c5bd9f1d9d9a6fd8a2efefdf6f9d62f8c4b3";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-25-page-screenshot-timeout-v1";
+const BRIDGE_BUILD_SHA256 = "575aa0447f8626727ae48e91c189fe795c0b6f2214e1de57e2e8cdc71e2c10e3";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
+const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
 let captureVisibleTabQueue = Promise.resolve();
 let lastCaptureVisibleTabAtMs = 0;
 const COMMAND_CAPABILITIES = Object.freeze([
@@ -2843,6 +2844,9 @@ async function handleCapturePageScreenshot(params) {
 async function handlePageScreenshot(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const request = normalizePageScreenshotRequest(params, selected.tabId);
+  const commandStartedAtMs = Date.now();
+  const commandDeadlineMs =
+    commandStartedAtMs + Math.min(request.waitTimeoutMs, PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS);
   const before = await tabPageState(selected.tabId, selected.target);
   if (!Number.isInteger(before.chrome_window_id)) {
     throw bridgeError(
@@ -2882,43 +2886,73 @@ async function handlePageScreenshot(params) {
     }
     if (!before.active) {
       await chrome.tabs.update(selected.tabId, { active: true });
-      await waitForTabActiveState(selected.tabId, true, request.waitTimeoutMs);
+      await waitForTabActiveState(
+        selected.tabId,
+        true,
+        remainingPageScreenshotBudgetMs(commandDeadlineMs, "activate_tab")
+      );
       activeForCapture = true;
     }
     if (!focusedWindowForCapture) {
       await chrome.windows.update(before.chrome_window_id, { focused: true });
-      await waitForChromeWindowFocused(before.chrome_window_id, true, request.waitTimeoutMs);
+      await waitForChromeWindowFocused(
+        before.chrome_window_id,
+        true,
+        remainingPageScreenshotBudgetMs(commandDeadlineMs, "focus_window")
+      );
       focusedWindowForCapture = true;
       restoredPreviousWindowFocus = false;
     }
     const positions = pageScreenshotTilePositions(setup.clip_css, setup.metrics);
-    for (const position of positions) {
+    for (const [index, position] of positions.entries()) {
+      remainingPageScreenshotBudgetMs(commandDeadlineMs, `scroll_tile_${index + 1}`);
       const scrollReadback = await runPageScreenshotScroll(selected.tabId, position);
+      remainingPageScreenshotBudgetMs(commandDeadlineMs, `delay_tile_${index + 1}`);
       await sleep(request.captureDelayMs);
       let imageDataUrl;
+      const captureStartedAtMs = Date.now();
       const attempt = {
+        attempt: index + 1,
         scroll_x_css: scrollReadback.scroll_x,
         scroll_y_css: scrollReadback.scroll_y,
         requested_scroll_x_css: position.x,
         requested_scroll_y_css: position.y,
         ok: false,
+        elapsed_ms: 0,
+        timeout_ms: 0,
+        retryable: false,
         image_data_url_len: 0,
         error_detail: ""
       };
       try {
+        const captureTimeoutMs = remainingPageScreenshotBudgetMs(
+          commandDeadlineMs,
+          `capture_visible_tab_tile_${index + 1}`
+        );
+        attempt.timeout_ms = captureTimeoutMs;
         imageDataUrl = await captureVisibleTabWithQuota(before.chrome_window_id, {
           format: request.format,
           quality: request.quality
+        }, captureTimeoutMs, {
+          tabId: selected.tabId,
+          windowId: before.chrome_window_id,
+          targetId: selected.target.id,
+          tileIndex: index + 1,
+          tileCount: positions.length,
+          requestedScrollX: position.x,
+          requestedScrollY: position.y
         });
         attempt.ok = true;
         attempt.image_data_url_len = String(imageDataUrl || "").length;
       } catch (error) {
         attempt.error_detail = errorMessage(error);
+        attempt.retryable = error?.code === ERROR_EXTENSION_TIMEOUT;
         throw bridgeError(
-          ERROR_ATTACH_FAILED,
+          error?.code === ERROR_EXTENSION_TIMEOUT ? ERROR_EXTENSION_TIMEOUT : ERROR_ATTACH_FAILED,
           `pageScreenshot chrome.tabs.captureVisibleTab(window=${before.chrome_window_id}) failed: ${errorMessage(error)}`
         );
       } finally {
+        attempt.elapsed_ms = Date.now() - captureStartedAtMs;
         captureAttempts.push(attempt);
       }
       if (typeof imageDataUrl !== "string" || !imageDataUrl.startsWith("data:image/")) {
@@ -3303,6 +3337,17 @@ function pageScreenshotTilePositions(clip, metrics) {
     );
   }
   return positions;
+}
+
+function remainingPageScreenshotBudgetMs(deadlineMs, phase) {
+  const remaining = Math.floor(Number(deadlineMs) - Date.now());
+  if (!Number.isFinite(remaining) || remaining <= 0) {
+    throw bridgeError(
+      ERROR_EXTENSION_TIMEOUT,
+      `pageScreenshot ${phase} exceeded extension response budget before daemon command timeout`
+    );
+  }
+  return remaining;
 }
 
 function pageScreenshotSetupInPage(request) {
@@ -19836,23 +19881,72 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function captureVisibleTabWithQuota(windowId, options) {
+async function captureVisibleTabWithQuota(windowId, options, timeoutMs, context = {}) {
+  const queuedAtMs = Date.now();
+  let queueWaitMs = 0;
+  let quotaWaitMs = 0;
+  let effectiveTimeoutMs = 0;
+  let captureStartedAtMs = 0;
+  let captureElapsedMs = 0;
   const run = captureVisibleTabQueue.catch(() => undefined).then(async () => {
-    const waitMs = Math.max(
+    queueWaitMs = Date.now() - queuedAtMs;
+    quotaWaitMs = Math.max(
       0,
       lastCaptureVisibleTabAtMs + CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS - Date.now()
     );
-    if (waitMs > 0) {
-      await sleep(waitMs);
+    if (quotaWaitMs > 0) {
+      await sleep(quotaWaitMs);
     }
+    effectiveTimeoutMs = Math.floor(Number(timeoutMs) - queueWaitMs - quotaWaitMs);
+    if (!Number.isFinite(effectiveTimeoutMs) || effectiveTimeoutMs <= 0) {
+      throw bridgeError(
+        ERROR_EXTENSION_TIMEOUT,
+        "chrome.tabs.captureVisibleTab was not started because queue/quota wait exhausted the screenshot deadline; " +
+          `${formatPageScreenshotCaptureContext(context)} timeout_ms=${timeoutMs} ` +
+          `queue_wait_ms=${queueWaitMs} quota_wait_ms=${quotaWaitMs} queue_recovered=true`
+      );
+    }
+    captureStartedAtMs = Date.now();
     try {
-      return await chrome.tabs.captureVisibleTab(windowId, options);
+      return await withTimeout(
+        chrome.tabs.captureVisibleTab(windowId, options),
+        effectiveTimeoutMs,
+        "chrome.tabs.captureVisibleTab"
+      );
     } finally {
+      captureElapsedMs = Date.now() - captureStartedAtMs;
       lastCaptureVisibleTabAtMs = Date.now();
     }
   });
   captureVisibleTabQueue = run.catch(() => undefined);
-  return run;
+  try {
+    return await run;
+  } catch (error) {
+    const detail = errorMessage(error);
+    if (detail.includes("timed out after")) {
+      throw bridgeError(
+        ERROR_EXTENSION_TIMEOUT,
+        "chrome.tabs.captureVisibleTab did not settle before the screenshot command deadline; " +
+          `${formatPageScreenshotCaptureContext(context)} ` +
+          `timeout_ms=${timeoutMs} effective_timeout_ms=${effectiveTimeoutMs} ` +
+          `queue_wait_ms=${queueWaitMs} quota_wait_ms=${quotaWaitMs} ` +
+          `capture_elapsed_ms=${captureElapsedMs || Math.max(0, Date.now() - captureStartedAtMs)} ` +
+          `queue_recovered=true`
+      );
+    }
+    throw error;
+  }
+}
+
+function formatPageScreenshotCaptureContext(context) {
+  return [
+    `tab_id=${String(context.tabId ?? "unknown")}`,
+    `window_id=${String(context.windowId ?? "unknown")}`,
+    `target_id=${String(context.targetId ?? "unknown")}`,
+    `tile=${String(context.tileIndex ?? "unknown")}/${String(context.tileCount ?? "unknown")}`,
+    `requested_scroll_x=${String(context.requestedScrollX ?? "unknown")}`,
+    `requested_scroll_y=${String(context.requestedScrollY ?? "unknown")}`
+  ].join(" ");
 }
 
 async function postResponse(id, ok, result, error) {

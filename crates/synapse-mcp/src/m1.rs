@@ -434,6 +434,13 @@ pub struct BrowserScreenshotResponse {
     pub mask_count: usize,
     pub omit_background: bool,
     pub required_foreground: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_os_foreground_before_hwnd: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_os_foreground_capture_hwnd: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_os_foreground_after_restore_hwnd: Option<i64>,
+    pub restored_human_os_foreground: bool,
     pub backend_tier_used: String,
     pub source_of_truth: String,
 }

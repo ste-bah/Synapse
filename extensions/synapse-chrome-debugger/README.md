@@ -171,8 +171,10 @@ window, it focuses that Chrome window during capture, reports
 `required_foreground=true`, restores the previous Chrome tab/window focus when
 Chrome can report one, and always restores scroll position and masks. It queues
 `captureVisibleTab` calls to stay under Chrome's per-second capture quota for
-tiled full-page screenshots and back-to-back screenshot requests. It never
-launches a helper profile.
+tiled full-page screenshots and back-to-back screenshot requests. Each tile
+capture is bounded inside the extension and reports tab/window/tile timing on
+timeout so a hung Chrome image readback cannot poison later screenshot requests.
+It never launches a helper profile.
 `pagePdf` attaches `chrome.debugger` only long enough to call `Page.printToPDF`,
 then detaches and returns base64 PDF bytes to the daemon for file writing.
 `clock` uses the same typed MAIN-world execution model for current-document

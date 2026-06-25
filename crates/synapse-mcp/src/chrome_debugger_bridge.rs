@@ -41,9 +41,9 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-25-browser-debugger-profile-v1";
+    "synapse-chrome-bridge-2026-06-25-page-screenshot-timeout-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "4f226f4a5f8e8a2d2f6a1f5c42f0c5bd9f1d9d9a6fd8a2efefdf6f9d62f8c4b3";
+    "575aa0447f8626727ae48e91c189fe795c0b6f2214e1de57e2e8cdc71e2c10e3";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",

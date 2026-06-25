@@ -1397,7 +1397,8 @@ impl SynapseService {
         }
         ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
         let bridge_payload = browser_screenshot_bridge_payload(params, validation.format)?;
-        let captured = crate::chrome_debugger_bridge::page_screenshot(
+        let foreground_guard = prepare_browser_screenshot_foreground(window_hwnd)?;
+        let captured_result = crate::chrome_debugger_bridge::page_screenshot(
             window_hwnd,
             cdp_target_id,
             bridge_payload,
@@ -1411,7 +1412,13 @@ impl SynapseService {
                     error.detail()
                 ),
             )
-        })?;
+        });
+        let foreground_readback = finish_browser_screenshot_foreground(
+            window_hwnd,
+            foreground_guard,
+            captured_result.as_ref().err(),
+        )?;
+        let captured = captured_result?;
         if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
             return Err(mcp_error(
                 error_codes::ACTION_POSTCONDITION_FAILED,
@@ -1421,6 +1428,26 @@ impl SynapseService {
                 ),
             ));
         }
+        tracing::info!(
+            code = "BROWSER_SCREENSHOT_BRIDGE_CAPTURED",
+            hwnd = window_hwnd,
+            cdp_target_id = %captured.target_id,
+            tab_id = captured.tab_id,
+            chrome_window_id = captured.chrome_window_id.unwrap_or_default(),
+            before_active = captured.before_active,
+            active_for_capture = captured.active_for_capture,
+            restored_previous_active = captured.restored_previous_active,
+            required_foreground = foreground_readback.required_foreground || captured.required_foreground,
+            human_os_foreground_before_hwnd = foreground_readback.before_hwnd.unwrap_or_default(),
+            human_os_foreground_capture_hwnd = foreground_readback.capture_hwnd.unwrap_or_default(),
+            human_os_foreground_after_restore_hwnd = foreground_readback.after_restore_hwnd.unwrap_or_default(),
+            restored_human_os_foreground = foreground_readback.restored_human_os_foreground,
+            capture_attempt_count = captured.capture_attempt_count,
+            capture_attempts = ?captured.capture_attempts,
+            tile_count = captured.tile_count,
+            output_path = %validation.output_path.display(),
+            "readback=chrome.tabs.captureVisibleTab outcome=bridge_tiles_returned"
+        );
         let bitmap =
             stitch_browser_screenshot_tiles(&captured, validation.format, params.omit_background)?;
         let bitmap_sha256 = sha256_hex(&bitmap.bytes);
@@ -1464,10 +1491,14 @@ impl SynapseService {
             tile_count: captured.tile_count,
             mask_count: captured.mask_count,
             omit_background: captured.omit_background,
-            required_foreground: captured.required_foreground,
+            required_foreground: foreground_readback.required_foreground || captured.required_foreground,
+            human_os_foreground_before_hwnd: foreground_readback.before_hwnd,
+            human_os_foreground_capture_hwnd: foreground_readback.capture_hwnd,
+            human_os_foreground_after_restore_hwnd: foreground_readback.after_restore_hwnd,
+            restored_human_os_foreground: foreground_readback.restored_human_os_foreground,
             backend_tier_used: captured.backend_tier_used,
             source_of_truth:
-                "normal Chrome bridge chrome.scripting page metrics/masks/scroll plus chrome.tabs.captureVisibleTab tiles stitched by synapse-mcp"
+                "human OS foreground readback plus normal Chrome bridge chrome.scripting page metrics/masks/scroll and chrome.tabs.captureVisibleTab tiles stitched by synapse-mcp"
                     .to_owned(),
         })
     }
@@ -12052,6 +12083,314 @@ fn current_human_os_foreground_hwnd() -> Option<i64> {
     synapse_a11y::current_foreground_context()
         .ok()
         .map(|context| context.hwnd)
+}
+
+#[derive(Clone, Debug, Default)]
+struct BrowserScreenshotForegroundReadback {
+    required_foreground: bool,
+    before_hwnd: Option<i64>,
+    capture_hwnd: Option<i64>,
+    after_restore_hwnd: Option<i64>,
+    restored_human_os_foreground: bool,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct BrowserScreenshotForegroundGuard {
+    before: ForegroundContext,
+    readback: BrowserScreenshotForegroundReadback,
+}
+
+#[cfg(not(windows))]
+#[derive(Clone, Debug, Default)]
+struct BrowserScreenshotForegroundGuard;
+
+#[cfg(windows)]
+fn prepare_browser_screenshot_foreground(
+    window_hwnd: i64,
+) -> Result<BrowserScreenshotForegroundGuard, ErrorData> {
+    const TOOL: &str = "browser_screenshot";
+    let before = read_browser_screenshot_current_foreground("before_capture")?;
+    let target = synapse_a11y::foreground_context(window_hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!(
+                "browser_screenshot target HWND {window_hwnd:#x} is not inspectable before capture: {error}"
+            ),
+        )
+    })?;
+    let required_foreground = before.hwnd != window_hwnd;
+    tracing::info!(
+        code = "BROWSER_SCREENSHOT_FOREGROUND_PREFLIGHT",
+        hwnd = window_hwnd,
+        human_os_foreground_before_hwnd = before.hwnd,
+        human_os_foreground_before_pid = before.pid,
+        human_os_foreground_before_process = %before.process_name,
+        human_os_foreground_before_title = %before.window_title,
+        target_hwnd = target.hwnd,
+        target_pid = target.pid,
+        target_process = %target.process_name,
+        target_title = %target.window_title,
+        required_foreground,
+        "readback=GetForegroundWindow outcome=foreground_precondition_evaluated"
+    );
+
+    if required_foreground {
+        synapse_a11y::focus_window_with_intent(
+            window_hwnd,
+            synapse_a11y::ForegroundActivationIntent::OperatorRequested { caller: TOOL },
+        )
+        .map_err(|error| {
+            mcp_error(
+                error_codes::ACTION_LAUNCH_FOREGROUND_FAILED,
+                format!(
+                    "browser_screenshot could not foreground Chrome HWND {window_hwnd:#x} before captureVisibleTab; before foreground was {}; focus error: {error}",
+                    browser_screenshot_foreground_summary(&before)
+                ),
+            )
+        })?;
+    }
+
+    let capture_foreground = read_browser_screenshot_current_foreground("capture_ready")?;
+    if capture_foreground.hwnd != window_hwnd {
+        tracing::error!(
+            code = error_codes::ACTION_POSTCONDITION_FAILED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            before_process = %before.process_name,
+            capture_hwnd = capture_foreground.hwnd,
+            capture_pid = capture_foreground.pid,
+            capture_process = %capture_foreground.process_name,
+            capture_title = %capture_foreground.window_title,
+            required_foreground,
+            "browser_screenshot foreground precondition failed after explicit activation"
+        );
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot refused captureVisibleTab because Chrome HWND {window_hwnd:#x} was not the physical OS foreground after activation; actual foreground was {}",
+                browser_screenshot_foreground_summary(&capture_foreground)
+            ),
+        ));
+    }
+
+    tracing::info!(
+        code = "BROWSER_SCREENSHOT_FOREGROUND_VERIFIED",
+        hwnd = window_hwnd,
+        human_os_foreground_before_hwnd = before.hwnd,
+        human_os_foreground_capture_hwnd = capture_foreground.hwnd,
+        human_os_foreground_capture_pid = capture_foreground.pid,
+        human_os_foreground_capture_process = %capture_foreground.process_name,
+        required_foreground,
+        "readback=GetForegroundWindow outcome=target_chrome_foreground_verified"
+    );
+
+    Ok(BrowserScreenshotForegroundGuard {
+        readback: BrowserScreenshotForegroundReadback {
+            required_foreground,
+            before_hwnd: Some(before.hwnd),
+            capture_hwnd: Some(capture_foreground.hwnd),
+            after_restore_hwnd: None,
+            restored_human_os_foreground: !required_foreground,
+        },
+        before,
+    })
+}
+
+#[cfg(not(windows))]
+fn prepare_browser_screenshot_foreground(
+    _window_hwnd: i64,
+) -> Result<BrowserScreenshotForegroundGuard, ErrorData> {
+    Ok(BrowserScreenshotForegroundGuard)
+}
+
+#[cfg(windows)]
+fn finish_browser_screenshot_foreground(
+    window_hwnd: i64,
+    guard: BrowserScreenshotForegroundGuard,
+    capture_error: Option<&ErrorData>,
+) -> Result<BrowserScreenshotForegroundReadback, ErrorData> {
+    const TOOL: &str = "browser_screenshot";
+    let mut readback = guard.readback;
+    let before = guard.before;
+    let current = read_browser_screenshot_current_foreground("after_bridge_capture")?;
+    readback.after_restore_hwnd = Some(current.hwnd);
+
+    if !readback.required_foreground {
+        if current.hwnd == before.hwnd && current.pid == before.pid {
+            readback.restored_human_os_foreground = true;
+            return Ok(readback);
+        }
+        tracing::error!(
+            code = error_codes::ACTION_POSTCONDITION_FAILED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            current_hwnd = current.hwnd,
+            current_pid = current.pid,
+            current_process = %current.process_name,
+            current_title = %current.window_title,
+            capture_error = ?capture_error,
+            "browser_screenshot detected unexpected physical foreground drift while target was already foreground"
+        );
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot physical foreground drifted from {} to {} during capture",
+                browser_screenshot_foreground_summary(&before),
+                browser_screenshot_foreground_summary(&current)
+            ),
+        ));
+    }
+
+    if current.hwnd == before.hwnd && current.pid == before.pid {
+        readback.restored_human_os_foreground = true;
+        tracing::info!(
+            code = "BROWSER_SCREENSHOT_FOREGROUND_ALREADY_RESTORED",
+            hwnd = window_hwnd,
+            human_os_foreground_before_hwnd = before.hwnd,
+            human_os_foreground_after_restore_hwnd = current.hwnd,
+            capture_error = ?capture_error,
+            "readback=GetForegroundWindow outcome=foreground_already_back_at_pre_capture_hwnd"
+        );
+        return Ok(readback);
+    }
+
+    if current.hwnd != window_hwnd {
+        tracing::error!(
+            code = error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            current_hwnd = current.hwnd,
+            current_pid = current.pid,
+            current_process = %current.process_name,
+            current_title = %current.window_title,
+            capture_error = ?capture_error,
+            "browser_screenshot refused to restore because physical foreground changed away from the capture HWND"
+        );
+        return Err(mcp_error(
+            error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+            format!(
+                "browser_screenshot captured with Chrome HWND {window_hwnd:#x}, but physical foreground changed to {} before restore; refusing to overwrite that foreground state",
+                browser_screenshot_foreground_summary(&current)
+            ),
+        ));
+    }
+
+    let prior = synapse_a11y::foreground_context(before.hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            format!(
+                "browser_screenshot could not inspect prior foreground HWND {:#x} before restore: {error}",
+                before.hwnd
+            ),
+        )
+    })?;
+    if prior.pid != before.pid {
+        tracing::error!(
+            code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            prior_actual_pid = prior.pid,
+            prior_actual_process = %prior.process_name,
+            prior_actual_title = %prior.window_title,
+            capture_error = ?capture_error,
+            "browser_screenshot refused foreground restore because the prior HWND now belongs to another process"
+        );
+        return Err(mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            format!(
+                "browser_screenshot refused to restore prior foreground HWND {:#x}: expected pid {}, actual pid {}",
+                before.hwnd, before.pid, prior.pid
+            ),
+        ));
+    }
+
+    synapse_a11y::focus_window_with_intent(
+        before.hwnd,
+        synapse_a11y::ForegroundActivationIntent::LeaseContextRestore { caller: TOOL },
+    )
+    .map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            format!(
+                "browser_screenshot captured with Chrome HWND {window_hwnd:#x} but failed to restore prior foreground {}; restore error: {error}",
+                browser_screenshot_foreground_summary(&before)
+            ),
+        )
+    })?;
+
+    let restored = read_browser_screenshot_current_foreground("after_restore")?;
+    readback.after_restore_hwnd = Some(restored.hwnd);
+    if restored.hwnd == before.hwnd && restored.pid == before.pid {
+        readback.restored_human_os_foreground = true;
+        tracing::info!(
+            code = "BROWSER_SCREENSHOT_FOREGROUND_RESTORED",
+            hwnd = window_hwnd,
+            human_os_foreground_before_hwnd = before.hwnd,
+            human_os_foreground_before_pid = before.pid,
+            human_os_foreground_after_restore_hwnd = restored.hwnd,
+            human_os_foreground_after_restore_pid = restored.pid,
+            capture_error = ?capture_error,
+            "readback=GetForegroundWindow outcome=foreground_restored_to_pre_capture_hwnd"
+        );
+        Ok(readback)
+    } else {
+        tracing::error!(
+            code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            hwnd = window_hwnd,
+            before_hwnd = before.hwnd,
+            before_pid = before.pid,
+            restored_hwnd = restored.hwnd,
+            restored_pid = restored.pid,
+            restored_process = %restored.process_name,
+            restored_title = %restored.window_title,
+            capture_error = ?capture_error,
+            "browser_screenshot foreground restore readback did not match the pre-capture foreground"
+        );
+        Err(mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+            format!(
+                "browser_screenshot restore readback mismatch: expected {}, actual {}",
+                browser_screenshot_foreground_summary(&before),
+                browser_screenshot_foreground_summary(&restored)
+            ),
+        ))
+    }
+}
+
+#[cfg(not(windows))]
+fn finish_browser_screenshot_foreground(
+    _window_hwnd: i64,
+    _guard: BrowserScreenshotForegroundGuard,
+    _capture_error: Option<&ErrorData>,
+) -> Result<BrowserScreenshotForegroundReadback, ErrorData> {
+    Ok(BrowserScreenshotForegroundReadback::default())
+}
+
+#[cfg(windows)]
+fn read_browser_screenshot_current_foreground(
+    phase: &'static str,
+) -> Result<ForegroundContext, ErrorData> {
+    synapse_a11y::current_foreground_context().map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            format!(
+                "browser_screenshot could not read physical OS foreground during {phase}: {error}"
+            ),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn browser_screenshot_foreground_summary(context: &ForegroundContext) -> String {
+    format!(
+        "hwnd={:#x} pid={} process={:?} title={:?}",
+        context.hwnd, context.pid, context.process_name, context.window_title
+    )
 }
 
 /// Validates a `set_target` window HWND is live and snapshottable, returning its
