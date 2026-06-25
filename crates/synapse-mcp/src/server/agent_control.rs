@@ -678,6 +678,20 @@ impl SynapseService {
         self.agent_kill_impl(params, None).await
     }
 
+    pub(crate) async fn dashboard_fleet_stop_request(
+        &self,
+        params: FleetStopParams,
+    ) -> Result<FleetStopResponse, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_FLEET_STOP_REQUESTED",
+            kind = TOOL_FLEET_STOP,
+            mode = %params.mode,
+            agent_kind_count = params.agent_kinds.len(),
+            "dashboard.invocation kind=fleet_stop"
+        );
+        self.fleet_stop_impl(params, Some("dashboard-fleet")).await
+    }
+
     pub(crate) fn dashboard_agent_interrupt_request(
         &self,
         params: AgentInterruptParams,

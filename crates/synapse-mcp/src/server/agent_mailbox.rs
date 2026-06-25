@@ -459,6 +459,59 @@ impl SynapseService {
         dashboard_json_readback(response)
     }
 
+    pub(crate) fn dashboard_agent_broadcast(
+        &self,
+        selector: String,
+        agent_kinds: Vec<String>,
+        sessions: Vec<String>,
+        kind: String,
+        payload: Value,
+        ttl_ms: Option<u64>,
+        request_receipt: bool,
+    ) -> Result<Value, ErrorData> {
+        tracing::info!(
+            code = "DASHBOARD_AGENT_BROADCAST_REQUESTED",
+            kind = "agent_send_broadcast",
+            selector = %selector,
+            agent_kind_count = agent_kinds.len(),
+            session_count = sessions.len(),
+            "dashboard.invocation kind=agent_send_broadcast"
+        );
+        let selector = selector.trim().to_ascii_lowercase();
+        let target = match selector.as_str() {
+            "all" => BroadcastTarget {
+                all: true,
+                ..BroadcastTarget::default()
+            },
+            "agent_kinds" => BroadcastTarget {
+                agent_kinds,
+                ..BroadcastTarget::default()
+            },
+            "sessions" => BroadcastTarget {
+                sessions,
+                ..BroadcastTarget::default()
+            },
+            other => {
+                return Err(params_error(format!(
+                    "dashboard agent broadcast selector {other:?} is not one of all|agent_kinds|sessions"
+                )));
+            }
+        };
+        let response = self.agent_send_broadcast_impl(
+            AgentSendBroadcastParams {
+                to: target,
+                kind,
+                payload,
+                artifact_handle: None,
+                ttl_ms: ttl_ms.unwrap_or_else(default_message_ttl_ms),
+                request_receipt,
+            },
+            "dashboard-fleet",
+        )?;
+        self.mailbox_notify_handle().notify_waiters();
+        dashboard_json_readback(response)
+    }
+
     pub(crate) fn dashboard_agent_inbox_snapshot(
         &self,
         session_id: &str,
@@ -975,13 +1028,71 @@ impl SynapseService {
         let resolved_recipients = recipients.len();
         let expires_at_unix_ms = now_unix_ms.saturating_add(params.ttl_ms);
         let db = self.mailbox_db()?;
-        let _expired = cleanup_expired_mailbox_rows(&db, now_unix_ms)?;
+        let expired_rows_deleted_before = cleanup_expired_mailbox_rows(&db, now_unix_ms)?;
+
+        let target_selector = if params.to.all {
+            json!({ "all": true })
+        } else if !params.to.agent_kinds.is_empty() {
+            json!({ "agent_kinds": &params.to.agent_kinds })
+        } else {
+            json!({ "sessions": &params.to.sessions })
+        };
+        let command_payload = json!({
+            "to": target_selector,
+            "kind": params.kind.trim(),
+            "payload": &params.payload,
+            "artifact_handle": &params.artifact_handle,
+            "ttl_ms": params.ttl_ms,
+            "request_receipt": params.request_receipt,
+        });
+        let command_before = json!({
+            "source_of_truth": cf::CF_KV,
+            "resolved_recipients": resolved_recipients,
+            "expires_at_unix_ms": expires_at_unix_ms,
+            "expired_rows_deleted_before": expired_rows_deleted_before,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "agent_send_broadcast",
+            "broadcast",
+            Some(from_session.to_owned()),
+            None,
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
 
         let mut outcomes = Vec::with_capacity(recipients.len());
         let mut delivered_count = 0_usize;
         let mut skipped_count = 0_usize;
         for to_session in recipients {
-            let depth = queue_depth_for_recipient(&db, &to_session, now_unix_ms)?;
+            let depth = match queue_depth_for_recipient(&db, &to_session, now_unix_ms) {
+                Ok(depth) => depth,
+                Err(error) => {
+                    self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            "agent_send_broadcast",
+                            "broadcast",
+                            Some(from_session.to_owned()),
+                            None,
+                            command_payload,
+                            command_before,
+                            json!({
+                                "source_of_truth": cf::CF_KV,
+                                "to_session": &to_session,
+                                "delivered_count": delivered_count,
+                                "skipped_count": skipped_count,
+                                "partial_recipients": outcomes,
+                            }),
+                            "error",
+                        )
+                        .with_error(
+                            super::command_audit::command_audit_error_from_error_data(&error),
+                        ),
+                    )?;
+                    return Err(error);
+                }
+            };
             if depth >= MAX_INBOX_ROWS_PER_RECIPIENT {
                 skipped_count += 1;
                 outcomes.push(RecipientOutcome {
@@ -1012,15 +1123,89 @@ impl SynapseService {
                 delivery_attempts: 0,
                 request_receipt: params.request_receipt,
             };
-            let encoded = encode_mailbox_message(&message)?;
-            db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
-                .map_err(|error| {
-                    mcp_error(
-                        error.code(),
-                        format!("write broadcast row {row_key}: {error}"),
+            let encoded = match encode_mailbox_message(&message) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            "agent_send_broadcast",
+                            "broadcast",
+                            Some(from_session.to_owned()),
+                            None,
+                            command_payload,
+                            command_before,
+                            json!({
+                                "source_of_truth": cf::CF_KV,
+                                "to_session": &to_session,
+                                "delivered_count": delivered_count,
+                                "skipped_count": skipped_count,
+                                "partial_recipients": outcomes,
+                            }),
+                            "error",
+                        )
+                        .with_error(
+                            super::command_audit::command_audit_error_from_error_data(&error),
+                        ),
+                    )?;
+                    return Err(error);
+                }
+            };
+            if let Err(error) =
+                db.put_batch_pressure_bypass(cf::CF_KV, [(row_key.as_bytes().to_vec(), encoded)])
+            {
+                let error = mcp_error(
+                    error.code(),
+                    format!("write broadcast row {row_key}: {error}"),
+                );
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "agent_send_broadcast",
+                        "broadcast",
+                        Some(from_session.to_owned()),
+                        None,
+                        command_payload,
+                        command_before,
+                        json!({
+                            "source_of_truth": cf::CF_KV,
+                            "delivered_count": delivered_count,
+                            "skipped_count": skipped_count,
+                            "partial_recipients": outcomes,
+                        }),
+                        "error",
                     )
-                })?;
-            let storage_readback = readback_exact_mailbox_row(&db, &row_key)?;
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                return Err(error);
+            }
+            let storage_readback = match readback_exact_mailbox_row(&db, &row_key) {
+                Ok(readback) => readback,
+                Err(error) => {
+                    self.command_audit_final(
+                        super::command_audit::CommandAuditInput::mcp(
+                            "agent_send_broadcast",
+                            "broadcast",
+                            Some(from_session.to_owned()),
+                            None,
+                            command_payload,
+                            command_before,
+                            json!({
+                                "source_of_truth": cf::CF_KV,
+                                "row_key": &row_key,
+                                "delivered_count": delivered_count,
+                                "skipped_count": skipped_count,
+                                "partial_recipients": outcomes,
+                            }),
+                            "error",
+                        )
+                        .with_error(
+                            super::command_audit::command_audit_error_from_error_data(&error),
+                        ),
+                    )?;
+                    return Err(error);
+                }
+            };
             delivered_count += 1;
             outcomes.push(RecipientOutcome {
                 to_session,
@@ -1042,7 +1227,7 @@ impl SynapseService {
             "readback=agent_mailbox edge=broadcast_committed"
         );
 
-        Ok(AgentSendBroadcastResponse {
+        let response = AgentSendBroadcastResponse {
             ok: true,
             from_session: from_session.to_owned(),
             kind: params.kind.trim().to_owned(),
@@ -1053,7 +1238,68 @@ impl SynapseService {
             delivered_count,
             skipped_count,
             recipients: outcomes,
-        })
+        };
+
+        let mut journal_record = synapse_core::AgentEventRecord::new(
+            super::agent_events::unix_time_ns_now(),
+            synapse_core::AgentEventKind::MessageSent,
+        );
+        journal_record.session_id = Some(from_session.to_owned());
+        journal_record.attributes.conversation_id = Some(from_session.to_owned());
+        journal_record.payload = json!({
+            "broadcast": true,
+            "message_kind": &response.kind,
+            "resolved_recipients": response.resolved_recipients,
+            "delivered_count": response.delivered_count,
+            "skipped_count": response.skipped_count,
+            "expires_at_unix_ms": response.expires_at_unix_ms,
+            "request_receipt": response.request_receipt,
+        });
+        if let Err(error) = super::agent_events::record_agent_event(&db, &journal_record) {
+            let tool_error =
+                super::agent_events::agent_event_tool_error("agent_send_broadcast", &error, true);
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "agent_send_broadcast",
+                    "broadcast",
+                    Some(from_session.to_owned()),
+                    None,
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": cf::CF_KV,
+                        "resolved_recipients": response.resolved_recipients,
+                        "delivered_count": response.delivered_count,
+                        "skipped_count": response.skipped_count,
+                        "recipients": &response.recipients,
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&tool_error),
+                ),
+            )?;
+            return Err(tool_error);
+        }
+
+        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+            "agent_send_broadcast",
+            "broadcast",
+            Some(from_session.to_owned()),
+            None,
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": cf::CF_KV,
+                "resolved_recipients": response.resolved_recipients,
+                "delivered_count": response.delivered_count,
+                "skipped_count": response.skipped_count,
+                "recipients": &response.recipients,
+            }),
+            "ok",
+        ))?;
+
+        Ok(response)
     }
 
     fn agent_receipts_impl(
@@ -2296,6 +2542,65 @@ mod tests {
         assert_eq!(
             sender_inbox.returned_count, 0,
             "sender must not receive its own broadcast"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn broadcast_writes_command_audit_intent_and_final_rows() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let now = 11_000;
+        for who in ["sender", "a", "b"] {
+            register_session(&service, who, now)?;
+        }
+
+        let response = service.agent_send_broadcast_impl_at(
+            broadcast_params(
+                BroadcastTarget {
+                    all: true,
+                    agent_kinds: Vec::new(),
+                    sessions: Vec::new(),
+                },
+                "steer",
+                true,
+            ),
+            "sender",
+            now,
+        )?;
+        assert_eq!(response.delivered_count, 2);
+
+        let snapshot = service.command_audit_snapshot()?;
+        assert!(
+            snapshot.rows.iter().any(|row| {
+                row.tool == "agent_send_broadcast"
+                    && row.verb == "broadcast"
+                    && row.phase == "intent"
+                    && row.outcome == "pending"
+                    && row.actor_session_id.as_deref() == Some("sender")
+                    && row
+                        .before
+                        .as_ref()
+                        .and_then(|v| v.get("resolved_recipients"))
+                        == Some(&json!(2))
+            }),
+            "broadcast intent row should record the resolved recipient count before storage writes"
+        );
+        assert!(
+            snapshot.rows.iter().any(|row| {
+                row.tool == "agent_send_broadcast"
+                    && row.verb == "broadcast"
+                    && row.phase == "final"
+                    && row.outcome == "ok"
+                    && row.actor_session_id.as_deref() == Some("sender")
+                    && row.after.as_ref().and_then(|v| v.get("delivered_count")) == Some(&json!(2))
+                    && row
+                        .after
+                        .as_ref()
+                        .and_then(|v| v.get("recipients"))
+                        .is_some()
+            }),
+            "broadcast final row should record the physical delivery readback"
         );
         Ok(())
     }

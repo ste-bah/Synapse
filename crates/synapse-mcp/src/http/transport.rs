@@ -595,6 +595,16 @@ fn router(
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
         )
         .route(
+            "/dashboard/agent-broadcast",
+            post(dashboard_agent_broadcast)
+                .layer(DefaultBodyLimit::max(DASHBOARD_CONTEXT_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/dashboard/fleet-stop",
+            post(dashboard_fleet_stop)
+                .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
+        )
+        .route(
             "/dashboard/agent-interrupt",
             post(dashboard_agent_interrupt)
                 .layer(DefaultBodyLimit::max(DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES)),
@@ -2135,6 +2145,33 @@ struct DashboardAgentKillRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DashboardAgentBroadcastRequest {
+    selector: String,
+    #[serde(default)]
+    agent_kinds: Vec<String>,
+    #[serde(default)]
+    sessions: Vec<String>,
+    kind: String,
+    payload: serde_json::Value,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+    #[serde(default)]
+    request_receipt: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DashboardFleetStopRequest {
+    mode: String,
+    confirm: String,
+    #[serde(default)]
+    agent_kinds: Vec<String>,
+    #[serde(default)]
+    grace_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DashboardAgentLookupRequest {
     session_id: String,
 }
@@ -2156,6 +2193,22 @@ struct DashboardAgentKillResponse {
     trigger: &'static str,
     source_of_truth: &'static str,
     kill: crate::server::agent_control::AgentKillResponse,
+}
+
+#[derive(Serialize)]
+struct DashboardAgentBroadcastResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    broadcast: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct DashboardFleetStopResponse {
+    ok: bool,
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    fleet_stop: crate::server::agent_control::FleetStopResponse,
 }
 
 #[derive(Serialize)]
@@ -4853,6 +4906,78 @@ async fn dashboard_agent_kill(
     }
 }
 
+async fn dashboard_agent_broadcast(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardAgentBroadcastRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    match state.health_service.dashboard_agent_broadcast(
+        request.selector,
+        request.agent_kinds,
+        request.sessions,
+        request.kind,
+        request.payload,
+        request.ttl_ms,
+        request.request_receipt,
+    ) {
+        Ok(broadcast) => with_dashboard_security_headers(
+            Json(DashboardAgentBroadcastResponse {
+                ok: true,
+                trigger: "dashboard.agent_broadcast",
+                source_of_truth:
+                    "CF_KV agent mailbox rows + CF_ACTION_LOG command audit + dashboard readback",
+                broadcast,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
+async fn dashboard_fleet_stop(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<DashboardFleetStopRequest>,
+) -> Response {
+    if let Err(response) = dashboard_local_only(&state, &headers) {
+        return with_dashboard_security_headers(response);
+    }
+    let params = crate::server::agent_control::FleetStopParams {
+        mode: request.mode,
+        confirm: request.confirm,
+        agent_kinds: request.agent_kinds,
+        grace_ms: request
+            .grace_ms
+            .unwrap_or(DASHBOARD_AGENT_KILL_DEFAULT_GRACE_MS),
+    };
+    match state.health_service.dashboard_fleet_stop_request(params).await {
+        Ok(fleet_stop) => with_dashboard_security_headers(
+            Json(DashboardFleetStopResponse {
+                ok: true,
+                trigger: "dashboard.fleet_stop",
+                source_of_truth:
+                    "OS process table, session registry, CF_AGENT_EVENTS, CF_ACTION_LOG command audit rows",
+                fleet_stop,
+            })
+            .into_response(),
+        ),
+        Err(error) => with_dashboard_security_headers(dashboard_error_response(
+            StatusCode::BAD_REQUEST,
+            &dashboard_error_code(&error),
+            &error.message,
+            error.data,
+        )),
+    }
+}
+
 async fn dashboard_agent_interrupt(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -6888,11 +7013,11 @@ fn dashboard_unix_time_ms() -> u64 {
 }
 
 const DASHBOARD_CSS_FILE: &str = "dashboard-CSAxSdg5.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-C0YbNhhp.js";
+const DASHBOARD_JS_FILE: &str = "dashboard-CcchN6-8.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
     include_str!("../../../../dashboard/dist/assets/dashboard-CSAxSdg5.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-C0YbNhhp.js");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-CcchN6-8.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

@@ -564,6 +564,37 @@ export interface AgentKillResponse {
   kill: Record<string, unknown>;
 }
 
+export interface AgentBroadcastRequest {
+  selector: "all" | "agent_kinds" | "sessions";
+  agent_kinds?: string[];
+  sessions?: string[];
+  kind: string;
+  payload: Record<string, unknown>;
+  ttl_ms?: number;
+  request_receipt?: boolean;
+}
+
+export interface AgentBroadcastResponse {
+  ok: boolean;
+  trigger: string;
+  source_of_truth: string;
+  broadcast: Record<string, unknown>;
+}
+
+export interface FleetStopRequest {
+  mode: "kill" | "interrupt";
+  confirm: string;
+  agent_kinds?: string[];
+  grace_ms?: number;
+}
+
+export interface FleetStopResponse {
+  ok: boolean;
+  trigger: string;
+  source_of_truth: string;
+  fleet_stop: Record<string, unknown>;
+}
+
 export interface AgentLookupRequest {
   session_id: string;
 }
@@ -1018,6 +1049,28 @@ export async function killAgent(request: AgentKillRequest): Promise<AgentKillRes
     body: JSON.stringify(request)
   });
   return (await readJsonOrThrow(response)) as unknown as AgentKillResponse;
+}
+
+export async function broadcastAgents(request: AgentBroadcastRequest): Promise<AgentBroadcastResponse> {
+  const response = await fetch("/dashboard/agent-broadcast", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  return (await readJsonOrThrow(response)) as unknown as AgentBroadcastResponse;
+}
+
+export async function stopFleet(request: FleetStopRequest): Promise<FleetStopResponse> {
+  const response = await fetch("/dashboard/fleet-stop", {
+    method: "POST",
+    cache: "no-store",
+    credentials: "same-origin",
+    headers: jsonHeaders(),
+    body: JSON.stringify(request)
+  });
+  return (await readJsonOrThrow(response)) as unknown as FleetStopResponse;
 }
 
 export async function interruptAgent(request: AgentLookupRequest): Promise<DashboardControlResponse> {

@@ -69,6 +69,7 @@ import {
   buildTaskRows,
   buildToolCalls,
   attachedAgentRegistry,
+  broadcastAgents,
   cancelAgentTask,
   claimDashboardAssetReload,
   createAgentTask,
@@ -109,6 +110,7 @@ import {
   runStorageGc,
   saveDashboardView,
   searchTimelineRows,
+  stopFleet,
   spawnAgent,
   updateAgentPlan,
   updateAgentTask,
@@ -129,6 +131,7 @@ import {
   type ContextInjectChannel,
   type ContextInjectResponse,
   type ContextPlanResponse,
+  type AgentBroadcastResponse,
   type DashboardControlResponse,
   type DashboardRouteReadback,
   type DashboardSavedView,
@@ -137,6 +140,7 @@ import {
   type FleetStatus,
   type ModelRow,
   type AgentKillResponse,
+  type FleetStopResponse,
   type RoutineEntry,
   type RoutineUpdateAction,
   type RoutineUpdateReadback,
@@ -928,6 +932,7 @@ function FleetView({
       >
         <TemplatesPanel onSpawned={onSpawned} />
       </Section>
+      <FleetControlPanel agents={agents} onRefresh={onSpawned} />
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(20rem,0.42fr)]">
         <div className="min-w-0">
           <Section
@@ -6672,6 +6677,195 @@ function TemplatesPanel({ onSpawned }: { onSpawned: () => void }) {
       </form>
     </div>
   );
+}
+
+type BroadcastSelector = "all" | "agent_kinds" | "sessions";
+type FleetStopMode = "kill" | "interrupt";
+
+function FleetControlPanel({ agents, onRefresh }: { agents: AgentSummary[]; onRefresh: () => void | Promise<unknown> }) {
+  const liveAgents = agents.filter((agent) => agent.killable || agent.lifecycle === "live");
+  const liveSessionIds = liveAgents
+    .map((agent) => agentRuntimeSessionId(agent) || agentSessionId(agent) || agent.spawnId || agent.id)
+    .filter((id): id is string => Boolean(id));
+  const liveKinds = Array.from(new Set(liveAgents.map((agent) => rawText(agent.kind)).filter(Boolean))).sort();
+  const [broadcastSelector, setBroadcastSelector] = useState<BroadcastSelector>("all");
+  const [broadcastKinds, setBroadcastKinds] = useState("");
+  const [broadcastSessions, setBroadcastSessions] = useState("");
+  const [broadcastKind, setBroadcastKind] = useState("steer");
+  const [broadcastReceipt, setBroadcastReceipt] = useState(true);
+  const [broadcastTtlMs, setBroadcastTtlMs] = useState("600000");
+  const [broadcastPayload, setBroadcastPayload] = useState(() =>
+    JSON.stringify(
+      {
+        source: "dashboard",
+        message: "issue930-fleet-broadcast",
+        expected_ack: "each live agent can read this durable mailbox row"
+      },
+      null,
+      2
+    )
+  );
+  const [broadcastPending, setBroadcastPending] = useState(false);
+  const [broadcastError, setBroadcastError] = useState("");
+  const [broadcastReadback, setBroadcastReadback] = useState<AgentBroadcastResponse | null>(null);
+
+  const [stopMode, setStopMode] = useState<FleetStopMode>("kill");
+  const [stopKinds, setStopKinds] = useState("");
+  const [stopGraceMs, setStopGraceMs] = useState("0");
+  const [stopConfirm, setStopConfirm] = useState("");
+  const [stopPending, setStopPending] = useState(false);
+  const [stopError, setStopError] = useState("");
+  const [stopReadback, setStopReadback] = useState<FleetStopResponse | null>(null);
+
+  const submitBroadcast = async (event: FormEvent) => {
+    event.preventDefault();
+    setBroadcastError("");
+    setBroadcastPending(true);
+    try {
+      const parsed = JSON.parse(broadcastPayload) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Broadcast payload must be a JSON object");
+      }
+      const readback = await broadcastAgents({
+        selector: broadcastSelector,
+        agent_kinds: parseDelimitedList(broadcastKinds),
+        sessions: parseDelimitedList(broadcastSessions),
+        kind: broadcastKind,
+        payload: parsed as Record<string, unknown>,
+        ttl_ms: parsePositiveInteger(broadcastTtlMs, "ttl_ms") ?? undefined,
+        request_receipt: broadcastReceipt
+      });
+      setBroadcastReadback(readback);
+      await onRefresh();
+    } catch (error) {
+      setBroadcastError(error instanceof Error ? error.message : rawText(error) || "Broadcast failed");
+    } finally {
+      setBroadcastPending(false);
+    }
+  };
+
+  const submitFleetStop = async (event: FormEvent) => {
+    event.preventDefault();
+    setStopError("");
+    setStopPending(true);
+    try {
+      const readback = await stopFleet({
+        mode: stopMode,
+        confirm: stopConfirm,
+        agent_kinds: parseDelimitedList(stopKinds),
+        grace_ms: parseNonNegativeInteger(stopGraceMs, "grace_ms") ?? 0
+      });
+      setStopReadback(readback);
+      await onRefresh();
+    } catch (error) {
+      setStopError(error instanceof Error ? error.message : rawText(error) || "Fleet stop failed");
+    } finally {
+      setStopPending(false);
+    }
+  };
+
+  return (
+    <Section
+      title="Fleet Controls"
+      tier="triage"
+      questions={["Which live agents are affected?", "Did the broadcast persist per-recipient rows?", "Did fleet stop remove every owned process?"]}
+    >
+      <div className="grid gap-4 xl:grid-cols-2">
+        <form className="rounded-lg border border-border bg-surface-1 p-[var(--density-card-padding)]" onSubmit={submitBroadcast}>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Bell aria-hidden="true" className="h-4 w-4 text-info" />
+              <h3 className="text-md font-semibold tracking-normal text-primary">Broadcast</h3>
+            </div>
+            <span className="font-mono text-xs text-muted">{liveAgents.length} live rows</span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="block text-sm text-secondary">
+              <span className="mb-1 block text-label font-medium uppercase text-muted">Recipients</span>
+              <select
+                className="h-10 w-full rounded-md border border-border bg-surface-2 px-3 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+                value={broadcastSelector}
+                onChange={(event) => setBroadcastSelector(event.target.value as BroadcastSelector)}
+              >
+                <option value="all">All live agents</option>
+                <option value="agent_kinds">Agent kinds</option>
+                <option value="sessions">Explicit sessions</option>
+              </select>
+            </label>
+            <TextField label="Kind" value={broadcastKind} onChange={setBroadcastKind} mono />
+            {broadcastSelector === "agent_kinds" ? (
+              <TextField label="Agent kinds" value={broadcastKinds} onChange={setBroadcastKinds} mono placeholder={liveKinds.join(", ")} />
+            ) : null}
+            {broadcastSelector === "sessions" ? (
+              <TextField label="Sessions" value={broadcastSessions} onChange={setBroadcastSessions} mono placeholder={liveSessionIds.join(", ")} />
+            ) : null}
+            <TextField label="TTL ms" value={broadcastTtlMs} onChange={setBroadcastTtlMs} mono type="number" />
+          </div>
+          <label className="mt-3 block text-sm text-secondary">
+            <span className="mb-1 block text-label font-medium uppercase text-muted">Payload JSON</span>
+            <textarea
+              className="min-h-32 w-full rounded-md border border-border bg-surface-2 px-3 py-2 font-mono text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+              value={broadcastPayload}
+              onChange={(event) => setBroadcastPayload(event.target.value)}
+            />
+          </label>
+          <label className="mt-3 flex items-center gap-2 text-sm text-secondary">
+            <input type="checkbox" checked={broadcastReceipt} onChange={(event) => setBroadcastReceipt(event.target.checked)} />
+            Request receipt
+          </label>
+          {broadcastError ? <div className="mt-3 rounded-md border border-danger-border bg-danger-bg p-3 text-sm text-danger-fg">{broadcastError}</div> : null}
+          <div className="mt-3 flex justify-end">
+            <Button type="submit" variant="secondary" disabled={broadcastPending || !broadcastKind.trim()}>
+              <Bell aria-hidden="true" className="h-4 w-4" />
+              {broadcastPending ? "Broadcasting" : "Broadcast"}
+            </Button>
+          </div>
+          {broadcastReadback ? <RawValue value={broadcastReadback} label="Broadcast readback" /> : null}
+        </form>
+
+        <form className="rounded-lg border border-danger-border bg-danger-bg p-[var(--density-card-padding)]" onSubmit={submitFleetStop}>
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <Trash2 aria-hidden="true" className="h-4 w-4 text-danger-fg" />
+              <h3 className="text-md font-semibold tracking-normal text-danger-fg">Fleet stop</h3>
+            </div>
+            <span className="font-mono text-xs text-danger-fg">{liveSessionIds.length} candidate sessions</span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="block text-sm text-secondary">
+              <span className="mb-1 block text-label font-medium uppercase text-muted">Mode</span>
+              <select
+                className="h-10 w-full rounded-md border border-border bg-surface-2 px-3 text-sm text-primary outline-none focus:ring-2 focus:ring-focus-ring"
+                value={stopMode}
+                onChange={(event) => setStopMode(event.target.value as FleetStopMode)}
+              >
+                <option value="kill">Kill</option>
+                <option value="interrupt">Interrupt</option>
+              </select>
+            </label>
+            <TextField label="Grace ms" value={stopGraceMs} onChange={setStopGraceMs} mono type="number" />
+            <TextField label="Agent kind filter" value={stopKinds} onChange={setStopKinds} mono placeholder={liveKinds.join(", ")} />
+            <TextField label="Confirm token" value={stopConfirm} onChange={setStopConfirm} mono placeholder="STOP-FLEET" />
+          </div>
+          {stopError ? <div className="mt-3 rounded-md border border-danger-border bg-surface p-3 text-sm text-danger-fg">{stopError}</div> : null}
+          <div className="mt-3 flex justify-end">
+            <Button type="submit" variant="danger" disabled={stopPending || stopConfirm !== "STOP-FLEET"}>
+              <Trash2 aria-hidden="true" className="h-4 w-4" />
+              {stopPending ? "Stopping" : "Stop fleet"}
+            </Button>
+          </div>
+          {stopReadback ? <RawValue value={stopReadback} label="Fleet stop readback" /> : null}
+        </form>
+      </div>
+    </Section>
+  );
+}
+
+function parseDelimitedList(value: string): string[] {
+  return value
+    .split(/[,\n]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function TextField({
