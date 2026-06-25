@@ -875,6 +875,10 @@ impl Runner {
             return Ok(());
         }
 
+        let args = self
+            .normalize_local_agent_attribution_args(&call, &tool_name, args, routed)
+            .await?;
+
         // Local-model agents are trusted autonomous workers. Prompt/exact-tool
         // contracts and tool-level invariants are the control surfaces; do not
         // pause normal local-model Synapse calls on a human approval queue.
@@ -1396,6 +1400,47 @@ impl Runner {
         }))
         .await?;
         Ok(contract_args)
+    }
+
+    async fn normalize_local_agent_attribution_args(
+        &mut self,
+        call: &OpenAiToolCall,
+        tool_name: &str,
+        args: JsonObject,
+        routed: bool,
+    ) -> anyhow::Result<JsonObject> {
+        let (attributed_args, changed) =
+            add_agent_ask_operator_spawn_id(tool_name, args, &self.spawn_id);
+        if !changed {
+            return Ok(attributed_args);
+        }
+        self.write_line(json!({
+            "type": "local.tool_call.arguments_normalized",
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "turn_index": self.turn_count,
+            "tool_name": tool_name,
+            "tool_call_id": call.id,
+            "routed_tool_name": if routed { Some(tool_name) } else { None },
+            "reason_code": "local_agent_spawn_id_attribution",
+            "spawn_id": self.spawn_id,
+            "attributed_arguments": Value::Object(attributed_args.clone()),
+            "tool_exposure": self.tool_exposure.as_str(),
+        }))?;
+        self.post_event(json!({
+            "event": "state_changed",
+            "session_id": self.mcp_session_id,
+            "conversation_id": self.conversation_id,
+            "model": self.registry.model_id,
+            "registry_name": self.registry.name,
+            "state_to": "live",
+            "reason_code": "local_agent_spawn_id_attribution",
+            "tool_name": tool_name,
+            "tool_call_id": call.id,
+            "spawn_id": self.spawn_id,
+        }))
+        .await?;
+        Ok(attributed_args)
     }
 
     async fn record_model_tool_call_invalid(
@@ -2258,6 +2303,26 @@ fn model_tool_call_pre_gate_rejection(
     }
 }
 
+fn add_agent_ask_operator_spawn_id(
+    tool_name: &str,
+    mut args: JsonObject,
+    spawn_id: &str,
+) -> (JsonObject, bool) {
+    if tool_name != "agent_ask_operator" {
+        return (args, false);
+    }
+    let should_add = match args.get("spawn_id") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(value)) => value.trim().is_empty(),
+        Some(_) => false,
+    };
+    if !should_add {
+        return (args, false);
+    }
+    args.insert("spawn_id".to_owned(), Value::String(spawn_id.to_owned()));
+    (args, true)
+}
+
 fn local_agent_exact_contract_gate_bypass_allowed(
     tool_name: &str,
     args: &JsonObject,
@@ -2871,11 +2936,26 @@ fn task_contract_required_tool_failure_is_terminal(
     if next_tool != tool_name {
         return false;
     }
-    contract
+    let Some(expected) = contract
         .step_argument_templates
         .get(step_index)
         .and_then(Option::as_ref)
-        .is_some_and(|expected| expected == args)
+    else {
+        return false;
+    };
+    expected == &contract_failure_comparable_args(tool_name, expected, args)
+}
+
+fn contract_failure_comparable_args(
+    tool_name: &str,
+    expected: &JsonObject,
+    args: &JsonObject,
+) -> JsonObject {
+    let mut comparable = args.clone();
+    if tool_name == "agent_ask_operator" && !expected.contains_key("spawn_id") {
+        comparable.remove("spawn_id");
+    }
+    comparable
 }
 
 fn task_contract_out_of_order_rejection(
@@ -4570,6 +4650,75 @@ mod tests {
             )
             .is_none()
         );
+        let question_args: JsonObject = serde_json::from_value(json!({
+            "question": "Which synthetic value should be used?",
+            "timeout_ms": 1000,
+            "notify": false,
+            "suppress_popup": true,
+        }))?;
+        assert!(
+            model_tool_call_pre_gate_rejection(
+                "agent_ask_operator",
+                &question_args,
+                true,
+                None,
+                &BTreeMap::new()
+            )
+            .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn agent_ask_operator_args_receive_local_spawn_attribution() -> anyhow::Result<()> {
+        let args: JsonObject = serde_json::from_value(json!({
+            "question": "Which synthetic value should be used?",
+            "timeout_ms": 1000,
+            "notify": false,
+            "suppress_popup": true,
+        }))?;
+        let (attributed, changed) =
+            add_agent_ask_operator_spawn_id("agent_ask_operator", args, "agent-spawn-local-test");
+        assert!(changed);
+        assert_eq!(
+            attributed.get("spawn_id").and_then(Value::as_str),
+            Some("agent-spawn-local-test")
+        );
+
+        let existing: JsonObject = serde_json::from_value(json!({
+            "question": "Already attributed?",
+            "spawn_id": "agent-spawn-explicit",
+        }))?;
+        let (existing, changed) = add_agent_ask_operator_spawn_id(
+            "agent_ask_operator",
+            existing,
+            "agent-spawn-local-test",
+        );
+        assert!(!changed);
+        assert_eq!(
+            existing.get("spawn_id").and_then(Value::as_str),
+            Some("agent-spawn-explicit")
+        );
+
+        let malformed: JsonObject = serde_json::from_value(json!({
+            "question": "Malformed attribution should fail in the tool schema.",
+            "spawn_id": 7,
+        }))?;
+        let (malformed, changed) = add_agent_ask_operator_spawn_id(
+            "agent_ask_operator",
+            malformed,
+            "agent-spawn-local-test",
+        );
+        assert!(!changed);
+        assert_eq!(malformed.get("spawn_id"), Some(&json!(7)));
+
+        let other: JsonObject = serde_json::from_value(json!({
+            "key": "x",
+        }))?;
+        let (other, changed) =
+            add_agent_ask_operator_spawn_id("workspace_get", other, "agent-spawn-local-test");
+        assert!(!changed);
+        assert!(other.get("spawn_id").is_none());
         Ok(())
     }
 
@@ -4889,6 +5038,35 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
                 &exact_args,
             ),
             "ordinary non-contract tool errors stay recoverable"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_tool_contract_terminal_on_agent_question_failure_after_spawn_attribution()
+    -> anyhow::Result<()> {
+        let tools = tools_named(["agent_ask_operator"]);
+        let task = "Exact-contract Synapse task. Use exactly these real Synapse tools in this exact order:\n\
+1. agent_ask_operator {\"question\":\"\",\"context\":\"FSV-1028-EMPTY\",\"timeout_ms\":120000,\"notify\":false,\"suppress_popup\":true}";
+        let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
+        let model_args: JsonObject = serde_json::from_value(json!({
+            "question": "",
+            "context": "FSV-1028-EMPTY",
+            "timeout_ms": 120000,
+            "notify": false,
+            "suppress_popup": true,
+        }))?;
+        let (dispatched_args, changed) =
+            add_agent_ask_operator_spawn_id("agent_ask_operator", model_args, "agent-spawn-empty");
+        assert!(changed);
+        assert!(
+            task_contract_required_tool_failure_is_terminal(
+                Some(&contract),
+                &BTreeMap::new(),
+                "agent_ask_operator",
+                &dispatched_args,
+            ),
+            "runner-added spawn_id must not make a fixed exact-contract agent_ask_operator failure recoverable forever"
         );
         Ok(())
     }

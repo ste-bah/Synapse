@@ -202,6 +202,7 @@ Prompt-injection scoring + operator-supplied OpenAI-compatible model registry. S
 | `approval_list` | List approval/suggestion queue rows | `statuses?`, `kinds?`, `include_terminal=false`, `limit?`, `cursor?` | materializes expired rows; audit row |
 | `approval_decide` | Resolve item accept/decline/snooze | `approval_id` (req), `decision` (req), `note?`, `snooze_ms?`, `edited_args?`, `response_text?` | writes CF_KV + audit |
 | `approval_gate` | Permission-prompt tool for spawned agents (#927) | `tool_name?`, `input?`, `tool_use_id?`, `spawn_id?` | gates tool call |
+| `agent_ask_operator` | Respond-only needs-input tool for spawned/local agents (#1028) | `question` (req), `context?`, `timeout_ms?`, `spawn_id?`, `notify=true`, `suppress_popup=false` | writes `agent_question` approval row and blocks until response/decline/timeout |
 | `escalation_config_set` | Configure AFK escalation engine | `webhooks?`, `min_tier1_severity?`, `ack_window_ms?`, `critical_ack_window_ms?`, `quiet_hours?` | writes policy (secrets stored, never echoed) |
 | `escalation_config_get` | Read current escalation policy | none | read-only (secrets redacted) |
 | `escalation_list` | List durable escalations + ladder state | `anchor?`, `status?`, `severity?`, `limit?`, `after_id?` | read-only |

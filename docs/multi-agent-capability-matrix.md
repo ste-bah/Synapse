@@ -50,6 +50,7 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | agent_cost_price_delete | break_glass | yes | no | no | no | agent_cost |
 | agent_cost_price_list | break_glass | yes | no | no | no | agent_cost |
 | agent_cost_price_put | break_glass | yes | no | no | no | agent_cost |
+| agent_ask_operator | normal_agent | no | no | no | no | none - default-safe |
 | agent_inbox | normal_agent | no | no | no | no | none - default-safe |
 | agent_interrupt | normal_agent | no | no | no | no | none - default-safe |
 | agent_kill | normal_agent | no | no | no | no | none - default-safe |
@@ -200,6 +201,7 @@ Research basis:
 | agent_cost_price_delete | session control | model price key in CF_KV | CF_KV price-table row delete with exact-row readback | no foreground lease | control | none (#949) | CF_KV price-table row absent after delete |
 | agent_cost_price_list | session control | CF_KV price-table prefix | CF_KV price-table prefix scan | no foreground lease | control | none (#949) | CF_KV price-table rows returned |
 | agent_cost_price_put | session control | model price key in CF_KV | CF_KV price-table row write with flush and exact-row readback | no foreground lease | control | none (#949) | CF_KV price-table row key and hash after write |
+| agent_ask_operator | session control | current MCP session id plus optional spawn id | writes a durable `agent_question` approval row and blocks until `approval_decide` stores a response, decline, or timeout decision; answer text returns as the tool result | no foreground lease | control | none (#1028) | `CF_KV approval/v1/item/<approval_id>` row plus `approval/v1/audit/<approval_id>/...` row; tool result approval_id/status/operator_response |
 | agent_inbox | session control | current MCP session id | CF_KV durable recipient-prefix scan, expired-row delete, optional exact-row drain | no foreground lease | control | none (#795) | CF_KV agent-mailbox recipient prefix before and after plus returned row keys and hashes |
 | agent_interrupt | session control | target agent MCP session id or agent-spawn-* id | resolves the agent in the live session registry then delivers a durable interrupt over the cooperative mailbox channel; codex turn/interrupt, claude stream-json, and PTY ESC channels are reported unavailable, never faked | no foreground lease | control | none (#904); PTY ESC channel tracked by #902 | CF_KV interrupt mailbox row, CF_AGENT_EVENTS interrupted row, and CF_ACTION_LOG command-audit rows |
 | agent_kill | session control | target agent MCP session id or agent-spawn-* id | resolves the agent then reuses per-session teardown: Windows job-close then force kill of the recorded process tree, plus lease, claim, and desktop release | no foreground lease | control | none (#904) | OS process table before and after, CF_AGENT_EVENTS killed row, and CF_ACTION_LOG command-audit rows |

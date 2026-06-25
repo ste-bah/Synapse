@@ -27,6 +27,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "act_run_shell_start",
     "act_run_shell_status",
     "act_spawn_agent",
+    "agent_ask_operator",
     "agent_cost",
     "agent_spawn_task_started",
     "agent_inbox",

@@ -369,6 +369,7 @@ const SAFE_MCP_TOOLS: &[&str] = &[
     "read_text",
     "get_target",
     "health",
+    "agent_ask_operator",
     "agent_spawn_task_started",
     "agent_query",
     "agent_inbox",
