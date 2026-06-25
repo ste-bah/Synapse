@@ -530,62 +530,48 @@ impl SynapseService {
                         "target_act verb=set_field does not accept x/y because set_field is a replacement operation; use verb=type with x/y for coordinate focus + keyboard text",
                     ));
                 }
-                if let Some(selector) = params
-                    .selector
-                    .as_ref()
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    // Background-safe web field replace in the user's normal Chrome
-                    // via the safe bridge (no foreground, no DOM/action debugger attach, no UIA) — the
-                    // #1000/#1005 path for forms perceived UIA-only.
-                    let response = self
-                        .browser_set_value(
-                            Parameters(BrowserSetValueParams {
-                                text: params.text.unwrap_or_default(),
-                                selector: Some(selector.clone()),
-                                active_element: false,
-                                cdp_target_id: None,
-                                window_hwnd: None,
-                            }),
-                            request_context,
-                        )
-                        .await;
-                    target_act_delegate_response("browser_set_value", response)?
-                } else {
-                    let element_id = match params.element_id.as_deref() {
-                        Some(value) if !value.trim().is_empty() => {
-                            Some(ElementId::parse(value).map_err(|error| {
-                                mcp_error(
-                                    error_codes::TOOL_PARAMS_INVALID,
-                                    format!(
-                                        "target_act verb=set_field element_id is invalid: {error}"
-                                    ),
-                                )
-                            })?)
-                        }
-                        _ => None,
-                    };
-                    let locator = target_act_set_field_locator(&params);
-                    if element_id.is_none() && locator.is_none() {
-                        return Err(mcp_error(
-                            error_codes::TOOL_PARAMS_INVALID,
-                            "target_act verb=set_field requires element_id, selector, or a native/UIA locator (role/name/automation_id)",
-                        ));
+                match target_act_set_field_target(&params)? {
+                    TargetActSetFieldTarget::Browser {
+                        selector,
+                        element_id,
+                    } => {
+                        // Background-safe web field replace in the user's normal Chrome
+                        // via the safe bridge (no foreground, no DOM/action debugger attach,
+                        // no UIA) — the #1000/#1005 path for forms perceived UIA-only.
+                        let response = self
+                            .browser_set_value(
+                                Parameters(BrowserSetValueParams {
+                                    text: params.text.unwrap_or_default(),
+                                    selector,
+                                    element_id,
+                                    active_element: false,
+                                    cdp_target_id: None,
+                                    window_hwnd: None,
+                                }),
+                                request_context,
+                            )
+                            .await;
+                        target_act_delegate_response("browser_set_value", response)?
                     }
-                    let response = self
-                        .act_set_field_text(
-                            Parameters(ActSetFieldTextParams {
-                                element_id,
-                                locator,
-                                text: params.text.unwrap_or_default(),
-                                verify_timeout_ms: default_verify_timeout_ms(),
-                                auto_wait: params.auto_wait,
-                                auto_wait_timeout_ms: params.auto_wait_timeout_ms,
-                            }),
-                            request_context,
-                        )
-                        .await;
-                    target_act_delegate_response("act_set_field_text", response)?
+                    TargetActSetFieldTarget::Native {
+                        element_id,
+                        locator,
+                    } => {
+                        let response = self
+                            .act_set_field_text(
+                                Parameters(ActSetFieldTextParams {
+                                    element_id,
+                                    locator,
+                                    text: params.text.unwrap_or_default(),
+                                    verify_timeout_ms: default_verify_timeout_ms(),
+                                    auto_wait: params.auto_wait,
+                                    auto_wait_timeout_ms: params.auto_wait_timeout_ms,
+                                }),
+                                request_context,
+                            )
+                            .await;
+                        target_act_delegate_response("act_set_field_text", response)?
+                    }
                 }
             }
             "insert_text" => {
@@ -3995,7 +3981,7 @@ fn target_act_dom_id_selector(value: &str) -> Result<String, ErrorData> {
     if value.is_empty() || value.chars().any(char::is_control) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=tap DOM element_id must be non-empty visible text",
+            "target_act DOM element_id must be non-empty visible text",
         ));
     }
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
@@ -4023,6 +4009,75 @@ fn target_act_set_field_locator(params: &TargetActParams) -> Option<ActSetFieldT
             automation_id,
         },
     )
+}
+
+#[derive(Debug)]
+enum TargetActSetFieldTarget {
+    Browser {
+        selector: Option<String>,
+        element_id: Option<String>,
+    },
+    Native {
+        element_id: Option<ElementId>,
+        locator: Option<ActSetFieldTextLocator>,
+    },
+}
+
+fn target_act_set_field_target(
+    params: &TargetActParams,
+) -> Result<TargetActSetFieldTarget, ErrorData> {
+    let selector = trimmed_non_empty_string(params.selector.as_deref());
+    let raw_element_id = trimmed_non_empty_string(params.element_id.as_deref());
+    let native_locator = target_act_set_field_locator(params);
+    let locator_count = usize::from(selector.is_some())
+        + usize::from(raw_element_id.is_some())
+        + usize::from(native_locator.is_some());
+    if locator_count != 1 {
+        let message = if locator_count == 0 {
+            "target_act verb=set_field requires element_id, selector, or a native/UIA locator (role/name/automation_id)"
+        } else {
+            "target_act verb=set_field accepts exactly one of element_id, selector, or native/UIA locator (role/name/automation_id)"
+        };
+        return Err(mcp_error(error_codes::TOOL_PARAMS_INVALID, message));
+    }
+    if let Some(selector) = selector {
+        return Ok(TargetActSetFieldTarget::Browser {
+            selector: Some(selector),
+            element_id: None,
+        });
+    }
+    if let Some(raw_element_id) = raw_element_id {
+        match ElementId::parse(&raw_element_id) {
+            Ok(element_id) => {
+                return Ok(TargetActSetFieldTarget::Native {
+                    element_id: Some(element_id),
+                    locator: None,
+                });
+            }
+            Err(_) if raw_element_id.starts_with("chrome-tab:") => {
+                return Ok(TargetActSetFieldTarget::Browser {
+                    selector: None,
+                    element_id: Some(raw_element_id),
+                });
+            }
+            Err(_) if target_act_click_element_id_can_be_dom_id(&raw_element_id) => {
+                return Ok(TargetActSetFieldTarget::Browser {
+                    selector: Some(target_act_dom_id_selector(&raw_element_id)?),
+                    element_id: None,
+                });
+            }
+            Err(error) => {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("target_act verb=set_field element_id is invalid: {error}"),
+                ));
+            }
+        }
+    }
+    Ok(TargetActSetFieldTarget::Native {
+        element_id: None,
+        locator: native_locator,
+    })
 }
 
 fn target_act_has_dom_locator(params: &TargetActParams) -> bool {
@@ -5705,6 +5760,99 @@ mod tests {
         assert_eq!(locator.name.as_deref(), Some("Message Body"));
         assert_eq!(locator.automation_id.as_deref(), Some("compose-body"));
         assert!(locator.name_substring.is_none());
+    }
+
+    #[test]
+    fn target_act_set_field_bridge_element_id_routes_to_browser_bridge() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "set_field",
+            "element_id": "chrome-tab:589708698:frame:0:path:0.1.1",
+            "text": "hello"
+        }))
+        .expect("set_field bridge element_id params should deserialize");
+
+        match target_act_set_field_target(&params).expect("bridge element_id routes") {
+            TargetActSetFieldTarget::Browser {
+                selector,
+                element_id,
+            } => {
+                assert!(selector.is_none());
+                assert_eq!(
+                    element_id.as_deref(),
+                    Some("chrome-tab:589708698:frame:0:path:0.1.1")
+                );
+            }
+            TargetActSetFieldTarget::Native { .. } => {
+                panic!("bridge element_id must not route to native/UIA")
+            }
+        }
+    }
+
+    #[test]
+    fn target_act_set_field_native_element_id_routes_to_native_text() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "set_field",
+            "element_id": "0x2a:0000000000000001",
+            "text": "hello"
+        }))
+        .expect("set_field native element_id params should deserialize");
+
+        match target_act_set_field_target(&params).expect("native element_id routes") {
+            TargetActSetFieldTarget::Native {
+                element_id,
+                locator,
+            } => {
+                assert_eq!(
+                    element_id.as_ref().map(ElementId::as_str),
+                    Some("0x2a:0000000000000001")
+                );
+                assert!(locator.is_none());
+            }
+            TargetActSetFieldTarget::Browser { .. } => {
+                panic!("native element_id must not route to browser bridge")
+            }
+        }
+    }
+
+    #[test]
+    fn target_act_set_field_plain_dom_element_id_routes_to_selector() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "set_field",
+            "element_id": "compose-body",
+            "text": "hello"
+        }))
+        .expect("set_field plain DOM id params should deserialize");
+
+        match target_act_set_field_target(&params).expect("plain DOM id routes") {
+            TargetActSetFieldTarget::Browser {
+                selector,
+                element_id,
+            } => {
+                assert_eq!(selector.as_deref(), Some("[id=\"compose-body\"]"));
+                assert!(element_id.is_none());
+            }
+            TargetActSetFieldTarget::Native { .. } => {
+                panic!("plain DOM id must not route to native/UIA")
+            }
+        }
+    }
+
+    #[test]
+    fn target_act_set_field_rejects_mixed_locators() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "set_field",
+            "selector": "textarea",
+            "element_id": "chrome-tab:589708698:frame:0:path:0.1.1",
+            "text": "hello"
+        }))
+        .expect("set_field mixed params should deserialize");
+
+        let error = target_act_set_field_target(&params).expect_err("mixed locators must fail");
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert!(error.message.contains("exactly one"));
     }
 
     #[test]

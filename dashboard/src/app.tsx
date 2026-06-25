@@ -132,6 +132,7 @@ import {
   type ContextInjectResponse,
   type ContextPlanResponse,
   type AgentBroadcastResponse,
+  type ApprovalDecideResponse,
   type DashboardControlResponse,
   type DashboardRouteReadback,
   type DashboardSavedView,
@@ -2794,8 +2795,15 @@ function buildAgentsWithAttention(state?: DashboardState): AgentSummary[] {
   return [...promoted, ...missingRows];
 }
 
-function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided?: () => void }) {
-  const rows = useMemo(() => parseApprovalRows(state?.approvals), [state]);
+type ApprovalDecisionRefresh = (approvalId: string, response: ApprovalDecideResponse) => unknown | Promise<unknown>;
+
+function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided?: ApprovalDecisionRefresh }) {
+  const [resolvedApprovalIds, setResolvedApprovalIds] = useState<Set<string>>(new Set());
+  const parsedRows = useMemo(() => parseApprovalRows(state?.approvals), [state]);
+  const rows = useMemo(
+    () => parsedRows.filter((row) => !resolvedApprovalIds.has(row.approvalId)),
+    [parsedRows, resolvedApprovalIds]
+  );
   const rowsById = useMemo(() => new Map(rows.map((row) => [row.approvalId, row])), [rows]);
   const agentRows = useMemo(
     () => rows.filter((row) => AGENT_ATTENTION_KINDS.includes(row.kind)),
@@ -2811,6 +2819,14 @@ function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided
   const [notes, setNotes] = useState<Record<string, string>>({});
   const [selected, setSelected] = useState<Set<string>>(new Set());
 
+  useEffect(() => {
+    const sourceIds = new Set(parsedRows.map((row) => row.approvalId));
+    setResolvedApprovalIds((prev) => {
+      const next = new Set(Array.from(prev).filter((approvalId) => sourceIds.has(approvalId)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [parsedRows]);
+
   async function decide(
     approvalId: string,
     decision: "approve" | "deny",
@@ -2824,19 +2840,23 @@ function ApprovalsView({ state, onDecided }: { state?: DashboardState; onDecided
     });
     try {
       const note = notes[approvalId]?.trim();
-      await decideApproval({
+      const response = await decideApproval({
         approval_id: approvalId,
         decision,
         note: note || undefined,
         edited_args: opts?.editedArgs,
         response: opts?.response
       });
+      const afterStatus = rawText(asRecord(response.decision).after_status);
+      if (afterStatus && afterStatus !== "pending" && afterStatus !== "snoozed") {
+        setResolvedApprovalIds((prev) => new Set(prev).add(approvalId));
+      }
       setSelected((prev) => {
         const next = new Set(prev);
         next.delete(approvalId);
         return next;
       });
-      onDecided?.();
+      await onDecided?.(approvalId, response);
     } catch (err) {
       setErrors((prev) => ({
         ...prev,
@@ -2963,15 +2983,28 @@ function AgentAttentionPeek({
 }: {
   state?: DashboardState;
   agent?: AgentSummary;
-  onDecided?: () => void;
+  onDecided?: ApprovalDecisionRefresh;
 }) {
-  const rows = useMemo(() => {
+  const [resolvedApprovalIds, setResolvedApprovalIds] = useState<Set<string>>(new Set());
+  const parsedRows = useMemo(() => {
     const ids = agentIdentifierSet(agent);
     return parseApprovalRows(state?.approvals).filter((row) => approvalRowMatchesAgent(row, ids));
   }, [agent, state]);
+  const rows = useMemo(
+    () => parsedRows.filter((row) => !resolvedApprovalIds.has(row.approvalId)),
+    [parsedRows, resolvedApprovalIds]
+  );
   const [busy, setBusy] = useState<Record<string, boolean>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [notes, setNotes] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    const sourceIds = new Set(parsedRows.map((row) => row.approvalId));
+    setResolvedApprovalIds((prev) => {
+      const next = new Set(Array.from(prev).filter((approvalId) => sourceIds.has(approvalId)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [parsedRows]);
 
   async function decide(
     approvalId: string,
@@ -2986,14 +3019,18 @@ function AgentAttentionPeek({
     });
     try {
       const note = notes[approvalId]?.trim();
-      await decideApproval({
+      const response = await decideApproval({
         approval_id: approvalId,
         decision,
         note: note || undefined,
         edited_args: opts?.editedArgs,
         response: opts?.response
       });
-      onDecided?.();
+      const afterStatus = rawText(asRecord(response.decision).after_status);
+      if (afterStatus && afterStatus !== "pending" && afterStatus !== "snoozed") {
+        setResolvedApprovalIds((prev) => new Set(prev).add(approvalId));
+      }
+      await onDecided?.(approvalId, response);
     } catch (err) {
       setErrors((prev) => ({
         ...prev,
@@ -6032,6 +6069,26 @@ const deepSeekPresets = {
 
 type SpawnMode = "local_model" | "codex" | "claude";
 type SpawnTargetMode = "none" | "window" | "cdp";
+const LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS = 15 * 60 * 1000;
+
+function localModelProbeAgeMs(model: ModelRow): number | null {
+  const observed = model.last_probe?.observed_at_unix_ms;
+  return typeof observed === "number" && Number.isFinite(observed) ? Math.max(0, Date.now() - observed) : null;
+}
+
+function localModelLaunchReady(model: ModelRow): boolean {
+  const ageMs = localModelProbeAgeMs(model);
+  return Boolean(model.enabled && model.last_probe?.healthy && ageMs !== null && ageMs <= LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS);
+}
+
+function localModelProbeLabel(model: ModelRow): string {
+  if (!model.last_probe) return "unprobed";
+  if (!model.last_probe.healthy) return model.last_probe.status || "unhealthy";
+  const ageMs = localModelProbeAgeMs(model);
+  if (ageMs === null) return "healthy probe missing timestamp";
+  if (ageMs > LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS) return `stale healthy probe (${Math.round(ageMs / 1000)}s old)`;
+  return model.last_probe.status || "healthy";
+}
 
 function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
   const modelsQuery = useQuery({
@@ -6058,7 +6115,7 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
 
   useEffect(() => {
     if (!selectedModel && models.length > 0) {
-      const firstLaunchable = models.find((model) => model.enabled && model.last_probe?.healthy) ?? models[0];
+      const firstLaunchable = models.find(localModelLaunchReady) ?? models[0];
       setSelectedModel(firstLaunchable.name);
     }
   }, [models, selectedModel]);
@@ -6303,7 +6360,7 @@ function SpawnConsole({ onSpawned }: { onSpawned: () => void }) {
             <div className="min-w-0 text-sm text-secondary">
               {spawnMode === "local_model"
                 ? selected
-                  ? `${selected.model_id} / ${selected.last_probe?.status || "unprobed"}`
+                  ? `${selected.model_id} / ${localModelProbeLabel(selected)}`
                   : "No model selected"
                 : `${spawnMode} agent`}
             </div>
@@ -6922,7 +6979,7 @@ function parseNonNegativeInteger(value: string, field: string): number | undefin
 
 function modelFleetStatus(model: ModelRow): FleetStatus {
   if (!model.enabled) return "idle";
-  if (model.last_probe?.healthy) return "done";
+  if (localModelLaunchReady(model)) return "done";
   if (model.last_probe) return "stuck";
   return "needs_input";
 }

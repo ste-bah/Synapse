@@ -30,7 +30,9 @@ use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, new_reflex_id};
 
-use crate::m3::local_models::{LocalModelApiShape, LocalModelRegistryRow, ResolvedApiKey};
+use crate::m3::local_models::{
+    LocalModelApiShape, LocalModelProbeParams, LocalModelRegistryRow, ResolvedApiKey,
+};
 
 use super::{
     m1_tools::validate_target_window,
@@ -1517,7 +1519,15 @@ impl SynapseService {
         validate_spawn_target(&params.target)?;
         let agent_kind = params.effective_cli()?;
         let local_model_row = if agent_kind.is_local_model() {
-            Some(self.require_spawn_local_model_row(&params)?)
+            Some(
+                self.require_spawn_local_model_row(
+                    &params,
+                    started_by_session_id
+                        .as_deref()
+                        .unwrap_or("dashboard_spawn_agent"),
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -2652,9 +2662,10 @@ impl SynapseService {
         }
     }
 
-    fn require_spawn_local_model_row(
+    async fn require_spawn_local_model_row(
         &self,
         params: &ActSpawnAgentParams,
+        probe_by_session: &str,
     ) -> Result<LocalModelRegistryRow, ErrorData> {
         let model_ref = params.local_model_ref().ok_or_else(|| {
             local_model_spawn_refusal(
@@ -2667,7 +2678,7 @@ impl SynapseService {
             )
         })?;
         let rows = self.local_model_registry_snapshot()?;
-        let row = rows
+        let mut row = rows
             .into_iter()
             .find(|row| row.name == model_ref)
             .ok_or_else(|| {
@@ -2681,35 +2692,9 @@ impl SynapseService {
                     }),
                 )
             })?;
-        if !row.enabled {
-            return Err(local_model_spawn_refusal(
-                error_codes::MODEL_REGISTRY_DISABLED,
-                "local_model_registry_row_disabled",
-                "act_spawn_agent local_model refused because the registry row is disabled",
-                json!({
-                    "model_ref": model_ref,
-                    "row_key": row.row_key.clone(),
-                    "enabled": row.enabled,
-                    "last_probe": row.last_probe.clone(),
-                    "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
-                }),
-            ));
-        }
-        if row.api_shape != LocalModelApiShape::OpenAiChatCompletions {
-            return Err(local_model_spawn_refusal(
-                error_codes::MODEL_TOOLS_UNSUPPORTED,
-                "local_model_api_shape_unsupported",
-                "act_spawn_agent local_model refused because the registry row API shape is unsupported",
-                json!({
-                    "model_ref": model_ref,
-                    "row_key": row.row_key.clone(),
-                    "api_shape": row.api_shape,
-                    "supported_api_shape": "open_ai_chat_completions",
-                }),
-            ));
-        }
-        let Some(probe) = row.last_probe.as_ref() else {
-            return Err(local_model_spawn_refusal(
+        validate_spawn_local_model_static_requirements(model_ref, &row)?;
+        let probe = row.last_probe.as_ref().ok_or_else(|| {
+            local_model_spawn_refusal(
                 error_codes::MODEL_REGISTRY_UNPROBED,
                 "local_model_registry_row_unprobed",
                 "act_spawn_agent local_model refused because the registry row has no probe evidence",
@@ -2719,46 +2704,136 @@ impl SynapseService {
                     "last_probe": null,
                     "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
                 }),
-            ));
-        };
+            )
+        })?;
         if !probe.healthy {
-            let code = match probe.error_code.as_deref() {
-                Some(error_codes::MODEL_TOOLS_UNSUPPORTED) => error_codes::MODEL_TOOLS_UNSUPPORTED,
-                Some(error_codes::MODEL_ENDPOINT_UNREACHABLE) | None => {
-                    error_codes::MODEL_ENDPOINT_UNREACHABLE
-                }
-                Some(_) => error_codes::MODEL_ENDPOINT_UNREACHABLE,
-            };
-            return Err(local_model_spawn_refusal(
-                code,
-                "local_model_registry_row_unhealthy",
-                "act_spawn_agent local_model refused because the registry row's last probe is unhealthy",
-                json!({
-                    "model_ref": model_ref,
-                    "row_key": row.row_key.clone(),
-                    "last_probe": row.last_probe.clone(),
-                    "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
-                }),
-            ));
+            return Err(local_model_unhealthy_refusal(model_ref, &row));
         }
         let probe_age_ms = unix_time_ms_now().saturating_sub(probe.observed_at_unix_ms);
         if probe_age_ms > LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS {
-            return Err(local_model_spawn_refusal(
-                error_codes::MODEL_REGISTRY_PROBE_STALE,
-                "local_model_registry_probe_stale",
-                "act_spawn_agent local_model refused because the registry row's last healthy probe is stale; run local_model_probe after verifying the endpoint process/socket Source of Truth",
-                json!({
-                    "model_ref": model_ref,
-                    "row_key": row.row_key.clone(),
-                    "last_probe": row.last_probe.clone(),
-                    "probe_age_ms": probe_age_ms,
-                    "max_probe_age_ms": LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS,
-                    "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
-                }),
-            ));
+            tracing::warn!(
+                code = "LOCAL_MODEL_SPAWN_STALE_PROBE_REFRESH",
+                model_ref,
+                row_key = %row.row_key,
+                probe_age_ms,
+                max_probe_age_ms = LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS,
+                probe_by_session,
+                "act_spawn_agent refreshing stale local-model probe before launch"
+            );
+            let db = self.m3_storage()?;
+            let refresh = crate::m3::local_models::probe_local_model(
+                &db,
+                &LocalModelProbeParams {
+                    name: model_ref.to_owned(),
+                    timeout_ms: None,
+                },
+                probe_by_session,
+            )
+            .await?;
+            row = refresh.row;
+            validate_spawn_local_model_static_requirements(model_ref, &row)?;
+            let Some(refreshed_probe) = row.last_probe.as_ref() else {
+                return Err(local_model_spawn_refusal(
+                    error_codes::MODEL_REGISTRY_UNPROBED,
+                    "local_model_registry_row_unprobed_after_refresh",
+                    "act_spawn_agent local_model probe refresh did not persist probe evidence",
+                    json!({
+                        "model_ref": model_ref,
+                        "row_key": row.row_key.clone(),
+                        "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
+                    }),
+                ));
+            };
+            if !refreshed_probe.healthy {
+                return Err(local_model_unhealthy_refusal(model_ref, &row));
+            }
+            let refreshed_age_ms =
+                unix_time_ms_now().saturating_sub(refreshed_probe.observed_at_unix_ms);
+            if refreshed_age_ms > LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS {
+                return Err(local_model_spawn_refusal(
+                    error_codes::MODEL_REGISTRY_PROBE_STALE,
+                    "local_model_registry_probe_stale_after_refresh",
+                    "act_spawn_agent local_model refused because probe refresh did not produce fresh evidence",
+                    json!({
+                        "model_ref": model_ref,
+                        "row_key": row.row_key.clone(),
+                        "last_probe": row.last_probe.clone(),
+                        "probe_age_ms": refreshed_age_ms,
+                        "max_probe_age_ms": LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS,
+                        "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
+                    }),
+                ));
+            }
+            tracing::info!(
+                code = "LOCAL_MODEL_SPAWN_STALE_PROBE_REFRESHED",
+                model_ref,
+                row_key = %row.row_key,
+                refreshed_age_ms,
+                probe_by_session,
+                "act_spawn_agent refreshed stale local-model probe and will launch with fresh evidence"
+            );
         }
         Ok(row)
     }
+}
+
+fn validate_spawn_local_model_static_requirements(
+    model_ref: &str,
+    row: &LocalModelRegistryRow,
+) -> Result<(), ErrorData> {
+    if !row.enabled {
+        return Err(local_model_spawn_refusal(
+            error_codes::MODEL_REGISTRY_DISABLED,
+            "local_model_registry_row_disabled",
+            "act_spawn_agent local_model refused because the registry row is disabled",
+            json!({
+                "model_ref": model_ref,
+                "row_key": row.row_key.clone(),
+                "enabled": row.enabled,
+                "last_probe": row.last_probe.clone(),
+                "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
+            }),
+        ));
+    }
+    if row.api_shape != LocalModelApiShape::OpenAiChatCompletions {
+        return Err(local_model_spawn_refusal(
+            error_codes::MODEL_TOOLS_UNSUPPORTED,
+            "local_model_api_shape_unsupported",
+            "act_spawn_agent local_model refused because the registry row API shape is unsupported",
+            json!({
+                "model_ref": model_ref,
+                "row_key": row.row_key.clone(),
+                "api_shape": row.api_shape,
+                "supported_api_shape": "open_ai_chat_completions",
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn local_model_unhealthy_refusal(model_ref: &str, row: &LocalModelRegistryRow) -> ErrorData {
+    let code = match row
+        .last_probe
+        .as_ref()
+        .and_then(|probe| probe.error_code.as_deref())
+    {
+        Some(error_codes::MODEL_TOOLS_UNSUPPORTED) => error_codes::MODEL_TOOLS_UNSUPPORTED,
+        Some(error_codes::MODEL_ENDPOINT_UNREACHABLE) | None => {
+            error_codes::MODEL_ENDPOINT_UNREACHABLE
+        }
+        Some(_) => error_codes::MODEL_ENDPOINT_UNREACHABLE,
+    };
+    local_model_spawn_refusal(
+        code,
+        "local_model_registry_row_unhealthy",
+        "act_spawn_agent local_model refused because the registry row's last probe is unhealthy",
+        json!({
+            "model_ref": model_ref,
+            "row_key": row.row_key.clone(),
+            "last_probe": row.last_probe.clone(),
+            "source_of_truth": "CF_KV prefix local_model_registry/v1/model/name_hex/",
+        }),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -4189,6 +4264,11 @@ fn build_claude_hook_settings(
             .iter()
             .map(|rule| (*rule).to_owned())
             .collect();
+        allow_rules.extend(
+            super::permission_policy::SYNAPSE_COORDINATION_MCP_TOOLS
+                .iter()
+                .map(|tool| format!("mcp__synapse__{tool}")),
+        );
         allow_rules.push(format!(
             "PowerShell({} *)",
             task_started_script_path.display()
@@ -4214,6 +4294,7 @@ const CLAUDE_AUTO_ALLOW_RULES: &[&str] = &[
     "Task",
     "mcp__synapse__health",
     "mcp__synapse__session_list",
+    "mcp__synapse__tool_profile_status",
     "mcp__synapse__get_target",
     "mcp__synapse__set_target",
     "mcp__synapse__agent_spawn_task_started",
@@ -7330,6 +7411,13 @@ mod tests {
                 .iter()
                 .any(|rule| rule == "mcp__synapse__agent_spawn_task_started")
         );
+        for tool in crate::server::permission_policy::SYNAPSE_COORDINATION_MCP_TOOLS {
+            let expected = format!("mcp__synapse__{tool}");
+            assert!(
+                allow.iter().any(|rule| rule == &expected),
+                "Claude static allow list must include {expected}"
+            );
+        }
         assert!(allow.iter().any(|rule| {
             rule.as_str()
                 == Some(

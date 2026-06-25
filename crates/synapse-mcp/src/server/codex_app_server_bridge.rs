@@ -869,6 +869,86 @@ mod tests {
     }
 
     #[test]
+    fn mcp_tool_elicitation_auto_accepts_synapse_coordination_tools() {
+        for (tool, tool_params) in [
+            (
+                "workspace_put",
+                json!({
+                    "key": "issue930/codex/session-1/plan",
+                    "value": { "expected": "plan-edit-before" },
+                    "ttl_ms": 3600000
+                }),
+            ),
+            (
+                "approval_request",
+                json!({
+                    "title": "Issue 930 permission",
+                    "body": "Allow synthetic issue930 command?",
+                    "kind": "agent_permission"
+                }),
+            ),
+            (
+                "agent_wait",
+                json!({
+                    "timeout_ms": 60000
+                }),
+            ),
+        ] {
+            let spec = request_spec(&envelope(
+                "mcpServer/elicitation/request",
+                json!({
+                    "threadId": "thread-a",
+                    "turnId": "turn-a",
+                    "serverName": "synapse",
+                    "message": format!("Allow the synapse MCP server to run tool \"{tool}\"?"),
+                    "mode": "form",
+                    "requestedSchema": { "type": "object", "properties": {} },
+                    "_meta": {
+                        "codex_approval_kind": "mcp_tool_call",
+                        "tool_name": tool,
+                        "tool_description": "spawned-agent coordination",
+                        "tool_params": tool_params,
+                        "tool_params_display": []
+                    }
+                }),
+            ))
+            .expect("spec");
+            assert_eq!(spec.kind, ApprovalKind::AgentPermission);
+            let expected_note =
+                format!("codex_app_server_auto_allow_safe_mcp_tool: mcp__synapse__{tool}");
+            assert_eq!(
+                spec.auto_accept_note.as_deref(),
+                Some(expected_note.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_tool_elicitation_does_not_auto_accept_coordination_name_from_other_server() {
+        let spec = request_spec(&envelope(
+            "mcpServer/elicitation/request",
+            json!({
+                "threadId": "thread-a",
+                "turnId": "turn-a",
+                "serverName": "other",
+                "message": "Allow the other MCP server to run tool \"workspace_put\"?",
+                "mode": "form",
+                "requestedSchema": { "type": "object", "properties": {} },
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "tool_name": "workspace_put",
+                    "tool_description": "untrusted server tool",
+                    "tool_params": { "key": "x", "value": true },
+                    "tool_params_display": []
+                }
+            }),
+        ))
+        .expect("spec");
+        assert_eq!(spec.kind, ApprovalKind::AgentPermission);
+        assert_eq!(spec.auto_accept_note, None);
+    }
+
+    #[test]
     fn mcp_tool_elicitation_does_not_auto_accept_destructive_tool() {
         let spec = request_spec(&envelope(
             "mcpServer/elicitation/request",

@@ -354,7 +354,7 @@ export interface ModelRow {
   max_tools?: number | null;
   /** Whether an encrypted API key is stored at rest for this model. */
   has_api_key_secret?: boolean;
-  last_probe?: { healthy?: boolean; status?: string; latency_ms?: number } | null;
+  last_probe?: { healthy?: boolean; status?: string; latency_ms?: number; observed_at_unix_ms?: number } | null;
 }
 
 export interface RegisterApiModelRequest {

@@ -41,9 +41,9 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-25-page-screenshot-timeout-v1";
+    "synapse-chrome-bridge-2026-06-25-set-field-element-id-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "575aa0447f8626727ae48e91c189fe795c0b6f2214e1de57e2e8cdc71e2c10e3";
+    "9e86887b4adca69e359078527fb16f1bc30ebe10576e4073d2707f1415541a0b";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -5918,14 +5918,16 @@ pub(crate) async fn type_active_element(
 
 /// Background-safe field REPLACE via the normal Chrome bridge (#1000/#717).
 /// Resolves the target in-page by a strict CSS `selector` (exactly one
-/// editable+visible match) or the current `active_element`, replaces its value
-/// with the native prototype setter (React-safe), and returns the raw before/
-/// after values for the daemon's Source-of-Truth check. No foreground, no
-/// debugger attach; works on inactive/occluded tabs UIA cannot perceive.
+/// editable+visible match), a normal Chrome bridge `element_id`, or the current
+/// `active_element`, replaces its value with the native prototype setter
+/// (React-safe), and returns the raw before/after values for the daemon's
+/// Source-of-Truth check. No foreground, no debugger attach; works on
+/// inactive/occluded tabs UIA cannot perceive.
 pub(crate) async fn set_field_value(
     hwnd: i64,
     target_id: &str,
     selector: Option<&str>,
+    element_id: Option<&str>,
     active_element: bool,
     text: &str,
 ) -> Result<ChromeDebuggerSetFieldValueResult, ChromeDebuggerBridgeError> {
@@ -5937,6 +5939,7 @@ pub(crate) async fn set_field_value(
                 "hwnd": hwnd,
                 "targetIdHint": target_id,
                 "selector": selector,
+                "elementId": element_id,
                 "activeElement": active_element,
                 "text": text,
             }),

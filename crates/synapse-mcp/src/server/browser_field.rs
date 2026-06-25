@@ -8,10 +8,11 @@
 //! agent had to steal the operator's foreground to type into a tab. The bridge's
 //! `chrome.scripting` path runs in the renderer regardless of paint/foreground
 //! state (proven live: it reads/acts on occluded, inactive tabs UIA cannot see),
-//! so this tool replaces a field's value entirely in-page and verifies it with
-//! TWO independent reads: the in-page post-set readback, and a separate
-//! `chrome.tabs` active-element readback. Fail-loud on every divergence; never an
-//! optimistic success and never a foreground fallback.
+//! so this tool replaces a field's value entirely in-page by a strict selector,
+//! Chrome bridge element id, or active element, and verifies it with TWO
+//! independent reads: the in-page post-set readback, and a separate
+//! `chrome.tabs` active-element readback. Fail-loud on every divergence; never
+//! an optimistic success and never a foreground fallback.
 
 use super::{ErrorData, Json, Parameters, SessionTarget, SynapseService, tool, tool_router};
 use crate::m1::mcp_error;
@@ -34,11 +35,17 @@ pub struct BrowserSetValueParams {
     pub text: String,
     /// Strict CSS selector for the target field. Exactly one editable+visible
     /// match is required; 0 or >1 fails loud. Mutually exclusive with
-    /// `active_element`.
+    /// `element_id` and `active_element`.
     #[serde(default)]
     pub selector: Option<String>,
+    /// Normal Chrome bridge element id
+    /// (`chrome-tab:<tabId>:frame:<frameId>:path:<domPath>`) returned by
+    /// browser locate/read tools. Mutually exclusive with `selector` and
+    /// `active_element`.
+    #[serde(default)]
+    pub element_id: Option<String>,
     /// Target the tab's current `document.activeElement` instead of a selector.
-    /// Mutually exclusive with `selector`.
+    /// Mutually exclusive with `selector` and `element_id`.
     #[serde(default)]
     pub active_element: bool,
     /// Chrome bridge tab target id (`chrome-tab:<id>`). Defaults to this
@@ -60,9 +67,9 @@ pub struct BrowserSetValueResponse {
     pub transport: String,
     pub window_hwnd: i64,
     pub cdp_target_id: String,
-    /// `selector` or `active_element`.
+    /// `selector`, `element_id`, or `active_element`.
     pub resolved_by: String,
-    /// Editable+visible nodes the selector matched (1 on success).
+    /// Editable+visible nodes the locator matched (1 on success).
     pub match_count: u32,
     pub tag_name: String,
     pub source_of_truth: String,
@@ -201,7 +208,7 @@ pub struct BrowserFillFormFieldOutcome {
 #[tool_router(router = browser_field_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Background-safe REPLACE of a web form field's text in the user's normal authenticated Chrome via the safe extension bridge (#1000/#717). No debugger attach, no OS foreground, no UIA: runs entirely in-page through chrome.scripting, so it works on inactive/occluded tabs and never steals the operator's foreground. Target by strict CSS `selector` (exactly one editable+visible match; 0 or >1 fails loud) or `active_element=true`. Replaces the value with the native prototype setter (React/Vue/Angular-safe) and verifies with TWO independent reads (in-page post-set + a separate chrome.tabs active-element readback); any divergence is ACTION_POSTCONDITION_FAILED, never an optimistic success. Defaults to this session's active CDP tab target (bind one with set_target/cdp_open_tab); the human foreground tab is never a fallback. Use this instead of foregrounding Chrome to type into a dashboard/form."
+        description = "Background-safe REPLACE of a web form field's text in the user's normal authenticated Chrome via the safe extension bridge (#1000/#717). No debugger attach, no OS foreground, no UIA: runs entirely in-page through chrome.scripting, so it works on inactive/occluded tabs and never steals the operator's foreground. Target by strict CSS `selector` (exactly one editable+visible match; 0 or >1 fails loud), normal Chrome bridge `element_id` (`chrome-tab:<tabId>:frame:<frameId>:path:<domPath>`), or `active_element=true`. Replaces the value with the native prototype setter (React/Vue/Angular-safe) and verifies with TWO independent reads (in-page post-set + a separate chrome.tabs active-element readback); any divergence is ACTION_POSTCONDITION_FAILED, never an optimistic success. Defaults to this session's active CDP tab target (bind one with set_target/cdp_open_tab); the human foreground tab is never a fallback. Use this instead of foregrounding Chrome to type into a dashboard/form."
     )]
     pub async fn browser_set_value(
         &self,
@@ -292,6 +299,7 @@ impl SynapseService {
             &BrowserSetValueParams {
                 text: String::new(),
                 selector: Some("#__synapse_unused__".to_owned()),
+                element_id: None,
                 active_element: false,
                 cdp_target_id: params.cdp_target_id.clone(),
                 window_hwnd: params.window_hwnd,
@@ -343,15 +351,17 @@ impl SynapseService {
         text: &str,
     ) -> Result<BrowserSetValueResponse, ErrorData> {
         let started = std::time::Instant::now();
-        let (selector_arg, active_arg) = match locator {
-            Locator::Selector(selector) => (Some(selector.as_str()), false),
-            Locator::ActiveElement => (None, true),
+        let (selector_arg, element_id_arg, active_arg) = match locator {
+            Locator::Selector(selector) => (Some(selector.as_str()), None, false),
+            Locator::ElementId(element_id) => (None, Some(element_id.as_str()), false),
+            Locator::ActiveElement => (None, None, true),
         };
 
         let result = crate::chrome_debugger_bridge::set_field_value(
             window_hwnd,
             cdp_target_id,
             selector_arg,
+            element_id_arg,
             active_arg,
             text,
         )
@@ -880,6 +890,7 @@ fn fill_form_bridge_error(
 #[derive(Debug)]
 enum Locator {
     Selector(String),
+    ElementId(String),
     ActiveElement,
 }
 
@@ -887,30 +898,51 @@ impl Locator {
     fn label(&self) -> &'static str {
         match self {
             Self::Selector(_) => "selector",
+            Self::ElementId(_) => "element_id",
             Self::ActiveElement => "active_element",
         }
     }
 }
 
 fn validate_locator(params: &BrowserSetValueParams) -> Result<Locator, ErrorData> {
-    match (&params.selector, params.active_element) {
-        (Some(selector), false) if !selector.trim().is_empty() => {
-            Ok(Locator::Selector(selector.clone()))
-        }
-        (Some(_), false) => Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!("{TOOL} selector must be a non-empty CSS selector"),
-        )),
-        (None, true) => Ok(Locator::ActiveElement),
-        (Some(_), true) => Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!("{TOOL} requires exactly one of `selector` or `active_element`, not both"),
-        )),
-        (None, false) => Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!("{TOOL} requires a `selector` or `active_element=true`"),
-        )),
+    let selector = params
+        .selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let element_id = params
+        .element_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let locator_count = usize::from(selector.is_some())
+        + usize::from(element_id.is_some())
+        + usize::from(params.active_element);
+    if locator_count != 1 {
+        let message = if locator_count == 0 {
+            format!("{TOOL} requires a `selector`, `element_id`, or `active_element=true`")
+        } else {
+            format!(
+                "{TOOL} requires exactly one of `selector`, `element_id`, or `active_element`, not multiple locators"
+            )
+        };
+        return Err(mcp_error(error_codes::TOOL_PARAMS_INVALID, message));
     }
+    if let Some(selector) = selector {
+        return Ok(Locator::Selector(selector.to_owned()));
+    }
+    if let Some(element_id) = element_id {
+        if !element_id.starts_with(CHROME_TAB_PREFIX) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "{TOOL} element_id must be a normal Chrome bridge id starting with {CHROME_TAB_PREFIX:?}; got {element_id:?}"
+                ),
+            ));
+        }
+        return Ok(Locator::ElementId(element_id.to_owned()));
+    }
+    Ok(Locator::ActiveElement)
 }
 
 /// Replace verification: newline-normalized exact equality (editable hosts emit
@@ -972,10 +1004,15 @@ fn postcondition_error(
 mod tests {
     use super::*;
 
-    fn params(selector: Option<&str>, active: bool) -> BrowserSetValueParams {
+    fn params(
+        selector: Option<&str>,
+        element_id: Option<&str>,
+        active: bool,
+    ) -> BrowserSetValueParams {
         BrowserSetValueParams {
             text: "x".to_owned(),
             selector: selector.map(str::to_owned),
+            element_id: element_id.map(str::to_owned),
             active_element: active,
             cdp_target_id: None,
             window_hwnd: None,
@@ -985,22 +1022,36 @@ mod tests {
     #[test]
     fn locator_requires_exactly_one() {
         assert!(matches!(
-            validate_locator(&params(Some("#q"), false)),
+            validate_locator(&params(Some("#q"), None, false)),
             Ok(Locator::Selector(_))
         ));
         assert!(matches!(
-            validate_locator(&params(None, true)),
+            validate_locator(&params(None, Some("chrome-tab:1:frame:0:path:0.1"), false)),
+            Ok(Locator::ElementId(_))
+        ));
+        assert!(matches!(
+            validate_locator(&params(None, None, true)),
             Ok(Locator::ActiveElement)
         ));
         // both
-        let err = validate_locator(&params(Some("#q"), true)).expect_err("both must fail");
+        let err = validate_locator(&params(Some("#q"), None, true)).expect_err("both must fail");
         assert!(err.message.contains("exactly one"));
+        let err = validate_locator(&params(
+            Some("#q"),
+            Some("chrome-tab:1:frame:0:path:0.1"),
+            false,
+        ))
+        .expect_err("selector plus element_id must fail");
+        assert!(err.message.contains("exactly one"));
+        let err = validate_locator(&params(None, Some("plain-dom-id"), false))
+            .expect_err("plain DOM id must not be accepted as bridge element id");
+        assert!(err.message.contains("normal Chrome bridge id"));
         // neither
-        let err = validate_locator(&params(None, false)).expect_err("neither must fail");
+        let err = validate_locator(&params(None, None, false)).expect_err("neither must fail");
         assert!(err.message.contains("selector"));
         // empty selector
-        let err = validate_locator(&params(Some("  "), false)).expect_err("empty must fail");
-        assert!(err.message.contains("non-empty"));
+        let err = validate_locator(&params(Some("  "), None, false)).expect_err("empty must fail");
+        assert!(err.message.contains("selector"));
     }
 
     #[test]

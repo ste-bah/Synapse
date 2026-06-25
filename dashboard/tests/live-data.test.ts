@@ -54,6 +54,7 @@ describe("dashboard live-data scope routing", () => {
     const sequence = [
       { kind: "agent_state_changed", source: "system" },
       { kind: "profile-changed", source: "system" },
+      { kind: "approval_decision", source: "system" },
       { kind: "command_finished", source: "action_emitter" },
       { kind: "file_changed", source: "filesystem" }
     ];
@@ -65,13 +66,14 @@ describe("dashboard live-data scope routing", () => {
       }
     }
 
-    assert.deepEqual(updates.get("fleet"), ["agent_state_changed"]);
+    assert.deepEqual(updates.get("fleet"), ["agent_state_changed", "approval_decision"]);
     assert.deepEqual(updates.get("agent"), ["agent_state_changed", "profile-changed"]);
-    assert.deepEqual(updates.get("tasks"), ["agent_state_changed"]);
+    assert.deepEqual(updates.get("tasks"), ["agent_state_changed", "approval_decision"]);
     assert.deepEqual(updates.get("audit"), ["command_finished"]);
     assert.deepEqual(updates.get("system"), [
       "agent_state_changed",
       "profile-changed",
+      "approval_decision",
       "command_finished",
       "file_changed"
     ]);

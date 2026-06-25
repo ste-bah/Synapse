@@ -497,7 +497,9 @@ impl SynapseService {
                 )));
             }
         };
-        let response = self.agent_send_broadcast_impl(
+        let now_unix_ms = unix_time_ms_now();
+        let live = self.live_spawned_agent_session_reads(now_unix_ms)?;
+        let response = self.agent_send_broadcast_impl_at_with_live(
             AgentSendBroadcastParams {
                 to: target,
                 kind,
@@ -507,6 +509,8 @@ impl SynapseService {
                 request_receipt,
             },
             "dashboard-fleet",
+            now_unix_ms,
+            live,
         )?;
         self.mailbox_notify_handle().notify_waiters();
         dashboard_json_readback(response)
@@ -969,19 +973,57 @@ impl SynapseService {
         Ok(live)
     }
 
+    /// Live spawned-agent MCP sessions, as `(session_id, agent_kind)` pairs,
+    /// read from the session registry. Dashboard fleet controls use this
+    /// narrower SoT so "all live agents" cannot fan out to the orchestrator
+    /// session or stale non-fleet MCP sessions.
+    fn live_spawned_agent_session_reads(
+        &self,
+        now_unix_ms: u64,
+    ) -> Result<Vec<(String, String)>, ErrorData> {
+        let guard = self.session_registry_ref().lock().map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "session registry lock poisoned while resolving dashboard fleet recipients",
+            )
+        })?;
+        let live = guard
+            .reads(now_unix_ms)
+            .into_iter()
+            .filter(|entry| entry.lifecycle == "live" && entry.spawned_agent.is_some())
+            .map(|entry| (entry.session_id, entry.agent_kind))
+            .collect::<Vec<_>>();
+        drop(guard);
+        Ok(live)
+    }
+
     fn agent_send_broadcast_impl(
         &self,
         params: AgentSendBroadcastParams,
         from_session: &str,
     ) -> Result<AgentSendBroadcastResponse, ErrorData> {
-        self.agent_send_broadcast_impl_at(params, from_session, unix_time_ms_now())
+        let now_unix_ms = unix_time_ms_now();
+        let live = self.live_session_reads(from_session, now_unix_ms)?;
+        self.agent_send_broadcast_impl_at_with_live(params, from_session, now_unix_ms, live)
     }
 
+    #[cfg(test)]
     fn agent_send_broadcast_impl_at(
         &self,
         params: AgentSendBroadcastParams,
         from_session: &str,
         now_unix_ms: u64,
+    ) -> Result<AgentSendBroadcastResponse, ErrorData> {
+        let live = self.live_session_reads(from_session, now_unix_ms)?;
+        self.agent_send_broadcast_impl_at_with_live(params, from_session, now_unix_ms, live)
+    }
+
+    fn agent_send_broadcast_impl_at_with_live(
+        &self,
+        params: AgentSendBroadcastParams,
+        from_session: &str,
+        now_unix_ms: u64,
+        live: Vec<(String, String)>,
     ) -> Result<AgentSendBroadcastResponse, ErrorData> {
         validate_session_id(from_session)?;
         validate_broadcast_target(&params.to)?;
@@ -992,8 +1034,12 @@ impl SynapseService {
             validate_artifact_handle(artifact_handle)?;
         }
 
-        // Resolve the recipient set from live sessions, applying the selector.
-        let live = self.live_session_reads(from_session, now_unix_ms)?;
+        let mut outcomes = Vec::new();
+        let mut skipped_count = 0_usize;
+
+        // Resolve the recipient set from the caller-supplied live read model,
+        // applying the selector. Explicit non-live recipients stay visible as
+        // skipped rows in the response/audit instead of disappearing.
         let recipients: Vec<String> = if params.to.all {
             live.into_iter().map(|(session, _kind)| session).collect()
         } else if !params.to.agent_kinds.is_empty() {
@@ -1002,19 +1048,38 @@ impl SynapseService {
                 .map(|(session, _kind)| session)
                 .collect()
         } else {
-            // Explicit list: keep only the ones that are actually live, in the
-            // caller's order; non-live ones surface as skipped below.
             let live_set: std::collections::BTreeSet<String> =
                 live.into_iter().map(|(session, _kind)| session).collect();
-            params
-                .to
-                .sessions
-                .iter()
-                .filter(|session| session.as_str() != from_session)
-                .cloned()
-                .map(|session| (live_set.contains(&session), session))
-                .filter_map(|(is_live, session)| is_live.then_some(session))
-                .collect()
+            let mut seen = std::collections::BTreeSet::new();
+            let mut explicit = Vec::new();
+            for session in &params.to.sessions {
+                if !seen.insert(session.clone()) {
+                    skipped_count += 1;
+                    outcomes.push(skipped_recipient(
+                        session.clone(),
+                        "duplicate explicit broadcast recipient",
+                    ));
+                    continue;
+                }
+                if session == from_session {
+                    skipped_count += 1;
+                    outcomes.push(skipped_recipient(
+                        session.clone(),
+                        "broadcast sender is excluded from recipients",
+                    ));
+                    continue;
+                }
+                if live_set.contains(session) {
+                    explicit.push(session.clone());
+                } else {
+                    skipped_count += 1;
+                    outcomes.push(skipped_recipient(
+                        session.clone(),
+                        "explicit broadcast recipient is not a live MCP session",
+                    ));
+                }
+            }
+            explicit
         };
 
         if recipients.len() > MAX_BROADCAST_RECIPIENTS {
@@ -1062,9 +1127,8 @@ impl SynapseService {
             "pending",
         ))?;
 
-        let mut outcomes = Vec::with_capacity(recipients.len());
+        outcomes.reserve(recipients.len());
         let mut delivered_count = 0_usize;
-        let mut skipped_count = 0_usize;
         for to_session in recipients {
             let depth = match queue_depth_for_recipient(&db, &to_session, now_unix_ms) {
                 Ok(depth) => depth,
@@ -1789,6 +1853,17 @@ fn mailbox_full_error(from_session: &str, to_session: &str, queue_depth: usize) 
     )
 }
 
+fn skipped_recipient(to_session: String, reason: &str) -> RecipientOutcome {
+    RecipientOutcome {
+        to_session,
+        status: "skipped".to_owned(),
+        message_id: None,
+        row_key: None,
+        storage_readback: None,
+        skip_reason: Some(reason.to_owned()),
+    }
+}
+
 fn recipient_unknown_error(
     from_session: &str,
     to_session: &str,
@@ -1950,8 +2025,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig,
-        server::session_registry::SessionRegistry,
+        m2::M2ServiceConfig,
+        m3::M3ServiceConfig,
+        m4::M4ServiceConfig,
+        server::session_registry::{SessionRegistry, SpawnedAgentRead},
     };
 
     fn service_with_db(path: &Path) -> anyhow::Result<SynapseService> {
@@ -2005,6 +2082,39 @@ mod tests {
             .lock()
             .map_err(|_error| anyhow::anyhow!("session registry lock poisoned"))?;
         registry.record_initialized(session_id, &state, "http", now);
+        Ok(())
+    }
+
+    fn register_spawned_session(
+        service: &SynapseService,
+        session_id: &str,
+        agent_kind: &str,
+        spawn_id: &str,
+        log_root: &Path,
+        now: u64,
+    ) -> anyhow::Result<()> {
+        let mut registry = service
+            .session_registry_ref()
+            .lock()
+            .map_err(|_error| anyhow::anyhow!("session registry lock poisoned"))?;
+        registry.record_seen(session_id, Some("test".to_owned()), now);
+        registry.record_spawned_agent(
+            session_id,
+            SpawnedAgentRead {
+                spawn_id: spawn_id.to_owned(),
+                cli: agent_kind.to_owned(),
+                launcher_process_id: 0,
+                agent_process_id: None,
+                started_by_session_id: Some("test-controller".to_owned()),
+                launched_at_unix_ms: now,
+                launch_target: "test".to_owned(),
+                log_dir: log_root.join(spawn_id).display().to_string(),
+                template_id: Some("test-template".to_owned()),
+                template_version: Some(1),
+                control: None,
+            },
+            now,
+        );
         Ok(())
     }
 
@@ -2547,6 +2657,65 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_broadcast_all_targets_only_live_spawned_agents() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let now = unix_time_ms_now();
+        register_initialized_session(&service, "controller", "codex-mcp-client", now)?;
+        register_session(&service, "ambient", now)?;
+        register_spawned_session(
+            &service,
+            "spawned-codex-session",
+            "codex",
+            "agent-spawn-dashboard-codex",
+            temp.path(),
+            now,
+        )?;
+        register_spawned_session(
+            &service,
+            "spawned-claude-session",
+            "claude",
+            "agent-spawn-dashboard-claude",
+            temp.path(),
+            now,
+        )?;
+
+        let response = service.dashboard_agent_broadcast(
+            "all".to_owned(),
+            Vec::new(),
+            Vec::new(),
+            "steer".to_owned(),
+            json!({"message": "dashboard-fleet-only"}),
+            Some(60_000),
+            true,
+        )?;
+        let recipients = response
+            .get("recipients")
+            .and_then(Value::as_array)
+            .expect("recipients array");
+        let to_sessions = recipients
+            .iter()
+            .map(|row| row.get("to_session").and_then(Value::as_str).unwrap_or(""))
+            .collect::<Vec<_>>();
+        assert_eq!(to_sessions.len(), 2);
+        assert!(to_sessions.contains(&"spawned-codex-session"));
+        assert!(to_sessions.contains(&"spawned-claude-session"));
+        assert!(!to_sessions.contains(&"controller"));
+        assert!(!to_sessions.contains(&"ambient"));
+
+        for session in ["spawned-codex-session", "spawned-claude-session"] {
+            let inbox = service.agent_inbox_impl_at(inbox_params(false, &[]), session, now + 1)?;
+            assert_eq!(inbox.returned_count, 1, "spawned recipient {session}");
+            assert_eq!(inbox.messages[0].from_session, "dashboard-fleet");
+        }
+        for session in ["controller", "ambient"] {
+            let inbox = service.agent_inbox_impl_at(inbox_params(false, &[]), session, now + 1)?;
+            assert_eq!(inbox.returned_count, 0, "non-fleet recipient {session}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn broadcast_writes_command_audit_intent_and_final_rows() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let service = service_with_db(temp.path())?;
@@ -2650,7 +2819,7 @@ mod tests {
     }
 
     #[test]
-    fn broadcast_explicit_sessions_skip_non_live() -> anyhow::Result<()> {
+    fn broadcast_explicit_sessions_report_non_live_skips() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let service = service_with_db(temp.path())?;
         let now = 10_000;
@@ -2663,7 +2832,12 @@ mod tests {
                 BroadcastTarget {
                     all: false,
                     agent_kinds: Vec::new(),
-                    sessions: vec!["live-one".to_owned(), "ghost".to_owned()],
+                    sessions: vec![
+                        "live-one".to_owned(),
+                        "ghost".to_owned(),
+                        "live-one".to_owned(),
+                        "sender".to_owned(),
+                    ],
                 },
                 "finding",
                 false,
@@ -2671,12 +2845,43 @@ mod tests {
             "sender",
             now,
         )?;
-        // Only the live one is resolved; the ghost is dropped before fan-out.
+        // Only the live one is resolved; invalid explicit entries remain
+        // visible as skipped outcomes instead of being silently dropped.
         assert_eq!(response.resolved_recipients, 1);
         assert_eq!(response.delivered_count, 1);
-        assert_eq!(response.recipients[0].to_session, "live-one");
+        assert_eq!(response.skipped_count, 3);
+        assert!(response.recipients.iter().any(|row| {
+            row.to_session == "live-one" && row.status == "delivered" && row.message_id.is_some()
+        }));
+        assert!(response.recipients.iter().any(|row| {
+            row.to_session == "ghost"
+                && row.status == "skipped"
+                && row
+                    .skip_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("not a live MCP session"))
+        }));
+        assert!(response.recipients.iter().any(|row| {
+            row.to_session == "live-one"
+                && row.status == "skipped"
+                && row
+                    .skip_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("duplicate"))
+        }));
+        assert!(response.recipients.iter().any(|row| {
+            row.to_session == "sender"
+                && row.status == "skipped"
+                && row
+                    .skip_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("sender is excluded"))
+        }));
         let inbox = service.agent_inbox_impl_at(inbox_params(false, &[]), "live-one", now + 1)?;
         assert_eq!(inbox.returned_count, 1);
+        let ghost_inbox =
+            service.agent_inbox_impl_at(inbox_params(false, &[]), "ghost", now + 1)?;
+        assert_eq!(ghost_inbox.returned_count, 0);
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-25-page-screenshot-timeout-v1";
-const BRIDGE_BUILD_SHA256 = "575aa0447f8626727ae48e91c189fe795c0b6f2214e1de57e2e8cdc71e2c10e3";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-25-set-field-element-id-v1";
+const BRIDGE_BUILD_SHA256 = "9e86887b4adca69e359078527fb16f1bc30ebe10576e4073d2707f1415541a0b";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -15285,14 +15285,36 @@ function dispatchSyntheticInputEvent(element, type, text, cancelable) {
 // #1000/#717: background-safe field REPLACE for the user's normal Chrome. Runs
 // entirely in-page via chrome.scripting (no debugger attach, no OS foreground,
 // works on occluded/inactive tabs that UIA cannot see). Resolves the target by
-// a strict CSS selector (exactly one editable, visible match) or the current
-// active element, then replaces the value with the NATIVE prototype setter so
-// React/Vue/Angular controlled inputs do not silently revert the change.
+// a strict CSS selector (exactly one editable, visible match), a normal Chrome
+// bridge element id, or the current active element, then replaces the value
+// with the NATIVE prototype setter so React/Vue/Angular controlled inputs do
+// not silently revert the change.
 async function handleSetFieldValue(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const text = String(params.text ?? "");
-  const selector = params.selector == null ? null : String(params.selector);
+  const selector = stringOrNull(params.selector);
+  const elementId = stringOrNull(params.elementId);
   const activeElement = Boolean(params.activeElement);
+  const locatorCount = (selector ? 1 : 0) + (elementId ? 1 : 0) + (activeElement ? 1 : 0);
+  if (locatorCount !== 1) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      "setFieldValue requires exactly one of selector, elementId, or activeElement=true"
+    );
+  }
+  const parsedElement = elementId
+    ? parseChromeBridgeElementId(elementId, selected.tabId, "setFieldValue")
+    : null;
+  const scriptTarget = parsedElement
+    ? { tabId: selected.tabId, frameIds: [parsedElement.frameId] }
+    : { tabId: selected.tabId, allFrames: true };
+  const scriptArgs = {
+    selector,
+    elementId,
+    elementPath: parsedElement ? parsedElement.path : null,
+    activeElement,
+    text
+  };
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_AXTREE_FAILED,
@@ -15302,9 +15324,9 @@ async function handleSetFieldValue(params) {
   let results;
   try {
     results = await chrome.scripting.executeScript({
-      target: { tabId: selected.tabId, allFrames: true },
+      target: scriptTarget,
       func: setFieldValueInPage,
-      args: [{ selector, activeElement, text, resolveOnly: true }]
+      args: [{ ...scriptArgs, resolveOnly: true }]
     });
   } catch (error) {
     throw bridgeError(
@@ -15344,7 +15366,7 @@ async function handleSetFieldValue(params) {
     actionResults = await chrome.scripting.executeScript({
       target: { tabId: selected.tabId, frameIds: [first.frame_id] },
       func: setFieldValueInPage,
-      args: [{ selector, activeElement, text }]
+      args: [scriptArgs]
     });
   } catch (error) {
     throw bridgeError(
@@ -15385,10 +15407,30 @@ async function handleSetFieldValue(params) {
 }
 
 function setFieldValueInPage(request) {
-  const selector = request && request.selector != null ? String(request.selector) : null;
+  const selector = request && request.selector != null ? String(request.selector).trim() : "";
+  const elementPath = request && request.elementPath != null ? String(request.elementPath).trim() : "";
   const wantActive = Boolean(request && request.activeElement);
   const inputText = String((request && request.text) ?? "");
   const resolveOnly = Boolean(request && request.resolveOnly);
+  const locatorCount = (selector ? 1 : 0) + (elementPath ? 1 : 0) + (wantActive ? 1 : 0);
+
+  function elementByPath(path) {
+    if (!path) {
+      return null;
+    }
+    const parts = String(path).split(".").map((part) => Number(part));
+    if (!Number.isSafeInteger(parts[0]) || parts[0] !== 0) {
+      return null;
+    }
+    let current = document.documentElement;
+    for (const index of parts.slice(1)) {
+      if (!current || !Number.isSafeInteger(index) || index < 0) {
+        return null;
+      }
+      current = current.children ? current.children[index] : null;
+    }
+    return current instanceof Element ? current : null;
+  }
 
   function isEditable(el) {
     if (!el || el.nodeType !== 1) {
@@ -15432,6 +15474,13 @@ function setFieldValueInPage(request) {
   let element = null;
   let resolvedBy = "";
   let matchCount = 0;
+  if (locatorCount !== 1) {
+    return {
+      ok: false,
+      error_code: "CHROME_SET_FIELD_BAD_LOCATOR",
+      error_detail: "setFieldValue requires exactly one of selector, element_id, or active_element=true"
+    };
+  }
   if (selector) {
     let nodes;
     try {
@@ -15463,6 +15512,18 @@ function setFieldValueInPage(request) {
     }
     element = editable[0];
     resolvedBy = "selector";
+  } else if (elementPath) {
+    element = elementByPath(elementPath);
+    resolvedBy = "element_id";
+    matchCount = element ? 1 : 0;
+    if (!element) {
+      return {
+        ok: false,
+        error_code: "CHROME_SET_FIELD_NOT_FOUND",
+        error_detail: `bridge element path ${elementPath} did not resolve in this frame`,
+        element_path: elementPath
+      };
+    }
   } else if (wantActive) {
     element = document.activeElement;
     resolvedBy = "active_element";
@@ -15471,7 +15532,7 @@ function setFieldValueInPage(request) {
     return {
       ok: false,
       error_code: "CHROME_SET_FIELD_BAD_LOCATOR",
-      error_detail: "setFieldValue requires a selector or active_element=true"
+      error_detail: "setFieldValue requires exactly one of selector, element_id, or active_element=true"
     };
   }
 

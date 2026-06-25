@@ -252,7 +252,10 @@ fn classify_cargo(tokens: &[&str]) -> GateDecision {
 
 fn classify_mcp(rest: &str) -> GateDecision {
     // rest is "<server>__<tool>" (server segment is glob-free per Claude rules).
-    let tool = rest.split("__").nth(1).unwrap_or(rest);
+    let (server, tool) = split_mcp_name(rest);
+    if server == "synapse" && SYNAPSE_COORDINATION_MCP_TOOLS.contains(&tool) {
+        return GateDecision::AutoAllow;
+    }
     if SAFE_MCP_TOOLS.contains(&tool) || is_readonly_mcp_suffix(tool) {
         return GateDecision::AutoAllow;
     }
@@ -261,6 +264,10 @@ fn classify_mcp(rest: &str) -> GateDecision {
     }
     // Outward-facing / state-mutating / unknown MCP tool — gate.
     GateDecision::GATE
+}
+
+fn split_mcp_name(rest: &str) -> (&str, &str) {
+    rest.split_once("__").unwrap_or(("", rest))
 }
 
 fn is_readonly_mcp_suffix(tool: &str) -> bool {
@@ -410,6 +417,13 @@ const SAFE_MCP_TOOLS: &[&str] = &[
     "agent_template_get",
 ];
 
+/// Synapse-only control-plane tools that let spawned agents publish auditable
+/// state, ask for a real operator decision, and wait for mailbox commands.
+/// These are intentionally not granted to other MCP servers with the same tool
+/// names because they mutate state.
+pub(crate) const SYNAPSE_COORDINATION_MCP_TOOLS: &[&str] =
+    &["approval_request", "agent_wait", "workspace_put"];
+
 const DESTRUCTIVE_MCP_TOOLS: &[&str] = &[
     "agent_kill",
     "fleet_stop",
@@ -522,6 +536,17 @@ mod tests {
             classify("mcp__synapse__agent_spawn_task_started", &json!({})),
             GateDecision::AutoAllow
         );
+        for tool in SYNAPSE_COORDINATION_MCP_TOOLS {
+            assert_eq!(
+                classify(&format!("mcp__synapse__{tool}"), &json!({})),
+                GateDecision::AutoAllow,
+                "synapse coordination tool {tool} must auto-allow"
+            );
+            assert!(
+                classify(&format!("mcp__other__{tool}"), &json!({})).is_gate(),
+                "non-synapse coordination-like tool {tool} must still gate"
+            );
+        }
         assert!(classify("mcp__synapse__act_run_shell", &json!({})).is_gate());
         assert!(classify("mcp__synapse__agent_kill", &json!({})).destructive());
         assert!(classify("mcp__synapse__storage_gc_once", &json!({})).destructive());
