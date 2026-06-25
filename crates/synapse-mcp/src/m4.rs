@@ -3095,7 +3095,7 @@ pub(crate) async fn launch_for_session(
         cdp_launch.as_ref(),
         force_renderer_accessibility,
     );
-    let launch_target_name = launch_target_file_name(&params.target);
+    let launch_target_name = launch_target_effective_file_name(&params.target);
     let launch_desktop = prepare_launch_desktop(params.desktop.as_deref(), session_id)?;
     refuse_shared_tabbed_app_visible_reuse(&params, &launch_target_name, launch_desktop.as_ref())?;
     let excluded_hwnds = excluded_launch_wait_hwnds(wait_regex.as_ref(), launch_desktop.as_ref())?;
@@ -3196,7 +3196,7 @@ fn chromium_renderer_accessibility_arg(params: &ActLaunchParams) -> Option<Strin
     if !force_renderer_accessibility_enabled(params) {
         return None;
     }
-    if !synapse_a11y::is_chromium_family(&launch_target_file_name(&params.target)) {
+    if !synapse_a11y::is_chromium_family(&launch_target_effective_file_name(&params.target)) {
         return None;
     }
     let already_configured = params
@@ -3259,7 +3259,8 @@ fn chromium_cdp_launch(params: &ActLaunchParams) -> Option<ChromiumCdpLaunch> {
     if params.cdp_debug == Some(false) {
         return None;
     }
-    let is_chromium = synapse_a11y::is_chromium_family(&launch_target_file_name(&params.target));
+    let is_chromium =
+        synapse_a11y::is_chromium_family(&launch_target_effective_file_name(&params.target));
     if !is_chromium && params.cdp_debug != Some(true) {
         return None;
     }
@@ -3969,6 +3970,7 @@ fn validate_launch_params(params: &ActLaunchParams) -> Result<(), ErrorData> {
     }
     validate_console_launch_visibility(params)?;
     validate_launch_desktop_option(params)?;
+    validate_shared_tabbed_desktop_launch_target(params)?;
     validate_chromium_debug_launch_policy(params)?;
     Ok(())
 }
@@ -3978,6 +3980,48 @@ fn validate_launch_desktop_option(params: &ActLaunchParams) -> Result<(), ErrorD
         return Ok(());
     };
     validate_launch_desktop_request(desktop)
+}
+
+fn validate_shared_tabbed_desktop_launch_target(params: &ActLaunchParams) -> Result<(), ErrorData> {
+    let Some(desktop) = params.desktop.as_deref() else {
+        return Ok(());
+    };
+    let launch_target_name = launch_target_effective_file_name(&params.target);
+    let Some(risk_family) = shared_tabbed_app_family(&launch_target_name) else {
+        return Ok(());
+    };
+
+    #[cfg(not(windows))]
+    {
+        let _ = desktop;
+        let _ = risk_family;
+        return Ok(());
+    }
+
+    #[cfg(windows)]
+    {
+        if launch_target_is_absolute_windows_path(&params.target) {
+            return Ok(());
+        }
+
+        Err(launch_tool_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "act_launch refused {launch_target_name} on desktop route because non-absolute shared-tabbed app targets can resolve through Windows process search, relative paths, or aliases after policy decisions"
+            ),
+            json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "reason": "shared_tabbed_app_desktop_requires_explicit_path",
+                "target": params.target,
+                "args": params.args,
+                "desktop": desktop,
+                "launch_target_name": launch_target_name,
+                "risk_family": risk_family,
+                "required_invariant": "desktop-routed shared-tabbed app launches must use an absolute executable path so Synapse policy and Windows process creation agree on the executable identity before spawn",
+                "resolution": "use an absolute executable path such as C:\\Windows\\notepad.exe for hidden desktop launches; aliases or relative paths like notepad, notepad.exe, or .\\notepad.exe are not isolation-safe",
+            }),
+        ))
+    }
 }
 
 fn validate_launch_desktop_request(desktop: &str) -> Result<(), ErrorData> {
@@ -4060,7 +4104,8 @@ fn launch_desktop_params_error(
 }
 
 fn validate_chromium_debug_launch_policy(params: &ActLaunchParams) -> Result<(), ErrorData> {
-    let is_chromium = synapse_a11y::is_chromium_family(&launch_target_file_name(&params.target));
+    let is_chromium =
+        synapse_a11y::is_chromium_family(&launch_target_effective_file_name(&params.target));
     if !is_chromium && params.cdp_debug != Some(true) {
         return Ok(());
     }
@@ -4627,7 +4672,7 @@ fn apply_launch_environment(
 }
 
 fn launch_target_needs_new_console(target: &str) -> bool {
-    let name = launch_target_file_name(target);
+    let name = launch_target_effective_file_name(target);
     matches!(name.as_str(), "cmd.exe" | "powershell.exe" | "pwsh.exe")
 }
 
@@ -4637,6 +4682,25 @@ fn launch_target_file_name(target: &str) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or(target)
         .to_ascii_lowercase()
+}
+
+fn launch_target_effective_file_name(target: &str) -> String {
+    let file_name = launch_target_file_name(target);
+    #[cfg(windows)]
+    {
+        if !is_path_like_launch_target(target)
+            && Path::new(&file_name).extension().is_none()
+            && !file_name.ends_with('.')
+        {
+            return format!("{file_name}.exe");
+        }
+    }
+    file_name
+}
+
+#[cfg(windows)]
+fn launch_target_is_absolute_windows_path(target: &str) -> bool {
+    !target.contains("://") && Path::new(target).is_absolute()
 }
 
 #[cfg(windows)]
@@ -11546,7 +11610,7 @@ mod tests {
 
     #[test]
     fn launch_desktop_option_accepts_window_wait_for_hidden_desktop_readback() {
-        let mut params = launch_params("notepad.exe", Vec::new(), 10_000);
+        let mut params = launch_params(r"C:\Windows\notepad.exe", Vec::new(), 10_000);
         params.desktop = Some("agent:session".to_owned());
         params.wait_for_window_title_regex = Some("^owned-hidden-notepad$".to_owned());
 
@@ -14400,6 +14464,76 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn launch_desktop_shared_tabbed_targets_require_absolute_path() {
+        for target in ["notepad", "notepad.exe"] {
+            let mut params = launch_params(target, vec![r"C:\tmp\issue1319.txt"], 10_000);
+            params.desktop = Some("agent:session".to_owned());
+            params.wait_for_window_title_regex = Some("issue1319".to_owned());
+
+            let error = validate_launch_params(&params)
+                .expect_err("pathless shared-tabbed desktop targets must fail closed");
+
+            println!(
+                "readback=act_launch_shared_tabbed_desktop_target edge=pathless before=target:{target:?} after={:?}",
+                error.data
+            );
+            assert_eq!(
+                error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("reason"))
+                    .and_then(|reason| reason.as_str()),
+                Some("shared_tabbed_app_desktop_requires_explicit_path")
+            );
+            assert_eq!(
+                error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("launch_target_name"))
+                    .and_then(|name| name.as_str()),
+                Some("notepad.exe")
+            );
+        }
+
+        let mut explicit = launch_params(
+            r"C:\Windows\notepad.exe",
+            vec![r"C:\tmp\issue1319.txt"],
+            10_000,
+        );
+        explicit.desktop = Some("agent:session".to_owned());
+        explicit.wait_for_window_title_regex = Some("issue1319".to_owned());
+
+        println!(
+            "readback=act_launch_shared_tabbed_desktop_target happy=explicit_path before=target:{:?}",
+            explicit.target
+        );
+        validate_launch_params(&explicit).expect(
+            "absolute shared-tabbed desktop target remains eligible for hidden-desktop wait",
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_target_effective_file_name_matches_windows_createprocess_rules() {
+        let cases = [
+            ("notepad", "notepad.exe"),
+            ("notepad.exe", "notepad.exe"),
+            ("notepad.", "notepad."),
+            (r"C:\Windows\notepad", "notepad"),
+            (r"C:\Windows\notepad.exe", "notepad.exe"),
+        ];
+
+        for (target, expected) in cases {
+            let actual = launch_target_effective_file_name(target);
+            println!(
+                "readback=act_launch_effective_target_name before=target:{target:?} after={actual:?}"
+            );
+            assert_eq!(actual, expected);
+        }
+    }
+
     #[test]
     fn launch_window_selection_prefers_new_matching_window() {
         let contexts = vec![
@@ -14458,6 +14592,34 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         )
         .expect("new hidden-desktop Notepad window should satisfy launch wait despite broker PID");
 
+        assert_eq!(selected.hwnd, 11);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_desktop_window_selection_accepts_extensionless_notepad_effective_name() {
+        let contexts = vec![foreground_for_launch_selection(
+            11,
+            39016,
+            "Notepad.exe",
+            "issue1319.txt - Notepad",
+        )];
+        let excluded = HashSet::new();
+        let title_regex =
+            regex::Regex::new("^issue1319\\.txt - Notepad$").expect("synthetic regex compiles");
+        let launch_target_name = launch_target_effective_file_name("notepad");
+
+        let selected = select_launch_desktop_window(
+            &contexts,
+            51028,
+            &title_regex,
+            &excluded,
+            &launch_target_name,
+            &[r"C:\tmp\issue1319.txt".to_owned()],
+        )
+        .expect("effective notepad.exe name should match brokered hidden-desktop Notepad window");
+
+        assert_eq!(launch_target_name, "notepad.exe");
         assert_eq!(selected.hwnd, 11);
     }
 
@@ -15578,8 +15740,10 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
     #[test]
     fn launch_console_targets_request_real_console_windows() {
         for target in [
+            "cmd",
             "cmd.exe",
             "C:\\Windows\\System32\\cmd.exe",
+            "powershell",
             "powershell.exe",
             "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
         ] {
