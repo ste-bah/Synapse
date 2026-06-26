@@ -7070,11 +7070,11 @@ fn dashboard_unix_time_ms() -> u64 {
 }
 
 const DASHBOARD_CSS_FILE: &str = "dashboard-CicCCuUG.css";
-const DASHBOARD_JS_FILE: &str = "dashboard-Dih4LxeZ.js";
+const DASHBOARD_JS_FILE: &str = "dashboard-D_jF422B.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
 const DASHBOARD_CSS: &str =
     include_str!("../../../../dashboard/dist/assets/dashboard-CicCCuUG.css");
-const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-Dih4LxeZ.js");
+const DASHBOARD_JS: &str = include_str!("../../../../dashboard/dist/assets/dashboard-D_jF422B.js");
 #[cfg(test)]
 const DASHBOARD_APP_SOURCE: &str = include_str!("../../../../dashboard/src/app.tsx");
 #[cfg(test)]

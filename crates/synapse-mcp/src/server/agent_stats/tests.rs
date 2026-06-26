@@ -1,10 +1,10 @@
-//! FSV-grade tests for `agent_stats` (#903).
+//! Regression tests for `agent_stats` (#903).
 //!
 //! Integration tests write real rows to a real RocksDB temp instance through
 //! the journal write path, then read them back through `collect_anchors` and
 //! compare every figure to a hand-computed expected value — no mocks, no
-//! synthetic return values. Pure tests pin the percentile math and the
-//! empty-window / budget-exhaustion contracts the acceptance criteria name.
+//! synthetic return values. Manual Full State Verification is performed
+//! separately against the live daemon and physical storage.
 
 use serde_json::json;
 use synapse_core::{AgentEndState, AgentEventKind, AgentEventRecord};
@@ -160,6 +160,35 @@ fn single_agent_stats_match_hand_computed_values() {
 
     // No usage attributes on hook rows -> zero, honestly.
     assert_eq!(stats.tokens.total, 0);
+}
+
+/// The error-rate breakdown must explain the same numerator as
+/// `errored_tool_calls`; lifecycle rows with `error.type` are separate signals
+/// and must not make the tool-call error breakdown fail to reconcile.
+#[test]
+fn non_tool_error_type_does_not_pollute_tool_call_error_breakdown() {
+    let (_temp, db) = open_temp_db();
+    let spawn = "agent-spawn-stats-it-non-tool-error";
+    let secs = |n: u64| BASE_NS + n * 1_000_000_000;
+    let mut lifecycle_error = spawn_event(spawn, secs(0), AgentEventKind::StateChanged);
+    lifecycle_error.attributes.error_type = Some("LOCAL_AGENT_TIMEOUT".to_owned());
+    lifecycle_error.reason_code = Some("LOCAL_AGENT_TIMEOUT".to_owned());
+    write_rows(
+        &db,
+        &[
+            lifecycle_error,
+            spawn_event(spawn, secs(1), AgentEventKind::ToolCallStarted),
+            finished_call(spawn, secs(2), 1000, None),
+        ],
+    );
+
+    let (anchors, scanned_rows) =
+        collect_anchors(&db, &fleet_params(), MAX_SCAN_ROWS_PER_CALL).expect("scan");
+    assert_eq!(scanned_rows, 3);
+    let stats = anchors.get(spawn).expect("anchor").scope.finish();
+    assert_eq!(stats.errors.errored_tool_calls, 0);
+    assert_eq!(stats.errors.error_rate, Some(0.0));
+    assert!(stats.errors.by_type.is_empty());
 }
 
 /// Fleet aggregation over two agents: counts sum, percentile is over the pooled

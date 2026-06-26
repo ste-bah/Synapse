@@ -65,6 +65,7 @@ const ANY_PERMITTED_SENTINEL: &str = "__any_permitted__";
 const SHELL_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 const SHELL_JOB_TAIL_DEFAULT_BYTES: u64 = 64 * 1024;
 const SHELL_JOB_TAIL_MAX_BYTES: u64 = 1024 * 1024;
+const SHELL_JOB_DASHBOARD_TAIL_BYTES: u64 = 2 * 1024;
 const SHELL_JOB_ID_MAX_BYTES: usize = 128;
 const SHELL_COMMAND_METADATA_POLICY: &str = "safe_display_v1";
 const SHELL_ARG_DISPLAY_MAX_BYTES: usize = 160;
@@ -2777,25 +2778,36 @@ pub fn shell_jobs_dashboard_snapshot(
         }
         job_ids.push(job_id);
     }
-    job_ids.sort();
-    job_ids.reverse();
-
     let job_count = job_ids.len();
-    let mut rows = Vec::new();
+    let mut candidates = Vec::new();
     let mut status_files_read = 0usize;
     let mut skipped_unreadable_status_files = 0usize;
+    for job_id in job_ids {
+        let paths = shell_job_paths_from_root(&root, &job_id);
+        match read_shell_job_status(&paths.status_path, &job_id) {
+            Ok(job) => {
+                status_files_read = status_files_read.saturating_add(1);
+                candidates.push((job_id, shell_job_dashboard_sort_key(&job)));
+            }
+            Err(_error) => {
+                skipped_unreadable_status_files = skipped_unreadable_status_files.saturating_add(1);
+            }
+        }
+    }
+    candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| right.0.cmp(&left.0)));
+
+    let mut rows = Vec::new();
     let mut running_count = 0usize;
     let mut terminal_count = 0usize;
-    for job_id in job_ids.into_iter().take(max_jobs) {
+    for (job_id, _sort_key) in candidates.into_iter().take(max_jobs) {
         match shell_job_status(
             &ActRunShellStatusParams {
                 job_id,
-                tail_bytes: 0,
+                tail_bytes: SHELL_JOB_DASHBOARD_TAIL_BYTES,
             },
             None,
         ) {
             Ok(status) => {
-                status_files_read = status_files_read.saturating_add(1);
                 if status.running {
                     running_count = running_count.saturating_add(1);
                 }
@@ -2823,6 +2835,13 @@ pub fn shell_jobs_dashboard_snapshot(
         skipped_unreadable_status_files,
         rows,
     })
+}
+
+fn shell_job_dashboard_sort_key(job: &ActRunShellJobStatus) -> String {
+    job.completed_at
+        .as_deref()
+        .unwrap_or(job.started_at.as_str())
+        .to_owned()
 }
 
 pub fn run_shell_idempotency_row_key(

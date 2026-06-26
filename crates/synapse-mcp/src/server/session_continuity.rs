@@ -802,6 +802,20 @@ pub(crate) fn read_persisted_cdp_target_owners_for_session(
     read_persisted_cdp_target_owners_for_session_from_db(&db, session_id)
 }
 
+pub(crate) fn persisted_session_target_session_ids(
+    m3_state: &SharedM3State,
+) -> Result<BTreeSet<String>, String> {
+    let db = session_continuity_db_from_state(m3_state)?;
+    read_persisted_session_target_session_ids_from_db(&db)
+}
+
+pub(crate) fn persisted_cdp_target_owner_session_ids(
+    m3_state: &SharedM3State,
+) -> Result<BTreeSet<String>, String> {
+    let db = session_continuity_db_from_state(m3_state)?;
+    read_persisted_cdp_target_owner_session_ids_from_db(&db)
+}
+
 pub(crate) fn persisted_cdp_target_owner_row_key_string(
     owner_key: &str,
     cdp_target_id: &str,
@@ -869,6 +883,28 @@ fn read_persisted_cdp_target_owners_for_session_from_db(
     Ok(decoded)
 }
 
+fn read_persisted_session_target_session_ids_from_db(db: &Db) -> Result<BTreeSet<String>, String> {
+    let rows = db
+        .scan_cf_prefix(cf::CF_SESSIONS, SESSION_TARGET_PREFIX.as_bytes())
+        .map_err(|error| error.to_string())?;
+    let mut session_ids = BTreeSet::new();
+    for (row_key, value) in rows {
+        let key_session_id = session_id_from_target_row_key(&row_key)?;
+        let row = synapse_storage::decode_json::<PersistedSessionTarget>(&value)
+            .map_err(|error| format!("decode persisted session target failed: {error}"))?;
+        if row.schema_version != 1 || row.session_id != key_session_id {
+            return Err(format!(
+                "persisted session target row mismatch: row_key={} schema_version={} row_session_id={}",
+                String::from_utf8_lossy(&row_key),
+                row.schema_version,
+                row.session_id
+            ));
+        }
+        session_ids.insert(key_session_id);
+    }
+    Ok(session_ids)
+}
+
 fn read_persisted_cdp_target_owner_session_ids_from_db(
     db: &Db,
 ) -> Result<BTreeSet<String>, String> {
@@ -892,6 +928,25 @@ fn read_persisted_cdp_target_owner_session_ids_from_db(
         session_ids.insert(row.owner_session_id);
     }
     Ok(session_ids)
+}
+
+fn session_id_from_target_row_key(row_key: &[u8]) -> Result<String, String> {
+    let key = std::str::from_utf8(row_key)
+        .map_err(|error| format!("persisted session target row key is not UTF-8: {error}"))?;
+    let Some(session_id) = key.strip_prefix(SESSION_TARGET_PREFIX) else {
+        return Err(format!(
+            "persisted session target row key has unexpected prefix: {key}"
+        ));
+    };
+    if session_id.is_empty()
+        || session_id.chars().count() > 512
+        || !session_id.chars().all(|ch| ('!'..='~').contains(&ch))
+    {
+        return Err(format!(
+            "persisted session target row key has invalid session id: {key}"
+        ));
+    }
+    Ok(session_id.to_owned())
 }
 
 fn validate_persisted_cdp_target_owner(
@@ -1169,6 +1224,50 @@ mod tests {
         assert_eq!(
             ids,
             BTreeSet::from(["orphan-session-a".to_owned(), "orphan-session-b".to_owned()])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn persisted_session_target_session_ids_include_orphan_target_rows() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION)?;
+        let first = PersistedSessionTarget {
+            schema_version: 1,
+            session_id: "orphan-target-a".to_owned(),
+            stored_at_unix_ms: 1_000,
+            target: SessionTarget::Window { hwnd: 0x1111 },
+        };
+        let second = PersistedSessionTarget {
+            schema_version: 1,
+            session_id: "orphan-target-b".to_owned(),
+            stored_at_unix_ms: 2_000,
+            target: SessionTarget::Cdp {
+                window_hwnd: 0x2222,
+                cdp_target_id: "chrome-tab:200".to_owned(),
+            },
+        };
+        db.put_batch_pressure_bypass(
+            cf::CF_SESSIONS,
+            [
+                (
+                    session_target_key(&first.session_id),
+                    synapse_storage::encode_json(&first)?,
+                ),
+                (
+                    session_target_key(&second.session_id),
+                    synapse_storage::encode_json(&second)?,
+                ),
+            ],
+        )?;
+
+        let ids =
+            read_persisted_session_target_session_ids_from_db(&db).map_err(anyhow::Error::msg)?;
+
+        println!("readback=CF_SESSIONS test=persisted_session_target_session_ids selected={ids:?}");
+        assert_eq!(
+            ids,
+            BTreeSet::from(["orphan-target-a".to_owned(), "orphan-target-b".to_owned()])
         );
         Ok(())
     }

@@ -1567,7 +1567,9 @@ export async function fetchDashboardState(): Promise<DashboardState> {
 }
 
 const DASHBOARD_ASSET_RELOAD_PARAM = "_synapse_dashboard_asset";
+const DASHBOARD_ASSET_RELOAD_ATTEMPT_PARAM = "_synapse_dashboard_asset_attempt";
 const DASHBOARD_ASSET_RELOAD_SESSION_KEY = "synapse.dashboard.asset-reload";
+const DASHBOARD_ASSET_RELOAD_MAX_ATTEMPTS = 2;
 
 function dashboardLoadedJsFile(): string {
   if (typeof document === "undefined") return "";
@@ -1610,13 +1612,30 @@ export function claimDashboardAssetReload(decision: DashboardAssetReloadDecision
   if (!decision.shouldReload || !decision.reloadKey || !decision.expectedJsFile) return false;
   if (typeof window === "undefined") return false;
   const url = new URL(window.location.href);
-  if (url.searchParams.get(DASHBOARD_ASSET_RELOAD_PARAM) === decision.expectedJsFile) return false;
+  let attempts = parseDashboardAssetReloadAttempt(url.searchParams.get(DASHBOARD_ASSET_RELOAD_ATTEMPT_PARAM));
   try {
     const previous = window.sessionStorage.getItem(DASHBOARD_ASSET_RELOAD_SESSION_KEY);
-    if (previous === decision.reloadKey) return false;
-    window.sessionStorage.setItem(DASHBOARD_ASSET_RELOAD_SESSION_KEY, decision.reloadKey);
+    attempts = Math.max(attempts, dashboardAssetReloadAttempts(previous, decision.reloadKey));
   } catch {
-    // The URL marker below still bounds reloads if sessionStorage is unavailable.
+    // URL attempts below still bound reloads if sessionStorage is unavailable.
+  }
+  if (attempts >= DASHBOARD_ASSET_RELOAD_MAX_ATTEMPTS) {
+    const message = [
+      "DASHBOARD_ASSET_RELOAD_EXHAUSTED",
+      `current=${decision.currentJsFile || "unknown"}`,
+      `expected=${decision.expectedJsFile}`,
+      `attempts=${attempts}`
+    ].join(": ");
+    console.error(message);
+    throw new Error(message);
+  }
+  try {
+    window.sessionStorage.setItem(
+      DASHBOARD_ASSET_RELOAD_SESSION_KEY,
+      JSON.stringify({ reloadKey: decision.reloadKey, attempts: attempts + 1 })
+    );
+  } catch {
+    // The URL attempt marker below still bounds reloads if sessionStorage is unavailable.
   }
   return true;
 }
@@ -1624,7 +1643,29 @@ export function claimDashboardAssetReload(decision: DashboardAssetReloadDecision
 export function dashboardAssetReloadUrl(expectedJsFile: string): string {
   const url = new URL(window.location.href);
   url.searchParams.set(DASHBOARD_ASSET_RELOAD_PARAM, expectedJsFile);
+  const attempts = parseDashboardAssetReloadAttempt(url.searchParams.get(DASHBOARD_ASSET_RELOAD_ATTEMPT_PARAM));
+  url.searchParams.set(DASHBOARD_ASSET_RELOAD_ATTEMPT_PARAM, String(attempts + 1));
   return url.toString();
+}
+
+function parseDashboardAssetReloadAttempt(value: string | null): number {
+  if (!value) return 0;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function dashboardAssetReloadAttempts(value: string | null, reloadKey: string): number {
+  if (!value) return 0;
+  if (value === reloadKey) return 1;
+  try {
+    const parsed = JSON.parse(value) as { reloadKey?: unknown; attempts?: unknown };
+    if (parsed.reloadKey !== reloadKey) return 0;
+    return typeof parsed.attempts === "number" && Number.isFinite(parsed.attempts) && parsed.attempts > 0
+      ? parsed.attempts
+      : 0;
+  } catch {
+    return 0;
+  }
 }
 
 export function panelData<T = Record<string, unknown>>(panel?: DashboardPanel): T {
@@ -1957,6 +1998,82 @@ export function attachedAgentRegistry(state?: DashboardState): AttachedAgentRegi
   const registry = asRecord(asRecord(state.sessions.data).attached_agent_registry);
   if (!registry || Object.keys(registry).length === 0) return null;
   return registry as unknown as AttachedAgentRegistry;
+}
+
+export interface TargetDashboardRows {
+  liveTargetSessions: Record<string, unknown>[];
+  retainedTargetSessions: Record<string, unknown>[];
+  persistedCdpOwnerRows: Record<string, unknown>[];
+}
+
+export function buildTargetDashboardRows(sessions: Record<string, unknown>[]): TargetDashboardRows {
+  const liveTargetSessions: Record<string, unknown>[] = [];
+  const retainedTargetSessions: Record<string, unknown>[] = [];
+  const persistedCdpOwnerRows: Record<string, unknown>[] = [];
+
+  for (const session of sessions) {
+    const sessionId = rawText(session.session_id);
+    const lifecycle = rawText(session.lifecycle);
+    const attentionClass = rawText(session.attention_class);
+    const foregroundLane = asRecord(session.foreground_lane);
+    const targetStatus = rawText(foregroundLane.status);
+    const activeTarget = asRecord(session.active_target);
+    const persistedOwners = asArray<Record<string, unknown>>(session.persisted_cdp_target_owners);
+    const hasActiveTarget = Object.keys(activeTarget).length > 0;
+    const cleanupAction = sessionId ? `session_end ${sessionId}` : "";
+
+    for (const owner of persistedOwners) {
+      persistedCdpOwnerRows.push({
+        ...owner,
+        session_id: rawText(owner.owner_session_id) || sessionId,
+        lifecycle,
+        attention_class: attentionClass,
+        cleanup_action: rawText(owner.cleanup_action) || cleanupAction
+      });
+    }
+
+    if (!hasActiveTarget) continue;
+    const row = {
+      ...session,
+      target_status: targetStatus,
+      cleanup_action: lifecycle === "live" ? "" : cleanupAction
+    };
+    if (lifecycle === "live") {
+      liveTargetSessions.push(row);
+    } else {
+      retainedTargetSessions.push(row);
+    }
+  }
+
+  return { liveTargetSessions, retainedTargetSessions, persistedCdpOwnerRows };
+}
+
+export function shellJobNeedsReview(row: Record<string, unknown>): boolean {
+  const job = asRecord(row.job);
+  const status = rawText(job.status || row.status);
+  if (!status || status === "ok") return false;
+  return true;
+}
+
+export function shellJobCommandLabel(row: Record<string, unknown>): string {
+  const job = asRecord(row.job);
+  return rawText(job.command_line || job.command || row.command || row.job_id);
+}
+
+export function shellJobEvidence(row: Record<string, unknown>): string {
+  const job = asRecord(row.job);
+  const diagnostics = asRecord(job.diagnostics);
+  const hints = asArray(diagnostics.actionable_hints).map(rawText).filter(Boolean);
+  const parts = [
+    rawText(job.error_code),
+    rawText(job.error_message),
+    job.exit_code === null || job.exit_code === undefined ? "" : `exit_code=${rawText(job.exit_code)}`,
+    rawText(row.stderr_tail),
+    rawText(row.stdout_tail),
+    hints.join(", "),
+    rawText(diagnostics.output_state)
+  ].filter(Boolean);
+  return parts.join(" · ");
 }
 
 export function buildToolCalls(state?: DashboardState): ToolCallSummary[] {

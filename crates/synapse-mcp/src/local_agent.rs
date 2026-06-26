@@ -11,7 +11,7 @@ use anyhow::{Context, bail};
 use futures_util::StreamExt;
 use reqwest::Url;
 use rmcp::{
-    RoleClient, ServiceExt,
+    ErrorData, RoleClient, ServiceExt,
     model::{
         CallToolRequestParams, ClientCapabilities, ClientInfo, Content, Implementation, JsonObject,
         Tool,
@@ -915,11 +915,9 @@ impl Runner {
                     &args,
                 );
                 let fatal = transport_terminal || exact_required_tool_failed;
-                let error_code = if exact_required_tool_failed && !transport_terminal {
-                    "MODEL_TASK_REQUIRED_TOOL_FAILED"
-                } else {
-                    "SYNAPSE_TOOL_CALL_FAILED"
-                };
+                let failure_class =
+                    classify_synapse_tool_call_failure(&error, exact_required_tool_failed);
+                let error_code = failure_class.error_code.as_str();
                 let detail = format!("{error_code}: {tool_name}: {error}");
                 self.tool_call_error_count = self.tool_call_error_count.saturating_add(1);
                 // Structured, actionable feedback for the model (not a bare
@@ -929,10 +927,21 @@ impl Runner {
                     "error": error_code,
                     "tool": tool_name,
                     "message": error.to_string(),
+                    "error_code_source": failure_class.error_code_source,
+                    "mcp_error": failure_class.mcp_error,
                     "recoverable": !fatal,
+                    "terminal": fatal,
                     "suggestion": tool_failure_suggestion(fatal, self.tool_exposure),
                 });
-                let result_value = json!({ "error": detail });
+                let result_value = json!({
+                    "error": detail,
+                    "error_code": error_code,
+                    "error_code_source": failure_class.error_code_source,
+                    "tool": tool_name,
+                    "recoverable": !fatal,
+                    "terminal": fatal,
+                    "mcp_error": failure_class.mcp_error,
+                });
                 self.messages.push(json!({
                     "role": "tool",
                     "tool_call_id": call.id,
@@ -4239,6 +4248,72 @@ fn local_agent_active_elapsed(started: Instant, approval_wait_elapsed: Duration)
     started.elapsed().saturating_sub(approval_wait_elapsed)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SynapseToolCallFailureClass {
+    error_code: String,
+    error_code_source: &'static str,
+    mcp_error: Option<Value>,
+}
+
+fn classify_synapse_tool_call_failure(
+    error: &ServiceError,
+    exact_required_tool_failed: bool,
+) -> SynapseToolCallFailureClass {
+    if let ServiceError::McpError(mcp_error) = error {
+        if let Some(code) = mcp_error_data_code(mcp_error) {
+            return SynapseToolCallFailureClass {
+                error_code: code.to_owned(),
+                error_code_source: "mcp_error.data.code",
+                mcp_error: Some(mcp_error_value(mcp_error)),
+            };
+        }
+        return SynapseToolCallFailureClass {
+            error_code: "SYNAPSE_TOOL_CALL_FAILED".to_owned(),
+            error_code_source: "mcp_error_without_data_code",
+            mcp_error: Some(mcp_error_value(mcp_error)),
+        };
+    }
+
+    if exact_required_tool_failed {
+        return SynapseToolCallFailureClass {
+            error_code: "MODEL_TASK_REQUIRED_TOOL_FAILED".to_owned(),
+            error_code_source: "task_contract_required_tool",
+            mcp_error: None,
+        };
+    }
+
+    SynapseToolCallFailureClass {
+        error_code: "SYNAPSE_TOOL_CALL_FAILED".to_owned(),
+        error_code_source: "service_error",
+        mcp_error: None,
+    }
+}
+
+fn mcp_error_data_code(error: &ErrorData) -> Option<&str> {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .filter(|code| is_low_cardinality_error_code(code))
+}
+
+fn is_low_cardinality_error_code(code: &str) -> bool {
+    !code.is_empty()
+        && code.chars().count() <= synapse_core::AGENT_EVENT_MAX_REASON_CHARS
+        && code
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+}
+
+fn mcp_error_value(error: &ErrorData) -> Value {
+    json!({
+        "jsonrpc_code": error.code.0,
+        "message": error.message.as_ref(),
+        "data": error.data,
+    })
+}
+
 fn error_code_from_detail(detail: &str) -> &str {
     for code in [
         "MODEL_ENDPOINT_UNREACHABLE",
@@ -5629,6 +5704,55 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
         assert_eq!(
             error_code_from_detail("MODEL_TASK_REQUIRED_TOOL_FAILED: browser_set_value: synthetic"),
             "MODEL_TASK_REQUIRED_TOOL_FAILED"
+        );
+    }
+
+    #[test]
+    fn synapse_tool_call_failure_uses_nested_mcp_error_code() {
+        let error = ServiceError::McpError(ErrorData::new(
+            rmcp::model::ErrorCode(-32099),
+            "act_launch refused notepad.exe",
+            Some(json!({
+                "code": "ACTION_TARGET_INVALID",
+                "reason": "shared_tabbed_app_existing_window_risk",
+                "resolution": "create or select a provably owned native tab/document target first"
+            })),
+        ));
+
+        let class = classify_synapse_tool_call_failure(&error, false);
+
+        assert_eq!(class.error_code, "ACTION_TARGET_INVALID");
+        assert_eq!(class.error_code_source, "mcp_error.data.code");
+        let mcp_error = class.mcp_error.expect("MCP error envelope retained");
+        assert_eq!(mcp_error["jsonrpc_code"], json!(-32099));
+        assert_eq!(
+            mcp_error["message"],
+            json!("act_launch refused notepad.exe")
+        );
+        assert_eq!(
+            mcp_error["data"]["reason"],
+            json!("shared_tabbed_app_existing_window_risk")
+        );
+    }
+
+    #[test]
+    fn synapse_tool_call_failure_rejects_unbounded_nested_error_code() {
+        let error = ServiceError::McpError(ErrorData::new(
+            rmcp::model::ErrorCode(-32099),
+            "tool failed with unbounded detail",
+            Some(json!({
+                "code": "not a bounded machine code with spaces",
+                "reason": "bad_code_shape"
+            })),
+        ));
+
+        let class = classify_synapse_tool_call_failure(&error, false);
+
+        assert_eq!(class.error_code, "SYNAPSE_TOOL_CALL_FAILED");
+        assert_eq!(class.error_code_source, "mcp_error_without_data_code");
+        assert_eq!(
+            class.mcp_error.expect("MCP error envelope retained")["data"]["reason"],
+            json!("bad_code_shape")
         );
     }
 

@@ -297,6 +297,7 @@ pub struct SessionCdpCleanupReport {
     pub owned_before: usize,
     pub closed: usize,
     pub already_absent: usize,
+    pub endpoint_unreachable: usize,
     pub persisted_rows_deleted: usize,
     pub failed: usize,
     pub target_ids: Vec<String>,
@@ -1168,6 +1169,20 @@ impl SessionLifecycleState {
                 add_if_stale(&mut candidates, &live, session_id, HTTP_STALE_REASON);
             }
         }
+        match super::session_continuity::persisted_session_target_session_ids(&self.m3_state) {
+            Ok(session_ids) => {
+                for session_id in session_ids {
+                    add_if_stale(&mut candidates, &live, &session_id, HTTP_STALE_REASON);
+                }
+            }
+            Err(detail) => {
+                tracing::error!(
+                    code = error_codes::STORAGE_CORRUPTED,
+                    detail = %detail,
+                    "session lifecycle could not scan persisted session target rows for stale candidates"
+                );
+            }
+        }
         if let Ok(state) = self.m3_state.lock() {
             for session_id in state.mcp_audit_sessions.keys() {
                 add_if_stale(&mut candidates, &live, session_id, HTTP_STALE_REASON);
@@ -1176,6 +1191,20 @@ impl SessionLifecycleState {
         if let Ok(owners) = self.cdp_target_owners.lock() {
             for owner in owners.values() {
                 add_if_stale(&mut candidates, &live, &owner.session_id, HTTP_STALE_REASON);
+            }
+        }
+        match super::session_continuity::persisted_cdp_target_owner_session_ids(&self.m3_state) {
+            Ok(session_ids) => {
+                for session_id in session_ids {
+                    add_if_stale(&mut candidates, &live, &session_id, HTTP_STALE_REASON);
+                }
+            }
+            Err(detail) => {
+                tracing::error!(
+                    code = error_codes::STORAGE_CORRUPTED,
+                    detail = %detail,
+                    "session lifecycle could not scan persisted CDP target owner rows for stale candidates"
+                );
             }
         }
         if let Ok(claims) = self.target_claims.lock() {
@@ -1897,6 +1926,9 @@ async fn cleanup_session_cdp_targets(
                     CdpCleanupCloseOutcome::AlreadyAbsent => {
                         report.already_absent = report.already_absent.saturating_add(1);
                     }
+                    CdpCleanupCloseOutcome::EndpointUnreachable => {
+                        report.endpoint_unreachable = report.endpoint_unreachable.saturating_add(1);
+                    }
                 }
                 tracing::info!(
                     code = "MCP_SESSION_CDP_TARGET_CLEANUP",
@@ -1939,6 +1971,7 @@ fn cdp_cleanup_owner_identity(owner_key: &str, endpoint: &str, target_id: &str) 
 enum CdpCleanupCloseOutcome {
     Closed,
     AlreadyAbsent,
+    EndpointUnreachable,
 }
 
 impl CdpCleanupCloseOutcome {
@@ -1946,6 +1979,7 @@ impl CdpCleanupCloseOutcome {
         match self {
             Self::Closed => "closed",
             Self::AlreadyAbsent => "already_absent",
+            Self::EndpointUnreachable => "endpoint_unreachable",
         }
     }
 }
@@ -1989,7 +2023,20 @@ async fn close_cdp_target_for_cleanup(
     synapse_a11y::cdp_close_target(&owner.endpoint, target_id)
         .await
         .map(|_closed| CdpCleanupCloseOutcome::Closed)
-        .map_err(|error| error.to_string())
+        .or_else(|error| match error {
+            synapse_a11y::A11yError::CdpUnreachable { detail } => {
+                tracing::warn!(
+                    code = error_codes::A11Y_CDP_UNREACHABLE,
+                    hwnd = owner.window_hwnd,
+                    endpoint = %owner.endpoint,
+                    cdp_target_id = %owner.cdp_target_id,
+                    detail = %detail,
+                    "session lifecycle reclaimed persisted CDP owner row after owner endpoint became unreachable"
+                );
+                Ok(CdpCleanupCloseOutcome::EndpointUnreachable)
+            }
+            other => Err(other.to_string()),
+        })
 }
 
 #[cfg(windows)]
@@ -2414,6 +2461,25 @@ mod tests {
             "targetIdHint chrome-tab:600751161 did not match any chrome.tabs tab id",
             "chrome-tab:other"
         ));
+    }
+
+    #[test]
+    fn cdp_cleanup_report_exposes_unreachable_endpoint_reclaims() {
+        let report = SessionCdpCleanupReport {
+            persisted_owned_before: 2,
+            endpoint_unreachable: 2,
+            persisted_rows_deleted: 2,
+            target_ids: vec!["dead-target-a".to_owned(), "dead-target-b".to_owned()],
+            ..SessionCdpCleanupReport::default()
+        };
+        let json = serde_json::to_value(report).expect("serialize report");
+
+        assert_eq!(json["endpoint_unreachable"], 2);
+        assert_eq!(json["persisted_rows_deleted"], 2);
+        assert_eq!(
+            CdpCleanupCloseOutcome::EndpointUnreachable.as_str(),
+            "endpoint_unreachable"
+        );
     }
 
     #[test]

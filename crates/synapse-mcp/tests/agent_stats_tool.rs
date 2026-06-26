@@ -1,11 +1,12 @@
-//! Live end-to-end FSV for the `agent_stats` MCP tool (#903).
+//! Live end-to-end regression coverage for the `agent_stats` MCP tool (#903).
 //!
 //! Seeds a real `CF_AGENT_EVENTS` journal with a synthetic agent whose every
 //! derived metric is hand-computable, launches the actual `synapse-mcp` binary
 //! pointed at that DB, calls `agent_stats` over a real MCP stdio session, and
 //! reconciles the returned numbers against a direct physical-row scan of the
-//! same column family — the #903 acceptance test (compare `agent_stats` output
-//! against direct CF row counts). No mocks: real binary, real `RocksDB`.
+//! same column family. This is supporting evidence only; manual Full State
+//! Verification is performed separately against a live daemon and physical
+//! Sources of Truth. No mocks: real binary, real `RocksDB`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -3,15 +3,23 @@ import { describe, test } from "node:test";
 
 import {
   buildAgents,
+  buildTargetDashboardRows,
   buildTaskRows,
+  claimDashboardAssetReload,
+  dashboardAssetReloadDecision,
+  dashboardAssetReloadUrl,
   localModelLaunchReady,
   localModelProbeLabel,
   modelRegistryStatus,
+  shellJobCommandLabel,
+  shellJobEvidence,
+  shellJobNeedsReview,
+  type DashboardPanel,
   type DashboardState,
   type ModelRow
 } from "../src/lib/dashboard-state";
 
-function panel(data: unknown) {
+function panel<T = unknown>(data: T): DashboardPanel<T> {
   return { status: "ok" as const, source: "test", data };
 }
 
@@ -57,6 +65,49 @@ function liveSession(state: string, reason = "session_initialized", lastSeenMs =
   };
 }
 
+function dashboardStateWithAsset(jsFile: string): DashboardState {
+  const state = dashboardState({
+    sessions: [],
+    unbound_agent_states: []
+  });
+  state.dashboard_assets = panel({
+    schema_version: 1,
+    source_of_truth: "test asset surface",
+    js_file: jsFile,
+    css_file: "dashboard-test.css"
+  });
+  return state;
+}
+
+function installDashboardDom(currentJsFile: string, href = "http://127.0.0.1:7700/dashboard#/fleet") {
+  const storage = new Map<string, string>();
+  const fakeWindow = {
+    location: { href },
+    sessionStorage: {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        storage.set(key, value);
+      }
+    }
+  };
+  const fakeDocument = {
+    scripts: [
+      {
+        getAttribute: (name: string) => (name === "src" ? `/dashboard/assets/${currentJsFile}` : null)
+      }
+    ]
+  };
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: fakeWindow
+  });
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: fakeDocument
+  });
+  return { storage, fakeWindow };
+}
+
 const MODEL_STATUS_NOW_MS = 1_782_400_000_000;
 
 function registryRow(overrides: Partial<ModelRow> = {}): ModelRow {
@@ -79,6 +130,104 @@ function registryRow(overrides: Partial<ModelRow> = {}): ModelRow {
     ...overrides
   };
 }
+
+describe("dashboard asset reload contract", () => {
+  test("reloads when URL marker names the expected bundle but the running script is stale", () => {
+    const { storage } = installDashboardDom(
+      "dashboard-old.js",
+      "http://127.0.0.1:7700/dashboard?_synapse_dashboard_asset=dashboard-new.js#/fleet"
+    );
+    const decision = dashboardAssetReloadDecision(dashboardStateWithAsset("dashboard-new.js"));
+
+    assert.equal(decision.reason, "asset_mismatch");
+    assert.equal(claimDashboardAssetReload(decision), true);
+    assert.match(storage.get("synapse.dashboard.asset-reload") || "", /"attempts":1/);
+    assert.equal(
+      dashboardAssetReloadUrl("dashboard-new.js"),
+      "http://127.0.0.1:7700/dashboard?_synapse_dashboard_asset=dashboard-new.js&_synapse_dashboard_asset_attempt=1#/fleet"
+    );
+  });
+
+  test("fails closed after bounded reload attempts for the same stale bundle transition", () => {
+    const { storage } = installDashboardDom(
+      "dashboard-old.js",
+      "http://127.0.0.1:7700/dashboard?_synapse_dashboard_asset=dashboard-new.js&_synapse_dashboard_asset_attempt=2#/fleet"
+    );
+    storage.set(
+      "synapse.dashboard.asset-reload",
+      JSON.stringify({ reloadKey: "dashboard-old.js->dashboard-new.js", attempts: 2 })
+    );
+    const decision = dashboardAssetReloadDecision(dashboardStateWithAsset("dashboard-new.js"));
+    const originalConsoleError = console.error;
+    console.error = () => undefined;
+    try {
+      assert.throws(
+        () => claimDashboardAssetReload(decision),
+        /DASHBOARD_ASSET_RELOAD_EXHAUSTED: current=dashboard-old\.js: expected=dashboard-new\.js: attempts=2/
+      );
+    } finally {
+      console.error = originalConsoleError;
+    }
+  });
+});
+
+describe("system dashboard diagnostics", () => {
+  test("separates live target sessions from retained cleanup rows and persisted CDP owners", () => {
+    const rows = buildTargetDashboardRows([
+      {
+        session_id: "live-session",
+        lifecycle: "live",
+        active_target: { kind: "cdp", cdp_target_id: "chrome-tab:live", window_hwnd: 10 },
+        foreground_lane: { status: "unclaimed_session_target" }
+      },
+      {
+        session_id: "orphan-session",
+        lifecycle: "unregistered",
+        attention_class: "cleanup_required",
+        active_target: { kind: "window", window_hwnd: 20 },
+        foreground_lane: { status: "unclaimed_session_target" },
+        persisted_cdp_target_owners: [
+          {
+            owner_session_id: "orphan-session",
+            cdp_target_id: "chrome-tab:orphan",
+            window_hwnd: 20,
+            cleanup_action: "call session_end with session_id=orphan-session"
+          }
+        ]
+      }
+    ]);
+
+    assert.equal(rows.liveTargetSessions.length, 1);
+    assert.equal(rows.liveTargetSessions[0].session_id, "live-session");
+    assert.equal(rows.retainedTargetSessions.length, 1);
+    assert.equal(rows.retainedTargetSessions[0].cleanup_action, "session_end orphan-session");
+    assert.equal(rows.persistedCdpOwnerRows.length, 1);
+    assert.equal(rows.persistedCdpOwnerRows[0].cdp_target_id, "chrome-tab:orphan");
+  });
+
+  test("surfaces shell job command, exit code, and bounded failure evidence", () => {
+    const row = {
+      job_id: "issue989-exit7-20260614184340765",
+      stderr_tail: "Write-Error issue989-exit7",
+      stdout_tail: "",
+      job: {
+        status: "exit_nonzero",
+        command_line: "powershell.exe -NoProfile -Command \"Write-Error issue989-exit7; exit 7\"",
+        exit_code: 7,
+        diagnostics: {
+          output_state: "terminal_stderr_only",
+          actionable_hints: ["inspect_stderr_tail"]
+        }
+      }
+    };
+
+    assert.equal(shellJobNeedsReview(row), true);
+    assert.match(shellJobCommandLabel(row), /powershell\.exe/);
+    assert.match(shellJobEvidence(row), /exit_code=7/);
+    assert.match(shellJobEvidence(row), /Write-Error issue989-exit7/);
+    assert.match(shellJobEvidence(row), /inspect_stderr_tail/);
+  });
+});
 
 describe("modelRegistryStatus", () => {
   test("keeps fresh healthy registry rows launch-ready", () => {

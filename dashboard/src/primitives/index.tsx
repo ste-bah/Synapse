@@ -104,7 +104,7 @@ export function StatCard({
         <StatusBadge status={status} />
       </div>
       <div className="mt-3 font-mono text-metric font-semibold leading-none text-primary">{value}</div>
-      {delta ? <div className="mt-3 text-sm text-secondary">{delta}</div> : null}
+      {delta ? <div className="mt-3 break-words text-sm text-secondary">{delta}</div> : null}
     </article>
   );
 }

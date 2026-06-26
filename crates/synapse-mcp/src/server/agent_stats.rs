@@ -212,8 +212,8 @@ pub struct ErrorStats {
     /// finished in the window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_rate: Option<f64>,
-    /// Count per OTel `error.type`, across every row that carried one. Ordered
-    /// by type.
+    /// Count per OTel `error.type` among the same errored `tool_call_finished`
+    /// rows counted by `errored_tool_calls`. Ordered by type.
     pub by_type: BTreeMap<String, u64>,
 }
 
@@ -518,8 +518,12 @@ impl ScopeAccumulator {
             AgentEventKind::ToolCallStarted => self.tool_calls_started += 1,
             AgentEventKind::ToolCallFinished => {
                 self.tool_calls_finished += 1;
-                if record.attributes.error_type.is_some() {
+                if let Some(error_type) = record.attributes.error_type.as_deref() {
                     self.errored_tool_calls += 1;
+                    *self
+                        .errors_by_type
+                        .entry(error_type.to_owned())
+                        .or_insert(0) += 1;
                 }
                 if let Some(duration_ms) = record
                     .payload
@@ -539,14 +543,6 @@ impl ScopeAccumulator {
                 *self.end_states.entry(label).or_insert(0) += 1;
             }
             _ => {}
-        }
-
-        // error.type can ride any kind (e.g. tool_failure on a finished call).
-        if let Some(error_type) = record.attributes.error_type.as_deref() {
-            *self
-                .errors_by_type
-                .entry(error_type.to_owned())
-                .or_insert(0) += 1;
         }
 
         // Usage tokens fold from whichever rows carry them (forward-compatible

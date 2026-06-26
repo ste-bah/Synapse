@@ -67,6 +67,7 @@ import {
 import {
   buildAgents,
   buildTaskRows,
+  buildTargetDashboardRows,
   buildToolCalls,
   attachedAgentRegistry,
   broadcastAgents,
@@ -114,6 +115,9 @@ import {
   runStorageGc,
   saveDashboardView,
   searchTimelineRows,
+  shellJobCommandLabel,
+  shellJobEvidence,
+  shellJobNeedsReview,
   stopFleet,
   spawnAgent,
   updateAgentPlan,
@@ -3878,6 +3882,16 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
   };
   const statsActions = asRecord(fleetStats.actions);
   const statsErrors = asRecord(fleetStats.errors);
+  const statsFinishedCalls = numberOrZero(statsActions.tool_calls_finished);
+  const statsErroredCalls = numberOrZero(statsErrors.errored_tool_calls);
+  const statsErrorTypes = Object.entries(asRecord(statsErrors.by_type))
+    .map(([type, count]) => ({ type, count: numberOrZero(count) }))
+    .filter((row) => row.count > 0)
+    .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+  const topStatsErrorType = statsErrorTypes[0];
+  const statsErrorDelta = topStatsErrorType
+    ? `${statsErroredCalls} of ${statsFinishedCalls} finished · top ${topStatsErrorType.type} ${topStatsErrorType.count}`
+    : `${statsErroredCalls} of ${statsFinishedCalls} finished`;
   const unpricedModels = asArray(fleetCost.unpriced_models).map(rawText).filter(Boolean);
   const rollupSource = costPanel?.status === "ok" ? costPanel.source : costPanel?.error || "transcript fallback";
   const sourceComputedDelta = sourceReportedCost - totals.cost;
@@ -3894,7 +3908,7 @@ function CostTokenAnalytics({ state, agents }: { state?: DashboardState; agents:
         <StatCard label="Source Cost" value={formatMicroUsd(sourceReportedCost)} status={sourceReportedCost ? "working" : "idle"} delta={sourceReportedCost && totals.cost ? `${formatSignedMicroUsd(sourceComputedDelta)} delta` : rollupSource} />
         <StatCard label="Rollup Rows" value={scannedTranscriptRows ?? usagePoints.length} status={hasCostRollup ? "done" : "needs_input"} delta={`${scannedEventRows ?? 0} event rows`} />
         <StatCard label="Actions / min" value={formatRate(numberOrUndefined(statsActions.tool_calls_started_per_min))} status={statsPanel?.status === "ok" ? "working" : "idle"} delta={`${numberOrZero(statsActions.tool_calls_finished)} finished`} />
-        <StatCard label="Error Rate" value={formatPercentValue(numberOrUndefined(statsErrors.error_rate))} status={numberOrZero(statsErrors.errored_tool_calls) ? "needs_input" : "done"} delta={`${numberOrZero(statsErrors.errored_tool_calls)} errored calls`} />
+        <StatCard label="Tool Error Rate" value={formatPercentValue(numberOrUndefined(statsErrors.error_rate))} status={statsErroredCalls ? "needs_input" : "done"} delta={statsErrorDelta} />
         <StatCard label="Usage Rows" value={usagePoints.length} status={usagePoints.length ? "working" : "idle"} delta={state?.agent_transcripts.source || "CF_AGENT_TRANSCRIPTS"} />
         <StatCard label="Runaway Watch" value={runawayRows.length + statsWatchRows.length} status={runawayRows.length || statsWatchRows.length ? "needs_input" : "done"} delta="stuck / error / high burn" />
         <StatCard label="Zero-turn Spawns" value={zeroTurnRows.length} status={zeroTurnRows.length ? "needs_input" : "done"} delta="edge coverage" />
@@ -5167,6 +5181,14 @@ function SystemView({
   const cdpAttachments = asArray<Record<string, unknown>>(asRecord(panelData(state?.cdp_attachments)).rows);
   const shellJobsData = asRecord(panelData(state?.shell_jobs));
   const shellJobs = asArray<Record<string, unknown>>(shellJobsData.rows);
+  const targetRows = buildTargetDashboardRows(sessions);
+  const shellJobsNeedingReview = shellJobs.filter(shellJobNeedsReview);
+  const shellJobStatusCounts = shellJobs.reduce<Record<string, number>>((counts, row) => {
+    const status = rawText(asRecord(row.job).status || row.status || "unknown");
+    counts[status] = (counts[status] || 0) + 1;
+    return counts;
+  }, {});
+  const shellJobTopStatus = Object.entries(shellJobStatusCounts).sort((left, right) => right[1] - left[1])[0];
   const events = asRecord(panelData(state?.events));
   const pressureName = rawText(pressure.name || pressure.level || pressure.value || storage.pressure_level || "unknown");
   const pressureStatus: FleetStatus = /level[34]|l[34]|refus/i.test(pressureName) ? "stuck" : /level[12]|l[12]/i.test(pressureName) ? "needs_input" : "done";
@@ -5562,19 +5584,39 @@ function SystemView({
       <Section
         title="Targets"
         tier="drill-down"
-        questions={["Which sessions own browser tabs?", "Which hidden desktops exist?", "Which session owns each target?"]}
+        questions={["Which target lanes are live?", "Which retained rows require cleanup?", "Which persisted CDP owners remain?"]}
       >
+        <div className="mb-3 grid gap-4 md:grid-cols-3">
+          <StatCard label="Live target lanes" value={targetRows.liveTargetSessions.length} status={targetRows.liveTargetSessions.length ? "working" : "idle"} delta="session_list live rows" />
+          <StatCard label="Retained targets" value={targetRows.retainedTargetSessions.length} status={targetRows.retainedTargetSessions.length ? "needs_input" : "done"} delta="cleanup-required continuity rows" />
+          <StatCard label="Persisted CDP owners" value={targetRows.persistedCdpOwnerRows.length} status={targetRows.persistedCdpOwnerRows.length ? "needs_input" : "done"} delta="CF_SESSIONS owner rows" />
+        </div>
         <div className="grid gap-4 xl:grid-cols-2">
           <SystemTable
-            title="Sessions"
+            title="Live Target Sessions"
             icon={MonitorUp}
-            rows={sessions}
-            empty="No session rows"
+            rows={targetRows.liveTargetSessions}
+            empty="No live session target rows"
             columns={[
               { id: "session", header: "Session", cell: ({ row }) => rawText(row.original.session_id) },
               { id: "lifecycle", header: "Lifecycle", cell: ({ row }) => rawText(row.original.lifecycle) },
+              { id: "attention", header: "Attention", cell: ({ row }) => rawText(row.original.attention_class) || "-" },
+              { id: "status", header: "Lane", cell: ({ row }) => rawText(row.original.target_status) || "-" },
               { id: "target", header: "Target", cell: ({ row }) => rawText(row.original.active_target) },
               { id: "last", header: "Last Action", cell: ({ row }) => rawText(row.original.last_action) }
+            ]}
+          />
+          <SystemTable
+            title="Retained Target Cleanup"
+            icon={ShieldCheck}
+            rows={targetRows.retainedTargetSessions}
+            empty="No retained session-target cleanup rows"
+            columns={[
+              { id: "session", header: "Session", cell: ({ row }) => rawText(row.original.session_id) },
+              { id: "lifecycle", header: "Lifecycle", cell: ({ row }) => rawText(row.original.lifecycle) },
+              { id: "attention", header: "Attention", cell: ({ row }) => rawText(row.original.attention_class) || "-" },
+              { id: "target", header: "Target", cell: ({ row }) => rawText(row.original.active_target) },
+              { id: "cleanup", header: "Cleanup", cell: ({ row }) => rawText(row.original.cleanup_action) || "session_end" }
             ]}
           />
           <SystemTable
@@ -5587,6 +5629,19 @@ function SystemView({
               { id: "target", header: "Target", cell: ({ row }) => rawText(row.original.cdp_target_id) },
               { id: "window", header: "HWND", cell: ({ row }) => rawText(row.original.window_hwnd) },
               { id: "url", header: "URL", cell: ({ row }) => <span className="line-clamp-2">{rawText(row.original.target_url)}</span> }
+            ]}
+          />
+          <SystemTable
+            title="Persisted CDP Owners"
+            icon={Network}
+            rows={targetRows.persistedCdpOwnerRows}
+            empty="No persisted CDP owner cleanup rows"
+            columns={[
+              { id: "session", header: "Session", cell: ({ row }) => rawText(row.original.session_id) },
+              { id: "target", header: "Target", cell: ({ row }) => rawText(row.original.cdp_target_id) },
+              { id: "window", header: "HWND", cell: ({ row }) => rawText(row.original.window_hwnd) },
+              { id: "url", header: "URL", cell: ({ row }) => <span className="line-clamp-2">{rawText(row.original.target_url || row.original.requested_url)}</span> },
+              { id: "cleanup", header: "Cleanup", cell: ({ row }) => <span className="line-clamp-2">{rawText(row.original.cleanup_action)}</span> }
             ]}
           />
         </div>
@@ -5607,9 +5662,10 @@ function SystemView({
       </Section>
 
       <Section title="Shell Jobs" tier="drill-down" questions={["Which jobs are still running?", "Which status files were read?", "Can a job be inspected?"]}>
-        <div className="mb-3 grid gap-4 md:grid-cols-3">
+        <div className="mb-3 grid gap-4 md:grid-cols-4">
           <StatCard label="Total" value={rawText(shellJobsData.job_count || 0)} status="idle" delta={rawText(shellJobsData.job_root)} />
           <StatCard label="Running" value={rawText(shellJobsData.running_count || 0)} status={Number(shellJobsData.running_count || 0) ? "working" : "done"} />
+          <StatCard label="Needs review" value={shellJobsNeedingReview.length} status={shellJobsNeedingReview.length ? "needs_input" : "done"} delta={shellJobTopStatus ? `${shellJobTopStatus[0]} x${shellJobTopStatus[1]}` : "no rows"} />
           <StatCard label="Unreadable" value={rawText(shellJobsData.skipped_unreadable_status_files || 0)} status={Number(shellJobsData.skipped_unreadable_status_files || 0) ? "stuck" : "done"} />
         </div>
         {shellJobs.length ? (
@@ -5620,8 +5676,19 @@ function SystemView({
               { id: "job", header: "Job", cell: ({ row }) => rawText(row.original.job_id) },
               { id: "status", header: "Status", cell: ({ row }) => rawText(asRecord(row.original.job).status || row.original.status) },
               { id: "running", header: "Running", cell: ({ row }) => rawText(row.original.running) },
-              { id: "pid", header: "PID", cell: ({ row }) => rawText(row.original.pid) },
-              { id: "session", header: "Session", cell: ({ row }) => rawText(row.original.session_id) }
+              {
+                id: "exit",
+                header: "Exit / Code",
+                cell: ({ row }) => {
+                  const job = asRecord(row.original.job);
+                  return rawText(job.exit_code ?? job.error_code ?? "-");
+                }
+              },
+              { id: "command", header: "Command", cell: ({ row }) => <span className="line-clamp-2">{shellJobCommandLabel(row.original)}</span> },
+              { id: "updated", header: "Updated", cell: ({ row }) => rawText(asRecord(row.original.job).completed_at || asRecord(asRecord(row.original.job).diagnostics).checked_at || asRecord(row.original.job).started_at) },
+              { id: "evidence", header: "Evidence", cell: ({ row }) => <span className="line-clamp-2">{shellJobEvidence(row.original) || "-"}</span> },
+              { id: "pid", header: "PID", cell: ({ row }) => rawText(asRecord(row.original.job).pid || row.original.pid) },
+              { id: "session", header: "Session", cell: ({ row }) => rawText(asRecord(row.original.job).session_id || row.original.session_id) }
             ]}
           />
         ) : (
