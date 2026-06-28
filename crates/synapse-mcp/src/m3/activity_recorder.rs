@@ -3300,6 +3300,7 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[ignore = "spawns real Notepad windows on the operator desktop; opt-in via cargo test -- --ignored (#1333)"]
     #[tokio::test]
     async fn recorder_writes_real_foreground_rows_into_cf_timeline() {
         let _live_window_lock = ACTIVITY_RECORDER_LIVE_WINDOW_LOCK.lock().await;
@@ -3460,6 +3461,7 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[ignore = "spawns real Notepad windows on the operator desktop; opt-in via cargo test -- --ignored (#1333)"]
     #[tokio::test]
     async fn pause_and_exclusion_gates_suppress_real_rows() {
         let _live_window_lock = ACTIVITY_RECORDER_LIVE_WINDOW_LOCK.lock().await;

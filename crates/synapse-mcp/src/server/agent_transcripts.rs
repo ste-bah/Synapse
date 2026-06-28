@@ -1484,6 +1484,30 @@ fn parse_local_model_object(
             });
             Ok(())
         }
+        "local.tool_call.gate_bypassed" => {
+            // A local autonomous agent recorded that a permission-gated tool call
+            // proceeded without an interactive approval gate (e.g. trusted
+            // unattended exact-contract authorization). This is an expected
+            // local-model lifecycle event, not schema drift — give it a typed
+            // path so it parses cleanly instead of landing as an invalid row
+            // (#1327). The bypass reason is preserved on the tool call status.
+            record.role = Some(TranscriptRole::Tool);
+            let tool_name = required_local_str(object, "tool_name")?.to_owned();
+            let reason_code = object
+                .get("reason_code")
+                .and_then(Value::as_str)
+                .unwrap_or("gate_bypassed");
+            record.tool_calls.push(TranscriptToolCall {
+                tool_name,
+                tool_call_id: object
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                status: Some(format!("gate_bypassed:{reason_code}")),
+                ..TranscriptToolCall::default()
+            });
+            Ok(())
+        }
         "local.tool_parse_error" => {
             record.role = Some(TranscriptRole::Tool);
             record.source_error = Some(

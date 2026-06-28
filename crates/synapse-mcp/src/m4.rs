@@ -768,6 +768,12 @@ pub struct ShellSessionCleanupReadback {
     pub skipped_unreadable_status_files: usize,
     pub live_jobs_before: usize,
     pub retained_live_jobs: usize,
+    /// Durable jobs whose status still claimed live ("running"/"cancel_requested")
+    /// but whose backing process was already dead, reconciled to a terminal state
+    /// on this cleanup pass instead of being retained as a phantom forever (#1334).
+    #[serde(default)]
+    #[schemars(!default)]
+    pub reaped_phantom_jobs: usize,
     pub termination_attempted: usize,
     pub termination_succeeded: usize,
     pub failed: usize,
@@ -2586,6 +2592,7 @@ pub fn cleanup_shell_jobs_for_session(
             skipped_unreadable_status_files: 0,
             live_jobs_before: 0,
             retained_live_jobs: 0,
+            reaped_phantom_jobs: 0,
             termination_attempted: 0,
             termination_succeeded: 0,
             failed: 0,
@@ -2603,6 +2610,7 @@ pub fn cleanup_shell_jobs_for_session(
         skipped_unreadable_status_files: 0,
         live_jobs_before: 0,
         retained_live_jobs: 0,
+        reaped_phantom_jobs: 0,
         termination_attempted: 0,
         termination_succeeded: 0,
         failed: 0,
@@ -2690,6 +2698,41 @@ pub fn cleanup_shell_jobs_for_session(
             continue;
         }
         if !shell_job_live_status(&job.status) {
+            continue;
+        }
+        // #1334: liveness must be PID-backed, not status-string-only. A durable
+        // job whose status still claims live but whose backing process is dead is
+        // a phantom — reconcile it to a terminal state (persisting the fix so it
+        // is cleaned product-wide) instead of retaining it as "running" forever.
+        let claimed_live_before = job.status.clone();
+        let job = match reconcile_shell_job_process_state(job, &paths) {
+            Ok(job) => job,
+            Err(error) => {
+                readback.failed = readback.failed.saturating_add(1);
+                tracing::warn!(
+                    code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_RECONCILE_FAILED",
+                    session_id,
+                    reason,
+                    job_id,
+                    detail = %error.message,
+                    "act_run_shell session cleanup could not reconcile a durable job's process state"
+                );
+                continue;
+            }
+        };
+        if !shell_job_process_still_running(&job) {
+            if shell_job_live_status(&claimed_live_before) {
+                readback.reaped_phantom_jobs = readback.reaped_phantom_jobs.saturating_add(1);
+                tracing::info!(
+                    code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_PHANTOM_REAPED",
+                    session_id,
+                    reason,
+                    job_id,
+                    claimed_status = %claimed_live_before,
+                    reconciled_status = %job.status,
+                    "act_run_shell session cleanup reconciled a phantom durable job (live status, dead process) to terminal"
+                );
+            }
             continue;
         }
         readback.live_jobs_before = readback.live_jobs_before.saturating_add(1);
@@ -12480,6 +12523,77 @@ mod tests {
         assert_eq!(readback_after_unobserved.exit_code, Some(0));
     }
 
+    // #1334: a durable job whose status still claims "running" but whose backing
+    // process is dead must be reconciled off the live set, not retained forever.
+    // Source of truth = the persisted status file on disk after reconcile.
+    #[test]
+    fn reconcile_demotes_running_job_with_dead_pid_off_live_set() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
+        let paths = ShellJobPaths {
+            job_dir: temp.path().to_path_buf(),
+            stdout_path: temp.path().join("stdout.log"),
+            stderr_path: temp.path().join("stderr.log"),
+            status_path: temp.path().join("status.json"),
+            request_path: temp.path().join("request.json"),
+            remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+        };
+        let params = ActRunShellStartParams {
+            command: "powershell.exe".to_owned(),
+            args: vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                "Start-Sleep -Seconds 600".to_owned(),
+            ],
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: None,
+            job_id: Some("issue1334-phantom".to_owned()),
+        };
+        let authorization = RunShellAuthorization {
+            command_line: shell_command_line_from_parts(&params.command, &params.args),
+            matched_pattern: "__any_permitted__".to_owned(),
+        };
+        let request_sha = run_shell_start_request_sha256(&params)
+            .unwrap_or_else(|error| panic!("start request should hash: {error}"));
+        // A PID that cannot be alive (max u32, never a real Windows PID).
+        let dead_pid = u32::MAX - 1;
+        let phantom = shell_job_status_record(
+            "issue1334-phantom",
+            "running",
+            &params,
+            &paths,
+            &request_sha,
+            &authorization,
+            "2026-06-14T00:00:00Z".to_owned(),
+            Some(dead_pid),
+            None,
+        );
+        write_shell_job_status(&paths.status_path, &phantom)
+            .unwrap_or_else(|error| panic!("plant phantom status: {error}"));
+
+        // Precondition: status string alone classifies it live (the old bug).
+        assert!(shell_job_live_status(&phantom.status));
+        // But PID-backed liveness already knows it is dead.
+        assert!(!shell_job_process_still_running(&phantom));
+
+        let reconciled = reconcile_shell_job_process_state(phantom, &paths)
+            .unwrap_or_else(|error| panic!("reconcile should succeed: {error}"));
+        println!(
+            "readback=reconcile edge=running_dead_pid before=running after=status:{}",
+            reconciled.status
+        );
+        assert_ne!(reconciled.status, "running");
+        assert!(!shell_job_process_still_running(&reconciled));
+
+        // Source of truth: re-read the persisted file — the phantom is no longer
+        // a live "running" job on disk.
+        let on_disk = read_shell_job_status(&paths.status_path, "issue1334-phantom")
+            .unwrap_or_else(|error| panic!("status should read after reconcile: {error}"));
+        assert_ne!(on_disk.status, "running");
+        assert!(!shell_job_live_status(&on_disk.status));
+    }
+
     #[test]
     fn shell_job_status_readback_preserves_terminal_monitor_status() {
         let temp = tempfile::TempDir::new()
@@ -15597,7 +15711,11 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         );
         let authorization = authorize_run_shell(&shell_config_for(&auth_params), &auth_params)
             .unwrap_or_else(|error| panic!("durable cleanup shell should authorize: {error}"));
-        let context = shell_execution_context_for_session("issue812-cleanup-retain-session")
+        // #1334: a unique session id per run so this test can never count a prior
+        // run's (now dead-PID) durable job as live — combined with the PID-liveness
+        // reconcile in cleanup_shell_jobs_for_session, the live count is exact.
+        let session_label = format!("issue1334-cleanup-retain-{}", uuid::Uuid::new_v4());
+        let context = shell_execution_context_for_session(&session_label)
             .unwrap_or_else(|error| panic!("shell context should build: {error}"));
         let started = start_authorized_shell_job(
             ActRunShellStartParams {
@@ -15619,6 +15737,9 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         println!("readback=act_run_shell_session_cleanup edge=retain after={cleanup:?}");
         assert_eq!(cleanup.live_jobs_before, 1);
         assert_eq!(cleanup.retained_live_jobs, 1);
+        // The only durable job under this unique session is genuinely alive, so
+        // nothing should be reaped as a phantom (#1334).
+        assert_eq!(cleanup.reaped_phantom_jobs, 0);
         assert_eq!(cleanup.termination_attempted, 0);
         assert_eq!(cleanup.failed, 0);
         assert!(cleanup.job_ids.contains(&job_id));

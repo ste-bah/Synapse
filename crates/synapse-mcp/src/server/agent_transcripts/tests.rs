@@ -23,6 +23,7 @@ const LOCAL_MODEL_STREAM: &str = r#"{"type":"local.thread.started","conversation
 {"type":"local.turn.started","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":1}
 {"type":"local.assistant.message","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":1,"content":"","finish_reason":"tool_calls","raw_response_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
 {"type":"local.tool_call.started","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":1,"tool_name":"workspace_put","tool_call_id":"call_1","arguments":"{\"run_id\":\"issue931-test\",\"key\":\"result\",\"value\":{\"actual\":4}}"}
+{"type":"local.tool_call.gate_bypassed","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":1,"tool_name":"workspace_put","tool_call_id":"call_1","reason_code":"trusted_unattended_exact_contract","approval_gate_used":false,"exact_contract_authorized":true}
 {"type":"local.tool_call.finished","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":1,"tool_name":"workspace_put","tool_call_id":"call_1","status":"ok","result":{"ok":true}}
 {"type":"local.turn.finished","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":1,"finish_reason":"tool_calls","usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120}}
 {"type":"local.context.truncated","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":2,"before_chars":2048,"after_chars":1024,"limit_chars":1024}
@@ -322,6 +323,20 @@ fn local_model_stream_reconciles_usage_tool_calls_and_errors() {
             .as_deref()
             .expect("arguments")
             .contains("issue931-test")
+    );
+    // #1327: gate_bypassed is an expected local lifecycle event, not schema drift.
+    // It must parse to a typed Tool row (the new_invalid_rows==0 assertion above
+    // already proves it is not counted invalid).
+    let gate_bypassed = rows
+        .iter()
+        .map(|(_line, record)| record)
+        .find(|record| record.event_kind.as_deref() == Some("local.tool_call.gate_bypassed"))
+        .expect("gate_bypassed row must parse");
+    assert_eq!(gate_bypassed.role, Some(TranscriptRole::Tool));
+    assert_eq!(gate_bypassed.tool_calls[0].tool_name, "workspace_put");
+    assert_eq!(
+        gate_bypassed.tool_calls[0].status.as_deref(),
+        Some("gate_bypassed:trusted_unattended_exact_contract")
     );
     let usage_row = rows
         .iter()
