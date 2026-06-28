@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-shadow-dom-pierce-v1";
-const BRIDGE_BUILD_SHA256 = "420e9a0d082cb9be706631a174c23d22ff61cc9a86a1a0fa731ba09586f962d5";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-dispatch-bubble-v1";
+const BRIDGE_BUILD_SHA256 = "4c806bda225d1242b6435cc3a2275a157a1949eb58699fa2463a9b79f5136c35";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -16152,6 +16152,31 @@ function normalizeEventInit(value) {
   if (value === null || value === undefined) {
     return {};
   }
+  // Some MCP transports stringify nested object params, so a bubbling EventInit
+  // can arrive as a JSON-encoded object string. Parse it back before validating
+  // so callers can forge e.g. {"bubbles":true} input events (#1347).
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (trimmed === "") {
+      return {};
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch (error) {
+      throw bridgeError(
+        ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+        `domAction dispatch_event eventInit string was not valid JSON: ${String(error && error.message ? error.message : error)}`
+      );
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw bridgeError(
+        ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+        `domAction dispatch_event eventInit string must encode a JSON object; got ${JSON.stringify(parsed)}`
+      );
+    }
+    return parsed;
+  }
   if (typeof value !== "object" || Array.isArray(value)) {
     throw bridgeError(
       ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
@@ -17513,8 +17538,13 @@ async function performDomActionInPage(request) {
     };
   }
 
-  function createDomEvent(eventType, eventInit) {
+  function createDomEvent(eventType, requestedInit) {
     const lower = eventType.toLowerCase();
+    // Default synthetic dispatch_event events to bubble/cancel/compose so
+    // framework-delegated listeners at the document root (React onInput, etc.)
+    // and editors like Quill/Draft observe them. Caller-supplied values override
+    // these defaults (#1347).
+    const eventInit = { bubbles: true, cancelable: true, composed: true, ...requestedInit };
     if (Object.prototype.hasOwnProperty.call(eventInit, "detail") && typeof CustomEvent === "function") {
       return new CustomEvent(eventType, eventInit);
     }

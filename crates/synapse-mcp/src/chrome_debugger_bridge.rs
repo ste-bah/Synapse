@@ -41,9 +41,9 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-28-shadow-dom-pierce-v1";
+    "synapse-chrome-bridge-2026-06-28-dispatch-bubble-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "420e9a0d082cb9be706631a174c23d22ff61cc9a86a1a0fa731ba09586f962d5";
+    "4c806bda225d1242b6435cc3a2275a157a1949eb58699fa2463a9b79f5136c35";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -4898,6 +4898,22 @@ impl ChromeDebuggerBridge {
         kind: &str,
         params: Value,
     ) -> Result<Value, ChromeDebuggerBridgeError> {
+        self.send_command_with_timeout(kind, params, COMMAND_TIMEOUT)
+            .await
+    }
+
+    /// Like `send_command` but with an explicit daemon-side response budget.
+    /// Long-running in-extension operations (e.g. `downloads` operation=wait with
+    /// a caller `waitTimeoutMs` greater than the default 30s) must give the daemon
+    /// a budget that outlives the in-page wait, otherwise the daemon kills the
+    /// command first and surfaces a transport-looking A11Y_CDP_EXTENSION_TIMEOUT
+    /// instead of the extension's clean no-match result (#1342).
+    async fn send_command_with_timeout(
+        &self,
+        kind: &str,
+        params: Value,
+        command_timeout: Duration,
+    ) -> Result<Value, ChromeDebuggerBridgeError> {
         let id = format!(
             "chrome-cdp-{}-{}",
             std::process::id(),
@@ -4966,7 +4982,7 @@ impl ChromeDebuggerBridge {
         }
         self.notify.notify_waiters();
 
-        let response = match timeout(COMMAND_TIMEOUT, receiver).await {
+        let response = match timeout(command_timeout, receiver).await {
             Ok(Ok(response)) => response,
             Ok(Err(_closed)) => {
                 self.drop_pending(&id);
@@ -5885,12 +5901,41 @@ pub(crate) async fn downloads(
         json!({})
     };
     payload["hwnd"] = json!(hwnd);
-    let result = bridge().send_command("downloads", payload).await?;
+    // For waiting operations the extension blocks in-page up to waitTimeoutMs, so
+    // the daemon command budget must outlive it; otherwise the fixed 30s default
+    // fires first and a no-match wait reads as A11Y_CDP_EXTENSION_TIMEOUT (#1342).
+    let command_timeout = downloads_command_timeout(&payload);
+    let result = bridge()
+        .send_command_with_timeout("downloads", payload, command_timeout)
+        .await?;
     serde_json::from_value::<ChromeDebuggerDownloadsResult>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger downloads response: {error}"
         ))
     })
+}
+
+/// Daemon-side response budget for a `downloads` bridge command. Read-only
+/// `list` keeps the default budget; `wait`/`save`/`move` extend it to the
+/// caller's `waitTimeoutMs` plus a margin so the daemon never times out before
+/// the extension's own bounded wait returns a clean no-match result (#1342).
+fn downloads_command_timeout(payload: &Value) -> Duration {
+    let operation = payload
+        .get("operation")
+        .and_then(Value::as_str)
+        .unwrap_or("list");
+    if !matches!(operation, "wait" | "save" | "move") {
+        return COMMAND_TIMEOUT;
+    }
+    // The MCP layer already clamps waitTimeoutMs to <= 300_000; default to the
+    // bridge contract's 30_000 when absent. Add a 5s margin so the extension's
+    // own timeout result wins the race over the daemon budget.
+    let wait_ms = payload
+        .get("waitTimeoutMs")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000);
+    let budget = Duration::from_millis(wait_ms).saturating_add(Duration::from_secs(5));
+    budget.max(COMMAND_TIMEOUT)
 }
 
 pub(crate) async fn type_active_element(
@@ -8177,6 +8222,38 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Uri, header};
 
     use super::*;
+
+    // #1342: a downloads wait/save/move must give the daemon a response budget
+    // that outlives the caller's in-extension waitTimeoutMs; list keeps default.
+    #[test]
+    fn downloads_command_timeout_scales_with_wait_budget() {
+        // Read-only list keeps the fixed default budget.
+        assert_eq!(
+            downloads_command_timeout(&json!({"operation": "list"})),
+            COMMAND_TIMEOUT
+        );
+        // A long wait extends the budget past the 30s default (+5s margin).
+        assert_eq!(
+            downloads_command_timeout(&json!({"operation": "wait", "waitTimeoutMs": 300_000})),
+            Duration::from_millis(300_000) + Duration::from_secs(5)
+        );
+        // save/move also wait for a completed match.
+        assert_eq!(
+            downloads_command_timeout(&json!({"operation": "save", "waitTimeoutMs": 120_000})),
+            Duration::from_millis(120_000) + Duration::from_secs(5)
+        );
+        // A short wait budget never drops below the default floor.
+        assert_eq!(
+            downloads_command_timeout(&json!({"operation": "wait", "waitTimeoutMs": 1000})),
+            COMMAND_TIMEOUT
+        );
+        // Absent waitTimeoutMs falls back to the extension's 30s default, so the
+        // daemon budget is that default + the 5s margin (must outlive the in-page wait).
+        assert_eq!(
+            downloads_command_timeout(&json!({"operation": "wait"})),
+            COMMAND_TIMEOUT + Duration::from_secs(5)
+        );
+    }
 
     #[test]
     fn native_host_invocation_detects_chrome_origin_and_parent_window() {

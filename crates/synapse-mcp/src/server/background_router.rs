@@ -4328,15 +4328,18 @@ fn target_act_validate_dom_locator(
             "target_act verb=dispatch_event requires non-empty event_type",
         ));
     }
+    // Accept event_init as either a JSON object or a JSON-encoded object string
+    // (some MCP transports stringify nested object params); the in-page bridge's
+    // normalizeEventInit parses the string back into an EventInit object (#1347).
     if action == "dispatch_event"
         && params
             .event_init
             .as_ref()
-            .is_some_and(|value| !value.is_object())
+            .is_some_and(|value| !value.is_object() && !value.is_string())
     {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=dispatch_event event_init must be a JSON object when supplied",
+            "target_act verb=dispatch_event event_init must be a JSON object or JSON-object string when supplied",
         ));
     }
     if target_act_is_click_like_dom_action(action) {
