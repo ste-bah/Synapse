@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-navigate-download-v1";
-const BRIDGE_BUILD_SHA256 = "40cb52b61f7c7ce13f165867b39e92a37f57c0a69f3f71793202cec673f8d0d1";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-typeactive-nativesetter-v1";
+const BRIDGE_BUILD_SHA256 = "2ea09785c52d3529e918bd1d23bcb1a64af421f905a39cfeaf319903aeea5647";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -15552,7 +15552,21 @@ function typeActiveElementInPage(text) {
       const start = typeof active.selectionStart === "number" ? active.selectionStart : beforeValue.length;
       const end = typeof active.selectionEnd === "number" ? active.selectionEnd : start;
       const expected = beforeValue.slice(0, start) + inputText + beforeValue.slice(end);
-      active.value = expected;
+      // Use the native prototype value setter (not `active.value = …`) so
+      // controlled React/Vue/Angular inputs do not revert the write: a plain
+      // assignment updates the framework's cached value tracker, so the input
+      // event reports "no change" and the next render restores the old state.
+      // The prototype setter bypasses that tracker — the same react-safe path
+      // setFieldValueInPage uses (#1348). The caller's post-set readback still
+      // fails loud (CHROME_ACTIVE_ELEMENT_VALUE_MISMATCH) if a page reverts it.
+      const proto =
+        tagName === "input" ? window.HTMLInputElement.prototype : window.HTMLTextAreaElement.prototype;
+      const descriptor = Object.getOwnPropertyDescriptor(proto, "value");
+      if (descriptor && typeof descriptor.set === "function") {
+        descriptor.set.call(active, expected);
+      } else {
+        active.value = expected;
+      }
       if (typeof active.setSelectionRange === "function") {
         const caret = start + inputText.length;
         active.setSelectionRange(caret, caret);
