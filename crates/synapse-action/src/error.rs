@@ -43,6 +43,8 @@ pub enum ActionError {
     ForegroundLost { detail: String },
     #[error("action unsupported key: {detail}")]
     UnsupportedKey { detail: String },
+    #[error("action observed no state delta: {detail}")]
+    NoObservedDelta { detail: String },
     #[error("action drag distance exceeds limit: {detail}")]
     DragDistanceExceedsLimit { detail: String },
     #[error("stuck key auto-released: {detail}")]
@@ -73,6 +75,7 @@ impl ActionError {
             Self::TransientElementExpired { .. } => error_codes::TRANSIENT_ELEMENT_EXPIRED,
             Self::ForegroundLost { .. } => error_codes::ACTION_FOREGROUND_LOST,
             Self::UnsupportedKey { .. } => error_codes::ACTION_UNSUPPORTED_KEY,
+            Self::NoObservedDelta { .. } => error_codes::ACTION_NO_OBSERVED_DELTA,
             Self::DragDistanceExceedsLimit { .. } => {
                 error_codes::ACTION_DRAG_DISTANCE_EXCEEDS_LIMIT
             }
@@ -99,6 +102,7 @@ impl ActionError {
             | Self::TransientElementExpired { detail, .. }
             | Self::ForegroundLost { detail }
             | Self::UnsupportedKey { detail }
+            | Self::NoObservedDelta { detail }
             | Self::DragDistanceExceedsLimit { detail }
             | Self::StuckKeyAutoReleased { detail }
             | Self::SafetyReleaseAllFired { detail }
@@ -143,6 +147,7 @@ impl ActionError {
             }
             Self::ForegroundLost { .. } => Self::ForegroundLost { detail },
             Self::UnsupportedKey { .. } => Self::UnsupportedKey { detail },
+            Self::NoObservedDelta { .. } => Self::NoObservedDelta { detail },
             Self::DragDistanceExceedsLimit { .. } => Self::DragDistanceExceedsLimit { detail },
             Self::StuckKeyAutoReleased { .. } => Self::StuckKeyAutoReleased { detail },
             Self::SafetyReleaseAllFired { .. } => Self::SafetyReleaseAllFired { detail },
@@ -167,6 +172,7 @@ impl ActionError {
             | Self::TransientElementExpired { .. }
             | Self::ForegroundLost { .. }
             | Self::UnsupportedKey { .. }
+            | Self::NoObservedDelta { .. }
             | Self::DragDistanceExceedsLimit { .. }
             | Self::StuckKeyAutoReleased { .. }
             | Self::SafetyReleaseAllFired { .. }

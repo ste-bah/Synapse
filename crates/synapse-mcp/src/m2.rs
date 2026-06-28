@@ -5,7 +5,7 @@ mod config;
 mod focus_window;
 mod pad;
 pub(crate) mod postcondition;
-mod press;
+pub(crate) mod press;
 mod release_all;
 mod scroll;
 mod set_field_text;

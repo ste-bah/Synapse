@@ -23,6 +23,7 @@ pub use schema::{
 };
 
 pub(crate) use postmessage::HwndKeyboardTargetState;
+pub(crate) use postmessage::clipboard_sequence_number;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedKeymapPress {

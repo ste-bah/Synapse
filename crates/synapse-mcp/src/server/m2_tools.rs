@@ -2347,13 +2347,21 @@ struct CdpKeyboardDeltaSignature {
 #[serde(deny_unknown_fields)]
 struct HwndKeyboardDeltaSignature {
     target: HwndKeyboardTargetState,
+    /// Windows clipboard sequence number at capture time. Lets the PostMessage
+    /// keyboard verify observe clipboard-mutating chords (Ctrl+C/Ctrl+X) whose
+    /// effect is NOT a target text/selection change (#1331).
+    clipboard_sequence: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum HwndKeyboardExpectedEffect {
     AnyDelta,
-    PrintableText { text: String },
+    PrintableText {
+        text: String,
+    },
     SelectAll,
+    /// Ctrl+C / Ctrl+X: success is observed as a clipboard sequence-number change.
+    Clipboard,
 }
 
 #[derive(Clone, Debug)]
@@ -4023,6 +4031,7 @@ impl SynapseService {
     ) -> Result<HwndKeyboardDeltaSignature, ErrorData> {
         Ok(HwndKeyboardDeltaSignature {
             target: hwnd_keyboard_target_state(root_hwnd)?,
+            clipboard_sequence: crate::m2::press::clipboard_sequence_number(),
         })
     }
 
@@ -4313,6 +4322,11 @@ fn hwnd_keyboard_expected_effect(
     if labels == ["ctrl", "a"] {
         return Ok(HwndKeyboardExpectedEffect::SelectAll);
     }
+    // Ctrl+C / Ctrl+X copy/cut to the clipboard without changing target text
+    // (copy) — their effect is a clipboard sequence-number change (#1331).
+    if hwnd_is_clipboard_chord(&labels) {
+        return Ok(HwndKeyboardExpectedEffect::Clipboard);
+    }
     let has_command_modifier = labels
         .iter()
         .any(|label| matches!(label.as_str(), "ctrl" | "alt" | "super"));
@@ -4322,6 +4336,27 @@ fn hwnd_keyboard_expected_effect(
         }
     }
     Ok(HwndKeyboardExpectedEffect::AnyDelta)
+}
+
+/// True for a Ctrl+C / Ctrl+X chord (copy/cut): exactly ctrl + {c|x}, no other
+/// command modifier. These mutate the clipboard, not the target text (#1331).
+fn hwnd_is_clipboard_chord(labels: &[String]) -> bool {
+    let has_ctrl = labels.iter().any(|label| label == "ctrl");
+    if !has_ctrl {
+        return false;
+    }
+    if labels
+        .iter()
+        .any(|label| matches!(label.as_str(), "alt" | "super" | "shift"))
+    {
+        return false;
+    }
+    let letters: Vec<&str> = labels
+        .iter()
+        .filter(|label| label.as_str() != "ctrl")
+        .map(String::as_str)
+        .collect();
+    letters.len() == 1 && matches!(letters[0], "c" | "x")
 }
 
 fn hwnd_printable_text_for_label(label: &str) -> Option<String> {
@@ -4342,6 +4377,14 @@ fn hwnd_keyboard_effect_mismatch(
 ) -> Option<&'static str> {
     match expected_effect {
         HwndKeyboardExpectedEffect::AnyDelta => None,
+        HwndKeyboardExpectedEffect::Clipboard => {
+            if before.clipboard_sequence == after.clipboard_sequence {
+                return Some(
+                    "clipboard chord (Ctrl+C/Ctrl+X) did not change the clipboard sequence number",
+                );
+            }
+            None
+        }
         HwndKeyboardExpectedEffect::SelectAll => {
             if !same_hwnd_keyboard_target(before, after) {
                 return Some("target HWND changed while verifying Ctrl+A select-all delivery");
@@ -4410,6 +4453,7 @@ fn hwnd_keyboard_expected_effect_name(
         HwndKeyboardExpectedEffect::AnyDelta => "any_delta",
         HwndKeyboardExpectedEffect::PrintableText { .. } => "printable_text",
         HwndKeyboardExpectedEffect::SelectAll => "select_all",
+        HwndKeyboardExpectedEffect::Clipboard => "clipboard",
     }
 }
 
@@ -7956,6 +8000,47 @@ mod tests {
     }
 
     #[test]
+    fn hwnd_keyboard_clipboard_chord_verified_by_sequence_change() {
+        // Ctrl+C/Ctrl+X leave the target text+selection unchanged; their real
+        // effect is a clipboard sequence-number bump (#1331). A copy that bumps
+        // the clipboard must pass; a no-op copy (no selection -> seq unchanged)
+        // must fail loud as ACTION_NO_OBSERVED_DELTA, not a false success.
+        let before = hwnd_keyboard_signature("alpha beta gamma", 0, 16);
+        let mut after_copied = hwnd_keyboard_signature("alpha beta gamma", 0, 16);
+        after_copied.clipboard_sequence = before.clipboard_sequence + 1;
+
+        let postcondition = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before.clone(),
+            after_copied,
+            HwndKeyboardExpectedEffect::Clipboard,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect("Ctrl+C must pass when the clipboard sequence number changes");
+        assert_eq!(postcondition.status, "observed_delta");
+
+        // No-op copy: text/selection AND clipboard sequence all unchanged.
+        let no_op_after = hwnd_keyboard_signature("alpha beta gamma", 0, 16);
+        let error = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            "target_hwnd_text_or_selection",
+            250,
+            before,
+            no_op_after,
+            HwndKeyboardExpectedEffect::Clipboard,
+            "observed target HWND text/selection change after PostMessage keyboard delivery",
+        )
+        .expect_err("a no-op copy must not report success");
+        let data = error.data.as_ref().expect("structured error data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::ACTION_NO_OBSERVED_DELTA)
+        );
+    }
+
+    #[test]
     fn hwnd_keyboard_printable_after_full_selection_requires_exact_replacement() {
         let before = hwnd_keyboard_signature("alpha beta gamma", 0, 16);
         let wrong_after = hwnd_keyboard_signature("alpha beta gammaz", 17, 17);
@@ -9040,6 +9125,7 @@ mod tests {
                 selection_start: Some(selection_start),
                 selection_end: Some(selection_end),
             },
+            clipboard_sequence: 0,
         }
     }
 
