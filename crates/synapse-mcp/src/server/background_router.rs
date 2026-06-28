@@ -3160,7 +3160,9 @@ async fn target_act_coordinate_click(
                     ));
                 }
             };
-            if let Err(error) = target_act_window_coordinate_foreground_preflight(hwnd) {
+            if let Err(error) =
+                target_act_window_coordinate_foreground_preflight(hwnd, &session_id)
+            {
                 service.audit_action_denied_with_details_for_session(
                     "target_act",
                     &error,
@@ -5836,7 +5838,10 @@ fn target_act_window_coordinate_to_screen_point(
     Ok(point)
 }
 
-fn target_act_window_coordinate_foreground_preflight(hwnd: i64) -> Result<(), ErrorData> {
+fn target_act_window_coordinate_foreground_preflight(
+    hwnd: i64,
+    session_id: &str,
+) -> Result<(), ErrorData> {
     let target_root = synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
         mcp_error(
             error.code(),
@@ -5860,16 +5865,110 @@ fn target_act_window_coordinate_foreground_preflight(hwnd: i64) -> Result<(), Er
             ),
         )
     })?;
-    if foreground_root != target_root {
-        return Err(mcp_error(
-            error_codes::FOREGROUND_ACTIVATION_REFUSED,
+    if foreground_root == target_root {
+        return Ok(());
+    }
+
+    // #1351: verb=focus_window may have verified the target as foreground, but the
+    // MCP round-trip gap let another window (often the human) reclaim it, so this
+    // pre-click readback no longer matches and the click was refused — asking for
+    // a focus step that was already done. If THIS session holds the foreground
+    // input lease, it is authorized to re-assert the claimed target's foreground
+    // (exactly what verb=focus_window does) and self-heal the race once, rather
+    // than refuse. Without the lease we fail loud with a precise, evidence-bearing
+    // foreground-lost diagnostic (both readbacks) instead of a focus re-request.
+    let holds_lease =
+        synapse_action::lease::status().owner_session_id.as_deref() == Some(session_id);
+    if holds_lease {
+        if let Err(error) = synapse_a11y::focus_window_with_intent(
+            target_root,
+            synapse_a11y::ForegroundActivationIntent::LeaseContextRestore {
+                caller: "target_act",
+            },
+        ) {
+            return Err(target_act_foreground_lost_error(
+                target_root,
+                foreground_root,
+                &foreground,
+                true,
+                Some(format!("lease-held re-focus failed: {error}")),
+            ));
+        }
+        // Confirm the re-assert took before clicking.
+        let after = synapse_a11y::current_foreground_context().ok();
+        let after_root = after
+            .as_ref()
+            .and_then(|context| synapse_a11y::top_level_root_hwnd(context.hwnd).ok());
+        if after_root == Some(target_root) {
+            tracing::info!(
+                code = "TARGET_ACT_COORDINATE_FOREGROUND_SELF_HEALED",
+                target_root,
+                prior_foreground_root = foreground_root,
+                session_id,
+                "readback=foreground self-healed lease-held re-focus before native coordinate click"
+            );
+            return Ok(());
+        }
+        let detail = after.map(|context| {
             format!(
-                "target_act native/window coordinate click requires the session target 0x{target_root:x} to already be the real OS foreground before using screen coordinates; current human_os_foreground root=0x{foreground_root:x} process={} title={:?}. Acquire the foreground input lease and call target_act verb=focus_window explicitly before this fallback, or use a Chrome CDP target coordinate route.",
-                foreground.process_name, foreground.window_title
-            ),
+                "lease-held re-focus did not stick; foreground is still 0x{:x} process={} title={:?}",
+                context.hwnd, context.process_name, context.window_title
+            )
+        });
+        return Err(target_act_foreground_lost_error(
+            target_root,
+            foreground_root,
+            &foreground,
+            true,
+            detail,
         ));
     }
-    Ok(())
+    Err(target_act_foreground_lost_error(
+        target_root,
+        foreground_root,
+        &foreground,
+        false,
+        None,
+    ))
+}
+
+/// #1351: precise foreground-lost diagnostic for a native coordinate click whose
+/// pre-click foreground readback no longer matches the target. Carries both
+/// readbacks and whether the session held the lease, so the caller can tell a
+/// human-reclaimed-foreground race apart from a missing focus/lease step.
+fn target_act_foreground_lost_error(
+    target_root: i64,
+    foreground_root: i64,
+    foreground: &synapse_core::ForegroundContext,
+    holds_lease: bool,
+    extra: Option<String>,
+) -> ErrorData {
+    let remediation = if holds_lease {
+        "this session holds the foreground input lease but could not re-assert the target's foreground (the human or another window is actively holding it); retry, or wait for the human to release foreground"
+    } else {
+        "acquire the foreground input lease (control_lease_acquire) so target_act can re-assert the claimed target's foreground automatically, or call verb=focus_window immediately before the click"
+    };
+    let message = format!(
+        "target_act native/window coordinate click: the target 0x{target_root:x} is not the OS foreground at click time; foreground moved to root=0x{foreground_root:x} process={} title={:?}. {remediation}.{}",
+        foreground.process_name,
+        foreground.window_title,
+        extra.as_ref().map(|e| format!(" ({e})")).unwrap_or_default()
+    );
+    ErrorData::new(
+        rmcp::model::ErrorCode(-32099),
+        message,
+        Some(json!({
+            "code": error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            "reason": "foreground_moved_before_click",
+            "target_root_hwnd": target_root,
+            "foreground_root_hwnd": foreground_root,
+            "foreground_hwnd": foreground.hwnd,
+            "foreground_process": foreground.process_name,
+            "foreground_title": foreground.window_title,
+            "session_holds_foreground_lease": holds_lease,
+            "self_heal_attempted": holds_lease,
+        })),
+    )
 }
 
 fn target_act_rect_contains_point(rect: Rect, point: Point) -> bool {
