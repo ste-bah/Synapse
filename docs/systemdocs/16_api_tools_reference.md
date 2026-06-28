@@ -299,7 +299,6 @@ All target a session-owned tab via `cdp_target_id?` + `window_hwnd?` (default ac
 | `browser_network_har` | browser_network.rs | Record/replay/clear HAR 1.2 | `operation` (Record), `path?`, filters, `include_bodies=true`, `missing_policy=Passthrough` |
 | `browser_network_request` | browser_network.rs | Inspect one request by id | `request_id` (req), `include_body=true`, `include_post_data=true` |
 | `browser_network_overrides` | browser_network.rs | Set/get/clear extra headers + UA override (raw CDP only) | `operation` (Set), `headers` (req), `user_agent?` |
-| `browser_network_conditions` | browser_network.rs | Set/reset offline/throttling | `operation` (Set), `offline?`, `latency_ms=0`, throughputs, `connection_type?` |
 | `browser_route` | browser_network.rs | Add/list/remove/clear Fetch route rules | `operation` (AddFulfill), `route_id?`, `url?`, `match_kind` (Glob), `status=200`, `headers`, `body?`/`body_base64?`, `error_reason?`, continue_* |
 | `browser_cookies` | browser_storage.rs | Get/set/clear cookies via chrome.cookies | (get/set/clear verb + cookie fields) |
 | `browser_storage` | browser_storage.rs | Get/set/clear local/sessionStorage; save/load storageState | (verb + storage/state fields) |
