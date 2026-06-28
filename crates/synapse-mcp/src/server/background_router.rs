@@ -639,7 +639,19 @@ impl SynapseService {
                     }
                     target_act_coordinate_click(self, action, &params, &request_context).await?
                 } else if target_act_has_dom_locator(&params) {
-                    target_act_browser_dom_action(self, action, &params, &request_context).await?
+                    let bridge_action: &'static str = if action == "dblclick" {
+                        "dblclick"
+                    } else {
+                        "click"
+                    };
+                    target_act_dom_locator_pointer(
+                        self,
+                        bridge_action,
+                        bridge_action,
+                        &params,
+                        &request_context,
+                    )
+                    .await?
                 } else {
                     let element_id =
                         require_param(params.element_id.clone(), action, "element_id")?;
@@ -746,7 +758,11 @@ impl SynapseService {
                 if target_act_has_key_chord(&params) {
                     target_act_key_press(self, &params, &request_context).await?
                 } else {
-                    target_act_browser_dom_action(self, "press", &params, &request_context).await?
+                    // press a named button/link = a real trusted click on the
+                    // bridge target; keep the synthetic "press" DOM-action only as
+                    // the raw-CDP/native fallback (#1348 headline #2).
+                    target_act_dom_locator_pointer(self, "click", "press", &params, &request_context)
+                        .await?
                 }
             }
             "select" => {
@@ -3788,6 +3804,89 @@ async fn target_act_hover(
     ))
 }
 
+/// Route a DOM-locator click/dblclick/press to the REAL trusted-input lane
+/// (#1348 headline #1/#2). For the normal Chrome bridge target this dispatches
+/// chrome.debugger `Input.dispatchMouseEvent` (isTrusted=true) instead of the
+/// synthetic `performClick` that guarded handlers ignore. Raw-CDP and
+/// native/window targets keep the existing path (raw-CDP real mouse click is a
+/// tracked follow-up). `bridge_action` is the cdpInput action ("click"/
+/// "dblclick"); `fallback_action` is the DOM-action verb used when the real lane
+/// does not apply (so verb=press keeps its named-button fallback semantics).
+#[cfg(windows)]
+async fn target_act_dom_locator_pointer(
+    service: &SynapseService,
+    bridge_action: &'static str,
+    fallback_action: &'static str,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let session_id = target_act_session_id(request_context, bridge_action)?;
+    let Some(target) = service.session_target(Some(&session_id))? else {
+        return target_act_browser_dom_action(service, fallback_action, params, request_context)
+            .await;
+    };
+    let SessionTarget::Cdp {
+        window_hwnd,
+        cdp_target_id,
+    } = &target
+    else {
+        return target_act_browser_dom_action(service, fallback_action, params, request_context)
+            .await;
+    };
+    // Raw-CDP endpoint present → keep the existing path (raw real-mouse click is
+    // a tracked follow-up). Only the bridge-only target gets the cdpInput lane.
+    if synapse_a11y::endpoint_for_window(*window_hwnd).is_some() {
+        return target_act_browser_dom_action(service, fallback_action, params, request_context)
+            .await;
+    }
+    let request_details = json!({
+        "session_id": &session_id,
+        "verb": bridge_action,
+        "fallback_verb": fallback_action,
+        "lane": "chrome_debugger_bridge.cdpInput",
+        "real_trusted_input": true,
+        "required_foreground": false,
+    });
+    if let Err(error) =
+        service.ensure_target_claim_allows_session("target_act", &session_id, &target)
+    {
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
+            &request_details,
+            &session_id,
+        );
+        return Ok((
+            "chrome_debugger_bridge.cdpInput",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
+    }
+    target_act_bridge_cdp_input(
+        service,
+        bridge_action,
+        *window_hwnd,
+        cdp_target_id,
+        None,
+        params,
+        &request_details,
+        &session_id,
+    )
+    .await
+}
+
+#[cfg(not(windows))]
+async fn target_act_dom_locator_pointer(
+    service: &SynapseService,
+    _bridge_action: &'static str,
+    fallback_action: &'static str,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    target_act_browser_dom_action(service, fallback_action, params, request_context).await
+}
+
 #[cfg(windows)]
 async fn target_act_bridge_cdp_input(
     service: &SynapseService,
@@ -3800,6 +3899,24 @@ async fn target_act_bridge_cdp_input(
     session_id: &str,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
     target_act_validate_bridge_cdp_input(action, coordinate, params)?;
+    // Mouse-click options apply only to the real-mouse click/dblclick lane;
+    // hover/tap/drag ignore them (left None).
+    let is_click = matches!(action, "click" | "dblclick");
+    let click_count = if is_click {
+        Some(target_act_click_count_for_action(action, params.clicks)?)
+    } else {
+        None
+    };
+    let click_button = if is_click {
+        params.button.map(TargetActMouseButton::as_str)
+    } else {
+        None
+    };
+    let click_modifiers = if is_click {
+        Some(target_act_click_modifiers_bridge_value(&params.modifiers)?)
+    } else {
+        None
+    };
     let mut request_details = request_details.clone();
     if let Some(object) = request_details.as_object_mut() {
         object.insert("window_hwnd".to_owned(), json!(window_hwnd));
@@ -3836,6 +3953,9 @@ async fn target_act_bridge_cdp_input(
             drag_duration_ms: None,
             drag_data_mime_type: None,
             drag_data_text: None,
+            button: click_button,
+            modifiers: click_modifiers.as_ref(),
+            clicks: click_count,
             wait_timeout_ms: target_act_dom_wait_timeout(params.wait_timeout_ms)?,
             auto_wait: params.auto_wait,
             auto_wait_timeout_ms: params.auto_wait_timeout_ms,

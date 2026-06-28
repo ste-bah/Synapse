@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-typeactive-nativesetter-v1";
-const BRIDGE_BUILD_SHA256 = "2ea09785c52d3529e918bd1d23bcb1a64af421f905a39cfeaf319903aeea5647";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-cdpinput-realclick-v2";
+const BRIDGE_BUILD_SHA256 = "2afc29ccf3f8156642e186c19c3f9998f577a0fb680781f861c2265070370d90";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -4799,8 +4799,17 @@ async function handleCdpInput(params) {
     };
   }
 
-  const touchActivation = action === "tap"
-    ? await activateTabForCdpTouch(selected.tabId, before)
+  // tap/click/dblclick deliver real trusted Input.* events through
+  // chrome.debugger, which the renderer only processes for the ACTIVE tab
+  // (an inactive tab silently drops mousePressed/mouseReleased — the same
+  // reason dispatchMouseDrag gates its real lane on before.active). Activate
+  // the owned tab in its already-focused Chrome window first; hover does not
+  // need it. This is in-Chrome tab activation, not OS foreground theft
+  // (required_foreground stays false). #1348 headline #1/#2.
+  const needsActivation =
+    action === "tap" || action === "click" || action === "dblclick";
+  const touchActivation = needsActivation
+    ? await activateTabForCdpTouch(selected.tabId, before, action)
     : {
         attempted: false,
         activated: false,
@@ -4809,7 +4818,11 @@ async function handleCdpInput(params) {
         required_foreground: false,
         readback_backend: "not_required_for_hover"
       };
-  const dispatch = await dispatchCdpInput(selected.tabId, action, point);
+  const dispatch = await dispatchCdpInput(selected.tabId, action, point, {
+    button: normalizeMouseButton(params.button, "cdpInput"),
+    modifiers: normalizeClickModifiers(params.modifiers, "cdpInput"),
+    clickCount: normalizeClickCount(params.clicks)
+  });
   const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
   const afterPageText = await tabPageTextState(selected.tabId);
   return {
@@ -5246,13 +5259,41 @@ async function handleNetworkConditions(params) {
 
 function normalizeCdpInputAction(value) {
   const action = String(value || "").trim().toLowerCase();
-  if (action === "hover" || action === "tap" || action === "drag" || action === "html5_drag") {
+  if (
+    action === "hover" ||
+    action === "tap" ||
+    action === "click" ||
+    action === "dblclick" ||
+    action === "drag" ||
+    action === "html5_drag"
+  ) {
     return action;
   }
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `cdpInput action must be hover, tap, drag, or html5_drag; got ${JSON.stringify(value)}`
+    `cdpInput action must be hover, tap, click, dblclick, drag, or html5_drag; got ${JSON.stringify(value)}`
   );
+}
+
+// CDP Input.dispatchMouseEvent modifier bitmask: Alt=1, Ctrl=2, Meta=4, Shift=8.
+function cdpModifierBitmask(modifiers) {
+  if (!Array.isArray(modifiers)) {
+    return 0;
+  }
+  let mask = 0;
+  for (const item of modifiers) {
+    const normalized = String(item || "").trim().toLowerCase();
+    if (normalized === "alt" || normalized === "option") {
+      mask |= 1;
+    } else if (normalized === "ctrl" || normalized === "control") {
+      mask |= 2;
+    } else if (["meta", "super", "cmd", "command"].includes(normalized)) {
+      mask |= 4;
+    } else if (normalized === "shift") {
+      mask |= 8;
+    }
+  }
+  return mask;
 }
 
 function normalizeViewportEmulationOperation(value) {
@@ -8693,7 +8734,7 @@ function normalizeCdpInputCoordinate(params, action) {
   };
 }
 
-async function dispatchCdpInput(tabId, action, point) {
+async function dispatchCdpInput(tabId, action, point, options = {}) {
   const debuggee = { tabId };
   const protocolVersion = "1.3";
   let attached = false;
@@ -8712,6 +8753,33 @@ async function dispatchCdpInput(tabId, action, point) {
       return {
         method: "Input.dispatchMouseEvent(mouseMoved)",
         dispatched_events: ["mouseMoved"],
+        protocol_version: protocolVersion
+      };
+    }
+    if (action === "click" || action === "dblclick") {
+      // Real, trusted mouse click via chrome.debugger: isTrusted=true so
+      // activation-guarded handlers fire (synthetic dispatchEvent does not).
+      const button = String(options.button || "left");
+      const modifiers = cdpModifierBitmask(options.modifiers);
+      const dispatched = [];
+      // Move first so :hover/pointer state matches a real click.
+      await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
+        type: "mouseMoved", x: point.x, y: point.y, button: "none", modifiers, pointerType: "mouse"
+      });
+      dispatched.push("mouseMoved");
+      const pairs = action === "dblclick" ? 2 : 1;
+      for (let clickCount = 1; clickCount <= pairs; clickCount += 1) {
+        await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
+          type: "mousePressed", x: point.x, y: point.y, button, buttons: 1, clickCount, modifiers, pointerType: "mouse"
+        });
+        await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
+          type: "mouseReleased", x: point.x, y: point.y, button, buttons: 0, clickCount, modifiers, pointerType: "mouse"
+        });
+        dispatched.push(`mousePressed(clickCount=${clickCount})`, `mouseReleased(clickCount=${clickCount})`);
+      }
+      return {
+        method: "Input.dispatchMouseEvent(mousePressed,mouseReleased)",
+        dispatched_events: dispatched,
         protocol_version: protocolVersion
       };
     }
@@ -9045,7 +9113,7 @@ async function dispatchHtml5DragDrop(tabId, sourceSelector, targetSelector, para
   };
 }
 
-async function activateTabForCdpTouch(tabId, beforeState) {
+async function activateTabForCdpTouch(tabId, beforeState, action = "tap") {
   const beforeActive = Boolean(beforeState?.active);
   if (beforeActive) {
     return {
@@ -9060,7 +9128,7 @@ async function activateTabForCdpTouch(tabId, beforeState) {
   if (!chrome.tabs || typeof chrome.tabs.update !== "function") {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
-      "cdpInput tap requires activating the target tab before Input.dispatchTouchEvent, but chrome.tabs.update is unavailable"
+      `cdpInput ${action} requires activating the target tab before Input.* dispatch, but chrome.tabs.update is unavailable`
     );
   }
   try {
@@ -9068,7 +9136,7 @@ async function activateTabForCdpTouch(tabId, beforeState) {
   } catch (error) {
     throw bridgeError(
       ERROR_ATTACH_FAILED,
-      `cdpInput tap could not activate tab ${tabId} before Input.dispatchTouchEvent: ${errorMessage(error)}`
+      `cdpInput ${action} could not activate tab ${tabId} before Input.* dispatch: ${errorMessage(error)}`
     );
   }
   const started = Date.now();
@@ -9089,7 +9157,7 @@ async function activateTabForCdpTouch(tabId, beforeState) {
   }
   throw bridgeError(
     ERROR_EXTENSION_TIMEOUT,
-    `cdpInput tap activated tab ${tabId} but active readback did not settle within 2000ms; after_active=${Boolean(after?.active)}`
+    `cdpInput ${action} activated tab ${tabId} but active readback did not settle within 2000ms; after_active=${Boolean(after?.active)}`
   );
 }
 

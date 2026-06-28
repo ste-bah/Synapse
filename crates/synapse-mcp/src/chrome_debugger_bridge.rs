@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-28-typeactive-nativesetter-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-28-cdpinput-realclick-v2";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "2ea09785c52d3529e918bd1d23bcb1a64af421f905a39cfeaf319903aeea5647";
+    "2afc29ccf3f8156642e186c19c3f9998f577a0fb680781f861c2265070370d90";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -6820,6 +6820,13 @@ pub(crate) struct ChromeDebuggerCdpInputRequest<'a> {
     pub drag_duration_ms: Option<u64>,
     pub drag_data_mime_type: Option<&'a str>,
     pub drag_data_text: Option<&'a str>,
+    /// Mouse button for action=click/dblclick (left/middle/right). Ignored by
+    /// hover/tap/drag.
+    pub button: Option<&'a str>,
+    /// Modifier chord for action=click/dblclick. Ignored by hover/tap/drag.
+    pub modifiers: Option<&'a Value>,
+    /// Click count for action=click/dblclick (1 for click, 2 for dblclick).
+    pub clicks: Option<u8>,
     pub wait_timeout_ms: u64,
     pub auto_wait: bool,
     pub auto_wait_timeout_ms: u32,
@@ -6850,6 +6857,9 @@ pub(crate) async fn cdp_input(
                 "dragDurationMs": request.drag_duration_ms,
                 "dragDataMimeType": request.drag_data_mime_type,
                 "dragDataText": request.drag_data_text,
+                "button": request.button,
+                "modifiers": request.modifiers,
+                "clicks": request.clicks,
                 "waitTimeoutMs": request.wait_timeout_ms,
                 "autoWait": request.auto_wait,
                 "autoWaitTimeoutMs": request.auto_wait_timeout_ms,
