@@ -374,8 +374,6 @@ const BREAK_GLASS_HAZARDOUS_TOOLS: &[&str] = &[
     "act_set_value",
     "act_stroke",
     "act_type",
-    "action_diagnostic_queue_full_setup",
-    "action_diagnostic_rate_limit_override",
     "hidden_desktop_pip_frame",
     "release_all",
 ];

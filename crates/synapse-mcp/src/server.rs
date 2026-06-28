@@ -674,12 +674,22 @@ impl SynapseService {
                 + Self::everquest_world_model_tool_router()
                 + Self::everquest_world_summary_tool_router();
         }
-        // Gate synthetic disk-pressure simulation off the default agent
-        // surface; it remains available only when SYNAPSE_DEBUG_TOOLS is set.
-        // `storage_put_probe_rows` is a real diagnostic write tool used by
-        // storage GC FSV to seed bounded probe rows before eviction.
+        // Gate the synthetic fault-injectors off the default agent surface;
+        // they remain available only when SYNAPSE_DEBUG_TOOLS is set, mirroring
+        // the EverQuest opt-in model — no capability is lost, visibility is gated.
+        // `storage_pressure_sample` simulates disk pressure, and the two
+        // `action_diagnostic_*` tools force ACTION_RATE_LIMITED / ACTION_QUEUE_FULL
+        // to exercise the action emitter's backpressure paths (#1348). They have
+        // no production callers and every test that drives them sets
+        // SYNAPSE_DEBUG_TOOLS=1.
+        //
+        // NOTE: `storage_put_probe_rows` is intentionally NOT gated here — it is a
+        // default-granted real diagnostic write tool (normal_agent surface, see
+        // tool_profiles tests) used by storage-GC FSV to seed bounded probe rows.
         if !debug_tools_enabled() {
             router.remove_route("storage_pressure_sample");
+            router.remove_route("action_diagnostic_rate_limit_override");
+            router.remove_route("action_diagnostic_queue_full_setup");
         }
         router
     }
