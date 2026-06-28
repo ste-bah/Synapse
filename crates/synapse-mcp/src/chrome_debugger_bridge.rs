@@ -40,10 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-06-28-dispatch-bubble-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-28-navigate-download-v1";
 const EXPECTED_EXTENSION_BUILD_SHA256: &str =
-    "4c806bda225d1242b6435cc3a2275a157a1949eb58699fa2463a9b79f5136c35";
+    "40cb52b61f7c7ce13f165867b39e92a37f57c0a69f3f71793202cec673f8d0d1";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -3643,6 +3642,22 @@ pub(crate) struct ChromeDebuggerNavigateResult {
     pub readback_backend: String,
     pub navigation_error_text: Option<String>,
     pub is_download: Option<bool>,
+    /// #1344: structured download outcome when the navigate started a Chrome
+    /// download instead of changing the tab URL.
+    #[serde(default)]
+    pub download_status: Option<String>,
+    #[serde(default)]
+    pub download_id: Option<i64>,
+    #[serde(default)]
+    pub download_url: Option<String>,
+    #[serde(default)]
+    pub download_final_url: Option<String>,
+    #[serde(default)]
+    pub download_filename: Option<String>,
+    #[serde(default)]
+    pub download_state: Option<String>,
+    #[serde(default)]
+    pub download_match_reason: Option<String>,
     pub target_candidate_count: u32,
     pub target_selection_reason: String,
     pub extension_id: Option<String>,

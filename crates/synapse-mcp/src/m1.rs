@@ -1511,6 +1511,24 @@ pub struct CdpNavigateTabResponse {
     pub navigation_error_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_download: Option<bool>,
+    /// #1344: when the navigate started a Chrome download instead of changing the
+    /// tab URL, the structured outcome — `download_started` or `download_completed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_final_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_state: Option<String>,
+    /// Why the navigate-triggered download was matched: `url_match` or
+    /// `download_created_during_navigate`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_match_reason: Option<String>,
     pub backend_tier_used: String,
     pub required_foreground: bool,
     pub target_candidate_count: u32,

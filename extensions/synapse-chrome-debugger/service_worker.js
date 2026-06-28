@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-dispatch-bubble-v1";
-const BRIDGE_BUILD_SHA256 = "4c806bda225d1242b6435cc3a2275a157a1949eb58699fa2463a9b79f5136c35";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-28-navigate-download-v1";
+const BRIDGE_BUILD_SHA256 = "40cb52b61f7c7ce13f165867b39e92a37f57c0a69f3f71793202cec673f8d0d1";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -4239,6 +4239,11 @@ async function handleNavigateTab(params) {
   const ignoreCache = Boolean(params.ignoreCache);
   const before = await tabPageState(selected.tabId, selected.target);
   let readbackExpectation = null;
+  // #1344: a navigate to a URL that triggers a Chrome download leaves the tab on
+  // its current URL, so the url-change readback would (wrongly) time out. Snapshot
+  // the download-event sequence before the navigate so we can detect a download
+  // that this navigate started and report it as a structured outcome instead.
+  let downloadSeqBefore = null;
   try {
     if (action === "navigate") {
       markAgentNavigation(selected.tabId, {
@@ -4246,6 +4251,7 @@ async function handleNavigateTab(params) {
         requestedUrl,
         sessionId: agentSessionId
       });
+      downloadSeqBefore = downloadEventSeq;
       await chrome.tabs.update(selected.tabId, { url: requestedUrl });
       if (requestedUrl !== before.url) {
         readbackExpectation = {
@@ -4291,6 +4297,72 @@ async function handleNavigateTab(params) {
         `status=${JSON.stringify(before.ready_state)}`
     );
   }
+  // #1344: for a navigate, race the tab-url readback against a Chrome download
+  // started by this navigate. A matching download is a valid outcome, reported
+  // structurally instead of a navigation timeout.
+  if (action === "navigate") {
+    const outcome = await waitForNavigateOrDownload(
+      selected.tabId,
+      selected.target,
+      waitTimeoutMs,
+      readbackExpectation,
+      downloadSeqBefore,
+      requestedUrl,
+      before.url
+    );
+    if (outcome.kind === "download") {
+      const dl = outcome.download;
+      const after = outcome.state || before;
+      return {
+        extension_id: chrome.runtime.id,
+        target_id: after.target_id || selected.target.id,
+        tab_id: selected.tabId,
+        action,
+        requested_url: requestedUrl,
+        before_url: before.url,
+        before_title: before.title,
+        after_url: after.url,
+        after_title: after.title,
+        ready_state: after.ready_state,
+        history_current_index: -1,
+        history_entry_count: 0,
+        history_readback_source: "not_available_chrome_tabs",
+        readback_backend: "chrome.tabs.get+chrome.downloads",
+        navigation_error_text: null,
+        is_download: true,
+        download_status: dl.state === "complete" ? "download_completed" : "download_started",
+        download_id: dl.download_id,
+        download_url: dl.url,
+        download_final_url: dl.final_url,
+        download_filename: dl.filename,
+        download_state: dl.state,
+        download_match_reason: dl.match_reason,
+        target_candidate_count: selected.targetCandidateCount,
+        target_selection_reason: selected.selectionReason
+      };
+    }
+    const after = outcome.state;
+    return {
+      extension_id: chrome.runtime.id,
+      target_id: after.target_id || selected.target.id,
+      tab_id: selected.tabId,
+      action,
+      requested_url: requestedUrl,
+      before_url: before.url,
+      before_title: before.title,
+      after_url: after.url,
+      after_title: after.title,
+      ready_state: after.ready_state,
+      history_current_index: -1,
+      history_entry_count: 0,
+      history_readback_source: "not_available_chrome_tabs",
+      readback_backend: "chrome.tabs.get",
+      navigation_error_text: null,
+      is_download: false,
+      target_candidate_count: selected.targetCandidateCount,
+      target_selection_reason: selected.selectionReason
+    };
+  }
   const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs, readbackExpectation);
   return {
     extension_id: chrome.runtime.id,
@@ -4311,6 +4383,95 @@ async function handleNavigateTab(params) {
     is_download: null,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
+  };
+}
+
+// #1344: wait for a navigate to either settle on a new tab URL or start a Chrome
+// download. Returns {kind:"navigated", state} or {kind:"download", download, state}.
+// Fails loud (ERROR_EXTENSION_TIMEOUT) only when NEITHER a tab navigation nor a
+// matching download is observed within the budget.
+async function waitForNavigateOrDownload(
+  tabId,
+  fallbackTarget,
+  waitTimeoutMs,
+  expectation,
+  downloadSeqBefore,
+  requestedUrl,
+  beforeUrl
+) {
+  const started = Date.now();
+  let last = null;
+  let lastError = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    const download = matchNavigateDownload(downloadSeqBefore, requestedUrl, last, beforeUrl);
+    if (download) {
+      return { kind: "download", download, state: last };
+    }
+    try {
+      last = await tabPageState(tabId, fallbackTarget);
+      lastError = null;
+      const loaded = last.ready_state === "complete";
+      if (loaded && (!expectation || expectation.matches(last))) {
+        return { kind: "navigated", state: last };
+      }
+    } catch (error) {
+      lastError = error?.message ? String(error.message) : String(error);
+    }
+    await sleep(100);
+  }
+  // Final download check before declaring failure — the download event may have
+  // landed in the same tick the budget expired.
+  const download = matchNavigateDownload(downloadSeqBefore, requestedUrl, last, beforeUrl);
+  if (download) {
+    return { kind: "download", download, state: last };
+  }
+  const detail = last
+    ? `waiting for ${expectation?.description || "complete tab state"} or a Chrome download; ` +
+      `last url=${JSON.stringify(last.url)} title=${JSON.stringify(last.title)} ` +
+      `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)}`
+    : lastError
+      ? `last readback error=${JSON.stringify(lastError)}`
+      : "no tab state readback";
+  throw bridgeError(ERROR_EXTENSION_TIMEOUT, `tab readback did not settle within ${waitTimeoutMs} ms; ${detail}`);
+}
+
+// #1344: find a download event recorded after `seqBefore` that this navigate most
+// likely started. A URL match (item.url/final_url === requestedUrl) is accepted
+// unconditionally; otherwise a download "created" after the navigate is accepted
+// only when the tab did NOT navigate away (still on beforeUrl), which is exactly
+// the timeout-prone case. Returns null when there is no defensible match.
+function matchNavigateDownload(seqBefore, requestedUrl, tabState, beforeUrl) {
+  if (seqBefore === null || seqBefore === undefined) {
+    return null;
+  }
+  const fresh = downloadEventBuffer.filter((event) => event.seq > seqBefore);
+  if (fresh.length === 0) {
+    return null;
+  }
+  const urlMatch = requestedUrl
+    ? fresh.find((event) => event.url === requestedUrl || event.final_url === requestedUrl)
+    : null;
+  if (urlMatch) {
+    return downloadMatchResult(urlMatch, "url_match");
+  }
+  const tabUnchanged = !tabState || tabState.url === beforeUrl;
+  if (tabUnchanged) {
+    const created = fresh.find((event) => event.event_kind === "created") || fresh[0];
+    if (created) {
+      return downloadMatchResult(created, "download_created_during_navigate");
+    }
+  }
+  return null;
+}
+
+function downloadMatchResult(event, matchReason) {
+  return {
+    download_id: event.download_id ?? null,
+    url: event.url ?? null,
+    final_url: event.final_url ?? null,
+    filename: event.filename ?? null,
+    state: event.state ?? null,
+    match_reason: matchReason
   };
 }
 
