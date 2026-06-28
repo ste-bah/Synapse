@@ -10,7 +10,7 @@
 - `crates/synapse-mcp/src/server/background_router.rs` (`target_act`)
 - `crates/synapse-mcp/src/server/agent_control.rs`, `agent_cost.rs`, `agent_stats.rs`, `agent_query.rs`, `agent_mailbox.rs`, `agent_templates.rs`, `agent_tasks.rs`
 - `crates/synapse-mcp/src/server/session_tools.rs`, `lease_tools.rs`, `target_claims.rs`
-- `crates/synapse-mcp/src/server/browser_assert.rs`, `browser_clock_events.rs`, `browser_dialog.rs`, `browser_dnd.rs`, `browser_emulate.rs`, `browser_emulation.rs`, `browser_field.rs`, `browser_files.rs`, `browser_frames.rs`, `browser_network.rs`, `browser_storage.rs`
+- `crates/synapse-mcp/src/server/browser_assert.rs`, `browser_clock_events.rs`, `browser_dialog.rs`, `browser_dnd.rs`, `browser_emulate.rs`, `browser_field.rs`, `browser_files.rs`, `browser_frames.rs`, `browser_network.rs`, `browser_storage.rs`
 - `crates/synapse-mcp/src/server/intent_tools.rs`, `plan_tools.rs`, `reality.rs`, `suggestions.rs`, `routine_feedback.rs`, `routine_labeling.rs`
 - `crates/synapse-mcp/src/server/timeline_query.rs`, `timeline_digest.rs`, `data_cleaning.rs`
 - `crates/synapse-mcp/src/server/workspace_blackboard.rs`, `tool_profiles.rs`, `notify_tools.rs`, `hygiene_report.rs`, `permission_gate.rs`, `escalation/mod.rs`
@@ -296,12 +296,7 @@ All target a session-owned tab via `cdp_target_id?` + `window_hwnd?` (default ac
 | `browser_handle_dialog` | browser_dialog.rs | Read/accept/dismiss JS dialogs via raw CDP or normal Chrome bridge | `operation` (Status), `default_policy?`, `prompt_text?`, `since_seq?`, `limit=20` |
 | `browser_drag` | browser_dnd.rs | Drag element->element (CDP mouse default) | `source_selector`, `target_selector` (req), `mode?`, `steps=12`, `duration_ms=350`, `auto_wait=true` |
 | `browser_drop` | browser_dnd.rs | HTML5 DragEvent drop (mode=mouse optional) | same `BrowserDndParams` (default mode Html5) |
-| `browser_emulate` | browser_emulate.rs | Set/reset multiple emulation overrides in one call | `operation` (Set), `domains` (req), `viewport?`/`device?`/`geolocation?`/`locale?`/`media?`/`network?` |
-| `browser_resize` | browser_emulation.rs | Set/reset viewport size + DPR | `width?`, `height?`, `device_scale_factor?`, `is_mobile?`, `operation` (Set) |
-| `browser_device` | browser_emulation.rs | Apply/reset device descriptor | `user_agent?`, `width?`, `height?`, `has_touch?`, `max_touch_points?`, `operation` (Set) |
-| `browser_geolocation` | browser_emulation.rs | Set/reset geolocation | `latitude?`, `longitude?`, `accuracy=0`, `grant_permission=true`, `operation` (Set) |
-| `browser_locale` | browser_emulation.rs | Set/reset locale + timezone | `locale?`, `timezone_id?`, `operation` (Set) |
-| `browser_media` | browser_emulation.rs | Set/reset CSS media emulation | `media?`, `color_scheme?`, `reduced_motion?`, `operation` (Set) |
+| `browser_emulate` | browser_emulate.rs | Set/reset emulation overrides (viewport/device/geolocation/locale/media/network) in one call; subsumes the former single-domain browser_resize/device/geolocation/locale/media tools (#1348) | `operation` (Set), `domains` (req), `viewport?`/`device?`/`geolocation?`/`locale?`/`media?`/`network?` |
 | `browser_set_value` | browser_field.rs | Replace field text via safe Chrome bridge | `text` (req), `selector?`, `active_element=false` |
 | `browser_fill_form` | browser_field.rs | Fill multiple fields in one ordered call | `fields` (req, 1–200), `continue_on_error=false`, `wait_timeout_ms=5000` |
 | `browser_frames` | browser_frames.rs | Enumerate composed frame tree | target params only |

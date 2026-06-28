@@ -222,7 +222,6 @@ mod browser_dialog;
 mod browser_batch;
 mod browser_dnd;
 mod browser_emulate;
-mod browser_emulation;
 mod browser_field;
 mod browser_files;
 mod browser_frames;
@@ -644,7 +643,6 @@ impl SynapseService {
             + Self::browser_dialog_tool_router()
             + Self::browser_dnd_tool_router()
             + Self::browser_emulate_tool_router()
-            + Self::browser_emulation_tool_router()
             + Self::browser_field_tool_router()
             + Self::browser_files_tool_router()
             + Self::browser_frames_tool_router()

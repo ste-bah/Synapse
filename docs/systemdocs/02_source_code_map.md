@@ -566,8 +566,7 @@ crates/synapse-mcp/src/server/browser_assert.rs       # browser_assert
 crates/synapse-mcp/src/server/browser_clock_events.rs # clock / page events
 crates/synapse-mcp/src/server/browser_dialog.rs       # dialog handling
 crates/synapse-mcp/src/server/browser_dnd.rs          # drag-and-drop
-crates/synapse-mcp/src/server/browser_emulate.rs      # emulation tool surface
-crates/synapse-mcp/src/server/browser_emulation.rs    # device/viewport/geolocation emulation impl
+crates/synapse-mcp/src/server/browser_emulate.rs      # unified emulation tool surface (viewport/device/geolocation/locale/media/network)
 crates/synapse-mcp/src/server/browser_field.rs        # form-field fill/set
 crates/synapse-mcp/src/server/browser_frames.rs       # frame enumeration
 crates/synapse-mcp/src/server/browser_network.rs      # network requests/HAR/websockets/overrides
