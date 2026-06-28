@@ -595,7 +595,8 @@ fn is_matrix_scope_tool(name: &str) -> bool {
         || name.starts_with("workspace_")
         || matches!(
             name,
-            "capture_screenshot"
+            "capture_gif"
+                | "capture_screenshot"
                 | "clear_target"
                 | "find"
                 | "get_target"

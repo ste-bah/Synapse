@@ -228,6 +228,7 @@ mod browser_files;
 mod browser_frames;
 mod browser_network;
 mod browser_storage;
+mod capture_gif;
 mod data_cleaning;
 pub(crate) mod drain;
 pub(crate) mod escalation;
@@ -635,6 +636,7 @@ impl SynapseService {
             + Self::escalation_tool_router()
             + Self::background_router_tool_router()
             + Self::browser_batch_tool_router()
+            + Self::capture_gif_tool_router()
             + Self::browser_assert_tool_router()
             + Self::browser_clock_events_tool_router()
             + Self::browser_dialog_tool_router()
