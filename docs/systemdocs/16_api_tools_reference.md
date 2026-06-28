@@ -76,13 +76,7 @@ Source-of-truth observation, OCR, screenshots, window enumeration, and the CDP/C
 | `browser_add_init_script` | Add/remove a Playwright-style init script | `operation` (Add), `source?`, `identifier?`, `world_name?`, `include_command_line_api=false`, `run_immediately=false`, `cdp_target_id?`, `window_hwnd?` | mutates page init |
 | `browser_add_script_tag` | Inject `<script>` (url/content/path) | one of `url?`/`content?`/`path?`, `script_type?`, `cdp_target_id?`, `window_hwnd?` | DOM mutation |
 | `browser_add_style_tag` | Inject `<style>`/`<link>` (url/content/path) | one of `url?`/`content?`/`path?`, `cdp_target_id?`, `window_hwnd?` | DOM mutation |
-| `browser_wait_for` | Wait for text appears/gone/timeout | `text?`, `state?`, `timeout_ms=30000`, `polling_interval_ms=100`, `cdp_target_id?`, `window_hwnd?` | read-only (polls) |
-| `browser_wait_for_load_state` | Wait for lifecycle state | `state` (default Load), `timeout_ms=30000`, `cdp_target_id?`, `window_hwnd?` | read-only |
-| `browser_wait_for_url` | Wait for URL match | `url` (req), `match_kind` (Exact), `timeout_ms=30000`, `polling_interval_ms=100`, target params | read-only |
-| `browser_wait_for_request` | Wait for matching network request | `url?`, `match_kind?`, `method?`, `resource_type?`, `timeout_ms=30000`, target params | arms CDP Network buffer |
-| `browser_wait_for_response` | Wait for matching response | `url?`, `match_kind?`, `method?`, `status?`, `resource_type?`, `timeout_ms=30000`, target params | arms CDP Network buffer |
-| `browser_wait_for_selector` | Wait for selector state (full Playwright locator: css/xpath/text/role/label/layout) | `query` (req), `engine` (Css), `state` (Visible), many locator filters, `timeout_ms=30000` (summarized) | read-only |
-| `browser_wait_for_function` | Wait until JS predicate true | `expression` (req), `args?`, `timeout_ms=30000`, `polling_interval_ms=100`, target params | runs JS |
+| `browser_wait_for` | Unified wait (#1348): `condition` selects text/load_state/url/selector/function/request/response, with the matching nested spec carrying that predicate's former-standalone-tool params | `condition` (req), one of `text`/`load_state`/`url`/`selector`/`function`/`request`/`response` spec objects | read-only (selector/function run JS) |
 | `browser_content` | Get full HTML | `cdp_target_id?`, `window_hwnd?`, `max_bytes=2MiB` | read-only |
 | `browser_set_content` | Replace main-frame HTML | `html` (req), `wait_timeout_ms?`, target params | DOM replacement |
 | `browser_console_messages` | Read captured console entries (delta via `since_seq`) | `since_seq?`, `level?`, `source?`, `text_contains?`, `max_messages=200`, target params | arms console buffer |
@@ -414,6 +408,6 @@ Run-scoped durable key/value blackboard for multi-agent coordination.
 
 ## 16.19 Notes & caveats
 
-- **Param detail summarized** for: `browser_wait_for_selector`, `browser_locate`, `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), `browser_cookies`/`browser_storage` (verb-shaped), and all EverQuest tools. Authoritative field sets live in the named `*Params` structs in each source file.
+- **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), `browser_cookies`/`browser_storage` (verb-shaped), and all EverQuest tools. Authoritative field sets live in the named `*Params` structs in each source file.
 - **Empty-schema tools** (`input_schema = empty_input_schema()`): `health`, `get_target`, `clear_target`, `control_lease_release`, `control_lease_status`, `tool_profile_status`, `escalation_config_get`.
 - Counts: enumerated by `#[tool(...)]` across `crates/synapse-mcp/src/server/`. The 25 EverQuest tools are the gated set in `server.rs:649-667`.

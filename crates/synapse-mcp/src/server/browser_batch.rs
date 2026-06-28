@@ -99,7 +99,7 @@ pub struct BrowserBatchResponse {
 #[tool_router(router = browser_batch_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Execute an ordered list of browser sub-actions in one MCP call against the calling session's bound browser target (Claude browser_batch parity, #1337). Pure orchestration over vetted primitives — each step routes to the SAME code path as its standalone tool, so there are no new action semantics: action=navigate→cdp_navigate_tab, wait_for_selector/wait_for_url/wait_for_load_state→the matching browser_wait_for_* tool, set_value→browser_set_value, fill_form→browser_fill_form, scroll_into_view→browser_scroll_into_view, evaluate→browser_evaluate, screenshot→browser_screenshot, click→target_act verb=click. Each step's `params` object is shaped exactly like that tool's parameters. Stop-on-first-error by default (interdependent steps compound errors): returns a per-step result array [{index, action, status (ok|error|skipped), ok, result|error}]; the failing step carries its full structured error and later steps are reported skipped. Set stop_on_error=false to run every step regardless. Bind a target first with set_target; an empty steps list is a loud error."
+        description = "Execute an ordered list of browser sub-actions in one MCP call against the calling session's bound browser target (Claude browser_batch parity, #1337). Pure orchestration over vetted primitives — each step routes to the SAME code path as its standalone tool, so there are no new action semantics: action=navigate→cdp_navigate_tab, wait_for_selector/wait_for_url/wait_for_load_state→the matching browser_wait_for condition lane, set_value→browser_set_value, fill_form→browser_fill_form, scroll_into_view→browser_scroll_into_view, evaluate→browser_evaluate, screenshot→browser_screenshot, click→target_act verb=click. Each step's `params` object is shaped exactly like that tool's parameters. Stop-on-first-error by default (interdependent steps compound errors): returns a per-step result array [{index, action, status (ok|error|skipped), ok, result|error}]; the failing step carries its full structured error and later steps are reported skipped. Set stop_on_error=false to run every step regardless. Bind a target first with set_target; an empty steps list is a loud error."
     )]
     pub async fn browser_batch(
         &self,
@@ -238,21 +238,21 @@ impl SynapseService {
             "wait_for_selector" => {
                 let parsed: BrowserWaitForSelectorParams = browser_batch_parse(action, params)?;
                 let response = self
-                    .browser_wait_for_selector(Parameters(parsed), request_context.clone())
+                    .browser_wait_for_selector_inner(Parameters(parsed), request_context.clone())
                     .await?;
                 response_to_value(&response.0)
             }
             "wait_for_url" => {
                 let parsed: BrowserWaitForUrlParams = browser_batch_parse(action, params)?;
                 let response = self
-                    .browser_wait_for_url(Parameters(parsed), request_context.clone())
+                    .browser_wait_for_url_inner(Parameters(parsed), request_context.clone())
                     .await?;
                 response_to_value(&response.0)
             }
             "wait_for_load_state" => {
                 let parsed: BrowserWaitForLoadStateParams = browser_batch_parse(action, params)?;
                 let response = self
-                    .browser_wait_for_load_state(Parameters(parsed), request_context.clone())
+                    .browser_wait_for_load_state_inner(Parameters(parsed), request_context.clone())
                     .await?;
                 response_to_value(&response.0)
             }

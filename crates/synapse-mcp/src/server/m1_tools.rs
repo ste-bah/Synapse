@@ -12,13 +12,14 @@ use super::{
     BrowserScreenshotParams, BrowserScreenshotResponse, BrowserScreenshotScope,
     BrowserScrollIntoViewParams, BrowserScrollIntoViewResponse, BrowserSetContentParams,
     BrowserSetContentResponse, BrowserTabEntry, BrowserTabsParams, BrowserTabsResponse,
-    BrowserWaitForFunctionParams, BrowserWaitForFunctionResponse, BrowserWaitForLoadStateParams,
-    BrowserWaitForLoadStateResponse, BrowserWaitForLoadStateState,
+    BrowserWaitConditionKind, BrowserWaitForFunctionParams, BrowserWaitForFunctionResponse,
+    BrowserWaitForLoadStateParams, BrowserWaitForLoadStateResponse, BrowserWaitForLoadStateState,
     BrowserWaitForNetworkResponseParams, BrowserWaitForNetworkResponseResponse,
     BrowserWaitForParams, BrowserWaitForRequestParams, BrowserWaitForRequestResponse,
     BrowserWaitForResponse, BrowserWaitForSelectorParams, BrowserWaitForSelectorResponse,
     BrowserWaitForSelectorState, BrowserWaitForState, BrowserWaitForUrlMatchKind,
-    BrowserWaitForUrlParams, BrowserWaitForUrlResponse, CaptureScreenshotFormat,
+    BrowserWaitForUrlParams, BrowserWaitForUrlResponse, BrowserWaitParams, BrowserWaitResponse,
+    CaptureScreenshotFormat,
     CaptureScreenshotParams, CaptureScreenshotResponse, CdpActivateTabParams,
     CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
     CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
@@ -2686,9 +2687,105 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Wait in the calling session's owned browser tab for text to appear, text to disappear, or for a plain timeout. If text is supplied without state, waits for text_appears; if text is omitted, defaults to timeout. Uses raw CDP Runtime.evaluate when available or the debugger-free normal Chrome bridge page-text polling helper for chrome-tab:* targets, then returns URL/title/readyState read back from the same target. Condition failures return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Wait in the calling session's owned browser tab for one of seven predicates, selected by `condition` with the matching nested spec (#1348 — folds the former browser_wait_for_text/load_state/url/selector/function/request/response tools into one). condition=text waits for page text to appear/disappear or a plain timeout (spec `text`); condition=load_state waits for domcontentloaded/load/networkidle (spec `load_state`); condition=url waits until the tab URL matches an exact string/glob/regex (spec `url`); condition=selector waits for a Playwright-style selector to reach attached/visible/hidden/detached using the same engines/options as browser_locate (spec `selector`); condition=function polls a JavaScript predicate until truthy (spec `function`); condition=request/response wait for a captured network request/response matching url/method/status/resource_type predicates (spec `request`/`response`). Each spec object is exactly the former standalone tool's parameters. Raw CDP when available or the debugger-free normal Chrome bridge for chrome-tab:* targets. Timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. The response field matching `condition` carries that predicate's full result."
     )]
     pub async fn browser_wait_for(
+        &self,
+        params: Parameters<BrowserWaitParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserWaitResponse>, ErrorData> {
+        let params = params.0;
+        let condition = params.condition;
+        let missing = |field: &str| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("browser_wait_for condition={condition:?} requires the `{field}` spec object"),
+            )
+        };
+        match condition {
+            BrowserWaitConditionKind::Text => {
+                let spec = params.text.ok_or_else(|| missing("text"))?;
+                let inner = self
+                    .browser_wait_for_text_inner(Parameters(spec), request_context)
+                    .await?;
+                Ok(Json(BrowserWaitResponse {
+                    condition,
+                    text: Some(inner.0),
+                    ..Default::default()
+                }))
+            }
+            BrowserWaitConditionKind::LoadState => {
+                let spec = params.load_state.ok_or_else(|| missing("load_state"))?;
+                let inner = self
+                    .browser_wait_for_load_state_inner(Parameters(spec), request_context)
+                    .await?;
+                Ok(Json(BrowserWaitResponse {
+                    condition,
+                    load_state: Some(inner.0),
+                    ..Default::default()
+                }))
+            }
+            BrowserWaitConditionKind::Url => {
+                let spec = params.url.ok_or_else(|| missing("url"))?;
+                let inner = self
+                    .browser_wait_for_url_inner(Parameters(spec), request_context)
+                    .await?;
+                Ok(Json(BrowserWaitResponse {
+                    condition,
+                    url: Some(inner.0),
+                    ..Default::default()
+                }))
+            }
+            BrowserWaitConditionKind::Selector => {
+                let spec = params.selector.ok_or_else(|| missing("selector"))?;
+                let inner = self
+                    .browser_wait_for_selector_inner(Parameters(spec), request_context)
+                    .await?;
+                Ok(Json(BrowserWaitResponse {
+                    condition,
+                    selector: Some(inner.0),
+                    ..Default::default()
+                }))
+            }
+            BrowserWaitConditionKind::Function => {
+                let spec = params.function.ok_or_else(|| missing("function"))?;
+                let inner = self
+                    .browser_wait_for_function_inner(Parameters(spec), request_context)
+                    .await?;
+                Ok(Json(BrowserWaitResponse {
+                    condition,
+                    function: Some(inner.0),
+                    ..Default::default()
+                }))
+            }
+            BrowserWaitConditionKind::Request => {
+                let spec = params.request.ok_or_else(|| missing("request"))?;
+                let inner = self
+                    .browser_wait_for_request_inner(Parameters(spec), request_context)
+                    .await?;
+                Ok(Json(BrowserWaitResponse {
+                    condition,
+                    request: Some(inner.0),
+                    ..Default::default()
+                }))
+            }
+            BrowserWaitConditionKind::Response => {
+                let spec = params.response.ok_or_else(|| missing("response"))?;
+                let inner = self
+                    .browser_wait_for_response_inner(Parameters(spec), request_context)
+                    .await?;
+                Ok(Json(BrowserWaitResponse {
+                    condition,
+                    response: Some(inner.0),
+                    ..Default::default()
+                }))
+            }
+        }
+    }
+
+    /// Text/timeout wait predicate — internal lane for the unified
+    /// `browser_wait_for` tool (#1348).
+    pub async fn browser_wait_for_text_inner(
         &self,
         params: Parameters<BrowserWaitForParams>,
         request_context: RequestContext<RoleServer>,
@@ -2742,10 +2839,8 @@ impl SynapseService {
         result.map(Json)
     }
 
-    #[tool(
-        description = "Wait for a page lifecycle state in the calling session's owned browser tab: domcontentloaded, load, or networkidle. Uses raw CDP Page lifecycle + Network buffers when available, or the normal Chrome bridge for chrome-tab:* targets using page readyState, webNavigation events, and in-page fetch/XHR/resource-timing quiet polling. Timed-out waits return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
-    )]
-    pub async fn browser_wait_for_load_state(
+    /// Page-lifecycle wait predicate — internal lane for `browser_wait_for` (#1348).
+    pub async fn browser_wait_for_load_state_inner(
         &self,
         params: Parameters<BrowserWaitForLoadStateParams>,
         request_context: RequestContext<RoleServer>,
@@ -2795,10 +2890,8 @@ impl SynapseService {
         result.map(Json)
     }
 
-    #[tool(
-        description = "Wait until the calling session's owned browser tab URL matches an exact string, glob, or regex. Uses raw CDP Page navigation events plus target-scoped page-state polling when available, or the normal Chrome bridge for chrome-tab:* targets using chrome.tabs URL/status polling plus webNavigation event readback. Timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
-    )]
-    pub async fn browser_wait_for_url(
+    /// URL-match wait predicate — internal lane for `browser_wait_for` (#1348).
+    pub async fn browser_wait_for_url_inner(
         &self,
         params: Parameters<BrowserWaitForUrlParams>,
         request_context: RequestContext<RoleServer>,
@@ -2852,10 +2945,8 @@ impl SynapseService {
         result.map(Json)
     }
 
-    #[tool(
-        description = "Wait until the calling session's owned browser tab observes a network request matching optional URL exact/glob/regex, method, and resource_type predicates. Uses the persistent target-scoped CDP Network buffer when available, or the normal Chrome bridge for chrome-tab:* targets using chrome.webRequest event buffering. Returns the matched request details; timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
-    )]
-    pub async fn browser_wait_for_request(
+    /// Network-request wait predicate — internal lane for `browser_wait_for` (#1348).
+    pub async fn browser_wait_for_request_inner(
         &self,
         params: Parameters<BrowserWaitForRequestParams>,
         request_context: RequestContext<RoleServer>,
@@ -2913,10 +3004,8 @@ impl SynapseService {
         result.map(Json)
     }
 
-    #[tool(
-        description = "Wait until the calling session's owned browser tab observes a network response matching optional URL exact/glob/regex, method, status, and resource_type predicates. Uses the persistent target-scoped CDP Network buffer when available, or the normal Chrome bridge for chrome-tab:* targets using chrome.webRequest event buffering. Returns the matched response details; timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
-    )]
-    pub async fn browser_wait_for_response(
+    /// Network-response wait predicate — internal lane for `browser_wait_for` (#1348).
+    pub async fn browser_wait_for_response_inner(
         &self,
         params: Parameters<BrowserWaitForNetworkResponseParams>,
         request_context: RequestContext<RoleServer>,
@@ -2976,10 +3065,8 @@ impl SynapseService {
         result.map(Json)
     }
 
-    #[tool(
-        description = "Wait for a Playwright-style selector in the calling session's owned browser tab to reach state attached | visible | hidden | detached. Uses the same selector engines/options as browser_locate (css/xpath/text/role/label/placeholder/alttext/title/testid/layout), with raw CDP frame scoping when available and debugger-free normal Chrome bridge all-frame or explicit frame_id/name/url/index polling for chrome-tab:* targets. Returns an element_id when the satisfied state has a concrete matched element, and returns BROWSER_WAIT_TIMEOUT on timeout. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
-    )]
-    pub async fn browser_wait_for_selector(
+    /// Selector-state wait predicate — internal lane for `browser_wait_for` (#1348).
+    pub async fn browser_wait_for_selector_inner(
         &self,
         params: Parameters<BrowserWaitForSelectorParams>,
         request_context: RequestContext<RoleServer>,
@@ -3106,10 +3193,8 @@ impl SynapseService {
         result.map(Json)
     }
 
-    #[tool(
-        description = "Poll a JavaScript predicate/expression in the calling session's owned browser tab until it resolves truthy, returning the final JSON-safe value. If expression evaluates to a function, it is called as fn(...args) each poll; otherwise the expression value is re-read each poll. Timed-out predicates return BROWSER_WAIT_TIMEOUT. Uses raw CDP Runtime.evaluate when available or the debugger-free normal Chrome bridge MAIN-world predicate polling helper for chrome-tab:* targets. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
-    )]
-    pub async fn browser_wait_for_function(
+    /// JavaScript-predicate wait — internal lane for `browser_wait_for` (#1348).
+    pub async fn browser_wait_for_function_inner(
         &self,
         params: Parameters<BrowserWaitForFunctionParams>,
         request_context: RequestContext<RoleServer>,

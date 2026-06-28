@@ -2498,6 +2498,84 @@ pub struct BrowserWaitForSelectorResponse {
     pub required_foreground: bool,
 }
 
+/// Which wait predicate the unified `browser_wait_for` tool evaluates (#1348).
+/// The matching nested spec under [`BrowserWaitParams`] must be supplied.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserWaitConditionKind {
+    /// Wait for page text to appear/disappear, or a plain timeout.
+    #[default]
+    Text,
+    /// Wait for a page lifecycle state (domcontentloaded/load/networkidle).
+    LoadState,
+    /// Wait until the tab URL matches an exact string, glob, or regex.
+    Url,
+    /// Wait for a Playwright-style selector to reach attached/visible/hidden/detached.
+    Selector,
+    /// Poll a JavaScript predicate until it resolves truthy.
+    Function,
+    /// Wait for a captured network request matching predicates.
+    Request,
+    /// Wait for a captured network response matching predicates.
+    Response,
+}
+
+/// Parameters for the unified `browser_wait_for` tool (#1348). One tool, one
+/// `condition` discriminator, and exactly one matching nested spec carrying that
+/// predicate's fields. Each spec is the former standalone `browser_wait_for_*`
+/// tool's parameter object, reused verbatim, so behaviour is identical to the
+/// seven tools this folds together — only the surface shrinks.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitParams {
+    /// Which wait predicate to evaluate. Supply the matching nested spec.
+    pub condition: BrowserWaitConditionKind,
+    /// `condition=text`: page-text appear/disappear or plain timeout.
+    #[serde(default)]
+    pub text: Option<BrowserWaitForParams>,
+    /// `condition=load_state`: page lifecycle state.
+    #[serde(default)]
+    pub load_state: Option<BrowserWaitForLoadStateParams>,
+    /// `condition=url`: tab URL match.
+    #[serde(default)]
+    pub url: Option<BrowserWaitForUrlParams>,
+    /// `condition=selector`: Playwright-style selector state.
+    #[serde(default)]
+    pub selector: Option<BrowserWaitForSelectorParams>,
+    /// `condition=function`: JavaScript predicate poll.
+    #[serde(default)]
+    pub function: Option<BrowserWaitForFunctionParams>,
+    /// `condition=request`: captured network request match.
+    #[serde(default)]
+    pub request: Option<BrowserWaitForRequestParams>,
+    /// `condition=response`: captured network response match.
+    #[serde(default)]
+    pub response: Option<BrowserWaitForNetworkResponseParams>,
+}
+
+/// Response for the unified `browser_wait_for` tool (#1348): the populated field
+/// matches `condition` and carries the former standalone tool's full response.
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserWaitResponse {
+    /// Which wait predicate was evaluated.
+    pub condition: BrowserWaitConditionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<BrowserWaitForResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_state: Option<BrowserWaitForLoadStateResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<BrowserWaitForUrlResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<BrowserWaitForSelectorResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub function: Option<BrowserWaitForFunctionResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<BrowserWaitForRequestResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<BrowserWaitForNetworkResponseResponse>,
+}
+
 /// Parameters for `browser_content` (#1158): return the full serialized HTML of
 /// the calling session's owned browser page target.
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
