@@ -592,6 +592,7 @@ fn is_matrix_scope_tool(name: &str) -> bool {
         || name.starts_with("reflex_")
         || name.starts_with("target_")
         || name.starts_with("tool_profile_")
+        || name.starts_with("verification_")
         || name.starts_with("workspace_")
         || matches!(
             name,
