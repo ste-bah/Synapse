@@ -71,6 +71,53 @@ pub struct VerificationInboxResponse {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct VerificationPollParams {
+    #[serde(default)]
+    pub cdp_target_id: Option<String>,
+    #[serde(default)]
+    pub window_hwnd: Option<i64>,
+    /// Logical source label for the audit trail (e.g. `gmail`).
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Only return a code whose value or surrounding context contains this
+    /// substring (case-insensitive) — e.g. the service name `stripe`. Omit to
+    /// return the first code found.
+    #[serde(default)]
+    pub service: Option<String>,
+    /// Total poll budget in ms (default 60000, max 300000).
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub max_codes: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationPollResponse {
+    pub ok: bool,
+    pub matched: bool,
+    pub timed_out: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<VerificationCode>,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service: Option<String>,
+    pub polls: u32,
+    pub elapsed_ms: u64,
+    pub audit_key: String,
+}
+
+/// Internal result of a single inbox read (not a tool type).
+struct VerificationReadOnce {
+    url: String,
+    title: String,
+    text_len: usize,
+    codes: Vec<VerificationCode>,
+    audit_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationAuditParams {
     /// Max rows to return, newest first (default 50).
     #[serde(default)]
@@ -122,44 +169,159 @@ impl SynapseService {
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?
             .unwrap_or_else(|| "stdio".to_owned());
 
+        let read = self
+            .verification_read_once(
+                params.cdp_target_id.clone(),
+                params.window_hwnd,
+                &source,
+                max_codes,
+                &session_id,
+                &request_context,
+            )
+            .await?;
+
+        Ok(Json(VerificationInboxResponse {
+            ok: true,
+            source,
+            url: read.url,
+            title: read.title,
+            text_len: read.text_len,
+            codes: read.codes,
+            audit_key: read.audit_key,
+        }))
+    }
+
+    #[tool(
+        description = "Poll the bound Chrome tab until a verification/OTP code arrives, then return it (Verification Inbox, #1345). Re-reads the tab (browser_content) on an exponential backoff (2s→15s) up to timeout_ms (default 60s, max 300s), running the same keyword-clause-gated extractor as verification_inbox; returns the first code whose code or context matches the optional `service` substring (case-insensitive), or the first code found when no service filter is given. Each poll iteration is journaled to the CF_KV audit (masked). Returns matched=false + timed_out=true if no matching code appears in the window. Use for autonomous sign-up/2FA flows: point the tab at the user's logged-in Gmail/Outlook/Messages and poll for the code. No paid SaaS."
+    )]
+    pub async fn verification_poll(
+        &self,
+        params: Parameters<VerificationPollParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<VerificationPollResponse>, ErrorData> {
+        let params = params.0;
+        let source = params.source.clone().unwrap_or_else(|| "unspecified".to_owned());
+        let service = params.service.clone();
+        let timeout_ms = params.timeout_ms.unwrap_or(60_000).min(300_000);
+        let max_codes = params.max_codes.unwrap_or(MAX_CODES).min(200);
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "verification_poll",
+            source = %source,
+            service = ?service,
+            timeout_ms,
+            "tool.invocation kind=verification_poll"
+        );
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?
+            .unwrap_or_else(|| "stdio".to_owned());
+
+        let started = std::time::Instant::now();
+        let mut polls = 0u32;
+        let mut backoff_ms = 0u64; // first read immediately
+        let mut last_audit_key = String::new();
+        loop {
+            if backoff_ms > 0 {
+                let remaining = timeout_ms.saturating_sub(
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                if remaining == 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms.min(remaining)))
+                    .await;
+            }
+            polls += 1;
+            let read = self
+                .verification_read_once(
+                    params.cdp_target_id.clone(),
+                    params.window_hwnd,
+                    &source,
+                    max_codes,
+                    &session_id,
+                    &request_context,
+                )
+                .await?;
+            last_audit_key = read.audit_key.clone();
+            if let Some(code) = verification_match(&read.codes, service.as_deref()) {
+                return Ok(Json(VerificationPollResponse {
+                    ok: true,
+                    matched: true,
+                    timed_out: false,
+                    code: Some(code),
+                    source,
+                    service,
+                    polls,
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(0),
+                    audit_key: last_audit_key,
+                }));
+            }
+            // exponential backoff 2s -> 4s -> 8s -> 15s (cap), per 2FA polling guidance
+            backoff_ms = if backoff_ms == 0 { 2_000 } else { (backoff_ms * 2).min(15_000) };
+            if u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                >= timeout_ms
+            {
+                break;
+            }
+        }
+        Ok(Json(VerificationPollResponse {
+            ok: true,
+            matched: false,
+            timed_out: true,
+            code: None,
+            source,
+            service,
+            polls,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(0),
+            audit_key: last_audit_key,
+        }))
+    }
+
+    /// Shared read: browser_content on the bound tab -> HTML-to-text -> OTP
+    /// extraction -> masked CF_KV audit row. Used by verification_inbox and
+    /// verification_poll so both share one extraction + audit path.
+    async fn verification_read_once(
+        &self,
+        cdp_target_id: Option<String>,
+        window_hwnd: Option<i64>,
+        source: &str,
+        max_codes: usize,
+        session_id: &str,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<VerificationReadOnce, ErrorData> {
         let content = self
             .browser_content(
                 Parameters(BrowserContentParams {
-                    cdp_target_id: params.cdp_target_id.clone(),
-                    window_hwnd: params.window_hwnd,
+                    cdp_target_id,
+                    window_hwnd,
                     max_bytes: Some(MAX_CONTENT_BYTES),
                 }),
                 request_context.clone(),
             )
-            .await?;
-        let content = content.0;
+            .await?
+            .0;
         let text = html_to_text(&content.html);
         let mut codes = extract_verification_codes(&text);
         codes.truncate(max_codes);
-
         let read_at_unix_ms = unix_time_ms_now();
         let masked_codes: Vec<String> = codes.iter().map(|c| mask_code(&c.code)).collect();
         let audit_row = VerificationAuditRow {
             schema_version: AUDIT_SCHEMA,
-            source: source.clone(),
+            source: source.to_owned(),
             url: content.url.clone(),
             title: content.title.clone(),
             masked_codes,
             code_count: codes.len(),
             read_at_unix_ms,
-            by_session: session_id.clone(),
+            by_session: session_id.to_owned(),
         };
         let audit_key = self.verification_write_audit(&audit_row, read_at_unix_ms)?;
-
-        Ok(Json(VerificationInboxResponse {
-            ok: true,
-            source,
+        Ok(VerificationReadOnce {
             url: content.url,
             title: content.title,
             text_len: text.len(),
             codes,
             audit_key,
-        }))
+        })
     }
 
     #[tool(
@@ -366,8 +528,20 @@ pub fn extract_verification_codes(text: &str) -> Vec<VerificationCode> {
         CODE_KEYWORDS.iter().any(|kw| fwd.contains(kw))
     };
     let context_of = |start: usize, end: usize| -> String {
-        let from = start.saturating_sub(25);
-        let to = (end + 25).min(n);
+        // Clause-bounded: expand to the code's own sentence (stop at terminators)
+        // so the context captures the preceding sender/service name (e.g.
+        // "Stripe: your verification code is 224488") for verification_poll's
+        // `service` match, WITHOUT bleeding into the next message's text.
+        let mut from = start;
+        let lo = start.saturating_sub(70);
+        while from > lo && !is_terminator(lower_chars[from - 1]) {
+            from -= 1;
+        }
+        let mut to = end;
+        let hi = (end + 40).min(n);
+        while to < hi && !is_terminator(lower_chars[to]) {
+            to += 1;
+        }
         chars[from..to].iter().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
     };
     let is_tok = |c: char| c.is_ascii_alphanumeric() || c == '-';
@@ -402,6 +576,25 @@ pub fn extract_verification_codes(text: &str) -> Vec<VerificationCode> {
         i = j.max(start + 1);
     }
     out
+}
+
+/// Pick the first extracted code matching the optional service filter (the
+/// service substring must appear in the code or its surrounding context,
+/// case-insensitive). With no filter, returns the first code.
+fn verification_match(codes: &[VerificationCode], service: Option<&str>) -> Option<VerificationCode> {
+    match service {
+        None => codes.first().cloned(),
+        Some(service) => {
+            let needle = service.to_ascii_lowercase();
+            codes
+                .iter()
+                .find(|c| {
+                    c.code.to_ascii_lowercase().contains(&needle)
+                        || c.context.to_ascii_lowercase().contains(&needle)
+                })
+                .cloned()
+        }
+    }
 }
 
 fn classify_code(token: &str) -> Option<&'static str> {
@@ -475,6 +668,22 @@ mod tests {
     fn alphanumeric_code_with_keyword() {
         let codes = extract_verification_codes("Enter passcode A1B2C3 to confirm your account");
         assert!(codes.iter().any(|c| c.code == "A1B2C3" && c.kind == "alphanumeric"));
+    }
+
+    #[test]
+    fn poll_match_filters_by_service_context() {
+        let codes = extract_verification_codes(
+            "Stripe: your verification code is 224488. Acme login code: A1B2C3.",
+        );
+        // service filter matches by surrounding context
+        let stripe = verification_match(&codes, Some("stripe")).expect("stripe code");
+        assert_eq!(stripe.code, "224488");
+        let acme = verification_match(&codes, Some("acme")).expect("acme code");
+        assert_eq!(acme.code, "A1B2C3");
+        // no filter -> first code
+        assert_eq!(verification_match(&codes, None).unwrap().code, "224488");
+        // unknown service -> none
+        assert!(verification_match(&codes, Some("paypal")).is_none());
     }
 
     #[test]
