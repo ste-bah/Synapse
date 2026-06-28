@@ -526,13 +526,22 @@ impl SynapseService {
         // Tracked in #1328. Explicit MCP agent_cost calls keep the fail-closed contract.
         let since_ns = super::agent_events::unix_time_ns_now()
             .saturating_sub(super::agent_stats::DASHBOARD_ANALYTICS_WINDOW_NS);
-        self.agent_cost_impl(AgentCostParams {
-            spawn_id: None,
-            since_ns: Some(since_ns),
-            until_ns: None,
-            include_per_turn: true,
-            group_by: vec![AgentCostGroupBy::Template, AgentCostGroupBy::Task],
-        })
+        // Enumerate spawns active in the window from the (time-stamped, much
+        // smaller) CF_AGENT_EVENTS journal, then roll up cost over ONLY those
+        // spawns' transcript prefixes — CF_AGENT_TRANSCRIPTS is spawn-keyed, so a
+        // bare since_ns cannot prune the full-table scan (#1328).
+        let db = self.agent_cost_db()?;
+        let recent_spawn_ids = collect_recent_spawn_ids(&db, since_ns)?;
+        self.agent_cost_impl_scoped(
+            AgentCostParams {
+                spawn_id: None,
+                since_ns: Some(since_ns),
+                until_ns: None,
+                include_per_turn: true,
+                group_by: vec![AgentCostGroupBy::Template, AgentCostGroupBy::Task],
+            },
+            Some(&recent_spawn_ids),
+        )
     }
 
     fn agent_cost_db(&self) -> Result<std::sync::Arc<Db>, ErrorData> {
@@ -659,6 +668,21 @@ impl SynapseService {
     }
 
     fn agent_cost_impl(&self, params: AgentCostParams) -> Result<AgentCostResponse, ErrorData> {
+        self.agent_cost_impl_scoped(params, None)
+    }
+
+    /// `agent_cost` rollup with an optional restriction to a fixed set of spawn
+    /// ids. When `restrict_spawn_ids` is `Some`, only those spawns' transcript
+    /// prefixes are scanned (bounded per spawn) instead of the full
+    /// CF_AGENT_TRANSCRIPTS — the dashboard cost panel uses this with the
+    /// window-active spawn set so it never exhausts the scan budget over the
+    /// entire retained journal (#1328). The public MCP tool passes `None` and
+    /// keeps its fail-closed full-scan contract.
+    fn agent_cost_impl_scoped(
+        &self,
+        params: AgentCostParams,
+        restrict_spawn_ids: Option<&[String]>,
+    ) -> Result<AgentCostResponse, ErrorData> {
         if let (Some(since), Some(until)) = (params.since_ns, params.until_ns)
             && since >= until
         {
@@ -683,6 +707,32 @@ impl SynapseService {
             for (key, value) in rows {
                 scanned_rows += 1;
                 ingest_row(&mut spawns, &key, &value, params.since_ns, params.until_ns)?;
+            }
+        } else if let Some(spawn_ids) = restrict_spawn_ids {
+            // #1328: scan only the window-active spawns' transcript prefixes,
+            // not the whole CF. Still budget-guarded so a runaway set fails loud.
+            for spawn_id in spawn_ids {
+                validate_spawn_id(spawn_id)?;
+                if usize::try_from(scanned_rows).unwrap_or(usize::MAX) >= MAX_SCAN_ROWS_PER_CALL {
+                    return Err(mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "AGENT_COST_SCAN_BUDGET_EXHAUSTED after {MAX_SCAN_ROWS_PER_CALL} \
+                             CF_AGENT_TRANSCRIPTS rows across the window-active spawn set; \
+                             narrow the dashboard window — a truncated rollup would under-report cost"
+                        ),
+                    ));
+                }
+                let rows = db
+                    .scan_cf_prefix(
+                        cf::CF_AGENT_TRANSCRIPTS,
+                        &agent_transcript_spawn_prefix(spawn_id),
+                    )
+                    .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+                for (key, value) in rows {
+                    scanned_rows += 1;
+                    ingest_row(&mut spawns, &key, &value, params.since_ns, params.until_ns)?;
+                }
             }
         } else {
             let mut start: Vec<u8> = Vec::new();
@@ -1722,6 +1772,57 @@ fn build_spawn_task_map(db: &Db) -> Result<SpawnTaskMap, ErrorData> {
         }
     }
     Ok(map)
+}
+
+/// Collects the spawn ids with at least one `CF_AGENT_EVENTS` row at or after
+/// `since_ns` — i.e. the spawns active within the dashboard window (#1328). The
+/// events journal is time-stamped and far smaller than the transcript store, so
+/// this scan is bounded by the event budget; the returned set lets the cost
+/// rollup scan only those spawns' transcript prefixes instead of the whole CF.
+fn collect_recent_spawn_ids(db: &Db, since_ns: u64) -> Result<Vec<String>, ErrorData> {
+    let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut scanned: u64 = 0;
+    let mut start: Vec<u8> = Vec::new();
+    loop {
+        if usize::try_from(scanned).unwrap_or(usize::MAX) >= MAX_EVENT_SCAN_ROWS_PER_CALL {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_EVENT_SCAN_BUDGET_EXHAUSTED after {MAX_EVENT_SCAN_ROWS_PER_CALL} \
+                     CF_AGENT_EVENTS rows collecting window-active spawns; narrow the window"
+                ),
+            ));
+        }
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_AGENT_EVENTS, &start, SCAN_CHUNK_ROWS)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        for (_key, value) in &rows {
+            scanned += 1;
+            let record: AgentEventRecord = serde_json::from_slice(value).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("AGENT_EVENT_ROW_CORRUPT: row failed to decode: {error}"),
+                )
+            })?;
+            if record.ts_ns < since_ns {
+                continue;
+            }
+            if let Some(spawn_id) = record.spawn_id.clone() {
+                ids.insert(spawn_id);
+            }
+        }
+        if !more {
+            break;
+        }
+        let Some((last, _value)) = rows.last() else {
+            break;
+        };
+        start = key_after(last);
+    }
+    Ok(ids.into_iter().collect())
 }
 
 /// Builds the durable spawn→template join (#909) by scanning the
