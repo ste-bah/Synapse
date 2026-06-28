@@ -71,7 +71,7 @@ pub(crate) use press::{
     delete_key_action, hwnd_keyboard_target_state, resolve_keymap_press, select_all_chord_action,
 };
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
-pub use scroll::{ActScrollParams, ActScrollResponse, act_scroll_with_handle};
+pub use scroll::{ActScrollParams, ActScrollPoint, ActScrollResponse, act_scroll_with_handle};
 #[cfg(windows)]
 pub(crate) use set_field_text::act_set_field_text_web;
 pub use set_field_text::{

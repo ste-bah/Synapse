@@ -24,8 +24,9 @@ use crate::m1::{
     CdpTargetInfoParams, ObserveParams, mcp_error,
 };
 use crate::m2::{
-    ActClickParams, ActFocusWindowParams, ActPressParams, ActSetFieldTextLocator,
-    ActSetFieldTextParams, ActTypeParams, default_auto_wait_timeout_ms, default_verify_timeout_ms,
+    ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollParams, ActScrollPoint,
+    ActSetFieldTextLocator, ActSetFieldTextParams, ActTypeParams, default_auto_wait_timeout_ms,
+    default_verify_timeout_ms,
 };
 use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
 use rmcp::schemars::JsonSchema;
@@ -52,7 +53,7 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
-const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
+const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -842,6 +843,7 @@ impl SynapseService {
                     target_act_delegate_response("act_focus_window", response)?
                 }
             }
+            "scroll" => target_act_scroll(self, &params, &request_context).await?,
             "set_window_bounds" => {
                 target_act_set_window_bounds(self, &params, &request_context)?
             }
@@ -4270,6 +4272,66 @@ fn trimmed_non_empty_string(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+/// #1353: `verb=scroll` routes to the real `act_scroll` wheel primitive (visible
+/// in break_glass), which the hidden-tool route guidance advertises. Wheel deltas
+/// come in `args` as `[dx, dy]` (e.g. `["0","120"]`); an optional screen-space
+/// `x`/`y` sets the wheel point, and omitting it scrolls the focused/claimed
+/// target window — the native egui/wgpu viewport case.
+async fn target_act_scroll(
+    service: &SynapseService,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let parse_delta = |raw: &str| -> Result<i32, ErrorData> {
+        raw.trim().parse::<i32>().map_err(|_| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("target_act verb=scroll args must be integer deltas [dx, dy]; got {raw:?}"),
+            )
+        })
+    };
+    let dx = params.args.first().map(|s| parse_delta(s)).transpose()?.unwrap_or(0);
+    let dy = params.args.get(1).map(|s| parse_delta(s)).transpose()?.unwrap_or(0);
+    if dx == 0 && dy == 0 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=scroll requires wheel deltas in args as [dx, dy] (e.g. args=[\"0\",\"120\"] to scroll down)",
+        ));
+    }
+    let at = match target_act_coordinate(params)? {
+        Some(coordinate) => match coordinate.space {
+            TargetActCoordinateSpace::Screen => Some(ActScrollPoint {
+                x: coordinate.x,
+                y: coordinate.y,
+            }),
+            other => {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "target_act verb=scroll supports coordinate_space=screen for the at-point (got {other:?}); omit x/y to scroll the focused target window"
+                    ),
+                ));
+            }
+        },
+        None => None,
+    };
+    let scroll_params = ActScrollParams {
+        dx,
+        dy,
+        at,
+        target: None,
+        smooth: false,
+        verify_delta: false,
+        verify_timeout_ms: default_verify_timeout_ms(),
+    };
+    target_act_delegate_response(
+        "act_scroll",
+        service
+            .act_scroll(Parameters(scroll_params), request_context.clone())
+            .await,
+    )
 }
 
 fn target_act_coordinate(
