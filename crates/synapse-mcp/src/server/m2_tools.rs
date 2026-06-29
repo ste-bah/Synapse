@@ -16,7 +16,7 @@ use crate::m1::{FindParams, FindResult, FindResultKind, FindScope, mcp_error};
 use crate::m2::postcondition::{
     ActPostcondition, hash_json as verify_hash_json,
     no_observed_delta_error as source_no_observed_delta_error, postcondition_failed_error,
-    postcondition_not_requested, postcondition_observed_delta,
+    postcondition_not_requested, postcondition_observed_delta, postcondition_target_window_closed,
 };
 use crate::m2::{
     ActClickPostcondition, ActClickTierAttempt, ActStrokePlan, CLICK_REASON_NO_OBSERVED_DELTA,
@@ -2804,10 +2804,33 @@ impl SynapseService {
                 Ok(response)
             }
             Err(error) => {
-                let mut tier_attempts = response.tier_attempts.clone();
                 let error_code = click_error_data_code(&error)
                     .unwrap_or(error_codes::ACTION_NO_OBSERVED_DELTA)
                     .to_owned();
+                // #1360: a DELIVERED click that closed its own target window
+                // (a dialog Open/OK/Cancel button) makes the post-delivery SoT
+                // readback fail with TARGET_WINDOW_NOT_FOUND. We are in the
+                // Ok(response) branch, so delivery already succeeded and the
+                // element + window were live at invoke time — the window
+                // vanishing is the click's INTENDED effect, not a delivery
+                // failure. Treat target-window-gone-after-delivery as success
+                // (verified via window disappearance) instead of a
+                // false-negative refusal. Any other verify failure still
+                // propagates.
+                if error_code == error_codes::TARGET_WINDOW_NOT_FOUND {
+                    tracing::info!(
+                        code = "M2_ACT_CLICK_TARGET_WINDOW_CLOSED_AFTER_DELIVERY",
+                        kind = "act_click",
+                        detail = %error.message,
+                        "act_click delivered; target window closed afterward (dialog dismissed) — verified via window disappearance"
+                    );
+                    response.postcondition = postcondition_target_window_closed(
+                        "act_click",
+                        error.message.to_string(),
+                    );
+                    return Ok(response);
+                }
+                let mut tier_attempts = response.tier_attempts.clone();
                 tier_attempts.push(click_tier_failed(
                     response.backend_tier_used.clone(),
                     CLICK_REASON_NO_OBSERVED_DELTA,
