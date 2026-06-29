@@ -3833,11 +3833,68 @@ async fn target_act_dom_locator_pointer(
         return target_act_browser_dom_action(service, fallback_action, params, request_context)
             .await;
     };
-    // Raw-CDP endpoint present → keep the existing path (raw real-mouse click is
-    // a tracked follow-up). Only the bridge-only target gets the cdpInput lane.
-    if synapse_a11y::endpoint_for_window(*window_hwnd).is_some() {
-        return target_act_browser_dom_action(service, fallback_action, params, request_context)
-            .await;
+    // Raw-CDP endpoint present → real trusted mouse click via
+    // synapse_a11y::cdp_click_node (Input.dispatchMouseEvent mouseMoved →
+    // mousePressed → mouseReleased), NOT the bridge synthetic path (which rejects
+    // a non-bridge raw-CDP target outright). #1348: closes the last
+    // synthetic/broken input lane — raw-CDP locator clicks are now real and
+    // trusted, mirroring the verb=tap raw-CDP path. Bridge-only targets fall
+    // through to the cdpInput lane below.
+    #[cfg(windows)]
+    if let Some(endpoint) = synapse_a11y::endpoint_for_window(*window_hwnd) {
+        let raw_details = json!({
+            "session_id": &session_id,
+            "verb": bridge_action,
+            "lane": "synapse_a11y.cdp_click_node",
+            "real_trusted_input": true,
+            "required_foreground": false,
+            "window_hwnd": *window_hwnd,
+            "cdp_target_id": cdp_target_id,
+        });
+        if let Err(error) =
+            service.ensure_target_claim_allows_session("target_act", &session_id, &target)
+        {
+            service.audit_action_denied_with_details_for_session(
+                "target_act",
+                &error,
+                &raw_details,
+                &session_id,
+            );
+            return Ok((
+                "synapse_a11y.cdp_click_node",
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("target_act", error),
+            ));
+        }
+        service.audit_action_started_with_details_for_session(
+            "target_act",
+            &raw_details,
+            &session_id,
+        )?;
+        let result = target_act_raw_cdp_click_dispatch(
+            &endpoint,
+            *window_hwnd,
+            cdp_target_id,
+            bridge_action,
+            params,
+        )
+        .await;
+        service.audit_action_result_for_session("target_act", &result, &session_id)?;
+        return match result {
+            Ok(result) => Ok((
+                "synapse_a11y.cdp_click_node",
+                true,
+                TARGET_ACT_STATUS_OK,
+                result,
+            )),
+            Err(error) => Ok((
+                "synapse_a11y.cdp_click_node",
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("synapse_a11y.cdp_click_node", error),
+            )),
+        };
     }
     let request_details = json!({
         "session_id": &session_id,
@@ -4064,6 +4121,81 @@ async fn target_act_hover_dispatch(
         "readback_backend": "raw_cdp",
         "method": "Input.dispatchMouseEvent(mouseMoved)",
         "scrolled_into_view_before_move": true
+    }))
+}
+
+/// CDP `Input.dispatchMouseEvent` modifier bitmask: Alt=1, Ctrl=2, Meta=4,
+/// Shift=8 (#1348 raw-CDP click).
+fn target_act_click_modifiers_cdp_mask(modifiers: &[TargetActClickModifier]) -> i64 {
+    let mut mask = 0;
+    for modifier in modifiers {
+        mask |= match modifier {
+            TargetActClickModifier::Alt => 1,
+            TargetActClickModifier::Ctrl => 2,
+            TargetActClickModifier::Meta => 4,
+            TargetActClickModifier::Shift => 8,
+        };
+    }
+    mask
+}
+
+/// Real, TRUSTED raw-CDP mouse click/dblclick on a DOM-locator/element_id target
+/// via `synapse_a11y::cdp_click_node` (Input.dispatchMouseEvent
+/// mouseMoved→mousePressed→mouseReleased), mirroring `target_act_touch_tap_dispatch`
+/// but with mouse instead of touch. isTrusted=true, so activation-guarded handlers
+/// fire — the raw-CDP analogue of the bridge cdpInput real-click lane (#1348).
+#[cfg(windows)]
+async fn target_act_raw_cdp_click_dispatch(
+    endpoint: &str,
+    window_hwnd: i64,
+    cdp_target_id: &str,
+    action: &'static str,
+    params: &TargetActParams,
+) -> Result<Value, ErrorData> {
+    let element =
+        target_act_tap_element(endpoint, window_hwnd, cdp_target_id, params, action).await?;
+    let click_count = i64::from(target_act_click_count_for_action(action, params.clicks)?);
+    let button = match params.button {
+        Some(TargetActMouseButton::Right) => synapse_a11y::CdpMouseButton::Right,
+        Some(TargetActMouseButton::Middle) => synapse_a11y::CdpMouseButton::Middle,
+        Some(TargetActMouseButton::Left) | None => synapse_a11y::CdpMouseButton::Left,
+    };
+    let modifiers = target_act_click_modifiers_cdp_mask(&params.modifiers);
+    let point = synapse_a11y::cdp_click_node(
+        endpoint,
+        "",
+        Some(&element.target_id),
+        element.backend_node_id,
+        button,
+        click_count,
+        modifiers,
+    )
+    .await
+    .map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "target_act {action} Input.dispatchMouseEvent failed for backendNodeId {} in target {:?}: {error}",
+                element.backend_node_id, element.target_id
+            ),
+        )
+    })?;
+    Ok(json!({
+        "ok": true,
+        "action": action,
+        "target_id": element.target_id,
+        "point": point,
+        "resolved_by": element.resolved_by,
+        "backend_node_id": element.backend_node_id,
+        "element_id": element.element_id,
+        "match_count": element.match_count,
+        "returned_count": element.returned_count,
+        "window_hwnd": window_hwnd,
+        "readback_backend": "raw_cdp",
+        "method": "Input.dispatchMouseEvent(mouseMoved,mousePressed,mouseReleased)",
+        "click_count": click_count,
+        "real_trusted_input": true,
+        "scrolled_into_view_before_click": true
     }))
 }
 
