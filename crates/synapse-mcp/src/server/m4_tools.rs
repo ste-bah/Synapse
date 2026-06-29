@@ -1024,6 +1024,8 @@ fn launch_agent_spawn_with_terminal_capture(
     Ok(ActLaunchResponse {
         pid: spawned.process_id,
         hwnd: None,
+        window_owner_pid: None,
+        reused_existing_window: false,
         matched_title: None,
         launched_at: chrono::Utc::now().to_rfc3339(),
         reason: Some("owned_conpty_terminal_capture".to_owned()),

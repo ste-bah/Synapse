@@ -1425,8 +1425,21 @@ fn validate_local_model_ref(model_ref: &str) -> Result<(), ErrorData> {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActLaunchResponse {
+    /// PID of the process act_launch freshly spawned.
     pub pid: u32,
     pub hwnd: Option<i64>,
+    /// PID that actually OWNS `hwnd`. Equals `pid` for a normal launch where the
+    /// spawned process showed its own window. Differs from `pid` when act_launch
+    /// matched a PRE-EXISTING same-app window via the existing-window fallback, or
+    /// the target re-exec'd into another process — so `(hwnd, window_owner_pid)`
+    /// always refer to the same process even when `pid` does not (#1358).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_owner_pid: Option<u32>,
+    /// True when `hwnd` is a window act_launch did NOT freshly spawn: its owner
+    /// (`window_owner_pid`) differs from the launched `pid`. The spawned `pid` may
+    /// be a separate, still-running (orphaned) process — bind by `hwnd` /
+    /// `window_owner_pid`, not `pid`, to drive the matched window (#1358).
+    pub reused_existing_window: bool,
     pub matched_title: Option<String>,
     pub launched_at: String,
     pub reason: Option<String>,
@@ -3216,9 +3229,25 @@ pub(crate) async fn launch_for_session(
         cdp_verified_url = ?cdp_target.as_ref().map(|target| target.url.as_str()),
         "readback=act_launch after=process_spawn"
     );
+    // #1358: keep (hwnd, window_owner_pid) consistent and flag when act_launch
+    // matched a window it did not freshly spawn (existing-window fallback / a
+    // re-exec'd pid). `pid` stays the spawned process for back-compat.
+    let window_owner_pid = window.matched_pid;
+    let reused_existing_window = window.matched_pid.is_some_and(|owner| owner != pid);
+    if reused_existing_window {
+        tracing::warn!(
+            code = "M4_ACT_LAUNCH_REUSED_EXISTING_WINDOW",
+            launched_pid = pid,
+            window_owner_pid = ?window_owner_pid,
+            hwnd = ?window.hwnd,
+            "act_launch matched a pre-existing/foreign window not owned by the spawned pid (#1358)"
+        );
+    }
     Ok(ActLaunchOutcome {
         response: ActLaunchResponse {
             pid,
+            window_owner_pid,
+            reused_existing_window,
             hwnd: window.hwnd,
             matched_title: window.matched_title,
             launched_at,
@@ -6134,6 +6163,9 @@ const fn apply_new_console_creation_flags(_command: &mut StdCommand) {}
 #[derive(Debug)]
 struct WindowWaitResult {
     hwnd: Option<i64>,
+    /// PID owning the matched window (#1358) — may differ from the launched pid
+    /// when the existing-window fallback matches a pre-existing instance.
+    matched_pid: Option<u32>,
     matched_title: Option<String>,
     reason: Option<String>,
 }
@@ -6142,6 +6174,7 @@ impl WindowWaitResult {
     const fn not_requested() -> Self {
         Self {
             hwnd: None,
+            matched_pid: None,
             matched_title: None,
             reason: None,
         }
@@ -6150,6 +6183,7 @@ impl WindowWaitResult {
     fn matched(context: ForegroundContext) -> Self {
         Self {
             hwnd: Some(context.hwnd),
+            matched_pid: Some(context.pid),
             matched_title: Some(context.window_title),
             reason: None,
         }
@@ -15854,6 +15888,8 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         let response = ActLaunchResponse {
             pid: 1234,
             hwnd: Some(5678),
+            window_owner_pid: Some(1234),
+            reused_existing_window: false,
             matched_title: Some("launch.txt - Notepad".to_owned()),
             launched_at: "2026-05-31T20:00:00Z".to_owned(),
             reason: None,
@@ -15894,6 +15930,8 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         let response = ActLaunchResponse {
             pid: 2222,
             hwnd: Some(3333),
+            window_owner_pid: Some(2222),
+            reused_existing_window: false,
             matched_title: Some("Synthetic CDP Page - Google Chrome".to_owned()),
             launched_at: "2026-06-03T23:00:00Z".to_owned(),
             reason: None,
