@@ -30,7 +30,6 @@ const WEBSOCKETS_TOOL: &str = "browser_network_websockets";
 const HAR_TOOL: &str = "browser_network_har";
 const OVERRIDES_TOOL: &str = "browser_network_overrides";
 const ROUTE_TOOL: &str = "browser_route";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const DEFAULT_NETWORK_REQUEST_LIMIT: usize = 100;
 const MAX_NETWORK_REQUEST_LIMIT: usize = 1000;
 const MAX_NETWORK_FILTER_CHARS: usize = 8192;
