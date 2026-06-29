@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?style=for-the-badge&logo=windows" alt="Windows">
   <img src="https://img.shields.io/badge/built%20with-Rust-CE412B?style=for-the-badge&logo=rust" alt="Rust">
   <img src="https://img.shields.io/badge/protocol-MCP-7C3AED?style=for-the-badge" alt="MCP">
-  <img src="https://img.shields.io/badge/MCP%20tools-81-0ea5e9?style=for-the-badge" alt="81 MCP tools">
+  <img src="https://img.shields.io/badge/MCP%20tools-152-0ea5e9?style=for-the-badge" alt="152 MCP tools">
 </p>
 
 <p align="center">
@@ -51,7 +51,7 @@ local process control.
 
 ## What you can do with it
 
-Synapse exposes **81 live MCP tools**. Here's what that unlocks.
+Synapse exposes **152 live MCP tools**. Here's what that unlocks.
 
 ### 👁️ It can see — structured perception
 
