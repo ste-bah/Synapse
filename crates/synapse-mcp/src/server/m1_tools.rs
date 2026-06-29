@@ -1398,6 +1398,16 @@ impl SynapseService {
         }
         ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
         let bridge_payload = browser_screenshot_bridge_payload(params, validation.format)?;
+        // #1359: serialize the brief foreground-capture critical section so
+        // concurrent browser_screenshot captures (multi-agent / batched) cannot
+        // interleave their Chrome-window activation and corrupt each other's
+        // foreground-restore tracking — which surfaced as a spurious
+        // "physical foreground drifted ... during capture" failure. This never
+        // fights the human: each capture still restores the human's foreground,
+        // and a genuine human-contention drift still fails loud (we never
+        // re-steal focus from an actively-used human window). The lock only
+        // makes concurrent agent captures queue.
+        let _foreground_serialization = BROWSER_SCREENSHOT_FOREGROUND_LOCK.lock().await;
         let foreground_guard = prepare_browser_screenshot_foreground(window_hwnd)?;
         let captured_result = crate::chrome_debugger_bridge::page_screenshot(
             window_hwnd,
@@ -12224,6 +12234,14 @@ struct BrowserScreenshotForegroundReadback {
     after_restore_hwnd: Option<i64>,
     restored_human_os_foreground: bool,
 }
+
+/// #1359: process-wide serialization of browser_screenshot's foreground-capture
+/// critical section. Concurrent captures otherwise interleave their Chrome-window
+/// activation/restore and one observes the other's foreground change as a
+/// spurious drift, failing the capture. Held across prepare → capture → finish
+/// (and the passive-window fallback), released on drop even on error.
+static BROWSER_SCREENSHOT_FOREGROUND_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
 
 #[cfg(windows)]
 #[derive(Clone, Debug)]
