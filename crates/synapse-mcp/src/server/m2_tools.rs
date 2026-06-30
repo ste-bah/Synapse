@@ -2824,10 +2824,8 @@ impl SynapseService {
                         detail = %error.message,
                         "act_click delivered; target window closed afterward (dialog dismissed) — verified via window disappearance"
                     );
-                    response.postcondition = postcondition_target_window_closed(
-                        "act_click",
-                        error.message.to_string(),
-                    );
+                    response.postcondition =
+                        postcondition_target_window_closed("act_click", error.message.to_string());
                     return Ok(response);
                 }
                 let mut tier_attempts = response.tier_attempts.clone();

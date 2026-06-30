@@ -1241,7 +1241,9 @@ fn foreground_route_readiness(
     );
     let mut remaining_steps = Vec::new();
     if !holds_foreground_lease {
-        remaining_steps.push("control_lease_acquire (this session must own the foreground input lease)".to_owned());
+        remaining_steps.push(
+            "control_lease_acquire (this session must own the foreground input lease)".to_owned(),
+        );
     }
     if !profile_allows_foreground {
         remaining_steps.push(

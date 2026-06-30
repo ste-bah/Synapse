@@ -119,7 +119,9 @@ impl SynapseService {
             ));
         }
 
-        let frames_requested = usize::try_from(duration_ms / interval_ms).unwrap_or(1).max(1);
+        let frames_requested = usize::try_from(duration_ms / interval_ms)
+            .unwrap_or(1)
+            .max(1);
         let started = Instant::now();
         let mut native_dims: Option<(u32, u32)> = None;
         let mut target_dims: Option<(u32, u32)> = None;
@@ -135,15 +137,23 @@ impl SynapseService {
                     let bitmap = captured.bitmap;
                     if native_dims.is_none() {
                         native_dims = Some((bitmap.width, bitmap.height));
-                        target_dims =
-                            Some(capture_gif_target_dims(bitmap.width, bitmap.height, max_long_edge));
+                        target_dims = Some(capture_gif_target_dims(
+                            bitmap.width,
+                            bitmap.height,
+                            max_long_edge,
+                        ));
                     }
                     let rgba = bgra_to_rgba(&bitmap.bytes, bitmap.width, bitmap.height)?;
                     let (tw, th) = target_dims.unwrap_or((bitmap.width, bitmap.height));
                     let frame = if (tw, th) == (bitmap.width, bitmap.height) {
                         rgba
                     } else {
-                        image::imageops::resize(&rgba, tw, th, image::imageops::FilterType::Triangle)
+                        image::imageops::resize(
+                            &rgba,
+                            tw,
+                            th,
+                            image::imageops::FilterType::Triangle,
+                        )
                     };
                     frames.push(frame);
                 }
@@ -206,7 +216,9 @@ impl SynapseService {
             }
         }
 
-        let bytes_written = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+        let bytes_written = std::fs::metadata(&output_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(duration_ms);
         tracing::info!(
             code = "CAPTURE_GIF_RECORDED",

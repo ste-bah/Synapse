@@ -218,7 +218,10 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<VerificationInboxResponse>, ErrorData> {
         let params = params.0;
-        let source = params.source.clone().unwrap_or_else(|| "unspecified".to_owned());
+        let source = params
+            .source
+            .clone()
+            .unwrap_or_else(|| "unspecified".to_owned());
         let max_codes = params.max_codes.unwrap_or(MAX_CODES).min(200);
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
@@ -261,7 +264,10 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<VerificationPollResponse>, ErrorData> {
         let params = params.0;
-        let source = params.source.clone().unwrap_or_else(|| "unspecified".to_owned());
+        let source = params
+            .source
+            .clone()
+            .unwrap_or_else(|| "unspecified".to_owned());
         let service = params.service.clone();
         let timeout_ms = params.timeout_ms.unwrap_or(60_000).min(300_000);
         let max_codes = params.max_codes.unwrap_or(MAX_CODES).min(200);
@@ -317,10 +323,12 @@ impl SynapseService {
                 }));
             }
             // exponential backoff 2s -> 4s -> 8s -> 15s (cap), per 2FA polling guidance
-            backoff_ms = if backoff_ms == 0 { 2_000 } else { (backoff_ms * 2).min(15_000) };
-            if u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
-                >= timeout_ms
-            {
+            backoff_ms = if backoff_ms == 0 {
+                2_000
+            } else {
+                (backoff_ms * 2).min(15_000)
+            };
+            if u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX) >= timeout_ms {
                 break;
             }
         }
@@ -485,10 +493,16 @@ impl SynapseService {
         })?;
         db.put_batch(cf::CF_KV, [(key.clone().into_bytes(), encoded)])
             .map_err(|error| {
-                mcp_error(error.code(), format!("verification binding persist failed: {error}"))
+                mcp_error(
+                    error.code(),
+                    format!("verification binding persist failed: {error}"),
+                )
             })?;
         db.flush().map_err(|error| {
-            mcp_error(error.code(), format!("verification binding flush failed: {error}"))
+            mcp_error(
+                error.code(),
+                format!("verification binding flush failed: {error}"),
+            )
         })?;
         Ok(Json(VerificationBindResponse {
             ok: true,
@@ -515,7 +529,10 @@ impl SynapseService {
         let rows = db
             .scan_cf_prefix(cf::CF_KV, BINDING_PREFIX.as_bytes())
             .map_err(|error| {
-                mcp_error(error.code(), format!("verification_sources scan failed: {error}"))
+                mcp_error(
+                    error.code(),
+                    format!("verification_sources scan failed: {error}"),
+                )
             })?;
         let mut sources = Vec::new();
         for (_key, raw) in rows {
@@ -619,9 +636,24 @@ fn mask_code(code: &str) -> String {
 /// text rather than markup. Deliberately simple (no full HTML parse): the goal is
 /// to surface code-bearing text, not to reconstruct the DOM.
 const CODE_KEYWORDS: &[&str] = &[
-    "code", "verification", "verify", "otp", "one-time", "one time", "passcode", "pass code",
-    "confirm", "2fa", "two-factor", "two factor", "security code", "login code",
-    "authentication", "auth code", "access code", "pin",
+    "code",
+    "verification",
+    "verify",
+    "otp",
+    "one-time",
+    "one time",
+    "passcode",
+    "pass code",
+    "confirm",
+    "2fa",
+    "two-factor",
+    "two factor",
+    "security code",
+    "login code",
+    "authentication",
+    "auth code",
+    "access code",
+    "pin",
 ];
 
 /// Keyword-gated OTP/verification-code extraction from page text. Google `G-####`
@@ -687,7 +719,12 @@ pub fn extract_verification_codes(text: &str) -> Vec<VerificationCode> {
         while to < hi && !is_terminator(lower_chars[to]) {
             to += 1;
         }
-        chars[from..to].iter().collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ")
+        chars[from..to]
+            .iter()
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
     };
     let is_tok = |c: char| c.is_ascii_alphanumeric() || c == '-';
 
@@ -726,7 +763,10 @@ pub fn extract_verification_codes(text: &str) -> Vec<VerificationCode> {
 /// Pick the first extracted code matching the optional service filter (the
 /// service substring must appear in the code or its surrounding context,
 /// case-insensitive). With no filter, returns the first code.
-fn verification_match(codes: &[VerificationCode], service: Option<&str>) -> Option<VerificationCode> {
+fn verification_match(
+    codes: &[VerificationCode],
+    service: Option<&str>,
+) -> Option<VerificationCode> {
     match service {
         None => codes.first().cloned(),
         Some(service) => {
@@ -744,7 +784,10 @@ fn verification_match(codes: &[VerificationCode], service: Option<&str>) -> Opti
 
 fn classify_code(token: &str) -> Option<&'static str> {
     // Google G-#### style.
-    if let Some(rest) = token.strip_prefix("G-").or_else(|| token.strip_prefix("g-")) {
+    if let Some(rest) = token
+        .strip_prefix("G-")
+        .or_else(|| token.strip_prefix("g-"))
+    {
         if (4..=8).contains(&rest.len()) && rest.chars().all(|c| c.is_ascii_digit()) {
             return Some("google_g");
         }
@@ -781,14 +824,22 @@ mod tests {
 
     #[test]
     fn extracts_google_g_code_unconditionally() {
-        let codes = extract_verification_codes("Your Google verification code is G-739212 for sign-in");
-        assert!(codes.iter().any(|c| c.code == "G-739212" && c.kind == "google_g"));
+        let codes =
+            extract_verification_codes("Your Google verification code is G-739212 for sign-in");
+        assert!(
+            codes
+                .iter()
+                .any(|c| c.code == "G-739212" && c.kind == "google_g")
+        );
     }
 
     #[test]
     fn numeric_code_only_with_keyword() {
         let with = extract_verification_codes("Your verification code is 481923. Do not share it.");
-        assert!(with.iter().any(|c| c.code == "481923" && c.kind == "numeric"));
+        assert!(
+            with.iter()
+                .any(|c| c.code == "481923" && c.kind == "numeric")
+        );
         // Bare numbers with no code keyword nearby are NOT treated as codes.
         let without = extract_verification_codes("Order 481923 shipped on 2026 at 14:32 to 90210");
         assert!(without.iter().all(|c| c.code != "481923"));
@@ -812,7 +863,11 @@ mod tests {
     #[test]
     fn alphanumeric_code_with_keyword() {
         let codes = extract_verification_codes("Enter passcode A1B2C3 to confirm your account");
-        assert!(codes.iter().any(|c| c.code == "A1B2C3" && c.kind == "alphanumeric"));
+        assert!(
+            codes
+                .iter()
+                .any(|c| c.code == "A1B2C3" && c.kind == "alphanumeric")
+        );
     }
 
     #[test]

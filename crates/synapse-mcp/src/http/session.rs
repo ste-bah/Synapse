@@ -536,8 +536,7 @@ mod tests {
 
     #[tokio::test]
     async fn session_invalid_response_carries_actionable_json_diagnostic() {
-        let response =
-            session_invalid_for(SessionFailure::Terminated, Some("sess-abc-123"));
+        let response = session_invalid_for(SessionFailure::Terminated, Some("sess-abc-123"));
         // Status stays 404 so rmcp transports keep treating it as session-expired.
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         // Recovery header lets header-only clients branch without parsing JSON.

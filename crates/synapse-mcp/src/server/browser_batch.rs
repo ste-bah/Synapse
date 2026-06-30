@@ -108,8 +108,7 @@ impl SynapseService {
     ) -> Result<Json<BrowserBatchResponse>, ErrorData> {
         let params = params.0;
         let stop_on_error = params.stop_on_error.unwrap_or(true);
-        let session_id =
-            super::context::mcp_session_id_from_request_context(&request_context)?;
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "browser_batch",
@@ -336,11 +335,7 @@ fn browser_batch_parse<T: for<'de> Deserialize<'de>>(
     action: &str,
     params: Value,
 ) -> Result<T, ErrorData> {
-    let params = if params.is_null() {
-        json!({})
-    } else {
-        params
-    };
+    let params = if params.is_null() { json!({}) } else { params };
     serde_json::from_value(params).map_err(|error| {
         mcp_error(
             synapse_core::error_codes::TOOL_PARAMS_INVALID,

@@ -218,9 +218,9 @@ pub(crate) use context::{
 };
 mod background_router;
 mod browser_assert;
+mod browser_batch;
 mod browser_clock_events;
 mod browser_dialog;
-mod browser_batch;
 mod browser_dnd;
 mod browser_emulate;
 mod browser_field;
@@ -229,7 +229,6 @@ mod browser_frames;
 mod browser_network;
 mod browser_storage;
 mod capture_gif;
-mod verification;
 mod data_cleaning;
 pub(crate) mod drain;
 pub(crate) mod escalation;
@@ -282,6 +281,7 @@ mod tests;
 pub(crate) mod timeline_digest;
 mod timeline_query;
 mod tool_profiles;
+mod verification;
 mod workspace_blackboard;
 
 use session_registry::{SessionRegistry, SharedSessionRegistry};

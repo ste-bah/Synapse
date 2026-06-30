@@ -277,8 +277,8 @@ impl SynapseService {
         // current fleet state, not a multi-week cumulative count over the entire
         // retained journal. The since_ns is echoed in the response so the UI can
         // state the window. Explicit MCP agent_stats calls remain unbounded.
-        let since_ns = super::agent_events::unix_time_ns_now()
-            .saturating_sub(DASHBOARD_ANALYTICS_WINDOW_NS);
+        let since_ns =
+            super::agent_events::unix_time_ns_now().saturating_sub(DASHBOARD_ANALYTICS_WINDOW_NS);
         self.agent_stats_impl(AgentStatsParams {
             since_ns: Some(since_ns),
             until_ns: None,

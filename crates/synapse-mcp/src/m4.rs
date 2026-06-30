@@ -6220,8 +6220,7 @@ async fn wait_for_launch_window(
         match synapse_a11y::visible_top_level_window_contexts() {
             Ok(contexts) => {
                 last_windows = window_context_summaries(&contexts);
-                last_title_mismatch =
-                    title_matching_other_pid_windows(&contexts, title_regex, pid);
+                last_title_mismatch = title_matching_other_pid_windows(&contexts, title_regex, pid);
                 if let Some(context) = select_launch_window(
                     &contexts,
                     pid,
@@ -6304,8 +6303,7 @@ async fn wait_for_launch_desktop_window(
         match desktop_window_contexts_from_handle_value(desktop_handle) {
             Ok(contexts) => {
                 last_windows = window_context_summaries(&contexts);
-                last_title_mismatch =
-                    title_matching_other_pid_windows(&contexts, title_regex, pid);
+                last_title_mismatch = title_matching_other_pid_windows(&contexts, title_regex, pid);
                 if let Some(context) = select_launch_desktop_window(
                     &contexts,
                     pid,

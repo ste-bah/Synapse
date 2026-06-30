@@ -57,7 +57,10 @@ pub fn postcondition_observed_delta(
 /// because the window is gone — but the click succeeded: the window
 /// disappearing IS the observed delta and the click's intended effect. Verified
 /// via target-window liveness, not reported as a false-negative refusal.
-pub fn postcondition_target_window_closed(tool: &str, detail: impl Into<String>) -> ActPostcondition {
+pub fn postcondition_target_window_closed(
+    tool: &str,
+    detail: impl Into<String>,
+) -> ActPostcondition {
     ActPostcondition {
         status: "observed_delta".to_owned(),
         observed_delta: Some(true),
