@@ -203,6 +203,7 @@ pub(crate) mod agent_control;
 pub(crate) mod agent_cost;
 pub(crate) mod agent_event_ingress;
 pub(crate) mod agent_events;
+mod agent_facades;
 mod agent_mailbox;
 pub(crate) mod agent_query;
 pub(crate) mod agent_state;
@@ -622,6 +623,7 @@ impl SynapseService {
             + Self::agent_control_tool_router()
             + Self::agent_template_tool_router()
             + Self::agent_task_tool_router()
+            + Self::agent_facade_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()
