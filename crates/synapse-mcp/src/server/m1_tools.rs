@@ -14749,7 +14749,7 @@ fn write_screenshot_bitmap_with_quality(
     format: CaptureScreenshotFormat,
     captured: synapse_capture::CapturedBgraBitmap,
     capture_backend: &str,
-    bitmap_sha256: String,
+    _bitmap_sha256: String,
     foreground: Option<ForegroundContext>,
     jpeg_quality: Option<u8>,
 ) -> Result<CaptureScreenshotResponse, ErrorData> {
@@ -14796,6 +14796,27 @@ fn write_screenshot_bitmap_with_quality(
             ),
         ));
     }
+    let file_bytes = std::fs::read(&output_path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "capture_screenshot file hash readback failed for {}: {error}",
+                output_path.display()
+            ),
+        )
+    })?;
+    if u64::try_from(file_bytes.len()).unwrap_or(u64::MAX) != metadata.len() {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "capture_screenshot file readback length mismatch for {}: metadata={} read={}",
+                output_path.display(),
+                metadata.len(),
+                file_bytes.len()
+            ),
+        ));
+    }
+    let bitmap_sha256 = sha256_hex(&file_bytes);
     Ok(CaptureScreenshotResponse {
         path: output_path.to_string_lossy().into_owned(),
         format,

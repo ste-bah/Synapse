@@ -615,16 +615,27 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "browser_capture",
         "BrowserCaptureOperation",
-        "browser screenshot/content/readback artifacts",
-        &[op(
-            "screenshot",
-            false,
-            true,
-            "target-scoped screenshot bytes + page metadata",
-            None,
-            error_codes::ACTION_TARGET_INVALID,
-            "bind the tab and retry capture after the bridge reports healthy",
-        )],
+        "browser screenshot/download artifacts and readbacks",
+        &[
+            op(
+                "screenshot",
+                false,
+                true,
+                "target-scoped screenshot bytes + page metadata",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "bind the tab and retry capture after the bridge reports healthy",
+            ),
+            op(
+                "downloads",
+                true,
+                false,
+                "Chrome downloads rows/events or saved file bytes",
+                Some("saved file path/bytes/hash or Chrome downloads event cursor"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "pass downloads={...} with a bounded wait/filter and verify file/event readback",
+            ),
+        ],
     ),
     facade_contract(
         "browser_storage",
@@ -655,15 +666,152 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
         "browser_debugger",
         "BrowserDebuggerOperation",
         "explicit browser_debugger profile + raw CDP/chrome.debugger readback",
-        &[op(
-            "call",
-            true,
-            true,
-            "browser_debugger profile row + raw CDP/chrome.debugger response",
-            Some("browser_debugger response/readback for the same target"),
-            error_codes::TOOL_PROFILE_POLICY_DENIED,
-            "switch to browser_debugger with reason/confirmation before raw debugger calls",
-        )],
+        &[
+            op(
+                "evaluate",
+                true,
+                true,
+                "browser_debugger profile row + Runtime.evaluate response",
+                Some("Runtime.evaluate target/url/ready_state/value readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger with reason/confirmation before evaluation",
+            ),
+            op(
+                "console_messages",
+                false,
+                true,
+                "browser_debugger profile row + console buffer cursor",
+                None,
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and read the target console buffer",
+            ),
+            op(
+                "pdf",
+                true,
+                true,
+                "browser_debugger profile row + PDF file path",
+                Some("PDF file bytes/hash readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify the PDF file bytes/hash",
+            ),
+            op(
+                "file_upload",
+                true,
+                true,
+                "browser_debugger profile row + file input/chooser readback",
+                Some("file input/chooser state readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify input or chooser state",
+            ),
+            op(
+                "dialog",
+                true,
+                true,
+                "browser_debugger profile row + dialog buffer readback",
+                Some("dialog pending/history readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify dialog pending/history state",
+            ),
+            op(
+                "add_init_script",
+                true,
+                true,
+                "browser_debugger profile row + init-script identifier",
+                Some("init-script identifier/readback for the target"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify returned script identifier",
+            ),
+            op(
+                "add_script_tag",
+                true,
+                true,
+                "browser_debugger profile row + script tag injection readback",
+                Some("script tag target/source readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify script tag target/source",
+            ),
+            op(
+                "add_style_tag",
+                true,
+                true,
+                "browser_debugger profile row + style tag injection readback",
+                Some("style tag target/source readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify style tag target/source",
+            ),
+            op(
+                "network",
+                false,
+                true,
+                "browser_debugger profile row + captured network rows",
+                None,
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and read the captured network rows",
+            ),
+            op(
+                "network_har",
+                true,
+                true,
+                "browser_debugger profile row + HAR file/routes",
+                Some("HAR file bytes or replay route readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify HAR bytes/routes",
+            ),
+            op(
+                "network_overrides",
+                true,
+                true,
+                "browser_debugger profile row + network override state",
+                Some("target-scoped header/User-Agent override readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify override state",
+            ),
+            op(
+                "route",
+                true,
+                true,
+                "browser_debugger profile row + route state",
+                Some("target-scoped route table readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify route table state",
+            ),
+            op(
+                "emulate",
+                true,
+                true,
+                "browser_debugger profile row + emulation domain state",
+                Some("target-scoped emulation result readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify emulation domain result",
+            ),
+            op(
+                "expose_binding",
+                true,
+                true,
+                "browser_debugger profile row + binding buffer/state",
+                Some("binding active/cursor readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify binding state",
+            ),
+            op(
+                "drag",
+                true,
+                true,
+                "browser_debugger profile row + drag target readback",
+                Some("drag status/readback for the same target"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify drag target status",
+            ),
+            op(
+                "drop",
+                true,
+                true,
+                "browser_debugger profile row + drop target readback",
+                Some("drop status/readback for the same target"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify drop target status",
+            ),
+        ],
     ),
     facade_contract(
         "workspace",
@@ -1044,7 +1192,47 @@ const fn op(
     }
 }
 
-const NORMAL_ALLOWED_EXACT: &[&str] = PUBLIC_TOOL_NAMES;
+const NORMAL_ALLOWED_EXACT: &[&str] = &[
+    "health",
+    "profile",
+    "session",
+    "subscribe",
+    "observe",
+    "find",
+    "read_text",
+    "screenshot",
+    "target",
+    "act",
+    "shell",
+    "process",
+    "browser_tabs",
+    "browser_nav",
+    "browser_dom",
+    "browser_form",
+    "browser_wait",
+    "browser_capture",
+    "browser_storage",
+    "workspace",
+    "agent",
+    "task",
+    "approval",
+    "escalation",
+    "timeline",
+    "episode",
+    "routine",
+    "assist",
+    "reality",
+    "verification",
+    "storage",
+    "model",
+    "cost",
+    "hygiene",
+    "audit",
+    "replay",
+    "privacy",
+    "setup",
+    "telemetry",
+];
 const NORMAL_ALLOWED_PREFIXES: &[&str] = &[];
 
 const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
@@ -1053,6 +1241,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "browser_aria_snapshot",
     "browser_assert",
     "browser_batch",
+    "browser_capture",
     "browser_clock",
     "browser_cookies",
     "browser_content",
@@ -1148,6 +1337,7 @@ const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = &[
     "browser_aria_snapshot",
     "browser_assert",
     "browser_batch",
+    "browser_capture",
     "browser_clock",
     "browser_console_messages",
     "browser_cookies",
@@ -1156,6 +1346,7 @@ const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = &[
     "browser_dom",
     "browser_drag",
     "browser_drop",
+    "browser_debugger",
     "browser_emulate",
     "browser_evaluate",
     "browser_expose_binding",
@@ -3013,6 +3204,7 @@ mod tests {
                 "browser_aria_snapshot",
                 "browser_assert",
                 "browser_batch",
+                "browser_capture",
                 "browser_clock",
                 "browser_content",
                 "browser_dom",
@@ -3033,6 +3225,7 @@ mod tests {
                 "browser_tabs",
                 "browser_wait",
                 "browser_wait_for",
+                "browser_debugger",
                 "control_lease_acquire",
                 "control_lease_release",
                 "tool_profile_set",
@@ -3134,6 +3327,18 @@ mod tests {
                 .registered_tools_present
                 .contains(&"browser_nav".to_owned()),
             "#1381 registers the browser_nav facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"browser_capture".to_owned()),
+            "#1383 registers the browser_capture facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"browser_debugger".to_owned()),
+            "#1383 registers the browser_debugger facade"
         );
         assert!(snapshot.duplicate_public_tool_names.is_empty());
         assert!(snapshot.forbidden_public_tool_names.is_empty());
@@ -3345,6 +3550,7 @@ mod tests {
                 "browser_dom",
                 "browser_form",
                 "browser_wait",
+                "browser_capture",
                 "browser_storage",
             ]
             .into_iter()
@@ -3375,6 +3581,7 @@ mod tests {
         assert!(!visible.contains(&"act_click".to_owned()));
         assert!(!visible.contains(&"act_type".to_owned()));
         assert!(!visible.contains(&"release_all".to_owned()));
+        assert!(!visible.contains(&"browser_debugger".to_owned()));
         assert_debugger_only_hidden(&visible);
 
         let policy = foreground_capability_policy(ToolProfileKind::NormalAgent);
@@ -3462,6 +3669,8 @@ mod tests {
     #[test]
     fn browser_debugger_profile_exposes_browser_debugger_surface_without_shell_or_foreground() {
         let visible = visible_tool_names_for_profile(ToolProfileKind::BrowserDebugger, &names());
+        assert!(visible.contains(&"browser_debugger".to_owned()));
+        assert!(visible.contains(&"browser_capture".to_owned()));
         assert_debugger_only_visible(&visible);
         assert!(visible.contains(&"browser_content".to_owned()));
         assert!(visible.contains(&"browser_dom".to_owned()));
@@ -3602,7 +3811,9 @@ mod tests {
         );
         let registry =
             public_tool_registry_snapshot_for(&service.full_tool_names()).expect("registry");
-        assert_eq!(tools, registry.registered_tools_present);
+        let mut expected = registry.registered_tools_present.clone();
+        expected.retain(|name| name != "browser_debugger");
+        assert_eq!(tools, expected);
         assert!(tools.contains(&"health".to_owned()));
         assert!(tools.contains(&"profile".to_owned()));
         assert!(tools.contains(&"session".to_owned()));
@@ -3612,6 +3823,9 @@ mod tests {
         assert!(tools.contains(&"browser_dom".to_owned()));
         assert!(tools.contains(&"browser_form".to_owned()));
         assert!(tools.contains(&"browser_wait".to_owned()));
+        assert!(tools.contains(&"browser_capture".to_owned()));
+        assert!(tools.contains(&"browser_storage".to_owned()));
+        assert!(!tools.contains(&"browser_debugger".to_owned()));
         assert!(tools.contains(&"shell".to_owned()));
         assert!(tools.contains(&"process".to_owned()));
         assert!(!tools.contains(&"agent_spawn_task_started".to_owned()));
