@@ -136,14 +136,27 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "escalation_list",
     "get_target",
     "hidden_desktop_pip_frame",
+    "intent_current",
     "intent_detect_tick",
+    "observe_delta",
     "profile_authoring_generate",
     "profile_authoring_inspect",
     "profile_authoring_list",
+    "reality_audit",
+    "reality_baseline",
     "release_all",
+    "routine_automate",
+    "routine_feedback",
+    "routine_inspect",
+    "routine_label_export",
+    "routine_list",
+    "routine_mine",
+    "routine_update",
     "set_target",
     "storage_gc_once",
     "storage_put_probe_rows",
+    "suggestion_accept",
+    "suggestion_list",
     "suggestion_tick",
     "task_cancel",
     "task_claim",
@@ -170,6 +183,11 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "timeline_stats",
     "tool_profile_set",
     "tool_profile_status",
+    "verification_audit",
+    "verification_bind",
+    "verification_inbox",
+    "verification_poll",
+    "verification_sources",
     "window_list",
     "workspace_get",
     "workspace_list",
@@ -1339,58 +1357,219 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "routine",
         "RoutineOperation",
-        "routine registry rows + routine feedback rows",
-        &[op(
-            "list",
-            false,
-            false,
-            "routine registry rows",
-            None,
-            error_codes::STORAGE_READ_FAILED,
-            "read routine registry storage health and retry with a narrower filter",
-        )],
+        "CF_ROUTINES + CF_ROUTINE_STATE + CF_KV routine automation/armed rows",
+        &[
+            op(
+                "mine",
+                true,
+                false,
+                "CF_EPISODES input rows + CF_ROUTINES replace-all rows + CF_ROUTINE_STATE reconciliation rows",
+                Some("routines_written/deleted and state row count readback"),
+                error_codes::STORAGE_READ_FAILED,
+                "fix mining bounds and inspect CF_EPISODES, CF_ROUTINES, and CF_ROUTINE_STATE",
+            ),
+            op(
+                "list",
+                false,
+                false,
+                "CF_ROUTINES joined with CF_ROUTINE_STATE",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "read routine storage health and retry with a narrower filter",
+            ),
+            op(
+                "inspect",
+                false,
+                false,
+                "CF_ROUTINES exact routine row + CF_ROUTINE_STATE row + automation/armed rows",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "provide an existing routine_id and inspect routine state rows",
+            ),
+            op(
+                "update",
+                true,
+                false,
+                "CF_ROUTINE_STATE row + optional CF_KV armed_routine/v1 row",
+                Some("routine state row and armed row readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "fix lifecycle/arming params and inspect routine state after write",
+            ),
+            op(
+                "feedback",
+                true,
+                false,
+                "CF_ROUTINE_STATE feedback counters/history",
+                Some("routine feedback state row readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide an existing routine_id/outcome and inspect feedback history",
+            ),
+            op(
+                "label",
+                false,
+                false,
+                "CF_ROUTINES + CF_ROUTINE_STATE naming evidence",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "provide an existing routine_id and inspect label evidence rows",
+            ),
+            op(
+                "automate",
+                true,
+                false,
+                "CF_KV profile_authoring/v1 candidate + routine_automation/v1 row + plan/v1 row",
+                Some("candidate, automation, and plan row readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide a mined routine_id and inspect authoring/automation rows",
+            ),
+            op(
+                "armed_tick",
+                true,
+                false,
+                "CF_KV armed_routine/v1 + armed_routine_run/v1 + plan_execution/v1 rows",
+                Some("armed tick run/audit rows readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "fix armed tick filters and inspect armed routine run rows",
+            ),
+        ],
     ),
     facade_contract(
         "assist",
         "AssistOperation",
-        "suggestion/routine assist queue + target readback",
-        &[op(
-            "suggest",
-            false,
-            true,
-            "assist suggestion queue + target readback",
-            None,
-            error_codes::ACTION_TARGET_INVALID,
-            "bind the target and read suggestion queue state before accepting",
-        )],
+        "CF_KV suggestion/v1 + intent tracker/events + CF_ROUTINES/CF_ROUTINE_STATE",
+        &[
+            op(
+                "intent",
+                false,
+                false,
+                "CF_EPISODES recent rows + CF_ROUTINES/CF_ROUTINE_STATE",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "fix intent filters and inspect derived episode/routine rows",
+            ),
+            op(
+                "detect",
+                false,
+                false,
+                "intent tracker state + event bus delivery counts + routine stores",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "fix detection filters and inspect intent tracker/event delivery",
+            ),
+            op(
+                "suggestion_tick",
+                true,
+                false,
+                "CF_KV suggestion/v1 rows + suggestion feedback rows",
+                Some("created/expired/abandoned suggestion row readback"),
+                error_codes::STORAGE_READ_FAILED,
+                "fix suggestion tick bounds and inspect suggestion rows",
+            ),
+            op(
+                "suggestion_list",
+                false,
+                false,
+                "CF_KV suggestion/v1 prefix scan",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "narrow suggestion filters and inspect suggestion rows",
+            ),
+            op(
+                "suggestion_accept",
+                true,
+                true,
+                "CF_KV suggestion/v1 + plan/v1 + plan_execution/v1 rows",
+                Some("accepted suggestion and plan execution row readback"),
+                error_codes::ACTION_TARGET_INVALID,
+                "bind any required browser target and inspect suggestion/plan rows",
+            ),
+        ],
     ),
     facade_contract(
         "reality",
         "RealityOperation",
-        "reality baseline/delta/audit rows",
-        &[op(
-            "audit",
-            false,
-            false,
-            "reality baseline/delta/audit rows",
-            None,
-            error_codes::STORAGE_READ_FAILED,
-            "read the latest baseline and retry the drift audit with a bounded scope",
-        )],
+        "CF_KV reality baseline/delta/audit rows + physical observation readback",
+        &[
+            op(
+                "baseline",
+                true,
+                true,
+                "CF_KV reality head/baseline rows + physical observation readback",
+                Some("reality head/baseline row readback"),
+                error_codes::STORAGE_READ_FAILED,
+                "fix baseline profile/epoch params and inspect reality rows",
+            ),
+            op(
+                "delta",
+                true,
+                true,
+                "CF_KV reality delta/head rows + physical observation readback",
+                Some("delta rows and cursor/head readback"),
+                error_codes::STORAGE_READ_FAILED,
+                "fix delta cursor/profile params and inspect reality delta rows",
+            ),
+            op(
+                "audit",
+                true,
+                true,
+                "CF_KV reality audit/head rows + fresh physical observation readback",
+                Some("audit row and drift/head readback"),
+                error_codes::STORAGE_READ_FAILED,
+                "read the latest baseline and retry drift audit with bounded scope",
+            ),
+        ],
     ),
     facade_contract(
         "verification",
         "VerificationOperation",
-        "verification claim rows + physical SoT readback references",
-        &[op(
-            "record",
-            true,
-            false,
-            "verification claim row",
-            Some("verification row readback with physical SoT reference"),
-            error_codes::STORAGE_WRITE_FAILED,
-            "include the physical source-of-truth readback before recording the claim",
-        )],
+        "CF_KV verification/audit/v1 + verification/binding/v1 + bound Chrome tab readback",
+        &[
+            op(
+                "inbox",
+                true,
+                true,
+                "bound Chrome tab visible text + CF_KV verification/audit/v1 row",
+                Some("masked audit row readback"),
+                error_codes::ACTION_TARGET_INVALID,
+                "bind/select the logged-in verification tab and inspect audit row",
+            ),
+            op(
+                "poll",
+                true,
+                true,
+                "bound Chrome tab visible text polling + CF_KV verification/audit/v1 row",
+                Some("masked audit row readback from final poll"),
+                error_codes::ACTION_TARGET_INVALID,
+                "bind/select the logged-in verification tab and inspect audit row",
+            ),
+            op(
+                "audit",
+                false,
+                false,
+                "CF_KV verification/audit/v1 prefix scan",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "inspect verification audit prefix and storage health",
+            ),
+            op(
+                "bind",
+                true,
+                true,
+                "CF_KV verification/binding/v1 exact source row",
+                Some("binding row readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide a non-empty source and inspect binding row readback",
+            ),
+            op(
+                "sources",
+                false,
+                false,
+                "CF_KV verification/binding/v1 prefix scan",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "inspect verification binding prefix and storage health",
+            ),
+        ],
     ),
     facade_contract(
         "storage",
@@ -3678,6 +3857,31 @@ mod tests {
                 "escalation_config_get",
                 "escalation_config_set",
                 "escalation_list",
+                "routine",
+                "routine_mine",
+                "routine_list",
+                "routine_inspect",
+                "routine_update",
+                "routine_feedback",
+                "routine_label_export",
+                "routine_automate",
+                "armed_routine_tick",
+                "assist",
+                "intent_current",
+                "intent_detect_tick",
+                "suggestion_tick",
+                "suggestion_list",
+                "suggestion_accept",
+                "reality",
+                "reality_baseline",
+                "observe_delta",
+                "reality_audit",
+                "verification",
+                "verification_inbox",
+                "verification_poll",
+                "verification_audit",
+                "verification_bind",
+                "verification_sources",
                 "timeline",
                 "timeline_get",
                 "timeline_search",
@@ -3763,6 +3967,27 @@ mod tests {
         assert!(!public_names.contains(&"timeline_redact".to_owned()));
         assert!(!public_names.contains(&"episode_list".to_owned()));
         assert!(!public_names.contains(&"episode_get".to_owned()));
+        assert!(!public_names.contains(&"routine_mine".to_owned()));
+        assert!(!public_names.contains(&"routine_list".to_owned()));
+        assert!(!public_names.contains(&"routine_inspect".to_owned()));
+        assert!(!public_names.contains(&"routine_update".to_owned()));
+        assert!(!public_names.contains(&"routine_feedback".to_owned()));
+        assert!(!public_names.contains(&"routine_label_export".to_owned()));
+        assert!(!public_names.contains(&"routine_automate".to_owned()));
+        assert!(!public_names.contains(&"armed_routine_tick".to_owned()));
+        assert!(!public_names.contains(&"intent_current".to_owned()));
+        assert!(!public_names.contains(&"intent_detect_tick".to_owned()));
+        assert!(!public_names.contains(&"suggestion_tick".to_owned()));
+        assert!(!public_names.contains(&"suggestion_list".to_owned()));
+        assert!(!public_names.contains(&"suggestion_accept".to_owned()));
+        assert!(!public_names.contains(&"reality_baseline".to_owned()));
+        assert!(!public_names.contains(&"observe_delta".to_owned()));
+        assert!(!public_names.contains(&"reality_audit".to_owned()));
+        assert!(!public_names.contains(&"verification_inbox".to_owned()));
+        assert!(!public_names.contains(&"verification_poll".to_owned()));
+        assert!(!public_names.contains(&"verification_audit".to_owned()));
+        assert!(!public_names.contains(&"verification_bind".to_owned()));
+        assert!(!public_names.contains(&"verification_sources".to_owned()));
         assert!(!public_names.contains(&"workspace_put".to_owned()));
         assert!(!public_names.contains(&"workspace_get".to_owned()));
         assert!(!public_names.contains(&"storage_put_probe_rows".to_owned()));
@@ -3883,6 +4108,30 @@ mod tests {
                 .registered_tools_present
                 .contains(&"privacy".to_owned()),
             "#1387 registers the privacy facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"routine".to_owned()),
+            "#1388 registers the routine facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"assist".to_owned()),
+            "#1388 registers the assist facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"reality".to_owned()),
+            "#1388 registers the reality facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"verification".to_owned()),
+            "#1388 registers the verification facade"
         );
         assert!(snapshot.duplicate_public_tool_names.is_empty());
         assert!(snapshot.forbidden_public_tool_names.is_empty());
@@ -4103,6 +4352,10 @@ mod tests {
                 "escalation",
                 "timeline",
                 "episode",
+                "routine",
+                "assist",
+                "reality",
+                "verification",
                 "privacy",
             ]
             .into_iter()
@@ -4137,6 +4390,27 @@ mod tests {
         assert!(!visible.contains(&"episode_list".to_owned()));
         assert!(!visible.contains(&"episode_get".to_owned()));
         assert!(!visible.contains(&"episode_segment".to_owned()));
+        assert!(!visible.contains(&"routine_mine".to_owned()));
+        assert!(!visible.contains(&"routine_list".to_owned()));
+        assert!(!visible.contains(&"routine_inspect".to_owned()));
+        assert!(!visible.contains(&"routine_update".to_owned()));
+        assert!(!visible.contains(&"routine_feedback".to_owned()));
+        assert!(!visible.contains(&"routine_label_export".to_owned()));
+        assert!(!visible.contains(&"routine_automate".to_owned()));
+        assert!(!visible.contains(&"armed_routine_tick".to_owned()));
+        assert!(!visible.contains(&"intent_current".to_owned()));
+        assert!(!visible.contains(&"intent_detect_tick".to_owned()));
+        assert!(!visible.contains(&"suggestion_tick".to_owned()));
+        assert!(!visible.contains(&"suggestion_list".to_owned()));
+        assert!(!visible.contains(&"suggestion_accept".to_owned()));
+        assert!(!visible.contains(&"reality_baseline".to_owned()));
+        assert!(!visible.contains(&"observe_delta".to_owned()));
+        assert!(!visible.contains(&"reality_audit".to_owned()));
+        assert!(!visible.contains(&"verification_inbox".to_owned()));
+        assert!(!visible.contains(&"verification_poll".to_owned()));
+        assert!(!visible.contains(&"verification_audit".to_owned()));
+        assert!(!visible.contains(&"verification_bind".to_owned()));
+        assert!(!visible.contains(&"verification_sources".to_owned()));
         assert!(!visible.contains(&"cdp_activate_tab".to_owned()));
         assert!(!visible.contains(&"cdp_close_tab".to_owned()));
         assert!(!visible.contains(&"cdp_navigate_tab".to_owned()));
@@ -4401,6 +4675,10 @@ mod tests {
         assert!(tools.contains(&"timeline".to_owned()));
         assert!(tools.contains(&"episode".to_owned()));
         assert!(tools.contains(&"privacy".to_owned()));
+        assert!(tools.contains(&"routine".to_owned()));
+        assert!(tools.contains(&"assist".to_owned()));
+        assert!(tools.contains(&"reality".to_owned()));
+        assert!(tools.contains(&"verification".to_owned()));
         assert!(!tools.contains(&"agent_spawn_task_started".to_owned()));
         assert!(!tools.contains(&"cdp_activate_tab".to_owned()));
         assert!(!tools.contains(&"cdp_close_tab".to_owned()));
@@ -4429,6 +4707,27 @@ mod tests {
         assert!(!tools.contains(&"timeline_redact".to_owned()));
         assert!(!tools.contains(&"episode_list".to_owned()));
         assert!(!tools.contains(&"episode_get".to_owned()));
+        assert!(!tools.contains(&"routine_mine".to_owned()));
+        assert!(!tools.contains(&"routine_list".to_owned()));
+        assert!(!tools.contains(&"routine_inspect".to_owned()));
+        assert!(!tools.contains(&"routine_update".to_owned()));
+        assert!(!tools.contains(&"routine_feedback".to_owned()));
+        assert!(!tools.contains(&"routine_label_export".to_owned()));
+        assert!(!tools.contains(&"routine_automate".to_owned()));
+        assert!(!tools.contains(&"armed_routine_tick".to_owned()));
+        assert!(!tools.contains(&"intent_current".to_owned()));
+        assert!(!tools.contains(&"intent_detect_tick".to_owned()));
+        assert!(!tools.contains(&"suggestion_tick".to_owned()));
+        assert!(!tools.contains(&"suggestion_list".to_owned()));
+        assert!(!tools.contains(&"suggestion_accept".to_owned()));
+        assert!(!tools.contains(&"reality_baseline".to_owned()));
+        assert!(!tools.contains(&"observe_delta".to_owned()));
+        assert!(!tools.contains(&"reality_audit".to_owned()));
+        assert!(!tools.contains(&"verification_inbox".to_owned()));
+        assert!(!tools.contains(&"verification_poll".to_owned()));
+        assert!(!tools.contains(&"verification_audit".to_owned()));
+        assert!(!tools.contains(&"verification_bind".to_owned()));
+        assert!(!tools.contains(&"verification_sources".to_owned()));
         assert!(
             tools
                 .iter()

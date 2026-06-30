@@ -429,6 +429,10 @@ pub(crate) const SYNAPSE_COORDINATION_MCP_TOOLS: &[&str] =
 const DESTRUCTIVE_MCP_TOOLS: &[&str] = &[
     "agent_kill",
     "fleet_stop",
+    "routine",
+    "assist",
+    "reality",
+    "verification",
     "storage_gc_once",
     "storage_put_probe_rows",
     "timeline_purge",

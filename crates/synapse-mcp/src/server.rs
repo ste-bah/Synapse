@@ -271,6 +271,7 @@ mod permission_gate;
 pub(crate) mod permission_policy;
 mod plan_tools;
 mod reality;
+mod routine_assist_facades;
 mod routine_feedback;
 mod routine_labeling;
 mod schema_sanitize;
@@ -628,6 +629,7 @@ impl SynapseService {
             + Self::agent_facade_tool_router()
             + Self::approval_facade_tool_router()
             + Self::timeline_facade_tool_router()
+            + Self::routine_assist_facade_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()
