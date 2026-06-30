@@ -19,6 +19,95 @@ const TOOL_PROFILE_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<ses
 const TOOL_PROFILE_ROW_KIND: &str = "mcp_tool_profile";
 const TOOL_PROFILE_SCHEMA_VERSION: u32 = 1;
 const MAX_PROFILE_REASON_CHARS: usize = 1024;
+pub(crate) const PUBLIC_TOOL_LIMIT: usize = 40;
+const PUBLIC_TOOL_REGISTRY_SOURCE_OF_TRUTH: &str =
+    "crates/synapse-mcp/src/server/tool_profiles.rs PUBLIC_TOOL_NAMES";
+const PUBLIC_TOOL_REGISTRY_OPERATION: &str = "validate_public_tool_registry";
+
+pub(crate) const PUBLIC_TOOL_NAMES: &[&str] = &[
+    "health",
+    "profile",
+    "session",
+    "subscribe",
+    "observe",
+    "find",
+    "read_text",
+    "screenshot",
+    "target",
+    "act",
+    "shell",
+    "process",
+    "browser_tabs",
+    "browser_nav",
+    "browser_dom",
+    "browser_form",
+    "browser_wait",
+    "browser_capture",
+    "browser_storage",
+    "browser_debugger",
+    "workspace",
+    "agent",
+    "task",
+    "approval",
+    "escalation",
+    "timeline",
+    "episode",
+    "routine",
+    "assist",
+    "reality",
+    "verification",
+    "storage",
+    "model",
+    "cost",
+    "hygiene",
+    "audit",
+    "replay",
+    "privacy",
+    "setup",
+    "telemetry",
+];
+
+const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
+    "act_click",
+    "act_clipboard",
+    "act_combo",
+    "act_focus_window",
+    "act_keymap",
+    "act_launch",
+    "act_pad",
+    "act_press",
+    "act_run_shell",
+    "act_run_shell_cancel",
+    "act_run_shell_start",
+    "act_run_shell_status",
+    "act_scroll",
+    "act_set_field_text",
+    "act_set_value",
+    "act_spawn_agent",
+    "act_stroke",
+    "act_type",
+    "armed_routine_tick",
+    "audit_intelligence_query",
+    "cdp_activate_tab",
+    "cdp_bridge_reload",
+    "cdp_close_tab",
+    "cdp_navigate_tab",
+    "cdp_open_tab",
+    "cdp_target_info",
+    "demo_record_start",
+    "demo_record_stop",
+    "hidden_desktop_pip_frame",
+    "intent_detect_tick",
+    "profile_authoring_generate",
+    "profile_authoring_inspect",
+    "profile_authoring_list",
+    "release_all",
+    "storage_gc_once",
+    "storage_put_probe_rows",
+    "suggestion_tick",
+    "tool_profile_set",
+    "tool_profile_status",
+];
 
 const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "act_foreground",
@@ -475,6 +564,22 @@ pub(crate) struct ToolProfileAuditReadback {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct PublicToolRegistrySnapshot {
+    pub source_of_truth: &'static str,
+    pub max_public_tool_count: usize,
+    pub public_tool_count: usize,
+    pub public_tool_sha256: String,
+    pub public_tool_names: Vec<String>,
+    pub implementation_tool_count: usize,
+    pub registered_tools_present: Vec<String>,
+    pub registered_tools_missing: Vec<String>,
+    pub duplicate_public_tool_names: Vec<String>,
+    pub forbidden_public_tool_names: Vec<String>,
+    pub over_limit_by: usize,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ToolProfileSnapshot {
     pub source_of_truth: &'static str,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -489,6 +594,7 @@ pub(crate) struct ToolProfileSnapshot {
     pub denied_break_glass_tools: Vec<String>,
     pub foreground_capability: ToolProfileForegroundCapability,
     pub hidden_tool_routes: Vec<HiddenToolCapabilityRoute>,
+    pub public_tool_registry: PublicToolRegistrySnapshot,
     /// #1352: this session's CURRENT readiness for the real OS-foreground route —
     /// whether it already holds the lease + a break_glass profile, and the exact
     /// remaining steps. Lets an agent preflight the foreground route before
@@ -794,6 +900,7 @@ impl SynapseService {
     ) -> Result<ToolProfileSnapshot, ErrorData> {
         let full_tool_names = self.full_tool_names();
         let implementation_tool_count = full_tool_names.len();
+        let public_tool_registry = public_tool_registry_snapshot_for(&full_tool_names)?;
         let (profile, source, policy_row) = match session_id {
             Some(session_id) => {
                 let row = self.ensure_tool_profile_assignment(session_id)?;
@@ -826,9 +933,16 @@ impl SynapseService {
             denied_break_glass_tools,
             foreground_capability: foreground_capability_policy(profile),
             hidden_tool_routes,
+            public_tool_registry,
             foreground_route: foreground_route_readiness(session_id, profile),
             policy_row,
         })
+    }
+
+    pub(crate) fn public_tool_registry_snapshot(
+        &self,
+    ) -> Result<PublicToolRegistrySnapshot, ErrorData> {
+        public_tool_registry_snapshot_for(&self.full_tool_names())
     }
 
     pub(crate) fn admit_tool_call_for_profile(
@@ -1394,6 +1508,122 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct PublicToolRegistryValidation {
+    duplicate_public_tool_names: Vec<String>,
+    forbidden_public_tool_names: Vec<String>,
+    over_limit_by: usize,
+}
+
+impl PublicToolRegistryValidation {
+    const fn is_valid(&self) -> bool {
+        self.duplicate_public_tool_names.is_empty()
+            && self.forbidden_public_tool_names.is_empty()
+            && self.over_limit_by == 0
+    }
+}
+
+fn public_tool_names() -> Vec<String> {
+    PUBLIC_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect()
+}
+
+fn public_tool_registry_snapshot_for(
+    full_tool_names: &[String],
+) -> Result<PublicToolRegistrySnapshot, ErrorData> {
+    let public_tool_names = public_tool_names();
+    let validation = validate_public_tool_registry_names(&public_tool_names)?;
+    let full_tool_names = full_tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let registered_tools_present = public_tool_names
+        .iter()
+        .filter(|name| full_tool_names.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let registered_tools_missing = public_tool_names
+        .iter()
+        .filter(|name| !full_tool_names.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(PublicToolRegistrySnapshot {
+        source_of_truth: PUBLIC_TOOL_REGISTRY_SOURCE_OF_TRUTH,
+        max_public_tool_count: PUBLIC_TOOL_LIMIT,
+        public_tool_count: public_tool_names.len(),
+        public_tool_sha256: sha256_json_hex(&public_tool_names)?,
+        public_tool_names,
+        implementation_tool_count: full_tool_names.len(),
+        registered_tools_present,
+        registered_tools_missing,
+        duplicate_public_tool_names: validation.duplicate_public_tool_names,
+        forbidden_public_tool_names: validation.forbidden_public_tool_names,
+        over_limit_by: validation.over_limit_by,
+    })
+}
+
+fn validate_public_tool_registry_names(
+    names: &[String],
+) -> Result<PublicToolRegistryValidation, ErrorData> {
+    let validation = inspect_public_tool_registry_names(names);
+    if validation.is_valid() {
+        return Ok(validation);
+    }
+    Err(public_tool_registry_error(names, &validation))
+}
+
+fn inspect_public_tool_registry_names(names: &[String]) -> PublicToolRegistryValidation {
+    let mut seen = BTreeSet::new();
+    let mut duplicate_public_tool_names = BTreeSet::new();
+    for name in names {
+        if !seen.insert(name.as_str()) {
+            duplicate_public_tool_names.insert(name.clone());
+        }
+    }
+    let forbidden_public_tool_names = names
+        .iter()
+        .filter(|name| PUBLIC_TOOL_IMPLEMENTATION_DENYLIST.contains(&name.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    PublicToolRegistryValidation {
+        duplicate_public_tool_names: duplicate_public_tool_names.into_iter().collect(),
+        forbidden_public_tool_names,
+        over_limit_by: names.len().saturating_sub(PUBLIC_TOOL_LIMIT),
+    }
+}
+
+fn public_tool_registry_error(
+    names: &[String],
+    validation: &PublicToolRegistryValidation,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "public MCP tool registry is invalid: count={} max={} duplicates={:?} forbidden={:?}",
+            names.len(),
+            PUBLIC_TOOL_LIMIT,
+            validation.duplicate_public_tool_names,
+            validation.forbidden_public_tool_names
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_INTERNAL_ERROR,
+            "detail_code": "PUBLIC_TOOL_REGISTRY_INVALID",
+            "operation": PUBLIC_TOOL_REGISTRY_OPERATION,
+            "source_of_truth": PUBLIC_TOOL_REGISTRY_SOURCE_OF_TRUTH,
+            "max_public_tool_count": PUBLIC_TOOL_LIMIT,
+            "public_tool_count": names.len(),
+            "over_limit_by": validation.over_limit_by,
+            "duplicate_public_tool_names": validation.duplicate_public_tool_names,
+            "forbidden_public_tool_names": validation.forbidden_public_tool_names,
+            "remediation": "edit PUBLIC_TOOL_NAMES so it has at most 40 unique facade names and no implementation-only tools",
+        })),
+    )
+}
+
 fn sort_tools_for_profile(tools: &mut [Tool], profile: ToolProfileKind) {
     tools.sort_by(|left, right| {
         let left_name = left.name.as_ref();
@@ -1578,6 +1808,91 @@ mod tests {
                 "browser_debugger profile must expose browser debugger tool {required}"
             );
         }
+    }
+
+    fn registry_error_data(error: &ErrorData) -> &Value {
+        error.data.as_ref().expect("registry error data")
+    }
+
+    #[test]
+    fn public_tool_registry_contract_is_capped_unique_and_facade_only() {
+        let public_names = public_tool_names();
+        assert_eq!(public_names.len(), PUBLIC_TOOL_LIMIT);
+        let validation =
+            validate_public_tool_registry_names(&public_names).expect("valid registry");
+        assert!(validation.is_valid());
+        assert!(public_names.contains(&"health".to_owned()));
+        assert!(public_names.contains(&"telemetry".to_owned()));
+        assert!(!public_names.contains(&"cdp_open_tab".to_owned()));
+        assert!(!public_names.contains(&"storage_put_probe_rows".to_owned()));
+
+        let snapshot =
+            public_tool_registry_snapshot_for(&names()).expect("registry snapshot from fixture");
+        assert_eq!(snapshot.max_public_tool_count, PUBLIC_TOOL_LIMIT);
+        assert_eq!(snapshot.public_tool_count, PUBLIC_TOOL_LIMIT);
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"health".to_owned())
+        );
+        assert!(
+            snapshot
+                .registered_tools_missing
+                .contains(&"profile".to_owned()),
+            "future facade issues implement missing public names; #1375 only owns the registry contract"
+        );
+        assert!(snapshot.duplicate_public_tool_names.is_empty());
+        assert!(snapshot.forbidden_public_tool_names.is_empty());
+        assert_eq!(snapshot.over_limit_by, 0);
+    }
+
+    #[test]
+    fn public_tool_registry_rejects_duplicate_public_names() {
+        let names = vec!["health".to_owned(), "health".to_owned()];
+        let error = validate_public_tool_registry_names(&names).expect_err("duplicate rejected");
+        let data = registry_error_data(&error);
+        assert_eq!(
+            data.get("detail_code").and_then(Value::as_str),
+            Some("PUBLIC_TOOL_REGISTRY_INVALID")
+        );
+        assert_eq!(
+            data.get("duplicate_public_tool_names"),
+            Some(&json!(["health"]))
+        );
+    }
+
+    #[test]
+    fn public_tool_registry_rejects_forty_first_public_tool() {
+        let names = (0..=PUBLIC_TOOL_LIMIT)
+            .map(|index| format!("facade_{index:02}"))
+            .collect::<Vec<_>>();
+        let error = validate_public_tool_registry_names(&names).expect_err("41st tool rejected");
+        let data = registry_error_data(&error);
+        assert_eq!(
+            data.get("detail_code").and_then(Value::as_str),
+            Some("PUBLIC_TOOL_REGISTRY_INVALID")
+        );
+        assert_eq!(data.get("over_limit_by").and_then(Value::as_u64), Some(1));
+        assert_eq!(
+            data.get("public_tool_count").and_then(Value::as_u64),
+            Some(41)
+        );
+    }
+
+    #[test]
+    fn public_tool_registry_rejects_implementation_tool_publication() {
+        let names = vec!["health".to_owned(), "cdp_open_tab".to_owned()];
+        let error =
+            validate_public_tool_registry_names(&names).expect_err("implementation tool rejected");
+        let data = registry_error_data(&error);
+        assert_eq!(
+            data.get("detail_code").and_then(Value::as_str),
+            Some("PUBLIC_TOOL_REGISTRY_INVALID")
+        );
+        assert_eq!(
+            data.get("forbidden_public_tool_names"),
+            Some(&json!(["cdp_open_tab"]))
+        );
     }
 
     #[test]

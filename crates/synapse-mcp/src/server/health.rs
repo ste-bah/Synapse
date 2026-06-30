@@ -62,6 +62,10 @@ impl SynapseService {
             "daemon_lifecycle".to_owned(),
             crate::daemon_lifecycle::health_subsystem(),
         );
+        subsystems.insert(
+            "public_tool_registry".to_owned(),
+            self.public_tool_registry_health(),
+        );
         let tool_surface = self.tool_surface_fingerprint(session_id);
         if let Some(error) = &tool_surface.error {
             subsystems.insert(
@@ -84,6 +88,37 @@ impl SynapseService {
             tool_surface_sha256: tool_surface.sha256,
             tool_names: tool_surface.names,
             subsystems,
+        }
+    }
+
+    fn public_tool_registry_health(&self) -> SubsystemHealth {
+        match self.public_tool_registry_snapshot() {
+            Ok(snapshot) => {
+                let missing_count = snapshot.registered_tools_missing.len();
+                let status = if missing_count == 0 {
+                    "ok"
+                } else {
+                    "pending_facades"
+                };
+                SubsystemHealth {
+                    status: status.to_owned(),
+                    detail: Some(format!(
+                        "source_of_truth={} public_tool_count={} max_public_tool_count={} implementation_tool_count={} registered_tools_present={} registered_tools_missing={}",
+                        snapshot.source_of_truth,
+                        snapshot.public_tool_count,
+                        snapshot.max_public_tool_count,
+                        snapshot.implementation_tool_count,
+                        snapshot.registered_tools_present.len(),
+                        missing_count
+                    )),
+                    ..SubsystemHealth::default()
+                }
+            }
+            Err(error) => SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(format!("{error:?}")),
+                ..SubsystemHealth::default()
+            },
         }
     }
 
