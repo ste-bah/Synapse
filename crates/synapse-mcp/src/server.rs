@@ -622,6 +622,7 @@ impl SynapseService {
             + Self::session_tool_router()
             + Self::agent_mailbox_tool_router()
             + Self::agent_cost_tool_router()
+            + Self::cost_facade_tool_router()
             + Self::agent_stats_tool_router()
             + Self::agent_query_tool_router()
             + Self::agent_control_tool_router()

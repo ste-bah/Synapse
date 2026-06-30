@@ -96,6 +96,10 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "agent_interrupt",
     "agent_kill",
     "agent_pause",
+    "agent_cost",
+    "agent_cost_price_delete",
+    "agent_cost_price_list",
+    "agent_cost_price_put",
     "agent_query",
     "agent_receipts",
     "agent_respawn",
@@ -1689,16 +1693,45 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "cost",
         "CostOperation",
-        "cost table rows + token event scan/readback",
-        &[op(
-            "summarize",
-            false,
-            false,
-            "cost table rows + bounded token event scan",
-            None,
-            error_codes::STORAGE_READ_FAILED,
-            "price the missing model or narrow the scan scope before retrying",
-        )],
+        "CF_AGENT_TRANSCRIPTS transcript rows + CF_KV cost/price/v1 rows",
+        &[
+            op(
+                "summarize",
+                false,
+                false,
+                "CF_AGENT_TRANSCRIPTS bounded transcript scan + CF_KV price rows",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "pass a spawn_id or bounded window, add missing price rows, or repair corrupt transcript/price rows",
+            ),
+            op(
+                "price_list",
+                false,
+                false,
+                "CF_KV cost/price/v1 rows",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "repair corrupt price rows and retry price_list",
+            ),
+            op(
+                "price_put",
+                true,
+                false,
+                "CF_KV cost/price/v1 row",
+                Some("exact CF_KV price row readback after write"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before mutating prices",
+            ),
+            op(
+                "price_delete",
+                true,
+                false,
+                "CF_KV cost/price/v1 row",
+                Some("exact CF_KV row absence/existed readback after delete"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before deleting prices",
+            ),
+        ],
     ),
     facade_contract(
         "hygiene",
@@ -4034,6 +4067,11 @@ mod tests {
                 "workspace_put",
                 "workspace_subscribe",
                 "privacy",
+                "cost",
+                "agent_cost",
+                "agent_cost_price_put",
+                "agent_cost_price_list",
+                "agent_cost_price_delete",
                 "storage",
                 "storage_inspect",
                 "storage_put_probe_rows",
@@ -4138,6 +4176,10 @@ mod tests {
         assert!(!public_names.contains(&"local_model_list".to_owned()));
         assert!(!public_names.contains(&"local_model_probe".to_owned()));
         assert!(!public_names.contains(&"hygiene_report".to_owned()));
+        assert!(!public_names.contains(&"agent_cost".to_owned()));
+        assert!(!public_names.contains(&"agent_cost_price_put".to_owned()));
+        assert!(!public_names.contains(&"agent_cost_price_list".to_owned()));
+        assert!(!public_names.contains(&"agent_cost_price_delete".to_owned()));
 
         let snapshot =
             public_tool_registry_snapshot_for(&names()).expect("registry snapshot from fixture");
@@ -4291,6 +4333,12 @@ mod tests {
                 .registered_tools_present
                 .contains(&"model".to_owned()),
             "#1389 registers the model facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"cost".to_owned()),
+            "#1390 registers the cost facade"
         );
         assert!(
             snapshot
@@ -4535,6 +4583,7 @@ mod tests {
                 "verification",
                 "storage",
                 "model",
+                "cost",
                 "hygiene",
                 "privacy",
                 "setup",
@@ -4863,6 +4912,7 @@ mod tests {
         assert!(tools.contains(&"verification".to_owned()));
         assert!(tools.contains(&"storage".to_owned()));
         assert!(tools.contains(&"model".to_owned()));
+        assert!(tools.contains(&"cost".to_owned()));
         assert!(tools.contains(&"hygiene".to_owned()));
         assert!(tools.contains(&"setup".to_owned()));
         assert!(tools.contains(&"telemetry".to_owned()));
@@ -4895,6 +4945,10 @@ mod tests {
         assert!(!tools.contains(&"hygiene_scan_storage".to_owned()));
         assert!(!tools.contains(&"hygiene_flags".to_owned()));
         assert!(!tools.contains(&"hygiene_report".to_owned()));
+        assert!(!tools.contains(&"agent_cost".to_owned()));
+        assert!(!tools.contains(&"agent_cost_price_put".to_owned()));
+        assert!(!tools.contains(&"agent_cost_price_list".to_owned()));
+        assert!(!tools.contains(&"agent_cost_price_delete".to_owned()));
         assert!(!tools.contains(&"timeline_get".to_owned()));
         assert!(!tools.contains(&"timeline_search".to_owned()));
         assert!(!tools.contains(&"timeline_stats".to_owned()));

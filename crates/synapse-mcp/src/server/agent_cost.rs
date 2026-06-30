@@ -56,8 +56,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest as _, Sha256};
 use synapse_core::{
     AgentEventKind, AgentEventRecord, AgentTranscriptRecord, BillableUsage, CostBreakdown,
@@ -71,7 +73,7 @@ use synapse_storage::{
 
 use super::{
     ErrorData, Json, Parameters, SynapseService, agent_events::unix_time_ns_now, mcp_error, tool,
-    tool_router,
+    tool_profiles::ToolProfileKind, tool_router,
 };
 
 /// `CF_KV` key prefix for operator price rows. Versioned so a future codec can
@@ -100,6 +102,77 @@ const MAX_EVENT_SCAN_ROWS_PER_CALL: usize = 1_000_000;
 /// exactly with the fleet total — the FinOps "no unallocated spend hidden"
 /// rule.
 const UNATTRIBUTED_KEY: &str = "(unattributed)";
+const COST_TOOL: &str = "cost";
+const COST_SOURCE_OF_TRUTH: &str =
+    "CF_AGENT_TRANSCRIPTS transcript rows + CF_KV cost/price/v1 rows";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CostOperation {
+    Summarize,
+    PriceList,
+    PricePut,
+    PriceDelete,
+}
+
+impl CostOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Summarize => "summarize",
+            Self::PriceList => "price_list",
+            Self::PricePut => "price_put",
+            Self::PriceDelete => "price_delete",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, ErrorData> {
+        match raw {
+            "summarize" => Ok(Self::Summarize),
+            "price_list" => Ok(Self::PriceList),
+            "price_put" => Ok(Self::PricePut),
+            "price_delete" => Ok(Self::PriceDelete),
+            other => Err(cost_invalid_operation(other)),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CostParams {
+    #[schemars(schema_with = "cost_operation_schema")]
+    pub operation: String,
+    #[serde(default)]
+    pub summarize: Option<AgentCostParams>,
+    #[serde(default)]
+    pub price_list: Option<AgentCostPriceListParams>,
+    #[serde(default)]
+    pub price_put: Option<AgentCostPricePutParams>,
+    #[serde(default)]
+    pub price_delete: Option<AgentCostPriceDeleteParams>,
+}
+
+fn cost_operation_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "string",
+        "enum": ["summarize", "price_list", "price_put", "price_delete"]
+    })
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CostResponse {
+    pub operation: CostOperation,
+    pub source_of_truth: String,
+    pub readback_source_of_truth: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summarize: Option<AgentCostResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_list: Option<AgentCostPriceListResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_put: Option<AgentCostPricePutResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price_delete: Option<AgentCostPriceDeleteResponse>,
+}
 
 // ----------------------------------------------------------------------------
 // Price-table parameters and responses
@@ -510,6 +583,152 @@ impl SynapseService {
             "tool.invocation kind=agent_cost"
         );
         self.agent_cost_impl(params.0).map(Json)
+    }
+}
+
+#[tool_router(router = cost_facade_tool_router, vis = "pub(super)")]
+impl SynapseService {
+    #[tool(
+        description = "Public cost facade for the <=40 MCP surface. operation=summarize rolls up token/cost from CF_AGENT_TRANSCRIPTS; price_list reads CF_KV price rows; price_put/price_delete are maintenance-gated mutations with exact CF_KV readback."
+    )]
+    pub async fn cost(
+        &self,
+        params: Parameters<CostParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<CostResponse>, ErrorData> {
+        let operation = validate_cost_params(&params.0)?;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = COST_TOOL,
+            operation = operation.as_str(),
+            "tool.invocation kind=cost"
+        );
+
+        match operation {
+            CostOperation::Summarize => {
+                let summarize = params
+                    .0
+                    .summarize
+                    .ok_or_else(|| cost_missing_spec("summarize"))?;
+                let response = self.agent_cost_impl(summarize).map_err(|error| {
+                    cost_delegate_error(
+                        operation.as_str(),
+                        "agent_cost",
+                        error,
+                        "pass a spawn_id or bounded window, add missing price rows, or repair corrupt transcript/price rows",
+                    )
+                })?;
+                Ok(Json(CostResponse {
+                    operation,
+                    source_of_truth: COST_SOURCE_OF_TRUTH.to_owned(),
+                    readback_source_of_truth: format!(
+                        "CF_AGENT_TRANSCRIPTS scanned_rows={} spawns={} models={} unpriced_models={}",
+                        response.scanned_rows,
+                        response.fleet.spawns_total,
+                        response.per_model.len(),
+                        response.fleet.unpriced_models.len()
+                    ),
+                    summarize: Some(response),
+                    price_list: None,
+                    price_put: None,
+                    price_delete: None,
+                }))
+            }
+            CostOperation::PriceList => {
+                let _spec = params
+                    .0
+                    .price_list
+                    .ok_or_else(|| cost_missing_spec("price_list"))?;
+                let response = self.agent_cost_price_list_impl().map_err(|error| {
+                    cost_delegate_error(
+                        operation.as_str(),
+                        "agent_cost_price_list",
+                        error,
+                        "repair corrupt CF_KV cost/price/v1 rows and retry price_list",
+                    )
+                })?;
+                Ok(Json(CostResponse {
+                    operation,
+                    source_of_truth: COST_SOURCE_OF_TRUTH.to_owned(),
+                    readback_source_of_truth: format!(
+                        "CF_KV prefix {PRICE_KEY_PREFIX} rows={}",
+                        response.count
+                    ),
+                    summarize: None,
+                    price_list: Some(response),
+                    price_put: None,
+                    price_delete: None,
+                }))
+            }
+            CostOperation::PricePut => {
+                require_cost_maintenance_profile(
+                    self,
+                    &request_context,
+                    operation.as_str(),
+                    "CF_KV cost/price/v1",
+                )?;
+                let price_put = params
+                    .0
+                    .price_put
+                    .ok_or_else(|| cost_missing_spec("price_put"))?;
+                let response = self.agent_cost_price_put_impl(price_put).map_err(|error| {
+                    cost_delegate_error(
+                        operation.as_str(),
+                        "agent_cost_price_put",
+                        error,
+                        "fix the price payload and retry; model prices are never guessed",
+                    )
+                })?;
+                Ok(Json(CostResponse {
+                    operation,
+                    source_of_truth: COST_SOURCE_OF_TRUTH.to_owned(),
+                    readback_source_of_truth: format!(
+                        "{} {} sha256={}",
+                        response.storage_readback.cf_name,
+                        response.storage_readback.row_key,
+                        response.storage_readback.value_sha256
+                    ),
+                    summarize: None,
+                    price_list: None,
+                    price_put: Some(response),
+                    price_delete: None,
+                }))
+            }
+            CostOperation::PriceDelete => {
+                require_cost_maintenance_profile(
+                    self,
+                    &request_context,
+                    operation.as_str(),
+                    "CF_KV cost/price/v1",
+                )?;
+                let price_delete = params
+                    .0
+                    .price_delete
+                    .ok_or_else(|| cost_missing_spec("price_delete"))?;
+                let response =
+                    self.agent_cost_price_delete_impl(price_delete)
+                        .map_err(|error| {
+                            cost_delegate_error(
+                                operation.as_str(),
+                                "agent_cost_price_delete",
+                                error,
+                                "pass a valid model_id and retry price_delete",
+                            )
+                        })?;
+                Ok(Json(CostResponse {
+                    operation,
+                    source_of_truth: COST_SOURCE_OF_TRUTH.to_owned(),
+                    readback_source_of_truth: format!(
+                        "CF_KV {} existed_before={}",
+                        response.row_key, response.existed
+                    ),
+                    summarize: None,
+                    price_list: None,
+                    price_put: None,
+                    price_delete: Some(response),
+                }))
+            }
+        }
     }
 }
 
@@ -1045,6 +1264,153 @@ impl SynapseService {
             per_task,
         })
     }
+}
+
+fn validate_cost_params(params: &CostParams) -> Result<CostOperation, ErrorData> {
+    let operation = CostOperation::parse(params.operation.as_str())?;
+    let matches = [
+        (
+            CostOperation::Summarize,
+            params.summarize.is_some(),
+            "summarize",
+        ),
+        (
+            CostOperation::PriceList,
+            params.price_list.is_some(),
+            "price_list",
+        ),
+        (
+            CostOperation::PricePut,
+            params.price_put.is_some(),
+            "price_put",
+        ),
+        (
+            CostOperation::PriceDelete,
+            params.price_delete.is_some(),
+            "price_delete",
+        ),
+    ];
+    let supplied = matches
+        .iter()
+        .filter(|(_operation, present, _name)| *present)
+        .count();
+    if supplied != 1 {
+        return Err(cost_missing_spec(operation.as_str()));
+    }
+    let matched = matches
+        .iter()
+        .any(|(candidate, present, _name)| *candidate == operation && *present);
+    if matched {
+        Ok(operation)
+    } else {
+        Err(cost_missing_spec(operation.as_str()))
+    }
+}
+
+fn require_cost_maintenance_profile(
+    service: &SynapseService,
+    request_context: &RequestContext<RoleServer>,
+    operation: &'static str,
+    source_id: &str,
+) -> Result<(), ErrorData> {
+    let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
+    let snapshot = service.tool_profile_snapshot(session_id.as_deref())?;
+    if matches!(
+        snapshot.profile,
+        ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability
+    ) {
+        return Ok(());
+    }
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{COST_TOOL} operation={operation} is not allowed for profile {}",
+            snapshot.profile.as_str()
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PROFILE_POLICY_DENIED,
+            "tool": COST_TOOL,
+            "operation": operation,
+            "source_id": source_id,
+            "profile": snapshot.profile.as_str(),
+            "source_of_truth": COST_SOURCE_OF_TRUTH,
+            "remediation": "switch to an explicit maintenance profile with operator intent before mutating the cost price table; normal_agent may use summarize or price_list first",
+        })),
+    ))
+}
+
+fn cost_missing_spec(operation: &str) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32602),
+        format!(
+            "{COST_TOOL} operation={operation} requires exactly one matching operation payload"
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "tool": COST_TOOL,
+            "operation": operation,
+            "source_of_truth": "MCP request parameters",
+            "source_id": operation,
+            "remediation": "pass exactly one payload object whose field name matches operation",
+        })),
+    )
+}
+
+fn cost_invalid_operation(operation: &str) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32602),
+        format!(
+            "{COST_TOOL} operation={operation} is invalid; expected summarize, price_list, price_put, or price_delete"
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "tool": COST_TOOL,
+            "operation": operation,
+            "source_of_truth": "MCP request parameters",
+            "source_id": "operation",
+            "allowed_operations": ["summarize", "price_list", "price_put", "price_delete"],
+            "remediation": "set operation to one of the allowed values and pass exactly the matching payload object",
+        })),
+    )
+}
+
+fn cost_delegate_error(
+    operation: &'static str,
+    source_id: &str,
+    error: ErrorData,
+    remediation: &'static str,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{COST_TOOL} operation={operation} failed for {source_id}: {}",
+            error.message
+        ),
+        Some(json!({
+            "code": error_code_from(&error),
+            "tool": COST_TOOL,
+            "operation": operation,
+            "source_id": source_id,
+            "source_of_truth": COST_SOURCE_OF_TRUTH,
+            "remediation": remediation,
+            "cause": {
+                "message": error.message.to_string(),
+                "data": error.data,
+            },
+        })),
+    )
+}
+
+fn error_code_from(error: &ErrorData) -> String {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(|code| code.as_str())
+        .map_or_else(
+            || error_codes::TOOL_INTERNAL_ERROR.to_owned(),
+            str::to_owned,
+        )
 }
 
 /// Loads the full operator price table from `CF_KV`, keyed by normalized model

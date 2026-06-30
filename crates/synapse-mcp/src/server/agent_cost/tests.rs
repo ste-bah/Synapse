@@ -183,6 +183,63 @@ fn cost_params_per_turn(spawn: Option<&str>) -> AgentCostParams {
     }
 }
 
+#[test]
+fn cost_facade_requires_matching_operation_payload() {
+    let ok = CostParams {
+        operation: "summarize".to_owned(),
+        summarize: Some(cost_params(Some("agent-spawn-cost-facade"), None, None)),
+        price_list: None,
+        price_put: None,
+        price_delete: None,
+    };
+    validate_cost_params(&ok).expect("matching summarize payload accepted");
+
+    let missing = CostParams {
+        operation: "summarize".to_owned(),
+        summarize: None,
+        price_list: None,
+        price_put: None,
+        price_delete: None,
+    };
+    validate_cost_params(&missing).expect_err("missing payload rejected");
+
+    let mismatched = CostParams {
+        operation: "price_list".to_owned(),
+        summarize: Some(cost_params(Some("agent-spawn-cost-facade"), None, None)),
+        price_list: None,
+        price_put: None,
+        price_delete: None,
+    };
+    validate_cost_params(&mismatched).expect_err("mismatched payload rejected");
+
+    let extra = CostParams {
+        operation: "price_list".to_owned(),
+        summarize: Some(cost_params(Some("agent-spawn-cost-facade"), None, None)),
+        price_list: Some(AgentCostPriceListParams {}),
+        price_put: None,
+        price_delete: None,
+    };
+    validate_cost_params(&extra).expect_err("extra payload rejected");
+
+    let invalid_operation = CostParams {
+        operation: "not_real".to_owned(),
+        summarize: Some(cost_params(Some("agent-spawn-cost-facade"), None, None)),
+        price_list: None,
+        price_put: None,
+        price_delete: None,
+    };
+    let error = validate_cost_params(&invalid_operation).expect_err("invalid operation rejected");
+    assert!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("operation"))
+            .and_then(serde_json::Value::as_str)
+            == Some("not_real"),
+        "invalid operation error must carry the bad operation: {error:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Price table CRUD against physical CF_KV rows
 // ---------------------------------------------------------------------------
