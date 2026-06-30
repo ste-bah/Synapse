@@ -4201,6 +4201,120 @@ mod tests {
         error.data.as_ref().expect("registry error data")
     }
 
+    const STRICT_CLIENT_SCHEMA_MAP_KEYWORDS: &[&str] = &[
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    ];
+    const STRICT_CLIENT_SCHEMA_ARRAY_KEYWORDS: &[&str] =
+        &["oneOf", "anyOf", "allOf", "prefixItems"];
+    const STRICT_CLIENT_SCHEMA_VALUE_KEYWORDS: &[&str] = &[
+        "contains",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+    ];
+    const STRICT_CLIENT_BOOLEAN_EXEMPT_KEYS: &[&str] = &[
+        "additionalItems",
+        "additionalProperties",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ];
+
+    fn strict_client_tool_schema_errors(tool: &Tool) -> Vec<String> {
+        let mut errors = Vec::new();
+        let input = Value::Object((*tool.input_schema).clone());
+        if input.get("type") != Some(&json!("object")) {
+            errors.push(format!("{}.inputSchema.type is not object", tool.name));
+        }
+        if input.get("additionalProperties") != Some(&Value::Bool(false)) {
+            errors.push(format!(
+                "{}.inputSchema.additionalProperties is not false",
+                tool.name
+            ));
+        }
+        strict_client_schema_errors(&input, &format!("{}.inputSchema", tool.name), &mut errors);
+        if let Some(output) = &tool.output_schema {
+            let output = Value::Object((**output).clone());
+            strict_client_schema_errors(
+                &output,
+                &format!("{}.outputSchema", tool.name),
+                &mut errors,
+            );
+        }
+        errors
+    }
+
+    fn strict_client_schema_errors(value: &Value, path: &str, errors: &mut Vec<String>) {
+        match value {
+            Value::Bool(_) => errors.push(format!("{path} is a bare boolean schema")),
+            Value::Object(map) => {
+                if let Some(enum_value) = map.get("enum")
+                    && !enum_value
+                        .as_array()
+                        .is_some_and(|variants| !variants.is_empty())
+                {
+                    errors.push(format!("{path}.enum is not a non-empty array"));
+                }
+                for (key, child) in map {
+                    let child_path = format!("{path}.{key}");
+                    if STRICT_CLIENT_SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) {
+                        if let Value::Object(members) = child {
+                            for (member_key, member_value) in members {
+                                strict_client_subschema_errors(
+                                    member_value,
+                                    &format!("{child_path}.{member_key}"),
+                                    errors,
+                                );
+                            }
+                        } else {
+                            strict_client_schema_errors(child, &child_path, errors);
+                        }
+                    } else if STRICT_CLIENT_SCHEMA_ARRAY_KEYWORDS.contains(&key.as_str()) {
+                        if let Value::Array(elements) = child {
+                            for (index, element) in elements.iter().enumerate() {
+                                strict_client_subschema_errors(
+                                    element,
+                                    &format!("{child_path}[{index}]"),
+                                    errors,
+                                );
+                            }
+                        } else {
+                            strict_client_schema_errors(child, &child_path, errors);
+                        }
+                    } else if STRICT_CLIENT_SCHEMA_VALUE_KEYWORDS.contains(&key.as_str()) {
+                        strict_client_subschema_errors(child, &child_path, errors);
+                    } else if STRICT_CLIENT_BOOLEAN_EXEMPT_KEYS.contains(&key.as_str()) {
+                        if !child.is_boolean() {
+                            strict_client_subschema_errors(child, &child_path, errors);
+                        }
+                    } else {
+                        continue;
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    strict_client_schema_errors(item, &format!("{path}[{index}]"), errors);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn strict_client_subschema_errors(value: &Value, path: &str, errors: &mut Vec<String>) {
+        if value.is_boolean() {
+            errors.push(format!("{path} is a bare boolean schema"));
+        } else {
+            strict_client_schema_errors(value, path, errors);
+        }
+    }
+
     #[test]
     fn public_tool_registry_contract_is_capped_unique_and_facade_only() {
         let public_names = public_tool_names();
@@ -4443,6 +4557,110 @@ mod tests {
         assert!(snapshot.duplicate_public_tool_names.is_empty());
         assert!(snapshot.forbidden_public_tool_names.is_empty());
         assert_eq!(snapshot.over_limit_by, 0);
+    }
+
+    #[test]
+    fn production_client_public_tools_list_gate_is_schema_safe_and_capped() {
+        let tools = super::super::schema_sanitize::sanitize_tools(
+            super::super::SynapseService::tool_router().list_all(),
+        );
+        let mut by_name = std::collections::BTreeMap::new();
+        let mut full_tool_names = Vec::new();
+        for tool in tools {
+            full_tool_names.push(tool.name.to_string());
+            by_name.insert(tool.name.to_string(), tool);
+        }
+        full_tool_names.sort();
+
+        let public_names = public_tool_names();
+        validate_public_tool_registry_names(&public_names).expect("public registry <=40");
+        assert!(
+            public_names.len() <= PUBLIC_TOOL_LIMIT,
+            "public registry count {} exceeds {PUBLIC_TOOL_LIMIT}",
+            public_names.len()
+        );
+
+        let normal_agent_names =
+            visible_tool_names_for_profile(ToolProfileKind::NormalAgent, &full_tool_names);
+        assert!(
+            normal_agent_names.len() <= PUBLIC_TOOL_LIMIT,
+            "normal_agent tools/list count {} exceeds {PUBLIC_TOOL_LIMIT}",
+            normal_agent_names.len()
+        );
+
+        let mut strict_client_errors = Vec::new();
+        let mut checked = BTreeSet::new();
+        for name in public_names.iter().chain(normal_agent_names.iter()) {
+            if !checked.insert(name.clone()) {
+                continue;
+            }
+            let tool = by_name
+                .get(name)
+                .unwrap_or_else(|| panic!("registered public/default tool missing: {name}"));
+            strict_client_errors.extend(strict_client_tool_schema_errors(tool));
+        }
+        assert!(
+            strict_client_errors.is_empty(),
+            "production-client tools/list schema gate failed: {strict_client_errors:#?}"
+        );
+    }
+
+    #[test]
+    fn production_client_schema_gate_rejects_boolean_true_subschema() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "payload": true
+            }
+        });
+        let mut errors = Vec::new();
+        strict_client_schema_errors(&schema, "synthetic_tool.inputSchema", &mut errors);
+        assert_eq!(
+            errors,
+            vec!["synthetic_tool.inputSchema.properties.payload is a bare boolean schema"]
+        );
+    }
+
+    #[test]
+    fn production_client_schema_gate_allows_boolean_defaults_and_additional_properties() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "enabled": {
+                    "type": "boolean",
+                    "default": false
+                },
+                "metadata": {
+                    "type": "object",
+                    "additionalProperties": true
+                }
+            }
+        });
+        let mut errors = Vec::new();
+        strict_client_schema_errors(&schema, "synthetic_tool.inputSchema", &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn production_client_schema_gate_rejects_invalid_enum_schema() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": "status"
+                }
+            }
+        });
+        let mut errors = Vec::new();
+        strict_client_schema_errors(&schema, "synthetic_tool.inputSchema", &mut errors);
+        assert_eq!(
+            errors,
+            vec!["synthetic_tool.inputSchema.properties.operation.enum is not a non-empty array"]
+        );
     }
 
     #[test]
