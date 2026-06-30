@@ -124,6 +124,10 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "tool_profile_set",
     "tool_profile_status",
     "window_list",
+    "workspace_get",
+    "workspace_list",
+    "workspace_put",
+    "workspace_subscribe",
 ];
 
 const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
@@ -824,7 +828,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 false,
                 "CF_KV workspace-blackboard exact row",
                 None,
-                error_codes::STORAGE_READ_FAILED,
+                "WORKSPACE_KEY_ABSENT",
                 "read the exact run/key row and handle absent rows explicitly",
             ),
             op(
@@ -835,6 +839,42 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 Some("CF_KV exact row readback with value hash/version"),
                 error_codes::STORAGE_WRITE_FAILED,
                 "retry with the observed expected_version or correct the key/value",
+            ),
+            op(
+                "list",
+                false,
+                false,
+                "CF_KV workspace-blackboard run/prefix scan",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "provide a valid run_id/prefix/limit and inspect corrupt_rows_skipped",
+            ),
+            op(
+                "subscribe",
+                true,
+                false,
+                "SSE subscription registry + workspace.put event stream",
+                Some("subscription id + SSE registry readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide a non-empty prefix and read the returned subscription_id",
+            ),
+            op(
+                "exists",
+                false,
+                false,
+                "CF_KV workspace-blackboard exact row or absent readback",
+                None,
+                "WORKSPACE_KEY_ABSENT",
+                "use exists to distinguish absent user keys from storage failures",
+            ),
+            op(
+                "delete",
+                true,
+                false,
+                "CF_KV workspace-blackboard exact row",
+                Some("pre-delete row hash/version or corrupt hash + post-delete absent readback"),
+                error_codes::STORAGE_WRITE_FAILED,
+                "read the row version or corrupt hash, pass the matching guard, then verify the row is absent",
             ),
         ],
     ),
@@ -1304,6 +1344,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "verification_poll",
     "verification_sources",
     "window_list",
+    "workspace",
     "workspace_get",
     "workspace_list",
     "workspace_put",
@@ -1413,6 +1454,7 @@ const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = &[
     "verification_poll",
     "verification_sources",
     "window_list",
+    "workspace",
     "workspace_get",
     "workspace_list",
     "workspace_put",
@@ -3230,6 +3272,11 @@ mod tests {
                 "control_lease_release",
                 "tool_profile_set",
                 "tool_profile_status",
+                "workspace",
+                "workspace_get",
+                "workspace_list",
+                "workspace_put",
+                "workspace_subscribe",
             ]
             .iter()
             .map(|name| (*name).to_owned()),
@@ -3269,6 +3316,8 @@ mod tests {
         assert!(public_names.contains(&"health".to_owned()));
         assert!(public_names.contains(&"telemetry".to_owned()));
         assert!(!public_names.contains(&"cdp_open_tab".to_owned()));
+        assert!(!public_names.contains(&"workspace_put".to_owned()));
+        assert!(!public_names.contains(&"workspace_get".to_owned()));
         assert!(!public_names.contains(&"storage_put_probe_rows".to_owned()));
 
         let snapshot =
@@ -3339,6 +3388,12 @@ mod tests {
                 .registered_tools_present
                 .contains(&"browser_debugger".to_owned()),
             "#1383 registers the browser_debugger facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"workspace".to_owned()),
+            "#1384 registers the workspace facade"
         );
         assert!(snapshot.duplicate_public_tool_names.is_empty());
         assert!(snapshot.forbidden_public_tool_names.is_empty());
@@ -3552,6 +3607,7 @@ mod tests {
                 "browser_wait",
                 "browser_capture",
                 "browser_storage",
+                "workspace",
             ]
             .into_iter()
             .map(str::to_owned)

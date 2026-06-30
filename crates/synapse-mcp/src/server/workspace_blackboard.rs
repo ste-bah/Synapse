@@ -41,9 +41,54 @@ const MAX_KEY_BYTES: usize = 512;
 const MAX_INLINE_VALUE_BYTES: usize = 256 * 1024;
 const MAX_ARTIFACT_HANDLE_CHARS: usize = 1024;
 const MAX_ARTIFACT_TEXT_CHARS: usize = 512;
+const WORKSPACE_TOOL: &str = "workspace";
+const WORKSPACE_KEY_ABSENT: &str = "WORKSPACE_KEY_ABSENT";
+const WORKSPACE_SOURCE_OF_TRUTH: &str = "CF_KV workspace-blackboard exact row";
 
 static NEXT_WORKSPACE_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 static WORKSPACE_WRITE_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceOperation {
+    Get,
+    Put,
+    List,
+    Subscribe,
+    Exists,
+    Delete,
+}
+
+impl WorkspaceOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Put => "put",
+            Self::List => "list",
+            Self::Subscribe => "subscribe",
+            Self::Exists => "exists",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceParams {
+    pub operation: WorkspaceOperation,
+    #[serde(default)]
+    pub get: Option<WorkspaceGetParams>,
+    #[serde(default)]
+    pub put: Option<WorkspacePutParams>,
+    #[serde(default)]
+    pub list: Option<WorkspaceListParams>,
+    #[serde(default)]
+    pub subscribe: Option<WorkspaceSubscribeParams>,
+    #[serde(default)]
+    pub exists: Option<WorkspaceExistsParams>,
+    #[serde(default)]
+    pub delete: Option<WorkspaceDeleteParams>,
+}
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +157,39 @@ pub struct WorkspaceSubscribeParams {
     pub snapshot_first: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceExistsParams {
+    /// Optional logical run id. Defaults to the current daemon lifecycle run id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeleteParams {
+    /// Optional logical run id. Defaults to the current daemon lifecycle run id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub key: String,
+    /// Exact CF_KV row key for corrupt-row remediation. This is accepted only
+    /// with expected_corrupt_sha256, must be under the resolved workspace run
+    /// prefix, and is refused for decodable rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_row_key: Option<String>,
+    /// Compare-and-delete guard for a decodable row. Read the row first, then
+    /// pass its version so deletes cannot silently remove a concurrently
+    /// updated row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_version: Option<u64>,
+    /// Exact SHA-256 guard for a corrupt row reported by workspace list/get.
+    /// This is mutually exclusive with expected_version and exists so corrupt
+    /// rows can be manually remediated without broad arbitrary storage writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_corrupt_sha256: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceArtifactRef {
@@ -153,6 +231,15 @@ pub struct WorkspaceRowReadback {
     pub row_key: String,
     pub value_len_bytes: u64,
     pub value_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceAbsentReadback {
+    pub cf_name: String,
+    pub row_key: String,
+    pub exists: bool,
+    pub exact_match_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -244,11 +331,81 @@ pub struct WorkspaceSubscribeResponse {
     pub started_at_unix_ms: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceExistenceState {
+    Present,
+    Absent,
+    Expired,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceExistsResponse {
+    pub ok: bool,
+    pub run_id: String,
+    pub key: String,
+    pub row_key: String,
+    pub now_unix_ms: u64,
+    pub exists: bool,
+    pub physical_row_present: bool,
+    pub state: WorkspaceExistenceState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_readback: Option<WorkspaceRowReadback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absent_readback: Option<WorkspaceAbsentReadback>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceDeleteResponse {
+    pub ok: bool,
+    pub run_id: String,
+    pub key: String,
+    pub row_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_corrupt_row: Option<WorkspaceCorruptRow>,
+    pub writer_session_id: String,
+    pub deleted_row_readback: WorkspaceRowReadback,
+    pub post_delete_readback: WorkspaceAbsentReadback,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceResponse {
+    pub operation: WorkspaceOperation,
+    pub source_of_truth: String,
+    pub readback_source_of_truth: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub get: Option<WorkspaceGetResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub put: Option<WorkspacePutResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub list: Option<WorkspaceListResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribe: Option<WorkspaceSubscribeResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exists: Option<WorkspaceExistsResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete: Option<WorkspaceDeleteResponse>,
+}
+
 #[derive(Clone)]
 struct DecodedWorkspaceRow {
     key: Vec<u8>,
     encoded: Vec<u8>,
     entry: WorkspaceEntry,
+}
+
+struct WorkspaceRawRow {
+    key: Vec<u8>,
+    encoded: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -259,6 +416,140 @@ struct WorkspaceCleanupReport {
 
 #[tool_router(router = workspace_blackboard_tool_router, vis = "pub(super)")]
 impl SynapseService {
+    #[tool(
+        description = "Facade for run-scoped workspace blackboard operations in the <=40 public MCP surface. operation is one of get, put, list, subscribe, exists, or delete. Exactly one matching operation spec is accepted. Mutating operations return CF_KV or subscription readback metadata; absent keys are reported as WORKSPACE_KEY_ABSENT instead of generic storage corruption/read failures."
+    )]
+    pub async fn workspace(
+        &self,
+        params: Parameters<WorkspaceParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<WorkspaceResponse>, ErrorData> {
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = WORKSPACE_TOOL,
+            operation = params.0.operation.as_str(),
+            "tool.invocation kind=workspace"
+        );
+        validate_workspace_facade_params(&params.0)?;
+        let session_id = require_workspace_session_id(WORKSPACE_TOOL, &request_context)?;
+        match params.0.operation {
+            WorkspaceOperation::Get => {
+                let response = self.workspace_get_impl(
+                    params.0.get.ok_or_else(|| missing_workspace_spec("get"))?,
+                    &session_id,
+                )?;
+                Ok(Json(workspace_response(
+                    WorkspaceOperation::Get,
+                    format!(
+                        "CF_KV row={} bytes={} sha256={}",
+                        response.storage_readback.row_key,
+                        response.storage_readback.value_len_bytes,
+                        response.storage_readback.value_sha256
+                    ),
+                    |out| out.get = Some(response),
+                )))
+            }
+            WorkspaceOperation::Put => {
+                let response = self.workspace_put_impl(
+                    params.0.put.ok_or_else(|| missing_workspace_spec("put"))?,
+                    &session_id,
+                )?;
+                Ok(Json(workspace_response(
+                    WorkspaceOperation::Put,
+                    format!(
+                        "CF_KV row={} version={} bytes={} sha256={} event_seq={}",
+                        response.storage_readback.row_key,
+                        response.version,
+                        response.storage_readback.value_len_bytes,
+                        response.storage_readback.value_sha256,
+                        response.event_publish_report.event_seq
+                    ),
+                    |out| out.put = Some(response),
+                )))
+            }
+            WorkspaceOperation::List => {
+                let response = self.workspace_list_impl(
+                    params
+                        .0
+                        .list
+                        .ok_or_else(|| missing_workspace_spec("list"))?,
+                    &session_id,
+                )?;
+                Ok(Json(workspace_response(
+                    WorkspaceOperation::List,
+                    format!(
+                        "CF_KV run={} prefix={} returned={} corrupt_rows={}",
+                        response.run_id,
+                        response.prefix,
+                        response.returned_count,
+                        response.corrupt_rows_skipped.len()
+                    ),
+                    |out| out.list = Some(response),
+                )))
+            }
+            WorkspaceOperation::Subscribe => {
+                let response = self.workspace_subscribe_impl(
+                    params
+                        .0
+                        .subscribe
+                        .ok_or_else(|| missing_workspace_spec("subscribe"))?,
+                    &session_id,
+                )?;
+                Ok(Json(workspace_response(
+                    WorkspaceOperation::Subscribe,
+                    format!(
+                        "SSE subscription_id={} event_kind={} run={} prefix={}",
+                        response.subscription_id,
+                        response.event_kind,
+                        response.run_id,
+                        response.prefix
+                    ),
+                    |out| out.subscribe = Some(response),
+                )))
+            }
+            WorkspaceOperation::Exists => {
+                let response = self.workspace_exists_impl(
+                    params
+                        .0
+                        .exists
+                        .ok_or_else(|| missing_workspace_spec("exists"))?,
+                    &session_id,
+                )?;
+                Ok(Json(workspace_response(
+                    WorkspaceOperation::Exists,
+                    format!(
+                        "CF_KV row={} state={:?} exists={} physical_row_present={}",
+                        response.row_key,
+                        response.state,
+                        response.exists,
+                        response.physical_row_present
+                    ),
+                    |out| out.exists = Some(response),
+                )))
+            }
+            WorkspaceOperation::Delete => {
+                let response = self.workspace_delete_impl(
+                    params
+                        .0
+                        .delete
+                        .ok_or_else(|| missing_workspace_spec("delete"))?,
+                    &session_id,
+                )?;
+                Ok(Json(workspace_response(
+                    WorkspaceOperation::Delete,
+                    format!(
+                        "CF_KV row={} deleted_version={:?} deleted_corrupt={} after_exists={}",
+                        response.row_key,
+                        response.deleted_version,
+                        response.deleted_corrupt_row.is_some(),
+                        response.post_delete_readback.exists
+                    ),
+                    |out| out.delete = Some(response),
+                )))
+            }
+        }
+    }
+
     #[tool(
         description = "Publish one run-scoped blackboard entry into durable CF_KV storage, with optional inline JSON and artifact handle. Creates fail closed if the key already exists unless expected_version matches the current row. If artifact.path is provided, Synapse reads the file and verifies size/hash before accepting the row. The write is accepted only after an exact CF_KV row readback, then a workspace.put SSE event is published."
     )]
@@ -752,6 +1043,226 @@ impl SynapseService {
         })
     }
 
+    fn workspace_exists_impl(
+        &self,
+        params: WorkspaceExistsParams,
+        session_id: &str,
+    ) -> Result<WorkspaceExistsResponse, ErrorData> {
+        self.workspace_exists_impl_at(params, session_id, unix_time_ms_now())
+    }
+
+    fn workspace_exists_impl_at(
+        &self,
+        params: WorkspaceExistsParams,
+        session_id: &str,
+        now_unix_ms: u64,
+    ) -> Result<WorkspaceExistsResponse, ErrorData> {
+        validate_session_id(session_id)?;
+        let run_id = resolve_workspace_run_id(params.run_id.as_deref())?;
+        let key = normalize_workspace_key(&params.key)?;
+        let db = self.workspace_db()?;
+        let row_key = workspace_row_key(&run_id, &key);
+        match read_workspace_row_optional(&db, &row_key, now_unix_ms)? {
+            Some(row) if row.entry.expires_at_unix_ms > now_unix_ms => {
+                let storage_readback = workspace_row_readback(&row);
+                Ok(WorkspaceExistsResponse {
+                    ok: true,
+                    run_id,
+                    key,
+                    row_key,
+                    now_unix_ms,
+                    exists: true,
+                    physical_row_present: true,
+                    state: WorkspaceExistenceState::Present,
+                    current_version: Some(row.entry.version),
+                    expires_at_unix_ms: Some(row.entry.expires_at_unix_ms),
+                    storage_readback: Some(storage_readback),
+                    absent_readback: None,
+                })
+            }
+            Some(row) => {
+                let storage_readback = workspace_row_readback(&row);
+                Ok(WorkspaceExistsResponse {
+                    ok: true,
+                    run_id,
+                    key,
+                    row_key,
+                    now_unix_ms,
+                    exists: false,
+                    physical_row_present: true,
+                    state: WorkspaceExistenceState::Expired,
+                    current_version: Some(row.entry.version),
+                    expires_at_unix_ms: Some(row.entry.expires_at_unix_ms),
+                    storage_readback: Some(storage_readback),
+                    absent_readback: None,
+                })
+            }
+            None => Ok(WorkspaceExistsResponse {
+                ok: true,
+                run_id,
+                key,
+                row_key: row_key.clone(),
+                now_unix_ms,
+                exists: false,
+                physical_row_present: false,
+                state: WorkspaceExistenceState::Absent,
+                current_version: None,
+                expires_at_unix_ms: None,
+                storage_readback: None,
+                absent_readback: Some(readback_absent_workspace_row(&db, &row_key)?),
+            }),
+        }
+    }
+
+    fn workspace_delete_impl(
+        &self,
+        params: WorkspaceDeleteParams,
+        session_id: &str,
+    ) -> Result<WorkspaceDeleteResponse, ErrorData> {
+        self.workspace_delete_impl_at(params, session_id, unix_time_ms_now())
+    }
+
+    fn workspace_delete_impl_at(
+        &self,
+        params: WorkspaceDeleteParams,
+        session_id: &str,
+        _now_unix_ms: u64,
+    ) -> Result<WorkspaceDeleteResponse, ErrorData> {
+        validate_session_id(session_id)?;
+        let run_id = resolve_workspace_run_id(params.run_id.as_deref())?;
+        let key = normalize_workspace_key(&params.key)?;
+        let row_key = match params.raw_row_key.as_deref() {
+            Some(raw_row_key) => validate_workspace_raw_delete_row_key(&run_id, raw_row_key)?,
+            None => workspace_row_key(&run_id, &key),
+        };
+        let _write_guard = workspace_write_lock()?;
+        let db = self.workspace_db()?;
+        let raw_row = read_workspace_raw_row_optional(&db, &row_key)?
+            .ok_or_else(|| workspace_missing_error(&run_id, &key, &row_key))?;
+        let deleted_row_readback = WorkspaceRowReadback {
+            cf_name: cf::CF_KV.to_owned(),
+            row_key: row_key.clone(),
+            value_len_bytes: raw_row.encoded.len() as u64,
+            value_sha256: hash_bytes(&raw_row.encoded),
+        };
+        let (deleted_version, deleted_corrupt_row) =
+            match decode_workspace_row(raw_row.key.clone(), raw_row.encoded.clone()) {
+                Ok(row) => {
+                    validate_workspace_delete_version_guard(
+                        params.expected_version,
+                        params.expected_corrupt_sha256.as_deref(),
+                        params.raw_row_key.as_deref(),
+                        row.entry.version,
+                        &run_id,
+                        &key,
+                        &row_key,
+                    )?;
+                    (Some(row.entry.version), None)
+                }
+                Err(error) => {
+                    validate_workspace_delete_corrupt_guard(
+                        params.expected_version,
+                        params.expected_corrupt_sha256.as_deref(),
+                        params.raw_row_key.as_deref(),
+                        &deleted_row_readback,
+                        &run_id,
+                        &key,
+                    )?;
+                    (
+                        None,
+                        Some(WorkspaceCorruptRow {
+                            row_key: row_key.clone(),
+                            value_len_bytes: deleted_row_readback.value_len_bytes,
+                            value_sha256: deleted_row_readback.value_sha256.clone(),
+                            error,
+                        }),
+                    )
+                }
+            };
+        let command_payload = json!({
+            "run_id": &params.run_id,
+            "resolved_run_id": &run_id,
+            "key": &params.key,
+            "normalized_key": &key,
+            "raw_row_key": &params.raw_row_key,
+            "expected_version": params.expected_version,
+            "expected_corrupt_sha256": &params.expected_corrupt_sha256,
+        });
+        let command_before = json!({
+            "source_of_truth": cf::CF_KV,
+            "row_key": &row_key,
+            "current_version": deleted_version,
+            "deleted_corrupt_row": &deleted_corrupt_row,
+            "deleted_row_readback": &deleted_row_readback,
+        });
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "workspace",
+            "delete",
+            Some(session_id.to_owned()),
+            Some(session_id.to_owned()),
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        delete_workspace_rows(&db, vec![raw_row.key], "delete exact workspace row")?;
+        let post_delete_readback = readback_absent_workspace_row(&db, &row_key)?;
+        if post_delete_readback.exists {
+            let error = mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!("workspace delete readback still found row {row_key}"),
+            );
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "workspace",
+                    "delete",
+                    Some(session_id.to_owned()),
+                    Some(session_id.to_owned()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": cf::CF_KV,
+                        "row_key": &row_key,
+                        "post_delete_readback": &post_delete_readback,
+                    }),
+                    "error",
+                )
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&error),
+                ),
+            )?;
+            return Err(error);
+        }
+        let response = WorkspaceDeleteResponse {
+            ok: true,
+            run_id,
+            key,
+            row_key,
+            deleted_version,
+            deleted_corrupt_row,
+            writer_session_id: session_id.to_owned(),
+            deleted_row_readback,
+            post_delete_readback,
+        };
+        self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+            "workspace",
+            "delete",
+            Some(session_id.to_owned()),
+            Some(session_id.to_owned()),
+            command_payload,
+            command_before,
+            json!({
+                "source_of_truth": cf::CF_KV,
+                "row_key": &response.row_key,
+                "deleted_version": response.deleted_version,
+                "deleted_corrupt_row": &response.deleted_corrupt_row,
+                "post_delete_readback": &response.post_delete_readback,
+            }),
+            "ok",
+        ))?;
+        Ok(response)
+    }
+
     fn workspace_db(&self) -> Result<Arc<Db>, ErrorData> {
         let state = self.m3_state_handle();
         let mut guard = state.lock().map_err(|_error| {
@@ -864,17 +1375,24 @@ fn read_workspace_row_optional(
     row_key: &str,
     _now_unix_ms: u64,
 ) -> Result<Option<DecodedWorkspaceRow>, ErrorData> {
-    let row = db
+    let Some(row) = read_workspace_raw_row_optional(db, row_key)? else {
+        return Ok(None);
+    };
+    decode_workspace_row(row.key, row.encoded)
+        .map(Some)
+        .map_err(|error| workspace_corrupt_error(row_key, error))
+}
+
+fn read_workspace_raw_row_optional(
+    db: &Db,
+    row_key: &str,
+) -> Result<Option<WorkspaceRawRow>, ErrorData> {
+    Ok(db
         .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
         .map_err(|error| mcp_error(error.code(), error.to_string()))?
         .into_iter()
-        .find(|(key, _value)| key == row_key.as_bytes());
-    let Some((key, encoded)) = row else {
-        return Ok(None);
-    };
-    decode_workspace_row(key, encoded)
-        .map(Some)
-        .map_err(|error| workspace_corrupt_error(row_key, error))
+        .find(|(key, _value)| key == row_key.as_bytes())
+        .map(|(key, encoded)| WorkspaceRawRow { key, encoded }))
 }
 
 fn decode_workspace_row(key: Vec<u8>, encoded: Vec<u8>) -> Result<DecodedWorkspaceRow, String> {
@@ -923,6 +1441,33 @@ fn readback_exact_workspace_row(db: &Db, row_key: &str) -> Result<WorkspaceRowRe
         value_len_bytes: stored.len() as u64,
         value_sha256: hash_bytes(&stored),
     })
+}
+
+fn readback_absent_workspace_row(
+    db: &Db,
+    row_key: &str,
+) -> Result<WorkspaceAbsentReadback, ErrorData> {
+    let exact_match_count = db
+        .scan_cf_prefix(cf::CF_KV, row_key.as_bytes())
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+        .into_iter()
+        .filter(|(key, _value)| key == row_key.as_bytes())
+        .count();
+    Ok(WorkspaceAbsentReadback {
+        cf_name: cf::CF_KV.to_owned(),
+        row_key: row_key.to_owned(),
+        exists: exact_match_count > 0,
+        exact_match_count,
+    })
+}
+
+fn workspace_row_readback(row: &DecodedWorkspaceRow) -> WorkspaceRowReadback {
+    WorkspaceRowReadback {
+        cf_name: cf::CF_KV.to_owned(),
+        row_key: row.entry.row_key.clone(),
+        value_len_bytes: row.encoded.len() as u64,
+        value_sha256: hash_bytes(&row.encoded),
+    }
 }
 
 fn encode_workspace_entry(entry: &WorkspaceEntry) -> Result<Vec<u8>, ErrorData> {
@@ -1225,11 +1770,13 @@ fn workspace_missing_error(run_id: &str, key: &str, row_key: &str) -> ErrorData 
         ErrorCode(-32099),
         format!("workspace blackboard key {key:?} was not found for run {run_id:?}"),
         Some(json!({
-            "code": error_codes::STORAGE_READ_FAILED,
+            "code": WORKSPACE_KEY_ABSENT,
+            "detail_code": WORKSPACE_KEY_ABSENT,
             "run_id": run_id,
             "key": key,
             "row_key": row_key,
-            "source_of_truth": "CF_KV workspace-blackboard exact row",
+            "source_of_truth": WORKSPACE_SOURCE_OF_TRUTH,
+            "remediation": "create the key with workspace operation=put or check presence with workspace operation=exists",
         })),
     )
 }
@@ -1296,6 +1843,186 @@ fn workspace_version_conflict_error(
     )
 }
 
+fn validate_workspace_delete_version_guard(
+    expected_version: Option<u64>,
+    expected_corrupt_sha256: Option<&str>,
+    raw_row_key: Option<&str>,
+    current_version: u64,
+    run_id: &str,
+    key: &str,
+    row_key: &str,
+) -> Result<(), ErrorData> {
+    if raw_row_key.is_some() {
+        return Err(workspace_delete_guard_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "WORKSPACE_DELETE_RAW_ROW_KEY_ON_DECODABLE_ROW",
+            "workspace delete received raw_row_key for a decodable row",
+            run_id,
+            key,
+            row_key,
+            expected_version,
+            expected_corrupt_sha256,
+            None,
+            "omit raw_row_key and pass expected_version for decodable rows",
+        ));
+    }
+    if let Some(hash) = expected_corrupt_sha256 {
+        return Err(workspace_delete_guard_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "WORKSPACE_DELETE_CORRUPT_GUARD_ON_DECODABLE_ROW",
+            "workspace delete received expected_corrupt_sha256 for a decodable row",
+            run_id,
+            key,
+            row_key,
+            expected_version,
+            Some(hash),
+            None,
+            "read the row version and pass expected_version for decodable rows",
+        ));
+    }
+    validate_workspace_expected_version(
+        expected_version,
+        Some(current_version),
+        run_id,
+        key,
+        row_key,
+    )
+}
+
+fn validate_workspace_delete_corrupt_guard(
+    expected_version: Option<u64>,
+    expected_corrupt_sha256: Option<&str>,
+    raw_row_key: Option<&str>,
+    readback: &WorkspaceRowReadback,
+    run_id: &str,
+    key: &str,
+) -> Result<(), ErrorData> {
+    if expected_version.is_some() {
+        return Err(workspace_delete_guard_error(
+            error_codes::STORAGE_CORRUPTED,
+            "WORKSPACE_DELETE_VERSION_GUARD_ON_CORRUPT_ROW",
+            "workspace delete cannot use expected_version for a corrupt row because no trusted version can be decoded",
+            run_id,
+            key,
+            &readback.row_key,
+            expected_version,
+            expected_corrupt_sha256,
+            Some(&readback.value_sha256),
+            "read the corrupt row hash from workspace list/get, then retry with expected_corrupt_sha256 and no expected_version",
+        ));
+    }
+    if raw_row_key.is_some_and(|raw| raw.trim() != readback.row_key) {
+        return Err(workspace_delete_guard_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "WORKSPACE_DELETE_RAW_ROW_KEY_MISMATCH",
+            "workspace delete raw_row_key did not match the physical row selected for deletion",
+            run_id,
+            key,
+            &readback.row_key,
+            expected_version,
+            expected_corrupt_sha256,
+            Some(&readback.value_sha256),
+            "pass the exact corrupt row_key returned by workspace list/get",
+        ));
+    }
+    let Some(expected_hash) = expected_corrupt_sha256.map(str::trim) else {
+        return Err(workspace_delete_guard_error(
+            error_codes::STORAGE_CORRUPTED,
+            "WORKSPACE_CORRUPT_ROW_REQUIRES_HASH_GUARD",
+            "workspace delete found a corrupt row and requires expected_corrupt_sha256 before deleting it",
+            run_id,
+            key,
+            &readback.row_key,
+            expected_version,
+            None,
+            Some(&readback.value_sha256),
+            "read the corrupt row hash from workspace list/get, then retry with expected_corrupt_sha256",
+        ));
+    };
+    if expected_hash != readback.value_sha256 {
+        return Err(workspace_delete_guard_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            "WORKSPACE_CORRUPT_HASH_CONFLICT",
+            "workspace delete corrupt-row hash precondition failed",
+            run_id,
+            key,
+            &readback.row_key,
+            expected_version,
+            Some(expected_hash),
+            Some(&readback.value_sha256),
+            "retry only after reading the current corrupt row hash from the source of truth",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_workspace_raw_delete_row_key(
+    run_id: &str,
+    raw_row_key: &str,
+) -> Result<String, ErrorData> {
+    let trimmed = raw_row_key.trim();
+    if trimmed.is_empty() {
+        return Err(params_error(
+            "workspace delete raw_row_key must not be empty",
+        ));
+    }
+    if trimmed != raw_row_key {
+        return Err(params_error(
+            "workspace delete raw_row_key must not contain leading or trailing whitespace",
+        ));
+    }
+    if trimmed.len() > MAX_ARTIFACT_HANDLE_CHARS {
+        return Err(params_error(format!(
+            "workspace delete raw_row_key must be <= {MAX_ARTIFACT_HANDLE_CHARS} bytes"
+        )));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(params_error(
+            "workspace delete raw_row_key must not contain control characters",
+        ));
+    }
+    let run_prefix = workspace_run_prefix(run_id);
+    if !trimmed.starts_with(&run_prefix) || trimmed == run_prefix {
+        return Err(workspace_facade_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "delete",
+            "workspace delete raw_row_key must be under the resolved workspace run prefix",
+            "pass the exact corrupt row_key returned by workspace list/get for the same run_id",
+        ));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn workspace_delete_guard_error(
+    code: &'static str,
+    detail_code: &'static str,
+    message: impl Into<String>,
+    run_id: &str,
+    key: &str,
+    row_key: &str,
+    expected_version: Option<u64>,
+    expected_corrupt_sha256: Option<&str>,
+    actual_sha256: Option<&str>,
+    remediation: impl Into<String>,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        message.into(),
+        Some(json!({
+            "code": code,
+            "detail_code": detail_code,
+            "run_id": run_id,
+            "key": key,
+            "row_key": row_key,
+            "expected_version": expected_version,
+            "expected_corrupt_sha256": expected_corrupt_sha256,
+            "actual_sha256": actual_sha256,
+            "source_of_truth": WORKSPACE_SOURCE_OF_TRUTH,
+            "remediation": remediation.into(),
+        })),
+    )
+}
+
 fn workspace_corrupt_error(row_key: &str, detail: String) -> ErrorData {
     ErrorData::new(
         ErrorCode(-32099),
@@ -1311,6 +2038,100 @@ fn workspace_corrupt_error(row_key: &str, detail: String) -> ErrorData {
 
 fn params_error(message: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_PARAMS_INVALID, message.into())
+}
+
+fn validate_workspace_facade_params(params: &WorkspaceParams) -> Result<(), ErrorData> {
+    validate_exact_operation_spec(
+        WORKSPACE_TOOL,
+        params.operation.as_str(),
+        &[
+            ("get", params.get.is_some()),
+            ("put", params.put.is_some()),
+            ("list", params.list.is_some()),
+            ("subscribe", params.subscribe.is_some()),
+            ("exists", params.exists.is_some()),
+            ("delete", params.delete.is_some()),
+        ],
+    )
+}
+
+fn validate_exact_operation_spec(
+    tool: &'static str,
+    operation: &'static str,
+    specs: &[(&'static str, bool)],
+) -> Result<(), ErrorData> {
+    let present = specs
+        .iter()
+        .filter_map(|(name, is_present)| is_present.then_some(*name))
+        .collect::<Vec<_>>();
+    if !present.contains(&operation) {
+        return Err(workspace_facade_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            operation,
+            format!("{tool} operation={operation} requires a matching {operation} spec"),
+            format!("pass {operation}={{...}} and no other operation spec"),
+        ));
+    }
+    if present.len() != 1 {
+        return Err(workspace_facade_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            operation,
+            format!("{tool} operation={operation} received invalid operation specs {present:?}"),
+            format!("pass exactly one operation-specific spec matching {operation}"),
+        ));
+    }
+    Ok(())
+}
+
+fn missing_workspace_spec(operation: &'static str) -> ErrorData {
+    workspace_facade_error(
+        error_codes::TOOL_PARAMS_INVALID,
+        operation,
+        format!("workspace operation={operation} requires a {operation} spec"),
+        format!("pass {operation}={{...}} and no other operation spec"),
+    )
+}
+
+fn workspace_facade_error(
+    code: &'static str,
+    operation: &'static str,
+    message: impl Into<String>,
+    remediation: impl Into<String>,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        message.into(),
+        Some(json!({
+            "code": code,
+            "tool": WORKSPACE_TOOL,
+            "operation": operation,
+            "source_of_truth": "typed workspace facade params before delegated workspace operation",
+            "remediation": remediation.into(),
+        })),
+    )
+}
+
+fn workspace_response(
+    operation: WorkspaceOperation,
+    readback_source_of_truth: String,
+    populate: impl FnOnce(&mut WorkspaceResponse),
+) -> WorkspaceResponse {
+    let mut response = WorkspaceResponse {
+        operation,
+        source_of_truth: format!(
+            "{WORKSPACE_SOURCE_OF_TRUTH} + delegated workspace operation={}",
+            operation.as_str()
+        ),
+        readback_source_of_truth,
+        get: None,
+        put: None,
+        list: None,
+        subscribe: None,
+        exists: None,
+        delete: None,
+    };
+    populate(&mut response);
+    response
 }
 
 fn require_workspace_session_id(
@@ -1420,6 +2241,14 @@ mod tests {
             .data
             .as_ref()
             .and_then(|data| data.get("detail_code"))
+            .and_then(Value::as_str)
+    }
+
+    fn error_remediation(error: &rmcp::ErrorData) -> Option<&str> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("remediation"))
             .and_then(Value::as_str)
     }
 
@@ -1815,5 +2644,366 @@ mod tests {
         };
         assert_eq!(error_code(&error), Some(error_codes::TOOL_PARAMS_INVALID));
         Ok(())
+    }
+
+    #[test]
+    fn workspace_get_absent_key_has_typed_absent_error() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        let error = match service.workspace_get_impl_at(
+            WorkspaceGetParams {
+                run_id: Some("run-absent".to_owned()),
+                key: "missing/key".to_owned(),
+            },
+            "session-a",
+            80_000,
+        ) {
+            Ok(response) => anyhow::bail!("absent get unexpectedly succeeded: {response:?}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error_code(&error), Some(WORKSPACE_KEY_ABSENT));
+        assert_eq!(error_detail_code(&error), Some(WORKSPACE_KEY_ABSENT));
+        assert!(
+            error_remediation(&error)
+                .is_some_and(|text| text.contains("workspace operation=exists"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_facade_put_get_exists_delete_round_trip() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        let put = service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-facade".to_owned()),
+                key: "findings/facade".to_owned(),
+                expected_version: None,
+                value: Some(json!({"marker": "facade", "known": 4})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-a",
+            90_000,
+        )?;
+        assert_eq!(put.version, 1);
+
+        let exists = service.workspace_exists_impl_at(
+            WorkspaceExistsParams {
+                run_id: Some("run-facade".to_owned()),
+                key: "findings/facade".to_owned(),
+            },
+            "session-b",
+            90_001,
+        )?;
+        assert!(exists.exists);
+        assert!(exists.physical_row_present);
+        assert_eq!(exists.state, WorkspaceExistenceState::Present);
+        assert_eq!(exists.current_version, Some(1));
+
+        let delete = service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-facade".to_owned()),
+                key: "findings/facade".to_owned(),
+                raw_row_key: None,
+                expected_version: Some(1),
+                expected_corrupt_sha256: None,
+            },
+            "session-c",
+            90_002,
+        )?;
+        assert_eq!(delete.deleted_version, Some(1));
+        assert!(delete.deleted_corrupt_row.is_none());
+        assert!(!delete.post_delete_readback.exists);
+        assert_eq!(delete.post_delete_readback.exact_match_count, 0);
+
+        let absent = service.workspace_exists_impl_at(
+            WorkspaceExistsParams {
+                run_id: Some("run-facade".to_owned()),
+                key: "findings/facade".to_owned(),
+            },
+            "session-d",
+            90_003,
+        )?;
+        assert!(!absent.exists);
+        assert_eq!(absent.state, WorkspaceExistenceState::Absent);
+        assert_eq!(
+            absent
+                .absent_readback
+                .as_ref()
+                .map(|readback| readback.exact_match_count),
+            Some(0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_delete_requires_current_expected_version() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+
+        service.workspace_put_impl_at(
+            WorkspacePutParams {
+                run_id: Some("run-delete-cas".to_owned()),
+                key: "findings/protected".to_owned(),
+                expected_version: None,
+                value: Some(json!({"version": 1})),
+                artifact: None,
+                ttl_ms: 60_000,
+            },
+            "session-a",
+            100_000,
+        )?;
+
+        let conflict = match service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-cas".to_owned()),
+                key: "findings/protected".to_owned(),
+                raw_row_key: None,
+                expected_version: Some(2),
+                expected_corrupt_sha256: None,
+            },
+            "session-b",
+            100_001,
+        ) {
+            Ok(response) => {
+                anyhow::bail!("wrong-version delete unexpectedly succeeded: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&conflict),
+            Some(error_codes::STORAGE_WRITE_FAILED)
+        );
+        assert_eq!(
+            error_detail_code(&conflict),
+            Some("WORKSPACE_VERSION_CONFLICT")
+        );
+
+        let still_present = service.workspace_exists_impl_at(
+            WorkspaceExistsParams {
+                run_id: Some("run-delete-cas".to_owned()),
+                key: "findings/protected".to_owned(),
+            },
+            "session-c",
+            100_002,
+        )?;
+        assert!(still_present.exists);
+        assert_eq!(still_present.current_version, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_delete_corrupt_row_requires_exact_hash_guard() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let service = service_with_db(temp.path())?;
+        let db = service.workspace_db()?;
+        let corrupt_key = workspace_row_key("run-delete-corrupt", "findings/bad");
+        let corrupt_value = b"{not-json".to_vec();
+        let corrupt_hash = hash_bytes(&corrupt_value);
+        db.put_batch_pressure_bypass(
+            cf::CF_KV,
+            [(corrupt_key.as_bytes().to_vec(), corrupt_value.clone())],
+        )?;
+
+        let listed = service.workspace_list_impl_at(
+            WorkspaceListParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                prefix: Some("findings/".to_owned()),
+                limit: 10,
+                include_values: false,
+            },
+            "session-a",
+            110_000,
+        )?;
+        assert_eq!(listed.returned_count, 0);
+        assert_eq!(listed.corrupt_rows_skipped.len(), 1);
+        assert_eq!(listed.corrupt_rows_skipped[0].row_key, corrupt_key);
+        assert_eq!(listed.corrupt_rows_skipped[0].value_sha256, corrupt_hash);
+
+        let missing_guard = match service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                key: "findings/bad".to_owned(),
+                raw_row_key: None,
+                expected_version: None,
+                expected_corrupt_sha256: None,
+            },
+            "session-b",
+            110_001,
+        ) {
+            Ok(response) => {
+                anyhow::bail!("unguarded corrupt delete unexpectedly succeeded: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&missing_guard),
+            Some(error_codes::STORAGE_CORRUPTED)
+        );
+        assert_eq!(
+            error_detail_code(&missing_guard),
+            Some("WORKSPACE_CORRUPT_ROW_REQUIRES_HASH_GUARD")
+        );
+        assert_eq!(
+            readback_exact_workspace_row(&db, &corrupt_key)?.value_sha256,
+            corrupt_hash
+        );
+
+        let wrong_hash = match service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                key: "findings/bad".to_owned(),
+                raw_row_key: None,
+                expected_version: None,
+                expected_corrupt_sha256: Some("sha256:0000".to_owned()),
+            },
+            "session-c",
+            110_002,
+        ) {
+            Ok(response) => {
+                anyhow::bail!("wrong-hash corrupt delete unexpectedly succeeded: {response:?}")
+            }
+            Err(error) => error,
+        };
+        assert_eq!(
+            error_code(&wrong_hash),
+            Some(error_codes::STORAGE_WRITE_FAILED)
+        );
+        assert_eq!(
+            error_detail_code(&wrong_hash),
+            Some("WORKSPACE_CORRUPT_HASH_CONFLICT")
+        );
+        assert_eq!(
+            readback_exact_workspace_row(&db, &corrupt_key)?.value_sha256,
+            corrupt_hash
+        );
+
+        let deleted = service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                key: "findings/bad".to_owned(),
+                raw_row_key: None,
+                expected_version: None,
+                expected_corrupt_sha256: Some(corrupt_hash.clone()),
+            },
+            "session-d",
+            110_003,
+        )?;
+        assert_eq!(deleted.deleted_version, None);
+        assert_eq!(
+            deleted
+                .deleted_corrupt_row
+                .as_ref()
+                .map(|row| row.value_sha256.as_str()),
+            Some(corrupt_hash.as_str())
+        );
+        assert!(!deleted.post_delete_readback.exists);
+        assert_eq!(
+            readback_absent_workspace_row(&db, &corrupt_key)?.exact_match_count,
+            0
+        );
+
+        let indexed_corrupt_key = format!(
+            "{}:00000000000000000000",
+            workspace_row_key("run-delete-corrupt", "findings/indexed")
+        );
+        let indexed_corrupt_value = b"{indexed-not-json".to_vec();
+        let indexed_corrupt_hash = hash_bytes(&indexed_corrupt_value);
+        db.put_batch_pressure_bypass(
+            cf::CF_KV,
+            [(
+                indexed_corrupt_key.as_bytes().to_vec(),
+                indexed_corrupt_value,
+            )],
+        )?;
+
+        let indexed_list = service.workspace_list_impl_at(
+            WorkspaceListParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                prefix: Some("findings/".to_owned()),
+                limit: 10,
+                include_values: false,
+            },
+            "session-e",
+            110_004,
+        )?;
+        assert_eq!(indexed_list.corrupt_rows_skipped.len(), 1);
+        assert_eq!(
+            indexed_list.corrupt_rows_skipped[0].row_key,
+            indexed_corrupt_key
+        );
+        assert_eq!(
+            indexed_list.corrupt_rows_skipped[0].value_sha256,
+            indexed_corrupt_hash
+        );
+
+        let indexed_deleted = service.workspace_delete_impl_at(
+            WorkspaceDeleteParams {
+                run_id: Some("run-delete-corrupt".to_owned()),
+                key: "findings/indexed".to_owned(),
+                raw_row_key: Some(indexed_corrupt_key.clone()),
+                expected_version: None,
+                expected_corrupt_sha256: Some(indexed_corrupt_hash.clone()),
+            },
+            "session-f",
+            110_005,
+        )?;
+        assert_eq!(indexed_deleted.deleted_version, None);
+        assert_eq!(
+            indexed_deleted
+                .deleted_corrupt_row
+                .as_ref()
+                .map(|row| row.value_sha256.as_str()),
+            Some(indexed_corrupt_hash.as_str())
+        );
+        assert_eq!(
+            readback_absent_workspace_row(&db, &indexed_corrupt_key)?.exact_match_count,
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_facade_params_require_exact_matching_spec() {
+        let missing = validate_workspace_facade_params(&WorkspaceParams {
+            operation: WorkspaceOperation::Put,
+            get: Some(WorkspaceGetParams {
+                run_id: Some("run".to_owned()),
+                key: "k".to_owned(),
+            }),
+            put: None,
+            list: None,
+            subscribe: None,
+            exists: None,
+            delete: None,
+        })
+        .expect_err("operation=put without put spec must fail");
+        assert_eq!(error_code(&missing), Some(error_codes::TOOL_PARAMS_INVALID));
+
+        let extra = validate_workspace_facade_params(&WorkspaceParams {
+            operation: WorkspaceOperation::Get,
+            get: Some(WorkspaceGetParams {
+                run_id: Some("run".to_owned()),
+                key: "k".to_owned(),
+            }),
+            put: Some(WorkspacePutParams {
+                run_id: Some("run".to_owned()),
+                key: "k".to_owned(),
+                expected_version: None,
+                value: Some(json!({"bad": true})),
+                artifact: None,
+                ttl_ms: 60_000,
+            }),
+            list: None,
+            subscribe: None,
+            exists: None,
+            delete: None,
+        })
+        .expect_err("multiple specs must fail");
+        assert_eq!(error_code(&extra), Some(error_codes::TOOL_PARAMS_INVALID));
     }
 }
