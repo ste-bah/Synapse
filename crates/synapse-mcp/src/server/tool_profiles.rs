@@ -91,6 +91,7 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "act_spawn_agent",
     "act_stroke",
     "act_type",
+    "agent_ask_operator",
     "agent_inbox",
     "agent_interrupt",
     "agent_kill",
@@ -108,6 +109,10 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "agent_template_list",
     "agent_template_put",
     "agent_wait",
+    "approval_decide",
+    "approval_gate",
+    "approval_list",
+    "approval_request",
     "armed_routine_tick",
     "audit_intelligence_query",
     "browser_screenshot",
@@ -122,6 +127,10 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "clear_target",
     "demo_record_start",
     "demo_record_stop",
+    "escalation_ack",
+    "escalation_config_get",
+    "escalation_config_set",
+    "escalation_list",
     "get_target",
     "hidden_desktop_pip_frame",
     "intent_detect_tick",
@@ -1164,13 +1173,22 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "approval",
         "ApprovalOperation",
-        "approval queue rows + decision audit rows",
+        "CF_KV approval/v1/item rows + approval/v1/audit rows + daemon-tool-events.jsonl",
         &[
+            op(
+                "request",
+                true,
+                false,
+                "CF_KV approval item row + approval audit row",
+                Some("approval item_row/audit_row readback"),
+                error_codes::TOOL_INTERNAL_ERROR,
+                "fix request fields and inspect item_row/audit_row in CF_KV",
+            ),
             op(
                 "list",
                 false,
                 false,
-                "approval queue rows",
+                "CF_KV approval item prefix scan",
                 None,
                 error_codes::TOOL_INTERNAL_ERROR,
                 "read current approval rows and choose an existing request id",
@@ -1179,26 +1197,73 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "decide",
                 true,
                 false,
-                "approval queue row",
-                Some("approval decision row readback"),
+                "CF_KV approval item row + transition audit row",
+                Some("approval decision item_row/audit_row readback"),
                 error_codes::TOOL_PARAMS_INVALID,
                 "decide an existing pending approval id with explicit outcome",
+            ),
+            op(
+                "gate",
+                true,
+                false,
+                "CF_KV approval item row for risky calls or direct gate verdict for auto-allow",
+                Some("approval gate verdict plus queue row when one is created"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide a strict permission-prompt payload and inspect the gate verdict/queue row",
+            ),
+            op(
+                "ask_operator",
+                true,
+                false,
+                "CF_KV agent_question approval row + audit row",
+                Some("operator answer/decline/timeout row readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide a non-empty question and inspect the agent_question row",
             ),
         ],
     ),
     facade_contract(
         "escalation",
         "EscalationOperation",
-        "escalation policy rows + request audit rows",
-        &[op(
-            "request",
-            true,
-            false,
-            "escalation request row",
-            Some("escalation request/audit readback"),
-            error_codes::TOOL_PARAMS_INVALID,
-            "include the exact operator-only action and current SoT evidence",
-        )],
+        "CF_KV escalation/v1/config + escalation/v1/item rows + escalation/v1/audit rows",
+        &[
+            op(
+                "config_get",
+                false,
+                false,
+                "CF_KV escalation/v1/config row or absent-row default",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "inspect the persisted config row or default policy readback",
+            ),
+            op(
+                "config_set",
+                true,
+                false,
+                "CF_KV escalation/v1/config row",
+                Some("persisted config row readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "fix escalation policy fields and inspect the config row after write",
+            ),
+            op(
+                "list",
+                false,
+                false,
+                "CF_KV escalation item prefix scan",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "inspect status/anchor filters and item rows",
+            ),
+            op(
+                "ack",
+                true,
+                false,
+                "CF_KV escalation item row + audit row",
+                Some("acked item/audit row readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide an existing escalation_id and inspect item/audit rows after ack",
+            ),
+        ],
     ),
     facade_contract(
         "timeline",
@@ -3470,12 +3535,18 @@ mod tests {
                 "act_run_shell_status",
                 "act_spawn_agent",
                 "agent",
+                "agent_ask_operator",
                 "agent_inbox",
                 "agent_query",
                 "agent_send",
                 "agent_stats",
                 "agent_template_get",
                 "agent_wait",
+                "approval",
+                "approval_decide",
+                "approval_gate",
+                "approval_list",
+                "approval_request",
                 "act_foreground",
                 "act_launch",
                 "act",
@@ -3521,6 +3592,11 @@ mod tests {
                 "browser_debugger",
                 "control_lease_acquire",
                 "control_lease_release",
+                "escalation",
+                "escalation_ack",
+                "escalation_config_get",
+                "escalation_config_set",
+                "escalation_list",
                 "tool_profile_set",
                 "tool_profile_status",
                 "task",
@@ -3573,11 +3649,17 @@ mod tests {
         assert!(public_names.contains(&"telemetry".to_owned()));
         assert!(public_names.contains(&"agent".to_owned()));
         assert!(public_names.contains(&"task".to_owned()));
+        assert!(public_names.contains(&"approval".to_owned()));
+        assert!(public_names.contains(&"escalation".to_owned()));
         assert!(!public_names.contains(&"cdp_open_tab".to_owned()));
         assert!(!public_names.contains(&"agent_query".to_owned()));
         assert!(!public_names.contains(&"agent_stats".to_owned()));
         assert!(!public_names.contains(&"task_create".to_owned()));
         assert!(!public_names.contains(&"task_get".to_owned()));
+        assert!(!public_names.contains(&"approval_list".to_owned()));
+        assert!(!public_names.contains(&"approval_gate".to_owned()));
+        assert!(!public_names.contains(&"escalation_list".to_owned()));
+        assert!(!public_names.contains(&"escalation_config_set".to_owned()));
         assert!(!public_names.contains(&"workspace_put".to_owned()));
         assert!(!public_names.contains(&"workspace_get".to_owned()));
         assert!(!public_names.contains(&"storage_put_probe_rows".to_owned()));
@@ -3668,6 +3750,18 @@ mod tests {
                 .registered_tools_present
                 .contains(&"task".to_owned()),
             "#1385 registers the task facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"approval".to_owned()),
+            "#1386 registers the approval facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"escalation".to_owned()),
+            "#1386 registers the escalation facade"
         );
         assert!(snapshot.duplicate_public_tool_names.is_empty());
         assert!(snapshot.forbidden_public_tool_names.is_empty());
@@ -3884,6 +3978,8 @@ mod tests {
                 "workspace",
                 "agent",
                 "task",
+                "approval",
+                "escalation",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -3899,6 +3995,12 @@ mod tests {
         assert!(!visible.contains(&"act_run_shell_status".to_owned()));
         assert!(!visible.contains(&"act_run_shell_cancel".to_owned()));
         assert!(!visible.contains(&"act_launch".to_owned()));
+        assert!(!visible.contains(&"approval_list".to_owned()));
+        assert!(!visible.contains(&"approval_gate".to_owned()));
+        assert!(!visible.contains(&"approval_decide".to_owned()));
+        assert!(!visible.contains(&"escalation_list".to_owned()));
+        assert!(!visible.contains(&"escalation_config_set".to_owned()));
+        assert!(!visible.contains(&"escalation_ack".to_owned()));
         assert!(!visible.contains(&"cdp_activate_tab".to_owned()));
         assert!(!visible.contains(&"cdp_close_tab".to_owned()));
         assert!(!visible.contains(&"cdp_navigate_tab".to_owned()));

@@ -212,6 +212,7 @@ pub(crate) mod agent_tasks;
 pub(crate) mod agent_templates;
 pub(crate) mod agent_transcripts;
 pub(crate) mod ambient_agents;
+mod approval_facades;
 mod audit_context;
 pub(crate) mod codex_app_server_bridge;
 pub(crate) mod command_audit;
@@ -624,6 +625,7 @@ impl SynapseService {
             + Self::agent_template_tool_router()
             + Self::agent_task_tool_router()
             + Self::agent_facade_tool_router()
+            + Self::approval_facade_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()
