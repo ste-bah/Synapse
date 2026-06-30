@@ -42,7 +42,13 @@ use crate::m1::{
 };
 use crate::m3::activity_recorder::BrowserNavigationEvent;
 use crate::server::session_continuity::PersistedCdpTargetOwner;
+use crate::server::target_claims::{
+    DEFAULT_TARGET_CLAIM_TTL_MS, TargetClaimAdoptParams, TargetClaimAdoptResponse,
+    TargetClaimParams, TargetClaimResponse, TargetClaimStatusParams, TargetClaimStatusResponse,
+    TargetClaimTargetParam, TargetReleaseParams, TargetReleaseResponse,
+};
 use base64::Engine as _;
+use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 
 use std::{
@@ -86,6 +92,60 @@ use synapse_reflex::ReflexRuntime;
 
 const SCREENSHOT_SOURCE_OF_TRUTH: &str =
     "screenshot/GIF artifact bytes plus filesystem metadata readback";
+const TARGET_FACADE_SOURCE_OF_TRUTH: &str =
+    "MCP session target registry + CF_SESSIONS target rows + target claim registry";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TargetOperation {
+    #[default]
+    Get,
+    List,
+    Set,
+    Clear,
+    Claim,
+    Status,
+    Adopt,
+    Release,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TargetParams {
+    #[serde(default)]
+    operation: TargetOperation,
+    #[serde(default)]
+    target: Option<SetTargetParam>,
+    #[serde(default)]
+    owner_session_id: Option<String>,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+    #[serde(default)]
+    title_contains: Option<String>,
+    #[serde(default)]
+    process_name_contains: Option<String>,
+    #[serde(default)]
+    exclude_minimized: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TargetFacadeResponse {
+    operation: TargetOperation,
+    source_of_truth: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_state: Option<TargetResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    windows: Option<WindowListResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim: Option<TargetClaimResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_status: Option<TargetClaimStatusResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    adopted: Option<TargetClaimAdoptResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    released: Option<TargetReleaseResponse>,
+}
 
 #[tool_router(router = m1_tool_router, vis = "pub(super)")]
 impl SynapseService {
@@ -1000,6 +1060,131 @@ impl SynapseService {
             window_title: None,
             process_name: None,
         }))
+    }
+
+    #[tool(
+        description = "Public target facade. operation=get reads this MCP session's active target; operation=list passively lists live top-level windows; operation=set/clear update this session target; operation=claim/status/adopt/release wraps advisory target ownership leases. All operations use strict enum routing and return/name the physical source of truth."
+    )]
+    pub async fn target(
+        &self,
+        params: Parameters<TargetParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TargetFacadeResponse>, ErrorData> {
+        let params = params.0;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "target",
+            operation = target_operation_name(params.operation),
+            "tool.invocation kind=target"
+        );
+
+        let response = match params.operation {
+            TargetOperation::Get => {
+                validate_target_get_params(&params)?;
+                let target_state = self.get_target(request_context).await?.0;
+                TargetFacadeResponse::target_state(TargetOperation::Get, target_state)
+            }
+            TargetOperation::List => {
+                validate_target_list_params(&params)?;
+                let windows = self
+                    .window_list(
+                        Parameters(WindowListParams {
+                            title_contains: params.title_contains,
+                            process_name_contains: params.process_name_contains,
+                            exclude_minimized: params.exclude_minimized,
+                        }),
+                        request_context,
+                    )
+                    .await?
+                    .0;
+                TargetFacadeResponse::windows(windows)
+            }
+            TargetOperation::Set => {
+                validate_target_set_params(&params)?;
+                let target = params.target.ok_or_else(|| {
+                    target_facade_error(
+                        TargetOperation::Set,
+                        "target operation=set requires target",
+                        "pass a target from target operation=list or browser_tabs operation=list",
+                        "target",
+                    )
+                })?;
+                let target_state = self
+                    .set_target(Parameters(SetTargetParams { target }), request_context)
+                    .await?
+                    .0;
+                TargetFacadeResponse::target_state(TargetOperation::Set, target_state)
+            }
+            TargetOperation::Clear => {
+                validate_target_clear_params(&params)?;
+                let target_state = self.clear_target(request_context).await?.0;
+                TargetFacadeResponse::target_state(TargetOperation::Clear, target_state)
+            }
+            TargetOperation::Claim => {
+                validate_target_claim_params(&params)?;
+                let claim = self
+                    .target_claim(
+                        Parameters(TargetClaimParams {
+                            target: params.target.map(target_claim_param_from_set),
+                            ttl_ms: params.ttl_ms.unwrap_or(DEFAULT_TARGET_CLAIM_TTL_MS),
+                        }),
+                        request_context,
+                    )
+                    .await?
+                    .0;
+                TargetFacadeResponse::claim(claim)
+            }
+            TargetOperation::Status => {
+                validate_target_status_params(&params)?;
+                let claim_status = self
+                    .target_claim_status(
+                        Parameters(TargetClaimStatusParams {
+                            target: params.target.map(target_claim_param_from_set),
+                        }),
+                        request_context,
+                    )
+                    .await?
+                    .0;
+                TargetFacadeResponse::claim_status(claim_status)
+            }
+            TargetOperation::Adopt => {
+                validate_target_adopt_params(&params)?;
+                let owner_session_id = params.owner_session_id.ok_or_else(|| {
+                    target_facade_error(
+                        TargetOperation::Adopt,
+                        "target operation=adopt requires owner_session_id",
+                        "read target operation=status or session operation=list, then pass the owner_session_id to adopt",
+                        "owner_session_id",
+                    )
+                })?;
+                let adopted = self
+                    .target_claim_adopt(
+                        Parameters(TargetClaimAdoptParams {
+                            owner_session_id,
+                            target: params.target.map(target_claim_param_from_set),
+                            ttl_ms: params.ttl_ms.unwrap_or(DEFAULT_TARGET_CLAIM_TTL_MS),
+                        }),
+                        request_context,
+                    )
+                    .await?
+                    .0;
+                TargetFacadeResponse::adopted(adopted)
+            }
+            TargetOperation::Release => {
+                validate_target_release_params(&params)?;
+                let released = self
+                    .target_release(
+                        Parameters(TargetReleaseParams {
+                            target: params.target.map(target_claim_param_from_set),
+                        }),
+                        request_context,
+                    )
+                    .await?
+                    .0;
+                TargetFacadeResponse::released(released)
+            }
+        };
+        Ok(Json(response))
     }
 
     #[tool(
@@ -12664,6 +12849,248 @@ fn validate_target_window_context(hwnd: i64) -> Result<ForegroundContext, ErrorD
     })
 }
 
+impl TargetFacadeResponse {
+    fn base(operation: TargetOperation) -> Self {
+        Self {
+            operation,
+            source_of_truth: TARGET_FACADE_SOURCE_OF_TRUTH.to_owned(),
+            target_state: None,
+            windows: None,
+            claim: None,
+            claim_status: None,
+            adopted: None,
+            released: None,
+        }
+    }
+
+    fn target_state(operation: TargetOperation, target_state: TargetResponse) -> Self {
+        Self {
+            target_state: Some(target_state),
+            ..Self::base(operation)
+        }
+    }
+
+    fn windows(windows: WindowListResponse) -> Self {
+        Self {
+            windows: Some(windows),
+            ..Self::base(TargetOperation::List)
+        }
+    }
+
+    fn claim(claim: TargetClaimResponse) -> Self {
+        Self {
+            claim: Some(claim),
+            ..Self::base(TargetOperation::Claim)
+        }
+    }
+
+    fn claim_status(claim_status: TargetClaimStatusResponse) -> Self {
+        Self {
+            claim_status: Some(claim_status),
+            ..Self::base(TargetOperation::Status)
+        }
+    }
+
+    fn adopted(adopted: TargetClaimAdoptResponse) -> Self {
+        Self {
+            adopted: Some(adopted),
+            ..Self::base(TargetOperation::Adopt)
+        }
+    }
+
+    fn released(released: TargetReleaseResponse) -> Self {
+        Self {
+            released: Some(released),
+            ..Self::base(TargetOperation::Release)
+        }
+    }
+}
+
+fn target_operation_name(operation: TargetOperation) -> &'static str {
+    match operation {
+        TargetOperation::Get => "get",
+        TargetOperation::List => "list",
+        TargetOperation::Set => "set",
+        TargetOperation::Clear => "clear",
+        TargetOperation::Claim => "claim",
+        TargetOperation::Status => "status",
+        TargetOperation::Adopt => "adopt",
+        TargetOperation::Release => "release",
+    }
+}
+
+fn target_claim_param_from_set(target: SetTargetParam) -> TargetClaimTargetParam {
+    match target {
+        SetTargetParam::Window { window_hwnd } => TargetClaimTargetParam::Window { window_hwnd },
+        SetTargetParam::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        } => TargetClaimTargetParam::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        },
+    }
+}
+
+fn validate_target_get_params(params: &TargetParams) -> Result<(), ErrorData> {
+    reject_target_facade_fields(
+        TargetOperation::Get,
+        &[
+            ("target", params.target.is_some()),
+            ("owner_session_id", params.owner_session_id.is_some()),
+            ("ttl_ms", params.ttl_ms.is_some()),
+            ("title_contains", params.title_contains.is_some()),
+            (
+                "process_name_contains",
+                params.process_name_contains.is_some(),
+            ),
+            ("exclude_minimized", params.exclude_minimized),
+        ],
+    )
+}
+
+fn validate_target_list_params(params: &TargetParams) -> Result<(), ErrorData> {
+    reject_target_facade_fields(
+        TargetOperation::List,
+        &[
+            ("target", params.target.is_some()),
+            ("owner_session_id", params.owner_session_id.is_some()),
+            ("ttl_ms", params.ttl_ms.is_some()),
+        ],
+    )
+}
+
+fn validate_target_set_params(params: &TargetParams) -> Result<(), ErrorData> {
+    reject_target_facade_fields(
+        TargetOperation::Set,
+        &[
+            ("owner_session_id", params.owner_session_id.is_some()),
+            ("ttl_ms", params.ttl_ms.is_some()),
+            ("title_contains", params.title_contains.is_some()),
+            (
+                "process_name_contains",
+                params.process_name_contains.is_some(),
+            ),
+            ("exclude_minimized", params.exclude_minimized),
+        ],
+    )
+}
+
+fn validate_target_clear_params(params: &TargetParams) -> Result<(), ErrorData> {
+    reject_target_facade_fields(
+        TargetOperation::Clear,
+        &[
+            ("target", params.target.is_some()),
+            ("owner_session_id", params.owner_session_id.is_some()),
+            ("ttl_ms", params.ttl_ms.is_some()),
+            ("title_contains", params.title_contains.is_some()),
+            (
+                "process_name_contains",
+                params.process_name_contains.is_some(),
+            ),
+            ("exclude_minimized", params.exclude_minimized),
+        ],
+    )
+}
+
+fn validate_target_claim_params(params: &TargetParams) -> Result<(), ErrorData> {
+    reject_target_facade_fields(
+        TargetOperation::Claim,
+        &[
+            ("owner_session_id", params.owner_session_id.is_some()),
+            ("title_contains", params.title_contains.is_some()),
+            (
+                "process_name_contains",
+                params.process_name_contains.is_some(),
+            ),
+            ("exclude_minimized", params.exclude_minimized),
+        ],
+    )
+}
+
+fn validate_target_status_params(params: &TargetParams) -> Result<(), ErrorData> {
+    reject_target_facade_fields(
+        TargetOperation::Status,
+        &[
+            ("owner_session_id", params.owner_session_id.is_some()),
+            ("ttl_ms", params.ttl_ms.is_some()),
+            ("title_contains", params.title_contains.is_some()),
+            (
+                "process_name_contains",
+                params.process_name_contains.is_some(),
+            ),
+            ("exclude_minimized", params.exclude_minimized),
+        ],
+    )
+}
+
+fn validate_target_adopt_params(params: &TargetParams) -> Result<(), ErrorData> {
+    reject_target_facade_fields(
+        TargetOperation::Adopt,
+        &[
+            ("title_contains", params.title_contains.is_some()),
+            (
+                "process_name_contains",
+                params.process_name_contains.is_some(),
+            ),
+            ("exclude_minimized", params.exclude_minimized),
+        ],
+    )
+}
+
+fn validate_target_release_params(params: &TargetParams) -> Result<(), ErrorData> {
+    reject_target_facade_fields(
+        TargetOperation::Release,
+        &[
+            ("owner_session_id", params.owner_session_id.is_some()),
+            ("ttl_ms", params.ttl_ms.is_some()),
+            ("title_contains", params.title_contains.is_some()),
+            (
+                "process_name_contains",
+                params.process_name_contains.is_some(),
+            ),
+            ("exclude_minimized", params.exclude_minimized),
+        ],
+    )
+}
+
+fn reject_target_facade_fields(
+    operation: TargetOperation,
+    fields: &[(&'static str, bool)],
+) -> Result<(), ErrorData> {
+    if let Some((field, _)) = fields.iter().find(|(_, present)| *present) {
+        return Err(target_facade_error(
+            operation,
+            format!(
+                "target operation={} rejects {field}",
+                target_operation_name(operation)
+            ),
+            "remove the operation-irrelevant field or choose the matching target operation",
+            field,
+        ));
+    }
+    Ok(())
+}
+
+fn target_facade_error(
+    operation: TargetOperation,
+    message: impl Into<String>,
+    remediation: &'static str,
+    source_id: &'static str,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        message.into(),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "operation": target_operation_name(operation),
+            "source_of_truth": TARGET_FACADE_SOURCE_OF_TRUTH,
+            "source_id": source_id,
+            "remediation": remediation,
+        })),
+    )
+}
+
 fn screenshot_operation_name(operation: ScreenshotOperation) -> &'static str {
     match operation {
         ScreenshotOperation::Capture => "capture",
@@ -16191,24 +16618,26 @@ mod tests {
         DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS, DEFAULT_BROWSER_WAIT_TIMEOUT_MS, ErrorData,
         MAX_BROWSER_SET_CONTENT_HTML_BYTES, MAX_BROWSER_WAIT_POLLING_INTERVAL_MS,
         MAX_BROWSER_WAIT_TIMEOUT_MS, MIN_BROWSER_WAIT_POLLING_INTERVAL_MS, SessionTarget,
-        SynapseService, TargetWire, attach_find_hygiene_annotations,
-        attach_ocr_hygiene_annotations, browser_wait_for_selector_condition,
-        cdp_activate_resolution_request_details, cdp_target_info_resolution_request_details,
-        chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
-        downscale_captured_bitmap, hidden_desktop_pip_ended_response, hidden_worker_target_miss,
-        mcp_error, ocr_cache_key, page_text_info_from_parts, perception_window_hwnd,
-        resolve_browser_tag_source, resolve_capture_target_window_context,
-        screenshot_downscale_scale, select_single_active_browser_tab, sha256_hex, target_wire,
-        template_value, unavailable_page_vitals_info, validate_browser_add_init_script_params,
-        validate_browser_add_script_tag_params, validate_browser_add_style_tag_params,
-        validate_browser_downloads_params, validate_browser_evaluate_params,
-        validate_browser_expose_binding_params, validate_browser_frame_locator,
-        validate_browser_set_content_params, validate_browser_tabs_params,
-        validate_browser_wait_for_function_params, validate_browser_wait_for_load_state_params,
-        validate_browser_wait_for_params, validate_browser_wait_for_request_params,
-        validate_browser_wait_for_response_params, validate_browser_wait_for_selector_params,
-        validate_browser_wait_for_url_params, validate_screenshot_capture_facade_params,
-        validate_screenshot_gif_facade_params, validate_target_window,
+        SetTargetParam, SynapseService, TargetClaimTargetParam, TargetOperation, TargetParams,
+        TargetWire, attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
+        browser_wait_for_selector_condition, cdp_activate_resolution_request_details,
+        cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
+        chrome_page_vitals_info, downscale_captured_bitmap, hidden_desktop_pip_ended_response,
+        hidden_worker_target_miss, mcp_error, ocr_cache_key, page_text_info_from_parts,
+        perception_window_hwnd, resolve_browser_tag_source, resolve_capture_target_window_context,
+        screenshot_downscale_scale, select_single_active_browser_tab, sha256_hex,
+        target_claim_param_from_set, target_wire, template_value, unavailable_page_vitals_info,
+        validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
+        validate_browser_add_style_tag_params, validate_browser_downloads_params,
+        validate_browser_evaluate_params, validate_browser_expose_binding_params,
+        validate_browser_frame_locator, validate_browser_set_content_params,
+        validate_browser_tabs_params, validate_browser_wait_for_function_params,
+        validate_browser_wait_for_load_state_params, validate_browser_wait_for_params,
+        validate_browser_wait_for_request_params, validate_browser_wait_for_response_params,
+        validate_browser_wait_for_selector_params, validate_browser_wait_for_url_params,
+        validate_screenshot_capture_facade_params, validate_screenshot_gif_facade_params,
+        validate_target_adopt_params, validate_target_get_params, validate_target_set_params,
+        validate_target_status_params, validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
@@ -16230,6 +16659,7 @@ mod tests {
         model::{ClientCapabilities, Implementation, InitializeRequestParams},
         transport::streamable_http_server::session::SessionState,
     };
+    use serde_json::json;
     use std::{collections::BTreeSet, num::NonZeroUsize, path::Path};
     use synapse_core::{OcrResult, OcrWord, PERCEIVED_TEXT_UNTRUSTED_NOTICE, Rect, error_codes};
     use synapse_storage::cf;
@@ -16348,6 +16778,130 @@ mod tests {
             .and_then(|data| data.get(field))
             .and_then(|value| value.as_str())
             .map(str::to_owned)
+    }
+
+    fn target_params(operation: TargetOperation) -> TargetParams {
+        TargetParams {
+            operation,
+            ..TargetParams::default()
+        }
+    }
+
+    #[test]
+    fn target_facade_rejects_unknown_operation_enum() {
+        let error = serde_json::from_value::<TargetParams>(json!({
+            "operation": "delete_everything"
+        }))
+        .expect_err("unknown target operation must fail schema deserialization");
+
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected target operation error: {error}"
+        );
+    }
+
+    #[test]
+    fn target_facade_get_rejects_list_filter_fields() {
+        let mut params = target_params(TargetOperation::Get);
+        params.title_contains = Some("Chrome".to_owned());
+
+        let error = validate_target_get_params(&params)
+            .expect_err("get must reject list-only title filter");
+
+        assert_eq!(
+            screenshot_error_field(&error, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            screenshot_error_field(&error, "operation").as_deref(),
+            Some("get")
+        );
+        assert_eq!(
+            screenshot_error_field(&error, "source_id").as_deref(),
+            Some("title_contains")
+        );
+    }
+
+    #[test]
+    fn target_facade_set_rejects_claim_fields() {
+        let mut params = target_params(TargetOperation::Set);
+        params.target = Some(SetTargetParam::Window {
+            window_hwnd: 0x1234,
+        });
+        params.ttl_ms = Some(30_000);
+
+        let error =
+            validate_target_set_params(&params).expect_err("set must reject claim-only ttl_ms");
+
+        assert_eq!(
+            screenshot_error_field(&error, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            screenshot_error_field(&error, "operation").as_deref(),
+            Some("set")
+        );
+        assert_eq!(
+            screenshot_error_field(&error, "source_id").as_deref(),
+            Some("ttl_ms")
+        );
+    }
+
+    #[test]
+    fn target_facade_status_and_adopt_reject_irrelevant_fields() {
+        let mut status = target_params(TargetOperation::Status);
+        status.ttl_ms = Some(1_000);
+        let status_error = validate_target_status_params(&status)
+            .expect_err("status must reject ttl_ms mutation field");
+        assert_eq!(
+            screenshot_error_field(&status_error, "operation").as_deref(),
+            Some("status")
+        );
+        assert_eq!(
+            screenshot_error_field(&status_error, "source_id").as_deref(),
+            Some("ttl_ms")
+        );
+
+        let mut adopt = target_params(TargetOperation::Adopt);
+        adopt.process_name_contains = Some("chrome".to_owned());
+        let adopt_error = validate_target_adopt_params(&adopt)
+            .expect_err("adopt must reject list-only process filter");
+        assert_eq!(
+            screenshot_error_field(&adopt_error, "operation").as_deref(),
+            Some("adopt")
+        );
+        assert_eq!(
+            screenshot_error_field(&adopt_error, "source_id").as_deref(),
+            Some("process_name_contains")
+        );
+    }
+
+    #[test]
+    fn target_facade_claim_conversion_preserves_target_identity() {
+        let window = target_claim_param_from_set(SetTargetParam::Window {
+            window_hwnd: 0x250a08,
+        });
+        assert!(matches!(
+            window,
+            TargetClaimTargetParam::Window {
+                window_hwnd: 0x250a08
+            }
+        ));
+
+        let cdp = target_claim_param_from_set(SetTargetParam::Cdp {
+            window_hwnd: 0x250a08,
+            cdp_target_id: "A1B2".to_owned(),
+        });
+        match cdp {
+            TargetClaimTargetParam::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            } => {
+                assert_eq!(window_hwnd, 0x250a08);
+                assert_eq!(cdp_target_id, "A1B2");
+            }
+            TargetClaimTargetParam::Window { .. } => panic!("CDP target must stay CDP"),
+        }
     }
 
     #[test]

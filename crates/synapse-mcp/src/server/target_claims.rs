@@ -21,7 +21,7 @@ use super::{
     session_registry::unix_time_ms_now, tool, tool_router,
 };
 
-const DEFAULT_TARGET_CLAIM_TTL_MS: u64 = 120_000;
+pub(crate) const DEFAULT_TARGET_CLAIM_TTL_MS: u64 = 120_000;
 const MIN_TARGET_CLAIM_TTL_MS: u64 = 1_000;
 const MAX_TARGET_CLAIM_TTL_MS: u64 = 600_000;
 

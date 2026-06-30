@@ -30,7 +30,7 @@ use crate::m2::{
 };
 use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
 use rmcp::schemars::JsonSchema;
-use rmcp::{RoleServer, service::RequestContext};
+use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -54,6 +54,38 @@ const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
 const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
+const ACT_FACADE_SOURCE_OF_TRUTH: &str =
+    "target/action audit row + post-action target readback + daemon-tool-events.jsonl";
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum ActOperation {
+    #[default]
+    Invoke,
+    Foreground,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ActParams {
+    #[serde(default)]
+    operation: ActOperation,
+    action: TargetActParams,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ActResponse {
+    operation: ActOperation,
+    source_of_truth: String,
+    action: TargetActResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    foreground: Option<ActForegroundEscalation>,
+}
 
 #[derive(Clone, Debug, JsonSchema)]
 #[schemars(transparent)]
@@ -382,6 +414,68 @@ pub struct ActForegroundResponse {
 
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
+    #[tool(
+        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. Raw foreground primitives remain profile-gated; this facade only delegates to the capability-preserving router and returns the action/readback source of truth."
+    )]
+    pub async fn act(
+        &self,
+        params: Parameters<ActParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<ActResponse>, ErrorData> {
+        let params = params.0;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "act",
+            operation = act_operation_name(params.operation),
+            verb = params.action.verb.as_str(),
+            "tool.invocation kind=act"
+        );
+
+        match params.operation {
+            ActOperation::Invoke => {
+                validate_act_invoke_params(&params)?;
+                let action = self
+                    .target_act(Parameters(params.action), request_context)
+                    .await?
+                    .0;
+                Ok(Json(ActResponse {
+                    operation: ActOperation::Invoke,
+                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                    action,
+                    foreground: None,
+                }))
+            }
+            ActOperation::Foreground => {
+                validate_act_foreground_params(&params)?;
+                let reason = params.reason.ok_or_else(|| {
+                    act_facade_error(
+                        ActOperation::Foreground,
+                        "act operation=foreground requires reason",
+                        "pass a non-empty reason explaining why the audited foreground lane is required",
+                        "reason",
+                    )
+                })?;
+                let response = self
+                    .act_foreground(
+                        Parameters(ActForegroundParams {
+                            reason,
+                            action: params.action,
+                            ttl_ms: params.ttl_ms,
+                        }),
+                        request_context,
+                    )
+                    .await?
+                    .0;
+                Ok(Json(ActResponse {
+                    operation: ActOperation::Foreground,
+                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                    action: response.action,
+                    foreground: Some(response.escalation),
+                }))
+            }
+        }
+    }
+
     #[tool(
         description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd through raw CDP or the normal-profile Chrome bridge cdpInput lane, and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=check/uncheck set a native checkbox/radio to the requested checked state, no-op if already there, and verify checked-property readback; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed; verb=set_window_bounds moves/resizes the bound top-level window (native Window target, or the browser window behind a Cdp target) via background-safe SetWindowPos without activation, accepts x/y and/or width/height, and returns requested-vs-actual outer bounds (GetWindowRect readback) plus minimized state and size_satisfied so responsive-UI/layout FSV can drive a window through boundary sizes. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
@@ -5050,6 +5144,68 @@ fn target_act_dom_wait_timeout(value: Option<u64>) -> Result<u64, ErrorData> {
     Ok(wait_timeout_ms)
 }
 
+fn act_operation_name(operation: ActOperation) -> &'static str {
+    match operation {
+        ActOperation::Invoke => "invoke",
+        ActOperation::Foreground => "foreground",
+    }
+}
+
+fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
+    if params.reason.is_some() {
+        return Err(act_facade_error(
+            ActOperation::Invoke,
+            "act operation=invoke rejects reason; reason is only valid with operation=foreground",
+            "remove reason or call act with operation=foreground",
+            "reason",
+        ));
+    }
+    if params.ttl_ms.is_some() {
+        return Err(act_facade_error(
+            ActOperation::Invoke,
+            "act operation=invoke rejects ttl_ms; ttl_ms is only valid with operation=foreground",
+            "remove ttl_ms or call act with operation=foreground",
+            "ttl_ms",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {
+    if params
+        .reason
+        .as_deref()
+        .is_none_or(|reason| reason.trim().is_empty())
+    {
+        return Err(act_facade_error(
+            ActOperation::Foreground,
+            "act operation=foreground requires a non-empty reason",
+            "pass a non-empty reason explaining why the audited foreground lane is required",
+            "reason",
+        ));
+    }
+    Ok(())
+}
+
+fn act_facade_error(
+    operation: ActOperation,
+    message: impl Into<String>,
+    remediation: &'static str,
+    source_id: &'static str,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        message.into(),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "operation": act_operation_name(operation),
+            "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
+            "source_id": source_id,
+            "remediation": remediation,
+        })),
+    )
+}
+
 /*
  * Legacy element-id click helpers below are kept for observed native/UIA/OCR
  * element ids. Browser DOM selector/name/role actions route through the normal
@@ -6440,6 +6596,111 @@ fn target_act_error_code(error: &ErrorData) -> Option<&str> {
 mod tests {
     use super::*;
     use rmcp::schemars::schema_for;
+
+    fn read_action() -> TargetActParams {
+        serde_json::from_value(json!({ "verb": "read" }))
+            .expect("synthetic read action should deserialize")
+    }
+
+    fn act_error_field(error: &ErrorData, field: &str) -> Option<String> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get(field))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn act_facade_rejects_unknown_operation_enum() {
+        let error = serde_json::from_value::<ActParams>(json!({
+            "operation": "teleport",
+            "action": { "verb": "read" }
+        }))
+        .expect_err("unknown act operation must fail schema deserialization");
+
+        assert!(
+            error.to_string().contains("unknown variant"),
+            "unexpected act operation error: {error}"
+        );
+    }
+
+    #[test]
+    fn act_facade_invoke_rejects_foreground_fields() {
+        let params = ActParams {
+            operation: ActOperation::Invoke,
+            action: read_action(),
+            reason: Some("needs hardware foreground".to_owned()),
+            ttl_ms: None,
+        };
+
+        let error = validate_act_invoke_params(&params)
+            .expect_err("invoke must reject foreground-only reason");
+
+        assert_eq!(
+            act_error_field(&error, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            act_error_field(&error, "operation").as_deref(),
+            Some("invoke")
+        );
+        assert_eq!(
+            act_error_field(&error, "source_id").as_deref(),
+            Some("reason")
+        );
+    }
+
+    #[test]
+    fn act_facade_foreground_requires_non_empty_reason() {
+        let params = ActParams {
+            operation: ActOperation::Foreground,
+            action: read_action(),
+            reason: Some("   ".to_owned()),
+            ttl_ms: Some(30_000),
+        };
+
+        let error = validate_act_foreground_params(&params)
+            .expect_err("foreground must reject blank reason");
+
+        assert_eq!(
+            act_error_field(&error, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            act_error_field(&error, "operation").as_deref(),
+            Some("foreground")
+        );
+        assert_eq!(
+            act_error_field(&error, "source_id").as_deref(),
+            Some("reason")
+        );
+    }
+
+    #[test]
+    fn act_facade_operation_schema_is_closed_enum() {
+        let schema = serde_json::to_value(schema_for!(ActParams))
+            .unwrap_or_else(|error| panic!("act params schema should serialize: {error}"));
+        let operation_schema = schema
+            .pointer("/properties/operation")
+            .unwrap_or_else(|| panic!("act schema must include operation: {schema}"));
+        assert_eq!(
+            operation_schema.pointer("/$ref").and_then(Value::as_str),
+            Some("#/$defs/ActOperation")
+        );
+        let enum_schema = schema
+            .pointer("/$defs/ActOperation/enum")
+            .and_then(Value::as_array)
+            .unwrap_or_else(|| panic!("ActOperation enum schema missing: {schema}"));
+        let enum_values = enum_schema
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            enum_values.contains("invoke") && enum_values.contains("foreground"),
+            "act operation schema must enumerate invoke/foreground: {operation_schema}"
+        );
+    }
 
     #[test]
     fn target_act_verb_click_deserializes() {

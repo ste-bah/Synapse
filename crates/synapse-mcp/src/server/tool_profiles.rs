@@ -102,19 +102,28 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "cdp_navigate_tab",
     "cdp_open_tab",
     "cdp_target_info",
+    "clear_target",
     "demo_record_start",
     "demo_record_stop",
+    "get_target",
     "hidden_desktop_pip_frame",
     "intent_detect_tick",
     "profile_authoring_generate",
     "profile_authoring_inspect",
     "profile_authoring_list",
     "release_all",
+    "set_target",
     "storage_gc_once",
     "storage_put_probe_rows",
     "suggestion_tick",
+    "target_act",
+    "target_claim",
+    "target_claim_adopt",
+    "target_claim_status",
+    "target_release",
     "tool_profile_set",
     "tool_profile_status",
+    "window_list",
 ];
 
 const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
@@ -267,6 +276,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "establish an MCP session before reading target state",
             ),
             op(
+                "list",
+                false,
+                false,
+                "top-level window snapshot + target claim registry readback",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "refresh the live window list and choose a current target row",
+            ),
+            op(
                 "set",
                 true,
                 true,
@@ -275,21 +293,77 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::ACTION_TARGET_INVALID,
                 "pass a valid window or CDP target discovered from the live host",
             ),
+            op(
+                "clear",
+                true,
+                false,
+                "daemon session target registry + CF_SESSIONS row",
+                Some("CF_SESSIONS session-target row readback + daemon registry readback"),
+                error_codes::HTTP_SESSION_INVALID,
+                "establish an MCP session before clearing target state",
+            ),
+            op(
+                "claim",
+                true,
+                true,
+                "target claim registry + CF_ACTION_LOG",
+                Some("target claim registry readback + CF_ACTION_LOG command audit row"),
+                error_codes::ACTION_TARGET_INVALID,
+                "pass a live target from target operation=list, then retry claim",
+            ),
+            op(
+                "status",
+                false,
+                false,
+                "target claim registry readback",
+                None,
+                error_codes::HTTP_SESSION_INVALID,
+                "establish an MCP session before reading target claim status",
+            ),
+            op(
+                "adopt",
+                true,
+                true,
+                "target claim registry + session lifecycle state",
+                Some("target claim registry readback + owner session teardown readback"),
+                error_codes::TARGET_CLAIM_NOT_FOUND,
+                "read target operation=status, then pass a current owner_session_id",
+            ),
+            op(
+                "release",
+                true,
+                true,
+                "target claim registry + CF_ACTION_LOG",
+                Some("target claim registry readback + CF_ACTION_LOG command audit row"),
+                error_codes::TARGET_CLAIM_NOT_FOUND,
+                "pass the claimed target or current session claim before releasing",
+            ),
         ],
     ),
     facade_contract(
         "act",
         "ActOperation",
         "target/action audit row + post-action target readback",
-        &[op(
-            "invoke",
-            true,
-            true,
-            "target action preflight + input lease/readback",
-            Some("post-action target/UI readback + CF_ACTION_LOG command audit row"),
-            error_codes::ACTION_TARGET_INVALID,
-            "bind a valid target and acquire any required control lease before retrying",
-        )],
+        &[
+            op(
+                "invoke",
+                true,
+                true,
+                "target action preflight + input lease/readback",
+                Some("post-action target/UI readback + CF_ACTION_LOG command audit row"),
+                error_codes::ACTION_TARGET_INVALID,
+                "bind a valid target and acquire any required control lease before retrying",
+            ),
+            op(
+                "foreground",
+                true,
+                true,
+                "foreground input lease + target/action audit row",
+                Some("foreground lease/profile restore readback + post-action target/UI readback"),
+                error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
+                "provide a non-empty reason and let the facade acquire/restore the audited foreground lane",
+            ),
+        ],
     ),
     facade_contract(
         "shell",
@@ -2800,6 +2874,7 @@ mod tests {
                 "act_spawn_agent",
                 "act_foreground",
                 "act_launch",
+                "act",
                 "cdp_open_tab",
                 "profile",
                 "health",
@@ -2810,6 +2885,7 @@ mod tests {
                 "observe",
                 "find",
                 "read_text",
+                "target",
                 "target_act",
                 "browser_adopt_active_tab",
                 "browser_aria_snapshot",
@@ -2902,6 +2978,18 @@ mod tests {
                 .registered_tools_present
                 .contains(&"screenshot".to_owned()),
             "#1378 registers the screenshot facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"target".to_owned()),
+            "#1379 registers the target facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"act".to_owned()),
+            "#1379 registers the act facade"
         );
         assert!(snapshot.duplicate_public_tool_names.is_empty());
         assert!(snapshot.forbidden_public_tool_names.is_empty());
@@ -3104,6 +3192,8 @@ mod tests {
                 "find",
                 "read_text",
                 "screenshot",
+                "target",
+                "act",
                 "browser_tabs",
                 "browser_storage",
             ]
