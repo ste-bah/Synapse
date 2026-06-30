@@ -127,6 +127,9 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "clear_target",
     "demo_record_start",
     "demo_record_stop",
+    "episode_get",
+    "episode_list",
+    "episode_segment",
     "escalation_ack",
     "escalation_config_get",
     "escalation_config_set",
@@ -156,6 +159,15 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
+    "timeline_digest",
+    "timeline_exclusions",
+    "timeline_get",
+    "timeline_pause",
+    "timeline_purge",
+    "timeline_redact",
+    "timeline_resume",
+    "timeline_search",
+    "timeline_stats",
     "tool_profile_set",
     "tool_profile_status",
     "window_list",
@@ -1268,30 +1280,61 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "timeline",
         "TimelineOperation",
-        "timeline event store + query readback",
-        &[op(
-            "query",
-            false,
-            false,
-            "timeline event store query readback",
-            None,
-            error_codes::STORAGE_READ_FAILED,
-            "narrow the time range/filter and retry after reading storage health",
-        )],
+        "CF_TIMELINE rows + live recorder control gate",
+        &[
+            op(
+                "get",
+                false,
+                false,
+                "CF_TIMELINE ordered row scan",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "narrow the time range/kind/actor filter and inspect CF_TIMELINE health",
+            ),
+            op(
+                "search",
+                false,
+                false,
+                "CF_TIMELINE filtered row scan",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "narrow the time/text/app filter and inspect CF_TIMELINE health",
+            ),
+            op(
+                "stats",
+                false,
+                false,
+                "CF_TIMELINE aggregate scan + recorder control gate",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "fix the stats bounds and inspect recorder control state plus CF_TIMELINE rows",
+            ),
+        ],
     ),
     facade_contract(
         "episode",
         "EpisodeOperation",
-        "episode segment/export rows + file artifacts",
-        &[op(
-            "segment",
-            true,
-            false,
-            "episode segment rows",
-            Some("episode row/file artifact readback"),
-            error_codes::STORAGE_WRITE_FAILED,
-            "retry with a bounded time range and verify the written artifact path",
-        )],
+        "CF_EPISODES rows + CF_TIMELINE evidence refs",
+        &[
+            op(
+                "list",
+                false,
+                false,
+                "CF_EPISODES bounded row scan",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "run episode segmentation if no rows exist, or narrow the time/app/actor filter",
+            ),
+            op(
+                "get",
+                false,
+                false,
+                "CF_EPISODES episode row + CF_TIMELINE evidence refs",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "provide an existing episode_id and inspect CF_EPISODES plus CF_TIMELINE refs",
+            ),
+        ],
     ),
     facade_contract(
         "routine",
@@ -1447,16 +1490,54 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "privacy",
         "PrivacyOperation",
-        "privacy policy rows + redaction/exclusion readback",
-        &[op(
-            "redact",
-            true,
-            false,
-            "privacy policy/exclusion rows",
-            Some("redaction/exclusion row readback"),
-            error_codes::STORAGE_WRITE_FAILED,
-            "write a scoped privacy rule and read back the affected row/artifact",
-        )],
+        "CF_KV timeline/control/v1 + CF_TIMELINE rows/audit rows + hygiene flag/taint rows",
+        &[
+            op(
+                "pause",
+                true,
+                false,
+                "CF_KV timeline/control/v1 + CF_TIMELINE boundary row",
+                Some("timeline control row and boundary-row readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "escalate to an explicit privacy/admin profile and inspect timeline control rows",
+            ),
+            op(
+                "resume",
+                true,
+                false,
+                "CF_KV timeline/control/v1 + CF_TIMELINE boundary row",
+                Some("timeline control row and boundary-row readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "escalate to an explicit privacy/admin profile and inspect timeline control rows",
+            ),
+            op(
+                "exclusions",
+                true,
+                false,
+                "CF_KV timeline/control/v1 runtime exclusions",
+                Some("runtime/effective exclusion set readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "escalate before mutating exclusions; read-only exclusion inspection is allowed",
+            ),
+            op(
+                "redact",
+                true,
+                false,
+                "physical source rows + hygiene taint/audit rows",
+                Some("redacted source rows plus hygiene taint/audit readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "escalate to an explicit privacy/admin profile and inspect source rows plus hygiene taint/audit rows",
+            ),
+            op(
+                "purge",
+                true,
+                false,
+                "CF_TIMELINE rows + purge audit row",
+                Some("CF_TIMELINE row count/audit-key readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "escalate to an explicit privacy/admin profile and inspect CF_TIMELINE rows plus purge audit row",
+            ),
+        ],
     ),
     facade_contract(
         "setup",
@@ -3597,6 +3678,20 @@ mod tests {
                 "escalation_config_get",
                 "escalation_config_set",
                 "escalation_list",
+                "timeline",
+                "timeline_get",
+                "timeline_search",
+                "timeline_stats",
+                "timeline_pause",
+                "timeline_resume",
+                "timeline_exclusions",
+                "timeline_purge",
+                "timeline_redact",
+                "timeline_digest",
+                "episode",
+                "episode_list",
+                "episode_get",
+                "episode_segment",
                 "tool_profile_set",
                 "tool_profile_status",
                 "task",
@@ -3609,6 +3704,7 @@ mod tests {
                 "workspace_list",
                 "workspace_put",
                 "workspace_subscribe",
+                "privacy",
             ]
             .iter()
             .map(|name| (*name).to_owned()),
@@ -3660,6 +3756,13 @@ mod tests {
         assert!(!public_names.contains(&"approval_gate".to_owned()));
         assert!(!public_names.contains(&"escalation_list".to_owned()));
         assert!(!public_names.contains(&"escalation_config_set".to_owned()));
+        assert!(!public_names.contains(&"timeline_get".to_owned()));
+        assert!(!public_names.contains(&"timeline_search".to_owned()));
+        assert!(!public_names.contains(&"timeline_stats".to_owned()));
+        assert!(!public_names.contains(&"timeline_purge".to_owned()));
+        assert!(!public_names.contains(&"timeline_redact".to_owned()));
+        assert!(!public_names.contains(&"episode_list".to_owned()));
+        assert!(!public_names.contains(&"episode_get".to_owned()));
         assert!(!public_names.contains(&"workspace_put".to_owned()));
         assert!(!public_names.contains(&"workspace_get".to_owned()));
         assert!(!public_names.contains(&"storage_put_probe_rows".to_owned()));
@@ -3762,6 +3865,24 @@ mod tests {
                 .registered_tools_present
                 .contains(&"escalation".to_owned()),
             "#1386 registers the escalation facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"timeline".to_owned()),
+            "#1387 registers the timeline facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"episode".to_owned()),
+            "#1387 registers the episode facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"privacy".to_owned()),
+            "#1387 registers the privacy facade"
         );
         assert!(snapshot.duplicate_public_tool_names.is_empty());
         assert!(snapshot.forbidden_public_tool_names.is_empty());
@@ -3980,6 +4101,9 @@ mod tests {
                 "task",
                 "approval",
                 "escalation",
+                "timeline",
+                "episode",
+                "privacy",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -4001,6 +4125,18 @@ mod tests {
         assert!(!visible.contains(&"escalation_list".to_owned()));
         assert!(!visible.contains(&"escalation_config_set".to_owned()));
         assert!(!visible.contains(&"escalation_ack".to_owned()));
+        assert!(!visible.contains(&"timeline_get".to_owned()));
+        assert!(!visible.contains(&"timeline_search".to_owned()));
+        assert!(!visible.contains(&"timeline_stats".to_owned()));
+        assert!(!visible.contains(&"timeline_pause".to_owned()));
+        assert!(!visible.contains(&"timeline_resume".to_owned()));
+        assert!(!visible.contains(&"timeline_exclusions".to_owned()));
+        assert!(!visible.contains(&"timeline_purge".to_owned()));
+        assert!(!visible.contains(&"timeline_redact".to_owned()));
+        assert!(!visible.contains(&"timeline_digest".to_owned()));
+        assert!(!visible.contains(&"episode_list".to_owned()));
+        assert!(!visible.contains(&"episode_get".to_owned()));
+        assert!(!visible.contains(&"episode_segment".to_owned()));
         assert!(!visible.contains(&"cdp_activate_tab".to_owned()));
         assert!(!visible.contains(&"cdp_close_tab".to_owned()));
         assert!(!visible.contains(&"cdp_navigate_tab".to_owned()));
@@ -4262,6 +4398,9 @@ mod tests {
         assert!(!tools.contains(&"browser_debugger".to_owned()));
         assert!(tools.contains(&"shell".to_owned()));
         assert!(tools.contains(&"process".to_owned()));
+        assert!(tools.contains(&"timeline".to_owned()));
+        assert!(tools.contains(&"episode".to_owned()));
+        assert!(tools.contains(&"privacy".to_owned()));
         assert!(!tools.contains(&"agent_spawn_task_started".to_owned()));
         assert!(!tools.contains(&"cdp_activate_tab".to_owned()));
         assert!(!tools.contains(&"cdp_close_tab".to_owned()));
@@ -4280,6 +4419,16 @@ mod tests {
         assert!(!tools.contains(&"profile_authoring_generate".to_owned()));
         assert!(!tools.contains(&"storage_put_probe_rows".to_owned()));
         assert!(!tools.contains(&"storage_gc_once".to_owned()));
+        assert!(!tools.contains(&"timeline_get".to_owned()));
+        assert!(!tools.contains(&"timeline_search".to_owned()));
+        assert!(!tools.contains(&"timeline_stats".to_owned()));
+        assert!(!tools.contains(&"timeline_pause".to_owned()));
+        assert!(!tools.contains(&"timeline_resume".to_owned()));
+        assert!(!tools.contains(&"timeline_exclusions".to_owned()));
+        assert!(!tools.contains(&"timeline_purge".to_owned()));
+        assert!(!tools.contains(&"timeline_redact".to_owned()));
+        assert!(!tools.contains(&"episode_list".to_owned()));
+        assert!(!tools.contains(&"episode_get".to_owned()));
         assert!(
             tools
                 .iter()

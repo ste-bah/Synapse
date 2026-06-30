@@ -285,6 +285,7 @@ pub(crate) mod terminal_capture;
 #[cfg(test)]
 mod tests;
 pub(crate) mod timeline_digest;
+mod timeline_facades;
 mod timeline_query;
 mod tool_profiles;
 mod verification;
@@ -626,6 +627,7 @@ impl SynapseService {
             + Self::agent_task_tool_router()
             + Self::agent_facade_tool_router()
             + Self::approval_facade_tool_router()
+            + Self::timeline_facade_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()
