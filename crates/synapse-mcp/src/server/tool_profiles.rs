@@ -4293,8 +4293,6 @@ mod tests {
                         if !child.is_boolean() {
                             strict_client_subschema_errors(child, &child_path, errors);
                         }
-                    } else {
-                        continue;
                     }
                 }
             }
