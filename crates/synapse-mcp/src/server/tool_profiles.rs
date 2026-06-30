@@ -3511,6 +3511,10 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
                 "session operation=list",
             ]
         }
+        "profile" => vec!["tool_profile_status", "tool_profile_set"],
+        "tool_profile_set" | "tool_profile_status" => {
+            vec!["profile operation=status", "profile operation=set"]
+        }
         "browser_console_messages"
         | "browser_network"
         | "browser_network_har"
@@ -5205,6 +5209,35 @@ mod tests {
         assert!(!tools.contains(&"act_spawn_agent".to_owned()));
         assert!(!tools.contains(&"act_type".to_owned()));
         assert_debugger_only_hidden(&tools);
+    }
+
+    #[test]
+    fn profile_hidden_tool_routes_name_visible_counterpart() {
+        let profile_route = hidden_tool_capability_route("profile");
+        assert_eq!(profile_route.hidden_tool, "profile");
+        assert!(
+            profile_route
+                .preferred_tools
+                .contains(&"tool_profile_status".to_owned())
+        );
+        assert!(
+            profile_route
+                .preferred_tools
+                .contains(&"tool_profile_set".to_owned())
+        );
+
+        let raw_profile_route = hidden_tool_capability_route("tool_profile_set");
+        assert_eq!(raw_profile_route.hidden_tool, "tool_profile_set");
+        assert!(
+            raw_profile_route
+                .preferred_tools
+                .contains(&"profile operation=status".to_owned())
+        );
+        assert!(
+            raw_profile_route
+                .preferred_tools
+                .contains(&"profile operation=set".to_owned())
+        );
     }
 
     #[test]
