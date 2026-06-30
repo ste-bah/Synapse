@@ -23,6 +23,11 @@ pub(crate) const PUBLIC_TOOL_LIMIT: usize = 40;
 const PUBLIC_TOOL_REGISTRY_SOURCE_OF_TRUTH: &str =
     "crates/synapse-mcp/src/server/tool_profiles.rs PUBLIC_TOOL_NAMES";
 const PUBLIC_TOOL_REGISTRY_OPERATION: &str = "validate_public_tool_registry";
+const FACADE_CONTRACT_SOURCE_OF_TRUTH: &str =
+    "crates/synapse-mcp/src/server/tool_profiles.rs FACADE_TOOL_CONTRACTS";
+const FACADE_CONTRACT_OPERATION: &str = "validate_facade_contract";
+const FACADE_CONTRACT_ERROR_CODE: &str = "FACADE_CONTRACT_INVALID";
+const FACADE_CONTRACT_STRUCTURED_ERROR: &str = "facade errors must include code, operation, source_of_truth, remediation, and target/source id when applicable";
 
 pub(crate) const PUBLIC_TOOL_NAMES: &[&str] = &[
     "health",
@@ -108,6 +113,739 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "tool_profile_set",
     "tool_profile_status",
 ];
+
+const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
+    facade_contract(
+        "health",
+        "HealthOperation",
+        "daemon health payload + sanitized tools/list surface",
+        &[op(
+            "status",
+            false,
+            false,
+            "daemon health payload + process/socket SoT",
+            None,
+            error_codes::TOOL_INTERNAL_ERROR,
+            "read daemon process/socket state, then call health again after fixing the failed subsystem",
+        )],
+    ),
+    facade_contract(
+        "profile",
+        "ProfileOperation",
+        "CF_SESSIONS mcp/tool-profile/v1/<session_id> + sanitized tools/list",
+        &[
+            op(
+                "status",
+                false,
+                false,
+                "CF_SESSIONS policy row + sanitized tools/list",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "read tool_profile_status and compare visible tool names against the profile row",
+            ),
+            op(
+                "set",
+                true,
+                false,
+                "CF_SESSIONS mcp/tool-profile/v1/<session_id>",
+                Some("CF_SESSIONS row readback + notifications/tools/list_changed attempt"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "hold the required lease/profile permission, provide reason/confirmation, then retry",
+            ),
+        ],
+    ),
+    facade_contract(
+        "session",
+        "SessionOperation",
+        "MCP session registry + CF_SESSIONS session-target rows",
+        &[op(
+            "list",
+            false,
+            false,
+            "daemon session registry + CF_SESSIONS session-target rows",
+            None,
+            error_codes::HTTP_SESSION_INVALID,
+            "establish an MCP session and retry through the same client transport",
+        )],
+    ),
+    facade_contract(
+        "subscribe",
+        "SubscribeOperation",
+        "SSE subscriber registry + MCP session id",
+        &[op(
+            "events",
+            false,
+            false,
+            "SSE subscriber registry + emitted event stream",
+            None,
+            error_codes::HTTP_SESSION_INVALID,
+            "open a session-scoped subscription against the live daemon and retry",
+        )],
+    ),
+    facade_contract(
+        "observe",
+        "ObserveOperation",
+        "capture backend readback + perception observation payload",
+        &[op(
+            "current",
+            false,
+            true,
+            "active session target + capture backend readback",
+            None,
+            error_codes::CAPTURE_TARGET_INVALID,
+            "bind a target or pass an explicit target, then retry observe",
+        )],
+    ),
+    facade_contract(
+        "find",
+        "FindOperation",
+        "perception index over latest observation readback",
+        &[op(
+            "elements",
+            false,
+            true,
+            "latest observation payload + element index",
+            None,
+            error_codes::CAPTURE_TARGET_INVALID,
+            "capture or bind the intended target before querying elements",
+        )],
+    ),
+    facade_contract(
+        "read_text",
+        "ReadTextOperation",
+        "OCR/accessibility/browser text readback",
+        &[op(
+            "text",
+            false,
+            true,
+            "target-specific OCR, accessibility, or browser text readback",
+            None,
+            error_codes::CAPTURE_TARGET_INVALID,
+            "bind the text source target and retry with a scoped selector when needed",
+        )],
+    ),
+    facade_contract(
+        "screenshot",
+        "ScreenshotOperation",
+        "capture artifact path + image metadata readback",
+        &[op(
+            "capture",
+            false,
+            true,
+            "capture artifact bytes + target metadata",
+            None,
+            error_codes::CAPTURE_TARGET_INVALID,
+            "bind the target and retry after the capture backend reports healthy",
+        )],
+    ),
+    facade_contract(
+        "target",
+        "TargetOperation",
+        "MCP session target registry + CF_SESSIONS row",
+        &[
+            op(
+                "get",
+                false,
+                false,
+                "daemon session target registry + CF_SESSIONS row",
+                None,
+                error_codes::HTTP_SESSION_INVALID,
+                "establish an MCP session before reading target state",
+            ),
+            op(
+                "set",
+                true,
+                true,
+                "daemon session target registry + CF_SESSIONS row",
+                Some("CF_SESSIONS session-target row readback + daemon registry readback"),
+                error_codes::ACTION_TARGET_INVALID,
+                "pass a valid window or CDP target discovered from the live host",
+            ),
+        ],
+    ),
+    facade_contract(
+        "act",
+        "ActOperation",
+        "target/action audit row + post-action target readback",
+        &[op(
+            "invoke",
+            true,
+            true,
+            "target action preflight + input lease/readback",
+            Some("post-action target/UI readback + CF_ACTION_LOG command audit row"),
+            error_codes::ACTION_TARGET_INVALID,
+            "bind a valid target and acquire any required control lease before retrying",
+        )],
+    ),
+    facade_contract(
+        "shell",
+        "ShellOperation",
+        "durable shell job table + process status readback",
+        &[
+            op(
+                "run",
+                true,
+                false,
+                "shell job registry + process handle",
+                Some("shell job row/status readback + output artifact path"),
+                error_codes::TOOL_INTERNAL_ERROR,
+                "inspect the job row and process state, then retry with corrected command/input",
+            ),
+            op(
+                "status",
+                false,
+                false,
+                "shell job registry + output artifact path",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "read the job id returned by run and verify the artifact path exists",
+            ),
+        ],
+    ),
+    facade_contract(
+        "process",
+        "ProcessOperation",
+        "OS process table snapshot",
+        &[op(
+            "list",
+            false,
+            false,
+            "OS process table snapshot",
+            None,
+            error_codes::TOOL_INTERNAL_ERROR,
+            "refresh the process table and scope the query by exact pid/path when mutating",
+        )],
+    ),
+    facade_contract(
+        "browser_tabs",
+        "BrowserTabsOperation",
+        "already-open Chrome bridge tabs.query/readback",
+        &[
+            op(
+                "list",
+                false,
+                false,
+                "Chrome bridge tabs.query result + window context",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "use an already-open authenticated Chrome window and retry",
+            ),
+            op(
+                "select",
+                true,
+                true,
+                "Chrome bridge tabs.query result + MCP session target registry",
+                Some("session target registry readback after selecting the tab"),
+                error_codes::ACTION_TARGET_INVALID,
+                "select a cdp_target_id from the current tabs list",
+            ),
+            op(
+                "new",
+                true,
+                false,
+                "Chrome bridge tabs.create result + tabs.query readback",
+                Some("new tab id readback from tabs.query"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "pass a valid URL or empty string for about:blank",
+            ),
+            op(
+                "close",
+                true,
+                true,
+                "Chrome bridge tabs.remove result + tabs.query readback",
+                Some("tabs.query absence readback for the closed target"),
+                error_codes::ACTION_TARGET_INVALID,
+                "close only a tab owned by this MCP session",
+            ),
+        ],
+    ),
+    facade_contract(
+        "browser_nav",
+        "BrowserNavOperation",
+        "Chrome bridge navigation result + page URL/readiness readback",
+        &[op(
+            "navigate",
+            true,
+            true,
+            "Chrome bridge navigation result",
+            Some("page URL + readyState readback from the same target"),
+            error_codes::TOOL_PARAMS_INVALID,
+            "pass a valid target-scoped URL and wait condition",
+        )],
+    ),
+    facade_contract(
+        "browser_dom",
+        "BrowserDomOperation",
+        "target-scoped DOM query/evaluate readback",
+        &[op(
+            "query",
+            false,
+            true,
+            "target-scoped DOM snapshot",
+            None,
+            error_codes::ACTION_TARGET_INVALID,
+            "bind the intended tab and use a strict selector or element id",
+        )],
+    ),
+    facade_contract(
+        "browser_form",
+        "BrowserFormOperation",
+        "target-scoped DOM form mutation + DOM value readback",
+        &[op(
+            "set_value",
+            true,
+            true,
+            "target-scoped DOM mutation",
+            Some("DOM value/property readback after mutation"),
+            error_codes::ACTION_TARGET_INVALID,
+            "bind the target and pass a strict selector or element id",
+        )],
+    ),
+    facade_contract(
+        "browser_wait",
+        "BrowserWaitOperation",
+        "target-scoped browser wait condition readback",
+        &[op(
+            "for_condition",
+            false,
+            true,
+            "target-scoped DOM/URL/load-state readback",
+            None,
+            error_codes::TOOL_PARAMS_INVALID,
+            "use a declared wait condition and bounded timeout",
+        )],
+    ),
+    facade_contract(
+        "browser_capture",
+        "BrowserCaptureOperation",
+        "browser screenshot/content/readback artifacts",
+        &[op(
+            "screenshot",
+            false,
+            true,
+            "target-scoped screenshot bytes + page metadata",
+            None,
+            error_codes::ACTION_TARGET_INVALID,
+            "bind the tab and retry capture after the bridge reports healthy",
+        )],
+    ),
+    facade_contract(
+        "browser_storage",
+        "BrowserStorageOperation",
+        "browser cookies/local storage/session storage readback",
+        &[
+            op(
+                "read",
+                false,
+                true,
+                "target-scoped browser storage readback",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "bind the tab and request one supported storage namespace",
+            ),
+            op(
+                "write",
+                true,
+                true,
+                "target-scoped browser storage mutation",
+                Some("target-scoped browser storage readback after mutation"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "pass a supported storage namespace/key/value and verify the readback",
+            ),
+        ],
+    ),
+    facade_contract(
+        "browser_debugger",
+        "BrowserDebuggerOperation",
+        "explicit browser_debugger profile + raw CDP/chrome.debugger readback",
+        &[op(
+            "call",
+            true,
+            true,
+            "browser_debugger profile row + raw CDP/chrome.debugger response",
+            Some("browser_debugger response/readback for the same target"),
+            error_codes::TOOL_PROFILE_POLICY_DENIED,
+            "switch to browser_debugger with reason/confirmation before raw debugger calls",
+        )],
+    ),
+    facade_contract(
+        "workspace",
+        "WorkspaceOperation",
+        "CF_KV workspace-blackboard exact rows",
+        &[
+            op(
+                "get",
+                false,
+                false,
+                "CF_KV workspace-blackboard exact row",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "read the exact run/key row and handle absent rows explicitly",
+            ),
+            op(
+                "put",
+                true,
+                false,
+                "CF_KV workspace-blackboard exact row",
+                Some("CF_KV exact row readback with value hash/version"),
+                error_codes::STORAGE_WRITE_FAILED,
+                "retry with the observed expected_version or correct the key/value",
+            ),
+        ],
+    ),
+    facade_contract(
+        "agent",
+        "AgentOperation",
+        "agent lifecycle registry + CF_AGENT_EVENTS/CF_KV rows",
+        &[
+            op(
+                "list",
+                false,
+                false,
+                "agent lifecycle registry + recent journal rows",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "refresh the live registry and inspect the agent id/session id",
+            ),
+            op(
+                "spawn",
+                true,
+                false,
+                "agent spawn registry + transcript/event rows",
+                Some("spawned agent registry row + transcript/event readback"),
+                error_codes::TOOL_INTERNAL_ERROR,
+                "fix the spawn command/template and retry after reading the event row",
+            ),
+        ],
+    ),
+    facade_contract(
+        "task",
+        "TaskOperation",
+        "agent task registry + task event rows",
+        &[op(
+            "status",
+            false,
+            false,
+            "agent task registry + task event rows",
+            None,
+            error_codes::TOOL_INTERNAL_ERROR,
+            "read the task id from the registry before retrying task operations",
+        )],
+    ),
+    facade_contract(
+        "approval",
+        "ApprovalOperation",
+        "approval queue rows + decision audit rows",
+        &[
+            op(
+                "list",
+                false,
+                false,
+                "approval queue rows",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "read current approval rows and choose an existing request id",
+            ),
+            op(
+                "decide",
+                true,
+                false,
+                "approval queue row",
+                Some("approval decision row readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "decide an existing pending approval id with explicit outcome",
+            ),
+        ],
+    ),
+    facade_contract(
+        "escalation",
+        "EscalationOperation",
+        "escalation policy rows + request audit rows",
+        &[op(
+            "request",
+            true,
+            false,
+            "escalation request row",
+            Some("escalation request/audit readback"),
+            error_codes::TOOL_PARAMS_INVALID,
+            "include the exact operator-only action and current SoT evidence",
+        )],
+    ),
+    facade_contract(
+        "timeline",
+        "TimelineOperation",
+        "timeline event store + query readback",
+        &[op(
+            "query",
+            false,
+            false,
+            "timeline event store query readback",
+            None,
+            error_codes::STORAGE_READ_FAILED,
+            "narrow the time range/filter and retry after reading storage health",
+        )],
+    ),
+    facade_contract(
+        "episode",
+        "EpisodeOperation",
+        "episode segment/export rows + file artifacts",
+        &[op(
+            "segment",
+            true,
+            false,
+            "episode segment rows",
+            Some("episode row/file artifact readback"),
+            error_codes::STORAGE_WRITE_FAILED,
+            "retry with a bounded time range and verify the written artifact path",
+        )],
+    ),
+    facade_contract(
+        "routine",
+        "RoutineOperation",
+        "routine registry rows + routine feedback rows",
+        &[op(
+            "list",
+            false,
+            false,
+            "routine registry rows",
+            None,
+            error_codes::STORAGE_READ_FAILED,
+            "read routine registry storage health and retry with a narrower filter",
+        )],
+    ),
+    facade_contract(
+        "assist",
+        "AssistOperation",
+        "suggestion/routine assist queue + target readback",
+        &[op(
+            "suggest",
+            false,
+            true,
+            "assist suggestion queue + target readback",
+            None,
+            error_codes::ACTION_TARGET_INVALID,
+            "bind the target and read suggestion queue state before accepting",
+        )],
+    ),
+    facade_contract(
+        "reality",
+        "RealityOperation",
+        "reality baseline/delta/audit rows",
+        &[op(
+            "audit",
+            false,
+            false,
+            "reality baseline/delta/audit rows",
+            None,
+            error_codes::STORAGE_READ_FAILED,
+            "read the latest baseline and retry the drift audit with a bounded scope",
+        )],
+    ),
+    facade_contract(
+        "verification",
+        "VerificationOperation",
+        "verification claim rows + physical SoT readback references",
+        &[op(
+            "record",
+            true,
+            false,
+            "verification claim row",
+            Some("verification row readback with physical SoT reference"),
+            error_codes::STORAGE_WRITE_FAILED,
+            "include the physical source-of-truth readback before recording the claim",
+        )],
+    ),
+    facade_contract(
+        "storage",
+        "StorageOperation",
+        "RocksDB CF metadata + exact row readbacks",
+        &[op(
+            "inspect",
+            false,
+            false,
+            "RocksDB CF metadata + optional exact row readback",
+            None,
+            error_codes::STORAGE_READ_FAILED,
+            "inspect the named CF/key and fix storage health before mutating",
+        )],
+    ),
+    facade_contract(
+        "model",
+        "ModelOperation",
+        "local model registry CF_KV row + probe readback",
+        &[
+            op(
+                "list",
+                false,
+                false,
+                "CF_KV local model registry rows",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "read registry storage and probe diagnostics before routing a model",
+            ),
+            op(
+                "update",
+                true,
+                false,
+                "CF_KV local model registry row",
+                Some("forced structured tool-call probe row readback"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "fix endpoint/model/key settings until the real probe passes",
+            ),
+        ],
+    ),
+    facade_contract(
+        "cost",
+        "CostOperation",
+        "cost table rows + token event scan/readback",
+        &[op(
+            "summarize",
+            false,
+            false,
+            "cost table rows + bounded token event scan",
+            None,
+            error_codes::STORAGE_READ_FAILED,
+            "price the missing model or narrow the scan scope before retrying",
+        )],
+    ),
+    facade_contract(
+        "hygiene",
+        "HygieneOperation",
+        "repo/host hygiene report artifacts",
+        &[op(
+            "report",
+            false,
+            false,
+            "hygiene report artifact + process/worktree readback",
+            None,
+            error_codes::TOOL_INTERNAL_ERROR,
+            "read the failing hygiene artifact and remediate exact paths/processes",
+        )],
+    ),
+    facade_contract(
+        "audit",
+        "AuditOperation",
+        "daemon log/event rows + audit result rows",
+        &[op(
+            "query",
+            false,
+            false,
+            "daemon logs + event/audit rows",
+            None,
+            error_codes::STORAGE_READ_FAILED,
+            "query a bounded time range and inspect storage health if rows are missing",
+        )],
+    ),
+    facade_contract(
+        "replay",
+        "ReplayOperation",
+        "demo/replay event rows + replay state artifact",
+        &[op(
+            "run",
+            true,
+            false,
+            "demo/replay source rows",
+            Some("replay state artifact readback"),
+            error_codes::STORAGE_READ_FAILED,
+            "select an existing recording and verify replay output artifact bytes",
+        )],
+    ),
+    facade_contract(
+        "privacy",
+        "PrivacyOperation",
+        "privacy policy rows + redaction/exclusion readback",
+        &[op(
+            "redact",
+            true,
+            false,
+            "privacy policy/exclusion rows",
+            Some("redaction/exclusion row readback"),
+            error_codes::STORAGE_WRITE_FAILED,
+            "write a scoped privacy rule and read back the affected row/artifact",
+        )],
+    ),
+    facade_contract(
+        "setup",
+        "SetupOperation",
+        "host setup readback + daemon transport configuration",
+        &[op(
+            "doctor",
+            false,
+            false,
+            "host setup readback + daemon process/socket state",
+            None,
+            error_codes::TOOL_INTERNAL_ERROR,
+            "repair the exact missing local prerequisite and read the configured SoT again",
+        )],
+    ),
+    facade_contract(
+        "telemetry",
+        "TelemetryOperation",
+        "telemetry counters/events + public/implementation tool counts",
+        &[op(
+            "status",
+            false,
+            false,
+            "telemetry counters/events + tool profile snapshot",
+            None,
+            error_codes::STORAGE_READ_FAILED,
+            "read telemetry storage health and compare public/implementation count snapshots",
+        )],
+    ),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacadeToolContractSpec {
+    tool_name: &'static str,
+    operation_enum: &'static str,
+    source_of_truth: &'static str,
+    operations: &'static [FacadeOperationContractSpec],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FacadeOperationContractSpec {
+    operation: &'static str,
+    mutates_state: bool,
+    target_required: bool,
+    source_of_truth: &'static str,
+    readback_source_of_truth: Option<&'static str>,
+    error_code: &'static str,
+    remediation: &'static str,
+}
+
+const fn facade_contract(
+    tool_name: &'static str,
+    operation_enum: &'static str,
+    source_of_truth: &'static str,
+    operations: &'static [FacadeOperationContractSpec],
+) -> FacadeToolContractSpec {
+    FacadeToolContractSpec {
+        tool_name,
+        operation_enum,
+        source_of_truth,
+        operations,
+    }
+}
+
+const fn op(
+    operation: &'static str,
+    mutates_state: bool,
+    target_required: bool,
+    source_of_truth: &'static str,
+    readback_source_of_truth: Option<&'static str>,
+    error_code: &'static str,
+    remediation: &'static str,
+) -> FacadeOperationContractSpec {
+    FacadeOperationContractSpec {
+        operation,
+        mutates_state,
+        target_required,
+        source_of_truth,
+        readback_source_of_truth,
+        error_code,
+        remediation,
+    }
+}
 
 const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "act_foreground",
@@ -580,6 +1318,47 @@ pub(crate) struct PublicToolRegistrySnapshot {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct FacadeOperationContractSnapshot {
+    pub operation: &'static str,
+    pub mutates_state: bool,
+    pub target_required: bool,
+    pub source_of_truth: &'static str,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readback_source_of_truth: Option<&'static str>,
+    pub error_code: &'static str,
+    pub remediation: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FacadeToolContractSnapshot {
+    pub tool_name: &'static str,
+    pub operation_enum: &'static str,
+    pub source_of_truth: &'static str,
+    pub operations: Vec<FacadeOperationContractSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FacadeContractSnapshot {
+    pub source_of_truth: &'static str,
+    pub structured_error_contract: &'static str,
+    pub public_tool_count: usize,
+    pub contract_tool_count: usize,
+    pub operation_count: usize,
+    pub mutating_operation_count: usize,
+    pub facade_contract_sha256: String,
+    pub contract_tool_names: Vec<String>,
+    pub missing_contract_tool_names: Vec<String>,
+    pub unknown_contract_tool_names: Vec<String>,
+    pub duplicate_contract_tool_names: Vec<String>,
+    pub duplicate_operation_names: Vec<String>,
+    pub invalid_contract_reasons: Vec<String>,
+    pub contracts: Vec<FacadeToolContractSnapshot>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ToolProfileSnapshot {
     pub source_of_truth: &'static str,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -595,6 +1374,7 @@ pub(crate) struct ToolProfileSnapshot {
     pub foreground_capability: ToolProfileForegroundCapability,
     pub hidden_tool_routes: Vec<HiddenToolCapabilityRoute>,
     pub public_tool_registry: PublicToolRegistrySnapshot,
+    pub facade_contract: FacadeContractSnapshot,
     /// #1352: this session's CURRENT readiness for the real OS-foreground route —
     /// whether it already holds the lease + a break_glass profile, and the exact
     /// remaining steps. Lets an agent preflight the foreground route before
@@ -901,6 +1681,8 @@ impl SynapseService {
         let full_tool_names = self.full_tool_names();
         let implementation_tool_count = full_tool_names.len();
         let public_tool_registry = public_tool_registry_snapshot_for(&full_tool_names)?;
+        let facade_contract =
+            facade_contract_snapshot_for(&public_tool_registry.public_tool_names)?;
         let (profile, source, policy_row) = match session_id {
             Some(session_id) => {
                 let row = self.ensure_tool_profile_assignment(session_id)?;
@@ -934,6 +1716,7 @@ impl SynapseService {
             foreground_capability: foreground_capability_policy(profile),
             hidden_tool_routes,
             public_tool_registry,
+            facade_contract,
             foreground_route: foreground_route_readiness(session_id, profile),
             policy_row,
         })
@@ -943,6 +1726,10 @@ impl SynapseService {
         &self,
     ) -> Result<PublicToolRegistrySnapshot, ErrorData> {
         public_tool_registry_snapshot_for(&self.full_tool_names())
+    }
+
+    pub(crate) fn facade_contract_snapshot() -> Result<FacadeContractSnapshot, ErrorData> {
+        facade_contract_snapshot_for(&public_tool_names())
     }
 
     pub(crate) fn admit_tool_call_for_profile(
@@ -1523,6 +2310,25 @@ impl PublicToolRegistryValidation {
     }
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct FacadeContractValidation {
+    missing_contract_tool_names: Vec<String>,
+    unknown_contract_tool_names: Vec<String>,
+    duplicate_contract_tool_names: Vec<String>,
+    duplicate_operation_names: Vec<String>,
+    invalid_contract_reasons: Vec<String>,
+}
+
+impl FacadeContractValidation {
+    const fn is_valid(&self) -> bool {
+        self.missing_contract_tool_names.is_empty()
+            && self.unknown_contract_tool_names.is_empty()
+            && self.duplicate_contract_tool_names.is_empty()
+            && self.duplicate_operation_names.is_empty()
+            && self.invalid_contract_reasons.is_empty()
+    }
+}
+
 fn public_tool_names() -> Vec<String> {
     PUBLIC_TOOL_NAMES
         .iter()
@@ -1620,6 +2426,225 @@ fn public_tool_registry_error(
             "duplicate_public_tool_names": validation.duplicate_public_tool_names,
             "forbidden_public_tool_names": validation.forbidden_public_tool_names,
             "remediation": "edit PUBLIC_TOOL_NAMES so it has at most 40 unique facade names and no implementation-only tools",
+        })),
+    )
+}
+
+fn facade_contract_snapshot_for(
+    public_tool_names: &[String],
+) -> Result<FacadeContractSnapshot, ErrorData> {
+    let validation = validate_facade_contracts(public_tool_names, FACADE_TOOL_CONTRACTS)?;
+    let contracts = facade_contract_snapshots(FACADE_TOOL_CONTRACTS);
+    let contract_tool_names = contracts
+        .iter()
+        .map(|contract| contract.tool_name.to_owned())
+        .collect::<Vec<_>>();
+    let operation_count = contracts
+        .iter()
+        .map(|contract| contract.operations.len())
+        .sum::<usize>();
+    let mutating_operation_count = contracts
+        .iter()
+        .flat_map(|contract| &contract.operations)
+        .filter(|operation| operation.mutates_state)
+        .count();
+    let facade_contract_sha256 = sha256_json_hex(&contracts)?;
+    Ok(FacadeContractSnapshot {
+        source_of_truth: FACADE_CONTRACT_SOURCE_OF_TRUTH,
+        structured_error_contract: FACADE_CONTRACT_STRUCTURED_ERROR,
+        public_tool_count: public_tool_names.len(),
+        contract_tool_count: contracts.len(),
+        operation_count,
+        mutating_operation_count,
+        facade_contract_sha256,
+        contract_tool_names,
+        missing_contract_tool_names: validation.missing_contract_tool_names,
+        unknown_contract_tool_names: validation.unknown_contract_tool_names,
+        duplicate_contract_tool_names: validation.duplicate_contract_tool_names,
+        duplicate_operation_names: validation.duplicate_operation_names,
+        invalid_contract_reasons: validation.invalid_contract_reasons,
+        contracts,
+    })
+}
+
+fn facade_contract_snapshots(
+    contracts: &[FacadeToolContractSpec],
+) -> Vec<FacadeToolContractSnapshot> {
+    contracts
+        .iter()
+        .map(|contract| FacadeToolContractSnapshot {
+            tool_name: contract.tool_name,
+            operation_enum: contract.operation_enum,
+            source_of_truth: contract.source_of_truth,
+            operations: contract
+                .operations
+                .iter()
+                .map(|operation| FacadeOperationContractSnapshot {
+                    operation: operation.operation,
+                    mutates_state: operation.mutates_state,
+                    target_required: operation.target_required,
+                    source_of_truth: operation.source_of_truth,
+                    readback_source_of_truth: operation.readback_source_of_truth,
+                    error_code: operation.error_code,
+                    remediation: operation.remediation,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn validate_facade_contracts(
+    public_tool_names: &[String],
+    contracts: &[FacadeToolContractSpec],
+) -> Result<FacadeContractValidation, ErrorData> {
+    let validation = inspect_facade_contracts(public_tool_names, contracts);
+    if validation.is_valid() {
+        return Ok(validation);
+    }
+    Err(facade_contract_error(
+        public_tool_names,
+        contracts,
+        &validation,
+    ))
+}
+
+fn inspect_facade_contracts(
+    public_tool_names: &[String],
+    contracts: &[FacadeToolContractSpec],
+) -> FacadeContractValidation {
+    let public_name_set = public_tool_names
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    let contract_names = contracts
+        .iter()
+        .map(|contract| contract.tool_name)
+        .collect::<Vec<_>>();
+    let contract_name_set = contract_names.iter().copied().collect::<BTreeSet<_>>();
+    let missing_contract_tool_names = public_tool_names
+        .iter()
+        .filter(|name| !contract_name_set.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let unknown_contract_tool_names = contract_name_set
+        .iter()
+        .filter(|name| !public_name_set.contains(**name))
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+
+    let mut seen_contract_names = BTreeSet::new();
+    let mut duplicate_contract_tool_names = BTreeSet::new();
+    let mut duplicate_operation_names = BTreeSet::new();
+    let mut invalid_contract_reasons = Vec::new();
+    for contract in contracts {
+        if contract.tool_name.trim().is_empty() {
+            invalid_contract_reasons.push("contract tool_name must not be empty".to_owned());
+        }
+        if !seen_contract_names.insert(contract.tool_name) {
+            duplicate_contract_tool_names.insert(contract.tool_name.to_owned());
+        }
+        if contract.operation_enum.trim().is_empty() {
+            invalid_contract_reasons.push(format!(
+                "{} operation_enum must not be empty",
+                contract.tool_name
+            ));
+        }
+        if contract.source_of_truth.trim().is_empty() {
+            invalid_contract_reasons.push(format!(
+                "{} source_of_truth must not be empty",
+                contract.tool_name
+            ));
+        }
+        if contract.operations.is_empty() {
+            invalid_contract_reasons.push(format!(
+                "{} must declare at least one operation",
+                contract.tool_name
+            ));
+        }
+
+        let mut seen_operations = BTreeSet::new();
+        for operation in contract.operations {
+            if operation.operation.trim().is_empty() {
+                invalid_contract_reasons.push(format!(
+                    "{} operation name must not be empty",
+                    contract.tool_name
+                ));
+            }
+            if !seen_operations.insert(operation.operation) {
+                duplicate_operation_names
+                    .insert(format!("{}.{}", contract.tool_name, operation.operation));
+            }
+            if operation.source_of_truth.trim().is_empty() {
+                invalid_contract_reasons.push(format!(
+                    "{}.{} source_of_truth must not be empty",
+                    contract.tool_name, operation.operation
+                ));
+            }
+            if operation.error_code.trim().is_empty() {
+                invalid_contract_reasons.push(format!(
+                    "{}.{} error_code must not be empty",
+                    contract.tool_name, operation.operation
+                ));
+            }
+            if operation.remediation.trim().is_empty() {
+                invalid_contract_reasons.push(format!(
+                    "{}.{} remediation must not be empty",
+                    contract.tool_name, operation.operation
+                ));
+            }
+            if operation.mutates_state
+                && operation
+                    .readback_source_of_truth
+                    .is_none_or(|readback| readback.trim().is_empty())
+            {
+                invalid_contract_reasons.push(format!(
+                    "{}.{} mutates_state requires readback_source_of_truth",
+                    contract.tool_name, operation.operation
+                ));
+            }
+        }
+    }
+
+    FacadeContractValidation {
+        missing_contract_tool_names,
+        unknown_contract_tool_names,
+        duplicate_contract_tool_names: duplicate_contract_tool_names.into_iter().collect(),
+        duplicate_operation_names: duplicate_operation_names.into_iter().collect(),
+        invalid_contract_reasons,
+    }
+}
+
+fn facade_contract_error(
+    public_tool_names: &[String],
+    contracts: &[FacadeToolContractSpec],
+    validation: &FacadeContractValidation,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "public facade contract is invalid: public_count={} contract_count={} missing={:?} unknown={:?} duplicate_tools={:?} duplicate_operations={:?} invalid_reasons={:?}",
+            public_tool_names.len(),
+            contracts.len(),
+            validation.missing_contract_tool_names,
+            validation.unknown_contract_tool_names,
+            validation.duplicate_contract_tool_names,
+            validation.duplicate_operation_names,
+            validation.invalid_contract_reasons
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_INTERNAL_ERROR,
+            "detail_code": FACADE_CONTRACT_ERROR_CODE,
+            "operation": FACADE_CONTRACT_OPERATION,
+            "source_of_truth": FACADE_CONTRACT_SOURCE_OF_TRUTH,
+            "structured_error_contract": FACADE_CONTRACT_STRUCTURED_ERROR,
+            "public_tool_count": public_tool_names.len(),
+            "contract_tool_count": contracts.len(),
+            "missing_contract_tool_names": validation.missing_contract_tool_names,
+            "unknown_contract_tool_names": validation.unknown_contract_tool_names,
+            "duplicate_contract_tool_names": validation.duplicate_contract_tool_names,
+            "duplicate_operation_names": validation.duplicate_operation_names,
+            "invalid_contract_reasons": validation.invalid_contract_reasons,
+            "remediation": "edit FACADE_TOOL_CONTRACTS so every public facade has unique typed operations, source_of_truth, structured error code, remediation, and readback_source_of_truth for mutations",
         })),
     )
 }
@@ -1893,6 +2918,139 @@ mod tests {
             data.get("forbidden_public_tool_names"),
             Some(&json!(["cdp_open_tab"]))
         );
+    }
+
+    #[test]
+    fn facade_contract_covers_every_public_tool_with_readback_rules() {
+        let public_names = public_tool_names();
+        let snapshot = facade_contract_snapshot_for(&public_names).expect("facade contract");
+        assert_eq!(snapshot.public_tool_count, PUBLIC_TOOL_LIMIT);
+        assert_eq!(snapshot.contract_tool_count, PUBLIC_TOOL_LIMIT);
+        assert_eq!(snapshot.missing_contract_tool_names, Vec::<String>::new());
+        assert_eq!(snapshot.unknown_contract_tool_names, Vec::<String>::new());
+        assert_eq!(snapshot.duplicate_contract_tool_names, Vec::<String>::new());
+        assert_eq!(snapshot.duplicate_operation_names, Vec::<String>::new());
+        assert_eq!(snapshot.invalid_contract_reasons, Vec::<String>::new());
+        assert!(snapshot.operation_count > PUBLIC_TOOL_LIMIT);
+        assert!(snapshot.mutating_operation_count > 0);
+        assert!(snapshot.contracts.iter().any(|contract| {
+            contract.tool_name == "browser_tabs"
+                && contract.operation_enum == "BrowserTabsOperation"
+                && contract.operations.iter().any(|operation| {
+                    operation.operation == "select"
+                        && operation.mutates_state
+                        && operation.readback_source_of_truth.is_some()
+                })
+        }));
+        assert!(snapshot.contracts.iter().all(|contract| {
+            contract.operations.iter().all(|operation| {
+                !operation.mutates_state || operation.readback_source_of_truth.is_some()
+            })
+        }));
+    }
+
+    #[test]
+    fn facade_contract_rejects_unknown_contract_tool() {
+        const OPS: &[FacadeOperationContractSpec] = &[op(
+            "status",
+            false,
+            false,
+            "test SoT",
+            None,
+            error_codes::TOOL_INTERNAL_ERROR,
+            "fix test",
+        )];
+        const CONTRACTS: &[FacadeToolContractSpec] = &[
+            facade_contract("health", "HealthOperation", "test SoT", OPS),
+            facade_contract("not_public", "NotPublicOperation", "test SoT", OPS),
+        ];
+        let error = validate_facade_contracts(&["health".to_owned()], CONTRACTS)
+            .expect_err("unknown public contract rejected");
+        let data = registry_error_data(&error);
+        assert_eq!(
+            data.get("detail_code").and_then(Value::as_str),
+            Some(FACADE_CONTRACT_ERROR_CODE)
+        );
+        assert_eq!(
+            data.get("unknown_contract_tool_names"),
+            Some(&json!(["not_public"]))
+        );
+    }
+
+    #[test]
+    fn facade_contract_rejects_duplicate_operations() {
+        const OPS: &[FacadeOperationContractSpec] = &[
+            op(
+                "status",
+                false,
+                false,
+                "test SoT",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "fix test",
+            ),
+            op(
+                "status",
+                false,
+                false,
+                "test SoT",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "fix test",
+            ),
+        ];
+        const CONTRACTS: &[FacadeToolContractSpec] = &[facade_contract(
+            "health",
+            "HealthOperation",
+            "test SoT",
+            OPS,
+        )];
+        let error = validate_facade_contracts(&["health".to_owned()], CONTRACTS)
+            .expect_err("duplicate operation rejected");
+        let data = registry_error_data(&error);
+        assert_eq!(
+            data.get("detail_code").and_then(Value::as_str),
+            Some(FACADE_CONTRACT_ERROR_CODE)
+        );
+        assert_eq!(
+            data.get("duplicate_operation_names"),
+            Some(&json!(["health.status"]))
+        );
+    }
+
+    #[test]
+    fn facade_contract_rejects_mutation_without_readback_source() {
+        const OPS: &[FacadeOperationContractSpec] = &[op(
+            "set",
+            true,
+            false,
+            "test SoT",
+            None,
+            error_codes::STORAGE_WRITE_FAILED,
+            "fix test",
+        )];
+        const CONTRACTS: &[FacadeToolContractSpec] = &[facade_contract(
+            "health",
+            "HealthOperation",
+            "test SoT",
+            OPS,
+        )];
+        let error = validate_facade_contracts(&["health".to_owned()], CONTRACTS)
+            .expect_err("mutating operation without readback rejected");
+        let data = registry_error_data(&error);
+        assert_eq!(
+            data.get("detail_code").and_then(Value::as_str),
+            Some(FACADE_CONTRACT_ERROR_CODE)
+        );
+        let reasons = data
+            .get("invalid_contract_reasons")
+            .and_then(Value::as_array)
+            .expect("invalid reasons");
+        assert!(reasons.iter().any(|reason| {
+            reason
+                .as_str()
+                .is_some_and(|reason| reason.contains("mutates_state requires readback"))
+        }));
     }
 
     #[test]

@@ -66,6 +66,7 @@ impl SynapseService {
             "public_tool_registry".to_owned(),
             self.public_tool_registry_health(),
         );
+        subsystems.insert("facade_contract".to_owned(), self.facade_contract_health());
         let tool_surface = self.tool_surface_fingerprint(session_id);
         if let Some(error) = &tool_surface.error {
             subsystems.insert(
@@ -110,6 +111,38 @@ impl SynapseService {
                         snapshot.implementation_tool_count,
                         snapshot.registered_tools_present.len(),
                         missing_count
+                    )),
+                    ..SubsystemHealth::default()
+                }
+            }
+            Err(error) => SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(format!("{error:?}")),
+                ..SubsystemHealth::default()
+            },
+        }
+    }
+
+    fn facade_contract_health(&self) -> SubsystemHealth {
+        match Self::facade_contract_snapshot() {
+            Ok(snapshot) => {
+                let invalid_count = snapshot.missing_contract_tool_names.len()
+                    + snapshot.unknown_contract_tool_names.len()
+                    + snapshot.duplicate_contract_tool_names.len()
+                    + snapshot.duplicate_operation_names.len()
+                    + snapshot.invalid_contract_reasons.len();
+                let status = if invalid_count == 0 { "ok" } else { "error" };
+                SubsystemHealth {
+                    status: status.to_owned(),
+                    detail: Some(format!(
+                        "source_of_truth={} public_tool_count={} contract_tool_count={} operation_count={} mutating_operation_count={} invalid_count={} contract_sha256={}",
+                        snapshot.source_of_truth,
+                        snapshot.public_tool_count,
+                        snapshot.contract_tool_count,
+                        snapshot.operation_count,
+                        snapshot.mutating_operation_count,
+                        invalid_count,
+                        snapshot.facade_contract_sha256
                     )),
                     ..SubsystemHealth::default()
                 }
