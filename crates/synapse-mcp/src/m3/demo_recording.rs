@@ -50,7 +50,7 @@ const MAX_DEMO_DURATION_MS: u64 = 3_600_000;
 const MAX_LABEL_BYTES: usize = 256;
 const DEMO_TIMELINE_SEQ_BASE: u32 = 0x8000_0000;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DemoRecordActiveState {
     pub demo_id: String,
@@ -451,7 +451,7 @@ pub struct DemoRecordStopResponse {
     pub cleared_active_state: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DemoRecordStatusResponse {
     pub schema_version: u32,

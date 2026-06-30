@@ -214,6 +214,7 @@ pub(crate) mod agent_transcripts;
 pub(crate) mod ambient_agents;
 mod approval_facades;
 mod audit_context;
+mod audit_replay_facades;
 pub(crate) mod codex_app_server_bridge;
 pub(crate) mod command_audit;
 mod context;
@@ -630,6 +631,7 @@ impl SynapseService {
             + Self::agent_task_tool_router()
             + Self::agent_facade_tool_router()
             + Self::approval_facade_tool_router()
+            + Self::audit_replay_facade_tool_router()
             + Self::timeline_facade_tool_router()
             + Self::routine_assist_facade_tool_router()
             + Self::operational_facade_tool_router()

@@ -437,6 +437,8 @@ const DESTRUCTIVE_MCP_TOOLS: &[&str] = &[
     "model",
     "cost",
     "hygiene",
+    "audit",
+    "replay",
     "setup",
     "agent_cost_price_put",
     "agent_cost_price_delete",
