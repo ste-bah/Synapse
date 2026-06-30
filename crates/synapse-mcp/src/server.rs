@@ -267,6 +267,7 @@ mod m2_tools;
 mod m3_tools;
 pub(crate) mod m4_tools;
 mod notify_tools;
+mod operational_facades;
 mod permission_gate;
 pub(crate) mod permission_policy;
 mod plan_tools;
@@ -630,6 +631,7 @@ impl SynapseService {
             + Self::approval_facade_tool_router()
             + Self::timeline_facade_tool_router()
             + Self::routine_assist_facade_tool_router()
+            + Self::operational_facade_tool_router()
             + Self::workspace_blackboard_tool_router()
             + Self::target_claim_tool_router()
             + Self::reality_tool_router()

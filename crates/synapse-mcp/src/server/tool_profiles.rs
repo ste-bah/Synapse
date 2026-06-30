@@ -136,8 +136,17 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "escalation_list",
     "get_target",
     "hidden_desktop_pip_frame",
+    "hygiene_flags",
+    "hygiene_report",
+    "hygiene_scan_storage",
+    "hygiene_scan_text",
     "intent_current",
     "intent_detect_tick",
+    "local_model_list",
+    "local_model_probe",
+    "local_model_register",
+    "local_model_remove",
+    "local_model_update",
     "observe_delta",
     "profile_authoring_generate",
     "profile_authoring_inspect",
@@ -154,6 +163,8 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "routine_update",
     "set_target",
     "storage_gc_once",
+    "storage_inspect",
+    "storage_pressure_sample",
     "storage_put_probe_rows",
     "suggestion_accept",
     "suggestion_list",
@@ -1575,15 +1586,44 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
         "storage",
         "StorageOperation",
         "RocksDB CF metadata + exact row readbacks",
-        &[op(
-            "inspect",
-            false,
-            false,
-            "RocksDB CF metadata + optional exact row readback",
-            None,
-            error_codes::STORAGE_READ_FAILED,
-            "inspect the named CF/key and fix storage health before mutating",
-        )],
+        &[
+            op(
+                "inspect",
+                false,
+                false,
+                "RocksDB CF sizes/counts/samples",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "inspect storage health and CF metadata before mutating",
+            ),
+            op(
+                "summary",
+                false,
+                false,
+                "RocksDB CF live-data estimates + exact row counts",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "repair storage initialization and read CF metadata again",
+            ),
+            op(
+                "put_probe_rows",
+                true,
+                false,
+                "RocksDB CF probe rows",
+                Some("CF row-count and size readback after probe row write"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before writing probe rows",
+            ),
+            op(
+                "gc_once",
+                true,
+                false,
+                "RocksDB CF row counts + audit retention report rows",
+                Some("CF row-count and GC report readback after pass"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before running GC",
+            ),
+        ],
     ),
     facade_contract(
         "model",
@@ -1600,13 +1640,49 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "read registry storage and probe diagnostics before routing a model",
             ),
             op(
+                "status",
+                false,
+                false,
+                "CF_KV local model registry rows + last probe fields",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "inspect registry rows and corrupt-row diagnostics",
+            ),
+            op(
+                "probe",
+                true,
+                false,
+                "live model endpoint + CF_KV probe evidence row",
+                Some("registry row and probe-evidence readback"),
+                error_codes::MODEL_TOOLS_UNSUPPORTED,
+                "repair the real backend endpoint/socket/credentials and retry probe",
+            ),
+            op(
+                "register",
+                true,
+                false,
+                "CF_KV local model registry row",
+                Some("registry row readback after forced structured probe"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before registering endpoints",
+            ),
+            op(
                 "update",
                 true,
                 false,
                 "CF_KV local model registry row",
                 Some("forced structured tool-call probe row readback"),
-                error_codes::TOOL_PARAMS_INVALID,
-                "fix endpoint/model/key settings until the real probe passes",
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before mutating endpoints",
+            ),
+            op(
+                "remove",
+                true,
+                false,
+                "CF_KV local model registry row + secret row",
+                Some("removed-row readback plus exact after-row absence check"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before removing endpoints",
             ),
         ],
     ),
@@ -1627,16 +1703,45 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "hygiene",
         "HygieneOperation",
-        "repo/host hygiene report artifacts",
-        &[op(
-            "report",
-            false,
-            false,
-            "hygiene report artifact + process/worktree readback",
-            None,
-            error_codes::TOOL_INTERNAL_ERROR,
-            "read the failing hygiene artifact and remediate exact paths/processes",
-        )],
+        "CF_KV hygiene flags + physical source rows + downstream learned-state joins",
+        &[
+            op(
+                "scan_text",
+                true,
+                false,
+                "caller text + optional physical source row",
+                Some("CF_KV hygiene flag row readback when persist=true"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "run without persist for read-only scoring or switch to maintenance before persisting flags",
+            ),
+            op(
+                "scan_storage",
+                true,
+                false,
+                "CF_OBSERVATIONS/CF_TIMELINE source rows",
+                Some("CF_KV hygiene flag rows linked to exact source keys"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before batch-scanning storage",
+            ),
+            op(
+                "flags",
+                false,
+                false,
+                "CF_KV hygiene/flag/v1 rows",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "inspect hygiene flag prefix/cursor and storage health",
+            ),
+            op(
+                "report",
+                false,
+                false,
+                "CF_KV hygiene flags + CF_EPISODES/CF_ROUTINES/profile-authoring joins",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "inspect hygiene report joins and storage health",
+            ),
+        ],
     ),
     facade_contract(
         "audit",
@@ -1722,15 +1827,35 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
         "setup",
         "SetupOperation",
         "host setup readback + daemon transport configuration",
-        &[op(
-            "doctor",
-            false,
-            false,
-            "host setup readback + daemon process/socket state",
-            None,
-            error_codes::TOOL_INTERNAL_ERROR,
-            "repair the exact missing local prerequisite and read the configured SoT again",
-        )],
+        &[
+            op(
+                "status",
+                false,
+                false,
+                "host setup files + daemon process/socket state",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "repair the exact unreadable setup file/env prerequisite and retry",
+            ),
+            op(
+                "doctor",
+                false,
+                false,
+                "host setup files + daemon process/socket state",
+                None,
+                error_codes::TOOL_INTERNAL_ERROR,
+                "repair the exact missing local prerequisite and read the configured SoT again",
+            ),
+            op(
+                "repair",
+                true,
+                false,
+                "host setup files + external setup script process/socket state",
+                Some("post-repair daemon process/socket/token/config readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile and run repair from an external process",
+            ),
+        ],
     ),
     facade_contract(
         "telemetry",
@@ -3909,6 +4034,24 @@ mod tests {
                 "workspace_put",
                 "workspace_subscribe",
                 "privacy",
+                "storage",
+                "storage_inspect",
+                "storage_put_probe_rows",
+                "storage_gc_once",
+                "storage_pressure_sample",
+                "model",
+                "local_model_register",
+                "local_model_list",
+                "local_model_update",
+                "local_model_remove",
+                "local_model_probe",
+                "hygiene",
+                "hygiene_scan_text",
+                "hygiene_scan_storage",
+                "hygiene_flags",
+                "hygiene_report",
+                "setup",
+                "telemetry",
             ]
             .iter()
             .map(|name| (*name).to_owned()),
@@ -3991,6 +4134,10 @@ mod tests {
         assert!(!public_names.contains(&"workspace_put".to_owned()));
         assert!(!public_names.contains(&"workspace_get".to_owned()));
         assert!(!public_names.contains(&"storage_put_probe_rows".to_owned()));
+        assert!(!public_names.contains(&"storage_inspect".to_owned()));
+        assert!(!public_names.contains(&"local_model_list".to_owned()));
+        assert!(!public_names.contains(&"local_model_probe".to_owned()));
+        assert!(!public_names.contains(&"hygiene_report".to_owned()));
 
         let snapshot =
             public_tool_registry_snapshot_for(&names()).expect("registry snapshot from fixture");
@@ -4132,6 +4279,36 @@ mod tests {
                 .registered_tools_present
                 .contains(&"verification".to_owned()),
             "#1388 registers the verification facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"storage".to_owned()),
+            "#1389 registers the storage facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"model".to_owned()),
+            "#1389 registers the model facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"hygiene".to_owned()),
+            "#1389 registers the hygiene facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"setup".to_owned()),
+            "#1389 registers the setup facade"
+        );
+        assert!(
+            snapshot
+                .registered_tools_present
+                .contains(&"telemetry".to_owned()),
+            "#1389 registers the telemetry facade"
         );
         assert!(snapshot.duplicate_public_tool_names.is_empty());
         assert!(snapshot.forbidden_public_tool_names.is_empty());
@@ -4356,7 +4533,12 @@ mod tests {
                 "assist",
                 "reality",
                 "verification",
+                "storage",
+                "model",
+                "hygiene",
                 "privacy",
+                "setup",
+                "telemetry",
             ]
             .into_iter()
             .map(str::to_owned)
@@ -4679,6 +4861,11 @@ mod tests {
         assert!(tools.contains(&"assist".to_owned()));
         assert!(tools.contains(&"reality".to_owned()));
         assert!(tools.contains(&"verification".to_owned()));
+        assert!(tools.contains(&"storage".to_owned()));
+        assert!(tools.contains(&"model".to_owned()));
+        assert!(tools.contains(&"hygiene".to_owned()));
+        assert!(tools.contains(&"setup".to_owned()));
+        assert!(tools.contains(&"telemetry".to_owned()));
         assert!(!tools.contains(&"agent_spawn_task_started".to_owned()));
         assert!(!tools.contains(&"cdp_activate_tab".to_owned()));
         assert!(!tools.contains(&"cdp_close_tab".to_owned()));
@@ -4695,8 +4882,19 @@ mod tests {
         assert!(!tools.contains(&"tool_profile_set".to_owned()));
         assert!(!tools.contains(&"demo_record_start".to_owned()));
         assert!(!tools.contains(&"profile_authoring_generate".to_owned()));
+        assert!(!tools.contains(&"storage_inspect".to_owned()));
         assert!(!tools.contains(&"storage_put_probe_rows".to_owned()));
         assert!(!tools.contains(&"storage_gc_once".to_owned()));
+        assert!(!tools.contains(&"storage_pressure_sample".to_owned()));
+        assert!(!tools.contains(&"local_model_list".to_owned()));
+        assert!(!tools.contains(&"local_model_probe".to_owned()));
+        assert!(!tools.contains(&"local_model_register".to_owned()));
+        assert!(!tools.contains(&"local_model_update".to_owned()));
+        assert!(!tools.contains(&"local_model_remove".to_owned()));
+        assert!(!tools.contains(&"hygiene_scan_text".to_owned()));
+        assert!(!tools.contains(&"hygiene_scan_storage".to_owned()));
+        assert!(!tools.contains(&"hygiene_flags".to_owned()));
+        assert!(!tools.contains(&"hygiene_report".to_owned()));
         assert!(!tools.contains(&"timeline_get".to_owned()));
         assert!(!tools.contains(&"timeline_search".to_owned()));
         assert!(!tools.contains(&"timeline_stats".to_owned()));
