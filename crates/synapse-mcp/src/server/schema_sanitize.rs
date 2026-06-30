@@ -17,9 +17,9 @@
 //! Rather than annotate every `Value` field individually (fragile — the next
 //! `Value` field reintroduces the bug), we normalize at the serving boundary:
 //! every emitted tool schema is walked and any boolean found in a *schema
-//! position that strict clients validate as a property schema* is replaced with
-//! an explicit, fully permissive object schema. This is exhaustive over current
-//! and future tools and is enforced by `schema_sanitize_tests`.
+//! position that strict clients validate as a subschema* is replaced with an
+//! explicit, fully permissive object schema. This is exhaustive over current and
+//! future tools and is enforced by `schema_sanitize_tests`.
 //!
 //! Booleans in `additionalProperties` / `additionalItems` / `unevaluated*`
 //! positions are intentionally preserved: a boolean there is meaningful and is
@@ -54,11 +54,28 @@ use serde_json::{Map, Value};
 
 /// Keywords whose value is a *map* of subschemas. A boolean value of any member
 /// is the client-rejected case and is rewritten.
-const SCHEMA_MAP_KEYWORDS: &[&str] = &["properties", "patternProperties"];
+const SCHEMA_MAP_KEYWORDS: &[&str] = &[
+    "$defs",
+    "definitions",
+    "dependentSchemas",
+    "patternProperties",
+    "properties",
+];
 
 /// Keywords whose value is an *array* of subschemas. A boolean element is
 /// rewritten.
 const SCHEMA_ARRAY_KEYWORDS: &[&str] = &["oneOf", "anyOf", "allOf", "prefixItems"];
+
+/// Keywords whose value is a single subschema. A boolean value is rewritten.
+const SCHEMA_VALUE_KEYWORDS: &[&str] = &[
+    "contains",
+    "else",
+    "if",
+    "items",
+    "not",
+    "propertyNames",
+    "then",
+];
 
 /// The complete set of `format` values defined by the JSON Schema 2020-12
 /// format-annotation vocabulary. Any `format` whose value is **not** in this
@@ -172,16 +189,25 @@ fn rewrite_value(value: &mut Value) {
     }
 }
 
+fn rewrite_schema_value(value: &mut Value) {
+    match value {
+        Value::Bool(b) => *value = boolean_as_schema(*b),
+        Value::Object(map) => rewrite_map(map),
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                rewrite_schema_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn rewrite_map(map: &mut Map<String, Value>) {
     for (key, child) in map.iter_mut() {
         if SCHEMA_MAP_KEYWORDS.contains(&key.as_str()) {
             if let Value::Object(members) = child {
                 for member in members.values_mut() {
-                    if let Value::Bool(b) = member {
-                        *member = boolean_as_schema(*b);
-                    } else {
-                        rewrite_value(member);
-                    }
+                    rewrite_schema_value(member);
                 }
             } else {
                 rewrite_value(child);
@@ -189,19 +215,17 @@ fn rewrite_map(map: &mut Map<String, Value>) {
         } else if SCHEMA_ARRAY_KEYWORDS.contains(&key.as_str()) {
             if let Value::Array(elements) = child {
                 for element in elements.iter_mut() {
-                    if let Value::Bool(b) = element {
-                        *element = boolean_as_schema(*b);
-                    } else {
-                        rewrite_value(element);
-                    }
+                    rewrite_schema_value(element);
                 }
             } else {
                 rewrite_value(child);
             }
+        } else if SCHEMA_VALUE_KEYWORDS.contains(&key.as_str()) {
+            rewrite_schema_value(child);
         } else {
-            // `$defs`, `definitions`, `items`, `not`, `additionalProperties`
-            // (object form), etc. Recurse to reach nested `properties`, but do
-            // not rewrite a boolean that legitimately lives in
+            // `additionalProperties` (object form), etc. Recurse to reach nested
+            // schema keywords, but do not rewrite a boolean that legitimately
+            // lives in
             // `additionalProperties`/`additionalItems`/`unevaluated*`.
             rewrite_value(child);
         }
@@ -218,9 +242,8 @@ mod tests {
     use serde_json::{Value, json};
 
     /// Returns every JSON-pointer-ish path at which a *boolean* appears in a
-    /// client-validated schema position (a `properties`/`patternProperties`
-    /// member, or a `oneOf`/`anyOf`/`allOf`/`prefixItems` element). These are
-    /// exactly the positions strict MCP clients reject.
+    /// client-validated schema position. These are exactly the positions strict
+    /// MCP clients reject.
     fn bare_boolean_schema_paths(value: &Value, path: &str, out: &mut Vec<String>) {
         match value {
             Value::Object(map) => {
@@ -250,6 +273,13 @@ mod tests {
                             } else {
                                 bare_boolean_schema_paths(ev, &format!("{child_path}[{i}]"), out);
                             }
+                        }
+                        continue;
+                    } else if SCHEMA_VALUE_KEYWORDS.contains(&key.as_str()) {
+                        if child.is_boolean() {
+                            out.push(child_path);
+                        } else {
+                            bare_boolean_schema_paths(child, &child_path, out);
                         }
                         continue;
                     }
@@ -435,9 +465,17 @@ mod tests {
                 "nested": {
                     "type": "object",
                     "properties": { "inner": true }
+                },
+                "array_payload": {
+                    "type": "array",
+                    "items": true
                 }
             },
+            "$defs": {
+                "AnyJson": true
+            },
             "oneOf": [ true, { "type": "string" } ],
+            "not": false,
             "additionalProperties": false
         });
         rewrite_value(&mut schema);
@@ -447,8 +485,14 @@ mod tests {
         assert!(schema["properties"]["payload"]["type"].is_array());
         // deeply nested properties boolean rewritten too
         assert!(schema["properties"]["nested"]["properties"]["inner"].is_object());
+        // array item schemas are schema-valued and must be rewritten too
+        assert!(schema["properties"]["array_payload"]["items"].is_object());
+        // definition-map members are schema-valued and must be rewritten
+        assert!(schema["$defs"]["AnyJson"].is_object());
         // oneOf boolean element rewritten
         assert!(schema["oneOf"][0].is_object());
+        // single schema-valued keywords rewrite false to a never-matching schema
+        assert!(schema["not"].is_object());
         // additionalProperties boolean preserved (meaningful, accepted by clients)
         assert_eq!(schema["additionalProperties"], Value::Bool(false));
     }

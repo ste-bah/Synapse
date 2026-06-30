@@ -98,6 +98,10 @@ const TARGET_FACADE_SOURCE_OF_TRUTH: &str =
 const BROWSER_NAV_SOURCE_OF_TRUTH: &str =
     "Chrome bridge/CDP navigation command + session target ownership + CF_ACTION_LOG";
 const BROWSER_NAV_READBACK_SOURCE_OF_TRUTH: &str = "page URL/title/readyState readback from chrome.tabs.get or Runtime.evaluate + daemon-tool-events.jsonl";
+const BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH: &str =
+    "target-scoped browser wait predicate readback from DOM/URL/load/network/function state";
+const BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH: &str =
+    "browser_wait_for condition response plus daemon-tool-events.jsonl";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -111,6 +115,39 @@ enum TargetOperation {
     Status,
     Adopt,
     Release,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum BrowserWaitOperation {
+    ForCondition,
+}
+
+impl BrowserWaitOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ForCondition => "for_condition",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BrowserWaitFacadeParams {
+    /// Wait operation to run. Supply exactly the matching `wait` spec object.
+    operation: BrowserWaitOperation,
+    /// `operation=for_condition`: unified wait condition spec.
+    #[serde(default)]
+    wait: Option<BrowserWaitParams>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct BrowserWaitFacadeResponse {
+    operation: BrowserWaitOperation,
+    source_of_truth: String,
+    readback_source_of_truth: String,
+    wait: BrowserWaitResponse,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -3028,6 +3065,44 @@ impl SynapseService {
             .await;
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
+    }
+
+    #[tool(
+        description = "Public wait facade for the calling session's owned browser tab. operation=for_condition requires the nested wait spec and evaluates one typed condition: text, load_state, url, selector, function, request, or response. The facade rejects missing or extra operation fields before polling, delegates to the same target-scoped browser_wait_for runtime path, returns the full condition readback, and never activates Chrome, uses OS foreground input, or falls back to the human foreground tab."
+    )]
+    pub async fn browser_wait(
+        &self,
+        params: Parameters<BrowserWaitFacadeParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserWaitFacadeResponse>, ErrorData> {
+        let params = params.0;
+        let operation = params.operation;
+        let source_id = browser_wait_facade_source_id(&params);
+        let wait = validate_browser_wait_facade_params(params)?;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = "browser_wait",
+            operation = operation.as_str(),
+            source_id = %source_id,
+            "tool.invocation kind=browser_wait"
+        );
+        let response = self
+            .browser_wait_for(Parameters(wait), request_context)
+            .await
+            .map_err(|error| {
+                browser_wait_facade_delegate_error(
+                    operation,
+                    source_id.clone(),
+                    error,
+                    "bind the target tab and pass exactly one condition spec matching the wait condition",
+                )
+            })?;
+        Ok(Json(BrowserWaitFacadeResponse {
+            operation,
+            source_of_truth: BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+            readback_source_of_truth: BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH.to_owned(),
+            wait: response.0,
+        }))
     }
 
     #[tool(
@@ -10359,6 +10434,203 @@ fn validate_browser_evaluate_params(params: &BrowserEvaluateParams) -> Result<()
         ));
     }
     Ok(())
+}
+
+fn validate_browser_wait_facade_params(
+    params: BrowserWaitFacadeParams,
+) -> Result<BrowserWaitParams, ErrorData> {
+    match params.operation {
+        BrowserWaitOperation::ForCondition => {
+            let wait = params.wait.ok_or_else(|| {
+                browser_wait_facade_error(
+                    BrowserWaitOperation::ForCondition,
+                    "missing_wait_spec",
+                    "browser_wait operation=for_condition requires the `wait` spec object",
+                    "send wait={condition,...} with exactly one nested condition spec",
+                )
+            })?;
+            validate_browser_wait_condition_shape(&wait)?;
+            Ok(wait)
+        }
+    }
+}
+
+fn validate_browser_wait_condition_shape(params: &BrowserWaitParams) -> Result<(), ErrorData> {
+    let fields = [
+        ("text", params.text.is_some()),
+        ("load_state", params.load_state.is_some()),
+        ("url", params.url.is_some()),
+        ("selector", params.selector.is_some()),
+        ("function", params.function.is_some()),
+        ("request", params.request.is_some()),
+        ("response", params.response.is_some()),
+    ];
+    let supplied = fields
+        .iter()
+        .filter_map(|(field, present)| present.then_some(*field))
+        .collect::<Vec<_>>();
+    let expected = match params.condition {
+        BrowserWaitConditionKind::Text => "text",
+        BrowserWaitConditionKind::LoadState => "load_state",
+        BrowserWaitConditionKind::Url => "url",
+        BrowserWaitConditionKind::Selector => "selector",
+        BrowserWaitConditionKind::Function => "function",
+        BrowserWaitConditionKind::Request => "request",
+        BrowserWaitConditionKind::Response => "response",
+    };
+    if supplied.len() != 1 || supplied[0] != expected {
+        return Err(browser_wait_facade_error(
+            BrowserWaitOperation::ForCondition,
+            browser_wait_condition_source_id(params),
+            format!(
+                "browser_wait condition={:?} requires exactly `{expected}` spec and no other condition specs; supplied={supplied:?}",
+                params.condition
+            ),
+            "send exactly one nested condition spec whose field name matches condition",
+        ));
+    }
+    Ok(())
+}
+
+fn browser_wait_facade_source_id(params: &BrowserWaitFacadeParams) -> String {
+    match params.operation {
+        BrowserWaitOperation::ForCondition => params
+            .wait
+            .as_ref()
+            .map(browser_wait_condition_source_id)
+            .unwrap_or_else(|| "missing_wait_spec".to_owned()),
+    }
+}
+
+fn browser_wait_condition_source_id(params: &BrowserWaitParams) -> String {
+    match params.condition {
+        BrowserWaitConditionKind::Text => params
+            .text
+            .as_ref()
+            .map(|spec| browser_wait_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()))
+            .unwrap_or_else(|| "missing_text_spec".to_owned()),
+        BrowserWaitConditionKind::LoadState => params
+            .load_state
+            .as_ref()
+            .map(|spec| browser_wait_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()))
+            .unwrap_or_else(|| "missing_load_state_spec".to_owned()),
+        BrowserWaitConditionKind::Url => params
+            .url
+            .as_ref()
+            .map(|spec| {
+                format!(
+                    "{};url_len={}",
+                    browser_wait_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
+                    spec.url.len()
+                )
+            })
+            .unwrap_or_else(|| "missing_url_spec".to_owned()),
+        BrowserWaitConditionKind::Selector => params
+            .selector
+            .as_ref()
+            .map(|spec| {
+                format!(
+                    "{};query_len={}",
+                    browser_wait_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
+                    spec.query.len()
+                )
+            })
+            .unwrap_or_else(|| "missing_selector_spec".to_owned()),
+        BrowserWaitConditionKind::Function => params
+            .function
+            .as_ref()
+            .map(|spec| {
+                format!(
+                    "{};expression_len={}",
+                    browser_wait_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
+                    spec.expression.len()
+                )
+            })
+            .unwrap_or_else(|| "missing_function_spec".to_owned()),
+        BrowserWaitConditionKind::Request => params
+            .request
+            .as_ref()
+            .map(|spec| {
+                format!(
+                    "{};url_len={:?};method={:?}",
+                    browser_wait_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
+                    spec.url.as_ref().map(String::len),
+                    spec.method
+                )
+            })
+            .unwrap_or_else(|| "missing_request_spec".to_owned()),
+        BrowserWaitConditionKind::Response => params
+            .response
+            .as_ref()
+            .map(|spec| {
+                format!(
+                    "{};url_len={:?};status={:?}",
+                    browser_wait_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
+                    spec.url.as_ref().map(String::len),
+                    spec.status
+                )
+            })
+            .unwrap_or_else(|| "missing_response_spec".to_owned()),
+    }
+}
+
+fn browser_wait_target_source(window_hwnd: Option<i64>, cdp_target_id: Option<&str>) -> String {
+    match (window_hwnd, cdp_target_id) {
+        (Some(hwnd), Some(target)) => format!("window_hwnd={hwnd:#x};cdp_target_id={target}"),
+        (Some(hwnd), None) => format!("window_hwnd={hwnd:#x}"),
+        (None, Some(target)) => format!("cdp_target_id={target}"),
+        (None, None) => "active_session_target".to_owned(),
+    }
+}
+
+fn browser_wait_facade_error(
+    operation: BrowserWaitOperation,
+    source_id: impl Into<String>,
+    message: impl Into<String>,
+    remediation: &'static str,
+) -> ErrorData {
+    let message = message.into();
+    ErrorData::new(
+        ErrorCode(-32099),
+        message.clone(),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "operation": operation.as_str(),
+            "source_of_truth": BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH,
+            "source_id": source_id.into(),
+            "readback_source_of_truth": BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH,
+            "remediation": remediation,
+        })),
+    )
+}
+
+fn browser_wait_facade_delegate_error(
+    operation: BrowserWaitOperation,
+    source_id: impl Into<String>,
+    error: ErrorData,
+    remediation: &'static str,
+) -> ErrorData {
+    let cause_code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
+        .to_owned();
+    let cause = error.data.clone().unwrap_or(Value::Null);
+    ErrorData::new(
+        error.code,
+        error.message.to_string(),
+        Some(json!({
+            "code": cause_code,
+            "operation": operation.as_str(),
+            "source_of_truth": BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH,
+            "source_id": source_id.into(),
+            "readback_source_of_truth": BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH,
+            "remediation": remediation,
+            "cause": cause,
+        })),
+    )
 }
 
 fn validate_browser_wait_for_load_state_params(

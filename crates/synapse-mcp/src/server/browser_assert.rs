@@ -13,9 +13,10 @@ use super::{
     },
     tool, tool_router,
 };
-use crate::{
-    m1::mcp_error,
-    m1::{BrowserLayoutRelation, BrowserLocateEngine},
+use crate::m1::{
+    BrowserContentParams, BrowserContentResponse, BrowserInspectParams, BrowserInspectResponse,
+    BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
+    mcp_error,
 };
 use regex::Regex;
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
@@ -25,6 +26,10 @@ use synapse_core::{AccessibleNode, error_codes};
 
 const ARIA_TOOL: &str = "browser_aria_snapshot";
 const ASSERT_TOOL: &str = "browser_assert";
+const DOM_TOOL: &str = "browser_dom";
+const DOM_SOURCE_OF_TRUTH: &str = "Chrome bridge/raw-CDP DOM/ARIA readback for the target tab";
+const DOM_READBACK_SOURCE_OF_TRUTH: &str =
+    "browser_content/browser_locate/browser_inspect/browser_aria_snapshot same-target readback";
 
 const DEFAULT_ARIA_MAX_NODES: usize = 500;
 const MAX_ARIA_MAX_NODES: usize = 5_000;
@@ -106,6 +111,61 @@ pub struct BrowserAriaSnapshotResponse {
     pub readback_backend: String,
     pub backend_tier_used: String,
     pub required_foreground: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserDomOperation {
+    Content,
+    Locate,
+    Inspect,
+    AriaSnapshot,
+}
+
+impl BrowserDomOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Content => "content",
+            Self::Locate => "locate",
+            Self::Inspect => "inspect",
+            Self::AriaSnapshot => "aria_snapshot",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserDomParams {
+    /// DOM operation to run. Supply exactly the matching nested spec object.
+    pub operation: BrowserDomOperation,
+    /// `operation=content`: serialized document HTML readback.
+    #[serde(default)]
+    pub content: Option<BrowserContentParams>,
+    /// `operation=locate`: Playwright-style selector/ARIA locator readback.
+    #[serde(default)]
+    pub locate: Option<BrowserLocateParams>,
+    /// `operation=inspect`: single element property/readiness readback.
+    #[serde(default)]
+    pub inspect: Option<BrowserInspectParams>,
+    /// `operation=aria_snapshot`: accessibility tree readback.
+    #[serde(default)]
+    pub aria_snapshot: Option<BrowserAriaSnapshotParams>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserDomResponse {
+    pub operation: BrowserDomOperation,
+    pub source_of_truth: String,
+    pub readback_source_of_truth: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<BrowserContentResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locate: Option<BrowserLocateResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspect: Option<BrowserInspectResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aria_snapshot: Option<BrowserAriaSnapshotResponse>,
 }
 
 #[derive(Clone, Debug)]
@@ -348,6 +408,141 @@ struct AriaSnapshotBuild {
 
 #[tool_router(router = browser_assert_tool_router, vis = "pub(super)")]
 impl SynapseService {
+    #[tool(
+        description = "Public DOM facade for the calling session's owned browser tab. operation=content returns serialized document HTML; operation=locate resolves Playwright-style selectors/ARIA locators; operation=inspect reads a single element's live DOM/form/actionability state; operation=aria_snapshot emits an accessibility tree. Each operation requires exactly its matching nested spec object and rejects extra operation specs. Uses the existing target-scoped Chrome bridge/raw-CDP implementation paths, never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
+    )]
+    pub async fn browser_dom(
+        &self,
+        params: Parameters<BrowserDomParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserDomResponse>, ErrorData> {
+        let params = params.0;
+        let operation = params.operation;
+        let source_id = browser_dom_source_id(&params);
+        validate_browser_dom_params(&params)?;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = DOM_TOOL,
+            operation = operation.as_str(),
+            source_id = %source_id,
+            "tool.invocation kind=browser_dom"
+        );
+        match operation {
+            BrowserDomOperation::Content => {
+                let spec = params.content.ok_or_else(|| {
+                    browser_dom_facade_error(
+                        operation,
+                        source_id.clone(),
+                        "browser_dom operation=content reached dispatch without its validated content spec",
+                        "send exactly one nested spec whose field name matches operation",
+                    )
+                })?;
+                let response = self
+                    .browser_content(Parameters(spec), request_context)
+                    .await
+                    .map_err(|error| {
+                        browser_dom_delegate_error(
+                            operation,
+                            source_id.clone(),
+                            error,
+                            "verify the session owns the target tab, then retry browser_dom operation=content",
+                        )
+                    })?;
+                Ok(Json(browser_dom_response(
+                    operation,
+                    Some(response.0),
+                    None,
+                    None,
+                    None,
+                )))
+            }
+            BrowserDomOperation::Locate => {
+                let spec = params.locate.ok_or_else(|| {
+                    browser_dom_facade_error(
+                        operation,
+                        source_id.clone(),
+                        "browser_dom operation=locate reached dispatch without its validated locate spec",
+                        "send exactly one nested spec whose field name matches operation",
+                    )
+                })?;
+                let response = self
+                    .browser_locate(Parameters(spec), request_context)
+                    .await
+                    .map_err(|error| {
+                        browser_dom_delegate_error(
+                            operation,
+                            source_id.clone(),
+                            error,
+                            "provide a non-empty strict locator query scoped to the owned target",
+                        )
+                    })?;
+                Ok(Json(browser_dom_response(
+                    operation,
+                    None,
+                    Some(response.0),
+                    None,
+                    None,
+                )))
+            }
+            BrowserDomOperation::Inspect => {
+                let spec = params.inspect.ok_or_else(|| {
+                    browser_dom_facade_error(
+                        operation,
+                        source_id.clone(),
+                        "browser_dom operation=inspect reached dispatch without its validated inspect spec",
+                        "send exactly one nested spec whose field name matches operation",
+                    )
+                })?;
+                let response = self
+                    .browser_inspect(Parameters(spec), request_context)
+                    .await
+                    .map_err(|error| {
+                        browser_dom_delegate_error(
+                            operation,
+                            source_id.clone(),
+                            error,
+                            "pass an element_id returned by browser_dom operation=locate for the same owned target",
+                        )
+                    })?;
+                Ok(Json(browser_dom_response(
+                    operation,
+                    None,
+                    None,
+                    Some(response.0),
+                    None,
+                )))
+            }
+            BrowserDomOperation::AriaSnapshot => {
+                let spec = params.aria_snapshot.ok_or_else(|| {
+                    browser_dom_facade_error(
+                        operation,
+                        source_id.clone(),
+                        "browser_dom operation=aria_snapshot reached dispatch without its validated aria_snapshot spec",
+                        "send exactly one nested spec whose field name matches operation",
+                    )
+                })?;
+                let response = self
+                    .browser_aria_snapshot(Parameters(spec), request_context)
+                    .await
+                    .map_err(|error| {
+                        browser_dom_delegate_error(
+                            operation,
+                            source_id.clone(),
+                            error,
+                            "bind the target tab and keep root_element_id/cdp_target_id from the same target",
+                        )
+                    })?;
+                Ok(Json(browser_dom_response(
+                    operation,
+                    None,
+                    None,
+                    None,
+                    Some(response.0),
+                )))
+            }
+        }
+    }
+
     #[tool(
         description = "Emit a Playwright-style ARIA snapshot for the calling session's owned browser tab. Raw-CDP targets use Accessibility.getFullAXTree; normal Chrome bridge targets use debugger-free chrome.scripting DOM/ARIA readback. Returns a stable YAML-like role/name/value tree plus structured node entries, and can scope to a subtree by element id. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
@@ -676,6 +871,152 @@ impl SynapseService {
             "browser_assert is only available on Windows in this build",
         ))
     }
+}
+
+fn validate_browser_dom_params(params: &BrowserDomParams) -> Result<(), ErrorData> {
+    let fields = [
+        ("content", params.content.is_some()),
+        ("locate", params.locate.is_some()),
+        ("inspect", params.inspect.is_some()),
+        ("aria_snapshot", params.aria_snapshot.is_some()),
+    ];
+    let supplied = fields
+        .iter()
+        .filter_map(|(field, present)| present.then_some(*field))
+        .collect::<Vec<_>>();
+    let expected = params.operation.as_str();
+    if supplied.len() != 1 || supplied[0] != expected {
+        return Err(browser_dom_facade_error(
+            params.operation,
+            browser_dom_source_id(params),
+            format!(
+                "{DOM_TOOL} operation={} requires exactly `{expected}` spec and no other operation specs; supplied={supplied:?}",
+                params.operation.as_str()
+            ),
+            "send exactly one nested spec whose field name matches operation",
+        ));
+    }
+    Ok(())
+}
+
+fn browser_dom_response(
+    operation: BrowserDomOperation,
+    content: Option<BrowserContentResponse>,
+    locate: Option<BrowserLocateResponse>,
+    inspect: Option<BrowserInspectResponse>,
+    aria_snapshot: Option<BrowserAriaSnapshotResponse>,
+) -> BrowserDomResponse {
+    BrowserDomResponse {
+        operation,
+        source_of_truth: DOM_SOURCE_OF_TRUTH.to_owned(),
+        readback_source_of_truth: DOM_READBACK_SOURCE_OF_TRUTH.to_owned(),
+        content,
+        locate,
+        inspect,
+        aria_snapshot,
+    }
+}
+
+fn browser_dom_source_id(params: &BrowserDomParams) -> String {
+    match params.operation {
+        BrowserDomOperation::Content => params
+            .content
+            .as_ref()
+            .map(|spec| browser_dom_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()))
+            .unwrap_or_else(|| "missing_content_spec".to_owned()),
+        BrowserDomOperation::Locate => params
+            .locate
+            .as_ref()
+            .map(|spec| {
+                format!(
+                    "{};query_len={}",
+                    browser_dom_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
+                    spec.query.len()
+                )
+            })
+            .unwrap_or_else(|| "missing_locate_spec".to_owned()),
+        BrowserDomOperation::Inspect => params
+            .inspect
+            .as_ref()
+            .map(|spec| {
+                format!(
+                    "{};element_id={}",
+                    browser_dom_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
+                    spec.element_id
+                )
+            })
+            .unwrap_or_else(|| "missing_inspect_spec".to_owned()),
+        BrowserDomOperation::AriaSnapshot => params
+            .aria_snapshot
+            .as_ref()
+            .map(|spec| {
+                let root = spec.root_element_id.as_deref().unwrap_or("<page>");
+                format!(
+                    "{};root_element_id={root}",
+                    browser_dom_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref())
+                )
+            })
+            .unwrap_or_else(|| "missing_aria_snapshot_spec".to_owned()),
+    }
+}
+
+fn browser_dom_target_source(window_hwnd: Option<i64>, cdp_target_id: Option<&str>) -> String {
+    match (window_hwnd, cdp_target_id) {
+        (Some(hwnd), Some(target)) => format!("window_hwnd={hwnd:#x};cdp_target_id={target}"),
+        (Some(hwnd), None) => format!("window_hwnd={hwnd:#x}"),
+        (None, Some(target)) => format!("cdp_target_id={target}"),
+        (None, None) => "active_session_target".to_owned(),
+    }
+}
+
+fn browser_dom_facade_error(
+    operation: BrowserDomOperation,
+    source_id: impl Into<String>,
+    message: impl Into<String>,
+    remediation: &'static str,
+) -> ErrorData {
+    let message = message.into();
+    ErrorData::new(
+        rmcp::model::ErrorCode(-32099),
+        message.clone(),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "operation": operation.as_str(),
+            "source_of_truth": DOM_SOURCE_OF_TRUTH,
+            "source_id": source_id.into(),
+            "readback_source_of_truth": DOM_READBACK_SOURCE_OF_TRUTH,
+            "remediation": remediation,
+        })),
+    )
+}
+
+fn browser_dom_delegate_error(
+    operation: BrowserDomOperation,
+    source_id: impl Into<String>,
+    error: ErrorData,
+    remediation: &'static str,
+) -> ErrorData {
+    let cause_code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
+        .to_owned();
+    let cause = error.data.clone().unwrap_or(Value::Null);
+    ErrorData::new(
+        error.code,
+        error.message.to_string(),
+        Some(json!({
+            "code": cause_code,
+            "operation": operation.as_str(),
+            "source_of_truth": DOM_SOURCE_OF_TRUTH,
+            "source_id": source_id.into(),
+            "readback_source_of_truth": DOM_READBACK_SOURCE_OF_TRUTH,
+            "remediation": remediation,
+            "cause": cause,
+        })),
+    )
 }
 
 fn validate_aria_snapshot_params(

@@ -533,30 +533,70 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "browser_dom",
         "BrowserDomOperation",
-        "target-scoped DOM query/evaluate readback",
-        &[op(
-            "query",
-            false,
-            true,
-            "target-scoped DOM snapshot",
-            None,
-            error_codes::ACTION_TARGET_INVALID,
-            "bind the intended tab and use a strict selector or element id",
-        )],
+        "target-scoped DOM/ARIA readback",
+        &[
+            op(
+                "content",
+                false,
+                true,
+                "target-scoped document HTML readback",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "bind the intended tab and retry content readback",
+            ),
+            op(
+                "locate",
+                false,
+                true,
+                "target-scoped DOM locator readback",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "bind the intended tab and use a non-empty strict selector or locator",
+            ),
+            op(
+                "inspect",
+                false,
+                true,
+                "target-scoped element property/actionability readback",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "pass an element_id returned from browser_dom operation=locate on the same target",
+            ),
+            op(
+                "aria_snapshot",
+                false,
+                true,
+                "target-scoped accessibility tree readback",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "bind the intended tab and keep root element ids target-scoped",
+            ),
+        ],
     ),
     facade_contract(
         "browser_form",
         "BrowserFormOperation",
         "target-scoped DOM form mutation + DOM value readback",
-        &[op(
-            "set_value",
-            true,
-            true,
-            "target-scoped DOM mutation",
-            Some("DOM value/property readback after mutation"),
-            error_codes::ACTION_TARGET_INVALID,
-            "bind the target and pass a strict selector or element id",
-        )],
+        &[
+            op(
+                "set_value",
+                true,
+                true,
+                "target-scoped DOM mutation",
+                Some("DOM value/property readback after mutation"),
+                error_codes::ACTION_TARGET_INVALID,
+                "bind the target and pass a strict selector or element id",
+            ),
+            op(
+                "fill",
+                true,
+                true,
+                "ordered target-scoped DOM form mutations",
+                Some("per-field DOM value/property readback after mutation"),
+                error_codes::ACTION_TARGET_INVALID,
+                "bind the target and pass one or more strict field specs",
+            ),
+        ],
     ),
     facade_contract(
         "browser_wait",
@@ -1017,7 +1057,9 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "browser_cookies",
     "browser_content",
     "browser_downloads",
+    "browser_dom",
     "browser_file_upload",
+    "browser_form",
     "browser_fill_form",
     "browser_frames",
     "browser_inspect",
@@ -1030,6 +1072,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "browser_storage",
     "browser_nav",
     "browser_tabs",
+    "browser_wait",
     "browser_wait_for",
     "capture_gif",
     "capture_screenshot",
@@ -1110,12 +1153,14 @@ const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = &[
     "browser_cookies",
     "browser_content",
     "browser_downloads",
+    "browser_dom",
     "browser_drag",
     "browser_drop",
     "browser_emulate",
     "browser_evaluate",
     "browser_expose_binding",
     "browser_file_upload",
+    "browser_form",
     "browser_fill_form",
     "browser_frames",
     "browser_handle_dialog",
@@ -1134,6 +1179,7 @@ const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = &[
     "browser_storage",
     "browser_nav",
     "browser_tabs",
+    "browser_wait",
     "browser_wait_for",
     "capture_gif",
     "capture_screenshot",
@@ -2366,22 +2412,22 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
     let preferred_tools = match tool_name {
         "act_click" => vec![
             "act operation=invoke click",
-            "browser_dom operation=query",
+            "browser_dom operation=locate",
             "target operation=set",
         ],
         "act_type" | "act_set_value" | "act_set_field_text" => {
             vec![
                 "act operation=invoke set_field",
                 "browser_form operation=set_value",
-                "browser_dom operation=query",
+                "browser_dom operation=locate",
             ]
         }
         "act_press" | "act_keymap" | "act_combo" => {
-            vec!["act operation=invoke press", "browser_dom operation=query"]
+            vec!["act operation=invoke press", "browser_dom operation=locate"]
         }
         "act_scroll" => vec![
             "act operation=invoke scroll",
-            "browser_dom operation=query",
+            "browser_dom operation=locate",
             "browser_capture operation=screenshot",
             "observe operation=current",
             "target operation=set",
@@ -2433,14 +2479,14 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
         | "browser_network_overrides"
         | "browser_route" => vec![
             "profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why raw CDP is required>",
-            "browser_dom operation=query",
+            "browser_dom operation=locate",
             "browser_wait operation=for_condition",
             "browser_storage operation=read",
         ],
         tool if BROWSER_DEBUGGER_ONLY_EXACT.contains(&tool) => vec![
             "profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why chrome.debugger is required>",
             "browser_tabs operation=list",
-            "browser_dom operation=query",
+            "browser_dom operation=locate",
             "act operation=invoke",
         ],
         _ => vec![
@@ -2969,8 +3015,10 @@ mod tests {
                 "browser_batch",
                 "browser_clock",
                 "browser_content",
+                "browser_dom",
                 "browser_downloads",
                 "browser_file_upload",
+                "browser_form",
                 "browser_fill_form",
                 "browser_frames",
                 "browser_inspect",
@@ -2983,6 +3031,7 @@ mod tests {
                 "browser_storage",
                 "browser_nav",
                 "browser_tabs",
+                "browser_wait",
                 "browser_wait_for",
                 "control_lease_acquire",
                 "control_lease_release",
@@ -3293,6 +3342,9 @@ mod tests {
                 "process",
                 "browser_tabs",
                 "browser_nav",
+                "browser_dom",
+                "browser_form",
+                "browser_wait",
                 "browser_storage",
             ]
             .into_iter()
@@ -3360,7 +3412,7 @@ mod tests {
         assert!(
             act_type_route
                 .preferred_tools
-                .contains(&"browser_dom operation=query".to_owned())
+                .contains(&"browser_dom operation=locate".to_owned())
         );
         let browser_debugger_route = routes
             .iter()
@@ -3391,11 +3443,14 @@ mod tests {
         assert!(visible.contains(&"session_list".to_owned()));
         assert!(visible.contains(&"target_act".to_owned()));
         assert!(visible.contains(&"browser_content".to_owned()));
+        assert!(visible.contains(&"browser_dom".to_owned()));
         assert!(visible.contains(&"browser_locate".to_owned()));
         assert!(visible.contains(&"browser_scroll_into_view".to_owned()));
         assert!(visible.contains(&"browser_set_content".to_owned()));
+        assert!(visible.contains(&"browser_form".to_owned()));
         assert!(visible.contains(&"browser_set_value".to_owned()));
         assert!(visible.contains(&"browser_nav".to_owned()));
+        assert!(visible.contains(&"browser_wait".to_owned()));
         assert!(visible.contains(&"browser_wait_for".to_owned()));
         assert!(visible.contains(&"control_lease_acquire".to_owned()));
         assert!(visible.contains(&"control_lease_release".to_owned()));
@@ -3409,7 +3464,10 @@ mod tests {
         let visible = visible_tool_names_for_profile(ToolProfileKind::BrowserDebugger, &names());
         assert_debugger_only_visible(&visible);
         assert!(visible.contains(&"browser_content".to_owned()));
+        assert!(visible.contains(&"browser_dom".to_owned()));
         assert!(visible.contains(&"browser_locate".to_owned()));
+        assert!(visible.contains(&"browser_form".to_owned()));
+        assert!(visible.contains(&"browser_wait".to_owned()));
         assert!(visible.contains(&"target_act".to_owned()));
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
         assert!(visible.contains(&"tool_profile_set".to_owned()));
@@ -3551,6 +3609,9 @@ mod tests {
         assert!(tools.contains(&"subscribe".to_owned()));
         assert!(tools.contains(&"browser_tabs".to_owned()));
         assert!(tools.contains(&"browser_nav".to_owned()));
+        assert!(tools.contains(&"browser_dom".to_owned()));
+        assert!(tools.contains(&"browser_form".to_owned()));
+        assert!(tools.contains(&"browser_wait".to_owned()));
         assert!(tools.contains(&"shell".to_owned()));
         assert!(tools.contains(&"process".to_owned()));
         assert!(!tools.contains(&"agent_spawn_task_started".to_owned()));

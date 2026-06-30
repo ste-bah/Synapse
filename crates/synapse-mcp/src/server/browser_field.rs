@@ -24,9 +24,55 @@ use serde_json::{Value, json};
 use synapse_core::error_codes;
 
 const TOOL: &str = "browser_set_value";
+const FORM_TOOL: &str = "browser_form";
 const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const SOURCE_OF_TRUTH: &str =
     "chrome_bridge_in_page_value + separate chrome.tabs active-element readback";
+const FORM_SOURCE_OF_TRUTH: &str =
+    "target-scoped DOM form mutation through browser_set_value/browser_fill_form";
+const FORM_READBACK_SOURCE_OF_TRUTH: &str =
+    "browser_set_value dual readback or browser_fill_form per-field DOM readback";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserFormOperation {
+    SetValue,
+    Fill,
+}
+
+impl BrowserFormOperation {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SetValue => "set_value",
+            Self::Fill => "fill",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserFormParams {
+    /// Form operation to run. Supply exactly the matching nested spec object.
+    pub operation: BrowserFormOperation,
+    /// `operation=set_value`: replace one field value with dual readback.
+    #[serde(default)]
+    pub set_value: Option<BrowserSetValueParams>,
+    /// `operation=fill`: apply ordered multi-field form changes.
+    #[serde(default)]
+    pub fill: Option<BrowserFillFormParams>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserFormResponse {
+    pub operation: BrowserFormOperation,
+    pub source_of_truth: String,
+    pub readback_source_of_truth: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_value: Option<BrowserSetValueResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill: Option<BrowserFillFormResponse>,
+}
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -207,6 +253,81 @@ pub struct BrowserFillFormFieldOutcome {
 
 #[tool_router(router = browser_field_tool_router, vis = "pub(super)")]
 impl SynapseService {
+    #[tool(
+        description = "Public form facade for the calling session's owned browser tab. operation=set_value delegates to the dual-readback field replacement path; operation=fill delegates to ordered multi-field form fill. The operation requires exactly its matching nested spec object and rejects extra operation specs before mutation. Target-scoped and background-safe: never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
+    )]
+    pub async fn browser_form(
+        &self,
+        params: Parameters<BrowserFormParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<BrowserFormResponse>, ErrorData> {
+        let params = params.0;
+        let operation = params.operation;
+        let source_id = browser_form_source_id(&params);
+        validate_browser_form_params(&params)?;
+        tracing::info!(
+            code = "MCP_TOOL_INVOCATION",
+            kind = FORM_TOOL,
+            operation = operation.as_str(),
+            source_id = %source_id,
+            "tool.invocation kind=browser_form"
+        );
+        match operation {
+            BrowserFormOperation::SetValue => {
+                let spec = params.set_value.ok_or_else(|| {
+                    browser_form_facade_error(
+                        operation,
+                        source_id.clone(),
+                        "browser_form operation=set_value reached dispatch without its validated set_value spec",
+                        "send exactly one nested spec whose field name matches operation",
+                    )
+                })?;
+                let response = self
+                    .browser_set_value(Parameters(spec), request_context)
+                    .await
+                    .map_err(|error| {
+                        browser_form_delegate_error(
+                            operation,
+                            source_id.clone(),
+                            error,
+                            "pass exactly one locator for an editable field in the owned target tab",
+                        )
+                    })?;
+                Ok(Json(browser_form_response(
+                    operation,
+                    Some(response.0),
+                    None,
+                )))
+            }
+            BrowserFormOperation::Fill => {
+                let spec = params.fill.ok_or_else(|| {
+                    browser_form_facade_error(
+                        operation,
+                        source_id.clone(),
+                        "browser_form operation=fill reached dispatch without its validated fill spec",
+                        "send exactly one nested spec whose field name matches operation",
+                    )
+                })?;
+                let response = self
+                    .browser_fill_form(Parameters(spec), request_context)
+                    .await
+                    .map_err(|error| {
+                        browser_form_delegate_error(
+                            operation,
+                            source_id.clone(),
+                            error,
+                            "pass at least one valid field spec for controls in the owned target tab",
+                        )
+                    })?;
+                Ok(Json(browser_form_response(
+                    operation,
+                    None,
+                    Some(response.0),
+                )))
+            }
+        }
+    }
+
     #[tool(
         description = "Background-safe REPLACE of a web form field's text in the user's normal authenticated Chrome via the safe extension bridge (#1000/#717). No debugger attach, no OS foreground, no UIA: runs entirely in-page through chrome.scripting, so it works on inactive/occluded tabs and never steals the operator's foreground. Target by strict CSS `selector` (exactly one editable+visible match; 0 or >1 fails loud), normal Chrome bridge `element_id` (`chrome-tab:<tabId>:frame:<frameId>:path:<domPath>`), or `active_element=true`. Replaces the value with the native prototype setter (React/Vue/Angular-safe) and verifies with TWO independent reads (in-page post-set + a separate chrome.tabs active-element readback); any divergence is ACTION_POSTCONDITION_FAILED, never an optimistic success. Defaults to this session's active CDP tab target (bind one with set_target/cdp_open_tab); the human foreground tab is never a fallback. Use this instead of foregrounding Chrome to type into a dashboard/form."
     )]
@@ -816,6 +937,143 @@ impl SynapseService {
         }
         Ok((window_hwnd, cdp_target_id))
     }
+}
+
+fn validate_browser_form_params(params: &BrowserFormParams) -> Result<(), ErrorData> {
+    let fields = [
+        ("set_value", params.set_value.is_some()),
+        ("fill", params.fill.is_some()),
+    ];
+    let supplied = fields
+        .iter()
+        .filter_map(|(field, present)| present.then_some(*field))
+        .collect::<Vec<_>>();
+    let expected = params.operation.as_str();
+    if supplied.len() != 1 || supplied[0] != expected {
+        return Err(browser_form_facade_error(
+            params.operation,
+            browser_form_source_id(params),
+            format!(
+                "{FORM_TOOL} operation={} requires exactly `{expected}` spec and no other operation specs; supplied={supplied:?}",
+                params.operation.as_str()
+            ),
+            "send exactly one nested spec whose field name matches operation",
+        ));
+    }
+    Ok(())
+}
+
+fn browser_form_response(
+    operation: BrowserFormOperation,
+    set_value: Option<BrowserSetValueResponse>,
+    fill: Option<BrowserFillFormResponse>,
+) -> BrowserFormResponse {
+    BrowserFormResponse {
+        operation,
+        source_of_truth: FORM_SOURCE_OF_TRUTH.to_owned(),
+        readback_source_of_truth: FORM_READBACK_SOURCE_OF_TRUTH.to_owned(),
+        set_value,
+        fill,
+    }
+}
+
+fn browser_form_source_id(params: &BrowserFormParams) -> String {
+    match params.operation {
+        BrowserFormOperation::SetValue => params
+            .set_value
+            .as_ref()
+            .map(|spec| {
+                format!(
+                    "{};locator={}",
+                    browser_form_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
+                    browser_set_value_locator_source(spec)
+                )
+            })
+            .unwrap_or_else(|| "missing_set_value_spec".to_owned()),
+        BrowserFormOperation::Fill => params
+            .fill
+            .as_ref()
+            .map(|spec| {
+                format!(
+                    "{};field_count={}",
+                    browser_form_target_source(spec.window_hwnd, spec.cdp_target_id.as_deref()),
+                    spec.fields.len()
+                )
+            })
+            .unwrap_or_else(|| "missing_fill_spec".to_owned()),
+    }
+}
+
+fn browser_form_target_source(window_hwnd: Option<i64>, cdp_target_id: Option<&str>) -> String {
+    match (window_hwnd, cdp_target_id) {
+        (Some(hwnd), Some(target)) => format!("window_hwnd={hwnd:#x};cdp_target_id={target}"),
+        (Some(hwnd), None) => format!("window_hwnd={hwnd:#x}"),
+        (None, Some(target)) => format!("cdp_target_id={target}"),
+        (None, None) => "active_session_target".to_owned(),
+    }
+}
+
+fn browser_set_value_locator_source(params: &BrowserSetValueParams) -> &'static str {
+    match (
+        params.selector.as_ref(),
+        params.element_id.as_ref(),
+        params.active_element,
+    ) {
+        (Some(_), None, false) => "selector",
+        (None, Some(_), false) => "element_id",
+        (None, None, true) => "active_element",
+        _ => "invalid_locator_set",
+    }
+}
+
+fn browser_form_facade_error(
+    operation: BrowserFormOperation,
+    source_id: impl Into<String>,
+    message: impl Into<String>,
+    remediation: &'static str,
+) -> ErrorData {
+    let message = message.into();
+    ErrorData::new(
+        ErrorCode(-32099),
+        message.clone(),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "operation": operation.as_str(),
+            "source_of_truth": FORM_SOURCE_OF_TRUTH,
+            "source_id": source_id.into(),
+            "readback_source_of_truth": FORM_READBACK_SOURCE_OF_TRUTH,
+            "remediation": remediation,
+        })),
+    )
+}
+
+fn browser_form_delegate_error(
+    operation: BrowserFormOperation,
+    source_id: impl Into<String>,
+    error: ErrorData,
+    remediation: &'static str,
+) -> ErrorData {
+    let cause_code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
+        .to_owned();
+    let cause = error.data.clone().unwrap_or(Value::Null);
+    ErrorData::new(
+        error.code,
+        error.message.to_string(),
+        Some(json!({
+            "code": cause_code,
+            "operation": operation.as_str(),
+            "source_of_truth": FORM_SOURCE_OF_TRUTH,
+            "source_id": source_id.into(),
+            "readback_source_of_truth": FORM_READBACK_SOURCE_OF_TRUTH,
+            "remediation": remediation,
+            "cause": cause,
+        })),
+    )
 }
 
 fn validate_fill_form_params(params: &BrowserFillFormParams) -> Result<(), ErrorData> {
