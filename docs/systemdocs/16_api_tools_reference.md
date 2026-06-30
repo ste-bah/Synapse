@@ -1,5 +1,7 @@
 # 16. API / Tools Reference
 
+> Current production note, 2026-06-30: the default `normal_agent` MCP surface is now facade-first and capped under the 40-tool contract tracked by #1374. This older reference still documents implementation and advanced/profile-gated routes. For the old-to-new public migration table and deprecation policy, see [../../docs2/SYNAPSE_40_TOOL_SURFACE_MIGRATION.md](../../docs2/SYNAPSE_40_TOOL_SURFACE_MIGRATION.md).
+
 **Source files covered:**
 
 - `crates/synapse-mcp/src/server.rs` (tool-router composition / registration)
