@@ -113,6 +113,7 @@ fn tool_surface_telemetry(snapshot: &ToolProfileSnapshot) -> ToolSurfaceTelemetr
         facade_contract_tool_count: snapshot.facade_contract.contract_tool_count,
         facade_contract_operation_count: snapshot.facade_contract.operation_count,
         facade_contract_mutating_operation_count: snapshot.facade_contract.mutating_operation_count,
+        codex_client_surface: snapshot.codex_client_surface.clone(),
     }
 }
 

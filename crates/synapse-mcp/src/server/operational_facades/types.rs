@@ -3,6 +3,8 @@ use std::collections::BTreeMap;
 use rmcp::schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::server::tool_profiles::CodexClientSurfaceSnapshot;
+
 use crate::m3::{
     hygiene::{
         HygieneFlagsParams, HygieneFlagsResponse, HygieneReportParams, HygieneReportResponse,
@@ -340,6 +342,7 @@ pub struct ToolSurfaceTelemetry {
     pub facade_contract_tool_count: usize,
     pub facade_contract_operation_count: usize,
     pub facade_contract_mutating_operation_count: usize,
+    pub codex_client_surface: CodexClientSurfaceSnapshot,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

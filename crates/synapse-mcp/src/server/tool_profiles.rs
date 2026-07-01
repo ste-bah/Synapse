@@ -1,5 +1,7 @@
 use std::{
     collections::BTreeSet,
+    fs,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -28,6 +30,8 @@ const FACADE_CONTRACT_SOURCE_OF_TRUTH: &str =
 const FACADE_CONTRACT_OPERATION: &str = "validate_facade_contract";
 const FACADE_CONTRACT_ERROR_CODE: &str = "FACADE_CONTRACT_INVALID";
 const FACADE_CONTRACT_STRUCTURED_ERROR: &str = "facade errors must include code, operation, source_of_truth, remediation, and target/source id when applicable";
+const CODEX_CLIENT_SURFACE_SOURCE_OF_TRUTH: &str = "%APPDATA%\\synapse\\codex-tool-surface.json + %LOCALAPPDATA%\\synapse\\codex-restart-handoffs + live OS process table";
+const CODEX_CLIENT_SURFACE_REMEDIATION: &str = "restart Codex through the patched launcher when a live stale codex.exe PID is named by the latest handoff; rerun scripts\\synapse-setup.ps1 if the host tool-surface snapshot is missing or does not contain the daemon-visible public tools";
 
 pub(crate) const PUBLIC_TOOL_NAMES: &[&str] = &[
     "health",
@@ -2530,6 +2534,7 @@ pub(crate) struct ToolProfileSnapshot {
     pub hidden_tool_routes: Vec<HiddenToolCapabilityRoute>,
     pub public_tool_registry: PublicToolRegistrySnapshot,
     pub facade_contract: FacadeContractSnapshot,
+    pub codex_client_surface: CodexClientSurfaceSnapshot,
     /// #1352: this session's CURRENT readiness for the real OS-foreground route —
     /// whether it already holds the lease + a break_glass profile, and the exact
     /// remaining steps. Lets an agent preflight the foreground route before
@@ -2537,6 +2542,99 @@ pub(crate) struct ToolProfileSnapshot {
     pub foreground_route: ToolProfileForegroundRoute,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy_row: Option<ToolProfileRowReadback>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CodexClientSurfaceStatus {
+    HostSnapshotMatchesPublicTools,
+    HostSnapshotMissing,
+    HostSnapshotReadError,
+    HostSnapshotMissingPublicTools,
+    RestartRequiredForLiveCodexPid,
+    RestartHandoffPresentForDeadPid,
+    HandoffReadError,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CodexToolSurfaceSnapshotReadback {
+    pub path: String,
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_surface_sha256: Option<String>,
+    pub tool_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CodexRestartHandoffReadback {
+    pub path: String,
+    pub exists: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub len_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at_utc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    pub required_restart: bool,
+    pub no_in_process_hot_refresh: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_codex_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_codex_command_line: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_issue_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_tool_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_tool_surface_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_process_start_snapshot_status: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CodexProcessReadback {
+    pub source_of_truth: &'static str,
+    pub pid: u32,
+    pub parent_pid: Option<u32>,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    pub command_line: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CodexClientSurfaceSnapshot {
+    pub source_of_truth: &'static str,
+    pub status: CodexClientSurfaceStatus,
+    pub diagnostic_code: &'static str,
+    pub remediation: &'static str,
+    pub host_snapshot: CodexToolSurfaceSnapshotReadback,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_restart_handoff: Option<CodexRestartHandoffReadback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_stale_codex_process: Option<CodexProcessReadback>,
+    pub public_tools_missing_from_host_snapshot: Vec<String>,
+    pub host_snapshot_tools_missing_from_public_registry: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2981,6 +3079,8 @@ impl SynapseService {
         let visible_tool_sha256 = sha256_json_hex(&visible_tool_names)?;
         let denied_break_glass_tools = denied_break_glass_tools(&visible_tool_names);
         let hidden_tool_routes = hidden_tool_capability_routes(&visible_tool_names);
+        let codex_client_surface =
+            codex_client_surface_snapshot(&public_tool_registry.public_tool_names);
         Ok(ToolProfileSnapshot {
             source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
             session_id: session_id.map(ToOwned::to_owned),
@@ -2996,6 +3096,7 @@ impl SynapseService {
             hidden_tool_routes,
             public_tool_registry,
             facade_contract,
+            codex_client_surface,
             foreground_route: foreground_route_readiness(session_id, profile),
             policy_row,
         })
@@ -3998,6 +4099,394 @@ fn audit_readback(
         value_len_bytes: readback.value_len_bytes,
         value_sha256: readback.value_sha256,
     }
+}
+
+fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSurfaceSnapshot {
+    let host_snapshot = match env_path_checked("APPDATA", ["synapse", "codex-tool-surface.json"]) {
+        Ok(path) => codex_tool_surface_snapshot_readback(&path),
+        Err(error) => CodexToolSurfaceSnapshotReadback {
+            path: "%APPDATA%\\synapse\\codex-tool-surface.json".to_owned(),
+            exists: false,
+            len_bytes: None,
+            sha256: None,
+            read_error: Some(error),
+            tool_count: None,
+            tool_surface_sha256: None,
+            tool_names: Vec::new(),
+        },
+    };
+    let latest_restart_handoff =
+        match env_path_checked("LOCALAPPDATA", ["synapse", "codex-restart-handoffs"]) {
+            Ok(path) => latest_codex_restart_handoff(&path),
+            Err(error) => Some(CodexRestartHandoffReadback {
+                path: "%LOCALAPPDATA%\\synapse\\codex-restart-handoffs".to_owned(),
+                exists: false,
+                len_bytes: None,
+                sha256: None,
+                read_error: Some(error),
+                created_at_utc: None,
+                reason_code: None,
+                reason: None,
+                phase: None,
+                required_restart: false,
+                no_in_process_hot_refresh: false,
+                stale_codex_pid: None,
+                stale_codex_command_line: None,
+                active_issue_ref: None,
+                daemon_tool_count: None,
+                daemon_tool_surface_sha256: None,
+                current_process_start_snapshot_status: None,
+            }),
+        };
+    let public_tools_missing_from_host_snapshot =
+        sorted_missing_names(public_tool_names, &host_snapshot.tool_names);
+    let host_snapshot_tools_missing_from_public_registry =
+        sorted_missing_names(&host_snapshot.tool_names, public_tool_names);
+    let live_stale_codex_process = latest_restart_handoff
+        .as_ref()
+        .filter(|handoff| handoff.required_restart)
+        .and_then(|handoff| handoff.stale_codex_pid)
+        .and_then(live_codex_process_readback);
+
+    let (status, diagnostic_code) = if host_snapshot.read_error.is_some() && host_snapshot.exists {
+        (
+            CodexClientSurfaceStatus::HostSnapshotReadError,
+            "CODEX_CLIENT_SURFACE_HOST_SNAPSHOT_READ_ERROR",
+        )
+    } else if !host_snapshot.exists {
+        (
+            CodexClientSurfaceStatus::HostSnapshotMissing,
+            "CODEX_CLIENT_SURFACE_HOST_SNAPSHOT_MISSING",
+        )
+    } else if !public_tools_missing_from_host_snapshot.is_empty() {
+        (
+            CodexClientSurfaceStatus::HostSnapshotMissingPublicTools,
+            "CODEX_CLIENT_SURFACE_HOST_SNAPSHOT_TOOL_MISMATCH",
+        )
+    } else if latest_restart_handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.read_error.is_some())
+    {
+        (
+            CodexClientSurfaceStatus::HandoffReadError,
+            "SYNAPSE_CODEX_RESTART_HANDOFF_READ_ERROR",
+        )
+    } else if live_stale_codex_process.is_some() {
+        (
+            CodexClientSurfaceStatus::RestartRequiredForLiveCodexPid,
+            "SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE",
+        )
+    } else if latest_restart_handoff
+        .as_ref()
+        .is_some_and(|handoff| handoff.required_restart)
+    {
+        (
+            CodexClientSurfaceStatus::RestartHandoffPresentForDeadPid,
+            "SYNAPSE_CODEX_RESTART_HANDOFF_STALE_PID_DEAD",
+        )
+    } else {
+        (
+            CodexClientSurfaceStatus::HostSnapshotMatchesPublicTools,
+            "CODEX_CLIENT_SURFACE_OK",
+        )
+    };
+
+    CodexClientSurfaceSnapshot {
+        source_of_truth: CODEX_CLIENT_SURFACE_SOURCE_OF_TRUTH,
+        status,
+        diagnostic_code,
+        remediation: CODEX_CLIENT_SURFACE_REMEDIATION,
+        host_snapshot,
+        latest_restart_handoff,
+        live_stale_codex_process,
+        public_tools_missing_from_host_snapshot,
+        host_snapshot_tools_missing_from_public_registry,
+    }
+}
+
+fn codex_tool_surface_snapshot_readback(path: &Path) -> CodexToolSurfaceSnapshotReadback {
+    let path_text = path.display().to_string();
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CodexToolSurfaceSnapshotReadback {
+                path: path_text,
+                exists: false,
+                len_bytes: None,
+                sha256: None,
+                read_error: None,
+                tool_count: None,
+                tool_surface_sha256: None,
+                tool_names: Vec::new(),
+            };
+        }
+        Err(error) => {
+            return CodexToolSurfaceSnapshotReadback {
+                path: path_text,
+                exists: false,
+                len_bytes: None,
+                sha256: None,
+                read_error: Some(format!("read failed: {error}")),
+                tool_count: None,
+                tool_surface_sha256: None,
+                tool_names: Vec::new(),
+            };
+        }
+    };
+    let sha256 = sha256_hex(&bytes);
+    let len_bytes = bytes.len() as u64;
+    let value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return CodexToolSurfaceSnapshotReadback {
+                path: path_text,
+                exists: true,
+                len_bytes: Some(len_bytes),
+                sha256: Some(sha256),
+                read_error: Some(format!("json parse failed: {error}")),
+                tool_count: None,
+                tool_surface_sha256: None,
+                tool_names: Vec::new(),
+            };
+        }
+    };
+    CodexToolSurfaceSnapshotReadback {
+        path: path_text,
+        exists: true,
+        len_bytes: Some(len_bytes),
+        sha256: Some(sha256),
+        read_error: None,
+        tool_count: json_pointer_usize(&value, "/tool_count"),
+        tool_surface_sha256: json_pointer_string(&value, "/tool_surface_sha256"),
+        tool_names: json_pointer_string_array(&value, "/tool_names"),
+    }
+}
+
+fn latest_codex_restart_handoff(dir: &Path) -> Option<CodexRestartHandoffReadback> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(CodexRestartHandoffReadback {
+                path: dir.display().to_string(),
+                exists: false,
+                len_bytes: None,
+                sha256: None,
+                read_error: Some(format!("read_dir failed: {error}")),
+                created_at_utc: None,
+                reason_code: None,
+                reason: None,
+                phase: None,
+                required_restart: false,
+                no_in_process_hot_refresh: false,
+                stale_codex_pid: None,
+                stale_codex_command_line: None,
+                active_issue_ref: None,
+                daemon_tool_count: None,
+                daemon_tool_surface_sha256: None,
+                current_process_start_snapshot_status: None,
+            });
+        }
+    };
+
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let is_json = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+        let is_handoff = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("codex-restart-handoff-"));
+        if !is_json || !is_handoff {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        if newest
+            .as_ref()
+            .is_none_or(|(current_modified, _)| modified > *current_modified)
+        {
+            newest = Some((modified, path));
+        }
+    }
+    let (_, path) = newest?;
+    Some(codex_restart_handoff_readback(&path))
+}
+
+fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
+    let path_text = path.display().to_string();
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return CodexRestartHandoffReadback {
+                path: path_text,
+                exists: false,
+                len_bytes: None,
+                sha256: None,
+                read_error: Some(format!("read failed: {error}")),
+                created_at_utc: None,
+                reason_code: None,
+                reason: None,
+                phase: None,
+                required_restart: false,
+                no_in_process_hot_refresh: false,
+                stale_codex_pid: None,
+                stale_codex_command_line: None,
+                active_issue_ref: None,
+                daemon_tool_count: None,
+                daemon_tool_surface_sha256: None,
+                current_process_start_snapshot_status: None,
+            };
+        }
+    };
+    let sha256 = sha256_hex(&bytes);
+    let len_bytes = bytes.len() as u64;
+    let value = match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(error) => {
+            return CodexRestartHandoffReadback {
+                path: path_text,
+                exists: true,
+                len_bytes: Some(len_bytes),
+                sha256: Some(sha256),
+                read_error: Some(format!("json parse failed: {error}")),
+                created_at_utc: None,
+                reason_code: None,
+                reason: None,
+                phase: None,
+                required_restart: false,
+                no_in_process_hot_refresh: false,
+                stale_codex_pid: None,
+                stale_codex_command_line: None,
+                active_issue_ref: None,
+                daemon_tool_count: None,
+                daemon_tool_surface_sha256: None,
+                current_process_start_snapshot_status: None,
+            };
+        }
+    };
+    CodexRestartHandoffReadback {
+        path: path_text,
+        exists: true,
+        len_bytes: Some(len_bytes),
+        sha256: Some(sha256),
+        read_error: None,
+        created_at_utc: json_pointer_string(&value, "/created_at_utc"),
+        reason_code: json_pointer_string(&value, "/reason_code"),
+        reason: json_pointer_string(&value, "/reason"),
+        phase: json_pointer_string(&value, "/phase"),
+        required_restart: json_pointer_bool(&value, "/required_restart").unwrap_or(false),
+        no_in_process_hot_refresh: json_pointer_bool(&value, "/no_in_process_hot_refresh")
+            .unwrap_or(false),
+        stale_codex_pid: json_pointer_u32(&value, "/codex_process/pid"),
+        stale_codex_command_line: json_pointer_string(&value, "/codex_process/command_line"),
+        active_issue_ref: json_pointer_string(&value, "/active_issue/issue_ref"),
+        daemon_tool_count: json_pointer_usize(&value, "/daemon/tool_count"),
+        daemon_tool_surface_sha256: json_pointer_string(&value, "/daemon/tool_surface_sha256"),
+        current_process_start_snapshot_status: json_pointer_string(
+            &value,
+            "/current_process_start_surface/snapshot_status",
+        ),
+    }
+}
+
+fn live_codex_process_readback(pid: u32) -> Option<CodexProcessReadback> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+    let sys_pid = sysinfo::Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_exe(UpdateKind::Always),
+    );
+    let process = system.process(sys_pid)?;
+    let name = process.name().to_string_lossy().into_owned();
+    if !name.eq_ignore_ascii_case("codex.exe") && !name.eq_ignore_ascii_case("codex") {
+        return None;
+    }
+    Some(CodexProcessReadback {
+        source_of_truth: "live OS process table via sysinfo refresh_processes_specifics",
+        pid,
+        parent_pid: process.parent().map(|parent| parent.as_u32()),
+        name,
+        exe: process.exe().map(|path| path.display().to_string()),
+        command_line: process
+            .cmd()
+            .iter()
+            .map(|part| part.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+    })
+}
+
+fn sorted_missing_names(expected: &[String], actual: &[String]) -> Vec<String> {
+    let actual = actual.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    expected
+        .iter()
+        .filter(|name| !actual.contains(name.as_str()))
+        .cloned()
+        .collect()
+}
+
+fn env_path_checked<const N: usize>(env_name: &str, parts: [&str; N]) -> Result<PathBuf, String> {
+    let Some(root) = std::env::var_os(env_name) else {
+        return Err(format!("{env_name} environment variable is not set"));
+    };
+    let mut path = PathBuf::from(root);
+    for part in parts {
+        path.push(part);
+    }
+    Ok(path)
+}
+
+fn json_pointer_string(value: &Value, pointer: &str) -> Option<String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn json_pointer_bool(value: &Value, pointer: &str) -> Option<bool> {
+    value.pointer(pointer).and_then(Value::as_bool)
+}
+
+fn json_pointer_usize(value: &Value, pointer: &str) -> Option<usize> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .and_then(|raw| usize::try_from(raw).ok())
+}
+
+fn json_pointer_u32(value: &Value, pointer: &str) -> Option<u32> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .and_then(|raw| u32::try_from(raw).ok())
+}
+
+fn json_pointer_string_array(value: &Value, pointer: &str) -> Vec<String> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn sha256_json_hex<T: Serialize>(value: &T) -> Result<String, ErrorData> {
