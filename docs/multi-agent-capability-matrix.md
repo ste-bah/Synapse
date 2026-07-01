@@ -19,7 +19,7 @@ Model-selection exposure values:
 
 - `normal_agent`: the literal tool name/schema is visible in the default HTTP MCP profile.
 - `facade_only`: the raw implementation tool name/schema is hidden from the default profile, but the capability is reachable through a named public facade in the 40-tool surface.
-- `browser_debugger`: the stable `browser_debugger` facade is in `PUBLIC_TOOL_NAMES` but hidden from the default `normal_agent` profile; raw-CDP and `chrome.debugger` operations fail closed until an explicit `tool_profile_set browser_debugger` transition with confirm + reason.
+- `browser_debugger`: the stable `browser_debugger` facade is visible in the default profile so static MCP clients keep one callable route; its raw-CDP and `chrome.debugger` operations fail closed until an explicit `tool_profile_set browser_debugger` transition with confirm + reason.
 - `break_glass`: raw OS/global primitive is hidden from the default profile, but `tool_profile_status.hidden_tool_routes` must name a capability-preserving route; raw use is visible only after an explicit break-glass/admin profile transition.
 - `debug_only`: hidden from normal agent profiles and reserved for diagnostic/debug tool surfaces.
 
@@ -85,7 +85,7 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | browser_console_messages | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_content, browser_page_events, browser_downloads |
 | browser_cookies | facade_only | no | yes | no | no | browser_storage operation=read/write |
 | browser_content | facade_only | no | yes | no | no | browser_dom operation=content |
-| browser_debugger | browser_debugger | no | no | no | no | profile operation=set profile=browser_debugger with reason before advanced operations; raw debugger tools stay hidden |
+| browser_debugger | normal_agent | no | no | no | no | profile operation=set profile=browser_debugger with reason before advanced operations; raw debugger tools stay hidden |
 | browser_dom | normal_agent | no | no | no | no | none - default-safe |
 | browser_downloads | facade_only | no | yes | no | no | browser_capture operation=downloads |
 | browser_drag | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_locate, target_act |

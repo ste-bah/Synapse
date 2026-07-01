@@ -6,7 +6,8 @@ use super::{
     BrowserConsoleMessagesResponse, BrowserDownloadsParams, BrowserDownloadsResponse,
     BrowserEvaluateParams, BrowserEvaluateResponse, BrowserExposeBindingParams,
     BrowserExposeBindingResponse, BrowserPdfParams, BrowserPdfResponse, BrowserScreenshotParams,
-    BrowserScreenshotResponse, ErrorData, Json, Parameters, SynapseService,
+    BrowserScreenshotResponse, CdpBridgeReloadParams, CdpBridgeReloadResponse, ErrorData, Json,
+    Parameters, SynapseService,
     browser_dialog::{BrowserHandleDialogParams, BrowserHandleDialogResponse},
     browser_dnd::{BrowserDndParams, BrowserDndResponse},
     browser_emulate::{BrowserEmulateParams, BrowserEmulateResponse},
@@ -16,7 +17,9 @@ use super::{
         BrowserNetworkOverridesResponse, BrowserNetworkParams, BrowserNetworkResponse,
         BrowserRouteParams, BrowserRouteResponse,
     },
-    tool, tool_router,
+    tool,
+    tool_profiles::ToolProfileKind,
+    tool_router,
 };
 use rmcp::{RoleServer, model::ErrorCode, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
@@ -69,6 +72,7 @@ pub struct BrowserCaptureResponse {
 pub enum BrowserDebuggerOperation {
     Evaluate,
     ConsoleMessages,
+    ReloadBridge,
     Pdf,
     FileUpload,
     Dialog,
@@ -90,6 +94,7 @@ impl BrowserDebuggerOperation {
         match self {
             Self::Evaluate => "evaluate",
             Self::ConsoleMessages => "console_messages",
+            Self::ReloadBridge => "reload_bridge",
             Self::Pdf => "pdf",
             Self::FileUpload => "file_upload",
             Self::Dialog => "dialog",
@@ -116,6 +121,8 @@ pub struct BrowserDebuggerParams {
     pub evaluate: Option<BrowserEvaluateParams>,
     #[serde(default)]
     pub console_messages: Option<BrowserConsoleMessagesParams>,
+    #[serde(default)]
+    pub reload_bridge: Option<CdpBridgeReloadParams>,
     #[serde(default)]
     pub pdf: Option<BrowserPdfParams>,
     #[serde(default)]
@@ -156,6 +163,8 @@ pub struct BrowserDebuggerResponse {
     pub evaluate: Option<BrowserEvaluateResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console_messages: Option<BrowserConsoleMessagesResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload_bridge: Option<CdpBridgeReloadResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf: Option<BrowserPdfResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,7 +266,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Opt-in browser debugger facade. This tool is hidden from normal_agent and exposed only by the explicit browser_debugger profile (or broader admin profiles). It routes typed operations to target-scoped chrome.debugger/CDP browser tools: evaluate, console_messages, pdf, file_upload, dialog, script/style injection, network/HAR/overrides/route, emulation, binding, drag, and drop. Exactly one operation-specific spec is accepted."
+        description = "Stable browser debugger facade. The tool name is visible in the default <=40 surface so clients with static tool namespaces can keep one callable route; each operation still fails closed with TOOL_PROFILE_POLICY_DENIED until this MCP session is explicitly set to browser_debugger (or a broader admin profile). Routes typed operations to target-scoped chrome.debugger/CDP browser tools: evaluate, console_messages, reload_bridge, pdf, file_upload, dialog, script/style injection, network/HAR/overrides/route, emulation, binding, drag, and drop. Exactly one operation-specific spec is accepted."
     )]
     pub async fn browser_debugger(
         &self,
@@ -271,6 +280,7 @@ impl SynapseService {
             "tool.invocation kind=browser_debugger"
         );
         validate_browser_debugger_params(&params.0)?;
+        self.require_browser_debugger_facade_profile(&request_context, params.0.operation)?;
         match params.0.operation {
             BrowserDebuggerOperation::Evaluate => {
                 let delegate = params
@@ -306,6 +316,27 @@ impl SynapseService {
                         response.cdp_target_id, response.returned, response.next_cursor
                     ),
                     |out| out.console_messages = Some(response),
+                )))
+            }
+            BrowserDebuggerOperation::ReloadBridge => {
+                let delegate = params
+                    .0
+                    .reload_bridge
+                    .ok_or_else(|| missing_debugger_spec("reload_bridge"))?;
+                let response = self
+                    .cdp_bridge_reload(Parameters(delegate), request_context)
+                    .await?
+                    .0;
+                Ok(Json(browser_debugger_response(
+                    BrowserDebuggerOperation::ReloadBridge,
+                    format!(
+                        "bridge reload before_host={} after_host={} reconnected={} waited_ms={}",
+                        response.before.host_id,
+                        response.after.host_id,
+                        response.reconnected,
+                        response.waited_ms
+                    ),
+                    |out| out.reload_bridge = Some(response),
                 )))
             }
             BrowserDebuggerOperation::Pdf => {
@@ -582,6 +613,7 @@ fn validate_browser_debugger_params(params: &BrowserDebuggerParams) -> Result<()
         &[
             ("evaluate", params.evaluate.is_some()),
             ("console_messages", params.console_messages.is_some()),
+            ("reload_bridge", params.reload_bridge.is_some()),
             ("pdf", params.pdf.is_some()),
             ("file_upload", params.file_upload.is_some()),
             ("dialog", params.dialog.is_some()),
@@ -693,6 +725,7 @@ fn browser_debugger_response(
         readback_source_of_truth,
         evaluate: None,
         console_messages: None,
+        reload_bridge: None,
         pdf: None,
         file_upload: None,
         dialog: None,
@@ -710,4 +743,89 @@ fn browser_debugger_response(
     };
     populate(&mut response);
     response
+}
+
+impl SynapseService {
+    fn require_browser_debugger_facade_profile(
+        &self,
+        request_context: &RequestContext<RoleServer>,
+        operation: BrowserDebuggerOperation,
+    ) -> Result<(), ErrorData> {
+        let session_id = super::context::mcp_session_id_from_request_context(request_context)?
+            .ok_or_else(|| {
+                browser_facade_error(
+                    BROWSER_DEBUGGER_TOOL,
+                    error_codes::HTTP_SESSION_INVALID,
+                    operation.as_str(),
+                    "browser_debugger requires an MCP session id so the profile policy row can be read",
+                    "initialize a session, set profile=browser_debugger with a reason, then retry",
+                )
+            })?;
+        let snapshot = self.tool_profile_snapshot(Some(&session_id))?;
+        if matches!(
+            snapshot.profile,
+            ToolProfileKind::BrowserDebugger
+                | ToolProfileKind::BreakGlass
+                | ToolProfileKind::FullCapability
+        ) {
+            return Ok(());
+        }
+        let error = ErrorData::new(
+            ErrorCode(-32099),
+            format!(
+                "browser_debugger operation={} requires profile=browser_debugger for session {session_id}; current profile={}",
+                operation.as_str(),
+                snapshot.profile.as_str()
+            ),
+            Some(json!({
+                "code": error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "tool": BROWSER_DEBUGGER_TOOL,
+                "operation": operation.as_str(),
+                "session_id": &session_id,
+                "profile": snapshot.profile.as_str(),
+                "profile_label": snapshot.profile_label,
+                "source_of_truth": "CF_SESSIONS mcp/tool-profile/v1/<session_id> profile row",
+                "policy_row": &snapshot.policy_row,
+                "visible_tool_count": snapshot.visible_tool_count,
+                "resolution": "call profile operation=set profile=browser_debugger confirm_break_glass=true with a non-empty reason, then retry browser_debugger operation",
+            })),
+        );
+        tracing::warn!(
+            code = error_codes::TOOL_PROFILE_POLICY_DENIED,
+            tool = BROWSER_DEBUGGER_TOOL,
+            operation = operation.as_str(),
+            session_id = %session_id,
+            profile = snapshot.profile.as_str(),
+            "browser_debugger facade denied operation because session profile is not browser_debugger"
+        );
+        self.command_audit_final(
+            super::command_audit::CommandAuditInput::mcp(
+                BROWSER_DEBUGGER_TOOL,
+                operation.as_str(),
+                Some(session_id.clone()),
+                Some(session_id),
+                json!({
+                    "operation": operation.as_str(),
+                    "requested_tool": BROWSER_DEBUGGER_TOOL,
+                    "required_profile": ToolProfileKind::BrowserDebugger.as_str(),
+                }),
+                json!({
+                    "source_of_truth": "CF_SESSIONS mcp/tool-profile/v1/<session_id> profile row",
+                    "policy_row": &snapshot.policy_row,
+                    "visible_tool_count": snapshot.visible_tool_count,
+                }),
+                json!({
+                    "source_of_truth": "CF_ACTION_LOG command_audit row",
+                    "denied_tool": BROWSER_DEBUGGER_TOOL,
+                    "denied_operation": operation.as_str(),
+                    "profile": snapshot.profile.as_str(),
+                }),
+                "error",
+            )
+            .with_error(super::command_audit::command_audit_error_from_error_data(
+                &error,
+            )),
+        )?;
+        Err(error)
+    }
 }
