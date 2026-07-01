@@ -27,7 +27,7 @@ use synapse_core::error_codes;
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ControlLeaseAcquireParams {
-    /// Lease lifetime in milliseconds. Clamped to [100, 30000]. The lease is
+    /// Lease lifetime in milliseconds. Must be in [100, 30000]. The lease is
     /// renewed on every leased action and on a repeat acquire by the holder, so
     /// a short TTL is the safety floor against a crashed holder, not a hard cap
     /// on how long real work can take.
@@ -41,7 +41,7 @@ pub struct ControlLeaseAcquireParams {
 pub struct ControlLeaseHandoffParams {
     /// Live MCP session id that should receive the foreground input lease.
     pub to_session: String,
-    /// Fresh lease lifetime in milliseconds for the recipient. Clamped to
+    /// Fresh lease lifetime in milliseconds for the recipient. Must be in
     /// [100, 30000] like `control_lease_acquire`.
     #[serde(default = "default_lease_ttl_ms")]
     #[schemars(default = "default_lease_ttl_ms", range(min = 100, max = 30000))]
@@ -119,6 +119,8 @@ impl ControlLeaseResponse {
 
 const DASHBOARD_LEASE_SOURCE_OF_TRUTH: &str =
     "synapse_action::lease + CF_KV MCP session lease rows + CF_AGENT_EVENTS + CF_ACTION_LOG";
+pub(super) const LEASE_TTL_SOURCE_OF_TRUTH: &str =
+    "request ttl_ms before synapse_action::lease mutation";
 
 #[tool_router(router = lease_tool_router, vis = "pub(super)")]
 impl SynapseService {
@@ -135,9 +137,10 @@ impl SynapseService {
             kind = "control_lease_acquire",
             "tool.invocation kind=control_lease_acquire"
         );
+        let params = params.0;
+        validate_lease_ttl_ms("control_lease_acquire", params.ttl_ms)?;
         let session_id = require_lease_session_id(&request_context)?;
         self.restore_session_lease_if_needed(&session_id)?;
-        let params = params.0;
         let command_payload = json!({ "ttl_ms": params.ttl_ms });
         let command_before = json!({
             "source_of_truth": "synapse_action::lease",
@@ -411,9 +414,10 @@ impl SynapseService {
             kind = "control_lease_handoff",
             "tool.invocation kind=control_lease_handoff"
         );
+        let params = params.0;
+        validate_lease_ttl_ms("control_lease_handoff", params.ttl_ms)?;
         let session_id = require_lease_session_id(&request_context)?;
         self.restore_session_lease_if_needed(&session_id)?;
-        let params = params.0;
         let to_session = params.to_session;
         self.ensure_handoff_recipient_live(&session_id, &to_session)?;
         let command_payload = json!({
@@ -570,6 +574,41 @@ impl SynapseService {
         self.restore_session_lease_if_needed(&session_id)?;
         Ok(Json(lease_status_for_session(&session_id)))
     }
+}
+
+pub(super) fn validate_lease_ttl_ms(tool: &'static str, ttl_ms: u64) -> Result<(), ErrorData> {
+    if (synapse_action::MIN_LEASE_TTL_MS..=synapse_action::MAX_LEASE_TTL_MS).contains(&ttl_ms) {
+        return Ok(());
+    }
+    tracing::warn!(
+        code = error_codes::TOOL_PARAMS_INVALID,
+        detail_code = "LEASE_TTL_OUT_OF_RANGE",
+        tool,
+        ttl_ms,
+        min_ttl_ms = synapse_action::MIN_LEASE_TTL_MS,
+        max_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
+        source_of_truth = LEASE_TTL_SOURCE_OF_TRUTH,
+        "lease ttl_ms rejected before lease mutation"
+    );
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{tool} ttl_ms must be between {} and {}; got {ttl_ms}",
+            synapse_action::MIN_LEASE_TTL_MS,
+            synapse_action::MAX_LEASE_TTL_MS
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "detail_code": "LEASE_TTL_OUT_OF_RANGE",
+            "tool": tool,
+            "source_id": "ttl_ms",
+            "source_of_truth": LEASE_TTL_SOURCE_OF_TRUTH,
+            "min_ttl_ms": synapse_action::MIN_LEASE_TTL_MS,
+            "max_ttl_ms": synapse_action::MAX_LEASE_TTL_MS,
+            "ttl_ms": ttl_ms,
+            "remediation": "pass ttl_ms in the advertised lease range or omit it for the default",
+        })),
+    ))
 }
 
 /// Acquire/renew the lease for `session_id`. Contended → `ACTION_FOREGROUND_LEASE_BUSY`.
@@ -1233,7 +1272,7 @@ fn lease_not_held_error(session_id: &str, error: &synapse_action::LeaseError) ->
 mod tests {
     use super::{
         acquire_lease_for_session, handoff_lease_for_session, lease_status_for_session,
-        release_lease_for_session,
+        release_lease_for_session, validate_lease_ttl_ms,
     };
     use crate::test_support;
     use synapse_core::error_codes;
@@ -1247,6 +1286,46 @@ mod tests {
             .and_then(|data| data.get("code"))
             .and_then(serde_json::Value::as_str)
             .map(ToOwned::to_owned)
+    }
+
+    fn error_u64(error: &rmcp::ErrorData, field: &str) -> Option<u64> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get(field))
+            .and_then(serde_json::Value::as_u64)
+    }
+
+    #[test]
+    fn lease_ttl_validator_rejects_out_of_range_with_structured_bounds() {
+        let below = validate_lease_ttl_ms("control_lease_acquire", 99)
+            .expect_err("below-min ttl must fail closed");
+        assert_eq!(
+            error_code(&below).as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            error_u64(&below, "min_ttl_ms"),
+            Some(synapse_action::MIN_LEASE_TTL_MS)
+        );
+        assert_eq!(
+            error_u64(&below, "max_ttl_ms"),
+            Some(synapse_action::MAX_LEASE_TTL_MS)
+        );
+        assert_eq!(error_u64(&below, "ttl_ms"), Some(99));
+
+        let above = validate_lease_ttl_ms("control_lease_handoff", 30_001)
+            .expect_err("above-max ttl must fail closed");
+        assert_eq!(
+            error_code(&above).as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(error_u64(&above, "ttl_ms"), Some(30_001));
+
+        validate_lease_ttl_ms("control_lease_acquire", synapse_action::MIN_LEASE_TTL_MS)
+            .expect("minimum boundary ttl should be accepted");
+        validate_lease_ttl_ms("control_lease_acquire", synapse_action::MAX_LEASE_TTL_MS)
+            .expect("maximum boundary ttl should be accepted");
     }
 
     #[test]

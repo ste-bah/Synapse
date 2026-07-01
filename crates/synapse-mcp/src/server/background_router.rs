@@ -76,7 +76,10 @@ struct ActParams {
     action: Option<TargetActParams>,
     #[serde(default)]
     reason: Option<String>,
+    /// Foreground input lease lifetime for operation=foreground or
+    /// operation=lease_acquire. Must be in [100, 30000].
     #[serde(default)]
+    #[schemars(range(min = 100, max = 30000))]
     ttl_ms: Option<u64>,
 }
 
@@ -1080,6 +1083,8 @@ impl SynapseService {
                 "act_foreground requires a non-empty reason for the foreground escalation audit",
             ));
         }
+        let ttl_ms = params.ttl_ms.unwrap_or(30_000);
+        super::lease_tools::validate_lease_ttl_ms("act_foreground", ttl_ms)?;
         let session_id = target_act_session_id(&request_context, "act_foreground")?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
@@ -1091,7 +1096,6 @@ impl SynapseService {
         let prior_profile = before.profile;
         let already_held = synapse_action::lease::status().owner_session_id.as_deref()
             == Some(session_id.as_str());
-        let ttl_ms = params.ttl_ms.unwrap_or(30_000);
 
         // 1) acquire/renew the foreground input lease.
         self.control_lease_acquire(
@@ -5234,6 +5238,9 @@ fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
 
 fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {
     require_act_action(params, ActOperation::Foreground)?;
+    if let Some(ttl_ms) = params.ttl_ms {
+        super::lease_tools::validate_lease_ttl_ms("act operation=foreground", ttl_ms)?;
+    }
     if params
         .reason
         .as_deref()
@@ -5252,6 +5259,9 @@ fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {
 fn validate_act_lease_acquire_params(params: &ActParams) -> Result<(), ErrorData> {
     reject_act_action(params, ActOperation::LeaseAcquire)?;
     reject_act_reason(params, ActOperation::LeaseAcquire)?;
+    if let Some(ttl_ms) = params.ttl_ms {
+        super::lease_tools::validate_lease_ttl_ms("act operation=lease_acquire", ttl_ms)?;
+    }
     Ok(())
 }
 
@@ -6751,6 +6761,14 @@ mod tests {
             .map(str::to_owned)
     }
 
+    fn act_error_u64(error: &ErrorData, field: &str) -> Option<u64> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get(field))
+            .and_then(Value::as_u64)
+    }
+
     #[test]
     fn act_facade_rejects_unknown_operation_enum() {
         let error = serde_json::from_value::<ActParams>(json!({
@@ -6815,6 +6833,68 @@ mod tests {
             act_error_field(&error, "source_id").as_deref(),
             Some("reason")
         );
+    }
+
+    #[test]
+    fn act_facade_foreground_rejects_out_of_range_ttl() {
+        let params = ActParams {
+            operation: ActOperation::Foreground,
+            action: Some(read_action()),
+            reason: Some("needs audited hardware foreground".to_owned()),
+            ttl_ms: Some(30_001),
+        };
+
+        let error = validate_act_foreground_params(&params)
+            .expect_err("foreground must reject above-max ttl_ms");
+
+        assert_eq!(
+            act_error_field(&error, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            act_error_field(&error, "detail_code").as_deref(),
+            Some("LEASE_TTL_OUT_OF_RANGE")
+        );
+        assert_eq!(
+            act_error_field(&error, "source_id").as_deref(),
+            Some("ttl_ms")
+        );
+        assert_eq!(act_error_u64(&error, "ttl_ms"), Some(30_001));
+        assert_eq!(
+            act_error_u64(&error, "min_ttl_ms"),
+            Some(synapse_action::MIN_LEASE_TTL_MS)
+        );
+        assert_eq!(
+            act_error_u64(&error, "max_ttl_ms"),
+            Some(synapse_action::MAX_LEASE_TTL_MS)
+        );
+    }
+
+    #[test]
+    fn act_facade_lease_acquire_rejects_out_of_range_ttl() {
+        let params = ActParams {
+            operation: ActOperation::LeaseAcquire,
+            action: None,
+            reason: None,
+            ttl_ms: Some(99),
+        };
+
+        let error = validate_act_lease_acquire_params(&params)
+            .expect_err("lease_acquire must reject below-min ttl_ms");
+
+        assert_eq!(
+            act_error_field(&error, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            act_error_field(&error, "detail_code").as_deref(),
+            Some("LEASE_TTL_OUT_OF_RANGE")
+        );
+        assert_eq!(
+            act_error_field(&error, "tool").as_deref(),
+            Some("act operation=lease_acquire")
+        );
+        assert_eq!(act_error_u64(&error, "ttl_ms"), Some(99));
     }
 
     #[test]
