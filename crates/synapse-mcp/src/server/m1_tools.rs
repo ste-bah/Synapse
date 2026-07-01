@@ -4608,7 +4608,7 @@ impl SynapseService {
                 &memory_owners,
             ));
         }
-        let mut claimed = Vec::new();
+        let mut authorized = Vec::new();
         for (owner_key, row) in persisted {
             let target = SessionTarget::Cdp {
                 window_hwnd: row.owner.window_hwnd,
@@ -4617,23 +4617,24 @@ impl SynapseService {
             if self
                 .target_claim_for_session(session_id, &target)?
                 .is_some()
+                || active_target.is_some_and(|active| session_targets_equal(active, &target))
             {
-                claimed.push((owner_key, row));
+                authorized.push((owner_key, row));
             }
         }
-        if claimed.is_empty() {
+        if authorized.is_empty() {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "cdp_close_tab refused recovered target {target_id:?}: this session must hold an exact target_claim for the persisted CDP target before durable close authority can be restored"
+                    "cdp_close_tab refused recovered target {target_id:?}: this session must hold an exact target_claim or exact active CDP session target for the persisted CDP target before durable close authority can be restored"
                 ),
             ));
         }
-        let selected = select_persisted_cdp_owner_for_claimed_close(
+        let selected = select_persisted_cdp_owner_for_authorized_close(
             session_id,
             target_id,
             active_target,
-            claimed,
+            authorized,
         )?;
         self.ensure_persisted_cdp_owner_recoverable(session_id, &selected.1)?;
         let mut owner = selected.1.owner.clone();
@@ -9624,6 +9625,26 @@ fn cdp_target_ids_equal(left: &str, right: &str) -> bool {
     normalize_cdp_target_id(left) == normalize_cdp_target_id(right)
 }
 
+fn session_targets_equal(left: &SessionTarget, right: &SessionTarget) -> bool {
+    match (left, right) {
+        (SessionTarget::Window { hwnd: left }, SessionTarget::Window { hwnd: right }) => {
+            left == right
+        }
+        (
+            SessionTarget::Cdp {
+                window_hwnd: left_hwnd,
+                cdp_target_id: left_id,
+            },
+            SessionTarget::Cdp {
+                window_hwnd: right_hwnd,
+                cdp_target_id: right_id,
+            },
+        ) => left_hwnd == right_hwnd && cdp_target_ids_equal(left_id, right_id),
+        (SessionTarget::Window { .. }, SessionTarget::Cdp { .. })
+        | (SessionTarget::Cdp { .. }, SessionTarget::Window { .. }) => false,
+    }
+}
+
 fn select_cdp_owner_for_session(
     tool: &str,
     session_id: &str,
@@ -9674,7 +9695,7 @@ fn select_cdp_owner_for_session(
     ))
 }
 
-fn select_persisted_cdp_owner_for_claimed_close(
+fn select_persisted_cdp_owner_for_authorized_close(
     session_id: &str,
     target_id: &str,
     active_target: Option<&SessionTarget>,
@@ -20502,6 +20523,108 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.owner_session_id, current_session);
         assert_eq!(rows[0].1.owner_client_name.as_deref(), Some("codex-cli"));
+        Ok(())
+    }
+
+    #[test]
+    fn cdp_close_recovers_persisted_owner_with_exact_active_same_agent_target() -> anyhow::Result<()>
+    {
+        let dir = TempDir::new()?;
+        let service = service_with_temp_db(dir.path())?;
+        let owner_session = "issue1401-old-codex-session";
+        let current_session = "issue1401-current-codex-session";
+        let now = crate::server::session_registry::unix_time_ms_now();
+        seed_session_client(
+            &service,
+            owner_session,
+            "codex-mcp-client",
+            now.saturating_sub(1_000),
+        )?;
+        seed_session_client(&service, current_session, "codex-mcp-client", now)?;
+
+        let target_id = "chrome-tab:issue1401-recover-active-target";
+        let owner_key = service.register_cdp_target_owner(CdpTargetOwner {
+            session_id: owner_session.to_owned(),
+            window_hwnd: 0x1401,
+            endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+            chrome_window_id: None,
+            capture_window_hwnd: None,
+            cdp_target_id: target_id.to_owned(),
+            requested_url: "about:blank#issue1401".to_owned(),
+            target_url: "about:blank#issue1401".to_owned(),
+            created_at_unix_ms: now,
+        })?;
+        close_session_registry_row(&service, owner_session, now.saturating_add(1))?;
+        service.cdp_target_owners_ref().lock().unwrap().clear();
+        service.set_session_target(
+            current_session,
+            SessionTarget::Cdp {
+                window_hwnd: 0x1401,
+                cdp_target_id: target_id.to_owned(),
+            },
+        )?;
+
+        let (recovered_key, recovered_owner) =
+            service.cdp_target_owner_for_close(current_session, target_id)?;
+        assert_eq!(recovered_key, owner_key);
+        assert_eq!(recovered_owner.session_id, current_session);
+        assert_eq!(recovered_owner.window_hwnd, 0x1401);
+
+        let rows = service.read_persisted_cdp_target_owners_for_target_id(target_id)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.owner_session_id, current_session);
+        assert_eq!(
+            rows[0].1.owner_client_name.as_deref(),
+            Some("codex-mcp-client")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cdp_close_active_target_recovery_refuses_wrong_client_identity() -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let service = service_with_temp_db(dir.path())?;
+        let owner_session = "issue1401-owner-codex-session";
+        let current_session = "issue1401-current-claude-session";
+        let now = crate::server::session_registry::unix_time_ms_now();
+        seed_session_client(
+            &service,
+            owner_session,
+            "codex-mcp-client",
+            now.saturating_sub(1_000),
+        )?;
+        seed_session_client(&service, current_session, "claude-code", now)?;
+
+        let target_id = "chrome-tab:issue1401-wrong-client";
+        service.register_cdp_target_owner(CdpTargetOwner {
+            session_id: owner_session.to_owned(),
+            window_hwnd: 0x1402,
+            endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+            chrome_window_id: None,
+            capture_window_hwnd: None,
+            cdp_target_id: target_id.to_owned(),
+            requested_url: "about:blank#wrong-client".to_owned(),
+            target_url: "about:blank#wrong-client".to_owned(),
+            created_at_unix_ms: now,
+        })?;
+        close_session_registry_row(&service, owner_session, now.saturating_add(1))?;
+        service.cdp_target_owners_ref().lock().unwrap().clear();
+        service.set_session_target(
+            current_session,
+            SessionTarget::Cdp {
+                window_hwnd: 0x1402,
+                cdp_target_id: target_id.to_owned(),
+            },
+        )?;
+
+        let error = service
+            .cdp_target_owner_for_close(current_session, target_id)
+            .expect_err("active target must not bypass client identity checks");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!(error_codes::ACTION_TARGET_INVALID))
+        );
+        assert!(error.message.contains("agent_kind"));
         Ok(())
     }
 
