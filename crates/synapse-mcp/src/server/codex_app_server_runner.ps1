@@ -110,6 +110,60 @@ function Get-JsonProperty($Object, [string]$Name) {
     return $property.Value
 }
 
+function Get-JsonShape($Value) {
+    if ($null -eq $Value) {
+        return 'null'
+    }
+    if ($Value -is [System.Array]) {
+        return 'array'
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = @($Value.PSObject.Properties | ForEach-Object { $_.Name })
+        return ('object:{0}' -f ($names -join ','))
+    }
+    return $Value.GetType().FullName
+}
+
+function New-CodexAppServerRpcFailure([int]$Id, [string]$ExpectedMethod, $ResponseError, [string]$Phase) {
+    $errorCode = Get-JsonProperty $ResponseError 'code'
+    $errorMessage = Get-JsonProperty $ResponseError 'message'
+    $errorData = Get-JsonProperty $ResponseError 'data'
+    return [ordered]@{
+        code = 'SYNAPSE_CODEX_APP_SERVER_RPC_FAILED'
+        protocol = 'codex_app_server_ws'
+        phase = $Phase
+        request_id = $Id
+        expected_method = $ExpectedMethod
+        response_error_shape = Get-JsonShape $ResponseError
+        response_error_code = $errorCode
+        response_error_message = $errorMessage
+        response_error_data_shape = Get-JsonShape $errorData
+        response_error_json = ($ResponseError | ConvertTo-Json -Compress -Depth 100)
+        thread_id = $script:ThreadId
+        turn_id = $script:TurnId
+        turn_status = $script:TurnStatus
+        control_path = $ControlPath
+        events_path = $EventsPath
+        stdout_path = $StdoutPath
+        stderr_path = $StderrPath
+        remediation = 'Inspect codex app-server events/control artifacts and fix the request shape or Codex app-server state that produced the JSON-RPC error.'
+        at_unix_ms = Get-UnixMs
+    }
+}
+
+function Throw-CodexAppServerRpcFailure([int]$Id, [string]$ExpectedMethod, $ResponseError, [string]$Phase) {
+    $failure = New-CodexAppServerRpcFailure -Id $Id -ExpectedMethod $ExpectedMethod -ResponseError $ResponseError -Phase $Phase
+    Add-JsonLine -Path $EventsPath -Value ([ordered]@{
+        direction = 'server'
+        phase = 'response_error'
+        id = $Id
+        expected_method = $ExpectedMethod
+        failure = $failure
+        at_unix_ms = Get-UnixMs
+    })
+    throw ($failure | ConvertTo-Json -Compress -Depth 100)
+}
+
 function Write-Control([hashtable]$Patch) {
     $current = [ordered]@{}
     if (Test-Path -LiteralPath $ControlPath) {
@@ -391,7 +445,7 @@ function Update-FromNotification($Message) {
     }
 }
 
-function Receive-Response($Socket, [int]$Id) {
+function Receive-Response($Socket, [int]$Id, [string]$ExpectedMethod) {
     while ($true) {
         $message = Read-Message $Socket
         if (Handle-AppServerRequest -Socket $Socket -Message $message) {
@@ -402,8 +456,7 @@ function Receive-Response($Socket, [int]$Id) {
         if ($null -ne $messageId -and [int]$messageId -eq $Id) {
             $responseError = Get-JsonProperty $message 'error'
             if ($null -ne $responseError) {
-                $errorJson = $responseError | ConvertTo-Json -Compress -Depth 100
-                throw "codex app-server request id $Id failed: $errorJson"
+                Throw-CodexAppServerRpcFailure -Id $Id -ExpectedMethod $ExpectedMethod -ResponseError $responseError -Phase 'receive_response'
             }
             return $message
         }
@@ -441,7 +494,7 @@ $script:SynapseStartupApprovedMcpTools = @(
     'health',
     'session_list',
     'get_target',
-    'agent_spawn_task_started'
+    'agent'
 )
 $socket = $null
 $appServer = $null
@@ -489,7 +542,7 @@ try {
             capabilities = [ordered]@{ experimentalApi = $true }
         }
     })
-    [void](Receive-Response $socket 1)
+    [void](Receive-Response $socket 1 'initialize')
 
     $threadParams = [ordered]@{
         cwd = $WorkingDir
@@ -513,7 +566,7 @@ try {
         $threadParams['model'] = $Model
     }
     Send-WebSocketJson $socket ([ordered]@{ id = 2; method = 'thread/start'; params = $threadParams })
-    $threadResponse = Receive-Response $socket 2
+    $threadResponse = Receive-Response $socket 2 'thread/start'
     $threadResult = Get-JsonProperty $threadResponse 'result'
     $thread = Get-JsonProperty $threadResult 'thread'
     $script:ThreadId = [string](Get-JsonProperty $thread 'id')
@@ -538,7 +591,7 @@ try {
     Send-WebSocketJson $socket ([ordered]@{ id = 3; method = 'turn/start'; params = $turnParams })
     $script:TurnStatus = 'turn_start_sent'
     Write-Control @{}
-    $turnResponse = Receive-Response $socket 3
+    $turnResponse = Receive-Response $socket 3 'turn/start'
     $turnResult = Get-JsonProperty $turnResponse 'result'
     $turn = Get-JsonProperty $turnResult 'turn'
     $script:TurnId = [string](Get-JsonProperty $turn 'id')

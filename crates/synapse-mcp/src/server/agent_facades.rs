@@ -1,5 +1,6 @@
 use super::{
-    ActSpawnAgentRequest, ActSpawnAgentResponse, ErrorData, Json, Parameters, SynapseService,
+    ActSpawnAgentRequest, ActSpawnAgentResponse, AgentSpawnTaskStartedParams,
+    AgentSpawnTaskStartedResponse, ErrorData, Json, Parameters, SynapseService,
     agent_control::{
         AgentInterruptParams, AgentInterruptResponse, AgentKillParams, AgentKillResponse,
         AgentPauseParams, AgentRespawnParams, AgentRespawnResponse, AgentSteerParams,
@@ -51,6 +52,7 @@ pub enum AgentOperation {
     TemplateGet,
     TemplateList,
     TemplateDelete,
+    TaskStarted,
     Interrupt,
     Kill,
     Steer,
@@ -74,6 +76,7 @@ impl AgentOperation {
             Self::TemplateGet => "template_get",
             Self::TemplateList => "template_list",
             Self::TemplateDelete => "template_delete",
+            Self::TaskStarted => "task_started",
             Self::Interrupt => "interrupt",
             Self::Kill => "kill",
             Self::Steer => "steer",
@@ -112,6 +115,8 @@ pub struct AgentParams {
     pub template_list: Option<AgentTemplateListParams>,
     #[serde(default)]
     pub template_delete: Option<AgentTemplateDeleteParams>,
+    #[serde(default)]
+    pub task_started: Option<AgentSpawnTaskStartedParams>,
     #[serde(default)]
     pub interrupt: Option<AgentInterruptParams>,
     #[serde(default)]
@@ -156,6 +161,8 @@ pub struct AgentResponse {
     pub template_list: Option<AgentTemplateListResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_delete: Option<AgentTemplateDeleteResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_started: Option<AgentSpawnTaskStartedResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interrupt: Option<AgentInterruptResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -562,6 +569,36 @@ impl SynapseService {
                     operation,
                     format!("deleted CF_KV template row={}", response.deleted_row_key),
                     |out| out.template_delete = Some(response),
+                )))
+            }
+            AgentOperation::TaskStarted => {
+                let spec = params
+                    .0
+                    .task_started
+                    .ok_or_else(|| missing_agent_spec("task_started"))?;
+                let source_id = spec.spawn_id.clone();
+                let response = self
+                    .agent_spawn_task_started(Parameters(spec), request_context)
+                    .await
+                    .map_err(|error| {
+                        agent_delegate_error(
+                            operation,
+                            source_id,
+                            error,
+                            "inspect the spawn directory, manifest, MCP session id, and task-started artifact before retrying",
+                        )
+                    })?
+                    .0;
+                Ok(Json(agent_response(
+                    operation,
+                    format!(
+                        "task-started artifact path={} spawn_id={} session_id={} readiness_source={}",
+                        response.task_started_path,
+                        response.spawn_id,
+                        response.session_id,
+                        response.readiness_source
+                    ),
+                    |out| out.task_started = Some(response),
                 )))
             }
             AgentOperation::Interrupt => {
@@ -986,6 +1023,7 @@ fn validate_agent_facade_params(params: &AgentParams) -> Result<(), ErrorData> {
             ("template_get", params.template_get.is_some()),
             ("template_list", params.template_list.is_some()),
             ("template_delete", params.template_delete.is_some()),
+            ("task_started", params.task_started.is_some()),
             ("interrupt", params.interrupt.is_some()),
             ("kill", params.kill.is_some()),
             ("steer", params.steer.is_some()),
@@ -1171,6 +1209,7 @@ fn agent_response(
         template_get: None,
         template_list: None,
         template_delete: None,
+        task_started: None,
         interrupt: None,
         kill: None,
         steer: None,
@@ -1275,6 +1314,7 @@ mod tests {
             template_get: None,
             template_list: None,
             template_delete: None,
+            task_started: None,
             interrupt: None,
             kill: None,
             steer: None,

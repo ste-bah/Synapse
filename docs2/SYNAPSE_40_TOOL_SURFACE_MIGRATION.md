@@ -63,7 +63,7 @@ Removed status means removed from the normal public surface. It does not always 
 | `browser_storage` | `read`, `write` |
 | `browser_debugger` | `evaluate`, `console_messages`, `pdf`, `file_upload`, `dialog`, `add_init_script`, `add_script_tag`, `add_style_tag`, `network`, `network_har`, `network_overrides`, `route`, `emulate`, `expose_binding`, `drag`, `drop` |
 | `workspace` | `get`, `put`, `list`, `subscribe`, `exists`, `delete` |
-| `agent` | `spawn`, `query`, `send`, `inbox`, `wait`, `broadcast`, `receipts`, `stats`, `template_put`, `template_get`, `template_list`, `template_delete`, `interrupt`, `kill`, `steer`, `pause`, `resume`, `respawn` |
+| `agent` | `spawn`, `query`, `send`, `inbox`, `wait`, `broadcast`, `receipts`, `stats`, `template_put`, `template_get`, `template_list`, `template_delete`, `task_started`, `interrupt`, `kill`, `steer`, `pause`, `resume`, `respawn` |
 | `task` | `create`, `get`, `update`, `claim`, `cancel`, `list`, `next`, `reconcile`, `dispatch_once` |
 | `approval` | `request`, `list`, `decide`, `gate`, `ask_operator` |
 | `escalation` | `config_get`, `config_set`, `list`, `ack` |
@@ -195,7 +195,7 @@ The audit in `docs2/SYNAPSE_LOG_AND_TOOL_SURFACE_AUDIT.md` saw 152 live visible 
 | `agent_template_put`, `agent_template_get`, `agent_template_list`, `agent_template_delete` | `agent operation=template_put/template_get/template_list/template_delete` | Condensed. |
 | `agent_ask_operator` | `approval operation=ask_operator` | Condensed. |
 | `agent_cost` | `cost operation=summarize` | Condensed. |
-| `agent_spawn_task_started` | `task operation=dispatch_once` and agent/task event readback | Removed from normal public surface as event plumbing. |
+| `agent_spawn_task_started` | `agent operation=task_started` | Condensed; spawned-agent readiness stays in the visible agent facade without adding a public tool. |
 | `fleet_stop` | `agent operation=kill` scoped by explicit ids, or advanced maintenance route for fleet-wide stops | Removed from normal public surface as broad destructive control. |
 | `task_create`, `task_get`, `task_update`, `task_claim`, `task_cancel`, `task_list`, `task_next`, `task_reconcile`, `task_dispatch_once` | `task operation=create/get/update/claim/cancel/list/next/reconcile/dispatch_once` | Condensed. |
 | `approval_request`, `approval_list`, `approval_decide`, `approval_gate` | `approval operation=request/list/decide/gate` | Condensed. |
@@ -228,4 +228,3 @@ Removed tool still public in `normal_agent`: treat as profile regression. Fix `N
 Doc example uses hidden route from `normal_agent`: treat as a documentation regression. Examples must use current facade tools only.
 
 Public count above 40: treat as release blocker for #1374. The source of truth is production-client `tools/list`, not a local constant alone.
-

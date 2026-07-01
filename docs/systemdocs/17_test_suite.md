@@ -157,7 +157,7 @@ cargo test --workspace
 | Fixture / helper | Location | Purpose |
 |---|---|---|
 | `StdioMcpClient` | `crates/synapse-test-utils/src/stdio_mcp_client.rs` | Raw JSON-RPC stdio MCP client for e2e (see §4) |
-| `launch_notepad()` / `NotepadHandle` | `crates/synapse-test-utils/src/fixtures.rs` | Launches `notepad.exe`, waits for the expected window title (regex `^(?:Untitled - Notepad|Notepad)$`, 5 s timeout, 20 ms poll), handles Win11 session-restore via a Ctrl+N retry, and cleans up via WM_CLOSE → taskkill → CIM `Win32_Process.Terminate`. Non-Windows build returns a stub that fails closed. |
+| `launch_notepad()` / `NotepadHandle` | `crates/synapse-test-utils/src/fixtures.rs` | Launches a fixture-owned `notepad.exe`, waits for the expected window title (regex `^(?:Untitled - Notepad|Notepad)$`, 5 s timeout, 20 ms poll), handles Win11 session-restore via a Ctrl+N retry, and cleans up only the recorded fixture-owned UI/launcher PIDs via WM_CLOSE → taskkill → CIM `Win32_Process.Terminate`. Non-Windows build returns a stub that fails closed. |
 | `wait_for_window_title_regex` | `crates/synapse-test-utils/src/fixtures.rs` | Poll for a window whose title matches a regex |
 | Window-selection helpers | `crates/synapse-test-utils/src/fixtures.rs` | `select_window_title_match`, `select_new_notepad_window`, `is_notepad_window_title` — pure functions, unit-tested cross-platform |
 | Audio WAVs | `tests/fixtures/audio/*.wav` (+ `README.md`) | Deterministic synthetic WAVs for STT/direction/transient tests: `hello_world_5s.wav` ("Hello world. This is Synapse."), `loud_transient_1s.wav`, `pan_minus60_0_plus60.wav`. Each documented with format + SHA-256. |

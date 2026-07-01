@@ -5288,17 +5288,19 @@ fn prepare_agent_spawn_files(
         .is_local_model()
         .then(|| log_dir.join("local-model-runner.json"));
 
-    let task_started_script =
-        build_agent_spawn_task_start_script(spawn_id, params, &task_started_path);
-    fs::write(&task_started_script_path, task_started_script).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "act_spawn_agent failed to write task-start script {}: {error}",
-                task_started_script_path.display()
-            ),
-        )
-    })?;
+    if agent_kind == ActSpawnAgentCli::Claude {
+        let task_started_script =
+            build_agent_spawn_task_start_script(spawn_id, params, &task_started_path);
+        fs::write(&task_started_script_path, task_started_script).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "act_spawn_agent failed to write task-start script {}: {error}",
+                    task_started_script_path.display()
+                ),
+            )
+        })?;
+    }
 
     let prompt = build_agent_spawn_prompt(
         spawn_id,
@@ -5551,7 +5553,7 @@ const CLAUDE_AUTO_ALLOW_RULES: &[&str] = &[
     "mcp__synapse__tool_profile_status",
     "mcp__synapse__get_target",
     "mcp__synapse__set_target",
-    "mcp__synapse__agent_spawn_task_started",
+    "mcp__synapse__agent",
     "Edit",
     "Write",
     "MultiEdit",
@@ -5624,7 +5626,7 @@ fn build_agent_spawn_prompt(
     params: &ActSpawnAgentParams,
     working_dir: &Path,
     task_started_path: &Path,
-    task_started_script_path: &Path,
+    _task_started_script_path: &Path,
 ) -> Result<String, ErrorData> {
     let agent_kind = params.effective_cli()?;
     if agent_kind.is_local_model() {
@@ -5677,8 +5679,6 @@ fn build_agent_spawn_prompt(
         )
     };
     let task_started_path_display = task_started_path.display().to_string();
-    let task_started_script_path_display = task_started_script_path.display().to_string();
-    let task_started_script_path_ps = ps_single_quoted_path(task_started_script_path);
     Ok(format!(
         "You are a primary {cli} agent spawned by Synapse act_spawn_agent.\n\
 Spawn ID: {spawn_id}\n\
@@ -5697,12 +5697,9 @@ Mandatory provisioning checks:\n\
 {target_instruction}\n\
 5. If any Synapse MCP tool is missing or fails, stop and report the exact tool/error.\n\
 6. Before performing the assigned task or hold-open sleep, write the required task-start readiness artifact to: {task_started_path}\n\
-   Preferred path: call the real Synapse MCP agent_spawn_task_started tool with exactly this JSON: {{\"spawn_id\":\"{spawn_id}\"}}\n\
+   Call the real Synapse MCP agent facade with exactly this JSON: {{\"operation\":\"task_started\",\"task_started\":{{\"spawn_id\":\"{spawn_id}\"}}}}\n\
    Verify the tool response has ok=true, session_id equal to this spawned MCP session id, and task_started_path equal to {task_started_path}.\n\
-   Compatibility fallback only if agent_spawn_task_started is missing or fails: run the daemon-generated PowerShell helper exactly once after replacing <your_session_id> with this spawned MCP session id.\n\
-   Helper path: {task_started_script_path}\n\
-   & {task_started_script_path_ps} -SessionId '<your_session_id>'\n\
-   Do not rewrite the helper inline. The helper writes the JSON atomically, reads {task_started_path} back, and fails closed with an exact mismatch error if any field is wrong.\n\
+   If the facade call is missing or fails, stop and report the exact tool/error; do not use a helper script or direct file write.\n\
 7. In your final response, include one compact JSON object containing spawn_id, health_ok, session_id, target_ok, task_started_path, and any error.\n\
 \n\
 {assigned_block}\n\
@@ -5713,8 +5710,6 @@ Mandatory provisioning checks:\n\
         working_dir = working_dir.display(),
         target_instruction = target_instruction,
         task_started_path = task_started_path_display,
-        task_started_script_path_ps = task_started_script_path_ps,
-        task_started_script_path = task_started_script_path_display,
         assigned_block = assigned_block,
         hold_instruction = hold_instruction,
     ))
@@ -6193,23 +6188,31 @@ fn agent_spawn_powershell_script(
             let model_arg = params
                 .model
                 .as_deref()
-                .map(|model| {
-                    format!(
-                        "$codexRunnerArgs += @('-Model',{})\n",
-                        ps_single_quote(model)
-                    )
-                })
+                .map(|model| format!("$codexRunnerArgs['Model'] = {}\n", ps_single_quote(model)))
                 .unwrap_or_default();
             let approval_gate_arg = if params.require_approval_gate {
-                "$codexRunnerArgs += @('-RequireApprovalGate')\n"
+                "$codexRunnerArgs['RequireApprovalGate'] = $true\n"
             } else {
                 ""
             };
             format!(
-                "$codexRunnerArgs = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',{runner_path},'-SpawnId',$spawnId,'-PromptPath',$spawnPromptPath,'-StdoutPath',$spawnStdoutPath,'-StderrPath',$spawnStderrPath,'-FinalMessagePath',$spawnFinalMessagePath,'-ControlPath',{control_path},'-EventsPath',{events_path},'-AppServerStdoutPath',{app_stdout_path},'-AppServerStderrPath',{app_stderr_path},'-WorkingDir',{working_dir},'-McpUrl',{mcp_url},'-NotifyScriptPath',{notify_script_path})\n\
+                "$codexRunnerArgs = @{{\n\
+    SpawnId = $spawnId\n\
+    PromptPath = $spawnPromptPath\n\
+    StdoutPath = $spawnStdoutPath\n\
+    StderrPath = $spawnStderrPath\n\
+    FinalMessagePath = $spawnFinalMessagePath\n\
+    ControlPath = {control_path}\n\
+    EventsPath = {events_path}\n\
+    AppServerStdoutPath = {app_stdout_path}\n\
+    AppServerStderrPath = {app_stderr_path}\n\
+    WorkingDir = {working_dir}\n\
+    McpUrl = {mcp_url}\n\
+    NotifyScriptPath = {notify_script_path}\n\
+}}\n\
 {model_arg}\
 {approval_gate_arg}\
-& powershell.exe @codexRunnerArgs\n\
+& {runner_path} @codexRunnerArgs\n\
 ",
                 runner_path = ps_single_quoted_path(runner_path),
                 control_path = ps_single_quoted_path(control_path),
@@ -7736,9 +7739,10 @@ mod tests {
         assert!(prompt.contains("Start-Sleep -Milliseconds 1234"));
         assert!(prompt.contains("task-start readiness artifact"));
         assert!(prompt.contains("task-started.json"));
-        assert!(prompt.contains("agent_spawn_task_started"));
-        assert!(prompt.contains("write-task-started.ps1"));
-        assert!(prompt.contains("Do not rewrite the helper inline"));
+        assert!(prompt.contains("\"operation\":\"task_started\""));
+        assert!(prompt.contains("do not use a helper script or direct file write"));
+        assert!(!prompt.contains("agent_spawn_task_started"));
+        assert!(!prompt.contains("write-task-started.ps1"));
 
         let script = build_agent_spawn_task_start_script(
             "agent-spawn-test",
@@ -7751,6 +7755,62 @@ mod tests {
         assert!(script.contains("$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)"));
         assert!(script.contains("Write-TextNoBom -Path $taskStartedTempPath"));
         assert!(!script.contains("Set-Content -LiteralPath $taskStartedTempPath -Encoding UTF8"));
+    }
+
+    #[test]
+    fn codex_spawn_files_do_not_materialize_task_started_helper() {
+        struct EnvRestore {
+            key: &'static str,
+            value: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.value {
+                        Some(value) => std::env::set_var(self.key, value),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        let local_appdata = tempfile::TempDir::new().expect("create local appdata");
+        let _restore = EnvRestore {
+            key: "LOCALAPPDATA",
+            value: std::env::var_os("LOCALAPPDATA"),
+        };
+        unsafe { std::env::set_var("LOCALAPPDATA", local_appdata.path()) };
+
+        let working_dir = tempfile::TempDir::new().expect("create working dir");
+        let codex_files = prepare_agent_spawn_files(
+            "agent-spawn-codex",
+            &test_spawn_params(),
+            working_dir.path(),
+        )
+        .expect("prepare codex spawn files");
+
+        assert!(
+            !codex_files.task_started_script_path.exists(),
+            "Codex readiness must go through agent operation=task_started, not a helper script"
+        );
+        assert!(
+            codex_files
+                .codex_app_server_runner_path
+                .as_ref()
+                .is_some_and(|path| path.exists()),
+            "Codex still writes the app-server runner"
+        );
+
+        let mut claude_params = test_spawn_params();
+        claude_params.cli = Some(ActSpawnAgentCli::Claude);
+        let claude_files =
+            prepare_agent_spawn_files("agent-spawn-claude", &claude_params, working_dir.path())
+                .expect("prepare claude spawn files");
+
+        assert!(
+            claude_files.task_started_script_path.exists(),
+            "Claude gated-spawn settings still reference the helper path"
+        );
     }
 
     #[test]
@@ -8460,6 +8520,16 @@ mod tests {
             "runner must journal outbound JSON-RPC send boundaries for app-server stalls"
         );
         assert!(
+            CODEX_APP_SERVER_RUNNER_SCRIPT.contains("SYNAPSE_CODEX_APP_SERVER_RPC_FAILED")
+                && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("expected_method")
+                && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("response_error_shape")
+                && CODEX_APP_SERVER_RUNNER_SCRIPT
+                    .contains("Receive-Response $socket 2 'thread/start'")
+                && CODEX_APP_SERVER_RUNNER_SCRIPT
+                    .contains("Receive-Response $socket 3 'turn/start'"),
+            "runner must fail closed with structured JSON-RPC diagnostics for Bad Request-style app-server failures"
+        );
+        assert!(
             CODEX_APP_SERVER_RUNNER_SCRIPT.contains("/codex-app-server/request")
                 && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("Handle-AppServerRequest")
                 && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("app_server_response")
@@ -8477,7 +8547,8 @@ mod tests {
                 && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("'health'")
                 && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("'session_list'")
                 && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("'get_target'")
-                && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("'agent_spawn_task_started'")
+                && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("'agent'")
+                && !CODEX_APP_SERVER_RUNNER_SCRIPT.contains("'agent_spawn_task_started'")
                 && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("approval_mode=")
                 && CODEX_APP_SERVER_RUNNER_SCRIPT.contains("'approve'"),
             "startup-safe Synapse MCP tools must be pre-approved so Codex readiness cannot deadlock on its own health/task-start calls"
@@ -8514,6 +8585,12 @@ mod tests {
                 && interrupt_script.contains("Move-ReplaceWithRetry"),
             "Codex app-server interrupt control/events files must be no-BOM and retry transient file contention"
         );
+        assert!(
+            interrupt_script.contains("SYNAPSE_CODEX_APP_SERVER_RPC_FAILED")
+                && interrupt_script.contains("Receive-Response $socket 2 'turn/interrupt'")
+                && interrupt_script.contains("response_error_shape"),
+            "Codex app-server interrupt must preserve structured JSON-RPC failure diagnostics"
+        );
         let steer_script = include_str!("codex_app_server_steer.ps1");
         assert!(
             steer_script.contains("method = 'turn/steer'")
@@ -8523,6 +8600,12 @@ mod tests {
                 && steer_script.contains("last_steer_status")
                 && steer_script.contains("Move-ReplaceWithRetry"),
             "Codex app-server steer must use the generated turn/steer protocol with expectedTurnId and durable control readback"
+        );
+        assert!(
+            steer_script.contains("SYNAPSE_CODEX_APP_SERVER_RPC_FAILED")
+                && steer_script.contains("Receive-Response $socket 2 'turn/steer'")
+                && steer_script.contains("response_error_shape"),
+            "Codex app-server steer must preserve structured JSON-RPC failure diagnostics"
         );
     }
 
@@ -8579,12 +8662,25 @@ mod tests {
             "codex spawn must run through the app-server runner: {script}"
         );
         assert!(
-            script.contains("-RequireApprovalGate"),
+            script.contains("& '")
+                && script.contains("codex-app-server-runner.ps1' @codexRunnerArgs")
+                && !script.contains("& powershell.exe @codexRunnerArgs"),
+            "codex spawn must invoke the runner inside the already hidden wrapper instead of spawning a visible nested PowerShell: {script}"
+        );
+        assert!(
+            script.contains("$codexRunnerArgs = @{")
+                && script.contains("SpawnId = $spawnId")
+                && script.contains("EventsPath = '")
+                && !script.contains("$codexRunnerArgs = @('-SpawnId'"),
+            "codex spawn must use named parameter splatting so direct script invocation cannot misbind runner args: {script}"
+        );
+        assert!(
+            script.contains("RequireApprovalGate"),
             "default gated Codex spawns must tell the app-server runner to bridge approvals: {script}"
         );
-        assert!(script.contains("-ControlPath"));
+        assert!(script.contains("ControlPath"));
         assert!(script.contains("codex-control.json"));
-        assert!(script.contains("-NotifyScriptPath"));
+        assert!(script.contains("NotifyScriptPath"));
         assert!(script.contains("codex-notify.ps1"));
     }
 
@@ -8652,11 +8748,11 @@ mod tests {
         let codex_script = agent_spawn_powershell_script(&codex_params, &codex_files, dir.path())
             .expect("codex script");
         assert!(
-            codex_script.contains("$codexRunnerArgs += @('-Model','gpt-5-codex')"),
+            codex_script.contains("$codexRunnerArgs['Model'] = 'gpt-5-codex'"),
             "codex runner args must inject the pinned model: {codex_script}"
         );
         assert!(
-            codex_script.contains("$codexRunnerArgs += @('-RequireApprovalGate')"),
+            codex_script.contains("$codexRunnerArgs['RequireApprovalGate'] = $true"),
             "codex runner args must enable app-server approval bridging when the spawn is gated: {codex_script}"
         );
 
@@ -8668,8 +8764,8 @@ mod tests {
             codex_no_model.contains("codex-app-server-runner.ps1"),
             "codex still runs through app-server without a pinned model: {codex_no_model}"
         );
-        assert!(!codex_no_model.contains("'-Model'"));
-        assert!(codex_no_model.contains("'-RequireApprovalGate'"));
+        assert!(!codex_no_model.contains("['Model']"));
+        assert!(codex_no_model.contains("['RequireApprovalGate']"));
 
         // Claude: `--model <model>` injected right after `-p`.
         let claude_files = AgentSpawnFiles {
@@ -8941,11 +9037,7 @@ mod tests {
             .expect("permissions.allow present when gating");
         assert!(allow.iter().any(|rule| rule == "Read"));
         assert!(allow.iter().any(|rule| rule == "Bash(git status:*)"));
-        assert!(
-            allow
-                .iter()
-                .any(|rule| rule == "mcp__synapse__agent_spawn_task_started")
-        );
+        assert!(allow.iter().any(|rule| rule == "mcp__synapse__agent"));
         for tool in crate::server::permission_policy::SYNAPSE_COORDINATION_MCP_TOOLS {
             let expected = format!("mcp__synapse__{tool}");
             assert!(
