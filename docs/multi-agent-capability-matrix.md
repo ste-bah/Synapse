@@ -17,12 +17,13 @@ Status values:
 
 Model-selection exposure values:
 
-- `normal_agent`: visible in the default HTTP MCP profile.
-- `browser_debugger`: browser-only raw-CDP or `chrome.debugger` instrumentation is hidden from the default profile and visible only after an explicit `tool_profile_set browser_debugger` transition with confirm + reason.
+- `normal_agent`: the literal tool name/schema is visible in the default HTTP MCP profile.
+- `facade_only`: the raw implementation tool name/schema is hidden from the default profile, but the capability is reachable through a named public facade in the 40-tool surface.
+- `browser_debugger`: the stable `browser_debugger` facade is in `PUBLIC_TOOL_NAMES` but hidden from the default `normal_agent` profile; raw-CDP and `chrome.debugger` operations fail closed until an explicit `tool_profile_set browser_debugger` transition with confirm + reason.
 - `break_glass`: raw OS/global primitive is hidden from the default profile, but `tool_profile_status.hidden_tool_routes` must name a capability-preserving route; raw use is visible only after an explicit break-glass/admin profile transition.
 - `debug_only`: hidden from normal agent profiles and reserved for diagnostic/debug tool surfaces.
 
-The model-selection overlay is a checked extension of the capability matrix. It captures the affordance risk of exposing a tool name/schema to models, not only the technical implementation risk. The `Default exposure` and `Break-glass only` columns are kept in sync with `crates/synapse-mcp/src/server/tool_profiles.rs` by `crates/synapse-mcp/tests/multi_agent_capability_matrix.rs`.
+The model-selection overlay is a checked extension of the capability matrix. It captures the affordance risk of exposing a tool name/schema to models, not only the technical implementation risk. `Default exposure` is literal tool-name/schema visibility; normal-profile capability that moved behind a facade is marked `facade_only` and the public route is named under `Safe replacement tool`. The `Default exposure` and `Break-glass only` columns are kept in sync with `crates/synapse-mcp/src/server/tool_profiles.rs` by `crates/synapse-mcp/tests/multi_agent_capability_matrix.rs`.
 
 | Tool | Default exposure | Break-glass only | Hidden/internal | Deprecated alias | Foreground-prone wording | Safe replacement tool |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -30,137 +31,143 @@ The model-selection overlay is a checked extension of the capability matrix. It 
 | act_clipboard | break_glass | yes | no | no | no | workspace_put, browser_set_value, target_act verb=set_field |
 | act_combo | break_glass | yes | no | no | yes | target_act verb=press, browser DOM action |
 | act_focus_window | break_glass | yes | no | no | yes | set_target, target_claim, control_lease_acquire, tool_profile_set break_glass, target_act verb=focus_window, session_status |
-| act_foreground | normal_agent | no | no | no | no | none - default-safe |
+| act_foreground | facade_only | no | yes | no | no | act operation=foreground |
 | act_keymap | break_glass | yes | no | no | yes | target_act verb=press, browser DOM action |
-| act_launch | normal_agent | no | no | no | yes | hidden launch mode, act_spawn_agent, cdp_open_tab |
+| act_launch | facade_only | no | yes | no | yes | process operation=launch, agent operation=spawn, browser_tabs operation=new |
 | act_pad | break_glass | yes | no | no | yes | target_claim, control_lease_acquire, tool_profile_set break_glass |
 | act_press | break_glass | yes | no | no | yes | target_act verb=press, browser DOM action |
-| act_run_shell | normal_agent | no | no | no | no | none - default-safe |
-| act_run_shell_cancel | normal_agent | no | no | no | no | none - default-safe |
-| act_run_shell_start | normal_agent | no | no | no | no | none - default-safe |
-| act_run_shell_status | normal_agent | no | no | no | no | none - default-safe |
+| act_run_shell | facade_only | no | yes | no | no | shell operation=run |
+| act_run_shell_cancel | facade_only | no | yes | no | no | shell operation=cancel |
+| act_run_shell_start | facade_only | no | yes | no | no | shell operation=start |
+| act_run_shell_status | facade_only | no | yes | no | no | shell operation=status |
 | act_scroll | break_glass | yes | no | no | yes | target_act/browser DOM action when available, browser_scroll_into_view, observe, capture_screenshot |
 | act_set_field_text | break_glass | yes | no | no | yes | target_act verb=set_field, browser_set_value |
 | act_set_value | break_glass | yes | no | no | yes | target_act verb=set_field, browser_set_value |
-| act_spawn_agent | normal_agent | no | no | no | no | none - default-safe |
+| act_spawn_agent | facade_only | no | yes | no | no | agent operation=spawn |
 | act_stroke | break_glass | yes | no | no | yes | target_claim, control_lease_acquire, tool_profile_set break_glass |
 | act_type | break_glass | yes | no | no | yes | target_act verb=set_field, browser_set_value |
 | action_diagnostic_queue_full_setup | debug_only | yes | yes | no | no | action_diagnostic_rate_limit_override |
 | action_diagnostic_rate_limit_override | debug_only | yes | yes | no | no | action_diagnostic_queue_full_setup |
-| agent_cost | normal_agent | no | no | no | no | none - default-safe |
-| agent_cost_price_delete | break_glass | yes | no | no | no | agent_cost |
-| agent_cost_price_list | break_glass | yes | no | no | no | agent_cost |
-| agent_cost_price_put | break_glass | yes | no | no | no | agent_cost |
-| agent_ask_operator | normal_agent | no | no | no | no | none - default-safe |
-| agent_inbox | normal_agent | no | no | no | no | none - default-safe |
-| agent_interrupt | normal_agent | no | no | no | no | none - default-safe |
-| agent_kill | normal_agent | no | no | no | no | none - default-safe |
-| agent_pause | normal_agent | no | no | no | no | none - default-safe |
-| agent_query | normal_agent | no | no | no | no | none - default-safe |
-| agent_receipts | normal_agent | no | no | no | no | none - default-safe |
-| agent_respawn | normal_agent | no | no | no | no | none - default-safe |
-| agent_resume | normal_agent | no | no | no | no | none - default-safe |
-| agent_send | normal_agent | no | no | no | no | none - default-safe |
-| agent_send_broadcast | normal_agent | no | no | no | no | none - default-safe |
-| agent_spawn_task_started | normal_agent | no | no | no | no | none - default-safe |
-| agent_stats | normal_agent | no | no | no | no | none - default-safe |
-| agent_steer | normal_agent | no | no | no | no | none - default-safe |
-| agent_template_delete | normal_agent | no | no | no | no | none - default-safe |
-| agent_template_get | normal_agent | no | no | no | no | none - default-safe |
-| agent_template_list | normal_agent | no | no | no | no | none - default-safe |
-| agent_template_put | normal_agent | no | no | no | no | none - default-safe |
-| agent_wait | normal_agent | no | no | no | no | none - default-safe |
+| agent_cost | facade_only | no | yes | no | no | cost operation=summarize |
+| agent_cost_price_delete | break_glass | yes | no | no | no | cost operation=price_delete |
+| agent_cost_price_list | facade_only | no | yes | no | no | cost operation=price_list |
+| agent_cost_price_put | break_glass | yes | no | no | no | cost operation=price_put |
+| agent_ask_operator | facade_only | no | yes | no | no | approval operation=ask_operator |
+| agent_inbox | facade_only | no | yes | no | no | agent operation=inbox |
+| agent_interrupt | facade_only | no | yes | no | no | agent operation=interrupt |
+| agent_kill | facade_only | no | yes | no | no | agent operation=kill |
+| agent_pause | facade_only | no | yes | no | no | agent operation=pause |
+| agent_query | facade_only | no | yes | no | no | agent operation=query |
+| agent_receipts | facade_only | no | yes | no | no | agent operation=receipts |
+| agent_respawn | facade_only | no | yes | no | no | agent operation=respawn |
+| agent_resume | facade_only | no | yes | no | no | agent operation=resume |
+| agent_send | facade_only | no | yes | no | no | agent operation=send |
+| agent_send_broadcast | facade_only | no | yes | no | no | agent operation=broadcast |
+| agent_spawn_task_started | facade_only | no | yes | no | no | agent operation=task_started |
+| agent_stats | facade_only | no | yes | no | no | agent operation=stats |
+| agent_steer | facade_only | no | yes | no | no | agent operation=steer |
+| agent_template_delete | facade_only | no | yes | no | no | agent operation=template_delete |
+| agent_template_get | facade_only | no | yes | no | no | agent operation=template_get |
+| agent_template_list | facade_only | no | yes | no | no | agent operation=template_list |
+| agent_template_put | facade_only | no | yes | no | no | agent operation=template_put |
+| agent_wait | facade_only | no | yes | no | no | agent operation=wait |
 | audio_tail | break_glass | yes | no | no | no | #1005 background router |
 | audio_transcribe | break_glass | yes | no | no | no | #1005 background router |
 | browser_add_init_script | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_tabs, browser_locate, target_act |
 | browser_add_script_tag | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_tabs, browser_locate, target_act |
 | browser_add_style_tag | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_tabs, browser_locate, target_act |
-| browser_adopt_active_tab | normal_agent | no | no | no | no | none - default-safe |
-| browser_aria_snapshot | normal_agent | no | no | no | no | none - default-safe |
-| browser_assert | normal_agent | no | no | no | no | none - default-safe |
-| browser_batch | normal_agent | no | no | no | no | none - default-safe |
-| browser_clock | normal_agent | no | no | no | no | none - default-safe |
+| browser_adopt_active_tab | facade_only | no | yes | no | no | browser_tabs operation=select |
+| browser_aria_snapshot | facade_only | no | yes | no | no | browser_dom operation=aria_snapshot |
+| browser_assert | facade_only | no | yes | no | no | browser_wait operation=for_condition, browser_dom operation=locate |
+| browser_batch | facade_only | no | yes | no | no | sequence browser_nav/browser_wait/browser_form/browser_capture facade calls |
+| browser_capture | normal_agent | no | no | no | no | none - default-safe |
+| browser_clock | facade_only | no | yes | no | no | browser_debugger operation=add_init_script/evaluate after profile=browser_debugger |
 | browser_console_messages | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_content, browser_page_events, browser_downloads |
-| browser_cookies | normal_agent | no | no | no | no | none - default-safe |
-| browser_content | normal_agent | no | no | no | no | none - default-safe |
-| browser_downloads | normal_agent | no | no | no | no | none - default-safe |
+| browser_cookies | facade_only | no | yes | no | no | browser_storage operation=read/write |
+| browser_content | facade_only | no | yes | no | no | browser_dom operation=content |
+| browser_debugger | browser_debugger | no | no | no | no | profile operation=set profile=browser_debugger with reason before advanced operations; raw debugger tools stay hidden |
+| browser_dom | normal_agent | no | no | no | no | none - default-safe |
+| browser_downloads | facade_only | no | yes | no | no | browser_capture operation=downloads |
 | browser_drag | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_locate, target_act |
 | browser_drop | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_locate, target_act |
 | browser_emulate | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_tabs, browser_content, browser_locate |
 | browser_evaluate | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_content, browser_locate, target_act |
 | browser_expose_binding | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_content, browser_page_events |
-| browser_file_upload | normal_agent | no | no | no | no | none - default-safe |
-| browser_fill_form | normal_agent | no | no | no | no | none - default-safe |
-| browser_frames | normal_agent | no | no | no | no | none - default-safe |
+| browser_file_upload | facade_only | no | yes | no | no | browser_debugger operation=file_upload after profile=browser_debugger |
+| browser_fill_form | facade_only | no | yes | no | no | browser_form operation=fill |
+| browser_form | normal_agent | no | no | no | no | none - default-safe |
+| browser_frames | facade_only | no | yes | no | no | browser_dom operation=content/locate with frame-scoped target readback |
 | browser_handle_dialog | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_page_events, browser_content |
-| browser_inspect | normal_agent | no | no | no | no | none - default-safe |
-| browser_locate | normal_agent | no | no | no | no | none - default-safe |
+| browser_inspect | facade_only | no | yes | no | no | browser_dom operation=inspect |
+| browser_locate | facade_only | no | yes | no | no | browser_dom operation=locate |
+| browser_nav | normal_agent | no | no | no | no | none - default-safe |
 | browser_network | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_content, browser_page_events |
 | browser_network_har | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_content, browser_page_events, browser_downloads |
 | browser_network_overrides | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_content, browser_page_events |
-| browser_page_events | normal_agent | no | no | no | no | none - default-safe |
+| browser_page_events | facade_only | no | yes | no | no | browser_debugger operation=console_messages/network after profile=browser_debugger |
 | browser_pdf | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason; narrow Page.printToPDF debugger lane on a session-owned Chrome tab |
 | browser_route | browser_debugger | no | no | no | yes | tool_profile_set browser_debugger with reason, browser_content, browser_page_events |
-| browser_scroll_into_view | normal_agent | no | no | no | no | none - default-safe |
-| browser_screenshot | normal_agent | no | no | no | no | `captureVisibleTab` may focus the target Chrome window on Windows when Chrome refuses image readback for an unfocused window; read `required_foreground` |
-| browser_set_content | normal_agent | no | no | no | no | none - default-safe |
-| browser_set_value | normal_agent | no | no | no | no | none - default-safe |
+| browser_scroll_into_view | facade_only | no | yes | no | no | browser_dom operation=locate, act operation=invoke scroll |
+| browser_screenshot | facade_only | no | yes | no | no | browser_capture operation=screenshot; read `required_foreground` if Chrome requires focus |
+| browser_set_content | facade_only | no | yes | no | no | browser_debugger operation=evaluate after profile=browser_debugger |
+| browser_set_value | facade_only | no | yes | no | no | browser_form operation=set_value |
 | browser_storage | normal_agent | no | no | no | no | none - default-safe |
 | browser_tabs | normal_agent | no | no | no | no | none - default-safe |
-| browser_wait_for | normal_agent | no | no | no | no | none - default-safe |
-| capture_gif | normal_agent | no | no | no | no | none - default-safe |
-| capture_screenshot | normal_agent | no | no | no | no | none - default-safe |
-| cdp_activate_tab | normal_agent | no | no | no | no | none - default-safe |
-| cdp_bridge_reload | normal_agent | no | no | no | no | none - default-safe |
-| cdp_close_tab | normal_agent | no | no | no | no | none - default-safe |
-| cdp_navigate_tab | normal_agent | no | no | no | no | none - default-safe |
-| cdp_open_tab | normal_agent | no | no | no | no | none - default-safe |
-| cdp_target_info | normal_agent | no | no | no | no | none - default-safe |
-| clear_target | normal_agent | no | no | no | no | none - default-safe |
-| control_lease_acquire | normal_agent | no | no | no | no | none - default-safe |
-| control_lease_handoff | normal_agent | no | no | no | no | none - default-safe |
-| control_lease_release | normal_agent | no | no | no | no | none - default-safe |
-| control_lease_status | normal_agent | no | no | no | no | none - default-safe |
-| demo_record_start | normal_agent | no | no | no | no | profile_authoring_generate with existing replay_path |
-| demo_record_stop | normal_agent | no | no | no | no | profile_authoring_generate with existing replay_path |
+| browser_wait | normal_agent | no | no | no | no | none - default-safe |
+| browser_wait_for | facade_only | no | yes | no | no | browser_wait operation=for_condition |
+| capture_gif | facade_only | no | yes | no | no | screenshot operation=gif |
+| capture_screenshot | facade_only | no | yes | no | no | screenshot operation=capture, browser_capture operation=screenshot |
+| cdp_activate_tab | facade_only | no | yes | no | no | browser_tabs operation=select |
+| cdp_bridge_reload | facade_only | no | yes | no | no | browser_debugger operation=reload_bridge after profile=browser_debugger |
+| cdp_close_tab | facade_only | no | yes | no | no | browser_tabs operation=close |
+| cdp_navigate_tab | facade_only | no | yes | no | no | browser_nav operation=navigate/reload/back/forward |
+| cdp_open_tab | facade_only | no | yes | no | no | browser_tabs operation=new |
+| cdp_target_info | facade_only | no | yes | no | no | browser_tabs operation=list, browser_dom operation=content |
+| clear_target | facade_only | no | yes | no | no | target operation=clear |
+| control_lease_acquire | facade_only | no | yes | no | no | act operation=foreground, target operation=claim |
+| control_lease_handoff | facade_only | no | yes | no | no | target operation=adopt |
+| control_lease_release | facade_only | no | yes | no | no | target operation=release |
+| control_lease_status | facade_only | no | yes | no | no | target operation=status |
+| demo_record_start | facade_only | no | yes | no | no | routine/replay/profile authoring facade with existing replay_path |
+| demo_record_stop | facade_only | no | yes | no | no | routine/replay/profile authoring facade with existing replay_path |
 | find | normal_agent | no | no | no | no | none - default-safe |
-| fleet_stop | normal_agent | no | no | no | no | none - default-safe |
-| get_target | normal_agent | no | no | no | no | none - default-safe |
+| fleet_stop | facade_only | no | yes | no | no | agent operation=interrupt/kill with explicit scope |
+| get_target | facade_only | no | yes | no | no | target operation=get |
 | hidden_desktop_pip_frame | break_glass | yes | yes | no | no | capture_screenshot |
 | observe | normal_agent | no | no | no | no | none - default-safe |
-| observe_delta | normal_agent | no | no | no | no | none - default-safe |
+| observe_delta | facade_only | no | yes | no | no | reality operation=delta |
 | read_text | normal_agent | no | no | no | no | none - default-safe |
-| reality_audit | normal_agent | no | no | no | no | none - default-safe |
-| reality_baseline | normal_agent | no | no | no | no | none - default-safe |
+| reality_audit | facade_only | no | yes | no | no | reality operation=audit |
+| reality_baseline | facade_only | no | yes | no | no | reality operation=baseline |
 | reflex_cancel | break_glass | yes | no | no | no | task tools, #1005 |
 | reflex_history | break_glass | yes | no | no | no | observe_delta |
 | reflex_list | break_glass | yes | no | no | no | observe_delta |
 | reflex_register | break_glass | yes | no | no | no | task tools, #1005 |
 | release_all | break_glass | yes | no | no | yes | control_lease_release |
-| session_list | normal_agent | no | no | no | no | none - default-safe |
-| session_status | normal_agent | no | no | no | no | none - default-safe |
-| set_capture_target | normal_agent | no | no | no | no | none - default-safe |
-| set_perception_mode | normal_agent | no | no | no | no | none - default-safe |
-| set_target | normal_agent | no | no | no | no | none - default-safe |
+| session_list | facade_only | no | yes | no | no | session operation=list |
+| session_status | facade_only | no | yes | no | no | session operation=list/status readback |
+| set_capture_target | facade_only | no | yes | no | no | observe/screenshot with explicit target, setup facade for capture config |
+| set_perception_mode | facade_only | no | yes | no | no | observe operation=current, setup facade for perception config |
+| set_target | facade_only | no | yes | no | no | target operation=set |
 | subscribe | normal_agent | no | no | no | no | observe_delta |
-| subscribe_cancel | normal_agent | no | no | no | no | observe_delta |
-| target_act | normal_agent | no | no | no | no | none - default-safe |
-| target_claim | normal_agent | no | no | no | no | none - default-safe |
-| target_claim_adopt | normal_agent | no | no | no | no | none - default-safe |
-| target_claim_status | normal_agent | no | no | no | no | none - default-safe |
-| target_release | normal_agent | no | no | no | no | none - default-safe |
-| tool_profile_set | normal_agent | no | no | no | no | none - default-safe |
-| tool_profile_status | normal_agent | no | no | no | no | none - default-safe |
-| verification_audit | normal_agent | no | no | no | no | none - default-safe |
-| verification_bind | normal_agent | no | no | no | no | none - default-safe |
-| verification_inbox | normal_agent | no | no | no | no | none - default-safe |
-| verification_poll | normal_agent | no | no | no | no | none - default-safe |
-| verification_sources | normal_agent | no | no | no | no | none - default-safe |
-| window_list | normal_agent | no | no | no | no | none - default-safe |
-| workspace_get | normal_agent | no | no | no | no | none - default-safe |
-| workspace_list | normal_agent | no | no | no | no | none - default-safe |
-| workspace_put | normal_agent | no | no | no | no | none - default-safe |
-| workspace_subscribe | normal_agent | no | no | no | no | none - default-safe |
+| subscribe_cancel | facade_only | no | yes | no | no | subscribe operation=events cancellation route |
+| target_act | facade_only | no | yes | no | no | act operation=invoke |
+| target_claim | facade_only | no | yes | no | no | target operation=claim |
+| target_claim_adopt | facade_only | no | yes | no | no | target operation=adopt |
+| target_claim_status | facade_only | no | yes | no | no | target operation=status |
+| target_release | facade_only | no | yes | no | no | target operation=release |
+| tool_profile_set | facade_only | no | yes | no | no | profile operation=set |
+| tool_profile_status | facade_only | no | yes | no | no | profile operation=status |
+| verification_audit | facade_only | no | yes | no | no | verification operation=audit |
+| verification_bind | facade_only | no | yes | no | no | verification operation=bind |
+| verification_inbox | facade_only | no | yes | no | no | verification operation=inbox |
+| verification_poll | facade_only | no | yes | no | no | verification operation=poll |
+| verification_sources | facade_only | no | yes | no | no | verification operation=sources |
+| window_list | facade_only | no | yes | no | no | target operation=list |
+| workspace_get | facade_only | no | yes | no | no | workspace operation=get |
+| workspace_list | facade_only | no | yes | no | no | workspace operation=list |
+| workspace_put | facade_only | no | yes | no | no | workspace operation=put |
+| workspace_subscribe | facade_only | no | yes | no | no | workspace operation=subscribe |
 
 Research basis:
 
@@ -224,10 +231,13 @@ Research basis:
 | browser_aria_snapshot | browser readback | active session CDP target or CDP target owned by this MCP session | raw CDP Accessibility.getFullAXTree builds a stable Playwright-style role/name/value snapshot for the page or a CDP element subtree, with structured node entries and page state readback | read-only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1193 #1192 #1063 | YAML-like snapshot, structured AX-backed nodes, subtree root echo, node counts/truncation, URL/title/readyState readback, and CF_ACTION_LOG |
 | browser_assert | browser readback | active session CDP target or CDP target owned by this MCP session | raw CDP locator resolution plus Runtime.callFunctionOn polls Playwright-style assertions for visible/text/value/checked/enabled/attribute/count until pass or timeout, returning pass/fail with actual vs expected diagnostics | read-only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1194 #1195 #1192 #1063 | matcher/locator echo, pass/timed_out, elapsed/poll count, actual vs expected, element id/count, URL/title/readyState readback, and CF_ACTION_LOG |
 | browser_batch | browser orchestration | active session normal Chrome bridge target or same-session-owned `chrome-tab:*` target bound via set_target | ordered dispatch of each step to its standalone tool's exact code path (navigate→cdp_navigate_tab, wait_for_selector/url/load_state→the matching browser_wait_for condition lane, set_value→browser_set_value, fill_form→browser_fill_form, file_upload→browser_file_upload, scroll_into_view→browser_scroll_into_view, evaluate→browser_evaluate, screenshot→browser_screenshot, click→target_act verb=click); pure orchestration, no new action semantics | inherits each delegated sub-action's lease policy; the orchestrator itself takes no foreground lease and adds no tab activation; sub-actions refuse unowned/non-active targets | foreground-capable-targeted | #1337 #1365 | per-step result array {index, action, status (ok/error/skipped), ok, result-or-error}, stop_on_error stopped_at_index, steps_run/steps_succeeded counts, and CF_ACTION_LOG |
+| browser_capture | browser facade/output | active session normal Chrome bridge target, same-session-owned `chrome-tab:*` target, or Chrome downloads profile | stable public facade routes operation=screenshot to browser_screenshot and operation=downloads to browser_downloads with exactly one nested spec; it adds no independent action semantics | inherits delegated operation policy; no OS foreground lease by default, while screenshot reports `required_foreground` if Chrome requires window focus for `captureVisibleTab`; downloads uses Chrome downloads rows/events without tab activation | foreground-capable-targeted | #1383 #1447 | browser_capture operation/readback_source_of_truth, screenshot file bytes/hash or downloads rows/events/saved file bytes/hash, target/window readback, and CF_ACTION_LOG |
 | browser_clock | browser action/readback | active session CDP target or CDP target owned by this MCP session | raw CDP Page.addScriptToEvaluateOnNewDocument installs a target-scoped fake clock shim for current/future documents, then Runtime.evaluate controls Date, setTimeout/setInterval, and requestAnimationFrame with install/set_fixed_time/fast_forward/pause_at/status operations | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1198 #1201 #1197 #1063 | init-script identifier, clock state readback, timer counters, next timer cursor, browser_evaluate cross-check, and CF_ACTION_LOG |
 | browser_console_messages | browser readback | active session CDP target or CDP target owned by this MCP session | raw CDP: a persistent per-target listener enables Runtime + Log and buffers Runtime.consoleAPICalled, Runtime.exceptionThrown (uncaught throws + unhandled rejections, distinguished by source), and Log.entryAdded into a bounded ring buffer; reads filter by level/source/text and cursor (since_seq); the popup-safe normal Chrome extension bridge fails closed because it never attaches the debugger | read-only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1094 #1092 #1093 #1091 #1063 | captured console/page-error entries (level, structured args, stack, url:line:col) plus next_cursor/dropped and url/title readback and CF_ACTION_LOG |
 | browser_cookies | browser action/readback | active session chrome-bridge tab owned by this MCP session | normal Chrome extension bridge uses `chrome.cookies` to get, set, or clear cookies for the owned tab URL/filter while preserving Chrome-exposed domain/path/expires/httpOnly/secure/sameSite attributes; no debugger attach, nativeMessaging, tab activation, or OS foreground input | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1152 #1151 #1150 #1063 | chrome.cookies get/set/remove readback, affected-cookie counts, verification cookie for set, and CF_ACTION_LOG |
 | browser_content | browser readback | active session CDP target or chrome-bridge tab owned by this MCP session | raw CDP Runtime.evaluate or the debugger-free normal Chrome bridge pageContent helper reads document.documentElement.outerHTML (truncated in-page to max_bytes) with separate URL/title/readyState readback | read-only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1158 #1157 #1063 | serialized HTML plus html_len/truncated and url/title readback and CF_ACTION_LOG |
+| browser_debugger | browser facade/control | current MCP session profile row plus operation-specific owned browser target | stable public facade dispatches to profile-gated raw-CDP/`chrome.debugger` operations; normal_agent calls fail closed before internal delegation | no foreground lease; requires profile=browser_debugger or broader admin profile before advanced operation dispatch | control | #1318 #1445 | CF_SESSIONS policy row, facade error/response readback, bridge/target readback for delegated operation, and CF_ACTION_LOG |
+| browser_dom | browser facade/readback | active session CDP target or chrome-bridge tab owned by this MCP session | stable public facade routes content, locate, inspect, and aria_snapshot to their target-scoped DOM/ARIA readback tools with exactly one nested spec | read-only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1318 #1447 | browser_dom operation echo, delegated HTML/locator/element/ARIA readback, URL/title/readyState or element target readback, and CF_ACTION_LOG |
 | browser_downloads | browser download readback/output | already-open normal Chrome bridge profile resolved from active session target, explicit Chromium HWND, or explicit foreground Chromium discovery | normal Chrome bridge `chrome.downloads` captures created/changed/erased events, lists profile downloads, waits for complete/interrupted states, and the daemon saves/moves completed files to caller paths with metadata/SHA-256 readback | no foreground lease, no tab activation, no debugger attach, no helper profile, no nativeMessaging; save/move refuses non-complete rows and raw-CDP automation windows | background-pass | #1106 #1107 #1108 #1109 | download id/state/URL/suggested filename/local filename, event cursor, timed_out/elapsed readback, saved path/bytes/SHA-256, and CF_ACTION_LOG |
 | browser_drag | browser action/readback | active session chrome-bridge tab owned by this MCP session | normal Chrome bridge cdpInput drag resolves strict source/target selectors and dispatches target-scoped mouse drag; active tabs use chrome.debugger Input.dispatchMouseEvent and inactive tabs use strict chrome.scripting MouseEvent fallback | no foreground lease, no OS input, no implicit foreground tab fallback, refuses raw-CDP/non-chrome-tab targets, strict selector/actionability errors are loud | background-pass | #1144 #1143 #1063 | bridge result, source/target selector readback, dispatched event count, backend method, cdp fallback detail, before/after page text, and CF_ACTION_LOG |
 | browser_drop | browser action/readback | active session chrome-bridge tab owned by this MCP session | normal Chrome bridge dispatches HTML5 DragEvent dragstart/dragenter/dragover/drop/dragend with real DataTransfer payload by default; can use the same mouse-drag route as browser_drag when mode=mouse | no foreground lease, no OS input, no implicit foreground tab fallback, refuses raw-CDP/non-chrome-tab targets, strict selector/actionability errors are loud | background-pass | #1145 #1146 #1143 #1063 | bridge result, source/target selector readback, DataTransfer payload readback, dispatched events, backend method, before/after page text, and CF_ACTION_LOG |
@@ -237,8 +247,10 @@ Research basis:
 | browser_frames | browser readback | active session CDP target or CDP target owned by this MCP session | raw CDP Page.getFrameTree plus DOM.getDocument frame-owner nodes and Target.getTargets iframe metadata enumerate same-origin and OOPIF frame documents with stable frame ids, parent ids, target ids, URLs, names, origins, tree depth, sibling order, and owning iframe/frame element ids when Chromium exposes DOM.Node.frameId; the normal Chrome bridge supports chrome-tab:* targets through debugger-free chrome.webNavigation.getAllFrames plus optional chrome.scripting frame metadata, with frame owner element ids unavailable | read-only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets, normal bridge never calls chrome.debugger | background-pass | #1183 #1182 #1180 #1063 | frame entries, target/adopt payloads, raw-CDP frame_element_id/backend ids when available, OOPIF counts when visible, blocked frame targets, frame snapshot errors, source_of_truth, and CF_ACTION_LOG |
 | browser_handle_dialog | browser action/readback | active session CDP target or chrome-bridge tab owned by this MCP session | raw CDP or normal Chrome bridge target-scoped chrome.debugger Page.javascriptDialogOpening/Page.javascriptDialogClosed capture plus Page.handleJavaScriptDialog accepts or dismisses pending JavaScript dialogs with optional prompt text; status/set_policy arm target-scoped dialog capture and configure default accept/dismiss/manual behavior in the already-open authenticated profile | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets; accept/dismiss fail loud when no pending dialog exists | background-pass | #1099 #1098 #1097 #1096 #1063 | pending dialog message/type/defaultPrompt, history cursor/counts, default policy, manual/auto handle result, no-pending error code, URL/title/readyState readback, backend transport, and CF_ACTION_LOG |
 | browser_file_upload | browser action/readback | active session chrome-bridge tab owned by this MCP session | normal Chrome bridge target-scoped chrome.debugger DOM.setFileInputFiles sets or clears input[type=file] values by selector/element_id/active_element, and Page.setInterceptFileChooserDialog/Page.fileChooserOpened intercepts picker openings without showing an OS dialog before set_chooser assigns the pending backend node | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active chrome-tab targets; local paths are canonicalized and must exist before Chrome is called | background-pass | #1104 #1103 #1102 #1101 #1063 | input file count/names/sizes, pending/handled chooser entries, backendNodeId/mode, no-pending and missing-file errors, URL/title/readyState readback, backend transport, and CF_ACTION_LOG |
+| browser_form | browser facade/action | active session CDP target or chrome-bridge tab owned by this MCP session | stable public facade routes operation=set_value to dual-readback field replacement and operation=fill to ordered multi-field form fill with exactly one nested spec; field failures remain structured and loud | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1318 #1447 | browser_form operation echo, per-field browser_set_value/browser_fill_form readback, DOM value/property after-state, URL/title readback, and CF_ACTION_LOG |
 | browser_locate | browser readback | active session CDP target or CDP target owned by this MCP session | raw CDP DOM.querySelectorAll (CSS) or DOM.performSearch (XPath) then DOM.describeNode, with optional frame {frame_id/frame_element_id/name/url/index} scoping through browser_frames metadata and Page.createIsolatedWorld for same-target frames or direct OOPIF child target selection; the normal Chrome bridge resolves chrome-tab:* frame_id/name/url/index locators through chrome.webNavigation.getAllFrames plus chrome.scripting frame-targeted selector execution without chrome.debugger, while frame_element_id remains unresolved when owner ids are unavailable | read-only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets, normal bridge never calls chrome.debugger | background-pass | #1184 #1111 #1112 #1119 #1110 | resolved element ids, match_count, frame readback, bridge DOM-path element ids, and url/title readback and CF_ACTION_LOG |
 | browser_inspect | browser readback | element id embedded target owned by this MCP session | raw CDP Runtime.callFunctionOn or debugger-free normal Chrome bridge inspectElement returns tag/html/text/attributes/value/state(is_visible,is_enabled,is_checked,is_editable)/bounding_box in one round trip | read-only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1160 #1161 #1162 #1163 #1157 | typed element introspection payload plus url/title readback and CF_ACTION_LOG |
+| browser_nav | browser facade/action | active session CDP target or chrome-bridge tab owned by this MCP session | stable public facade routes navigate, reload, back, and forward to target-scoped Chrome bridge/CDP navigation commands with URL/readiness readback | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets and validates URL/timeout inputs before navigation | background-pass | #1381 #1447 | browser_nav operation/readback_source_of_truth, final page URL/title/readyState, navigation backend metadata, and CF_ACTION_LOG |
 | browser_network | browser readback | active session CDP target or CDP target owned by this MCP session | unified captured-network read (#1348) selected by `mode`: requests (filtered request-record list with since-cursor delta plus url substring/regex, resource-type, and HTTP status-range filters), request (one request by CDP request_id with full request/response metadata, optional post data, and a base64-aware response body), websockets (Network.webSocketCreated/handshake/frame sent/received/error/closed events with close code/reason decoded from opcode 8 close frames); all modes read the same target-scoped raw CDP Network buffer; the popup-safe normal Chrome extension bridge fails closed because it has no raw CDP endpoint | read-only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1348 #1081 #1082 #1089 #1080 #1079 #1063 | mode discriminator plus the matching read's full result (capture_newly_armed, next_cursor, returned/total/dropped counts, filter echo, request/response/websocket details, base64 body flag), and CF_ACTION_LOG |
 | browser_network_har | browser action/readback | active session CDP target or CDP target owned by this MCP session | raw CDP Network buffer serializes HAR 1.2 entries with retained response bodies when available; HAR replay reads a local HAR and installs exact method+URL Fetch.fulfillRequest routes with explicit passthrough or abort missing-entry policy | read/write local HAR file and Fetch route mutation only; no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1088 #1079 #1063 | HAR file bytes/entry counts, replay route ids/counts, missing policy, Fetch counters, and CF_ACTION_LOG |
 | browser_network_overrides | browser action/readback | active session CDP target or CDP target owned by this MCP session | raw CDP Network.setExtraHTTPHeaders and Emulation.setUserAgentOverride maintain target-scoped persistent extra request headers and User-Agent overrides; set/get/clear expose the override registry without using the normal Chrome bridge | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets; clear restores the captured original User-Agent when available and empties extra headers | background-pass | #1087 #1079 #1063 | header count and echo, active flag, captured original User-Agent, applied timestamps, newly_armed/cleared status, and CF_ACTION_LOG |
@@ -252,6 +264,7 @@ Research basis:
 | browser_set_value | browser action | active session CDP target or chrome-bridge tab owned by this MCP session | normal Chrome extension bridge chrome.scripting.executeScript in-page field REPLACE: resolves a strict CSS selector (exactly one editable+visible match) or the active element, then replaces the value with the native prototype value setter (React/Vue/Angular-safe) plus beforeinput/input/change; no debugger attach, no OS foreground, no tab activation; works on inactive/occluded tabs UIA cannot perceive; dual verify (in-page post-set value and a separate chrome.tabs active-element readback) | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1000 #994 #1005 #717 | in-page post-set value and separate chrome.tabs active-element readback plus CF_ACTION_LOG |
 | browser_storage | browser action/readback | active session chrome-bridge tab owned by this MCP session | normal Chrome extension bridge uses typed `chrome.scripting` storage commands for current-origin localStorage/sessionStorage plus `chrome.cookies` to save/load Playwright-style storageState cookies and per-origin localStorage; no arbitrary browser_evaluate, debugger attach, nativeMessaging, tab activation, or OS foreground input | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets | background-pass | #1153 #1154 #1155 #1156 #1150 #1063 | local/session storage item readback, storageState cookies/origins blob, load-state applied counts, and CF_ACTION_LOG |
 | browser_tabs | browser action/readback | list/select use an active session target window, explicit Chromium HWND, or explicit discovery against the current human OS foreground Chromium window when no session target is set; new/close require an active session target or explicit Chromium HWND | normal Chrome bridge `chrome.tabs.query` enumerates tabs and returns ready-to-pass `set_target` payloads; operation=select binds a listed tab as the session target, operation=new opens a background tab through `cdp_open_tab`, and operation=close closes only a same-session-owned tab through `cdp_close_tab` ownership checks | no foreground lease, no debugger attach, no implicit foreground mutation target; the human OS foreground window is used only as an explicit discovery source for list/select and is reported in readback | foreground-capable-targeted | #1188 #1298 #717 | tab list, operation, mutation previous/current target, selected/opened/closed target id, active_tab_count, chrome_window readback, used_human_os_foreground_window flag, source_of_truth, and CF_ACTION_LOG |
+| browser_wait | browser facade/readback | active session CDP target or chrome-bridge tab owned by this MCP session | stable public facade routes operation=for_condition to the unified browser_wait_for condition lane with declared nested condition and bounded timeout | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets and reports `BROWSER_WAIT_TIMEOUT` for unmet conditions | background-pass | #1348 #1447 | browser_wait operation/readback_source_of_truth, elapsed_ms/poll_count, condition-specific URL/DOM/load-state readback, timeout code, and CF_ACTION_LOG |
 | browser_wait_for | browser action/readback | active session CDP target or chrome-bridge tab owned by this MCP session | unified wait tool (#1348) selected by `condition` with the matching nested spec, dispatched to the same per-condition lanes the seven former browser_wait_for_* tools used: text (page-text appear/gone or plain timeout), load_state (domcontentloaded/load/networkidle), url (exact/glob/regex match), selector (browser_locate engine attached/visible/hidden/detached, returns element_id), function (JavaScript predicate poll → JSON-safe value), request/response (captured network match on url/method/status/resource_type). raw CDP when available or the debugger-free normal Chrome bridge for chrome-tab:* targets; condition misses return `BROWSER_WAIT_TIMEOUT` | no foreground lease, no tab activation, no implicit foreground tab fallback, refuses unowned/non-active targets, normal bridge never calls chrome.debugger | background-pass | #1348 #1127 #1128 #1129 #1130 #1131 #1132 #1126 #1110 #1080 #1079 #1063 | condition discriminator + the matching predicate's full result (elapsed_ms, poll_count, per-condition metadata, URL/title/readyState readback, optional element_id/value/matched network entry), timeout error code, and CF_ACTION_LOG |
 | capture_gif | perception/output | session bound window target, explicit `window_hwnd`, or the browser window behind a CDP tab target | passive per-window WGC frame loop over duration_ms at interval_ms (BGRA→RGBA, aspect-preserving downscale to max_long_edge), then animated-GIF encode via the image crate to an absolute .gif path; WGC captures occluded/background windows so no foreground is needed | no foreground lease, no tab activation, no implicit foreground fallback; single synchronous call with no recording state machine | background-pass | #1339 | output GIF file bytes and decoded frame count, frames_captured vs frames_requested (no silent drops), native/output dims, and capture_backend |
 | capture_screenshot | perception | explicit `window_hwnd`, session target window, active session raw CDP target, current foreground window, or absolute screen region | passive per-window WGC `CreateForWindow` for target/window captures; exact owned raw CDP tab screenshots use Page.captureScreenshot; the normal authenticated Chrome bridge refuses debugger-backed `capturePageScreenshot` before queueing any Chrome command because the Chrome debugger infobar changes viewport/layout and breaks coordinate truth; use `browser_screenshot` for normal-profile page/full-page/element/clip/mask screenshots; `PrintWindow` is disabled because it re-enters target `WM_PRINT`/`WM_PRINTCLIENT`; legacy GDI screen region only when no target is set | no foreground lease for session targets; target/window regions are client-relative; normal bridge screenshot refusal is explicit and popup-free | foreground-capable-targeted | #789 #1202 #1218 #1249 #1166 #1167 #1168 #1169 | image file metadata, bitmap hash, capture_backend/error_code, target/window readback, and CF_ACTION_LOG |
@@ -294,7 +307,7 @@ Research basis:
 | target_claim_adopt | target control | live target claim owner read from target_claim_status/session_list plus current MCP session identity | explicit same-agent recovery: old owner must be older, same client identity, no in-flight tool, and no input lease; then session lifecycle teardown terminates old owner before new claim generation is written | no foreground lease; fails closed with TARGET_CLAIM_ADOPT_REFUSED or TARGET_CLAIM_OWNER_ACTIVE | control | #813 #797 #801 | target_claim_status/session_list before and after, owner teardown report, terminated-session rejection, and denied active/different-agent edge readbacks |
 | target_claim_status | target control | target ownership registry | read-only target claim registry read | no foreground lease | control | #797 | target_claim_status response and session_list target_claims |
 | target_release | target control | current MCP session active target or explicit window/CDP target | daemon-local target ownership registry mutation scoped to the owner session | no foreground lease | control | #797 | target_claim_status/session_list before and after |
-| tool_profile_set | session control | current MCP session id plus requested profile | durable CF_SESSIONS profile assignment controls the session-filtered tools/list surface; normal/browser_control expose debugger-free already-open Chrome routes; browser_debugger exposes browser-only raw-CDP/`chrome.debugger` tools with confirm + reason; break_glass exposes the full raw surface only with confirm, reason, and owned foreground input lease | no real foreground lease for normal_agent, browser_control, or browser_debugger; break_glass transition requires foreground input lease proof | control | #1219 #1318 | CF_SESSIONS mcp/tool-profile row, health/tools-list names, and CF_ACTION_LOG profile_set rows |
+| tool_profile_set | session control | current MCP session id plus requested profile | durable CF_SESSIONS profile assignment controls the session-filtered tools/list surface; normal/browser_control expose debugger-free already-open Chrome routes plus the stable `browser_debugger` facade; browser_debugger exposes browser-only raw-CDP/`chrome.debugger` tools and allows facade operations with confirm + reason; break_glass exposes the full raw surface only with confirm, reason, and owned foreground input lease | no real foreground lease for normal_agent, browser_control, or browser_debugger; break_glass transition requires foreground input lease proof | control | #1219 #1318 #1445 | CF_SESSIONS mcp/tool-profile row, health/tools-list names, and CF_ACTION_LOG profile_set rows |
 | tool_profile_status | session control | current MCP session id | reads durable session profile row, visible tools/list names, foreground_capability policy, and hidden_tool_routes for raw OS primitives plus browser raw-CDP/`chrome.debugger` instrumentation routes | no foreground lease | control | #1219 #1318 | CF_SESSIONS mcp/tool-profile row plus visible_tool_names/count/hash, foreground_capability, and hidden_tool_routes readback |
 | verification_audit | readback | none (reads the daemon CF_KV verification/audit/v1 journal) | scans the CF_KV verification audit prefix and returns recent rows newest-first | read-only; no foreground lease, no target, no browser access | sessionless | #1345 | CF_KV verification/audit/v1 rows (source, url/title, masked codes, count, read timestamp, consuming session) |
 | verification_bind | config | none (writes CF_KV verification/binding/v1) | stores source->{cdp_target_id, window_hwnd, enabled, sender_allowlist} so verification_inbox/poll auto-resolve a source to its logged-in tab; flush for read-after-write | read/write CF_KV config only; no foreground lease, no browser access | sessionless | #1345 | CF_KV verification/binding/v1 row (cf_key) + echoed binding |
