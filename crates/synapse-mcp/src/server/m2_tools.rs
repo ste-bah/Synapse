@@ -3768,7 +3768,10 @@ impl SynapseService {
             if elapsed >= timeout {
                 break;
             }
-            tokio::time::sleep(std::cmp::min(poll_interval, timeout - elapsed)).await;
+            let Some(remaining) = timeout.checked_sub(elapsed) else {
+                break;
+            };
+            tokio::time::sleep(std::cmp::min(poll_interval, remaining)).await;
 
             let after = self
                 .capture_act_type_text_signature(

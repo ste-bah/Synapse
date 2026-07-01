@@ -5689,7 +5689,9 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
 
     #[test]
     fn local_agent_timeout_budget_excludes_approval_wait() {
-        let started = Instant::now() - Duration::from_millis(240_000);
+        let started = Instant::now()
+            .checked_sub(Duration::from_millis(240_000))
+            .expect("test duration must fit within Instant range");
         let active = local_agent_active_elapsed(started, Duration::from_millis(180_000));
         assert!(active < Duration::from_millis(90_000), "{active:?}");
 
