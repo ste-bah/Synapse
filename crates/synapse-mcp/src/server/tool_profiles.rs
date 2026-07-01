@@ -803,6 +803,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "switch to browser_debugger and read the target console buffer",
             ),
             op(
+                "reload_bridge",
+                true,
+                false,
+                "browser_debugger profile row + chrome.runtime.reload bridge command",
+                Some("bridge host before/after registration readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify the bridge host reconnect readback",
+            ),
+            op(
                 "pdf",
                 true,
                 true,
@@ -2097,6 +2106,7 @@ const NORMAL_ALLOWED_EXACT: &[&str] = &[
     "browser_wait",
     "browser_capture",
     "browser_storage",
+    "browser_debugger",
     "workspace",
     "agent",
     "task",
@@ -3566,12 +3576,14 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
         | "browser_network_overrides"
         | "browser_route" => vec![
             "profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why raw CDP is required>",
+            "browser_debugger operation=<matching operation>",
             "browser_dom operation=locate",
             "browser_wait operation=for_condition",
             "browser_storage operation=read",
         ],
         tool if BROWSER_DEBUGGER_ONLY_EXACT.contains(&tool) => vec![
             "profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why chrome.debugger is required>",
+            "browser_debugger operation=<matching operation>",
             "browser_tabs operation=list",
             "browser_dom operation=locate",
             "act operation=invoke",
@@ -4913,6 +4925,7 @@ mod tests {
                 "browser_wait",
                 "browser_capture",
                 "browser_storage",
+                "browser_debugger",
                 "workspace",
                 "agent",
                 "task",
@@ -4999,7 +5012,7 @@ mod tests {
         assert!(!visible.contains(&"act_click".to_owned()));
         assert!(!visible.contains(&"act_type".to_owned()));
         assert!(!visible.contains(&"release_all".to_owned()));
-        assert!(!visible.contains(&"browser_debugger".to_owned()));
+        assert!(visible.contains(&"browser_debugger".to_owned()));
         assert_debugger_only_hidden(&visible);
 
         let policy = foreground_capability_policy(ToolProfileKind::NormalAgent);
@@ -5048,6 +5061,11 @@ mod tests {
                 .preferred_tools
                 .iter()
                 .any(|tool| tool.contains("profile=browser_debugger"))
+        );
+        assert!(
+            browser_debugger_route
+                .preferred_tools
+                .contains(&"browser_debugger operation=<matching operation>".to_owned())
         );
         assert!(
             act_type_route
@@ -5231,9 +5249,7 @@ mod tests {
         );
         let registry =
             public_tool_registry_snapshot_for(&service.full_tool_names()).expect("registry");
-        let mut expected = registry.registered_tools_present.clone();
-        expected.retain(|name| name != "browser_debugger");
-        assert_eq!(tools, expected);
+        assert_eq!(tools, registry.registered_tools_present);
         assert!(tools.contains(&"health".to_owned()));
         assert!(tools.contains(&"profile".to_owned()));
         assert!(tools.contains(&"session".to_owned()));
@@ -5245,7 +5261,7 @@ mod tests {
         assert!(tools.contains(&"browser_wait".to_owned()));
         assert!(tools.contains(&"browser_capture".to_owned()));
         assert!(tools.contains(&"browser_storage".to_owned()));
-        assert!(!tools.contains(&"browser_debugger".to_owned()));
+        assert!(tools.contains(&"browser_debugger".to_owned()));
         assert!(tools.contains(&"shell".to_owned()));
         assert!(tools.contains(&"process".to_owned()));
         assert!(tools.contains(&"timeline".to_owned()));

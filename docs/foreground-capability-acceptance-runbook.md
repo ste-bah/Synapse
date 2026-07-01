@@ -141,12 +141,12 @@ Compare these `tools/list` profiles via real spawned agents / the wired client:
 | Profile | How to get it | Expected surface |
 |---|---|---|
 | raw/full legacy | `SYNAPSE_DEBUG_TOOLS=1 SYNAPSE_ENABLE_EVERQUEST=1` | full implementation surface (~177) |
-| normal capability-preserving | default `normal_agent` | visible count from `tool_profile_status`; no raw `act_*` foreground primitives and no raw-CDP/`chrome.debugger` browser instrumentation tools; `target_act`, debugger-free `browser_*`, `window_list`, `set_target`, legacy `cdp_*` tab-lifecycle wrappers, and route readbacks present |
+| normal capability-preserving | default `normal_agent` | visible count from `tool_profile_status`; no raw `act_*` foreground primitives and no raw-CDP/`chrome.debugger` browser instrumentation tools; `target_act`, debugger-free `browser_*`, stable `browser_debugger` facade, `window_list`, `set_target`, legacy `cdp_*` tab-lifecycle wrappers, and route readbacks present |
 | browser-control task | `tool_profile_set browser_control` | narrower; debugger-free browser/perception + target tools only |
-| browser-debugger task | `tool_profile_set browser_debugger` with confirm + reason | browser-only raw-CDP/`chrome.debugger` instrumentation visible; raw OS foreground, shell, and spawn surfaces stay hidden |
+| browser-debugger task | `tool_profile_set browser_debugger` with confirm + reason | browser-only raw-CDP/`chrome.debugger` instrumentation visible and stable `browser_debugger` facade operations admitted; raw OS foreground, shell, and spawn surfaces stay hidden |
 | break-glass/admin | lease + `tool_profile_set break_glass` | full raw surface incl. `act_*` |
 
-Codex/client compatibility note (#1261): some clients keep a static callable
+Codex/client compatibility note (#1261/#1445): some clients keep a static callable
 tool namespace even after the server sends `notifications/tools/list_changed`.
 For deliberate real-foreground activation, bind the exact window first with
 `window_list` -> `set_target` -> `target_claim`, acquire the foreground input
@@ -154,6 +154,11 @@ lease, set `profile=break_glass`, then call the already-visible
 `target_act {"verb":"focus_window"}` route. The route delegates to
 `act_focus_window` only after the profile gate passes and still uses the normal
 foreground lease plus `GetForegroundWindow` readback.
+For browser debugger work, use the already-visible `browser_debugger` facade
+after setting `profile=browser_debugger`; raw debugger implementation tools may
+still appear only for clients that refresh `tools/list`, but the stable facade is
+the Codex-safe route and fails closed with `TOOL_PROFILE_POLICY_DENIED` until
+the CF_SESSIONS profile row is updated.
 
 For each, give the same synthetic task with a known target/lane solution
 ("read the title of the LinkedIn tab", "type into the dashboard search box",
