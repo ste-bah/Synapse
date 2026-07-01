@@ -22,7 +22,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
@@ -115,6 +118,146 @@ pub struct ShellParams {
     #[serde(default)]
     #[schemars(range(min = 0, max = 1048576))]
     pub tail_bytes: Option<u64>,
+}
+
+fn shell_input_schema() -> Arc<Map<String, Value>> {
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["run", "start", "status", "cancel"],
+                "default": "run",
+                "description": "Shell facade operation. Omit only for the default run operation."
+            },
+            "command": {
+                "type": ["string", "null"],
+                "description": "Executable path/name only. Accepted by run/start."
+            },
+            "args": {
+                "type": ["array", "null"],
+                "items": { "type": "string" },
+                "description": "Literal executable arguments. Accepted by run/start."
+            },
+            "working_dir": {
+                "type": ["string", "null"],
+                "description": "Working directory for run/start."
+            },
+            "env": {
+                "type": ["object", "null"],
+                "additionalProperties": { "type": "string" },
+                "description": "Extra environment variables for run/start."
+            },
+            "timeout_ms": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "description": "run: caller inline wait budget. start: durable job lifetime cap. Omit start timeout for an unbounded durable job."
+            },
+            "execution_mode": {
+                "type": ["string", "null"],
+                "enum": ["auto", "inline", "durable", null],
+                "description": "run only. Controls inline vs durable/background routing."
+            },
+            "durable_timeout_ms": {
+                "type": ["integer", "null"],
+                "minimum": 1,
+                "description": "run only. Applies if run creates a durable/background job; start uses timeout_ms for its durable lifetime cap."
+            },
+            "idempotency_key": {
+                "type": ["string", "null"],
+                "description": "run only. Deduplicates/replays matching run requests."
+            },
+            "job_id": {
+                "type": ["string", "null"],
+                "minLength": 1,
+                "maxLength": 128,
+                "description": "start/status/cancel durable job id. Optional for start, required for status/cancel."
+            },
+            "tail_bytes": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "maximum": 1048576,
+                "description": "status only. Number of stdout/stderr tail bytes to read."
+            }
+        },
+        "oneOf": [
+            {
+                "title": "shell operation=run",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["command"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "run",
+                        "default": "run",
+                        "description": "Default shell operation."
+                    },
+                    "command": { "$ref": "#/properties/command" },
+                    "args": { "$ref": "#/properties/args" },
+                    "working_dir": { "$ref": "#/properties/working_dir" },
+                    "env": { "$ref": "#/properties/env" },
+                    "timeout_ms": { "$ref": "#/properties/timeout_ms" },
+                    "execution_mode": { "$ref": "#/properties/execution_mode" },
+                    "durable_timeout_ms": { "$ref": "#/properties/durable_timeout_ms" },
+                    "idempotency_key": { "$ref": "#/properties/idempotency_key" }
+                }
+            },
+            {
+                "title": "shell operation=start",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation", "command"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "start",
+                        "description": "Create a durable shell job immediately."
+                    },
+                    "command": { "$ref": "#/properties/command" },
+                    "args": { "$ref": "#/properties/args" },
+                    "working_dir": { "$ref": "#/properties/working_dir" },
+                    "env": { "$ref": "#/properties/env" },
+                    "timeout_ms": { "$ref": "#/properties/timeout_ms" },
+                    "job_id": { "$ref": "#/properties/job_id" }
+                }
+            },
+            {
+                "title": "shell operation=status",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation", "job_id"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "status",
+                        "description": "Read persisted durable shell job state."
+                    },
+                    "job_id": { "$ref": "#/properties/job_id" },
+                    "tail_bytes": { "$ref": "#/properties/tail_bytes" }
+                }
+            },
+            {
+                "title": "shell operation=cancel",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation", "job_id"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "cancel",
+                        "description": "Terminate an exact durable shell job."
+                    },
+                    "job_id": { "$ref": "#/properties/job_id" }
+                }
+            }
+        ]
+    });
+    match schema {
+        Value::Object(object) => Arc::new(object),
+        _ => Arc::new(Map::new()),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1196,7 +1339,8 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for shell execution. operation=run executes an allowlisted child process; start creates a durable shell job with artifact paths; status reads persisted job/output state; cancel terminates the exact durable job and returns before/after readback."
+        description = "Facade for shell execution. operation=run executes an allowlisted child process; start creates a durable shell job with artifact paths and uses timeout_ms as the durable lifetime cap; status reads persisted job/output state; cancel terminates the exact durable job and returns before/after readback. durable_timeout_ms, execution_mode, and idempotency_key are run-only fields and are invalid for start/status/cancel.",
+        input_schema = shell_input_schema()
     )]
     pub async fn shell(
         &self,
@@ -7247,11 +7391,91 @@ mod tests {
             .and_then(Value::as_str)
     }
 
+    fn sanitized_tool_input_schema(tool_name: &str) -> Value {
+        let tools = crate::server::schema_sanitize::sanitize_tools(
+            crate::server::SynapseService::tool_router().list_all(),
+        );
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} tool missing"));
+        Value::Object((*tool.input_schema).clone())
+    }
+
+    fn shell_schema_variant<'a>(schema: &'a Value, operation: &str) -> &'a Value {
+        schema["oneOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("shell schema oneOf missing"))
+            .iter()
+            .find(|variant| variant["properties"]["operation"]["const"] == operation)
+            .unwrap_or_else(|| panic!("shell schema operation={operation} variant missing"))
+    }
+
+    fn schema_property_names(schema: &Value) -> BTreeSet<String> {
+        schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("schema properties missing"))
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     #[test]
     fn shell_facade_rejects_unknown_operation_enum() {
         let error = serde_json::from_value::<ShellParams>(json!({"operation": "not_real"}))
             .expect_err("unknown shell operation must fail closed");
         assert!(error.to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn shell_facade_public_schema_is_operation_specific() {
+        let schema = sanitized_tool_input_schema("shell");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], Value::Bool(false));
+        assert_eq!(
+            schema["properties"]["durable_timeout_ms"]["description"],
+            "run only. Applies if run creates a durable/background job; start uses timeout_ms for its durable lifetime cap."
+        );
+
+        let variants = schema["oneOf"]
+            .as_array()
+            .expect("shell schema oneOf present");
+        assert_eq!(variants.len(), 4);
+        for variant in variants {
+            assert_eq!(variant["type"], "object");
+            assert_eq!(variant["additionalProperties"], Value::Bool(false));
+        }
+
+        let run_fields = schema_property_names(shell_schema_variant(&schema, "run"));
+        assert!(run_fields.contains("durable_timeout_ms"));
+        assert!(run_fields.contains("idempotency_key"));
+        assert!(run_fields.contains("execution_mode"));
+        assert!(!run_fields.contains("job_id"));
+        assert!(!run_fields.contains("tail_bytes"));
+
+        let start_fields = schema_property_names(shell_schema_variant(&schema, "start"));
+        assert!(start_fields.contains("timeout_ms"));
+        assert!(start_fields.contains("job_id"));
+        assert!(!start_fields.contains("durable_timeout_ms"));
+        assert!(!start_fields.contains("idempotency_key"));
+        assert!(!start_fields.contains("execution_mode"));
+        assert!(!start_fields.contains("tail_bytes"));
+
+        let status_fields = schema_property_names(shell_schema_variant(&schema, "status"));
+        assert_eq!(
+            status_fields,
+            BTreeSet::from([
+                "job_id".to_owned(),
+                "operation".to_owned(),
+                "tail_bytes".to_owned()
+            ])
+        );
+
+        let cancel_fields = schema_property_names(shell_schema_variant(&schema, "cancel"));
+        assert_eq!(
+            cancel_fields,
+            BTreeSet::from(["job_id".to_owned(), "operation".to_owned()])
+        );
     }
 
     #[test]
