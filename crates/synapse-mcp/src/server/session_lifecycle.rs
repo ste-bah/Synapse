@@ -8,7 +8,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use rmcp::{ErrorData, model::ErrorCode};
@@ -28,7 +28,7 @@ use crate::{
 };
 
 use super::{
-    CdpTargetOwner, SharedCdpTargetOwners, SharedSessionTargets, SynapseService,
+    CdpTargetOwner, SessionTarget, SharedCdpTargetOwners, SharedSessionTargets, SynapseService,
     session_registry::{SharedSessionRegistry, unix_time_ms_now},
     target_claims::{self, SharedTargetClaims, TargetClaimCleanupReport},
 };
@@ -37,6 +37,7 @@ const MCP_SESSION_STORE_PREFIX: &str = "mcp/session/v1/";
 const PROCESS_JOB_CLOSE_WAIT: Duration = Duration::from_secs(5);
 const ACT_SPAWN_AGENT_TOOL_NAME: &str = "act_spawn_agent";
 const AGENT_SPAWN_COMPLETION_GRACE: Duration = Duration::from_secs(30);
+const DAEMON_RESTART_BROWSER_CONTINUITY_GRACE: Duration = Duration::from_mins(30);
 pub(crate) const HTTP_STALE_REASON: &str = "http_stale";
 pub(crate) const SPAWN_COMPLETED_REASON: &str = "spawn_completed";
 pub(crate) const SPAWNED_AGENT_PROCESS_EXITED_REASON: &str = "spawned_agent_process_exited";
@@ -83,7 +84,7 @@ pub(crate) struct SessionProcessResource {
     pub desktop_lease: Option<m4::LaunchDesktopLease>,
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct SessionHiddenDesktopReadback {
     pub session_id: String,
@@ -92,9 +93,9 @@ pub(crate) struct SessionHiddenDesktopReadback {
     pub resource_count: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SessionCdpTargetOwnerReadback {
+pub struct SessionCdpTargetOwnerReadback {
     pub owner_key: String,
     pub session_id: String,
     pub window_hwnd: i64,
@@ -103,6 +104,35 @@ pub(crate) struct SessionCdpTargetOwnerReadback {
     pub requested_url: String,
     pub target_url: String,
     pub created_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SessionTargetShutdownReadback {
+    Window {
+        hwnd: i64,
+    },
+    Cdp {
+        window_hwnd: i64,
+        cdp_target_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SessionShutdownBrowserContinuityReport {
+    pub source_of_truth: String,
+    pub recovery_action: String,
+    pub restart_grace_remaining_ms: u64,
+    pub memory_target_before: Option<SessionTargetShutdownReadback>,
+    pub persisted_target_before: Option<SessionTargetShutdownReadback>,
+    pub memory_cdp_owner_count_before: usize,
+    pub persisted_cdp_owner_count_before: usize,
+    pub cdp_target_owners: Vec<SessionCdpTargetOwnerReadback>,
+    pub tab_close_attempted: bool,
+    pub tab_close_succeeded: bool,
+    pub failed: bool,
+    pub error_message: Option<String>,
 }
 
 impl SessionProcessResource {
@@ -143,6 +173,7 @@ impl SessionProcessResource {
 
 #[derive(Clone)]
 pub(crate) struct SessionLifecycleState {
+    started_at: Instant,
     action_handle: ActionHandle,
     m3_state: SharedM3State,
     session_targets: SharedSessionTargets,
@@ -213,6 +244,7 @@ pub struct SessionShutdownInputCleanupReport {
     pub session_id: String,
     pub reason: String,
     pub process_jobs: SessionProcessRestartHandoffReport,
+    pub browser_continuity: SessionShutdownBrowserContinuityReport,
     pub input: SessionInputCleanupReport,
     pub lease_row_existed_before: bool,
     pub lease_row_deleted: bool,
@@ -698,6 +730,7 @@ impl SessionTeardownReport {
 impl SynapseService {
     pub(crate) fn session_lifecycle_state(&self) -> Result<SessionLifecycleState, ErrorData> {
         Ok(SessionLifecycleState {
+            started_at: self.started_at,
             action_handle: self.unscoped_action_handle().map_err(|error| {
                 mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
@@ -956,6 +989,7 @@ impl SessionLifecycleState {
             report.error_message = Some(error.message.to_string());
             return report;
         }
+        report.browser_continuity = self.browser_continuity_for_daemon_shutdown(session_id);
         report.process_jobs =
             self.disarm_owned_process_jobs_for_daemon_shutdown(session_id, reason);
         report.input = self.cleanup_inputs_and_lease(session_id).await;
@@ -983,6 +1017,12 @@ impl SessionLifecycleState {
                     "{} owned process job(s) could not disarm kill-on-close before daemon shutdown",
                     report.process_jobs.failed
                 ));
+            }
+        }
+        if report.browser_continuity.failed {
+            report.failed = true;
+            if report.error_message.is_none() {
+                report.error_message = report.browser_continuity.error_message.clone();
             }
         }
         tracing::info!(
@@ -1173,6 +1213,9 @@ impl SessionLifecycleState {
         match super::session_continuity::persisted_session_target_session_ids(&self.m3_state) {
             Ok(session_ids) => {
                 for session_id in session_ids {
+                    if self.should_defer_restart_browser_stale_cleanup(&session_id) {
+                        continue;
+                    }
                     add_if_stale(&mut candidates, &live, &session_id, HTTP_STALE_REASON);
                 }
             }
@@ -1197,6 +1240,9 @@ impl SessionLifecycleState {
         match super::session_continuity::persisted_cdp_target_owner_session_ids(&self.m3_state) {
             Ok(session_ids) => {
                 for session_id in session_ids {
+                    if self.should_defer_restart_browser_stale_cleanup(&session_id) {
+                        continue;
+                    }
                     add_if_stale(&mut candidates, &live, &session_id, HTTP_STALE_REASON);
                 }
             }
@@ -1280,6 +1326,148 @@ impl SessionLifecycleState {
             );
         }
         live_spawn_sessions
+    }
+
+    fn browser_continuity_for_daemon_shutdown(
+        &self,
+        session_id: &str,
+    ) -> SessionShutdownBrowserContinuityReport {
+        let mut errors = Vec::new();
+        let memory_target = match self.session_targets.lock() {
+            Ok(targets) => targets
+                .get(session_id)
+                .map(session_target_shutdown_readback),
+            Err(_error) => {
+                errors.push("session target registry lock poisoned".to_owned());
+                None
+            }
+        };
+        let persisted_target =
+            match super::session_continuity::read_persisted_session_target_for_session(
+                &self.m3_state,
+                session_id,
+            ) {
+                Ok(target) => target.as_ref().map(session_target_shutdown_readback),
+                Err(error) => {
+                    errors.push(format!("read persisted session target failed: {error}"));
+                    None
+                }
+            };
+        let memory_owners = match self.memory_cdp_target_owner_readbacks_for_session(session_id) {
+            Ok(owners) => owners,
+            Err(error) => {
+                errors.push(error);
+                Vec::new()
+            }
+        };
+        let persisted_owners =
+            match persisted_cdp_target_owner_readbacks_for_session(&self.m3_state, session_id) {
+                Ok(owners) => owners,
+                Err(error) => {
+                    errors.push(format!(
+                        "read persisted CDP target owner rows failed: {error}"
+                    ));
+                    Vec::new()
+                }
+            };
+        let memory_cdp_owner_count_before = memory_owners.len();
+        let persisted_cdp_owner_count_before = persisted_owners.len();
+        let mut cdp_target_owners = Vec::with_capacity(
+            memory_cdp_owner_count_before.saturating_add(persisted_cdp_owner_count_before),
+        );
+        let mut seen = BTreeSet::new();
+        for owner in memory_owners.into_iter().chain(persisted_owners) {
+            if seen.insert(owner.owner_key.clone()) {
+                cdp_target_owners.push(owner);
+            }
+        }
+        let has_browser_continuity = matches!(
+            memory_target.as_ref().or(persisted_target.as_ref()),
+            Some(SessionTargetShutdownReadback::Cdp { .. })
+        ) || !cdp_target_owners.is_empty();
+        SessionShutdownBrowserContinuityReport {
+            source_of_truth: "in-memory session target/CDP owner registries + CF_SESSIONS persisted target/CDP owner rows".to_owned(),
+            recovery_action: if has_browser_continuity {
+                "daemon restart preserves browser target rows; create a new MCP session, inspect session_list/session_status(include_closed), then rebind/adopt the same already-open Chrome tab before retrying or proving completion".to_owned()
+            } else {
+                "no browser target or CDP owner row was present for this session at daemon shutdown".to_owned()
+            },
+            restart_grace_remaining_ms: self.restart_browser_continuity_grace_remaining_ms(),
+            memory_target_before: memory_target,
+            persisted_target_before: persisted_target,
+            memory_cdp_owner_count_before,
+            persisted_cdp_owner_count_before,
+            cdp_target_owners,
+            tab_close_attempted: false,
+            tab_close_succeeded: false,
+            failed: !errors.is_empty(),
+            error_message: (!errors.is_empty()).then(|| errors.join("; ")),
+        }
+    }
+
+    fn memory_cdp_target_owner_readbacks_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<SessionCdpTargetOwnerReadback>, String> {
+        let guard = self
+            .cdp_target_owners
+            .lock()
+            .map_err(|_error| "CDP target ownership registry lock poisoned".to_owned())?;
+        let mut owners = guard
+            .iter()
+            .filter_map(|(owner_key, owner)| {
+                (owner.session_id == session_id)
+                    .then(|| session_cdp_target_owner_readback(owner_key.clone(), owner.clone()))
+            })
+            .collect::<Vec<_>>();
+        owners.sort_by(|left, right| left.owner_key.cmp(&right.owner_key));
+        Ok(owners)
+    }
+
+    fn restart_browser_continuity_grace_remaining_ms(&self) -> u64 {
+        let elapsed = self.started_at.elapsed();
+        DAEMON_RESTART_BROWSER_CONTINUITY_GRACE
+            .checked_sub(elapsed)
+            .map(duration_millis_u64)
+            .unwrap_or(0)
+    }
+
+    fn daemon_restart_browser_continuity_grace_active(&self) -> bool {
+        self.restart_browser_continuity_grace_remaining_ms() > 0
+    }
+
+    fn should_defer_restart_browser_stale_cleanup(&self, session_id: &str) -> bool {
+        if !self.daemon_restart_browser_continuity_grace_active() {
+            return false;
+        }
+        match self.session_has_persisted_browser_continuity(session_id) {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(error) => {
+                tracing::error!(
+                    code = error_codes::STORAGE_CORRUPTED,
+                    session_id,
+                    detail = %error,
+                    "restart browser continuity deferral could not read persisted session rows"
+                );
+                false
+            }
+        }
+    }
+
+    fn session_has_persisted_browser_continuity(&self, session_id: &str) -> Result<bool, String> {
+        let target = super::session_continuity::read_persisted_session_target_for_session(
+            &self.m3_state,
+            session_id,
+        )?;
+        if matches!(target, Some(SessionTarget::Cdp { .. })) {
+            return Ok(true);
+        }
+        let owners = super::session_continuity::read_persisted_cdp_target_owners_for_session(
+            &self.m3_state,
+            session_id,
+        )?;
+        Ok(!owners.is_empty())
     }
 
     fn mark_terminated_session(&self, report: &mut SessionTeardownReport) {
@@ -2167,6 +2355,57 @@ fn spawned_agent_exit_reason(read: &super::session_registry::SessionRegistryRead
     }
 }
 
+fn session_target_shutdown_readback(target: &SessionTarget) -> SessionTargetShutdownReadback {
+    match target {
+        SessionTarget::Window { hwnd } => SessionTargetShutdownReadback::Window { hwnd: *hwnd },
+        SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        } => SessionTargetShutdownReadback::Cdp {
+            window_hwnd: *window_hwnd,
+            cdp_target_id: cdp_target_id.clone(),
+        },
+    }
+}
+
+fn session_cdp_target_owner_readback(
+    owner_key: String,
+    owner: CdpTargetOwner,
+) -> SessionCdpTargetOwnerReadback {
+    SessionCdpTargetOwnerReadback {
+        owner_key,
+        session_id: owner.session_id,
+        window_hwnd: owner.window_hwnd,
+        endpoint: owner.endpoint,
+        cdp_target_id: owner.cdp_target_id,
+        requested_url: owner.requested_url,
+        target_url: owner.target_url,
+        created_at_unix_ms: owner.created_at_unix_ms,
+    }
+}
+
+fn persisted_cdp_target_owner_readbacks_for_session(
+    m3_state: &SharedM3State,
+    session_id: &str,
+) -> Result<Vec<SessionCdpTargetOwnerReadback>, String> {
+    let mut owners = super::session_continuity::read_persisted_cdp_target_owners_for_session(
+        m3_state, session_id,
+    )?
+    .into_iter()
+    .map(|(owner_key, row)| {
+        let mut readback = session_cdp_target_owner_readback(owner_key, row.owner);
+        readback.session_id = row.owner_session_id;
+        readback
+    })
+    .collect::<Vec<_>>();
+    owners.sort_by(|left, right| left.owner_key.cmp(&right.owner_key));
+    Ok(owners)
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 fn reconciled_teardown_exit_reason(
     reason: &str,
     processes: &SessionProcessCleanupReport,
@@ -2259,11 +2498,40 @@ fn session_teardown_error(report: SessionTeardownReport) -> ErrorData {
 
 #[cfg(test)]
 mod tests {
-    use std::{process::Command, time::Duration};
+    use std::{
+        num::NonZeroUsize,
+        process::Command,
+        time::{Duration, Instant},
+    };
+
+    use tokio_util::sync::CancellationToken;
 
     use crate::server::session_registry::{SessionRegistryRead, SpawnedAgentRead};
+    use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
 
     use super::*;
+
+    fn service_with_temp_db(path: &Path) -> anyhow::Result<SynapseService> {
+        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(path.join("db")),
+                Some(path.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                NonZeroUsize::new(4).expect("nonzero"),
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
+    }
 
     fn spawned_read(
         session_id: &str,
@@ -2482,6 +2750,97 @@ mod tests {
             CdpCleanupCloseOutcome::EndpointUnreachable.as_str(),
             "endpoint_unreachable"
         );
+    }
+
+    #[test]
+    fn restart_grace_defers_persisted_browser_continuity_stale_candidate() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let service = service_with_temp_db(temp.path())?;
+        let session_id = "issue1443-restart-browser-session";
+        service.persist_session_target(
+            session_id,
+            &SessionTarget::Cdp {
+                window_hwnd: 0x1443,
+                cdp_target_id: "chrome-tab:1443".to_owned(),
+            },
+        )?;
+
+        let mut lifecycle = service.session_lifecycle_state()?;
+        let active_sessions = BTreeSet::new();
+        let candidates_during_grace = lifecycle.stale_session_candidates(&active_sessions);
+        assert!(
+            !candidates_during_grace.contains_key(session_id),
+            "persisted browser target must remain recoverable immediately after daemon restart"
+        );
+
+        lifecycle.started_at = Instant::now()
+            .checked_sub(DAEMON_RESTART_BROWSER_CONTINUITY_GRACE)
+            .and_then(|instant| instant.checked_sub(Duration::from_millis(1)))
+            .expect("restart grace test duration must fit in Instant range");
+        let candidates_after_grace = lifecycle.stale_session_candidates(&active_sessions);
+        assert_eq!(
+            candidates_after_grace.get(session_id),
+            Some(&HTTP_STALE_REASON),
+            "abandoned persisted browser target must become a normal cleanup candidate after grace"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn shutdown_browser_continuity_report_preserves_cdp_rows() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let service = service_with_temp_db(temp.path())?;
+        let session_id = "issue1443-shutdown-browser-session";
+        let target_id = "chrome-tab:shutdown-1443";
+        service.persist_session_target(
+            session_id,
+            &SessionTarget::Cdp {
+                window_hwnd: 0x1443,
+                cdp_target_id: target_id.to_owned(),
+            },
+        )?;
+        service
+            .session_targets_ref()
+            .lock()
+            .expect("session target lock")
+            .insert(
+                session_id.to_owned(),
+                SessionTarget::Cdp {
+                    window_hwnd: 0x1443,
+                    cdp_target_id: target_id.to_owned(),
+                },
+            );
+        service.register_cdp_target_owner(CdpTargetOwner {
+            session_id: session_id.to_owned(),
+            window_hwnd: 0x1443,
+            endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.tabs".to_owned(),
+            chrome_window_id: Some(1443),
+            capture_window_hwnd: None,
+            cdp_target_id: target_id.to_owned(),
+            requested_url: "https://example.invalid/issue1443".to_owned(),
+            target_url: "https://example.invalid/issue1443".to_owned(),
+            created_at_unix_ms: 1_443,
+        })?;
+
+        let lifecycle = service.session_lifecycle_state()?;
+        let report = lifecycle.browser_continuity_for_daemon_shutdown(session_id);
+
+        assert!(matches!(
+            report.memory_target_before,
+            Some(SessionTargetShutdownReadback::Cdp { .. })
+        ));
+        assert!(matches!(
+            report.persisted_target_before,
+            Some(SessionTargetShutdownReadback::Cdp { .. })
+        ));
+        assert_eq!(report.memory_cdp_owner_count_before, 1);
+        assert_eq!(report.persisted_cdp_owner_count_before, 1);
+        assert_eq!(report.cdp_target_owners.len(), 1);
+        assert!(!report.tab_close_attempted);
+        assert!(!report.tab_close_succeeded);
+        assert!(report.recovery_action.contains("rebind"));
+        assert!(!report.failed);
+        Ok(())
     }
 
     #[test]
