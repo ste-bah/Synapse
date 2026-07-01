@@ -766,6 +766,7 @@ pub struct ShellSessionCleanupReadback {
     pub status_files_read: usize,
     pub skipped_invalid_job_dirs: usize,
     pub skipped_unreadable_status_files: usize,
+    pub skipped_foreign_jobs: usize,
     pub live_jobs_before: usize,
     pub retained_live_jobs: usize,
     /// Durable jobs whose status still claimed live ("running"/"cancel_requested")
@@ -2606,6 +2607,7 @@ pub fn cleanup_shell_jobs_for_session(
             status_files_read: 0,
             skipped_invalid_job_dirs: 0,
             skipped_unreadable_status_files: 0,
+            skipped_foreign_jobs: 0,
             live_jobs_before: 0,
             retained_live_jobs: 0,
             reaped_phantom_jobs: 0,
@@ -2624,6 +2626,7 @@ pub fn cleanup_shell_jobs_for_session(
         status_files_read: 0,
         skipped_invalid_job_dirs: 0,
         skipped_unreadable_status_files: 0,
+        skipped_foreign_jobs: 0,
         live_jobs_before: 0,
         retained_live_jobs: 0,
         reaped_phantom_jobs: 0,
@@ -2710,7 +2713,8 @@ pub fn cleanup_shell_jobs_for_session(
             }
         };
         readback.status_files_read = readback.status_files_read.saturating_add(1);
-        if ensure_shell_job_session_owner(&job, Some(session_id)).is_err() {
+        if job.session_id.as_deref() != Some(session_id) {
+            readback.skipped_foreign_jobs = readback.skipped_foreign_jobs.saturating_add(1);
             continue;
         }
         if !shell_job_live_status(&job.status) {
@@ -2765,6 +2769,7 @@ pub fn cleanup_shell_jobs_for_session(
         status_files_read = readback.status_files_read,
         skipped_invalid_job_dirs = readback.skipped_invalid_job_dirs,
         skipped_unreadable_status_files = readback.skipped_unreadable_status_files,
+        skipped_foreign_jobs = readback.skipped_foreign_jobs,
         live_jobs_before = readback.live_jobs_before,
         retained_live_jobs = readback.retained_live_jobs,
         termination_attempted = readback.termination_attempted,
@@ -9057,29 +9062,6 @@ fn remote_aware_termination_status(
         }
         other => format!("{other}:remote_cleanup_unverified"),
     }
-}
-
-fn ensure_shell_job_session_owner(
-    job: &ActRunShellJobStatus,
-    requesting_session_id: Option<&str>,
-) -> Result<(), ErrorData> {
-    let Some(requesting_session_id) = requesting_session_id else {
-        return Ok(());
-    };
-    if job.session_id.as_deref() == Some(requesting_session_id) {
-        return Ok(());
-    }
-    Err(shell_tool_error(
-        error_codes::TOOL_PARAMS_INVALID,
-        "act_run_shell job is not owned by this MCP session",
-        json!({
-            "code": error_codes::TOOL_PARAMS_INVALID,
-            "job_id": job.job_id,
-            "requesting_session_id": requesting_session_id,
-            "owner_session_id": job.session_id.clone(),
-            "reason": "job_session_owner_mismatch",
-        }),
-    ))
 }
 
 fn shell_job_status_record(
@@ -15815,17 +15797,44 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         .unwrap_or_else(|error| panic!("durable cleanup shell should start: {error}"));
         let job_id = started.job.job_id.clone();
 
+        let foreign_session_label = format!("issue1461-cleanup-foreign-{}", uuid::Uuid::new_v4());
+        let foreign_context = shell_execution_context_for_session(&foreign_session_label)
+            .unwrap_or_else(|error| panic!("foreign shell context should build: {error}"));
+        let foreign_started = start_authorized_shell_job(
+            ActRunShellStartParams {
+                command: "powershell.exe".to_owned(),
+                args: vec![
+                    "-NoProfile".to_owned(),
+                    "-Command".to_owned(),
+                    "Start-Sleep -Milliseconds 5000".to_owned(),
+                ],
+                working_dir: None,
+                env: BTreeMap::new(),
+                timeout_ms: Some(30_000),
+                job_id: None,
+            },
+            &authorization,
+            Some(&foreign_context),
+        )
+        .unwrap_or_else(|error| panic!("foreign durable cleanup shell should start: {error}"));
+        let foreign_job_id = foreign_started.job.job_id.clone();
+
         let cleanup = cleanup_shell_jobs_for_session(context.session_id(), "regression_stale")
             .unwrap_or_else(|error| panic!("session cleanup readback should succeed: {error}"));
         println!("readback=act_run_shell_session_cleanup edge=retain after={cleanup:?}");
         assert_eq!(cleanup.live_jobs_before, 1);
         assert_eq!(cleanup.retained_live_jobs, 1);
+        assert!(
+            cleanup.skipped_foreign_jobs >= 1,
+            "cleanup should count the synthetic foreign job: {cleanup:?}"
+        );
         // The only durable job under this unique session is genuinely alive, so
         // nothing should be reaped as a phantom (#1334).
         assert_eq!(cleanup.reaped_phantom_jobs, 0);
         assert_eq!(cleanup.termination_attempted, 0);
         assert_eq!(cleanup.failed, 0);
         assert!(cleanup.job_ids.contains(&job_id));
+        assert!(!cleanup.job_ids.contains(&foreign_job_id));
 
         let retained = shell_job_status(
             &ActRunShellStatusParams {
@@ -15852,6 +15861,19 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         println!("readback=act_run_shell_cancel edge=retained_cleanup after={cancelled:?}");
         assert!(matches!(
             cancelled.status.job.status.as_str(),
+            "cancelled" | "timed_out" | "exited_unobserved"
+        ));
+
+        let foreign_cancelled = cancel_shell_job(
+            &ActRunShellJobIdParams {
+                job_id: foreign_job_id.clone(),
+            },
+            Some(foreign_context.session_id()),
+        )
+        .unwrap_or_else(|error| panic!("foreign owner should cancel retained job: {error}"));
+        println!("readback=act_run_shell_cancel edge=foreign_cleanup after={foreign_cancelled:?}");
+        assert!(matches!(
+            foreign_cancelled.status.job.status.as_str(),
             "cancelled" | "timed_out" | "exited_unobserved"
         ));
     }
