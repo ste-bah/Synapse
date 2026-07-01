@@ -2468,7 +2468,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "List or manage tabs in an already-open Chromium browser window through the normal Chrome bridge without debugger attach or OS foreground input (#1298/#1188). operation=list enumerates tabs and is the default; operation=select binds a listed tab as this MCP session target; operation=activate makes a listed tab active/highlighted inside its existing Chrome window without OS foreground input or session target binding; operation=new opens a background tab through the existing cdp_open_tab path; operation=close closes a same-session-owned tab through cdp_close_tab ownership checks. Human foreground is only an explicit discovery source for list/select when no session target/window is supplied; activate/new/close require an active/explicit browser context. Each row includes a ready-to-pass set_target payload with kind=cdp and cdp_target_id=chrome-tab:<id>."
+        description = "List or manage tabs in an already-open Chromium browser window through the normal Chrome bridge without debugger attach or OS foreground input (#1298/#1188). operation=list enumerates tabs and is the default; operation=select binds a listed tab as this MCP session target; operation=activate makes a listed tab active/highlighted inside its existing Chrome window without session target binding and fails closed if the requested Chrome window becomes the human OS foreground during the background activation; operation=new opens a background tab through the existing cdp_open_tab path; operation=close closes a same-session-owned tab through cdp_close_tab ownership checks. Human foreground is only an explicit discovery source for list/select when no session target/window is supplied; activate/new/close require an active/explicit browser context. Each row includes a ready-to-pass set_target payload with kind=cdp and cdp_target_id=chrome-tab:<id>."
     )]
     pub async fn browser_tabs(
         &self,
@@ -2708,7 +2708,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Make the calling session's CDP tab the active tab in its own Chrome window WITHOUT taking the OS foreground (the background-safe Playwright bringToFront analogue). Raw CDP uses Target.activateTarget; the normal Chrome extension bridge uses chrome.tabs.update({active:true}), which per the Chrome API does not focus the window. Requires an active session CDP target or a target owned by this session; never uses the human foreground tab as a fallback and never seizes the operator's foreground. Use this instead of injecting global keystrokes (e.g. SendKeys) through act_run_shell."
+        description = "Make the calling session's CDP tab the active tab in its own Chrome window with required_foreground=false (the background-safe Playwright bringToFront analogue). Raw CDP uses Target.activateTarget; the normal Chrome extension bridge uses chrome.tabs.update({active:true}) and separately reads the human OS foreground before/after, failing closed if the requested Chrome window becomes foreground. Requires an active session CDP target or a target owned by this session; never uses the human foreground tab as a fallback. Use this instead of injecting global keystrokes (e.g. SendKeys) through act_run_shell."
     )]
     pub async fn cdp_activate_tab(
         &self,
@@ -5842,6 +5842,7 @@ impl SynapseService {
                             ),
                         )
                     })?;
+                let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
                 let activated = crate::chrome_debugger_bridge::activate_tab(
                     window_context.hwnd,
                     requested,
@@ -5857,6 +5858,20 @@ impl SynapseService {
                         ),
                     )
                 })?;
+                let human_os_foreground_after_hwnd = current_human_os_foreground_hwnd();
+                if background_tab_activation_foregrounded_requested_window(
+                    human_os_foreground_before_hwnd,
+                    human_os_foreground_after_hwnd,
+                    window_context.hwnd,
+                ) {
+                    return Err(mcp_error(
+                        error_codes::ACTION_POSTCONDITION_FAILED,
+                        format!(
+                            "browser_tabs operation=activate refused target {requested:?}: Chrome bridge changed the human OS foreground from {:?} to requested HWND {:#x} while required_foreground=false",
+                            human_os_foreground_before_hwnd, window_context.hwnd
+                        ),
+                    ));
+                }
                 if !activated.target_id.eq_ignore_ascii_case(requested) {
                     return Err(mcp_error(
                         error_codes::ACTION_POSTCONDITION_FAILED,
@@ -9623,6 +9638,7 @@ impl SynapseService {
             });
         }
 
+        let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
         let activated = crate::chrome_debugger_bridge::activate_tab(
             window_hwnd,
             cdp_target_id,
@@ -9638,6 +9654,20 @@ impl SynapseService {
                 ),
             )
         })?;
+        let human_os_foreground_after_hwnd = current_human_os_foreground_hwnd();
+        if background_tab_activation_foregrounded_requested_window(
+            human_os_foreground_before_hwnd,
+            human_os_foreground_after_hwnd,
+            window_hwnd,
+        ) {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "cdp_activate_tab refused target {cdp_target_id:?}: Chrome bridge changed the human OS foreground from {:?} to requested HWND {window_hwnd:#x} while required_foreground=false",
+                    human_os_foreground_before_hwnd
+                ),
+            ));
+        }
         let endpoint = activated
             .extension_id
             .as_deref()
@@ -13270,6 +13300,16 @@ fn current_human_os_foreground_hwnd() -> Option<i64> {
     synapse_a11y::current_foreground_context()
         .ok()
         .map(|context| context.hwnd)
+}
+
+fn background_tab_activation_foregrounded_requested_window(
+    before_hwnd: Option<i64>,
+    after_hwnd: Option<i64>,
+    requested_window_hwnd: i64,
+) -> bool {
+    before_hwnd != Some(requested_window_hwnd)
+        && after_hwnd == Some(requested_window_hwnd)
+        && after_hwnd != before_hwnd
 }
 
 #[derive(Clone, Debug, Default)]
@@ -17637,12 +17677,13 @@ mod tests {
         MIN_BROWSER_WAIT_POLLING_INTERVAL_MS, SessionTarget, SetTargetParam, SynapseService,
         TargetClaimTargetParam, TargetOperation, TargetParams, TargetWire,
         attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
-        browser_nav_delegate_error, browser_wait_for_selector_condition,
-        cdp_activate_resolution_request_details, cdp_navigation_error_code,
-        cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
-        chrome_page_vitals_info, downscale_captured_bitmap, hidden_desktop_pip_ended_response,
-        hidden_worker_target_miss, mcp_error, ocr_cache_key, page_text_info_from_parts,
-        perception_window_hwnd, resolve_browser_tag_source, resolve_capture_target_window_context,
+        background_tab_activation_foregrounded_requested_window, browser_nav_delegate_error,
+        browser_wait_for_selector_condition, cdp_activate_resolution_request_details,
+        cdp_navigation_error_code, cdp_target_info_resolution_request_details,
+        chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
+        downscale_captured_bitmap, hidden_desktop_pip_ended_response, hidden_worker_target_miss,
+        mcp_error, ocr_cache_key, page_text_info_from_parts, perception_window_hwnd,
+        resolve_browser_tag_source, resolve_capture_target_window_context,
         screenshot_downscale_scale, select_single_active_browser_tab, sha256_hex,
         target_claim_param_from_set, target_wire, template_value, unavailable_page_vitals_info,
         validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
@@ -18730,6 +18771,29 @@ mod tests {
                 .contains("operation=close does not accept url"),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn background_tab_activation_foreground_guard_only_rejects_requested_window_focus() {
+        let requested = 0xabc_i64;
+        assert!(background_tab_activation_foregrounded_requested_window(
+            Some(0x111),
+            Some(requested),
+            requested,
+        ));
+        assert!(!background_tab_activation_foregrounded_requested_window(
+            Some(requested),
+            Some(requested),
+            requested,
+        ));
+        assert!(!background_tab_activation_foregrounded_requested_window(
+            Some(0x111),
+            Some(0x222),
+            requested,
+        ));
+        assert!(!background_tab_activation_foregrounded_requested_window(
+            None, None, requested,
+        ));
     }
 
     #[test]

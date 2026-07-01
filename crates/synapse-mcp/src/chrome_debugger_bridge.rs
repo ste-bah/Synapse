@@ -6605,10 +6605,12 @@ pub(crate) async fn navigate_tab(
     })
 }
 
-/// Background-safe tab activation (#1189): selects `target_id` as the active
-/// tab in its own Chrome window via `chrome.tabs.update({active:true})` without
-/// taking the OS foreground. External debugger/nativeMessaging risks must be
-/// suppressed by policy or the bridge management fallback before this queues.
+/// Background-intended tab activation (#1189): selects `target_id` as the
+/// active tab in its own Chrome window via `chrome.tabs.update({active:true})`.
+/// Callers that promise background-safe behavior must separately read the OS
+/// foreground before/after and fail closed if Chrome becomes foreground.
+/// External debugger/nativeMessaging risks must be suppressed by policy or the
+/// bridge management fallback before this queues.
 pub(crate) async fn activate_tab(
     hwnd: i64,
     target_id: &str,
