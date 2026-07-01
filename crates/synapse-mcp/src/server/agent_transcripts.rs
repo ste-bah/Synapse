@@ -1508,6 +1508,27 @@ fn parse_local_model_object(
             });
             Ok(())
         }
+        "local.tool_call.arguments_normalized" => {
+            record.role = Some(TranscriptRole::Tool);
+            let tool_name = required_local_str(object, "tool_name")?.to_owned();
+            let reason_code = required_local_str(object, "reason_code")?;
+            let normalized_arguments = required_local_normalized_arguments(object)?;
+            let (arguments, arguments_bytes, arguments_truncated) =
+                bounded_json_string(normalized_arguments, AGENT_TRANSCRIPT_MAX_TOOL_ARGS_CHARS);
+            record.tool_calls.push(TranscriptToolCall {
+                tool_name,
+                tool_call_id: object
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                arguments: Some(arguments),
+                arguments_bytes: Some(arguments_bytes),
+                arguments_truncated,
+                status: Some(format!("arguments_normalized:{reason_code}")),
+                ..TranscriptToolCall::default()
+            });
+            Ok(())
+        }
         "local.tool_parse_error" => {
             record.role = Some(TranscriptRole::Tool);
             record.source_error = Some(
@@ -1538,6 +1559,34 @@ fn parse_local_model_object(
             set_content(record, &Value::Object(object.clone()).to_string());
             Ok(())
         }
+        "local.steering.received" => {
+            record.role = Some(TranscriptRole::System);
+            let _message_id = required_local_str(object, "message_id")?;
+            let _kind = required_local_str(object, "kind")?;
+            if let Some(payload_summary) = object.get("payload_summary").and_then(Value::as_str) {
+                set_content(record, payload_summary);
+            } else {
+                set_content(record, &Value::Object(object.clone()).to_string());
+            }
+            Ok(())
+        }
+        "local.hold_open.started" | "local.hold_open.finished" => {
+            record.role = Some(TranscriptRole::System);
+            let _session_id = required_local_str(object, "session_id")?;
+            let _hold_open_ms = required_local_u64(object, "hold_open_ms")?;
+            let _started_at_unix_ms = required_local_u64(object, "started_at_unix_ms")?;
+            if event_type == "local.hold_open.finished" {
+                let _finished_at_unix_ms = required_local_u64(object, "finished_at_unix_ms")?;
+            }
+            set_content(record, &Value::Object(object.clone()).to_string());
+            Ok(())
+        }
+        "local.agent.completed" => {
+            record.role = Some(TranscriptRole::Result);
+            let final_message = required_local_str(object, "final_message")?;
+            set_content(record, final_message);
+            Ok(())
+        }
         "local.error" => {
             record.role = Some(TranscriptRole::Result);
             record.source_error = Some(
@@ -1554,12 +1603,41 @@ fn parse_local_model_object(
     }
 }
 
+fn required_local_normalized_arguments(object: &Map<String, Value>) -> Result<&Value, String> {
+    const FIELDS: [&str; 3] = [
+        "contract_arguments",
+        "attributed_arguments",
+        "model_arguments",
+    ];
+    for field in FIELDS {
+        if let Some(value) = object.get(field) {
+            if value.as_object().is_some() {
+                return Ok(value);
+            }
+            return Err(format!(
+                "required object field {field:?} is present but not an object"
+            ));
+        }
+    }
+    Err(format!(
+        "one of required object fields {:?} is missing",
+        FIELDS
+    ))
+}
+
 fn required_local_str<'a>(object: &'a Map<String, Value>, field: &str) -> Result<&'a str, String> {
     object
         .get(field)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| format!("required string field {field:?} is missing or empty"))
+}
+
+fn required_local_u64(object: &Map<String, Value>, field: &str) -> Result<u64, String> {
+    object
+        .get(field)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("required u64 field {field:?} is missing or invalid"))
 }
 
 #[cfg(test)]

@@ -30,6 +30,16 @@ const LOCAL_MODEL_STREAM: &str = r#"{"type":"local.thread.started","conversation
 {"type":"local.error","conversation_id":"local-model-test-thread","model":"gemma4:e4b","turn_index":2,"error_code":"MODEL_ENDPOINT_UNREACHABLE","error_detail":"MODEL_ENDPOINT_UNREACHABLE: synthetic"}
 "#;
 
+/// Byte-for-byte rows captured from live local-agent `stdout.jsonl` files on
+/// this host after #900. These are current writer events that are not in the
+/// older synthetic `LOCAL_MODEL_STREAM` above.
+const LOCAL_MODEL_CURRENT_LIFECYCLE_STREAM: &str = r#"{"attributed_arguments":{"context":"Expected operator response is token-73. This verifies local-agent spawn attribution.","notify":false,"question":"FSV-1028-ATTRIBUTED-HAPPY: What synthetic token should be recorded?","spawn_id":"agent-spawn-019efe12-18d6-7c90-b25d-31733fdb8793","suppress_popup":true,"timeout_ms":120000},"conversation_id":"local-model-019efe121f90712289b5524225272ad3","model":"deepseek-v4-flash","reason_code":"local_agent_spawn_id_attribution","routed_tool_name":null,"spawn_id":"agent-spawn-019efe12-18d6-7c90-b25d-31733fdb8793","tool_call_id":"call_00_Ct1SfrCZn4ajLQhBRKk28151","tool_exposure":"routed","tool_name":"agent_ask_operator","turn_index":1,"type":"local.tool_call.arguments_normalized"}
+{"completed_task_tool_sources":{"workspace_get":"workspace_put_post_write_readback","workspace_put":"model_tool_call"},"completed_task_tools":["workspace_get","workspace_put"],"conversation_id":"local-model-019ee30871017472b4dbc33c51abc9a7","final_message":"{\"case\":\"happy\",\"expected\":\"workspace row exists\",\"ok\":true}","model":"qwen8v2-tool","reason_code":"task_tool_contract_verified","type":"local.agent.completed"}
+{"conversation_id":"local-model-019ee575212b7931950ac7002a8dea93","hold_open_ms":60000,"model":"qwen8v2-tool","session_id":"b93d7034-9d5c-4711-aabb-c7b72d23a15e","source":"local_agent_mcp_session","started_at_unix_ms":1781966127405,"type":"local.hold_open.started"}
+{"conversation_id":"local-model-019ee575212b7931950ac7002a8dea93","finished_at_unix_ms":1781966187409,"hold_open_ms":60000,"model":"qwen8v2-tool","session_id":"b93d7034-9d5c-4711-aabb-c7b72d23a15e","source":"local_agent_mcp_session","started_at_unix_ms":1781966127405,"type":"local.hold_open.finished"}
+{"conversation_id":"local-model-019ed1a56e6f7721815802b3caf80f8b","kind":"interrupt","message_id":"agentmsg-00000001781633775598-00000000000000000002","model":"qwen8v2-tool","payload_summary":"stop the current turn at the next safe point","session_id":"2567dfa0-77ea-4aaa-b646-b92af130d539","turn_index":2,"type":"local.steering.received"}
+"#;
+
 fn open_temp_db() -> (tempfile::TempDir, Db) {
     let temp = tempfile::tempdir().expect("tempdir");
     let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION).expect("temp DB must open");
@@ -356,6 +366,118 @@ fn local_model_stream_reconciles_usage_tool_calls_and_errors() {
             .source_error
             .as_deref()
             .is_some_and(|detail| detail.contains("MODEL_ENDPOINT_UNREACHABLE"))
+    );
+}
+
+#[test]
+fn local_model_current_lifecycle_events_parse_from_real_rows() {
+    let (_temp, db) = open_temp_db();
+    let root = tempfile::tempdir().expect("spawn root");
+    let spawn_id = "agent-spawn-local-current-lifecycle";
+    let log_dir = plant_spawn_dir(
+        root.path(),
+        spawn_id,
+        TranscriptSource::LocalModelJson,
+        LOCAL_MODEL_CURRENT_LIFECYCLE_STREAM,
+    );
+    mark_completed(&log_dir);
+
+    let outcome =
+        ingest_spawn_dir_once(&db, spawn_id, &log_dir, false).expect("ingest must succeed");
+    let source_lines = LOCAL_MODEL_CURRENT_LIFECYCLE_STREAM.lines().count() as u64;
+    println!(
+        "edge=local_current_lifecycle parsed={} invalid={} total={}",
+        outcome.new_parsed_rows, outcome.new_invalid_rows, outcome.lines_ingested_total
+    );
+    assert_eq!(outcome.new_invalid_rows, 0);
+    assert_eq!(outcome.lines_ingested_total, source_lines);
+
+    let rows = scan_spawn_rows(&db, spawn_id);
+    assert_eq!(rows.len() as u64, source_lines);
+
+    let normalized = rows
+        .iter()
+        .map(|(_line, record)| record)
+        .find(|record| record.event_kind.as_deref() == Some("local.tool_call.arguments_normalized"))
+        .expect("arguments_normalized row must parse");
+    assert_eq!(normalized.role, Some(TranscriptRole::Tool));
+    assert_eq!(normalized.tool_calls[0].tool_name, "agent_ask_operator");
+    assert_eq!(
+        normalized.tool_calls[0].status.as_deref(),
+        Some("arguments_normalized:local_agent_spawn_id_attribution")
+    );
+    assert!(
+        normalized.tool_calls[0]
+            .arguments
+            .as_deref()
+            .expect("normalized arguments")
+            .contains("FSV-1028-ATTRIBUTED-HAPPY")
+    );
+
+    let completed = rows
+        .iter()
+        .map(|(_line, record)| record)
+        .find(|record| record.event_kind.as_deref() == Some("local.agent.completed"))
+        .expect("agent.completed row must parse");
+    assert_eq!(completed.role, Some(TranscriptRole::Result));
+    assert!(
+        completed
+            .content_summary
+            .as_deref()
+            .expect("final message")
+            .contains("workspace row exists")
+    );
+
+    for event_kind in ["local.hold_open.started", "local.hold_open.finished"] {
+        let hold_open = rows
+            .iter()
+            .map(|(_line, record)| record)
+            .find(|record| record.event_kind.as_deref() == Some(event_kind))
+            .expect("hold_open row must parse");
+        assert_eq!(hold_open.role, Some(TranscriptRole::System));
+        assert!(
+            hold_open
+                .content_summary
+                .as_deref()
+                .expect("hold_open summary")
+                .contains("\"hold_open_ms\":60000")
+        );
+    }
+
+    let steering = rows
+        .iter()
+        .map(|(_line, record)| record)
+        .find(|record| record.event_kind.as_deref() == Some("local.steering.received"))
+        .expect("steering row must parse");
+    assert_eq!(steering.role, Some(TranscriptRole::System));
+    assert_eq!(
+        steering.content_summary.as_deref(),
+        Some("stop the current turn at the next safe point")
+    );
+}
+
+#[test]
+fn malformed_current_local_lifecycle_event_is_still_invalid() {
+    let (_temp, db) = open_temp_db();
+    let root = tempfile::tempdir().expect("spawn root");
+    let spawn_id = "agent-spawn-local-current-malformed";
+    let content = "{\"type\":\"local.agent.completed\",\"conversation_id\":\"local-model-bad\"}\n";
+    let log_dir = plant_spawn_dir(
+        root.path(),
+        spawn_id,
+        TranscriptSource::LocalModelJson,
+        content,
+    );
+
+    let outcome = ingest_spawn_dir_once(&db, spawn_id, &log_dir, true).expect("ingest");
+    assert_eq!(outcome.new_invalid_rows, 1);
+    let rows = scan_spawn_rows(&db, spawn_id);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.status, TranscriptParseStatus::Invalid);
+    let parse_error = rows[0].1.parse_error.as_deref().expect("detail");
+    assert!(
+        parse_error.contains("required string field \"final_message\""),
+        "malformed current event must stay fail-closed: {parse_error}"
     );
 }
 
