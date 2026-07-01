@@ -337,12 +337,24 @@ pub struct AgentEventIngressStats {
 pub struct ToolSurfaceTelemetry {
     pub source_of_truth: &'static str,
     pub profile: String,
+    pub profile_label: String,
+    pub profile_source: String,
     pub visible_tool_count: usize,
+    pub visible_public_tool_count: usize,
     pub implementation_tool_count: usize,
+    pub hidden_implementation_tool_count: usize,
     pub public_tool_count: usize,
     pub max_public_tool_count: usize,
+    pub over_public_tool_limit_by: usize,
+    pub profile_gated_public_tool_count: usize,
     pub registered_public_tool_count: usize,
     pub missing_public_tool_count: usize,
+    pub denied_break_glass_tool_count: usize,
+    pub hidden_tool_route_count: usize,
+    pub last_tool_surface_sha256: String,
+    pub visible_tool_sha256: String,
+    pub public_tool_sha256: String,
+    pub facade_contract_sha256: String,
     pub facade_contract_tool_count: usize,
     pub facade_contract_operation_count: usize,
     pub facade_contract_mutating_operation_count: usize,
@@ -995,7 +1007,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Public telemetry facade for the <=40 MCP surface. operation=status returns tool-surface counts, public/implementation facade counts, storage CF counters, and agent-event ingress counters from physical SoTs."
+        description = "Public telemetry facade for the <=40 MCP surface. operation=status returns active profile, visible/public/implementation/hidden/profile-gated tool counts, tool-surface hashes, storage CF counters, and agent-event ingress counters from physical SoTs."
     )]
     pub async fn telemetry(
         &self,
@@ -1037,27 +1049,7 @@ impl SynapseService {
         let cf_row_counts = storage_summary.cf_row_counts.clone();
         let status = TelemetryStatusResponse {
             source_of_truth: TELEMETRY_SOT,
-            tool_surface: ToolSurfaceTelemetry {
-                source_of_truth: snapshot.source_of_truth,
-                profile: snapshot.profile.as_str().to_owned(),
-                visible_tool_count: snapshot.visible_tool_count,
-                implementation_tool_count: snapshot.implementation_tool_count,
-                public_tool_count: snapshot.public_tool_registry.public_tool_count,
-                max_public_tool_count: snapshot.public_tool_registry.max_public_tool_count,
-                registered_public_tool_count: snapshot
-                    .public_tool_registry
-                    .registered_tools_present
-                    .len(),
-                missing_public_tool_count: snapshot
-                    .public_tool_registry
-                    .registered_tools_missing
-                    .len(),
-                facade_contract_tool_count: snapshot.facade_contract.contract_tool_count,
-                facade_contract_operation_count: snapshot.facade_contract.operation_count,
-                facade_contract_mutating_operation_count: snapshot
-                    .facade_contract
-                    .mutating_operation_count,
-            },
+            tool_surface: tool_surface_telemetry(&snapshot),
             storage_summary,
             agent_event_ingress: ingress,
             cf_row_counts,
@@ -1284,6 +1276,55 @@ fn agent_ingress_stats() -> AgentEventIngressStats {
         rejected_malformed_total: stat_u64(&value, "rejected_malformed_total"),
         rejected_storage_total: stat_u64(&value, "rejected_storage_total"),
     }
+}
+
+fn tool_surface_telemetry(
+    snapshot: &super::tool_profiles::ToolProfileSnapshot,
+) -> ToolSurfaceTelemetry {
+    let visible_public_count = count_visible_public_tools(
+        &snapshot.public_tool_registry.public_tool_names,
+        &snapshot.visible_tool_names,
+    );
+    ToolSurfaceTelemetry {
+        source_of_truth: snapshot.source_of_truth,
+        profile: snapshot.profile.as_str().to_owned(),
+        profile_label: snapshot.profile_label.to_owned(),
+        profile_source: snapshot.source.clone(),
+        visible_tool_count: snapshot.visible_tool_count,
+        visible_public_tool_count: visible_public_count,
+        implementation_tool_count: snapshot.implementation_tool_count,
+        hidden_implementation_tool_count: snapshot
+            .implementation_tool_count
+            .saturating_sub(snapshot.visible_tool_count),
+        public_tool_count: snapshot.public_tool_registry.public_tool_count,
+        max_public_tool_count: snapshot.public_tool_registry.max_public_tool_count,
+        over_public_tool_limit_by: snapshot.public_tool_registry.over_limit_by,
+        profile_gated_public_tool_count: snapshot
+            .public_tool_registry
+            .public_tool_count
+            .saturating_sub(visible_public_count),
+        registered_public_tool_count: snapshot.public_tool_registry.registered_tools_present.len(),
+        missing_public_tool_count: snapshot.public_tool_registry.registered_tools_missing.len(),
+        denied_break_glass_tool_count: snapshot.denied_break_glass_tools.len(),
+        hidden_tool_route_count: snapshot.hidden_tool_routes.len(),
+        last_tool_surface_sha256: snapshot.visible_tool_sha256.clone(),
+        visible_tool_sha256: snapshot.visible_tool_sha256.clone(),
+        public_tool_sha256: snapshot.public_tool_registry.public_tool_sha256.clone(),
+        facade_contract_sha256: snapshot.facade_contract.facade_contract_sha256.clone(),
+        facade_contract_tool_count: snapshot.facade_contract.contract_tool_count,
+        facade_contract_operation_count: snapshot.facade_contract.operation_count,
+        facade_contract_mutating_operation_count: snapshot.facade_contract.mutating_operation_count,
+    }
+}
+
+fn count_visible_public_tools(
+    public_tool_names: &[String],
+    visible_tool_names: &[String],
+) -> usize {
+    visible_tool_names
+        .iter()
+        .filter(|visible| public_tool_names.iter().any(|public| public == *visible))
+        .count()
 }
 
 fn stat_u64(value: &Value, key: &str) -> u64 {

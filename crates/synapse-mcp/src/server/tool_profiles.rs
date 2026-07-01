@@ -2126,6 +2126,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "health",
     "observe",
     "observe_delta",
+    "profile",
     "read_text",
     "reality_audit",
     "reality_baseline",
@@ -2141,6 +2142,7 @@ const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
+    "telemetry",
     "tool_profile_set",
     "tool_profile_status",
     "verification_audit",
@@ -2236,6 +2238,7 @@ const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = &[
     "health",
     "observe",
     "observe_delta",
+    "profile",
     "read_text",
     "reality_audit",
     "reality_baseline",
@@ -2251,6 +2254,7 @@ const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = &[
     "target_claim_adopt",
     "target_claim_status",
     "target_release",
+    "telemetry",
     "tool_profile_set",
     "tool_profile_status",
     "verification_audit",
@@ -5052,6 +5056,8 @@ mod tests {
         assert!(visible.contains(&"browser_wait".to_owned()));
         assert!(visible.contains(&"target_act".to_owned()));
         assert!(visible.contains(&"cdp_open_tab".to_owned()));
+        assert!(visible.contains(&"profile".to_owned()));
+        assert!(visible.contains(&"telemetry".to_owned()));
         assert!(visible.contains(&"tool_profile_set".to_owned()));
         assert!(!visible.contains(&"act_run_shell".to_owned()));
         assert!(!visible.contains(&"act_spawn_agent".to_owned()));
