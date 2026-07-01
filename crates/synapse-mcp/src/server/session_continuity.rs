@@ -679,6 +679,14 @@ pub(crate) fn delete_persisted_session_continuity_rows(
     delete_persisted_session_continuity_rows_from_db(&db, session_id)
 }
 
+pub(crate) fn read_persisted_session_target_for_session(
+    m3_state: &SharedM3State,
+    session_id: &str,
+) -> Result<Option<SessionTarget>, String> {
+    let db = session_continuity_db_from_state(m3_state)?;
+    read_persisted_session_target_from_db(&db, session_id).map(|row| row.map(|row| row.target))
+}
+
 pub(crate) fn delete_persisted_session_continuity_rows_from_db(
     db: &Db,
     session_id: &str,
@@ -715,6 +723,30 @@ pub(crate) fn delete_persisted_session_continuity_rows_from_db(
         "readback=CF_SESSIONS after=session_continuity_deleted"
     );
     Ok(readback)
+}
+
+fn read_persisted_session_target_from_db(
+    db: &Db,
+    session_id: &str,
+) -> Result<Option<PersistedSessionTarget>, String> {
+    let key = session_target_key(session_id);
+    let rows = db
+        .scan_cf_prefix(cf::CF_SESSIONS, &key)
+        .map_err(|error| error.to_string())?;
+    let Some((_row_key, value)) = rows.into_iter().find(|(row_key, _)| row_key == &key) else {
+        return Ok(None);
+    };
+    let persisted =
+        synapse_storage::decode_json::<PersistedSessionTarget>(&value).map_err(|error| {
+            format!("decode persisted session target failed for {session_id}: {error}")
+        })?;
+    if persisted.schema_version != 1 || persisted.session_id != session_id {
+        return Err(format!(
+            "persisted session target row mismatch for {session_id}: schema_version={} row_session_id={}",
+            persisted.schema_version, persisted.session_id
+        ));
+    }
+    Ok(Some(persisted))
 }
 
 pub(crate) fn delete_persisted_session_lease_row(
