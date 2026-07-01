@@ -2198,9 +2198,10 @@ function Get-SynapseToolSurfaceDiff {
         DescriptionChanged = $descriptionChanged
         StoredToolHashChanged = $storedHashChanged
         StoredSchemaHashOnlyChanged = $storedSchemaHashOnlyChanged
+        HasDescriptionChange = ($descriptionChanged.Count -gt 0)
         HasNameDelta = $hasNameDelta
         HasCallableSchemaChange = $hasCallableSchemaChange
-        HasRestartRequired = ($hasNameDelta -or $hasCallableSchemaChange)
+        HasRestartRequired = ($hasNameDelta -or $hasCallableSchemaChange -or $descriptionChanged.Count -gt 0)
     })
 }
 
@@ -2267,12 +2268,241 @@ function Get-SynapseHandoffGitReadback {
     }
 }
 
+function Get-SynapseRecoveryNotesPath {
+    param([AllowNull()][string]$SourceDir)
+
+    $candidates = @()
+    if (-not [string]::IsNullOrWhiteSpace($SourceDir)) {
+        $candidates += (Join-Path $SourceDir 'STATE\RECOVERY_NOTES.md')
+    }
+    $repoRootFromScript = Split-Path -Parent $PSScriptRoot
+    if (-not [string]::IsNullOrWhiteSpace($repoRootFromScript)) {
+        $candidates += (Join-Path $repoRootFromScript 'STATE\RECOVERY_NOTES.md')
+    }
+
+    foreach ($candidate in @($candidates | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $candidate) {
+            return $candidate
+        }
+    }
+    $first = @($candidates | Select-Object -First 1)
+    if ($first.Count -gt 0) {
+        return [string]$first[0]
+    }
+    return $null
+}
+
+function ConvertTo-SynapseHandoffDiffObject {
+    param([AllowNull()]$Diff)
+
+    if ($null -eq $Diff) {
+        return [ordered]@{
+            available = $false
+            reason = 'diff_not_supplied'
+        }
+    }
+
+    return [ordered]@{
+        available = $true
+        summary = [string]$Diff.Summary
+        schema_detail = [string]$Diff.SchemaDetail
+        has_restart_required = [bool]$Diff.HasRestartRequired
+        has_name_delta = [bool]$Diff.HasNameDelta
+        has_callable_schema_change = [bool]$Diff.HasCallableSchemaChange
+        has_description_change = [bool]$Diff.HasDescriptionChange
+        added = @($Diff.Added | ForEach-Object { [string]$_ })
+        removed = @($Diff.Removed | ForEach-Object { [string]$_ })
+        input_schema_changed = @($Diff.InputSchemaChanged | ForEach-Object { [string]$_ })
+        output_schema_changed = @($Diff.OutputSchemaChanged | ForEach-Object { [string]$_ })
+        callable_schema_changed = @($Diff.CallableSchemaChanged | ForEach-Object { [string]$_ })
+        description_changed = @($Diff.DescriptionChanged | ForEach-Object { [string]$_ })
+        stored_tool_hash_changed = @($Diff.StoredToolHashChanged | ForEach-Object { [string]$_ })
+        stored_schema_hash_only_changed = @($Diff.StoredSchemaHashOnlyChanged | ForEach-Object { [string]$_ })
+    }
+}
+
+function Write-SynapseCodexRestartHandoff {
+    param(
+        [Parameter(Mandatory=$true)][string]$Phase,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [AllowNull()]$CodexAncestor,
+        [AllowNull()]$Surface,
+        [AllowNull()]$Diff,
+        [AllowNull()][string]$ProcessHashAtStart,
+        [AllowNull()][string]$ProcessSnapshotAtStart,
+        [AllowNull()][string]$CurrentSnapshotPath,
+        [AllowNull()][string]$SourceDir,
+        [AllowNull()][string]$Bind,
+        [AllowNull()][string]$TokenPath
+    )
+
+    $root = Join-Path $env:LOCALAPPDATA 'synapse\codex-restart-handoffs'
+    $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
+    $codexPid = if ($CodexAncestor) { [int]$CodexAncestor.ProcessId } else { 0 }
+    $baseName = "codex-restart-handoff-$codexPid-$stamp"
+    $jsonPath = Join-Path $root "$baseName.json"
+    $mdPath = Join-Path $root "$baseName.md"
+    $recoveryNotesPath = Get-SynapseRecoveryNotesPath -SourceDir $SourceDir
+    $startSnapshotStatus = if ([string]::IsNullOrWhiteSpace($ProcessSnapshotAtStart)) {
+        'missing_env'
+    } elseif (Test-Path -LiteralPath $ProcessSnapshotAtStart) {
+        'readable'
+    } else {
+        'missing_file'
+    }
+
+    $daemon = [ordered]@{
+        bind = $Bind
+        pid = if ($Surface -and $Surface.PSObject.Properties['daemon_pid']) { $Surface.daemon_pid } else { $null }
+        tool_count = if ($Surface -and $Surface.PSObject.Properties['tool_count']) { $Surface.tool_count } else { $null }
+        tool_surface_sha256 = if ($Surface -and $Surface.PSObject.Properties['tool_surface_sha256']) { [string]$Surface.tool_surface_sha256 } else { $null }
+        snapshot_path = $CurrentSnapshotPath
+    }
+    $codexProcess = if ($CodexAncestor) {
+        [ordered]@{
+            pid = [int]$CodexAncestor.ProcessId
+            name = [string]$CodexAncestor.Name
+            command_line = [string]$CodexAncestor.CommandLine
+        }
+    } else {
+        [ordered]@{
+            pid = $null
+            name = $null
+            command_line = $null
+        }
+    }
+    $diffObject = ConvertTo-SynapseHandoffDiffObject -Diff $Diff
+    $gitReadback = Get-SynapseHandoffGitReadback -SourceDir $SourceDir
+    $postRestartRequiredReads = @(
+        'C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md',
+        'C:\code\Synapse\docs\compressionprompt.md',
+        'C:\code\Synapse\AGENTS.md',
+        $recoveryNotesPath
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+
+    $record = [ordered]@{
+        schema_version = 2
+        artifact_kind = 'synapse_codex_restart_handoff'
+        created_at_utc = [DateTime]::UtcNow.ToString('o')
+        reason_code = 'SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE'
+        reason = $Reason
+        phase = $Phase
+        required_restart = $true
+        no_in_process_hot_refresh = $true
+        explanation = 'The already-running Codex process has process-local MCP callable metadata that does not match the current daemon tools/list surface. Restart through the patched Codex launcher is the same-agent recovery boundary.'
+        codex_process = $codexProcess
+        daemon = $daemon
+        current_process_start_surface = [ordered]@{
+            env_hash_present = (-not [string]::IsNullOrWhiteSpace($ProcessHashAtStart))
+            env_hash = $ProcessHashAtStart
+            env_snapshot_path = $ProcessSnapshotAtStart
+            snapshot_status = $startSnapshotStatus
+        }
+        diff = $diffObject
+        post_restart_required_reads = $postRestartRequiredReads
+        github_reads = @(
+            'gh issue view 351 --repo ChrisRoyse/Synapse --comments',
+            'gh issue view 1398 --repo ChrisRoyse/Synapse --comments',
+            'gh issue list --repo ChrisRoyse/Synapse --state open --limit 100'
+        )
+        post_restart_verification = @(
+            'Run git status --short --branch and confirm the working tree matches the handoff/recovery notes.',
+            "Read the active Codex process parent chain and confirm the active codex.exe PID is not stale PID $codexPid from this handoff.",
+            'Call real mcp__synapse.health and verify daemon pid/tool_surface_sha256 matches or intentionally supersedes this handoff.',
+            'Run tool discovery for the previously missing Synapse tools. If metadata is still stale, rerun scripts\synapse-setup.ps1 and keep the issue open.',
+            'Resume #1398 and perform manual real-MCP FSV; do not use direct helper calls as acceptance.'
+        )
+        restart_command_hint = "Close this Codex session completely, start a new Codex session through the patched Codex launcher, verify the active codex.exe PID is not $codexPid, then resume #1398."
+        repo_readback = $gitReadback
+        token_path = $TokenPath
+        recovery_notes_path = $recoveryNotesPath
+    }
+
+    try {
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Write-SynapseUtf8NoBomFile -Path $jsonPath -Text (($record | ConvertTo-Json -Depth 40) + "`n")
+        $md = @(
+            '# Synapse Codex Restart Handoff',
+            '',
+            "- Reason: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE ($Reason)",
+            "- Phase: $Phase",
+            "- Created UTC: $($record.created_at_utc)",
+            "- Codex PID: $codexPid",
+            "- Daemon: pid=$($daemon.pid) bind=$($daemon.bind) tool_count=$($daemon.tool_count) tool_surface_sha256=$($daemon.tool_surface_sha256)",
+            "- Current process start snapshot: status=$startSnapshotStatus hash=$ProcessHashAtStart path=$ProcessSnapshotAtStart",
+            "- Current daemon snapshot: $CurrentSnapshotPath",
+            "- Diff: $($diffObject.summary)",
+            '',
+            '## Required Restart',
+            "The running Codex process cannot hot-add changed MCP tools or mutate cached tool schemas. Close stale Codex PID $codexPid completely, restart Codex through the patched launcher, and prove the active codex.exe PID changed before continuing. Typing continue into the same PID is not a restart.",
+            '',
+            '## Read After Restart'
+        )
+        foreach ($item in $postRestartRequiredReads) {
+            $md += "- $item"
+        }
+        $md += @(
+            '',
+            '## GitHub Reads'
+        )
+        foreach ($item in $record.github_reads) {
+            $md += "- $item"
+        }
+        $md += @(
+            '',
+            '## Verification'
+        )
+        foreach ($item in $record.post_restart_verification) {
+            $md += "- $item"
+        }
+        $md += @(
+            '',
+            "JSON artifact: $jsonPath",
+            ''
+        )
+        Write-SynapseUtf8NoBomFile -Path $mdPath -Text (($md -join "`n") + "`n")
+
+        if (-not [string]::IsNullOrWhiteSpace($recoveryNotesPath)) {
+            $notes = @(
+                '# Synapse Recovery Notes',
+                '',
+                '## Latest Codex Restart Handoff',
+                '',
+                "- Reason: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE ($Reason)",
+                "- Phase: $Phase",
+                "- Created UTC: $($record.created_at_utc)",
+                "- JSON: $jsonPath",
+                "- Markdown: $mdPath",
+                "- Stale Codex PID: $codexPid",
+                "- Daemon bind: $Bind",
+                "- Daemon tool surface: $($daemon.tool_surface_sha256)",
+                '',
+                'After restart, re-read AGENTS.md, #351, #1398, git status, and this file before resuming. Use the real mcp__synapse client for FSV; direct helper calls are diagnostics only.',
+                ''
+            )
+            Write-SynapseUtf8NoBomFile -Path $recoveryNotesPath -Text (($notes -join "`n") + "`n")
+        }
+    } catch {
+        Die "SYNAPSE_CODEX_RESTART_HANDOFF_WRITE_FAILED phase=$Phase reason=$Reason path=$jsonPath error=$($_.Exception.Message) remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-restart-handoffs and the repo STATE directory, then rerun setup"
+    }
+
+    Info "SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE handoff_written phase=$Phase reason=$Reason json=$jsonPath markdown=$mdPath recovery_notes=$recoveryNotesPath"
+    return [pscustomobject]@{
+        JsonPath = $jsonPath
+        MarkdownPath = $mdPath
+        RecoveryNotesPath = $recoveryNotesPath
+    }
+}
+
 function Assert-CodexCandidateHandoffPreservesCurrentProcess {
     param(
         [AllowNull()]$CodexAncestor,
         [Parameter(Mandatory=$true)]$CandidateSurface,
         [AllowNull()][string]$ProcessHashAtStart,
-        [AllowNull()][string]$ProcessSnapshotAtStart
+        [AllowNull()][string]$ProcessSnapshotAtStart,
+        [AllowNull()][string]$SourceDir,
+        [AllowNull()][string]$Bind,
+        [AllowNull()][string]$TokenPath
     )
 
     if ($null -eq $CodexAncestor) {
@@ -2294,12 +2524,25 @@ function Assert-CodexCandidateHandoffPreservesCurrentProcess {
     $diffSummary = $diff.Summary
 
     if ([string]::IsNullOrWhiteSpace($ProcessHashAtStart)) {
-        Info ("WARN: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE_PRE_HANDOFF_NONFATAL codex_pid={0} tool_surface_at_process_start=missing candidate_tool_surface_sha256={1} candidate_tool_count={2} candidate_pid={3} start_snapshot={4} {5} remediation=same-process reconnect is permitted; after handoff call real mcp__synapse.health/tool_profile_status from this Codex session and verify the daemon/tool surface readback." -f `
+        $handoff = Write-SynapseCodexRestartHandoff `
+            -Phase 'pre_handoff_candidate' `
+            -Reason 'start_snapshot_missing_before_candidate_handoff' `
+            -CodexAncestor $CodexAncestor `
+            -Surface $CandidateSurface `
+            -Diff $diff `
+            -ProcessHashAtStart $ProcessHashAtStart `
+            -ProcessSnapshotAtStart $ProcessSnapshotAtStart `
+            -CurrentSnapshotPath $null `
+            -SourceDir $SourceDir `
+            -Bind $Bind `
+            -TokenPath $TokenPath
+        Info ("WARN: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE_PRE_HANDOFF codex_pid={0} tool_surface_at_process_start=missing candidate_tool_surface_sha256={1} candidate_tool_count={2} candidate_pid={3} start_snapshot={4} handoff={5} {6} remediation=setup will continue only to install the verified daemon; final setup must fail closed if this Codex process remains stale." -f `
             $CodexAncestor.ProcessId,
             $candidateHash,
             $CandidateSurface.tool_count,
             $CandidateSurface.daemon_pid,
             $ProcessSnapshotAtStart,
+            $handoff.JsonPath,
             $diffSummary)
         return
     }
@@ -2316,13 +2559,26 @@ function Assert-CodexCandidateHandoffPreservesCurrentProcess {
         return
     }
 
-    Info ("WARN: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE_PRE_HANDOFF_NONFATAL codex_pid={0} start_tool_surface_sha256={1} candidate_tool_surface_sha256={2} candidate_tool_count={3} candidate_pid={4} start_snapshot={5} {6} remediation=same-process reconnect is permitted; after handoff call real mcp__synapse.health/tool_profile_status from this Codex session and verify the daemon/tool surface readback." -f `
+    $handoff = Write-SynapseCodexRestartHandoff `
+        -Phase 'pre_handoff_candidate' `
+        -Reason 'start_snapshot_hash_mismatch_before_candidate_handoff' `
+        -CodexAncestor $CodexAncestor `
+        -Surface $CandidateSurface `
+        -Diff $diff `
+        -ProcessHashAtStart $ProcessHashAtStart `
+        -ProcessSnapshotAtStart $ProcessSnapshotAtStart `
+        -CurrentSnapshotPath $null `
+        -SourceDir $SourceDir `
+        -Bind $Bind `
+        -TokenPath $TokenPath
+    Info ("WARN: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE_PRE_HANDOFF codex_pid={0} start_tool_surface_sha256={1} candidate_tool_surface_sha256={2} candidate_tool_count={3} candidate_pid={4} start_snapshot={5} handoff={6} {7} remediation=setup will continue only to install the verified daemon; final setup must fail closed if this Codex process remains stale." -f `
         $CodexAncestor.ProcessId,
         $ProcessHashAtStart,
         $candidateHash,
         $CandidateSurface.tool_count,
         $CandidateSurface.daemon_pid,
         $ProcessSnapshotAtStart,
+        $handoff.JsonPath,
         $diffSummary)
     return
 }
@@ -2348,15 +2604,27 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
     $diff = Get-SynapseToolSurfaceDiff -StartSurface $startSurface -CurrentSurface $CurrentSurface
     $diffSummary = $diff.Summary
     if ([string]::IsNullOrWhiteSpace($ProcessHashAtStart)) {
-        Info ("WARN: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE_NONFATAL codex_pid={0} tool_surface_at_process_start=missing current_tool_surface_sha256={1} tool_count={2} daemon_pid={3} snapshot={4} start_snapshot={5} {6} remediation=same-process reconnect is permitted; call real mcp__synapse.health/tool_profile_status from this Codex session and verify the daemon/tool surface readback." -f `
+        $handoff = Write-SynapseCodexRestartHandoff `
+            -Phase 'post_handoff_current_daemon' `
+            -Reason 'start_snapshot_missing_after_daemon_handoff' `
+            -CodexAncestor $CodexAncestor `
+            -Surface $CurrentSurface `
+            -Diff $diff `
+            -ProcessHashAtStart $ProcessHashAtStart `
+            -ProcessSnapshotAtStart $ProcessSnapshotAtStart `
+            -CurrentSnapshotPath $SnapshotPath `
+            -SourceDir $SourceDir `
+            -Bind $Bind `
+            -TokenPath $TokenPath
+        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=missing current_tool_surface_sha256={1} tool_count={2} daemon_pid={3} snapshot={4} start_snapshot={5} handoff={6} {7} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume #1398 and verify real mcp__synapse metadata." -f `
             $CodexAncestor.ProcessId,
             $currentHash,
             $CurrentSurface.tool_count,
             $CurrentSurface.daemon_pid,
             $SnapshotPath,
             $ProcessSnapshotAtStart,
+            $handoff.JsonPath,
             $diffSummary)
-        return
     }
 
     if ($ProcessHashAtStart -ne $currentHash) {
@@ -2372,7 +2640,19 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
                 $diffSummary)
             return
         }
-        Info ("WARN: SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE_NONFATAL codex_pid={0} tool_surface_at_process_start=mismatch start_tool_surface_sha256={1} current_tool_surface_sha256={2} tool_count={3} daemon_pid={4} snapshot={5} start_snapshot={6} {7} remediation=same-process reconnect is permitted; call real mcp__synapse.health/tool_profile_status from this Codex session and verify the daemon/tool surface readback." -f `
+        $handoff = Write-SynapseCodexRestartHandoff `
+            -Phase 'post_handoff_current_daemon' `
+            -Reason 'start_snapshot_hash_mismatch_after_daemon_handoff' `
+            -CodexAncestor $CodexAncestor `
+            -Surface $CurrentSurface `
+            -Diff $diff `
+            -ProcessHashAtStart $ProcessHashAtStart `
+            -ProcessSnapshotAtStart $ProcessSnapshotAtStart `
+            -CurrentSnapshotPath $SnapshotPath `
+            -SourceDir $SourceDir `
+            -Bind $Bind `
+            -TokenPath $TokenPath
+        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=mismatch start_tool_surface_sha256={1} current_tool_surface_sha256={2} tool_count={3} daemon_pid={4} snapshot={5} start_snapshot={6} handoff={7} {8} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume #1398 and verify real mcp__synapse metadata." -f `
             $CodexAncestor.ProcessId,
             $ProcessHashAtStart,
             $currentHash,
@@ -2380,8 +2660,8 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
             $CurrentSurface.daemon_pid,
             $SnapshotPath,
             $ProcessSnapshotAtStart,
+            $handoff.JsonPath,
             $diffSummary)
-        return
     }
 
     Info "Codex current-process tool surface matches daemon snapshot codex_pid=$($CodexAncestor.ProcessId) tool_surface_sha256=$currentHash tool_count=$($CurrentSurface.tool_count)"
@@ -3076,7 +3356,10 @@ Assert-CodexCandidateHandoffPreservesCurrentProcess `
     -CodexAncestor $codexAncestorBeforeHandoff `
     -CandidateSurface $candidatePreflight.ToolSurface `
     -ProcessHashAtStart $processToolSurfaceHashAtStart `
-    -ProcessSnapshotAtStart $processToolSurfaceSnapshotAtStart
+    -ProcessSnapshotAtStart $processToolSurfaceSnapshotAtStart `
+    -SourceDir $SourceDir `
+    -Bind $Bind `
+    -TokenPath $TokenPath
 
 Step "Preflighting Chrome direct localhost bridge before daemon handoff"
 $chromeBridgeInstaller = Join-Path $PSScriptRoot 'install-synapse-chrome-debugger.ps1'
