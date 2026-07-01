@@ -54,8 +54,7 @@ const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
 const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
-const ACT_FACADE_SOURCE_OF_TRUTH: &str =
-    "target/action audit row + post-action target readback + daemon-tool-events.jsonl";
+const ACT_FACADE_SOURCE_OF_TRUTH: &str = "target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +62,9 @@ enum ActOperation {
     #[default]
     Invoke,
     Foreground,
+    LeaseAcquire,
+    LeaseStatus,
+    LeaseRelease,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -70,7 +72,8 @@ enum ActOperation {
 struct ActParams {
     #[serde(default)]
     operation: ActOperation,
-    action: TargetActParams,
+    #[serde(default)]
+    action: Option<TargetActParams>,
     #[serde(default)]
     reason: Option<String>,
     #[serde(default)]
@@ -82,9 +85,12 @@ struct ActParams {
 struct ActResponse {
     operation: ActOperation,
     source_of_truth: String,
-    action: TargetActResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<TargetActResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     foreground: Option<ActForegroundEscalation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lease: Option<super::lease_tools::ControlLeaseResponse>,
 }
 
 #[derive(Clone, Debug, JsonSchema)]
@@ -415,7 +421,7 @@ pub struct ActForegroundResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. Raw foreground primitives remain profile-gated; this facade only delegates to the capability-preserving router and returns the action/readback source of truth."
+        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. operation=lease_acquire/status/release exposes the foreground input lease as a facade route without adding raw control_lease_* tools to the public surface. Raw foreground primitives remain profile-gated; this facade only delegates to capability-preserving routes and returns the action/lease readback source of truth."
     )]
     pub async fn act(
         &self,
@@ -423,30 +429,38 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActResponse>, ErrorData> {
         let params = params.0;
+        let trace_verb = params
+            .action
+            .as_ref()
+            .map(|action| action.verb.as_str())
+            .unwrap_or("");
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "act",
             operation = act_operation_name(params.operation),
-            verb = params.action.verb.as_str(),
+            verb = trace_verb,
             "tool.invocation kind=act"
         );
 
         match params.operation {
             ActOperation::Invoke => {
                 validate_act_invoke_params(&params)?;
+                let action_params = require_act_action(&params, ActOperation::Invoke)?;
                 let action = self
-                    .target_act(Parameters(params.action), request_context)
+                    .target_act(Parameters(action_params), request_context)
                     .await?
                     .0;
                 Ok(Json(ActResponse {
                     operation: ActOperation::Invoke,
                     source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                    action,
+                    action: Some(action),
                     foreground: None,
+                    lease: None,
                 }))
             }
             ActOperation::Foreground => {
                 validate_act_foreground_params(&params)?;
+                let action_params = require_act_action(&params, ActOperation::Foreground)?;
                 let reason = params.reason.ok_or_else(|| {
                     act_facade_error(
                         ActOperation::Foreground,
@@ -459,7 +473,7 @@ impl SynapseService {
                     .act_foreground(
                         Parameters(ActForegroundParams {
                             reason,
-                            action: params.action,
+                            action: action_params,
                             ttl_ms: params.ttl_ms,
                         }),
                         request_context,
@@ -469,8 +483,51 @@ impl SynapseService {
                 Ok(Json(ActResponse {
                     operation: ActOperation::Foreground,
                     source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                    action: response.action,
+                    action: Some(response.action),
                     foreground: Some(response.escalation),
+                    lease: None,
+                }))
+            }
+            ActOperation::LeaseAcquire => {
+                validate_act_lease_acquire_params(&params)?;
+                let ttl_ms = params
+                    .ttl_ms
+                    .unwrap_or(synapse_action::DEFAULT_LEASE_TTL_MS);
+                let lease = self
+                    .control_lease_acquire(
+                        Parameters(super::lease_tools::ControlLeaseAcquireParams { ttl_ms }),
+                        request_context,
+                    )
+                    .await?
+                    .0;
+                Ok(Json(ActResponse {
+                    operation: ActOperation::LeaseAcquire,
+                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                    action: None,
+                    foreground: None,
+                    lease: Some(lease),
+                }))
+            }
+            ActOperation::LeaseStatus => {
+                validate_act_lease_read_params(&params, ActOperation::LeaseStatus)?;
+                let lease = self.control_lease_status(request_context).await?.0;
+                Ok(Json(ActResponse {
+                    operation: ActOperation::LeaseStatus,
+                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                    action: None,
+                    foreground: None,
+                    lease: Some(lease),
+                }))
+            }
+            ActOperation::LeaseRelease => {
+                validate_act_lease_read_params(&params, ActOperation::LeaseRelease)?;
+                let lease = self.control_lease_release(request_context).await?.0;
+                Ok(Json(ActResponse {
+                    operation: ActOperation::LeaseRelease,
+                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                    action: None,
+                    foreground: None,
+                    lease: Some(lease),
                 }))
             }
         }
@@ -5148,10 +5205,14 @@ fn act_operation_name(operation: ActOperation) -> &'static str {
     match operation {
         ActOperation::Invoke => "invoke",
         ActOperation::Foreground => "foreground",
+        ActOperation::LeaseAcquire => "lease_acquire",
+        ActOperation::LeaseStatus => "lease_status",
+        ActOperation::LeaseRelease => "lease_release",
     }
 }
 
 fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
+    require_act_action(params, ActOperation::Invoke)?;
     if params.reason.is_some() {
         return Err(act_facade_error(
             ActOperation::Invoke,
@@ -5172,6 +5233,7 @@ fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
 }
 
 fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {
+    require_act_action(params, ActOperation::Foreground)?;
     if params
         .reason
         .as_deref()
@@ -5182,6 +5244,84 @@ fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {
             "act operation=foreground requires a non-empty reason",
             "pass a non-empty reason explaining why the audited foreground lane is required",
             "reason",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_act_lease_acquire_params(params: &ActParams) -> Result<(), ErrorData> {
+    reject_act_action(params, ActOperation::LeaseAcquire)?;
+    reject_act_reason(params, ActOperation::LeaseAcquire)?;
+    Ok(())
+}
+
+fn validate_act_lease_read_params(
+    params: &ActParams,
+    operation: ActOperation,
+) -> Result<(), ErrorData> {
+    reject_act_action(params, operation)?;
+    reject_act_reason(params, operation)?;
+    reject_act_ttl(params, operation)?;
+    Ok(())
+}
+
+fn require_act_action(
+    params: &ActParams,
+    operation: ActOperation,
+) -> Result<TargetActParams, ErrorData> {
+    params.action.clone().ok_or_else(|| {
+        act_facade_error(
+            operation,
+            format!(
+                "act operation={} requires action",
+                act_operation_name(operation)
+            ),
+            "pass a target_act action object for invoke/foreground operations",
+            "action",
+        )
+    })
+}
+
+fn reject_act_action(params: &ActParams, operation: ActOperation) -> Result<(), ErrorData> {
+    if params.action.is_some() {
+        return Err(act_facade_error(
+            operation,
+            format!(
+                "act operation={} rejects action; lease operations do not run target actions",
+                act_operation_name(operation)
+            ),
+            "remove action or use operation=invoke/foreground",
+            "action",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_act_reason(params: &ActParams, operation: ActOperation) -> Result<(), ErrorData> {
+    if params.reason.is_some() {
+        return Err(act_facade_error(
+            operation,
+            format!(
+                "act operation={} rejects reason; lease audit uses the underlying lease command and profile set carries escalation reason",
+                act_operation_name(operation)
+            ),
+            "remove reason; pass the profile transition reason to profile operation=set",
+            "reason",
+        ));
+    }
+    Ok(())
+}
+
+fn reject_act_ttl(params: &ActParams, operation: ActOperation) -> Result<(), ErrorData> {
+    if params.ttl_ms.is_some() {
+        return Err(act_facade_error(
+            operation,
+            format!(
+                "act operation={} rejects ttl_ms; ttl_ms is only valid with foreground or lease_acquire",
+                act_operation_name(operation)
+            ),
+            "remove ttl_ms or call operation=lease_acquire",
+            "ttl_ms",
         ));
     }
     Ok(())
@@ -6629,7 +6769,7 @@ mod tests {
     fn act_facade_invoke_rejects_foreground_fields() {
         let params = ActParams {
             operation: ActOperation::Invoke,
-            action: read_action(),
+            action: Some(read_action()),
             reason: Some("needs hardware foreground".to_owned()),
             ttl_ms: None,
         };
@@ -6655,7 +6795,7 @@ mod tests {
     fn act_facade_foreground_requires_non_empty_reason() {
         let params = ActParams {
             operation: ActOperation::Foreground,
-            action: read_action(),
+            action: Some(read_action()),
             reason: Some("   ".to_owned()),
             ttl_ms: Some(30_000),
         };
@@ -6697,8 +6837,67 @@ mod tests {
             .filter_map(Value::as_str)
             .collect::<std::collections::BTreeSet<_>>();
         assert!(
-            enum_values.contains("invoke") && enum_values.contains("foreground"),
-            "act operation schema must enumerate invoke/foreground: {operation_schema}"
+            enum_values.contains("invoke")
+                && enum_values.contains("foreground")
+                && enum_values.contains("lease_acquire")
+                && enum_values.contains("lease_status")
+                && enum_values.contains("lease_release"),
+            "act operation schema must enumerate invoke/foreground/lease operations: {operation_schema}"
+        );
+    }
+
+    #[test]
+    fn act_facade_invoke_requires_action() {
+        let params = ActParams {
+            operation: ActOperation::Invoke,
+            action: None,
+            reason: None,
+            ttl_ms: None,
+        };
+
+        let error =
+            validate_act_invoke_params(&params).expect_err("invoke must require action payload");
+
+        assert_eq!(
+            act_error_field(&error, "code").as_deref(),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert_eq!(
+            act_error_field(&error, "operation").as_deref(),
+            Some("invoke")
+        );
+        assert_eq!(
+            act_error_field(&error, "source_id").as_deref(),
+            Some("action")
+        );
+    }
+
+    #[test]
+    fn act_facade_lease_status_rejects_action_and_ttl() {
+        let with_action = ActParams {
+            operation: ActOperation::LeaseStatus,
+            action: Some(read_action()),
+            reason: None,
+            ttl_ms: None,
+        };
+        let action_error = validate_act_lease_read_params(&with_action, ActOperation::LeaseStatus)
+            .expect_err("lease_status must not accept target actions");
+        assert_eq!(
+            act_error_field(&action_error, "source_id").as_deref(),
+            Some("action")
+        );
+
+        let with_ttl = ActParams {
+            operation: ActOperation::LeaseStatus,
+            action: None,
+            reason: None,
+            ttl_ms: Some(1_000),
+        };
+        let ttl_error = validate_act_lease_read_params(&with_ttl, ActOperation::LeaseStatus)
+            .expect_err("lease_status must not accept ttl_ms");
+        assert_eq!(
+            act_error_field(&ttl_error, "source_id").as_deref(),
+            Some("ttl_ms")
         );
     }
 

@@ -55,7 +55,7 @@ const fn default_lease_ttl_ms() -> u64 {
 /// Flattened lease snapshot returned by every lease tool. `LeaseStatus` lives in
 /// `synapse-action` (no `schemars` dep there), so its fields are flattened here
 /// rather than embedded, keeping the action crate schema-free.
-#[derive(Debug, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ControlLeaseResponse {
     /// One of: `acquired`, `renewed`, `released`, `status`.

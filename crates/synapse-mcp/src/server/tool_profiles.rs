@@ -449,6 +449,37 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
                 "provide a non-empty reason and let the facade acquire/restore the audited foreground lane",
             ),
+            op(
+                "lease_acquire",
+                true,
+                false,
+                "synapse_action input lease + CF_SESSIONS session lease row + command audit row",
+                Some(
+                    "lease status readback + CF_SESSIONS persisted lease row + CF_ACTION_LOG command audit row",
+                ),
+                error_codes::ACTION_FOREGROUND_LEASE_BUSY,
+                "retry after the reported holder expires/releases, or call act operation=lease_status to inspect the owner",
+            ),
+            op(
+                "lease_status",
+                false,
+                false,
+                "synapse_action input lease + CF_SESSIONS persisted lease row",
+                None,
+                error_codes::HTTP_SESSION_INVALID,
+                "establish an MCP session before reading lease state",
+            ),
+            op(
+                "lease_release",
+                true,
+                false,
+                "synapse_action input lease + CF_SESSIONS persisted lease row + command audit row",
+                Some(
+                    "lease status readback + CF_SESSIONS persisted lease row deletion + CF_ACTION_LOG command audit row",
+                ),
+                error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
+                "only the owning session can release; call act operation=lease_status to inspect the owner",
+            ),
         ],
     ),
     facade_contract(
@@ -3291,7 +3322,7 @@ fn validate_profile_set_policy(
                 "session_id": session_id,
                 "profile": profile.as_str(),
                 "lease_proof": lease_proof,
-                "resolution": "call control_lease_acquire first, then retry profile operation=set or tool_profile_set with confirm_break_glass=true and a reason",
+                "resolution": "call act operation=lease_acquire first, then retry profile operation=set or tool_profile_set with confirm_break_glass=true and a reason",
             })),
         ));
     }
@@ -3399,7 +3430,8 @@ fn foreground_route_readiness(
     let mut remaining_steps = Vec::new();
     if !holds_foreground_lease {
         remaining_steps.push(
-            "control_lease_acquire (this session must own the foreground input lease)".to_owned(),
+            "act operation=lease_acquire (this session must own the foreground input lease)"
+                .to_owned(),
         );
     }
     if !profile_allows_foreground {
@@ -3420,15 +3452,15 @@ fn foreground_capability_policy(profile: ToolProfileKind) -> ToolProfileForegrou
     let (preferred_path, real_os_foreground_path) = match profile {
         ToolProfileKind::NormalAgent => (
             "only registered public facade tools are visible in the normal profile; implementation tools require an explicit advanced profile or a facade route",
-            "control_lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
+            "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
         ),
         ToolProfileKind::BrowserControl => (
             "debugger-free browser/target_act tools plus lease controls are visible in the task profile; raw CDP/chrome.debugger, shell, and spawn surfaces stay hidden",
-            "control_lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
+            "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
         ),
         ToolProfileKind::BrowserDebugger => (
             "browser-only raw CDP/chrome.debugger tools are visible by explicit profile; raw shell/spawn and OS foreground primitives stay hidden",
-            "control_lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
+            "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
         ),
         ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability => (
             "full raw surface is visible; prefer target_act/session-lane tools unless real OS foreground input is the intended lane",
@@ -3485,12 +3517,12 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
         ],
         "act_stroke" | "act_pad" => vec![
             "target operation=set",
-            "control_lease_acquire",
+            "act operation=lease_acquire",
             "profile operation=set profile=break_glass",
         ],
         "act_focus_window" => vec![
             "target operation=set",
-            "control_lease_acquire",
+            "act operation=lease_acquire",
             "profile operation=set profile=break_glass",
             "act operation=invoke focus_window",
             "session operation=list",
@@ -3507,7 +3539,7 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
         ],
         "release_all" => vec![
             "target operation=set",
-            "control_lease_release",
+            "act operation=lease_release",
             "session operation=list",
         ],
         "hidden_desktop_pip_frame" => {
