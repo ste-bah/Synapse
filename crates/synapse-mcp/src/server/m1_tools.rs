@@ -2468,7 +2468,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "List or manage tabs in an already-open Chromium browser window through the normal Chrome bridge without debugger attach or OS foreground input (#1298/#1188). operation=list enumerates tabs and is the default; operation=select binds a listed tab as this MCP session target; operation=new opens a background tab through the existing cdp_open_tab path; operation=close closes a same-session-owned tab through cdp_close_tab ownership checks. Human foreground is only an explicit discovery source for list/select when no session target/window is supplied; new/close require an active/explicit browser context. Each row includes a ready-to-pass set_target payload with kind=cdp and cdp_target_id=chrome-tab:<id>."
+        description = "List or manage tabs in an already-open Chromium browser window through the normal Chrome bridge without debugger attach or OS foreground input (#1298/#1188). operation=list enumerates tabs and is the default; operation=select binds a listed tab as this MCP session target; operation=activate makes a listed tab active/highlighted inside its existing Chrome window without OS foreground input or session target binding; operation=new opens a background tab through the existing cdp_open_tab path; operation=close closes a same-session-owned tab through cdp_close_tab ownership checks. Human foreground is only an explicit discovery source for list/select when no session target/window is supplied; activate/new/close require an active/explicit browser context. Each row includes a ready-to-pass set_target payload with kind=cdp and cdp_target_id=chrome-tab:<id>."
     )]
     pub async fn browser_tabs(
         &self,
@@ -5791,6 +5791,145 @@ impl SynapseService {
                     previous,
                     current: Some(current),
                     selected_tab: Some(selected),
+                    activated_cdp_target_id: None,
+                    activated_tab: None,
+                    before_active: None,
+                    active: None,
+                    highlighted: None,
+                    opened_cdp_target_id: None,
+                    closed_cdp_target_id: None,
+                    closed: false,
+                });
+                Ok(response)
+            }
+            BrowserTabsOperation::Activate => {
+                let requested = params.cdp_target_id.as_deref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "browser_tabs operation=activate is missing its validated cdp_target_id"
+                            .to_string(),
+                    )
+                })?;
+                if synapse_a11y::endpoint_for_window(window_context.hwnd).is_some() {
+                    return Err(mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        format!(
+                            "browser_tabs operation=activate targets the normal Chrome extension bridge, but window {:#x} exposes a raw CDP debug endpoint; use cdp_activate_tab directly for raw-CDP targets",
+                            window_context.hwnd
+                        ),
+                    ));
+                }
+                let before_response = self
+                    .browser_tabs_impl(
+                        session_id,
+                        window_context.clone(),
+                        used_human_os_foreground_window,
+                        BrowserTabsOperation::Activate,
+                        None,
+                    )
+                    .await?;
+                let before_tab = before_response
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.cdp_target_id.eq_ignore_ascii_case(requested))
+                    .cloned()
+                    .ok_or_else(|| {
+                        mcp_error(
+                            error_codes::ACTION_TARGET_INVALID,
+                            format!(
+                                "browser_tabs operation=activate could not find target {requested:?} in listed tabs for window {:#x}; refusing to activate a tab outside the requested Chrome window",
+                                before_response.window_hwnd
+                            ),
+                        )
+                    })?;
+                let activated = crate::chrome_debugger_bridge::activate_tab(
+                    window_context.hwnd,
+                    requested,
+                    DEFAULT_CDP_NAVIGATE_WAIT_TIMEOUT_MS,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "browser_tabs operation=activate Chrome bridge chrome.tabs.update({{active:true}}) failed: {}",
+                            error.detail()
+                        ),
+                    )
+                })?;
+                if !activated.target_id.eq_ignore_ascii_case(requested) {
+                    return Err(mcp_error(
+                        error_codes::ACTION_POSTCONDITION_FAILED,
+                        format!(
+                            "browser_tabs operation=activate postcondition failed: bridge returned target {:?}, expected {requested:?}",
+                            activated.target_id
+                        ),
+                    ));
+                }
+                if before_tab.chrome_window_id.is_some()
+                    && activated.chrome_window_id.is_some()
+                    && before_tab.chrome_window_id != activated.chrome_window_id
+                {
+                    return Err(mcp_error(
+                        error_codes::ACTION_POSTCONDITION_FAILED,
+                        format!(
+                            "browser_tabs operation=activate postcondition failed: activated Chrome window {:?}, expected {:?}",
+                            activated.chrome_window_id, before_tab.chrome_window_id
+                        ),
+                    ));
+                }
+                if !activated.active || activated.highlighted == Some(false) {
+                    return Err(mcp_error(
+                        error_codes::ACTION_POSTCONDITION_FAILED,
+                        format!(
+                            "browser_tabs operation=activate postcondition failed after chrome.tabs.update: active={} highlighted={:?}",
+                            activated.active, activated.highlighted
+                        ),
+                    ));
+                }
+                let mut response = self
+                    .browser_tabs_impl(
+                        session_id,
+                        window_context,
+                        used_human_os_foreground_window,
+                        BrowserTabsOperation::Activate,
+                        None,
+                    )
+                    .await?;
+                let activated_tab = response
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.cdp_target_id.eq_ignore_ascii_case(requested))
+                    .cloned()
+                    .ok_or_else(|| {
+                        mcp_error(
+                            error_codes::ACTION_POSTCONDITION_FAILED,
+                            format!(
+                                "browser_tabs operation=activate postcondition failed: target {requested:?} was absent from tabs.query readback after activation"
+                            ),
+                        )
+                    })?;
+                if !activated_tab.active || !activated_tab.highlighted {
+                    return Err(mcp_error(
+                        error_codes::ACTION_POSTCONDITION_FAILED,
+                        format!(
+                            "browser_tabs operation=activate tabs.query postcondition failed: target {requested:?} active={} highlighted={}",
+                            activated_tab.active, activated_tab.highlighted
+                        ),
+                    ));
+                }
+                response.mutation = Some(BrowserTabsMutation {
+                    operation: BrowserTabsOperation::Activate,
+                    requested_cdp_target_id: Some(requested.to_owned()),
+                    requested_url: None,
+                    previous: None,
+                    current: None,
+                    selected_tab: None,
+                    activated_cdp_target_id: Some(activated.target_id),
+                    activated_tab: Some(activated_tab),
+                    before_active: activated.before_active,
+                    active: Some(activated.active),
+                    highlighted: activated.highlighted,
                     opened_cdp_target_id: None,
                     closed_cdp_target_id: None,
                     closed: false,
@@ -5834,6 +5973,11 @@ impl SynapseService {
                         previous: opened.previous,
                         current: Some(opened.current),
                         selected_tab: None,
+                        activated_cdp_target_id: None,
+                        activated_tab: None,
+                        before_active: None,
+                        active: None,
+                        highlighted: None,
                         opened_cdp_target_id: Some(opened.cdp_target_id),
                         closed_cdp_target_id: None,
                         closed: false,
@@ -5883,6 +6027,11 @@ impl SynapseService {
                         previous: closed.previous,
                         current: closed.current,
                         selected_tab: None,
+                        activated_cdp_target_id: None,
+                        activated_tab: None,
+                        before_active: None,
+                        active: None,
+                        highlighted: None,
                         opened_cdp_target_id: None,
                         closed_cdp_target_id: Some(target_id),
                         closed: closed.closed,
@@ -9989,17 +10138,31 @@ fn validate_browser_tabs_params(params: BrowserTabsParams) -> Result<BrowserTabs
                 ));
             }
         }
-        BrowserTabsOperation::Select => {
+        BrowserTabsOperation::Select | BrowserTabsOperation::Activate => {
             if params.cdp_target_id.is_none() {
                 return Err(mcp_error(
                     error_codes::TOOL_PARAMS_INVALID,
-                    "browser_tabs operation=select requires cdp_target_id",
+                    format!(
+                        "browser_tabs operation={} requires cdp_target_id",
+                        match params.operation {
+                            BrowserTabsOperation::Select => "select",
+                            BrowserTabsOperation::Activate => "activate",
+                            _ => unreachable!("operation arm is select or activate"),
+                        }
+                    ),
                 ));
             }
             if params.url.is_some() {
                 return Err(mcp_error(
                     error_codes::TOOL_PARAMS_INVALID,
-                    "browser_tabs operation=select does not accept url",
+                    format!(
+                        "browser_tabs operation={} does not accept url",
+                        match params.operation {
+                            BrowserTabsOperation::Select => "select",
+                            BrowserTabsOperation::Activate => "activate",
+                            _ => unreachable!("operation arm is select or activate"),
+                        }
+                    ),
                 ));
             }
         }
@@ -18433,6 +18596,13 @@ mod tests {
         .expect("select requires only target id");
 
         validate_browser_tabs_params(BrowserTabsParams {
+            operation: BrowserTabsOperation::Activate,
+            cdp_target_id: Some("chrome-tab:11".to_owned()),
+            ..BrowserTabsParams::default()
+        })
+        .expect("activate requires only target id");
+
+        validate_browser_tabs_params(BrowserTabsParams {
             operation: BrowserTabsOperation::New,
             url: Some(String::new()),
             ..BrowserTabsParams::default()
@@ -18455,6 +18625,18 @@ mod tests {
             error
                 .message
                 .contains("operation=select requires cdp_target_id"),
+            "{error:?}"
+        );
+
+        let error = validate_browser_tabs_params(BrowserTabsParams {
+            operation: BrowserTabsOperation::Activate,
+            ..BrowserTabsParams::default()
+        })
+        .expect_err("activate target id is required");
+        assert!(
+            error
+                .message
+                .contains("operation=activate requires cdp_target_id"),
             "{error:?}"
         );
 
@@ -18504,6 +18686,20 @@ mod tests {
             error
                 .message
                 .contains("operation=select does not accept url"),
+            "{error:?}"
+        );
+
+        let error = validate_browser_tabs_params(BrowserTabsParams {
+            operation: BrowserTabsOperation::Activate,
+            cdp_target_id: Some("chrome-tab:11".to_owned()),
+            url: Some("https://example.test/".to_owned()),
+            ..BrowserTabsParams::default()
+        })
+        .expect_err("activate rejects url");
+        assert!(
+            error
+                .message
+                .contains("operation=activate does not accept url"),
             "{error:?}"
         );
 

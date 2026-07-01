@@ -1191,6 +1191,8 @@ pub enum BrowserTabsOperation {
     List,
     /// Bind an existing listed tab as this MCP session's active CDP target.
     Select,
+    /// Make an existing listed tab active/highlighted in its own Chrome window.
+    Activate,
     /// Open a new background tab in the already-open browser window.
     New,
     /// Close a tab owned by this MCP session.
@@ -1211,7 +1213,7 @@ pub struct BrowserTabsParams {
     /// discovery behavior is available only for `list` and `select`.
     #[serde(default)]
     pub window_hwnd: Option<i64>,
-    /// Target id for `select` or `close`.
+    /// Target id for `select`, `activate`, or `close`.
     #[serde(default)]
     pub cdp_target_id: Option<String>,
     /// URL for `new`. Empty string opens about:blank.
@@ -1254,6 +1256,16 @@ pub struct BrowserTabsMutation {
     pub current: Option<TargetWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_tab: Option<BrowserTabEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_cdp_target_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated_tab: Option<BrowserTabEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub highlighted: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_cdp_target_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -589,6 +589,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "select a cdp_target_id from the current tabs list",
             ),
             op(
+                "activate",
+                true,
+                false,
+                "Chrome bridge tabs.update(active=true) result + tabs.query readback",
+                Some("tabs.query active/highlighted readback for the requested target"),
+                error_codes::ACTION_TARGET_INVALID,
+                "activate a cdp_target_id from the requested window's current tabs list",
+            ),
+            op(
                 "new",
                 true,
                 false,
