@@ -117,10 +117,10 @@ Higher-level action and process/agent launch.
 | `act_run_shell` | Run allowlisted shell command (inline/durable, SSH-aware) | `command` (req), `args`, `working_dir?`, `env`, `timeout_ms=30000`, `execution_mode=Auto`, `durable_timeout_ms?`, `idempotency_key?` | spawns process |
 | `act_run_shell_start` | Start durable background shell job | `command` (req), `args`, `working_dir?`, `env`, `timeout_ms?`, `job_id?` | spawns durable job |
 | `act_run_shell_status` | Read durable job status/logs | `job_id` (req), `tail_bytes=8192` | read-only |
-| `act_run_shell_cancel` | Cancel durable job (+remote SSH cleanup) | `job_id` (req) | kills process tree |
+| `act_run_shell_cancel` | Cancel only the recorded durable job (+remote SSH cleanup when that job owns it) | `job_id` (req) | terminates job-owned process tree with readback |
 | `act_launch` | Launch allowlisted process (optional hidden desktop) | `target` (req), `args`, `working_dir?`, `env`, `wait_for_window_title_regex?`, `timeout_ms=30000`, `cdp_debug?`, `desktop?`, `windows_console_window_state?` | spawns process |
 | `act_spawn_agent` | Spawn durable child agent (Claude/Codex/local) | `template_id?`, `cli?`/`kind?`, `model?`, `model_ref?`, `prompt?`, `target?`, `working_dir?`, `mcp_url=127.0.0.1:7700/mcp`, `wait_timeout_ms=30000`, `require_approval_gate=true` | spawns agent process; waits for readiness |
-| `agent_spawn_task_started` | Spawned-agent cooperative readiness signal | `spawn_id` (req) | writes task-started.json |
+| `agent_spawn_task_started` | Legacy implementation route for spawned-agent cooperative readiness; normal public profile uses `agent operation=task_started` | `spawn_id` (req) | writes task-started.json |
 
 ## 16.5 Reflex / M3 (reflexes, subscriptions, replay, audio) — `m3_tools.rs`
 
@@ -211,12 +211,12 @@ Prompt-injection scoring + operator-supplied OpenAI-compatible model registry. S
 | Tool | Description | Params | Side effects |
 |------|-------------|--------|--------------|
 | `agent_interrupt` | Graceful interrupt via ranked clean channels | `session_id` (req) | sends interrupt; no kill |
-| `agent_kill` | Force-terminate agent process tree | `session_id` (req), `grace_ms=` (0–120000), graceful-first bool (default true) | kills process tree |
-| `fleet_stop` | Stop/interrupt all (or filtered) agents | `mode` (req, `kill`/`interrupt`), `confirm` (req, `STOP-FLEET`), `agent_kinds?` | kills/interrupts many agents |
+| `agent_kill` | Force-terminate one resolved Synapse-spawned agent/session tree | `session_id` (req), `grace_ms=` (0–120000), graceful-first bool (default true) | terminates recorded agent-owned tree with readback |
+| `fleet_stop` | Stop/interrupt only confirmed Synapse-managed agents matching the filter | `mode` (req, `kill`/`interrupt`), `confirm` (req, `STOP-FLEET`), `agent_kinds?` | terminates/interrupts recorded managed agents |
 | `agent_steer` | Inject steering instruction (turn/steer or mailbox) | `session_id` (req), `instruction` (req, ≤16000), receipt bool (default true) | steers agent; mailbox row |
 | `agent_pause` | Suspend agent process tree (NtSuspendProcess) | `session_id` (req) | suspends threads |
 | `agent_resume` | Resume paused agent tree | `session_id` (req) | resumes threads |
-| `agent_respawn` | Kill (if live) + relaunch from prior spawn metadata | `session_id` (req), `prompt` (req), continuity-packet bool (default true) | kills + spawns agent |
+| `agent_respawn` | Stop the resolved prior Synapse agent if live, then relaunch from its spawn metadata | `session_id` (req), `prompt` (req), continuity-packet bool (default true) | terminates recorded agent-owned tree + spawns agent |
 
 ### 16.10.2 Cost & stats — `agent_cost.rs`, `agent_stats.rs`
 
@@ -247,6 +247,7 @@ Prompt-injection scoring + operator-supplied OpenAI-compatible model registry. S
 | `agent_template_get` | Read one template | `template_id` (req) | read-only |
 | `agent_template_list` | List templates by id | (filter params) | read-only |
 | `agent_template_delete` | Delete a template | `template_id` (req) | deletes row |
+| `agent operation=task_started` | Public facade route for spawned-agent cooperative readiness | `task_started.spawn_id` (req) | writes and reads back task-started.json |
 | `task_create` | Create durable fleet task | title/description/acceptance, `priority` 1–5, `template_id` (+`template_params`) | writes task (FIFO order) |
 | `task_get` | Read one task + attempt history | `task_id` (req) | read-only |
 | `task_update` | Move state / edit fields (state machine validated) | `task_id` (req), state?, priority?, title?, … | mutates task; settles attempt |
@@ -263,7 +264,7 @@ Prompt-injection scoring + operator-supplied OpenAI-compatible model registry. S
 |------|-------------|--------|--------------|
 | `session_list` | Cross-session read model (compact/full views) | `view?`, `include_*?`, `include_closed?`, `live_only?`, `cursor?`, `limit?` | read-only |
 | `session_status` | One session row joined with foreground/lease/claims | `session_id` (req) | read-only |
-| `session_end` | End/cleanup a session | `session_id` (req) (summarized) | terminates session; cleans rows |
+| `session_end` | End/cleanup the caller's session or a fail-closed eligible stale/dead resource owner | `session_id` (req) (summarized) | terminates recorded session-owned resources; cleans rows |
 | `control_lease_acquire` | Acquire/renew process-global input lease | (lease params; refuse-not-block) | mutates lease |
 | `control_lease_release` | Release lease held by this session | none (empty schema) | mutates lease |
 | `control_lease_handoff` | Atomically hand off lease to a named live peer | recipient session id (req) | transfers lease |

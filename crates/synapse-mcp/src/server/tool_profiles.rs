@@ -1074,6 +1074,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "provide an existing template_id and verify the row is absent after delete",
             ),
             op(
+                "task_started",
+                true,
+                false,
+                "%LOCALAPPDATA%\\synapse\\agent-spawns task-started.json + MCP session id",
+                Some("task-started artifact path/session/readiness source"),
+                error_codes::TOOL_INTERNAL_ERROR,
+                "provide the daemon-issued spawn_id from the spawned MCP session",
+            ),
+            op(
                 "interrupt",
                 true,
                 false,

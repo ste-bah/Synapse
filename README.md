@@ -258,8 +258,9 @@ runs, data crunches) outlives any single request:
   timeout guesses wrong.
 - **`act_run_shell_status`** — check in any time: persisted `status.json`,
   stdout/stderr log tails, and a live process-table read.
-- **`act_run_shell_cancel`** — kill exactly the job's recorded process tree,
-  nothing else.
+- **`act_run_shell_cancel`** — terminate only the job's recorded process tree
+  and read the process table back; it never sweeps unrelated terminals,
+  browsers, IDEs, daemons, or port owners.
 - Jobs get complete Windows child environments, per-session isolation, and
   WSL reach (`wsl.exe`) — so "kick off the 6-hour build, check hourly, and
   summarize at dawn" is a real, safe workflow.

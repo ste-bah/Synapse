@@ -78,6 +78,17 @@ const INTERRUPT_MAILBOX_KIND: &str = "interrupt";
 
 const TOOL_AGENT_INTERRUPT: &str = "agent_interrupt";
 const TOOL_AGENT_KILL: &str = "agent_kill";
+
+#[cfg(windows)]
+fn apply_hidden_helper_window_flags(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn apply_hidden_helper_window_flags(_command: &mut Command) {}
 const TOOL_FLEET_STOP: &str = "fleet_stop";
 const TOOL_AGENT_STEER: &str = "agent_steer";
 const TOOL_AGENT_PAUSE: &str = "agent_pause";
@@ -3330,7 +3341,9 @@ fn run_codex_interrupt_helper(
     thread_id: &str,
     turn_id: &str,
 ) -> Result<Output, String> {
-    let mut child = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    apply_hidden_helper_window_flags(&mut command);
+    let mut child = command
         .args([
             "-NoLogo",
             "-NoProfile",
@@ -3398,7 +3411,9 @@ fn run_codex_steer_helper(
     turn_id: &str,
     instruction: &str,
 ) -> Result<Output, String> {
-    let mut child = Command::new("powershell.exe")
+    let mut command = Command::new("powershell.exe");
+    apply_hidden_helper_window_flags(&mut command);
+    let mut child = command
         .args([
             "-NoLogo",
             "-NoProfile",

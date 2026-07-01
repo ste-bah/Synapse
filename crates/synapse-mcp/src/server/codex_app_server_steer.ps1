@@ -83,6 +83,58 @@ function Get-JsonProperty($Object, [string]$Name) {
     return $property.Value
 }
 
+function Get-JsonShape($Value) {
+    if ($null -eq $Value) {
+        return 'null'
+    }
+    if ($Value -is [System.Array]) {
+        return 'array'
+    }
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $names = @($Value.PSObject.Properties | ForEach-Object { $_.Name })
+        return ('object:{0}' -f ($names -join ','))
+    }
+    return $Value.GetType().FullName
+}
+
+function New-CodexAppServerRpcFailure([int]$Id, [string]$ExpectedMethod, $ResponseError, [string]$Phase) {
+    $errorCode = Get-JsonProperty $ResponseError 'code'
+    $errorMessage = Get-JsonProperty $ResponseError 'message'
+    $errorData = Get-JsonProperty $ResponseError 'data'
+    return [ordered]@{
+        code = 'SYNAPSE_CODEX_APP_SERVER_RPC_FAILED'
+        protocol = 'codex_app_server_ws'
+        phase = $Phase
+        request_id = $Id
+        expected_method = $ExpectedMethod
+        response_error_shape = Get-JsonShape $ResponseError
+        response_error_code = $errorCode
+        response_error_message = $errorMessage
+        response_error_data_shape = Get-JsonShape $errorData
+        response_error_json = ($ResponseError | ConvertTo-Json -Compress -Depth 100)
+        endpoint = $Endpoint
+        thread_id = $ThreadId
+        expected_turn_id = $TurnId
+        control_path = $ControlPath
+        events_path = $EventsPath
+        remediation = 'Inspect codex app-server events/control artifacts and fix the request shape or Codex app-server state that produced the JSON-RPC error.'
+        at_unix_ms = Get-UnixMs
+    }
+}
+
+function Throw-CodexAppServerRpcFailure([int]$Id, [string]$ExpectedMethod, $ResponseError, [string]$Phase) {
+    $failure = New-CodexAppServerRpcFailure -Id $Id -ExpectedMethod $ExpectedMethod -ResponseError $ResponseError -Phase $Phase
+    Add-JsonLine -Path $EventsPath -Value ([ordered]@{
+        direction = 'server'
+        phase = 'response_error'
+        id = $Id
+        expected_method = $ExpectedMethod
+        failure = $failure
+        at_unix_ms = Get-UnixMs
+    })
+    throw ($failure | ConvertTo-Json -Compress -Depth 100)
+}
+
 function Update-Control([string]$Status, $ErrorText, $ResultTurnId) {
     $current = [ordered]@{}
     if (Test-Path -LiteralPath $ControlPath) {
@@ -127,7 +179,7 @@ function Receive-WebSocketText($Socket) {
     return $builder.ToString()
 }
 
-function Receive-Response($Socket, [int]$Id) {
+function Receive-Response($Socket, [int]$Id, [string]$ExpectedMethod) {
     while ($true) {
         $text = Receive-WebSocketText $Socket
         Add-JsonLine -Path $EventsPath -Value $text
@@ -136,8 +188,7 @@ function Receive-Response($Socket, [int]$Id) {
         if ($null -ne $messageId -and [int]$messageId -eq $Id) {
             $responseError = Get-JsonProperty $message 'error'
             if ($null -ne $responseError) {
-                $errorJson = $responseError | ConvertTo-Json -Compress -Depth 100
-                throw "codex app-server request id $Id failed: $errorJson"
+                Throw-CodexAppServerRpcFailure -Id $Id -ExpectedMethod $ExpectedMethod -ResponseError $responseError -Phase 'receive_response'
             }
             return $message
         }
@@ -157,7 +208,7 @@ try {
             capabilities = [ordered]@{ experimentalApi = $true }
         }
     })
-    [void](Receive-Response $socket 1)
+    [void](Receive-Response $socket 1 'initialize')
 
     Send-WebSocketJson $socket ([ordered]@{
         id = 2
@@ -176,7 +227,7 @@ try {
             }
         }
     })
-    $steerResponse = Receive-Response $socket 2
+    $steerResponse = Receive-Response $socket 2 'turn/steer'
     $steerResult = Get-JsonProperty $steerResponse 'result'
     $resultTurnId = [string](Get-JsonProperty $steerResult 'turnId')
     if ([string]::IsNullOrWhiteSpace($resultTurnId)) {
