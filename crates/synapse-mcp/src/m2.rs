@@ -846,6 +846,7 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
     session_id: Option<&str>,
     ttl_ms: u64,
 ) -> Result<ForegroundInputLeaseGuard, ErrorData> {
+    validate_foreground_input_lease_ttl_ms(tool, ttl_ms)?;
     let session_id = session_id.ok_or_else(|| {
         crate::m1::mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -928,6 +929,44 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
             }))
         }
     }
+}
+
+fn validate_foreground_input_lease_ttl_ms(
+    tool: &'static str,
+    ttl_ms: u64,
+) -> Result<(), ErrorData> {
+    if (synapse_action::MIN_LEASE_TTL_MS..=synapse_action::MAX_LEASE_TTL_MS).contains(&ttl_ms) {
+        return Ok(());
+    }
+    tracing::warn!(
+        code = error_codes::TOOL_PARAMS_INVALID,
+        detail_code = "LEASE_TTL_OUT_OF_RANGE",
+        tool,
+        ttl_ms,
+        min_ttl_ms = synapse_action::MIN_LEASE_TTL_MS,
+        max_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
+        source_of_truth = "request ttl_ms before synapse_action::lease mutation",
+        "foreground helper ttl_ms rejected before lease mutation"
+    );
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{tool} ttl_ms must be between {} and {}; got {ttl_ms}",
+            synapse_action::MIN_LEASE_TTL_MS,
+            synapse_action::MAX_LEASE_TTL_MS
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "detail_code": "LEASE_TTL_OUT_OF_RANGE",
+            "tool": tool,
+            "source_id": "ttl_ms",
+            "source_of_truth": "request ttl_ms before synapse_action::lease mutation",
+            "min_ttl_ms": synapse_action::MIN_LEASE_TTL_MS,
+            "max_ttl_ms": synapse_action::MAX_LEASE_TTL_MS,
+            "ttl_ms": ttl_ms,
+            "remediation": "pass ttl_ms in the advertised lease range or omit it for the default",
+        })),
+    ))
 }
 
 pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
