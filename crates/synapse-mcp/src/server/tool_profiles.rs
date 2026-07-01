@@ -2602,11 +2602,24 @@ pub(crate) struct CodexRestartHandoffReadback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_issue_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_bind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid_authoritative_for_configured_bind: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_tool_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_tool_surface_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_process_start_snapshot_status: Option<String>,
+    pub live_daemon_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid_matches_live_daemon: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_pid_mismatch_detail: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -4133,9 +4146,16 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
                 stale_codex_pid: None,
                 stale_codex_command_line: None,
                 active_issue_ref: None,
+                daemon_pid: None,
+                daemon_bind: None,
+                daemon_pid_role: None,
+                daemon_pid_authoritative_for_configured_bind: None,
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                live_daemon_pid: std::process::id(),
+                daemon_pid_matches_live_daemon: None,
+                daemon_pid_mismatch_detail: None,
             }),
         };
     let public_tools_missing_from_host_snapshot =
@@ -4282,9 +4302,16 @@ fn latest_codex_restart_handoff(dir: &Path) -> Option<CodexRestartHandoffReadbac
                 stale_codex_pid: None,
                 stale_codex_command_line: None,
                 active_issue_ref: None,
+                daemon_pid: None,
+                daemon_bind: None,
+                daemon_pid_role: None,
+                daemon_pid_authoritative_for_configured_bind: None,
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                live_daemon_pid: std::process::id(),
+                daemon_pid_matches_live_daemon: None,
+                daemon_pid_mismatch_detail: None,
             });
         }
     };
@@ -4341,9 +4368,16 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
                 stale_codex_pid: None,
                 stale_codex_command_line: None,
                 active_issue_ref: None,
+                daemon_pid: None,
+                daemon_bind: None,
+                daemon_pid_role: None,
+                daemon_pid_authoritative_for_configured_bind: None,
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                live_daemon_pid: std::process::id(),
+                daemon_pid_matches_live_daemon: None,
+                daemon_pid_mismatch_detail: None,
             };
         }
     };
@@ -4367,12 +4401,37 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
                 stale_codex_pid: None,
                 stale_codex_command_line: None,
                 active_issue_ref: None,
+                daemon_pid: None,
+                daemon_bind: None,
+                daemon_pid_role: None,
+                daemon_pid_authoritative_for_configured_bind: None,
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                live_daemon_pid: std::process::id(),
+                daemon_pid_matches_live_daemon: None,
+                daemon_pid_mismatch_detail: None,
             };
         }
     };
+    let live_daemon_pid = std::process::id();
+    let daemon_pid = json_pointer_u32(&value, "/daemon/pid");
+    let daemon_pid_matches_live_daemon = daemon_pid.map(|pid| pid == live_daemon_pid);
+    let daemon_pid_role = json_pointer_string(&value, "/daemon/pid_role");
+    let daemon_pid_mismatch_detail =
+        daemon_pid_matches_live_daemon.and_then(|matches_live_daemon| {
+            if matches_live_daemon {
+                None
+            } else {
+                Some(format!(
+                    "handoff daemon pid {} does not match live daemon pid {} serving this profile/telemetry request; phase={} role={}",
+                    daemon_pid.unwrap_or_default(),
+                    live_daemon_pid,
+                    json_pointer_string(&value, "/phase").unwrap_or_else(|| "unknown".to_owned()),
+                    daemon_pid_role.as_deref().unwrap_or("unspecified")
+                ))
+            }
+        });
     CodexRestartHandoffReadback {
         path: path_text,
         exists: true,
@@ -4389,12 +4448,22 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
         stale_codex_pid: json_pointer_u32(&value, "/codex_process/pid"),
         stale_codex_command_line: json_pointer_string(&value, "/codex_process/command_line"),
         active_issue_ref: json_pointer_string(&value, "/active_issue/issue_ref"),
+        daemon_pid,
+        daemon_bind: json_pointer_string(&value, "/daemon/bind"),
+        daemon_pid_role,
+        daemon_pid_authoritative_for_configured_bind: json_pointer_bool(
+            &value,
+            "/daemon/pid_authoritative_for_configured_bind",
+        ),
         daemon_tool_count: json_pointer_usize(&value, "/daemon/tool_count"),
         daemon_tool_surface_sha256: json_pointer_string(&value, "/daemon/tool_surface_sha256"),
         current_process_start_snapshot_status: json_pointer_string(
             &value,
             "/current_process_start_surface/snapshot_status",
         ),
+        live_daemon_pid,
+        daemon_pid_matches_live_daemon,
+        daemon_pid_mismatch_detail,
     }
 }
 
@@ -5387,6 +5456,77 @@ mod tests {
                 .as_str()
                 .is_some_and(|reason| reason.contains("mutates_state requires readback"))
         }));
+    }
+
+    #[test]
+    fn codex_restart_handoff_readback_marks_candidate_pid_mismatch() {
+        let dir = TempDir::new().expect("tmp");
+        let path = dir
+            .path()
+            .join("codex-restart-handoff-1234-20260701T000000000Z.json");
+        let live_pid = std::process::id();
+        let candidate_pid = if live_pid == u32::MAX {
+            live_pid - 1
+        } else {
+            live_pid + 1
+        };
+        let record = json!({
+            "schema_version": 2,
+            "artifact_kind": "synapse_codex_restart_handoff",
+            "created_at_utc": "2026-07-01T00:00:00Z",
+            "reason_code": "SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE",
+            "reason": "test",
+            "phase": "pre_handoff_candidate",
+            "required_restart": true,
+            "no_in_process_hot_refresh": true,
+            "codex_process": {
+                "pid": 1234,
+                "name": "codex.exe",
+                "command_line": "codex resume --yolo"
+            },
+            "daemon": {
+                "bind": "127.0.0.1:7700",
+                "pid": candidate_pid,
+                "pid_role": "preflight_candidate",
+                "pid_authoritative_for_configured_bind": false,
+                "tool_count": 40,
+                "tool_surface_sha256": "test-surface",
+                "snapshot_path": null
+            },
+            "current_process_start_surface": {
+                "snapshot_status": "missing_env"
+            },
+            "active_issue": {
+                "issue_ref": "#1471"
+            }
+        });
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&record).expect("serialize handoff"),
+        )
+        .expect("write handoff");
+
+        let readback = codex_restart_handoff_readback(&path);
+
+        assert_eq!(readback.daemon_pid, Some(candidate_pid));
+        assert_eq!(readback.daemon_bind.as_deref(), Some("127.0.0.1:7700"));
+        assert_eq!(
+            readback.daemon_pid_role.as_deref(),
+            Some("preflight_candidate")
+        );
+        assert_eq!(
+            readback.daemon_pid_authoritative_for_configured_bind,
+            Some(false)
+        );
+        assert_eq!(readback.live_daemon_pid, live_pid);
+        assert_eq!(readback.daemon_pid_matches_live_daemon, Some(false));
+        assert!(
+            readback
+                .daemon_pid_mismatch_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("pre_handoff_candidate")
+                    && detail.contains("preflight_candidate"))
+        );
     }
 
     #[test]

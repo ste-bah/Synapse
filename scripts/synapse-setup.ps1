@@ -2391,6 +2391,13 @@ function Write-SynapseCodexRestartHandoff {
     $daemon = [ordered]@{
         bind = $Bind
         pid = if ($Surface -and $Surface.PSObject.Properties['daemon_pid']) { $Surface.daemon_pid } else { $null }
+        pid_role = if ($Phase -eq 'pre_handoff_candidate') { 'preflight_candidate' } else { 'installed_configured_daemon' }
+        pid_authoritative_for_configured_bind = ($Phase -ne 'pre_handoff_candidate')
+        pid_expectation = if ($Phase -eq 'pre_handoff_candidate') {
+            'This PID belongs to the isolated candidate daemon used before live handoff and is expected to be stopped before the configured daemon is installed.'
+        } else {
+            'This PID is the installed daemon observed after live handoff and should own the configured bind unless a later setup run superseded it.'
+        }
         tool_count = if ($Surface -and $Surface.PSObject.Properties['tool_count']) { $Surface.tool_count } else { $null }
         tool_surface_sha256 = if ($Surface -and $Surface.PSObject.Properties['tool_surface_sha256']) { [string]$Surface.tool_surface_sha256 } else { $null }
         snapshot_path = $CurrentSnapshotPath
@@ -2665,7 +2672,8 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
         [AllowNull()][string]$SourceDir,
         [AllowNull()][string]$Bind,
         [AllowNull()][string]$TokenPath,
-        [AllowNull()][string]$ActiveIssue
+        [AllowNull()][string]$ActiveIssue,
+        [switch]$NonFatal
     )
 
     if ($null -eq $CodexAncestor) {
@@ -2690,7 +2698,7 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
             -Bind $Bind `
             -TokenPath $TokenPath `
             -ActiveIssue $ActiveIssue
-        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=missing current_tool_surface_sha256={1} tool_count={2} daemon_pid={3} snapshot={4} start_snapshot={5} handoff={6} {7} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume the active issue named in the handoff and verify real mcp__synapse metadata." -f `
+        $message = ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=missing current_tool_surface_sha256={1} tool_count={2} daemon_pid={3} snapshot={4} start_snapshot={5} handoff={6} {7} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume the active issue named in the handoff and verify real mcp__synapse metadata." -f `
             $CodexAncestor.ProcessId,
             $currentHash,
             $CurrentSurface.tool_count,
@@ -2699,6 +2707,11 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
             $ProcessSnapshotAtStart,
             $handoff.JsonPath,
             $diffSummary)
+        if ($NonFatal) {
+            Info "WARN: $message"
+            return
+        }
+        Die $message
     }
 
     if ($ProcessHashAtStart -ne $currentHash) {
@@ -2727,7 +2740,7 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
             -Bind $Bind `
             -TokenPath $TokenPath `
             -ActiveIssue $ActiveIssue
-        Die ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=mismatch start_tool_surface_sha256={1} current_tool_surface_sha256={2} tool_count={3} daemon_pid={4} snapshot={5} start_snapshot={6} handoff={7} {8} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume the active issue named in the handoff and verify real mcp__synapse metadata." -f `
+        $message = ("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE codex_pid={0} tool_surface_at_process_start=mismatch start_tool_surface_sha256={1} current_tool_surface_sha256={2} tool_count={3} daemon_pid={4} snapshot={5} start_snapshot={6} handoff={7} {8} remediation=restart Codex through the patched launcher, read the handoff plus STATE\\RECOVERY_NOTES.md, then resume the active issue named in the handoff and verify real mcp__synapse metadata." -f `
             $CodexAncestor.ProcessId,
             $ProcessHashAtStart,
             $currentHash,
@@ -2737,6 +2750,11 @@ function Assert-CodexCurrentProcessToolSurfaceFresh {
             $ProcessSnapshotAtStart,
             $handoff.JsonPath,
             $diffSummary)
+        if ($NonFatal) {
+            Info "WARN: $message"
+            return
+        }
+        Die $message
     }
 
     Info "Codex current-process tool surface matches daemon snapshot codex_pid=$($CodexAncestor.ProcessId) tool_surface_sha256=$currentHash tool_count=$($CurrentSurface.tool_count)"
@@ -3726,7 +3744,23 @@ if (-not $SkipClientWiring) {
         -TokenPath $TokenPath `
         -ActiveIssue $ActiveIssue
 } else {
-    Info "Skipped Codex current-process freshness check because -SkipClientWiring was set; daemon health and tools/list were still verified."
+    $codexAncestor = Get-SynapseCurrentCodexAncestor
+    if ($codexAncestor) {
+        Assert-CodexCurrentProcessToolSurfaceFresh `
+            -CodexAncestor $codexAncestor `
+            -CurrentSurface $toolSurface `
+            -ProcessHashAtStart $processToolSurfaceHashAtStart `
+            -ProcessSnapshotAtStart $processToolSurfaceSnapshotAtStart `
+            -SnapshotPath $CodexToolSurfaceSnapshotPath `
+            -SourceDir $SourceDir `
+            -Bind $Bind `
+            -TokenPath $TokenPath `
+            -ActiveIssue $ActiveIssue `
+            -NonFatal
+        Info "Skipped client wiring because -SkipClientWiring was set; current-process freshness check still wrote any required current-daemon handoff in nonfatal mode."
+    } else {
+        Info "Skipped client wiring because -SkipClientWiring was set; no current Codex ancestor was found for a freshness handoff."
+    }
 }
 
 Step "Done"
