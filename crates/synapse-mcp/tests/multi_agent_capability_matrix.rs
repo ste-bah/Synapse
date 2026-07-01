@@ -29,8 +29,9 @@ const ALLOWED_STATUS: [&str; 8] = [
     "sessionless",
 ];
 
-const ALLOWED_DEFAULT_EXPOSURE: [&str; 4] = [
+const ALLOWED_DEFAULT_EXPOSURE: [&str; 5] = [
     "normal_agent",
+    "facade_only",
     "browser_debugger",
     "break_glass",
     "debug_only",
@@ -351,6 +352,23 @@ fn assert_exposure_row_complete(row: &ExposureRow) -> anyhow::Result<()> {
             "{} cannot be both default normal_agent and break-glass-only",
             row.tool
         );
+        ensure!(
+            row.default_exposure != "facade_only",
+            "{} cannot be both facade_only and break-glass-only",
+            row.tool
+        );
+    }
+    if row.default_exposure == "facade_only" {
+        ensure!(
+            row.hidden_internal == "yes",
+            "{} facade_only rows must mark the raw implementation name hidden/internal",
+            row.tool
+        );
+        ensure!(
+            !row.safe_replacement_tool.starts_with("none"),
+            "{} facade_only rows must name the public facade route",
+            row.tool
+        );
     }
     if row.foreground_prone_wording == "yes" {
         ensure!(
@@ -378,9 +396,10 @@ fn assert_exposure_overlay_matches_policy(
             .collect::<Vec<_>>()
     );
 
+    let public_tools = parse_string_array_const(TOOL_PROFILES_SOURCE, "PUBLIC_TOOL_NAMES")?;
     let normal_exact = parse_string_array_const(TOOL_PROFILES_SOURCE, "NORMAL_ALLOWED_EXACT")?;
     let normal_prefixes =
-        parse_string_array_const(TOOL_PROFILES_SOURCE, "NORMAL_ALLOWED_PREFIXES")?;
+        parse_string_array_const_allow_empty(TOOL_PROFILES_SOURCE, "NORMAL_ALLOWED_PREFIXES")?;
     let browser_debugger_only =
         parse_string_array_const(TOOL_PROFILES_SOURCE, "BROWSER_DEBUGGER_ONLY_EXACT")?;
     let break_glass_hazards =
@@ -424,18 +443,60 @@ fn assert_exposure_overlay_matches_policy(
                 "{} browser_debugger tool must not be classified break-glass-only",
                 tool
             );
-        } else {
+        } else if public_tools.contains(tool) {
+            ensure!(
+                row.default_exposure == "browser_debugger",
+                "{} public profile-gated tool must be classified browser_debugger, got {}",
+                tool,
+                row.default_exposure
+            );
+            ensure!(
+                row.break_glass_only == "no",
+                "{} public profile-gated tool must not be classified break-glass-only",
+                tool
+            );
+        } else if break_glass_hazards.contains(tool) {
             ensure!(
                 row.default_exposure == "break_glass",
-                "{} hidden from normal_agent must be classified break_glass or debug_only, got {}",
+                "{} break-glass hazard must be classified break_glass, got {}",
                 tool,
                 row.default_exposure
             );
             ensure!(
                 row.break_glass_only == "yes",
-                "{} hidden from normal_agent must be break-glass-only",
+                "{} break-glass hazard must be break-glass-only",
                 tool
             );
+        } else {
+            ensure!(
+                matches!(row.default_exposure.as_str(), "facade_only" | "break_glass"),
+                "{} hidden implementation tool must be classified facade_only, browser_debugger, break_glass, or debug_only; got {}",
+                tool,
+                row.default_exposure
+            );
+            if row.default_exposure == "facade_only" {
+                ensure!(
+                    row.break_glass_only == "no",
+                    "{} facade-routed implementation tool must not be break-glass-only",
+                    tool
+                );
+                ensure!(
+                    row.hidden_internal == "yes",
+                    "{} facade-routed implementation tool must mark the raw name hidden/internal",
+                    tool
+                );
+                ensure!(
+                    !row.safe_replacement_tool.starts_with("none"),
+                    "{} facade-routed implementation tool must name the public facade route",
+                    tool
+                );
+            } else {
+                ensure!(
+                    row.break_glass_only == "yes",
+                    "{} break-glass hidden implementation tool must be break-glass-only",
+                    tool
+                );
+            }
         }
 
         if break_glass_hazards.contains(tool) && !tool.starts_with("action_diagnostic_") {
@@ -475,22 +536,22 @@ fn assert_exposure_overlay_matches_policy(
     assert_representative_exposure(
         exposure_by_tool,
         "cdp_navigate_tab",
-        "normal_agent",
+        "facade_only",
         "no",
         "no",
     )?;
     assert_representative_exposure(
         exposure_by_tool,
         "cdp_target_info",
-        "normal_agent",
+        "facade_only",
         "no",
         "no",
     )?;
-    assert_representative_exposure(exposure_by_tool, "set_target", "normal_agent", "no", "no")?;
+    assert_representative_exposure(exposure_by_tool, "set_target", "facade_only", "no", "no")?;
     assert_representative_exposure(
         exposure_by_tool,
         "tool_profile_status",
-        "normal_agent",
+        "facade_only",
         "no",
         "no",
     )?;
@@ -539,6 +600,15 @@ fn assert_representative_exposure(
 }
 
 fn parse_string_array_const(source: &str, const_name: &str) -> anyhow::Result<BTreeSet<String>> {
+    let values = parse_string_array_const_allow_empty(source, const_name)?;
+    ensure!(!values.is_empty(), "{const_name} parsed as empty");
+    Ok(values)
+}
+
+fn parse_string_array_const_allow_empty(
+    source: &str,
+    const_name: &str,
+) -> anyhow::Result<BTreeSet<String>> {
     let marker = format!("const {const_name}: &[&str] = &[");
     let start = source
         .find(&marker)
@@ -561,7 +631,6 @@ fn parse_string_array_const(source: &str, const_name: &str) -> anyhow::Result<BT
             .with_context(|| format!("{const_name} malformed value: {trimmed}"))?;
         values.insert(value.to_owned());
     }
-    ensure!(!values.is_empty(), "{const_name} parsed as empty");
     Ok(values)
 }
 
