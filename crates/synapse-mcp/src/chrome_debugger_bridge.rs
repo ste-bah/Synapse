@@ -195,6 +195,13 @@ impl ChromeDebuggerBridgeError {
         }
     }
 
+    fn params_invalid(detail: impl Into<String>) -> Self {
+        Self {
+            code: error_codes::TOOL_PARAMS_INVALID,
+            detail: detail.into(),
+        }
+    }
+
     fn extension(code: Option<&str>, detail: impl Into<String>) -> Self {
         let code = match code {
             Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE) => {
@@ -6969,8 +6976,8 @@ pub(crate) fn validate_reload_wait_timeout(
 ) -> Result<u64, ChromeDebuggerBridgeError> {
     let value = value.unwrap_or(DEFAULT_RELOAD_WAIT_TIMEOUT_MS);
     if value == 0 || value > MAX_RELOAD_WAIT_TIMEOUT_MS {
-        return Err(ChromeDebuggerBridgeError::protocol(format!(
-            "cdp_bridge_reload wait_timeout_ms must be 1..={MAX_RELOAD_WAIT_TIMEOUT_MS}"
+        return Err(ChromeDebuggerBridgeError::params_invalid(format!(
+            "cdp_bridge_reload wait_timeout_ms must be 1..={MAX_RELOAD_WAIT_TIMEOUT_MS}, got {value}; remediation=use a positive wait_timeout_ms at or below {MAX_RELOAD_WAIT_TIMEOUT_MS}; source_of_truth=local cdp_bridge_reload parameter validation before bridge reload command"
         )));
     }
     Ok(value)
@@ -9221,8 +9228,14 @@ mod tests {
             validate_reload_wait_timeout(Some(MAX_RELOAD_WAIT_TIMEOUT_MS)).expect("max"),
             MAX_RELOAD_WAIT_TIMEOUT_MS
         );
-        assert!(validate_reload_wait_timeout(Some(0)).is_err());
-        assert!(validate_reload_wait_timeout(Some(MAX_RELOAD_WAIT_TIMEOUT_MS + 1)).is_err());
+        for invalid in [0, MAX_RELOAD_WAIT_TIMEOUT_MS + 1] {
+            let error =
+                validate_reload_wait_timeout(Some(invalid)).expect_err("invalid timeout rejected");
+            assert_eq!(error.code(), error_codes::TOOL_PARAMS_INVALID);
+            assert!(error.detail().contains("wait_timeout_ms must be 1..="));
+            assert!(error.detail().contains(&format!("got {invalid}")));
+            assert!(error.detail().contains("before bridge reload command"));
+        }
     }
 
     #[test]
