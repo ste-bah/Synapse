@@ -306,9 +306,10 @@ impl SynapseService {
         let mut returned = Vec::new();
         let mut next_start_key_hex = None;
         let mut more_after_window = false;
+        let mut more_matching_rows = false;
         let mut stopped_at_end_ts = false;
 
-        while scanned_rows < scan_limit && returned.len() < limit {
+        while scanned_rows < scan_limit {
             let remaining_scan = scan_limit.saturating_sub(scanned_rows);
             let batch_limit = remaining_scan.min(COMMAND_AUDIT_QUERY_BATCH_ROWS);
             if batch_limit == 0 {
@@ -341,26 +342,32 @@ impl SynapseService {
                 if !audit_row_matches(&row, &filters) {
                     continue;
                 }
-                matched_rows = matched_rows.saturating_add(1);
-                returned.push(command_audit_query_row(&key, &value, row));
                 if returned.len() >= limit {
+                    more_matching_rows = true;
+                    next_start_key_hex = Some(hex_encode(&key));
                     break;
                 }
+                matched_rows = matched_rows.saturating_add(1);
+                returned.push(command_audit_query_row(&key, &value, row));
+                next_start_key_hex = Some(hex_encode(&key_after(&key)));
             }
 
             if let Some(last_key) = last_scanned_key {
-                next_start_key_hex = Some(hex_encode(&key_after(&last_key)));
-                cursor = key_after(&last_key);
+                let resume_key = key_after(&last_key);
+                if !more_matching_rows {
+                    next_start_key_hex = Some(hex_encode(&resume_key));
+                }
+                cursor = resume_key;
             }
 
-            if stopped_at_end_ts || returned.len() >= limit || !more_after_window {
+            if stopped_at_end_ts || more_matching_rows || !more_after_window {
                 break;
             }
         }
 
-        let scan_budget_exhausted = scanned_rows >= scan_limit && more_after_window;
-        let row_budget_exhausted = returned.len() >= limit && !stopped_at_end_ts;
-        let partial = scan_budget_exhausted || row_budget_exhausted;
+        let scan_budget_exhausted =
+            scanned_rows >= scan_limit && more_after_window && !stopped_at_end_ts;
+        let partial = scan_budget_exhausted || more_matching_rows;
         if !partial {
             next_start_key_hex = None;
         }
@@ -903,6 +910,52 @@ fn error_data_code(error: &ErrorData) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{num::NonZeroUsize, path::Path};
+
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
+
+    fn service_with_db(path: &Path) -> SynapseService {
+        SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+            CancellationToken::new(),
+            "test",
+            CancellationToken::new(),
+            &M2ServiceConfig::default(),
+            M3ServiceConfig::from_cli_parts(
+                Some(path.join("db")),
+                Some(path.to_path_buf()),
+                false,
+                "127.0.0.1:0".to_owned(),
+                NonZeroUsize::new(4).expect("nonzero"),
+                false,
+                true,
+                None,
+                false,
+                None,
+            ),
+            M4ServiceConfig::default(),
+        )
+        .expect("construct service")
+    }
+
+    fn seed_command_rows(service: &SynapseService, tool: &'static str, rows: usize) {
+        for index in 0..rows {
+            service
+                .command_audit_final(CommandAuditInput::mcp(
+                    tool,
+                    "list",
+                    Some("issue1487-session".to_owned()),
+                    None,
+                    json!({ "index": index }),
+                    json!({}),
+                    json!({ "ok": true }),
+                    "ok",
+                ))
+                .expect("write command audit row");
+        }
+    }
 
     #[test]
     fn command_audit_redacts_sensitive_payload_fields() {
@@ -940,5 +993,64 @@ mod tests {
                 .and_then(Value::as_u64)
                 .is_some_and(|omitted| omitted > 0)
         );
+    }
+
+    #[test]
+    fn command_audit_query_exact_limit_is_complete_but_extra_match_is_partial() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let tool = "issue1487_browser_tabs";
+        seed_command_rows(&service, tool, 3);
+
+        let exact = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(3),
+                scan_limit: Some(16),
+                tool: Some(tool.to_owned()),
+                ..Default::default()
+            })
+            .expect("exact-limit page should query");
+        assert_eq!(exact.returned_count, 3);
+        assert_eq!(exact.matched_rows, 3);
+        assert!(!exact.partial);
+        assert!(exact.exhausted);
+        assert!(exact.next_start_key_hex.is_none());
+
+        let extra_match = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(2),
+                scan_limit: Some(16),
+                tool: Some(tool.to_owned()),
+                ..Default::default()
+            })
+            .expect("limit-plus-one page should query");
+        assert_eq!(extra_match.returned_count, 2);
+        assert_eq!(extra_match.matched_rows, 2);
+        assert!(extra_match.partial);
+        assert!(!extra_match.exhausted);
+        assert!(extra_match.next_start_key_hex.is_some());
+    }
+
+    #[test]
+    fn command_audit_query_scan_limit_partial_keeps_resume_key_without_matches() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        seed_command_rows(&service, "issue1487_other_tool", 3);
+
+        let response = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(20),
+                scan_limit: Some(2),
+                tool: Some("issue1487_no_match".to_owned()),
+                ..Default::default()
+            })
+            .expect("scan-limited no-match page should query");
+
+        assert_eq!(response.returned_count, 0);
+        assert_eq!(response.matched_rows, 0);
+        assert_eq!(response.scanned_rows, 2);
+        assert!(response.partial);
+        assert!(!response.exhausted);
+        assert!(response.next_start_key_hex.is_some());
     }
 }
