@@ -4498,6 +4498,7 @@ async function handleDomAction(params) {
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
   const autoWait = Boolean(params.autoWait);
   const autoWaitTimeoutMs = normalizeDomActionAutoWaitTimeout(params.autoWaitTimeoutMs, autoWait);
+  const suppressPageText = Boolean(params.suppressPageText);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -4506,7 +4507,7 @@ async function handleDomAction(params) {
   }
 
   const before = await tabPageState(selected.tabId, selected.target);
-  const beforePageText = await tabPageTextState(selected.tabId);
+  const beforePageText = await tabPageTextState(selected.tabId, suppressPageText);
   const requestedElementId = stringOrNull(params.elementId);
   const bridgeElement = requestedElementId && requestedElementId.startsWith("chrome-tab:")
     ? parseChromeBridgeElementId(requestedElementId, selected.tabId, "domAction")
@@ -4531,7 +4532,8 @@ async function handleDomAction(params) {
     position: normalizeClickPosition(params, "domAction"),
     autoWait,
     autoWaitTimeoutMs,
-    maxPageTextChars: MAX_PAGE_TEXT_CHARS
+    maxPageTextChars: suppressPageText ? 0 : MAX_PAGE_TEXT_CHARS,
+    suppressPageText
   };
   const resolveTarget = { tabId: selected.tabId };
   if (Number.isSafeInteger(bridgeElement.frameId)) {
@@ -4616,7 +4618,7 @@ async function handleDomAction(params) {
 
   const createdPopupTabs = await createDomActionPopupTabs(selected, before, actionResult);
   const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId);
+  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,
@@ -4647,8 +4649,9 @@ async function handleCdpInput(params) {
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
   const autoWait = params.autoWait === undefined ? true : Boolean(params.autoWait);
   const autoWaitTimeoutMs = normalizeDomActionAutoWaitTimeout(params.autoWaitTimeoutMs, autoWait);
+  const suppressPageText = Boolean(params.suppressPageText);
   const before = await tabPageState(selected.tabId, selected.target);
-  const beforePageText = await tabPageTextState(selected.tabId);
+  const beforePageText = await tabPageTextState(selected.tabId, suppressPageText);
   if (action === "drag" || action === "html5_drag" || action === "html5_real_drag") {
     return await handleCdpInputDrag(
       selected,
@@ -4658,7 +4661,8 @@ async function handleCdpInput(params) {
       beforePageText,
       waitTimeoutMs,
       autoWait,
-      autoWaitTimeoutMs
+      autoWaitTimeoutMs,
+      suppressPageText
     );
   }
   if (action === "set_text" || action === "type_text") {
@@ -4670,7 +4674,8 @@ async function handleCdpInput(params) {
       beforePageText,
       waitTimeoutMs,
       autoWait,
-      autoWaitTimeoutMs
+      autoWaitTimeoutMs,
+      suppressPageText
     );
   }
   let point;
@@ -4713,7 +4718,8 @@ async function handleCdpInput(params) {
       autoWaitTimeoutMs,
       resolveOnly: true,
       resolveActionability: true,
-      maxPageTextChars: MAX_PAGE_TEXT_CHARS
+      maxPageTextChars: suppressPageText ? 0 : MAX_PAGE_TEXT_CHARS,
+      suppressPageText
     };
     const resolveTarget = { tabId: selected.tabId };
     if (Number.isSafeInteger(bridgeElement.frameId)) {
@@ -4812,7 +4818,7 @@ async function handleCdpInput(params) {
     clickCount: normalizeClickCount(params.clicks)
   });
   const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId);
+  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,
@@ -4845,7 +4851,8 @@ async function handleCdpInputText(
   beforePageText,
   waitTimeoutMs,
   autoWait,
-  autoWaitTimeoutMs
+  autoWaitTimeoutMs,
+  suppressPageText = false
 ) {
   const text = String(params.text ?? "");
   if (action === "type_text" && text.length === 0) {
@@ -4862,7 +4869,7 @@ async function handleCdpInputText(
   });
   const dispatch = await dispatchCdpTextInput(selected.tabId, action, text);
   const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId);
+  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
   const readback = await cdpTextInputTargetScript(selected, action, params, {
     operation: "read",
     autoWait: false,
@@ -9254,7 +9261,7 @@ function readNetworkConditionsStateInPage() {
   };
 }
 
-async function handleCdpInputDrag(selected, action, params, before, beforePageText, waitTimeoutMs, autoWait, autoWaitTimeoutMs) {
+async function handleCdpInputDrag(selected, action, params, before, beforePageText, waitTimeoutMs, autoWait, autoWaitTimeoutMs, suppressPageText = false) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -9275,7 +9282,8 @@ async function handleCdpInputDrag(selected, action, params, before, beforePageTe
     "source",
     sourceSelector,
     autoWait,
-    autoWaitTimeoutMs
+    autoWaitTimeoutMs,
+    suppressPageText
   );
   const target = await resolveCdpInputSelector(
     selected,
@@ -9283,7 +9291,8 @@ async function handleCdpInputDrag(selected, action, params, before, beforePageTe
     "target",
     targetSelector,
     autoWait,
-    autoWaitTimeoutMs
+    autoWaitTimeoutMs,
+    suppressPageText
   );
   const steps = normalizeCdpInputDragSteps(params.dragSteps);
   const durationMs = normalizeCdpInputDragDuration(params.dragDurationMs);
@@ -9327,7 +9336,7 @@ async function handleCdpInputDrag(selected, action, params, before, beforePageTe
     dispatch = await dispatchHtml5DragDrop(selected.tabId, sourceSelector, targetSelector, params);
   }
   const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId);
+  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
   return {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,
@@ -9363,7 +9372,7 @@ async function handleCdpInputDrag(selected, action, params, before, beforePageTe
   };
 }
 
-async function resolveCdpInputSelector(selected, action, label, selector, autoWait, autoWaitTimeoutMs) {
+async function resolveCdpInputSelector(selected, action, label, selector, autoWait, autoWaitTimeoutMs, suppressPageText = false) {
   const request = {
     action,
     selector,
@@ -9376,7 +9385,8 @@ async function resolveCdpInputSelector(selected, action, label, selector, autoWa
     autoWaitTimeoutMs,
     resolveOnly: true,
     resolveActionability: true,
-    maxPageTextChars: MAX_PAGE_TEXT_CHARS
+    maxPageTextChars: suppressPageText ? 0 : MAX_PAGE_TEXT_CHARS,
+    suppressPageText
   };
   let injected;
   try {
@@ -11097,6 +11107,7 @@ async function selectTabTarget(params, options = {}) {
 async function handleCoordinateClick(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
+  const suppressPageText = Boolean(params.suppressPageText);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -11105,7 +11116,7 @@ async function handleCoordinateClick(params) {
   }
 
   const before = await tabPageState(selected.tabId, selected.target);
-  const beforePageText = await tabPageTextState(selected.tabId);
+  const beforePageText = await tabPageTextState(selected.tabId, suppressPageText);
   let injected;
   try {
     injected = await chrome.scripting.executeScript({
@@ -11118,7 +11129,8 @@ async function handleCoordinateClick(params) {
         clicks: normalizeClickCount(params.clicks),
         button: normalizeMouseButton(params.button, "coordinateClick"),
         modifiers: normalizeClickModifiers(params.modifiers, "coordinateClick"),
-        maxPageTextChars: MAX_PAGE_TEXT_CHARS
+        maxPageTextChars: suppressPageText ? 0 : MAX_PAGE_TEXT_CHARS,
+        suppressPageText
       }]
     });
   } catch (error) {
@@ -11144,7 +11156,7 @@ async function handleCoordinateClick(params) {
   }
 
   const after = await waitForTabPageState(selected.tabId, selected.target, waitTimeoutMs);
-  const afterPageText = await tabPageTextState(selected.tabId);
+  const afterPageText = await tabPageTextState(selected.tabId, suppressPageText);
   const activeElement = await tabActiveElementState(selected.tabId);
   return {
     extension_id: chrome.runtime.id,
@@ -11707,7 +11719,23 @@ async function tabActiveElementState(tabId) {
   }
 }
 
-async function tabPageTextState(tabId) {
+function suppressedPageTextState(maxChars = MAX_PAGE_TEXT_CHARS) {
+  return {
+    available: true,
+    readback_source: "secret_safe_suppressed",
+    text: null,
+    text_len: null,
+    text_truncated: false,
+    max_chars: maxChars,
+    redacted: true,
+    redaction_policy: "target_act_secret_safe_v1"
+  };
+}
+
+async function tabPageTextState(tabId, suppressPageText = false) {
+  if (suppressPageText) {
+    return suppressedPageTextState();
+  }
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     return {
       available: false,
@@ -17246,6 +17274,7 @@ async function performDomActionInPage(request) {
   const maxPageTextChars = Number.isSafeInteger(request?.maxPageTextChars)
     ? Math.min(Math.max(request.maxPageTextChars, 0), 65536)
     : 4096;
+  const suppressPageText = Boolean(request?.suppressPageText);
 
   if (!["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck", "hover", "tap", "drag", "html5_drag", "html5_real_drag"].includes(action)) {
     return fail(ERROR_ACTION_UNSUPPORTED, `unsupported DOM action ${JSON.stringify(action)}`);
@@ -17255,7 +17284,9 @@ async function performDomActionInPage(request) {
   }
 
   const beforeUrl = String(location.href || "");
-  const beforePageText = readPageText(maxPageTextChars);
+  const beforePageText = suppressPageText
+    ? suppressedPageTextLocal(maxPageTextChars)
+    : readPageText(maxPageTextChars);
   const resolved = resolveDomActionElement(action, locator);
   if (!resolved.ok) {
     return resolved;
@@ -17405,7 +17436,9 @@ async function performDomActionInPage(request) {
   }
 
   const afterElement = element.isConnected ? elementSummary(element) : null;
-  const afterPageText = readPageText(maxPageTextChars);
+  const afterPageText = suppressPageText
+    ? suppressedPageTextLocal(maxPageTextChars)
+    : readPageText(maxPageTextChars);
   return {
     ok: true,
     action,
@@ -19021,6 +19054,17 @@ async function performDomActionInPage(request) {
     };
   }
 
+  function suppressedPageTextLocal(maxChars) {
+    return {
+      text: null,
+      text_len: null,
+      text_truncated: false,
+      max_chars: maxChars,
+      redacted: true,
+      redaction_policy: "target_act_secret_safe_v1"
+    };
+  }
+
   function locatorDebug(loc) {
     return JSON.stringify({
       selector: loc.selector || null,
@@ -19107,6 +19151,7 @@ function performCoordinateClickInPage(request) {
   const maxPageTextChars = Number.isSafeInteger(request?.maxPageTextChars)
     ? Math.min(Math.max(request.maxPageTextChars, 0), 65536)
     : 4096;
+  const suppressPageText = Boolean(request?.suppressPageText);
 
   if (!Number.isSafeInteger(x) || !Number.isSafeInteger(y)) {
     return fail(ERROR_ACTION_UNSUPPORTED, `coordinateClick requires integer x/y, got (${JSON.stringify(request?.x)}, ${JSON.stringify(request?.y)})`);
@@ -19116,7 +19161,9 @@ function performCoordinateClickInPage(request) {
   }
 
   const beforeUrl = String(location.href || "");
-  const beforePageText = readPageTextLocal(maxPageTextChars);
+  const beforePageText = suppressPageText
+    ? suppressedPageTextLocal(maxPageTextChars)
+    : readPageTextLocal(maxPageTextChars);
   const beforeActiveElement = readActiveElementLocal();
   const viewportPoint = toViewportPoint(x, y, coordinateSpace);
   const viewportReadback = {
@@ -19218,7 +19265,9 @@ function performCoordinateClickInPage(request) {
 
   const afterElement = element.isConnected ? elementSummary(element) : null;
   const afterActiveElement = readActiveElementLocal();
-  const afterPageText = readPageTextLocal(maxPageTextChars);
+  const afterPageText = suppressPageText
+    ? suppressedPageTextLocal(maxPageTextChars)
+    : readPageTextLocal(maxPageTextChars);
   return {
     ok: true,
     action: "coordinate_click",
@@ -19416,6 +19465,17 @@ function performCoordinateClickInPage(request) {
   function readPageTextLocal(maxChars) {
     const source = document.body?.innerText || document.documentElement?.innerText || "";
     return trimForReadback(source, maxChars);
+  }
+
+  function suppressedPageTextLocal(maxChars) {
+    return {
+      text: null,
+      text_len: null,
+      text_truncated: false,
+      max_chars: maxChars,
+      redacted: true,
+      redaction_policy: "target_act_secret_safe_v1"
+    };
   }
 
   function isElementEnabled(element) {

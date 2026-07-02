@@ -874,6 +874,7 @@ impl SynapseService {
                 wait_timeout_ms,
                 auto_wait: false,
                 auto_wait_timeout_ms: 0,
+                suppress_page_text: false,
             },
         )
         .await

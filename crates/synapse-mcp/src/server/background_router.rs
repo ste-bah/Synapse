@@ -32,7 +32,7 @@ use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
 use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
@@ -55,6 +55,7 @@ const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
 const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
 const ACT_FACADE_SOURCE_OF_TRUTH: &str = "target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
+const TARGET_ACT_SECRET_SAFE_REDACTION_POLICY: &str = "target_act_secret_safe_v1";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -245,6 +246,16 @@ pub struct TargetActParams {
     /// actionability before dispatch. Default false preserves existing behavior.
     #[serde(default)]
     pub auto_wait: bool,
+    /// Browser action output mode for secret-producing pages. When true,
+    /// Synapse suppresses page-text collection in the Chrome bridge and returns
+    /// only structural state plus hashes/lengths for any redacted scalar fields.
+    #[serde(
+        default,
+        alias = "secretSafe",
+        alias = "suppress_page_text",
+        alias = "suppressPageText"
+    )]
+    pub secret_safe: bool,
     /// Auto-wait timeout in milliseconds when auto_wait=true.
     #[serde(default = "default_auto_wait_timeout_ms")]
     #[schemars(default = "default_auto_wait_timeout_ms", range(min = 50, max = 30000))]
@@ -3107,6 +3118,7 @@ async fn target_act_browser_dom_action(
         "wait_timeout_ms": wait_timeout_ms,
         "auto_wait": params.auto_wait,
         "auto_wait_timeout_ms": params.auto_wait_timeout_ms,
+        "secret_safe": params.secret_safe,
         "required_foreground": false,
     });
     let (window_hwnd, cdp_target_id) = match service.audit_cdp_target_resolution_result(
@@ -3168,6 +3180,7 @@ async fn target_act_browser_dom_action(
         "wait_timeout_ms": wait_timeout_ms,
         "auto_wait": params.auto_wait,
         "auto_wait_timeout_ms": params.auto_wait_timeout_ms,
+        "secret_safe": params.secret_safe,
         "required_foreground": false,
     });
     service.audit_action_started_with_details_for_session(
@@ -3208,6 +3221,7 @@ async fn target_act_browser_dom_action(
             wait_timeout_ms,
             auto_wait: params.auto_wait,
             auto_wait_timeout_ms: params.auto_wait_timeout_ms,
+            suppress_page_text: params.secret_safe,
         },
     )
     .await
@@ -3219,19 +3233,36 @@ async fn target_act_browser_dom_action(
             result = Err(error);
         }
     }
-    service.audit_action_result_for_session("target_act", &result, &session_id)?;
+    target_act_audit_result_for_session(
+        service,
+        "chrome_debugger_bridge.domAction",
+        &result,
+        &session_id,
+        params.secret_safe,
+    )?;
     match result {
-        Ok(value) => Ok((
-            "chrome_debugger_bridge.domAction",
-            true,
-            TARGET_ACT_STATUS_OK,
-            value,
-        )),
+        Ok(value) => {
+            let value = target_act_maybe_secret_safe_result(
+                "chrome_debugger_bridge.domAction",
+                value,
+                params.secret_safe,
+            )?;
+            Ok((
+                "chrome_debugger_bridge.domAction",
+                true,
+                TARGET_ACT_STATUS_OK,
+                value,
+            ))
+        }
         Err(error) => Ok((
             "chrome_debugger_bridge.domAction",
             false,
             target_act_error_status(&error),
-            target_act_error_result("chrome_debugger_bridge.domAction", error),
+            target_act_maybe_secret_safe_error_result(
+                "chrome_debugger_bridge.domAction",
+                error,
+                params.secret_safe,
+            ),
         )),
     }
 }
@@ -3355,6 +3386,7 @@ async fn target_act_coordinate_click(
         "button": params.button.map(TargetActMouseButton::as_str),
         "modifiers": &click_modifiers,
         "wait_timeout_ms": wait_timeout_ms,
+        "secret_safe": params.secret_safe,
         "requires_session_target": true,
         "no_human_os_foreground_fallback": true,
     });
@@ -3410,6 +3442,7 @@ async fn target_act_coordinate_click(
                 "button": params.button.map(TargetActMouseButton::as_str),
                 "modifiers": &click_modifiers,
                 "wait_timeout_ms": wait_timeout_ms,
+                "secret_safe": params.secret_safe,
                 "required_foreground": false,
             });
             service.audit_action_started_with_details_for_session(
@@ -3428,23 +3461,41 @@ async fn target_act_coordinate_click(
                     button: params.button.map(TargetActMouseButton::as_str),
                     modifiers: Some(&click_modifiers),
                     wait_timeout_ms,
+                    suppress_page_text: params.secret_safe,
                 },
             )
             .await
             .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
-            service.audit_action_result_for_session("target_act", &result, &session_id)?;
+            target_act_audit_result_for_session(
+                service,
+                "chrome_debugger_bridge.coordinateClick",
+                &result,
+                &session_id,
+                params.secret_safe,
+            )?;
             match result {
-                Ok(value) => Ok((
-                    "chrome_debugger_bridge.coordinateClick",
-                    true,
-                    TARGET_ACT_STATUS_OK,
-                    value,
-                )),
+                Ok(value) => {
+                    let value = target_act_maybe_secret_safe_result(
+                        "chrome_debugger_bridge.coordinateClick",
+                        value,
+                        params.secret_safe,
+                    )?;
+                    Ok((
+                        "chrome_debugger_bridge.coordinateClick",
+                        true,
+                        TARGET_ACT_STATUS_OK,
+                        value,
+                    ))
+                }
                 Err(error) => Ok((
                     "chrome_debugger_bridge.coordinateClick",
                     false,
                     target_act_error_status(&error),
-                    target_act_error_result("chrome_debugger_bridge.coordinateClick", error),
+                    target_act_maybe_secret_safe_error_result(
+                        "chrome_debugger_bridge.coordinateClick",
+                        error,
+                        params.secret_safe,
+                    ),
                 )),
             }
         }
@@ -4008,6 +4059,7 @@ async fn target_act_dom_locator_pointer(
             "required_foreground": false,
             "window_hwnd": *window_hwnd,
             "cdp_target_id": cdp_target_id,
+            "secret_safe": params.secret_safe,
         });
         if let Err(error) =
             service.ensure_target_claim_allows_session("target_act", &session_id, &target)
@@ -4142,6 +4194,7 @@ async fn target_act_bridge_cdp_input(
         );
         object.insert("bridge_debugger_lane".to_owned(), json!("chrome.debugger"));
         object.insert("required_foreground".to_owned(), json!(false));
+        object.insert("secret_safe".to_owned(), json!(params.secret_safe));
     }
     service.audit_action_started_with_details_for_session(
         "target_act",
@@ -4176,23 +4229,41 @@ async fn target_act_bridge_cdp_input(
             wait_timeout_ms: target_act_dom_wait_timeout(params.wait_timeout_ms)?,
             auto_wait: params.auto_wait,
             auto_wait_timeout_ms: params.auto_wait_timeout_ms,
+            suppress_page_text: params.secret_safe,
         },
     )
     .await
     .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
-    service.audit_action_result_for_session("target_act", &result, session_id)?;
+    target_act_audit_result_for_session(
+        service,
+        "chrome_debugger_bridge.cdpInput",
+        &result,
+        session_id,
+        params.secret_safe,
+    )?;
     match result {
-        Ok(value) => Ok((
-            "chrome_debugger_bridge.cdpInput",
-            true,
-            TARGET_ACT_STATUS_OK,
-            value,
-        )),
+        Ok(value) => {
+            let value = target_act_maybe_secret_safe_result(
+                "chrome_debugger_bridge.cdpInput",
+                value,
+                params.secret_safe,
+            )?;
+            Ok((
+                "chrome_debugger_bridge.cdpInput",
+                true,
+                TARGET_ACT_STATUS_OK,
+                value,
+            ))
+        }
         Err(error) => Ok((
             "chrome_debugger_bridge.cdpInput",
             false,
             target_act_error_status(&error),
-            target_act_error_result("chrome_debugger_bridge.cdpInput", error),
+            target_act_maybe_secret_safe_error_result(
+                "chrome_debugger_bridge.cdpInput",
+                error,
+                params.secret_safe,
+            ),
         )),
     }
 }
@@ -5479,6 +5550,294 @@ fn target_act_delegate_response<T: Serialize>(
             ))
         }
     }
+}
+
+fn target_act_audit_result_for_session(
+    service: &SynapseService,
+    delegated_tool: &'static str,
+    result: &Result<Value, ErrorData>,
+    session_id: &str,
+    secret_safe: bool,
+) -> Result<(), ErrorData> {
+    if !secret_safe {
+        return service.audit_action_result_for_session("target_act", result, session_id);
+    }
+    match result {
+        Ok(value) => {
+            let safe = target_act_secret_safe_result(delegated_tool, value.clone())?;
+            service.audit_action_redacted_result_for_session(
+                "target_act",
+                "ok",
+                None,
+                &json!({
+                    "response": safe,
+                    "secret_safe": true,
+                    "redaction_policy": TARGET_ACT_SECRET_SAFE_REDACTION_POLICY,
+                }),
+                session_id,
+            )
+        }
+        Err(error) => {
+            let code = target_act_error_code(error).map(str::to_owned);
+            let safe = target_act_secret_safe_error_result_ref(delegated_tool, error);
+            service.audit_action_redacted_result_for_session(
+                "target_act",
+                "error",
+                code.as_deref(),
+                &json!({
+                    "error": safe.get("error").cloned().unwrap_or(Value::Null),
+                    "secret_safe": true,
+                    "redaction_policy": TARGET_ACT_SECRET_SAFE_REDACTION_POLICY,
+                }),
+                session_id,
+            )
+        }
+    }
+}
+
+fn target_act_maybe_secret_safe_result(
+    delegated_tool: &'static str,
+    value: Value,
+    secret_safe: bool,
+) -> Result<Value, ErrorData> {
+    if secret_safe {
+        target_act_secret_safe_result(delegated_tool, value)
+    } else {
+        Ok(value)
+    }
+}
+
+fn target_act_secret_safe_result(
+    delegated_tool: &'static str,
+    value: Value,
+) -> Result<Value, ErrorData> {
+    let mut redactions = Vec::new();
+    let sanitized = target_act_secret_safe_sanitize_value(&value, "$", &mut redactions)?;
+    let mut object = match sanitized {
+        Value::Object(object) => object,
+        other => {
+            let mut object = Map::new();
+            object.insert("value".to_owned(), other);
+            object
+        }
+    };
+    object.insert("secret_safe".to_owned(), Value::Bool(true));
+    object.insert(
+        "redaction_policy".to_owned(),
+        Value::String(TARGET_ACT_SECRET_SAFE_REDACTION_POLICY.to_owned()),
+    );
+    object.insert(
+        "delegated_tool".to_owned(),
+        Value::String(delegated_tool.to_owned()),
+    );
+    object.insert(
+        "redacted_fields".to_owned(),
+        Value::Array(redactions.into_iter().map(Value::String).collect()),
+    );
+    object.insert(
+        "source_of_truth".to_owned(),
+        Value::String(
+            "secret-safe structural browser action readback; page text/html/input/clipboard values suppressed before audit and MCP response"
+                .to_owned(),
+        ),
+    );
+    Ok(Value::Object(object))
+}
+
+fn target_act_maybe_secret_safe_error_result(
+    delegated_tool: &'static str,
+    error: ErrorData,
+    secret_safe: bool,
+) -> Value {
+    if secret_safe {
+        target_act_secret_safe_error_result_ref(delegated_tool, &error)
+    } else {
+        target_act_error_result(delegated_tool, error)
+    }
+}
+
+fn target_act_secret_safe_error_result_ref(
+    delegated_tool: &'static str,
+    error: &ErrorData,
+) -> Value {
+    let code = target_act_error_code(error)
+        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
+        .to_owned();
+    let message = error.message.to_string();
+    let mut redactions = vec!["$.error.message".to_owned()];
+    let data = error
+        .data
+        .as_ref()
+        .map(|value| {
+            target_act_secret_safe_sanitize_value(value, "$.error.data", &mut redactions)
+                .unwrap_or_else(|sanitize_error| {
+                    json!({
+                        "redacted": true,
+                        "redaction_error": sanitize_error.message.to_string(),
+                    })
+                })
+        })
+        .unwrap_or(Value::Null);
+    json!({
+        "error": {
+            "delegated_tool": delegated_tool,
+            "code": code,
+            "message_redacted": true,
+            "message_len": message.chars().count(),
+            "message_sha256": target_act_secret_safe_sha256(message.as_bytes()),
+            "data": data,
+            "redaction_policy": TARGET_ACT_SECRET_SAFE_REDACTION_POLICY,
+            "redacted_fields": redactions,
+        }
+    })
+}
+
+fn target_act_secret_safe_sanitize_value(
+    value: &Value,
+    path: &str,
+    redactions: &mut Vec<String>,
+) -> Result<Value, ErrorData> {
+    match value {
+        Value::Object(fields) => {
+            let mut out = Map::new();
+            for (key, child) in fields {
+                let child_path = format!("{path}.{}", target_act_secret_safe_path_segment(key));
+                if target_act_secret_safe_redact_key(key) {
+                    redactions.push(child_path);
+                    out.insert(key.clone(), target_act_secret_safe_redacted_scalar(child)?);
+                } else {
+                    out.insert(
+                        key.clone(),
+                        target_act_secret_safe_sanitize_value(child, &child_path, redactions)?,
+                    );
+                }
+            }
+            Ok(Value::Object(out))
+        }
+        Value::Array(items) => items
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                target_act_secret_safe_sanitize_value(
+                    child,
+                    &format!("{path}[{index}]"),
+                    redactions,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn target_act_secret_safe_redact_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    if lower.ends_with("_len")
+        || lower.ends_with("_length")
+        || lower.ends_with("_sha256")
+        || lower.ends_with("_hash")
+        || lower == "sha256"
+        || lower == "hash"
+        || lower == "count"
+        || lower.ends_with("_count")
+    {
+        return false;
+    }
+    let exact = [
+        "text",
+        "selected_text",
+        "before_value",
+        "after_value",
+        "expected_value",
+        "value",
+        "label",
+        "option",
+        "option_label",
+        "name",
+        "name_attr",
+        "accessible_name",
+        "html",
+        "body",
+        "content",
+        "data",
+        "data_base64",
+        "clipboard",
+        "password",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "cookie",
+        "error_detail",
+        "message",
+    ];
+    if exact.iter().any(|candidate| lower == *candidate) {
+        return true;
+    }
+    [
+        "page_text",
+        "in_page",
+        "innerhtml",
+        "outerhtml",
+        "clipboard",
+        "password",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "authorization",
+        "bearer",
+        "cookie",
+        "selected_value",
+        "selected_values",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || lower.ends_with("_text")
+        || lower.ends_with("_html")
+        || lower.ends_with("_value")
+        || lower.ends_with("_label")
+}
+
+fn target_act_secret_safe_redacted_scalar(value: &Value) -> Result<Value, ErrorData> {
+    let encoded = serde_json::to_vec(value).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("target_act secret-safe redaction failed to encode scalar: {error}"),
+        )
+    })?;
+    let original_type = match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    let char_len = value.as_str().map(|text| text.chars().count());
+    Ok(json!({
+        "redacted": true,
+        "original_type": original_type,
+        "char_len": char_len,
+        "json_len_bytes": encoded.len(),
+        "sha256": target_act_secret_safe_sha256(&encoded),
+        "redaction_policy": TARGET_ACT_SECRET_SAFE_REDACTION_POLICY,
+    }))
+}
+
+fn target_act_secret_safe_sha256(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!(
+        "sha256:{}",
+        crate::m2::postcondition::hex_encode(&hasher.finalize())
+    )
+}
+
+fn target_act_secret_safe_path_segment(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
 }
 
 async fn target_act_key_press(
@@ -8497,6 +8856,117 @@ mod tests {
         assert_eq!(
             result.pointer("/error/data/code").and_then(Value::as_str),
             Some(error_codes::ACTION_POSTCONDITION_FAILED)
+        );
+    }
+
+    #[test]
+    fn target_act_secret_safe_result_redacts_page_text_and_values() {
+        let result = target_act_secret_safe_result(
+            "chrome_debugger_bridge.domAction",
+            json!({
+                "target_id": "target-1470",
+                "tab_id": 1470,
+                "action": "click",
+                "before_page": {
+                    "url": "https://example.test/secrets",
+                    "title": "API keys",
+                    "ready_state": "complete"
+                },
+                "after_page": {
+                    "url": "https://example.test/secrets",
+                    "title": "API keys",
+                    "ready_state": "complete"
+                },
+                "before_page_text": {"text": "existing-key-secret-1470"},
+                "after_page_text": {"text": "new-one-time-secret-1470"},
+                "action_readback": {
+                    "selected_text": "copied-secret-1470",
+                    "after_value": "input-secret-1470",
+                    "value_len": 17,
+                    "checked": true
+                }
+            }),
+        )
+        .expect("secret-safe result should sanitize");
+
+        let encoded = serde_json::to_string(&result).expect("serialize sanitized result");
+        for raw in [
+            "existing-key-secret-1470",
+            "new-one-time-secret-1470",
+            "copied-secret-1470",
+            "input-secret-1470",
+        ] {
+            assert!(
+                !encoded.contains(raw),
+                "secret-safe result leaked raw field {raw}"
+            );
+        }
+        assert_eq!(
+            result.get("secret_safe").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            result.pointer("/before_page/url").and_then(Value::as_str),
+            Some("https://example.test/secrets")
+        );
+        assert_eq!(
+            result
+                .pointer("/after_page_text/redaction_policy")
+                .and_then(Value::as_str),
+            Some(TARGET_ACT_SECRET_SAFE_REDACTION_POLICY)
+        );
+        assert_eq!(
+            result
+                .pointer("/action_readback/value_len")
+                .and_then(Value::as_u64),
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn target_act_secret_safe_error_redacts_message_and_data() {
+        let error = ErrorData::new(
+            ErrorCode(-32099),
+            "domAction frame_results contained new-one-time-secret-1470".to_owned(),
+            Some(json!({
+                "code": error_codes::CHROME_DOM_ELEMENT_NOT_FOUND,
+                "error_detail": "button near existing-key-secret-1470 was not found",
+                "frame_results": [{
+                    "result": {
+                        "in_page_before_text": "existing-key-secret-1470"
+                    }
+                }]
+            })),
+        );
+
+        let result =
+            target_act_secret_safe_error_result_ref("chrome_debugger_bridge.domAction", &error);
+        let encoded = serde_json::to_string(&result).expect("serialize sanitized error");
+        for raw in [
+            "new-one-time-secret-1470",
+            "existing-key-secret-1470",
+            "button near existing-key-secret-1470 was not found",
+        ] {
+            assert!(
+                !encoded.contains(raw),
+                "secret-safe error leaked raw field {raw}"
+            );
+        }
+        assert_eq!(
+            result.pointer("/error/code").and_then(Value::as_str),
+            Some(error_codes::CHROME_DOM_ELEMENT_NOT_FOUND)
+        );
+        assert_eq!(
+            result
+                .pointer("/error/message_redacted")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            result
+                .pointer("/error/data/error_detail/redaction_policy")
+                .and_then(Value::as_str),
+            Some(TARGET_ACT_SECRET_SAFE_REDACTION_POLICY)
         );
     }
 

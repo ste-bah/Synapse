@@ -6832,6 +6832,7 @@ pub(crate) struct ChromeDebuggerDomActionRequest<'a> {
     pub wait_timeout_ms: u64,
     pub auto_wait: bool,
     pub auto_wait_timeout_ms: u32,
+    pub suppress_page_text: bool,
 }
 
 pub(crate) async fn dom_action(
@@ -6864,6 +6865,7 @@ pub(crate) async fn dom_action(
                 "waitTimeoutMs": request.wait_timeout_ms,
                 "autoWait": request.auto_wait,
                 "autoWaitTimeoutMs": request.auto_wait_timeout_ms,
+                "suppressPageText": request.suppress_page_text,
             }),
         )
         .await
@@ -6899,6 +6901,7 @@ pub(crate) struct ChromeDebuggerCdpInputRequest<'a> {
     pub wait_timeout_ms: u64,
     pub auto_wait: bool,
     pub auto_wait_timeout_ms: u32,
+    pub suppress_page_text: bool,
 }
 
 pub(crate) async fn cdp_input(
@@ -6934,6 +6937,7 @@ pub(crate) async fn cdp_input(
                 "waitTimeoutMs": request.wait_timeout_ms,
                 "autoWait": request.auto_wait,
                 "autoWaitTimeoutMs": request.auto_wait_timeout_ms,
+                "suppressPageText": request.suppress_page_text,
             }),
         )
         .await
@@ -6949,6 +6953,7 @@ pub(crate) struct ChromeDebuggerCoordinateClickRequest<'a> {
     pub button: Option<&'a str>,
     pub modifiers: Option<&'a Value>,
     pub wait_timeout_ms: u64,
+    pub suppress_page_text: bool,
 }
 
 pub(crate) async fn coordinate_click(
@@ -6968,6 +6973,7 @@ pub(crate) async fn coordinate_click(
                 "button": request.button,
                 "modifiers": request.modifiers,
                 "waitTimeoutMs": request.wait_timeout_ms,
+                "suppressPageText": request.suppress_page_text,
             }),
         )
         .await

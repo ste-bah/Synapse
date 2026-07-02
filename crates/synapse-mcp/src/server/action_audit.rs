@@ -228,6 +228,17 @@ impl SynapseService {
         }
     }
 
+    pub(super) fn audit_action_redacted_result_for_session(
+        &self,
+        tool: &'static str,
+        status: &'static str,
+        error_code: Option<&str>,
+        details: &Value,
+        session_id: &str,
+    ) -> Result<(), ErrorData> {
+        self.write_action_audit_row(tool, status, error_code, details, Some(session_id))
+    }
+
     pub(super) fn audit_action_ok_with_details_for_session(
         &self,
         tool: &'static str,
@@ -328,6 +339,8 @@ impl SynapseService {
         let foreground_tier =
             self.action_audit_foreground_tier(tool, status, session_id.as_deref(), details);
         let human_os_foreground = self.action_audit_foreground();
+        let redactions = action_audit_detail_redactions(details);
+        let redacted = !redactions.is_empty();
         let value = json!({
             "schema_version": 1,
             "audit_id": format!("{ts_ns:020}-{seq:010}"),
@@ -348,8 +361,8 @@ impl SynapseService {
             "foreground_tier": foreground_tier,
             "active_profile_id": active_profile.profile_id,
             "active_profile_schema_version": active_profile.schema_version,
-            "redacted": false,
-            "redactions": [],
+            "redacted": redacted,
+            "redactions": redactions,
             "details": details,
         });
         let encoded = synapse_storage::encode_json(&value).map_err(|error| {
@@ -630,6 +643,39 @@ impl SynapseService {
                 .find(|profile| profile.id == profile_id)
                 .map(|profile| profile.schema_version)
         })
+    }
+}
+
+fn action_audit_detail_redactions(details: &Value) -> Vec<String> {
+    let mut redactions = Vec::new();
+    collect_action_audit_detail_redactions(details, &mut redactions);
+    redactions.sort();
+    redactions.dedup();
+    redactions
+}
+
+fn collect_action_audit_detail_redactions(value: &Value, redactions: &mut Vec<String>) {
+    match value {
+        Value::Object(fields) => {
+            if let Some(Value::Array(items)) = fields.get("redacted_fields") {
+                redactions.extend(
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|item| !item.trim().is_empty())
+                        .map(str::to_owned),
+                );
+            }
+            for child in fields.values() {
+                collect_action_audit_detail_redactions(child, redactions);
+            }
+        }
+        Value::Array(items) => {
+            for child in items {
+                collect_action_audit_detail_redactions(child, redactions);
+            }
+        }
+        _ => {}
     }
 }
 

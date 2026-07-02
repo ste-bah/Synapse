@@ -279,6 +279,7 @@ impl SynapseService {
                 wait_timeout_ms: dnd.wait_timeout_ms,
                 auto_wait: dnd.auto_wait,
                 auto_wait_timeout_ms: dnd.auto_wait_timeout_ms,
+                suppress_page_text: false,
             },
         )
         .await
