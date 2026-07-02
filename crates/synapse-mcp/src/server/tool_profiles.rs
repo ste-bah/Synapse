@@ -2099,127 +2099,10 @@ const fn op(
     }
 }
 
-const NORMAL_ALLOWED_EXACT: &[&str] = &[
-    "health",
-    "profile",
-    "session",
-    "subscribe",
-    "observe",
-    "find",
-    "read_text",
-    "screenshot",
-    "target",
-    "act",
-    "shell",
-    "process",
-    "browser_tabs",
-    "browser_nav",
-    "browser_dom",
-    "browser_form",
-    "browser_wait",
-    "browser_capture",
-    "browser_storage",
-    "browser_debugger",
-    "workspace",
-    "agent",
-    "task",
-    "approval",
-    "escalation",
-    "timeline",
-    "episode",
-    "routine",
-    "assist",
-    "reality",
-    "verification",
-    "storage",
-    "model",
-    "cost",
-    "hygiene",
-    "audit",
-    "replay",
-    "privacy",
-    "setup",
-    "telemetry",
-];
+const NORMAL_ALLOWED_EXACT: &[&str] = PUBLIC_TOOL_NAMES;
 const NORMAL_ALLOWED_PREFIXES: &[&str] = &[];
 
-const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = &[
-    "approval_list",
-    "browser_adopt_active_tab",
-    "browser_aria_snapshot",
-    "browser_assert",
-    "browser_batch",
-    "browser_capture",
-    "browser_clock",
-    "browser_cookies",
-    "browser_content",
-    "browser_downloads",
-    "browser_dom",
-    "browser_file_upload",
-    "browser_form",
-    "browser_fill_form",
-    "browser_frames",
-    "browser_inspect",
-    "browser_locate",
-    "browser_page_events",
-    "browser_scroll_into_view",
-    "browser_screenshot",
-    "browser_set_content",
-    "browser_set_value",
-    "browser_storage",
-    "browser_nav",
-    "browser_tabs",
-    "browser_wait",
-    "browser_wait_for",
-    "capture_gif",
-    "capture_screenshot",
-    "cdp_activate_tab",
-    "cdp_bridge_reload",
-    "cdp_close_tab",
-    "cdp_navigate_tab",
-    "cdp_open_tab",
-    "cdp_target_info",
-    "clear_target",
-    "control_lease_acquire",
-    "control_lease_release",
-    "control_lease_status",
-    "escalation_list",
-    "find",
-    "get_target",
-    "health",
-    "observe",
-    "observe_delta",
-    "profile",
-    "read_text",
-    "reality_audit",
-    "reality_baseline",
-    "session_end",
-    "session_list",
-    "session_status",
-    "set_capture_target",
-    "set_perception_mode",
-    "set_target",
-    "storage_inspect",
-    "target_act",
-    "target_claim",
-    "target_claim_adopt",
-    "target_claim_status",
-    "target_release",
-    "telemetry",
-    "tool_profile_set",
-    "tool_profile_status",
-    "verification_audit",
-    "verification_bind",
-    "verification_inbox",
-    "verification_poll",
-    "verification_sources",
-    "window_list",
-    "workspace",
-    "workspace_get",
-    "workspace_list",
-    "workspace_put",
-    "workspace_subscribe",
-];
+const BROWSER_CONTROL_ALLOWED_EXACT: &[&str] = PUBLIC_TOOL_NAMES;
 
 const BROWSER_DEBUGGER_ONLY_EXACT: &[&str] = &[
     "browser_add_init_script",
@@ -2239,99 +2122,7 @@ const BROWSER_DEBUGGER_ONLY_EXACT: &[&str] = &[
     "browser_route",
 ];
 
-const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = &[
-    "approval_list",
-    "browser_add_init_script",
-    "browser_add_script_tag",
-    "browser_add_style_tag",
-    "browser_adopt_active_tab",
-    "browser_aria_snapshot",
-    "browser_assert",
-    "browser_batch",
-    "browser_capture",
-    "browser_clock",
-    "browser_console_messages",
-    "browser_cookies",
-    "browser_content",
-    "browser_downloads",
-    "browser_dom",
-    "browser_drag",
-    "browser_drop",
-    "browser_debugger",
-    "browser_emulate",
-    "browser_evaluate",
-    "browser_expose_binding",
-    "browser_file_upload",
-    "browser_form",
-    "browser_fill_form",
-    "browser_frames",
-    "browser_handle_dialog",
-    "browser_inspect",
-    "browser_locate",
-    "browser_network",
-    "browser_network_har",
-    "browser_network_overrides",
-    "browser_page_events",
-    "browser_pdf",
-    "browser_route",
-    "browser_scroll_into_view",
-    "browser_screenshot",
-    "browser_set_content",
-    "browser_set_value",
-    "browser_storage",
-    "browser_nav",
-    "browser_tabs",
-    "browser_wait",
-    "browser_wait_for",
-    "capture_gif",
-    "capture_screenshot",
-    "cdp_activate_tab",
-    "cdp_bridge_reload",
-    "cdp_close_tab",
-    "cdp_navigate_tab",
-    "cdp_open_tab",
-    "cdp_target_info",
-    "clear_target",
-    "control_lease_acquire",
-    "control_lease_release",
-    "control_lease_status",
-    "escalation_list",
-    "find",
-    "get_target",
-    "health",
-    "observe",
-    "observe_delta",
-    "profile",
-    "read_text",
-    "reality_audit",
-    "reality_baseline",
-    "session_end",
-    "session_list",
-    "session_status",
-    "set_capture_target",
-    "set_perception_mode",
-    "set_target",
-    "storage_inspect",
-    "target_act",
-    "target_claim",
-    "target_claim_adopt",
-    "target_claim_status",
-    "target_release",
-    "telemetry",
-    "tool_profile_set",
-    "tool_profile_status",
-    "verification_audit",
-    "verification_bind",
-    "verification_inbox",
-    "verification_poll",
-    "verification_sources",
-    "window_list",
-    "workspace",
-    "workspace_get",
-    "workspace_list",
-    "workspace_put",
-    "workspace_subscribe",
-];
+const BROWSER_DEBUGGER_ALLOWED_EXACT: &[&str] = PUBLIC_TOOL_NAMES;
 
 const BREAK_GLASS_HAZARDOUS_TOOLS: &[&str] = &[
     "act_click",
@@ -2360,14 +2151,10 @@ pub(crate) enum ToolProfileKind {
     /// shell, or agent-spawn surfaces.
     BrowserDebugger,
     BreakGlass,
-    /// Full Synapse tool surface for Synapse-spawned local-model agents
-    /// (gemma/DeepSeek/etc., #1031). Identical visibility to `BreakGlass` (every
-    /// real tool, including the foreground input primitives) but assigned
-    /// automatically to the trusted local-model harness instead of requiring an
-    /// explicit operator-held foreground lease. Local models operate the machine
-    /// and must never be missing a tool; foreground contention is handled at
-    /// action time by the per-action lease/target guards (#717/#999), not by
-    /// hiding the tools from discovery.
+    /// Synapse-spawned local-model agent profile (gemma/DeepSeek/etc., #1031).
+    /// It receives the same <=40 public facade surface as every other profile;
+    /// broader authority is enforced inside the facades and action guards rather
+    /// than by exposing raw implementation tools in discovery.
     FullCapability,
 }
 
@@ -2403,7 +2190,7 @@ impl ToolProfileKind {
 
     fn is_visible(self, tool_name: &str) -> bool {
         match self {
-            Self::BreakGlass | Self::FullCapability => true,
+            Self::BreakGlass | Self::FullCapability => PUBLIC_TOOL_NAMES.contains(&tool_name),
             Self::NormalAgent => {
                 NORMAL_ALLOWED_EXACT.contains(&tool_name)
                     || NORMAL_ALLOWED_PREFIXES
@@ -2854,7 +2641,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Set this MCP session's durable tool profile. normal_agent and browser_control expose debugger-free already-open Chrome routes and hide raw-CDP/chrome.debugger browser tools from default discovery. browser_debugger exposes browser-only raw-CDP/chrome.debugger tools only when confirm_break_glass=true and reason is non-empty. break_glass exposes the full raw surface only when confirm_break_glass=true, reason is non-empty, and this session currently owns the foreground input lease."
+        description = "Set this MCP session's durable tool profile. Every profile keeps discovery on the <=40 public facade surface. browser_debugger, break_glass, and full_capability enable stricter facade operations only when confirm_break_glass=true and reason is non-empty; break_glass/full_capability also require this session to own the foreground input lease."
     )]
     pub async fn tool_profile_set(
         &self,
@@ -3214,8 +3001,9 @@ impl SynapseService {
                 // initialize client identity landed in the registry, it may have
                 // been written the least-privilege `default_normal_agent` row.
                 // Once the registry classifies it as the trusted local-model
-                // harness, upgrade it to the full-capability surface so the
-                // local model is never left without the input primitives (#1031).
+                // harness, upgrade it to the full-capability policy so the
+                // local model is never left without facade-routed input
+                // capability (#1031).
                 // Only the *default* normal-agent row self-heals; an explicit
                 // operator profile choice is never silently widened.
                 if is_local_agent && row.record.source == "default_normal_agent" {
@@ -3437,11 +3225,11 @@ fn validate_profile_set_policy(
     if profile == ToolProfileKind::BrowserDebugger {
         return Ok(());
     }
-    // The full raw surface (break_glass) and the local-agent full-capability
-    // surface, when requested *explicitly* via tool_profile_set, require
-    // foreground-lease proof. This stops any agent from self-escalating to raw
-    // foreground primitives by hand. The frictionless path to full_capability is
-    // the automatic, client-identity-keyed default for the trusted local-model
+    // The break_glass and full_capability policy profiles, when requested
+    // *explicitly* via tool_profile_set, require foreground-lease proof. This
+    // stops any agent from self-escalating to foreground-capable facade
+    // operations by hand. The frictionless path to full_capability is the
+    // automatic, client-identity-keyed default for the trusted local-model
     // harness (see `ensure_tool_profile_assignment`), never this tool.
     if !lease_proof.caller_is_owner {
         return Err(ErrorData::new(
@@ -3588,16 +3376,16 @@ fn foreground_capability_policy(profile: ToolProfileKind) -> ToolProfileForegrou
             "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
         ),
         ToolProfileKind::BrowserControl => (
-            "debugger-free browser/target_act tools plus lease controls are visible in the task profile; raw CDP/chrome.debugger, shell, and spawn surfaces stay hidden",
+            "the <=40 public browser/action facades are visible in the task profile; raw implementation browser tools stay hidden behind those facades",
             "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
         ),
         ToolProfileKind::BrowserDebugger => (
-            "browser-only raw CDP/chrome.debugger tools are visible by explicit profile; raw shell/spawn and OS foreground primitives stay hidden",
+            "the browser_debugger facade is visible by default and its raw CDP/chrome.debugger operations are enabled only by this explicit profile",
             "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
         ),
         ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability => (
-            "full raw surface is visible; prefer target_act/session-lane tools unless real OS foreground input is the intended lane",
-            "raw foreground primitives may run only under their own lease/target guards and action-audit policy",
+            "the <=40 public facade surface stays visible; broader authority is routed through facade operations and audited action guards",
+            "raw foreground implementation primitives are not discoverable; use act/target facades so lease/target guards and action audit always run",
         ),
     };
     ToolProfileForegroundCapability {
@@ -4104,7 +3892,10 @@ fn tool_rank(profile: ToolProfileKind, tool_name: &str) -> usize {
             .iter()
             .position(|name| *name == tool_name)
             .unwrap_or(usize::MAX),
-        ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability => usize::MAX,
+        ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability => PUBLIC_TOOL_NAMES
+            .iter()
+            .position(|name| *name == tool_name)
+            .unwrap_or(usize::MAX),
     }
 }
 
@@ -4794,6 +4585,8 @@ mod tests {
                 "hygiene_scan_storage",
                 "hygiene_flags",
                 "hygiene_report",
+                "audit",
+                "replay",
                 "setup",
                 "telemetry",
             ]
@@ -4812,13 +4605,33 @@ mod tests {
         }
     }
 
-    fn assert_debugger_only_visible(visible: &[String]) {
-        for required in BROWSER_DEBUGGER_ONLY_EXACT {
-            assert!(
-                visible.iter().any(|name| name == required),
-                "browser_debugger profile must expose browser debugger tool {required}"
-            );
-        }
+    fn assert_public_facade_surface(visible: &[String]) {
+        assert_eq!(visible, &public_tool_names());
+        assert!(visible.len() <= PUBLIC_TOOL_LIMIT);
+        assert!(
+            visible
+                .iter()
+                .all(|name| PUBLIC_TOOL_NAMES.contains(&name.as_str()))
+        );
+        assert!(visible.contains(&"act".to_owned()));
+        assert!(visible.contains(&"profile".to_owned()));
+        assert!(visible.contains(&"target".to_owned()));
+        assert!(visible.contains(&"browser_dom".to_owned()));
+        assert!(visible.contains(&"browser_form".to_owned()));
+        assert!(visible.contains(&"browser_capture".to_owned()));
+        assert!(visible.contains(&"browser_debugger".to_owned()));
+        assert!(!visible.contains(&"target_act".to_owned()));
+        assert!(!visible.contains(&"browser_content".to_owned()));
+        assert!(!visible.contains(&"browser_file_upload".to_owned()));
+        assert!(!visible.contains(&"browser_screenshot".to_owned()));
+        assert!(!visible.contains(&"browser_set_value".to_owned()));
+        assert!(!visible.contains(&"browser_wait_for".to_owned()));
+        assert!(!visible.contains(&"cdp_target_info".to_owned()));
+        assert!(!visible.contains(&"tool_profile_set".to_owned()));
+        assert!(!visible.contains(&"tool_profile_status".to_owned()));
+        assert!(!visible.contains(&"act_click".to_owned()));
+        assert!(!visible.contains(&"act_type".to_owned()));
+        assert!(!visible.contains(&"release_all".to_owned()));
     }
 
     fn registry_error_data(error: &ErrorData) -> &Value {
@@ -5541,57 +5354,7 @@ mod tests {
     #[test]
     fn normal_profile_routes_foreground_capability_without_raw_primitives() {
         let visible = visible_tool_names_for_profile(ToolProfileKind::NormalAgent, &names());
-        assert_eq!(
-            visible,
-            [
-                "health",
-                "profile",
-                "session",
-                "subscribe",
-                "observe",
-                "find",
-                "read_text",
-                "screenshot",
-                "target",
-                "act",
-                "shell",
-                "process",
-                "browser_tabs",
-                "browser_nav",
-                "browser_dom",
-                "browser_form",
-                "browser_wait",
-                "browser_capture",
-                "browser_storage",
-                "browser_debugger",
-                "workspace",
-                "agent",
-                "task",
-                "approval",
-                "escalation",
-                "timeline",
-                "episode",
-                "routine",
-                "assist",
-                "reality",
-                "verification",
-                "storage",
-                "model",
-                "cost",
-                "hygiene",
-                "privacy",
-                "setup",
-                "telemetry",
-            ]
-            .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-        );
-        assert!(
-            visible
-                .iter()
-                .all(|name| PUBLIC_TOOL_NAMES.contains(&name.as_str()))
-        );
+        assert_public_facade_surface(&visible);
         assert!(!visible.contains(&"act_run_shell".to_owned()));
         assert!(!visible.contains(&"act_run_shell_start".to_owned()));
         assert!(!visible.contains(&"act_run_shell_status".to_owned()));
@@ -5718,44 +5481,29 @@ mod tests {
     }
 
     #[test]
-    fn browser_profile_is_narrower_than_normal_agent() {
+    fn browser_profile_uses_public_facade_surface() {
         let visible = visible_tool_names_for_profile(ToolProfileKind::BrowserControl, &names());
-        assert!(visible.contains(&"cdp_open_tab".to_owned()));
-        assert!(visible.contains(&"session_list".to_owned()));
-        assert!(visible.contains(&"target_act".to_owned()));
-        assert!(visible.contains(&"browser_content".to_owned()));
-        assert!(visible.contains(&"browser_dom".to_owned()));
-        assert!(visible.contains(&"browser_locate".to_owned()));
-        assert!(visible.contains(&"browser_scroll_into_view".to_owned()));
-        assert!(visible.contains(&"browser_set_content".to_owned()));
-        assert!(visible.contains(&"browser_form".to_owned()));
-        assert!(visible.contains(&"browser_set_value".to_owned()));
+        assert_public_facade_surface(&visible);
+        assert!(visible.contains(&"browser_tabs".to_owned()));
         assert!(visible.contains(&"browser_nav".to_owned()));
         assert!(visible.contains(&"browser_wait".to_owned()));
-        assert!(visible.contains(&"browser_wait_for".to_owned()));
-        assert!(visible.contains(&"control_lease_acquire".to_owned()));
-        assert!(visible.contains(&"control_lease_release".to_owned()));
+        assert!(visible.contains(&"browser_storage".to_owned()));
         assert!(!visible.contains(&"act_run_shell".to_owned()));
         assert!(!visible.contains(&"act_click".to_owned()));
         assert_debugger_only_hidden(&visible);
     }
 
     #[test]
-    fn browser_debugger_profile_exposes_browser_debugger_surface_without_shell_or_foreground() {
+    fn browser_debugger_profile_uses_public_facade_surface_without_raw_tools() {
         let visible = visible_tool_names_for_profile(ToolProfileKind::BrowserDebugger, &names());
+        assert_public_facade_surface(&visible);
         assert!(visible.contains(&"browser_debugger".to_owned()));
         assert!(visible.contains(&"browser_capture".to_owned()));
-        assert_debugger_only_visible(&visible);
-        assert!(visible.contains(&"browser_content".to_owned()));
         assert!(visible.contains(&"browser_dom".to_owned()));
-        assert!(visible.contains(&"browser_locate".to_owned()));
         assert!(visible.contains(&"browser_form".to_owned()));
         assert!(visible.contains(&"browser_wait".to_owned()));
-        assert!(visible.contains(&"target_act".to_owned()));
-        assert!(visible.contains(&"cdp_open_tab".to_owned()));
         assert!(visible.contains(&"profile".to_owned()));
         assert!(visible.contains(&"telemetry".to_owned()));
-        assert!(visible.contains(&"tool_profile_set".to_owned()));
         assert!(!visible.contains(&"act_run_shell".to_owned()));
         assert!(!visible.contains(&"act_spawn_agent".to_owned()));
         assert!(!visible.contains(&"act_click".to_owned()));
@@ -5764,17 +5512,25 @@ mod tests {
 
         let policy = foreground_capability_policy(ToolProfileKind::BrowserDebugger);
         assert!(policy.profile_preserves_capability);
-        assert!(policy.preferred_path.contains("raw CDP/chrome.debugger"));
-        assert!(policy.preferred_path.contains("raw shell/spawn"));
+        assert!(policy.preferred_path.contains("browser_debugger facade"));
+        assert!(
+            policy
+                .preferred_path
+                .contains("enabled only by this explicit profile")
+        );
     }
 
     #[test]
-    fn break_glass_profile_exposes_full_surface() {
-        let mut expected = names();
-        expected.sort();
+    fn break_glass_profile_uses_public_facade_surface() {
         let visible = visible_tool_names_for_profile(ToolProfileKind::BreakGlass, &names());
-        assert_eq!(visible, expected);
-        assert!(denied_break_glass_tools(&visible).is_empty());
+        assert_public_facade_surface(&visible);
+        assert_eq!(
+            denied_break_glass_tools(&visible),
+            BREAK_GLASS_HAZARDOUS_TOOLS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -6090,7 +5846,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_control_profile_excludes_shell_and_foreground_primitives() {
+    fn browser_control_profile_persists_public_facade_surface() {
         let dir = TempDir::new().expect("tmp");
         let service = service_with_db(dir.path());
         let session_id = "issue1008-browser-session";
@@ -6110,15 +5866,12 @@ mod tests {
                 .tools_for_session_profile(Some(session_id))
                 .expect("browser profile tools"),
         );
-        assert!(tools.contains(&"cdp_open_tab".to_owned()));
-        assert!(tools.contains(&"cdp_target_info".to_owned()));
+        assert_public_facade_surface(&tools);
+        assert_eq!(row.record.allowed_tool_count, PUBLIC_TOOL_NAMES.len());
+        assert!(tools.contains(&"act".to_owned()));
+        assert!(tools.contains(&"target".to_owned()));
         assert!(tools.contains(&"browser_nav".to_owned()));
-        assert!(tools.contains(&"target_act".to_owned()));
-        assert!(tools.contains(&"control_lease_acquire".to_owned()));
-        assert!(tools.contains(&"control_lease_release".to_owned()));
-        assert!(tools.contains(&"tool_profile_set".to_owned()));
-        assert!(!tools.contains(&"shell".to_owned()));
-        assert!(!tools.contains(&"process".to_owned()));
+        assert!(tools.contains(&"browser_debugger".to_owned()));
         assert!(!tools.contains(&"act_run_shell".to_owned()));
         assert!(!tools.contains(&"act_run_shell_start".to_owned()));
         assert!(!tools.contains(&"act_run_shell_status".to_owned()));
@@ -6278,16 +6031,10 @@ mod tests {
             .record_initialized(session_id, &state, "http", 1_000);
     }
 
-    // The four foreground input primitives that #1031 must restore for local
-    // models. They are in BREAK_GLASS_HAZARDOUS_TOOLS and hidden from
-    // normal_agent — the exact tools gemma/DeepSeek lacked when they "opened
-    // Notepad and typed nothing".
-    const LOCAL_AGENT_REQUIRED_TOOLS: [&str; 4] = [
-        "act_type",
-        "act_set_field_text",
-        "act_click",
-        "act_focus_window",
-    ];
+    // The facade routes local models need for the same foreground-equivalent
+    // capability without exposing raw implementation tools in discovery.
+    const LOCAL_AGENT_REQUIRED_FACADE_TOOLS: [&str; 4] =
+        ["act", "target", "browser_dom", "browser_debugger"];
 
     #[test]
     fn local_model_agent_session_gets_full_capability_surface() {
@@ -6296,19 +6043,25 @@ mod tests {
         let session_id = "issue1031-local-session";
         seed_session_client(&service, session_id, "synapse-local-model-agent");
 
-        // tools/list surface SoT: the input primitives are present.
+        // tools/list surface SoT: public facades are present and raw input
+        // primitives are hidden.
         let tools = tool_names(
             service
                 .tools_for_session_profile(Some(session_id))
                 .expect("local-agent profile tools"),
         );
-        for required in LOCAL_AGENT_REQUIRED_TOOLS {
+        assert_public_facade_surface(&tools);
+        for required in LOCAL_AGENT_REQUIRED_FACADE_TOOLS {
             assert!(
                 tools.contains(&required.to_owned()),
                 "local-model agent must see {required}; visible tool count = {}",
                 tools.len()
             );
         }
+        assert!(!tools.contains(&"act_type".to_owned()));
+        assert!(!tools.contains(&"act_set_field_text".to_owned()));
+        assert!(!tools.contains(&"act_click".to_owned()));
+        assert!(!tools.contains(&"act_focus_window".to_owned()));
 
         // Durable policy row SoT: full_capability, auto-assigned source.
         let row = service
@@ -6317,7 +6070,13 @@ mod tests {
             .expect("row exists after resolution");
         assert_eq!(row.record.profile, ToolProfileKind::FullCapability);
         assert_eq!(row.record.source, "default_full_capability_local_agent");
-        assert!(row.record.denied_break_glass_tools.is_empty());
+        assert_eq!(
+            row.record.denied_break_glass_tools,
+            BREAK_GLASS_HAZARDOUS_TOOLS
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect::<Vec<_>>()
+        );
 
         // Physical CF_SESSIONS readback proves the row is on disk.
         let db = service.m3_storage().expect("storage");
@@ -6327,10 +6086,14 @@ mod tests {
         assert_eq!(stored.len(), 1);
         assert_eq!(sha256_hex(&stored[0].1), row.value_sha256);
 
-        // Call-admission gate SoT: a hidden-for-normal foreground tool is admitted.
+        // Call-admission gate SoT: facade tools are admitted, raw hidden tools
+        // are denied even for full_capability.
+        service
+            .admit_tool_call_for_profile("act", Some(session_id))
+            .expect("full_capability must admit the act facade");
         service
             .admit_tool_call_for_profile("act_type", Some(session_id))
-            .expect("full_capability must admit act_type for the local-model agent");
+            .expect_err("full_capability must not expose raw act_type directly");
     }
 
     #[test]
@@ -6346,7 +6109,12 @@ mod tests {
                 .expect("codex profile tools"),
         );
         assert!(tools.contains(&"health".to_owned()));
-        for hidden in LOCAL_AGENT_REQUIRED_TOOLS {
+        for hidden in [
+            "act_type",
+            "act_set_field_text",
+            "act_click",
+            "act_focus_window",
+        ] {
             assert!(
                 !tools.contains(&hidden.to_owned()),
                 "non-local agent must NOT see foreground primitive {hidden}"
@@ -6395,7 +6163,9 @@ mod tests {
                 .tools_for_session_profile(Some(session_id))
                 .expect("post-heal tools"),
         );
-        assert!(tools.contains(&"act_type".to_owned()));
+        assert_public_facade_surface(&tools);
+        assert!(tools.contains(&"act".to_owned()));
+        assert!(!tools.contains(&"act_type".to_owned()));
         let after = service
             .read_tool_profile_assignment(session_id)
             .expect("read after")
@@ -6428,19 +6198,18 @@ mod tests {
         );
     }
 
-    /// Measurement probe (not a regression gate): emit the EXACT FullCapability
-    /// tool surface a Synapse-spawned local-model agent (gemma/DeepSeek) receives,
-    /// as physical source of truth, plus the real byte size + token estimate of
-    /// the OpenAI `tools` array that the local-agent harness puts on the
-    /// chat-completion request body.
+    /// Measurement probe (not a regression gate): emit the EXACT public facade
+    /// tool surface a Synapse-spawned local-model agent (gemma/DeepSeek)
+    /// receives under FullCapability policy, as physical source of truth, plus
+    /// the real byte size + token estimate of the OpenAI `tools` array that the
+    /// local-agent harness puts on the chat-completion request body.
     ///
     /// Faithful reproduction of the production path:
     ///   1. a session whose MCP client identity is the local-model harness
     ///      (`synapse-local-model-agent`) resolves to `ToolProfileKind::FullCapability`,
-    ///   2. `tools_for_session_profile` returns `full_sanitized_tools()` (=
-    ///      `sanitize_tools(tool_router.list_all())`) sorted exactly as the
-    ///      handler emits them — the same `Vec<Tool>` the agent's `tools/list`
-    ///      receives,
+    ///   2. `tools_for_session_profile` returns the <=40 public facade tools
+    ///      sorted exactly as the handler emits them — the same `Vec<Tool>` the
+    ///      agent's `tools/list` receives,
     ///   3. each `Tool` is mapped through the SAME JSON shape as
     ///      `local_agent::openai_tool_from_mcp` (kept in sync below) to build the
     ///      `tools[]` field of the request body.
@@ -6471,7 +6240,7 @@ mod tests {
         // The exact Vec<Tool> the agent's tools/list receives for this session.
         let tools = service
             .tools_for_session_profile(Some(session_id))
-            .expect("full-capability tool surface");
+            .expect("full-capability facade tool surface");
 
         // Hard SoT assertion: this session really is FullCapability.
         let row = service
@@ -6541,7 +6310,7 @@ mod tests {
 
         let artifact = serde_json::json!({
             "_meta": {
-                "description": "Exact FullCapability MCP tool surface a Synapse-spawned local-model agent (e.g. gemma4) receives, with the real openai tools[] payload size and token estimate.",
+                "description": "Exact <=40 public facade MCP tool surface a Synapse-spawned local-model agent (e.g. gemma4) receives under FullCapability policy, with the real openai tools[] payload size and token estimate.",
                 "profile": row.record.profile.as_str(),
                 "profile_source": row.record.source,
                 "client_identity": "synapse-local-model-agent",
