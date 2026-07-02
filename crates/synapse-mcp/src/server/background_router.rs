@@ -25,8 +25,8 @@ use crate::m1::{
 };
 use crate::m2::{
     ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollParams, ActScrollPoint,
-    ActSetFieldTextLocator, ActSetFieldTextParams, ActTypeParams, default_auto_wait_timeout_ms,
-    default_verify_timeout_ms,
+    ActSetFieldTextLocator, ActSetFieldTextParams, ActTypeParams, act_press_normalized_labels,
+    default_auto_wait_timeout_ms, default_verify_timeout_ms,
 };
 use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
 use rmcp::schemars::JsonSchema;
@@ -6758,7 +6758,7 @@ fn target_act_press_params(
     verb: &str,
 ) -> Result<ActPressParams, ErrorData> {
     let verify_timeout_ms = target_act_verify_timeout(wait_timeout_ms, verb)?;
-    serde_json::from_value(json!({
+    let params: ActPressParams = serde_json::from_value(json!({
         "keys": keys,
         "verify_delta": true,
         "verify_timeout_ms": verify_timeout_ms
@@ -6768,7 +6768,35 @@ fn target_act_press_params(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("target_act failed to construct act_press params: {error}"),
         )
-    })
+    })?;
+    target_act_reject_printable_text_sequence(&params, verb)?;
+    Ok(params)
+}
+
+fn target_act_reject_printable_text_sequence(
+    params: &ActPressParams,
+    verb: &str,
+) -> Result<(), ErrorData> {
+    let labels = act_press_normalized_labels(params)?;
+    let printable: Vec<_> = labels
+        .iter()
+        .filter(|label| target_act_key_label_is_text_input(label))
+        .cloned()
+        .collect();
+    if printable.len() > 1 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb={verb} keys contain multiple printable text-producing keys ({printable:?}); key/press is a simultaneous chord route, not ordered text input. Use verb=type or verb=insert_text for ordered text so Synapse can preflight and verify the focused text Source of Truth before mutation."
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn target_act_key_label_is_text_input(label: &str) -> bool {
+    matches!(label, "`" | "space")
+        || (label.len() == 1 && label.as_bytes()[0].is_ascii_alphanumeric())
 }
 
 fn target_act_type_verify_timeout(value: Option<u64>) -> Result<u32, ErrorData> {
@@ -8523,6 +8551,46 @@ mod tests {
             target_act_error_code(&error),
             Some(error_codes::TOOL_PARAMS_INVALID)
         );
+    }
+
+    #[test]
+    fn target_act_key_rejects_printable_text_sequence() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "key",
+            "keys": ["V", "F", "X"]
+        }))
+        .expect("key params should deserialize");
+
+        let keys = target_act_key_chord_keys(&params, "key").expect("keys should parse");
+        let error = target_act_press_params(keys, params.wait_timeout_ms, "key")
+            .expect_err("printable text sequence must fail before act_press dispatch");
+
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+        assert!(
+            error
+                .message
+                .contains("simultaneous chord route, not ordered text input"),
+            "error should explain the root cause and route guidance: {error:?}"
+        );
+    }
+
+    #[test]
+    fn target_act_key_allows_modifier_plus_single_printable_key() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "key",
+            "key": "Ctrl+F"
+        }))
+        .expect("key params should deserialize");
+
+        let keys = target_act_key_chord_keys(&params, "key").expect("key chord should parse");
+        let press =
+            target_act_press_params(keys, params.wait_timeout_ms, "key").expect("press params");
+
+        assert_eq!(press.keys, vec!["Ctrl", "F"]);
+        assert!(press.verify_delta);
     }
 
     #[test]
