@@ -116,6 +116,67 @@ fi'
   [ -n "${SYNAPSE_BEARER_TOKEN:-}" ] || die "SYNAPSE_BEARER_TOKEN did not load from $TOKEN_WSL."
 }
 
+ensure_codex_synapse_policy() {
+  local cfg="$1"
+  local bind="$2"
+  local tmp
+  mkdir -p "$(dirname "$cfg")"
+  [ -f "$cfg" ] || : > "$cfg"
+  tmp="$(mktemp)" || die "Could not allocate a temp file to update $cfg."
+  awk -v bind="$bind" '
+    function emit() {
+      print "[mcp_servers.synapse]"
+      print "url = \"http://" bind "/mcp\""
+      print "bearer_token_env_var = \"SYNAPSE_BEARER_TOKEN\""
+      print "required = true"
+      print "default_tools_approval_mode = \"approve\""
+      emitted = 1
+    }
+    BEGIN { in_synapse = 0; found = 0; emitted = 0 }
+    /^\[mcp_servers\.synapse\][[:space:]]*$/ {
+      found = 1
+      in_synapse = 1
+      emit()
+      next
+    }
+    /^\[/ && in_synapse {
+      in_synapse = 0
+    }
+    in_synapse {
+      if ($0 ~ /^[[:space:]]*(url|bearer_token_env_var|required|default_tools_approval_mode)[[:space:]]*=/) {
+        next
+      }
+      if ($0 ~ /^[[:space:]]*$/) {
+        next
+      }
+      print
+      next
+    }
+    { print }
+    END {
+      if (!found) {
+        if (NR > 0) {
+          print ""
+        }
+        emit()
+      }
+    }
+  ' "$cfg" > "$tmp" || die "Failed to rewrite $cfg with Synapse Codex MCP policy."
+  mv "$tmp" "$cfg" || die "Failed to replace $cfg with repaired Synapse Codex MCP policy."
+  chmod 600 "$cfg" 2>/dev/null || true
+
+  grep -Fqx "[mcp_servers.synapse]" "$cfg" \
+    || die "Codex config $cfg missing [mcp_servers.synapse] after repair."
+  grep -Fqx "url = \"http://$bind/mcp\"" "$cfg" \
+    || die "Codex config $cfg missing Synapse HTTP URL after repair."
+  grep -Fqx 'bearer_token_env_var = "SYNAPSE_BEARER_TOKEN"' "$cfg" \
+    || die "Codex config $cfg missing SYNAPSE_BEARER_TOKEN bearer env after repair."
+  grep -Fqx 'required = true' "$cfg" \
+    || die "Codex config $cfg missing required=true after repair."
+  grep -Fqx 'default_tools_approval_mode = "approve"' "$cfg" \
+    || die "Codex config $cfg missing default_tools_approval_mode=approve after repair."
+}
+
 # --- 2. Sync source to a local Windows path ---------------------------------
 SRC_WSL="$WIN_HOME_WSL/synapse-src"
 SRC_WIN="$WIN_USERPROFILE\\synapse-src"
@@ -160,7 +221,8 @@ CODEX_CFG="$HOME/.codex/config.toml"
 if command -v codex >/dev/null 2>&1; then
   codex mcp remove synapse >/dev/null 2>&1 || true
   codex mcp add synapse --url "http://$BIND/mcp" --bearer-token-env-var SYNAPSE_BEARER_TOKEN
-  say "Codex (WSL) wired -> Streamable HTTP daemon."
+  ensure_codex_synapse_policy "$CODEX_CFG" "$BIND"
+  say "Codex (WSL) wired -> Streamable HTTP daemon with required=true and default_tools_approval_mode=approve."
 elif [ -f "$CODEX_CFG" ]; then
   die "Codex config exists at $CODEX_CFG but codex CLI is not on PATH, so the installer cannot safely replace stale synapse config. Install/repair Codex CLI, then re-run."
 else

@@ -371,6 +371,8 @@ Install Synapse for me and wire it into my AI tools.
      [mcp_servers.synapse]
      url = "http://127.0.0.1:7700/mcp"
      bearer_token_env_var = "SYNAPSE_BEARER_TOKEN"
+     required = true
+     default_tools_approval_mode = "approve"
 6. Connect it to the Claude Desktop app by adding a "synapse" server to
    %APPDATA%\Claude\claude_desktop_config.json under "mcpServers" with the same
    command and ["--mode","connect","--bind","127.0.0.1:7700"] args. Preserve any existing servers in that file.
@@ -476,6 +478,8 @@ Codex (`~/.codex/config.toml`):
 [mcp_servers.synapse]
 url = "http://127.0.0.1:7700/mcp"
 bearer_token_env_var = "SYNAPSE_BEARER_TOKEN"
+required = true
+default_tools_approval_mode = "approve"
 ```
 
 Claude Desktop (`%APPDATA%\Claude\claude_desktop_config.json`):

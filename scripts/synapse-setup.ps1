@@ -1398,25 +1398,117 @@ function Test-CodexSynapseHttpConfig {
         [Parameter(Mandatory=$true)][string]$Bind
     )
 
-    if (-not (Test-Path $ConfigPath)) {
+    $body = Get-CodexSynapseConfigBody -ConfigPath $ConfigPath
+    if ($null -eq $body) {
         return $false
+    }
+    $bindUrlRegex = [regex]::Escape("http://$Bind/mcp")
+    return ($body -match "url\s*=\s*`"$bindUrlRegex`"" -and
+        $body -match 'bearer_token_env_var\s*=\s*"SYNAPSE_BEARER_TOKEN"' -and
+        $body -match '(?m)^\s*required\s*=\s*true\s*$' -and
+        $body -match '(?m)^\s*default_tools_approval_mode\s*=\s*"approve"\s*$')
+}
+
+function Test-CodexSynapseHttpTransportConfig {
+    param(
+        [Parameter(Mandatory=$true)][string]$ConfigPath,
+        [Parameter(Mandatory=$true)][string]$Bind
+    )
+
+    $body = Get-CodexSynapseConfigBody -ConfigPath $ConfigPath
+    if ($null -eq $body) {
+        return $false
+    }
+    $bindUrlRegex = [regex]::Escape("http://$Bind/mcp")
+    return ($body -match "url\s*=\s*`"$bindUrlRegex`"" -and
+        $body -match 'bearer_token_env_var\s*=\s*"SYNAPSE_BEARER_TOKEN"')
+}
+
+function Get-CodexSynapseConfigBody {
+    param(
+        [Parameter(Mandatory=$true)][string]$ConfigPath
+    )
+
+    if (-not (Test-Path $ConfigPath)) {
+        return $null
     }
     try {
         $content = Get-Content -Raw $ConfigPath
     } catch {
-        return $false
+        return $null
     }
     $section = [regex]::Match(
         $content,
         '(?ms)^\[mcp_servers\.synapse\]\s*(?<body>.*?)(?=^\[|\z)'
     )
     if (-not $section.Success) {
-        return $false
+        return $null
     }
-    $body = [string]$section.Groups['body'].Value
-    $bindUrlRegex = [regex]::Escape("http://$Bind/mcp")
-    return ($body -match "url\s*=\s*`"$bindUrlRegex`"" -and
-        $body -match 'bearer_token_env_var\s*=\s*"SYNAPSE_BEARER_TOKEN"')
+    return [string]$section.Groups['body'].Value
+}
+
+function Set-CodexSynapseClientPolicy {
+    param(
+        [Parameter(Mandatory=$true)][string]$ConfigPath,
+        [Parameter(Mandatory=$true)][string]$Bind
+    )
+
+    $configDir = Split-Path -Parent $ConfigPath
+    if (-not (Test-Path $configDir)) {
+        [System.IO.Directory]::CreateDirectory($configDir) | Out-Null
+    }
+
+    $content = ''
+    if (Test-Path $ConfigPath) {
+        $content = Get-Content -Raw $ConfigPath
+    }
+
+    $desiredLines = @(
+        ('url = "http://{0}/mcp"' -f $Bind),
+        'bearer_token_env_var = "SYNAPSE_BEARER_TOKEN"',
+        'required = true',
+        'default_tools_approval_mode = "approve"'
+    )
+    $sectionRegex = '(?ms)^\[mcp_servers\.synapse\]\s*(?<body>.*?)(?=^\[|\z)'
+    $section = [regex]::Match($content, $sectionRegex)
+
+    if ($section.Success) {
+        $body = [string]$section.Groups['body'].Value
+        $preserved = @()
+        foreach ($line in ($body -split "`r?`n")) {
+            if ($line -match '^\s*(url|bearer_token_env_var|required|default_tools_approval_mode)\s*=') {
+                continue
+            }
+            if ([string]::IsNullOrWhiteSpace($line) -and $preserved.Count -eq 0) {
+                continue
+            }
+            $preserved += $line
+        }
+        while ($preserved.Count -gt 0 -and [string]::IsNullOrWhiteSpace($preserved[$preserved.Count - 1])) {
+            if ($preserved.Count -eq 1) {
+                $preserved = @()
+            } else {
+                $preserved = @($preserved[0..($preserved.Count - 2)])
+            }
+        }
+        $newSectionLines = @('[mcp_servers.synapse]') + $desiredLines
+        if ($preserved.Count -gt 0) {
+            $newSectionLines += $preserved
+        }
+        $newSection = ($newSectionLines -join "`r`n") + "`r`n"
+        $content = $content.Substring(0, $section.Index) + $newSection + $content.Substring($section.Index + $section.Length)
+    } else {
+        if (-not [string]::IsNullOrEmpty($content) -and -not $content.EndsWith("`n")) {
+            $content += "`r`n"
+        }
+        if (-not [string]::IsNullOrWhiteSpace($content)) {
+            $content += "`r`n"
+        }
+        $content += ((@('[mcp_servers.synapse]') + $desiredLines) -join "`r`n") + "`r`n"
+    }
+
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($ConfigPath, $content, $utf8NoBom)
 }
 
 function Get-SynapseMcpProcessSnapshot {
@@ -2825,8 +2917,8 @@ function Write-SynapseCodexRestartHandoff {
         post_restart_verification = @(
             'Run git status --short --branch and confirm the working tree matches the handoff/recovery notes.',
             "Read the active Codex process parent chain and confirm the active codex.exe PID is not stale PID $codexPid from this handoff.",
-            'Call real mcp__synapse.health and verify daemon pid/tool_surface_sha256 matches or intentionally supersedes this handoff.',
-            'Run tool discovery for the previously missing Synapse tools. If metadata is still stale, rerun scripts\synapse-setup.ps1 and keep the issue open.',
+            'Run deferred tool discovery for Synapse first, then call real mcp__synapse.health and verify daemon pid/tool_surface_sha256 matches or intentionally supersedes this handoff.',
+            'If Synapse tool discovery, approval, or metadata is still stale, rerun scripts\synapse-setup.ps1 and keep the issue open.',
             $resumeInstruction
         )
         restart_command_hint = $restartCommandHint
@@ -2898,7 +2990,7 @@ function Write-SynapseCodexRestartHandoff {
                 "- Active issue: $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown; recover from caller/session context or open issue queue' } else { $activeIssueRef })",
                 "- Stale-schema context issue: #1398 (background only; not the resume target)",
                 '',
-                "After restart, re-read AGENTS.md, #351, $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'the active issue from the caller/session context' } else { $activeIssueRef }), git status, and this file before resuming. #1398 is stale-schema background context only. Use the real mcp__synapse client for FSV; direct helper calls are diagnostics only.",
+                "After restart, re-read AGENTS.md, #351, $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'the active issue from the caller/session context' } else { $activeIssueRef }), git status, and this file before resuming. #1398 is stale-schema background context only. Run deferred Synapse tool discovery before calling real mcp__synapse tools for FSV; direct helper calls are diagnostics only.",
                 ''
             )
             Write-SynapseUtf8NoBomFile -Path $recoveryNotesPath -Text (($notes -join "`n") + "`n")
@@ -4146,29 +4238,33 @@ if (-not $SkipClientWiring) {
     $codex = Get-Command codex -ErrorAction SilentlyContinue
     $codexCfg = "$env:USERPROFILE\.codex\config.toml"
     if ($codex) {
-        if (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind) {
+        if (Test-CodexSynapseHttpTransportConfig -ConfigPath $codexCfg -Bind $Bind) {
             Info "Codex MCP entry already uses the required Streamable HTTP transport."
         } else {
             & $codex.Source mcp remove synapse 2>$null | Out-Null
             & $codex.Source mcp add synapse --url "http://$Bind/mcp" --bearer-token-env-var SYNAPSE_BEARER_TOKEN
             $codexAddExit = $LASTEXITCODE
-            if ($codexAddExit -ne 0 -and -not (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind)) {
+            if ($codexAddExit -ne 0 -and -not (Test-CodexSynapseHttpTransportConfig -ConfigPath $codexCfg -Bind $Bind)) {
                 Die "codex mcp add failed (exit $codexAddExit). Codex must be wired to HTTP, not the connect bridge."
             }
-            if (-not (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind)) {
+            if (-not (Test-CodexSynapseHttpTransportConfig -ConfigPath $codexCfg -Bind $Bind)) {
                 Die "codex mcp add completed but Codex config is not the required HTTP transport."
             }
             if ($codexAddExit -ne 0) {
                 Info "WARN: codex mcp add exited $codexAddExit but Codex config now contains the required HTTP entry; continuing."
             }
         }
+        Set-CodexSynapseClientPolicy -ConfigPath $codexCfg -Bind $Bind
+        if (-not (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind)) {
+            Die "SYNAPSE_CODEX_MCP_CONFIG_INCOMPLETE path=$codexCfg remediation=repair [mcp_servers.synapse] so it contains url=http://$Bind/mcp, bearer_token_env_var=SYNAPSE_BEARER_TOKEN, required=true, and default_tools_approval_mode=approve."
+        }
         Install-CodexSynapseTokenLoader -CodexCommandPath $codex.Source -TokenPath $TokenPath
-        Info "Codex (Windows) wired via Streamable HTTP transport."
+        Info "Codex (Windows) wired via Streamable HTTP transport with required=true and default_tools_approval_mode=approve."
     } elseif (Test-Path $codexCfg) {
         $c = Get-Content -Raw $codexCfg
         if ($c -match '(?m)^\[mcp_servers\.synapse\]' -and
             -not (Test-CodexSynapseHttpConfig -ConfigPath $codexCfg -Bind $Bind)) {
-            Die "Codex config exists at $codexCfg but codex CLI is not on PATH and the synapse entry is not the required HTTP transport. Install/repair Codex CLI, then re-run."
+            Die "Codex config exists at $codexCfg but codex CLI is not on PATH and the synapse entry is not the required HTTP transport/client policy. Install/repair Codex CLI, then re-run."
         }
         Info "Codex CLI not found; existing Codex config is already HTTP or has no synapse entry."
     } else { Info "codex CLI/config not found; skipping Codex wiring." }
