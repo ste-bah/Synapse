@@ -380,6 +380,11 @@ impl SynapseService {
             )
         })?;
         let redacted_value_count = redact_browser_secret_values(&mut readback);
+        normalize_keyed_storage_get_result_value(
+            &mut readback,
+            params.operation,
+            params.key.as_deref(),
+        );
         log_redaction_summary(STORAGE_TOOL, cdp_target_id, redacted_value_count);
         let result = readback.get("result").cloned().unwrap_or(Value::Null);
         let storage_state = readback
@@ -459,6 +464,45 @@ fn redact_browser_secret_values(value: &mut Value) -> u32 {
         Value::Array(items) => items.iter_mut().map(redact_browser_secret_values).sum(),
         Value::Object(fields) => redact_browser_secret_fields(fields),
         _ => 0,
+    }
+}
+
+fn normalize_keyed_storage_get_result_value(
+    readback: &mut Value,
+    operation: BrowserStorageOperation,
+    key: Option<&str>,
+) {
+    if !matches!(operation, BrowserStorageOperation::Get) {
+        return;
+    }
+    let Some(key) = key else {
+        return;
+    };
+    let Some(result) = readback.get_mut("result").and_then(Value::as_object_mut) else {
+        return;
+    };
+    let Some(items) = result.get("items").and_then(Value::as_array) else {
+        return;
+    };
+    let Some(item) = items
+        .iter()
+        .find(|item| item.get("name").and_then(Value::as_str) == Some(key))
+        .and_then(Value::as_object)
+        .cloned()
+    else {
+        return;
+    };
+    for field in [
+        "value",
+        "value_kind",
+        "value_len",
+        "value_redacted",
+        "value_sha256",
+        "redaction_policy",
+    ] {
+        if let Some(value) = item.get(field).cloned() {
+            result.insert(field.to_owned(), value);
+        }
     }
 }
 
@@ -723,6 +767,84 @@ mod tests {
     }
 
     #[test]
+    fn keyed_get_result_value_uses_matching_item_evidence() {
+        let raw = "issue1482-present-value";
+        let mut readback = json!({
+            "result": {
+                "operation": "get",
+                "key": "issue1482_key",
+                "value": null,
+                "items": [
+                    {"name": "issue1482_key", "value": raw}
+                ]
+            }
+        });
+
+        let redacted_count = redact_browser_secret_values(&mut readback);
+        assert_eq!(redacted_count, 2);
+        normalize_keyed_storage_get_result_value(
+            &mut readback,
+            BrowserStorageOperation::Get,
+            Some("issue1482_key"),
+        );
+
+        let result = object_at(&readback, "/result");
+        assert_redacted_value(result, raw);
+        let item = object_at(&readback, "/result/items/0");
+        assert_redacted_value(item, raw);
+    }
+
+    #[test]
+    fn keyed_get_result_value_stays_null_when_item_absent() {
+        let mut readback = json!({
+            "result": {
+                "operation": "get",
+                "key": "issue1482_missing",
+                "value": null,
+                "items": []
+            }
+        });
+
+        let redacted_count = redact_browser_secret_values(&mut readback);
+        assert_eq!(redacted_count, 1);
+        normalize_keyed_storage_get_result_value(
+            &mut readback,
+            BrowserStorageOperation::Get,
+            Some("issue1482_missing"),
+        );
+
+        let result = object_at(&readback, "/result");
+        assert_redacted_value_kind(
+            result,
+            "null",
+            4,
+            "sha256:74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+        );
+    }
+
+    #[test]
+    fn whole_store_get_does_not_copy_item_to_result_value() {
+        let raw = "issue1482-whole-store";
+        let mut readback = json!({
+            "result": {
+                "operation": "get",
+                "items": [
+                    {"name": "issue1482_key", "value": raw}
+                ]
+            }
+        });
+
+        let redacted_count = redact_browser_secret_values(&mut readback);
+        assert_eq!(redacted_count, 1);
+        normalize_keyed_storage_get_result_value(&mut readback, BrowserStorageOperation::Get, None);
+
+        let result = object_at(&readback, "/result");
+        assert!(result.get("value_kind").is_none());
+        let item = object_at(&readback, "/result/items/0");
+        assert_redacted_value(item, raw);
+    }
+
+    #[test]
     fn redacts_non_string_value_without_serializing_raw_payload() {
         let nested_secret = "nested-secret-1437";
         let mut readback = json!({
@@ -792,6 +914,27 @@ mod tests {
         assert_eq!(
             fields.get("value_sha256").and_then(Value::as_str),
             Some(format!("sha256:{}", sha256_hex(raw.as_bytes())).as_str())
+        );
+    }
+
+    fn assert_redacted_value_kind(fields: &Map<String, Value>, kind: &str, len: u64, sha256: &str) {
+        assert_eq!(
+            fields.get("value").and_then(Value::as_str),
+            Some(REDACTED_VALUE)
+        );
+        assert_eq!(
+            fields.get("value_redacted").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            fields.get("redaction_policy").and_then(Value::as_str),
+            Some(REDACTION_POLICY)
+        );
+        assert_eq!(fields.get("value_kind").and_then(Value::as_str), Some(kind));
+        assert_eq!(fields.get("value_len").and_then(Value::as_u64), Some(len));
+        assert_eq!(
+            fields.get("value_sha256").and_then(Value::as_str),
+            Some(sha256)
         );
     }
 
