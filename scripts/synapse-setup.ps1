@@ -2020,6 +2020,8 @@ function Invoke-SynapseSetupMcpTool {
         [Parameter(Mandatory=$true)][string]$Token,
         [Parameter(Mandatory=$true)][string]$Name,
         [Parameter(Mandatory=$true)]$Arguments,
+        [string]$Profile,
+        [string]$ProfileReason,
         [int]$TimeoutSec = 8
     )
 
@@ -2044,6 +2046,38 @@ function Invoke-SynapseSetupMcpTool {
         Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -SessionId $sessionId -Method 'notifications/initialized' -Params @{} | Out-Null
 
         $requestId = 2
+        $toolsResponse = Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -SessionId $sessionId -Method 'tools/list' -Params @{} -Id $requestId -TimeoutSec $TimeoutSec
+        $toolsMessage = Read-SynapseMcpSseJsonResponse -Content $toolsResponse.Content -Operation 'tools/list setup session' -ExpectedId $requestId
+        $toolNames = @($toolsMessage.result.tools | ForEach-Object { [string]$_.name })
+        if ($toolNames -notcontains $Name) {
+            $visible = if ($toolNames.Count -eq 0) { '<none>' } else { $toolNames -join ',' }
+            Die "SYNAPSE_MCP_SETUP_TOOL_NOT_VISIBLE bind=$Bind session_id=$sessionId requested_tool=$Name visible_tools=$visible remediation=setup may only call public facade tools visible through tools/list; route hidden implementation tools through their public facade/profile path"
+        }
+        $requestId++
+        if (-not [string]::IsNullOrWhiteSpace($Profile)) {
+            if ($toolNames -notcontains 'profile') {
+                $visible = if ($toolNames.Count -eq 0) { '<none>' } else { $toolNames -join ',' }
+                Die "SYNAPSE_MCP_SETUP_PROFILE_TOOL_NOT_VISIBLE bind=$Bind session_id=$sessionId requested_profile=$Profile visible_tools=$visible remediation=setup profile escalation requires the public profile facade in tools/list"
+            }
+            if ([string]::IsNullOrWhiteSpace($ProfileReason)) {
+                Die "SYNAPSE_MCP_PROFILE_REASON_MISSING bind=$Bind session_id=$sessionId tool=$Name requested_profile=$Profile remediation=setup profile escalation requires an explicit reason for audit readback"
+            }
+            $profileArgs = [ordered]@{
+                operation = 'set'
+                profile = $Profile
+                confirm_break_glass = $true
+                reason = $ProfileReason
+            }
+            $profileCallParams = @{ name = 'profile'; arguments = $profileArgs }
+            $profileResponse = Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -SessionId $sessionId -Method 'tools/call' -Params $profileCallParams -Id $requestId -TimeoutSec $TimeoutSec
+            $profileMessage = Read-SynapseMcpSseJsonResponse -Content $profileResponse.Content -Operation "tools/call profile set $Profile" -ExpectedId $requestId
+            if ($profileMessage.result.isError -eq $true) {
+                $profileErrorText = @($profileMessage.result.content | Where-Object { [string]$_.type -eq 'text' } | Select-Object -First 1).text
+                Die "SYNAPSE_MCP_PROFILE_SET_ERROR bind=$Bind session_id=$sessionId requested_profile=$Profile tool=$Name error=$profileErrorText remediation=repair the setup MCP profile policy path before accepting setup"
+            }
+            Info "Setup MCP session profile set session_id=$sessionId profile=$Profile reason=$ProfileReason"
+            $requestId++
+        }
         $callParams = @{ name = $Name; arguments = $Arguments }
         $callResponse = Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -SessionId $sessionId -Method 'tools/call' -Params $callParams -Id $requestId -TimeoutSec $TimeoutSec
         $callMessage = Read-SynapseMcpSseJsonResponse -Content $callResponse.Content -Operation "tools/call $Name" -ExpectedId $requestId
@@ -2116,10 +2150,22 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
         Die "SYNAPSE_CHROME_BRIDGE_HOST_ABSENT_AFTER_SETUP_WAIT status=$status detail=$detail remediation=setup waited for the already-installed bridge host to reconnect after daemon start; keep the active Chrome profile open and rerun scripts\\install-synapse-chrome-debugger.ps1 if the host does not register"
     }
 
-    Info "WARN: Chrome bridge not clean after daemon start; requesting in-place cdp_bridge_reload through the new live MCP daemon. status=$status detail=$detail"
-    $reload = Invoke-SynapseSetupMcpTool -Bind $Bind -Token $Token -Name 'cdp_bridge_reload' -Arguments @{ wait_timeout_ms = 30000 } -TimeoutSec 45
-    $afterBuild = if ($reload.Json -and $reload.Json.after) { [string]$reload.Json.after.extension_build_id } else { 'unknown' }
-    Info "Chrome bridge reload completed through MCP after_build_id=$afterBuild"
+    Info "WARN: Chrome bridge not clean after daemon start; requesting in-place browser_debugger.reload_bridge through the new live MCP daemon. status=$status detail=$detail"
+    $reloadArgs = [ordered]@{
+        operation = 'reload_bridge'
+        reload_bridge = [ordered]@{ wait_timeout_ms = 30000 }
+    }
+    $reload = Invoke-SynapseSetupMcpTool `
+        -Bind $Bind `
+        -Token $Token `
+        -Name 'browser_debugger' `
+        -Arguments $reloadArgs `
+        -Profile 'browser_debugger' `
+        -ProfileReason 'synapse-setup Chrome bridge post-start reload through public browser_debugger facade' `
+        -TimeoutSec 45
+    $reloadReadback = if ($reload.Json -and $reload.Json.reload_bridge) { $reload.Json.reload_bridge } else { $null }
+    $afterBuild = if ($reloadReadback -and $reloadReadback.after) { [string]$reloadReadback.after.extension_build_id } else { 'unknown' }
+    Info "Chrome bridge reload completed through public browser_debugger facade after_build_id=$afterBuild"
 
     try {
         $afterHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4

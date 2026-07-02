@@ -1261,7 +1261,7 @@ function Invoke-SynapseChromeBridgeAutoInstall {
                 reason = 'existing_ready_extension_code_reload_deferred_to_daemon_reloadself'
                 active_profile = $activeProfile
                 required_foreground = $false
-                bridge_self_reload_command = 'cdp_bridge_reload'
+                bridge_self_reload_command = 'browser_debugger.reload_bridge'
                 before = $before
                 after = $before
             }
@@ -1269,7 +1269,7 @@ function Invoke-SynapseChromeBridgeAutoInstall {
 
         $missing = if ($before.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $before.missing_active_api_permissions -join ',' }
         $disableReasons = if ($before.disable_reasons.Count -eq 0) { '<none>' } else { $before.disable_reasons -join ',' }
-        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_NOT_READY active_profile=$activeProfile ready=$($before.ready) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=existing Synapse Chrome Bridge row is installed from the expected path but is not active/permissioned; setup refuses to steal foreground for chrome://extensions repair. Enable/permission the existing extension in the already-open profile or remove it and rerun setup for a first-time Load unpacked install; once a live bridge host exists, setup uses cdp_bridge_reload for code reconvergence."
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_NOT_READY active_profile=$activeProfile ready=$($before.ready) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=existing Synapse Chrome Bridge row is installed from the expected path but is not active/permissioned; setup refuses to steal foreground for chrome://extensions repair. Enable/permission the existing extension in the already-open profile or remove it and rerun setup for a first-time Load unpacked install; once a live bridge host exists, setup uses the public browser_debugger.reload_bridge facade for code reconvergence."
     }
 
     # Same extension ID already loaded, enabled, and fully permissioned, but registered
@@ -1284,7 +1284,8 @@ function Invoke-SynapseChromeBridgeAutoInstall {
     # healthy is precisely the failure mode that broke the daemon handoff (see #1313), so
     # we refuse to do it. The stable directory has already been deployed for future
     # first-time installs; the live daemon reconverges the extension's code in place via
-    # cdp_bridge_reload after handoff, and the post-handoff /health check is the live
+    # the public browser_debugger.reload_bridge facade after handoff, and the
+    # post-handoff /health check is the live
     # source of truth that fails loud if the bridge is not actually serving. We surface
     # the pending path migration in the readback so health and operators can see that the
     # bridge is still loaded from a non-stable directory.
@@ -1295,7 +1296,7 @@ function Invoke-SynapseChromeBridgeAutoInstall {
             reason = 'existing_ready_extension_nonstable_path_code_reload_deferred_to_daemon'
             active_profile = $activeProfile
             required_foreground = $false
-            bridge_self_reload_command = 'cdp_bridge_reload'
+            bridge_self_reload_command = 'browser_debugger.reload_bridge'
             path_migration_pending = $true
             loaded_manifest_path = $before.manifest_path
             expected_stable_path = $ExtensionDir
@@ -1733,7 +1734,7 @@ $synapseChromeProfileInstallState = [pscustomobject]@{
     active_profile_installed = $synapseChromeActiveProfileInstalled
     reason = $synapseChromeProfileInstallReason
     cdp_bridge_reload_can_install_absent_extension = $false
-    remediation = 'run scripts\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\synapse\chrome-extension\<build-id> and auto-loads that stable unpacked directory in the active profile. cdp_bridge_reload can only reload an already-registered bridge host and cannot install an absent Chrome extension'
+    remediation = 'run scripts\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\synapse\chrome-extension\<build-id> and auto-loads that stable unpacked directory in the active profile. browser_debugger.reload_bridge can only reload an already-registered bridge host and cannot install an absent Chrome extension'
 }
 $externalNativeMessagingProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
@@ -1860,7 +1861,7 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
         stale_active_permissions = $staleSynapseActivePermissions
         chrome_policy_popup_shield = $chromePolicyPopupShield
     } | ConvertTo-Json -Depth 8 -Compress
-    throw "SYNAPSE_CHROME_EXTENSION_STALE_ACTIVE_NATIVE_MESSAGING_PERMISSION extension_id=$ExtensionId detail=$detail remediation=Synapse attempted to apply/preserve the HKCU ExtensionSettings self-shield for nativeMessaging and included the physical policy write result in detail.chrome_policy_popup_shield; call cdp_bridge_reload through the real Synapse MCP tool when the live bridge advertises reloadSelf, otherwise keep normal browser commands failed closed until Chrome reloads the extension or restarts the already-open profile"
+    throw "SYNAPSE_CHROME_EXTENSION_STALE_ACTIVE_NATIVE_MESSAGING_PERMISSION extension_id=$ExtensionId detail=$detail remediation=Synapse attempted to apply/preserve the HKCU ExtensionSettings self-shield for nativeMessaging and included the physical policy write result in detail.chrome_policy_popup_shield; call browser_debugger.reload_bridge through the real Synapse MCP public facade when the live bridge advertises reloadSelf, otherwise keep normal browser commands failed closed until Chrome reloads the extension or restarts the already-open profile"
 }
 
 [pscustomobject]@{
@@ -1875,7 +1876,7 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     extension_deploy = $extensionDeploy
     daemon_bridge_transport = 'direct_localhost_websocket'
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
-    bridge_self_reload_command = 'cdp_bridge_reload'
+    bridge_self_reload_command = 'browser_debugger.reload_bridge'
     bridge_build_id_expected = $bridgeBuildId
     bridge_declared_build_sha256_expected = $bridgeDeclaredBuildSha256
     bridge_build_sha256_expected = $bridgeDeclaredBuildSha256
