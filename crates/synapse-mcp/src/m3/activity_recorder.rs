@@ -68,6 +68,10 @@ use crate::m1::{
     ClipboardTimelineSample, FsTimelineEvent, timeline_clipboard_enabled,
     timeline_file_activity_enabled,
 };
+use crate::server::url_redaction::{
+    redact_url_fields_for_public_readback, redact_url_for_public_readback,
+    redact_url_opt_for_public_readback,
+};
 
 /// Idle threshold override, in milliseconds. Default mirrors ActivityWatch.
 pub const IDLE_TIMEOUT_ENV: &str = "SYNAPSE_TIMELINE_IDLE_TIMEOUT_MS";
@@ -1173,15 +1177,18 @@ fn env_ms_as_ns(name: &str, default_ms: u64) -> Result<u64> {
         .ok_or_else(|| anyhow::anyhow!("{name} is too large to convert from ms to ns: {ms}"))
 }
 
+fn redact_browser_navigation_event(mut event: BrowserNavigationEvent) -> BrowserNavigationEvent {
+    event.url = redact_url_for_public_readback(&event.url);
+    event.requested_url = redact_url_opt_for_public_readback(event.requested_url);
+    event.before_url = redact_url_opt_for_public_readback(event.before_url);
+    event
+}
+
 fn browser_nav_dedupe_key(event: &BrowserNavigationEvent) -> String {
+    let url_sha256 = sha256_hex(event.url.trim());
     format!(
         "{:?}\n{:?}\n{:?}\n{:?}\n{}\n{}",
-        event.actor,
-        event.tab_id,
-        event.cdp_target_id,
-        event.window_hwnd,
-        event.url.trim(),
-        event.title
+        event.actor, event.tab_id, event.cdp_target_id, event.window_hwnd, url_sha256, event.title
     )
 }
 
@@ -2030,6 +2037,8 @@ impl ActivityRecorder {
     }
 
     pub fn record_browser_navigation(&self, event: BrowserNavigationEvent) -> bool {
+        let dedupe_key = browser_nav_dedupe_key(&event);
+        let event = redact_browser_navigation_event(event);
         let url = event.url.trim();
         if url.is_empty() {
             tracing::warn!(
@@ -2052,11 +2061,10 @@ impl ActivityRecorder {
         {
             return false;
         }
-        let dedupe_key = browser_nav_dedupe_key(&event);
         if self.browser_nav_seen(&dedupe_key) {
             return false;
         }
-        let payload = json!({
+        let mut payload = json!({
             "url": url,
             "title": event.title.as_str(),
             "tab_id": event.tab_id,
@@ -2077,6 +2085,7 @@ impl ActivityRecorder {
             "highlighted": event.highlighted,
             "pinned": event.pinned,
         });
+        redact_url_fields_for_public_readback(&mut payload);
         match self.writer.try_write(
             now_ts_ns(),
             TimelineKind::BrowserNav,
@@ -2870,7 +2879,7 @@ mod tests {
             source: "tabs.onUpdated".to_owned(),
             event: "tabNavigation".to_owned(),
             action: None,
-            url: "https://example.com/issue840".to_owned(),
+            url: "https://example.com/account/issue840?token=SYN1485#frag".to_owned(),
             title: "Issue 840 Example".to_owned(),
             tab_id: Some(84001),
             chrome_window_id: Some(11),
@@ -2900,7 +2909,12 @@ mod tests {
         assert_eq!(records[0].kind, TimelineKind::BrowserNav);
         assert_eq!(records[0].actor, TimelineActor::Human);
         assert_eq!(records[0].app.as_deref(), Some("chrome.exe"));
-        assert_eq!(records[0].payload["url"], "https://example.com/issue840");
+        assert_eq!(
+            records[0].payload["url"],
+            "https://example.com/redacted?redacted#redacted"
+        );
+        assert!(!records[0].payload.to_string().contains("account/issue840"));
+        assert!(!records[0].payload.to_string().contains("SYN1485"));
         assert_eq!(records[0].payload["title"], "Issue 840 Example");
         assert_eq!(records[0].payload["tab_id"], 84001);
         assert_eq!(records[0].payload["ready_state"], "complete");
@@ -2944,7 +2958,12 @@ mod tests {
         assert_eq!(records[0].kind, TimelineKind::BrowserNav);
         assert_eq!(records[0].actor, actor);
         assert_eq!(records[0].payload["action"], "navigate");
+        assert_eq!(records[0].payload["url"], "data:redacted");
+        assert_eq!(records[0].payload["requested_url"], "data:redacted");
+        assert_eq!(records[0].payload["before_url"], "about:blank");
+        assert_eq!(records[0].payload["title"], "redacted");
         assert_eq!(records[0].payload["window_hwnd"], 0x840);
+        assert!(!records[0].payload.to_string().contains("Issue840Agent"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ use super::{
     tool, tool_router,
 };
 use crate::m1::mcp_error;
+use crate::server::url_redaction::redact_url_for_public_readback;
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -174,7 +175,7 @@ impl SynapseService {
                     transport: "chrome_tabs_extension".to_owned(),
                     endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.webNavigation".to_owned(),
                     cdp_target_id: result.target_id,
-                    page_url: result.url,
+                    page_url: redact_url_for_public_readback(&result.url),
                     page_title: result.title,
                     frame_count: result.frame_count,
                     oopif_target_count: result.oopif_target_count,
@@ -221,7 +222,7 @@ impl SynapseService {
             transport: "raw_cdp".to_owned(),
             endpoint: result.endpoint,
             cdp_target_id: result.target_id,
-            page_url: result.page_url,
+            page_url: redact_url_for_public_readback(&result.page_url),
             page_title: result.page_title,
             frame_count: result.frame_count,
             oopif_target_count: result.oopif_target_count,
@@ -276,7 +277,7 @@ fn browser_frame_entry(
         cdp_target_id: frame.cdp_target_id,
         target_type: frame.target_type,
         target_attached: frame.target_attached,
-        url: frame.url,
+        url: redact_url_for_public_readback(&frame.url),
         name: frame.name,
         origin: frame.origin,
         security_origin: frame.security_origin,
@@ -316,7 +317,7 @@ fn browser_bridge_frame_entry(
         cdp_target_id: frame.cdp_target_id,
         target_type: frame.target_type,
         target_attached: frame.target_attached,
-        url: frame.url,
+        url: redact_url_for_public_readback(&frame.url),
         name: frame.name,
         origin: frame.origin,
         security_origin: frame.security_origin,

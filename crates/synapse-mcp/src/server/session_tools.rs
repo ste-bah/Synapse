@@ -2506,11 +2506,11 @@ mod tests {
         assert_eq!(readback.chrome_window_id, Some(7));
         assert_eq!(
             readback.requested_url,
-            "https://example.test/issue1268?redacted#redacted"
+            "https://example.test/redacted?redacted#redacted"
         );
         assert_eq!(
             readback.target_url,
-            "https://example.test/issue1268?redacted#redacted"
+            "https://example.test/redacted?redacted#redacted"
         );
         assert!(!readback.requested_url.contains("SYNAPSE_SECRET_1484"));
         assert!(!readback.target_url.contains("SYNAPSE_TOKEN_1484"));

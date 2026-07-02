@@ -17,6 +17,9 @@ use super::{
     tool, tool_router,
 };
 use crate::m1::{BrowserNetworkWaitEntry, mcp_error};
+use crate::server::url_redaction::{
+    redact_url_for_public_readback, redact_url_opt_for_public_readback,
+};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
@@ -3737,12 +3740,12 @@ fn browser_network_entry_to_wire(entry: &synapse_a11y::CdpNetworkEntry) -> Brows
     BrowserNetworkWaitEntry {
         seq: entry.seq,
         request_id: entry.request_id.clone(),
-        url: entry.url.clone(),
+        url: redact_url_opt_for_public_readback(entry.url.clone()),
         method: entry.method.clone(),
         resource_type: entry.resource_type.clone(),
         request_headers: entry.request_headers.clone(),
         response_received: entry.response_received,
-        response_url: response.map(|response| response.url.clone()),
+        response_url: response.map(|response| redact_url_for_public_readback(&response.url)),
         status: response.map(|response| response.status),
         status_text: response.map(|response| response.status_text.clone()),
         response_headers: response.map(|response| response.headers.clone()),
@@ -3768,8 +3771,8 @@ fn browser_network_request_detail_to_wire(
         request_id: entry.request_id.clone(),
         loader_id: entry.loader_id.clone(),
         frame_id: entry.frame_id.clone(),
-        document_url: entry.document_url.clone(),
-        url: entry.url.clone(),
+        document_url: redact_url_opt_for_public_readback(entry.document_url.clone()),
+        url: redact_url_opt_for_public_readback(entry.url.clone()),
         method: entry.method.clone(),
         resource_type: entry.resource_type.clone(),
         request_headers: entry.request_headers.clone(),
@@ -3807,7 +3810,7 @@ fn browser_network_websocket_entry_to_wire(
         seq: entry.seq,
         first_seq: entry.first_seq,
         request_id: entry.request_id.clone(),
-        url: entry.url.clone(),
+        url: redact_url_opt_for_public_readback(entry.url.clone()),
         created: entry.created,
         created_at_unix_ms: entry.created_at_unix_ms,
         initiator: entry.initiator.clone(),
@@ -3861,7 +3864,7 @@ fn browser_network_response_snapshot_to_wire(
     response: &synapse_a11y::CdpNetworkResponseSnapshot,
 ) -> BrowserNetworkResponseSnapshot {
     BrowserNetworkResponseSnapshot {
-        url: response.url.clone(),
+        url: redact_url_for_public_readback(&response.url),
         status: response.status,
         status_text: response.status_text.clone(),
         headers: response.headers.clone(),
@@ -4012,7 +4015,7 @@ fn browser_route_fetch_status_from_a11y(
             failed_count: status.failed_count,
             continue_error_count: status.continue_error_count,
             last_request_id: status.last_request_id,
-            last_url: status.last_url,
+            last_url: redact_url_opt_for_public_readback(status.last_url),
             last_route_id: status.last_route_id,
             last_error: status.last_error,
         },
@@ -4039,7 +4042,7 @@ fn browser_route_rule_to_wire(rule: &synapse_a11y::CdpFetchRouteRule) -> Browser
     match &rule.action {
         synapse_a11y::CdpFetchRouteAction::Fulfill(fulfill) => BrowserRouteRuleResponse {
             id: rule.id.clone(),
-            url: rule.url.clone(),
+            url: redact_url_for_public_readback(&rule.url),
             match_kind: match rule.match_kind {
                 synapse_a11y::CdpFetchRouteMatchKind::Glob => BrowserRouteMatchKind::Glob,
                 synapse_a11y::CdpFetchRouteMatchKind::Regex => BrowserRouteMatchKind::Regex,
@@ -4068,7 +4071,7 @@ fn browser_route_rule_to_wire(rule: &synapse_a11y::CdpFetchRouteRule) -> Browser
         },
         synapse_a11y::CdpFetchRouteAction::Abort(abort) => BrowserRouteRuleResponse {
             id: rule.id.clone(),
-            url: rule.url.clone(),
+            url: redact_url_for_public_readback(&rule.url),
             match_kind: match rule.match_kind {
                 synapse_a11y::CdpFetchRouteMatchKind::Glob => BrowserRouteMatchKind::Glob,
                 synapse_a11y::CdpFetchRouteMatchKind::Regex => BrowserRouteMatchKind::Regex,
@@ -4087,7 +4090,7 @@ fn browser_route_rule_to_wire(rule: &synapse_a11y::CdpFetchRouteRule) -> Browser
         },
         synapse_a11y::CdpFetchRouteAction::Continue(continue_rule) => BrowserRouteRuleResponse {
             id: rule.id.clone(),
-            url: rule.url.clone(),
+            url: redact_url_for_public_readback(&rule.url),
             match_kind: match rule.match_kind {
                 synapse_a11y::CdpFetchRouteMatchKind::Glob => BrowserRouteMatchKind::Glob,
                 synapse_a11y::CdpFetchRouteMatchKind::Regex => BrowserRouteMatchKind::Regex,
@@ -4097,7 +4100,7 @@ fn browser_route_rule_to_wire(rule: &synapse_a11y::CdpFetchRouteRule) -> Browser
             action: "continue".to_owned(),
             status: None,
             error_reason: None,
-            continue_url: continue_rule.url.clone(),
+            continue_url: redact_url_opt_for_public_readback(continue_rule.url.clone()),
             continue_method: continue_rule.method.clone(),
             response_phrase: None,
             headers: continue_rule

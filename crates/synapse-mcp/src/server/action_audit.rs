@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::SynapseService;
 use crate::m1::mcp_error;
+use crate::server::url_redaction::redact_url_fields_for_public_readback;
 
 static ACTION_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -339,7 +340,14 @@ impl SynapseService {
         let foreground_tier =
             self.action_audit_foreground_tier(tool, status, session_id.as_deref(), details);
         let human_os_foreground = self.action_audit_foreground();
-        let redactions = action_audit_detail_redactions(details);
+        let mut details = details.clone();
+        let url_redaction_count = redact_url_fields_for_public_readback(&mut details);
+        let mut redactions = action_audit_detail_redactions(&details);
+        if url_redaction_count > 0 {
+            redactions.push("url_fields".to_owned());
+        }
+        redactions.sort();
+        redactions.dedup();
         let redacted = !redactions.is_empty();
         let value = json!({
             "schema_version": 1,

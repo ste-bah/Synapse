@@ -9,6 +9,7 @@ use super::{
     tool, tool_router,
 };
 use crate::m1::mcp_error;
+use crate::server::url_redaction::redact_url_for_public_readback;
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -545,7 +546,7 @@ fn browser_dialog_entry_from_bridge(
 ) -> BrowserDialogEntry {
     BrowserDialogEntry {
         seq: entry.seq,
-        url: entry.url,
+        url: redact_url_for_public_readback(&entry.url),
         frame_id: entry.frame_id,
         dialog_type: entry.dialog_type,
         message: entry.message,
@@ -641,7 +642,7 @@ fn browser_handle_dialog_response(
 fn browser_dialog_entry(entry: &synapse_a11y::CdpDialogEntry) -> BrowserDialogEntry {
     BrowserDialogEntry {
         seq: entry.seq,
-        url: entry.url.clone(),
+        url: redact_url_for_public_readback(&entry.url),
         frame_id: entry.frame_id.clone(),
         dialog_type: entry.dialog_type.clone(),
         message: entry.message.clone(),

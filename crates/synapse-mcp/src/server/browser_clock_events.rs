@@ -9,6 +9,9 @@ use super::{
     tool, tool_router,
 };
 use crate::m1::mcp_error;
+use crate::server::url_redaction::{
+    redact_url_for_public_readback, redact_url_opt_for_public_readback,
+};
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -906,12 +909,12 @@ fn browser_page_event_entry(
         subtype: entry.subtype,
         worker_id: entry.worker_id,
         worker_type: entry.worker_type,
-        worker_url: entry.worker_url,
+        worker_url: redact_url_opt_for_public_readback(entry.worker_url),
         frame_id: entry.frame_id,
         parent_frame_id: entry.parent_frame_id,
         loader_id: entry.loader_id,
         name: entry.name,
-        url: entry.url,
+        url: redact_url_opt_for_public_readback(entry.url),
         title: entry.title,
         navigation_type: entry.navigation_type,
         timestamp_s: entry.timestamp_s,
@@ -944,12 +947,12 @@ fn browser_bridge_page_event_entry(
         subtype: entry.subtype,
         worker_id: entry.worker_id,
         worker_type: entry.worker_type,
-        worker_url: entry.worker_url,
+        worker_url: redact_url_opt_for_public_readback(entry.worker_url),
         frame_id: entry.frame_id,
         parent_frame_id: entry.parent_frame_id,
         loader_id: entry.loader_id,
         name: entry.name,
-        url: entry.url,
+        url: redact_url_opt_for_public_readback(entry.url),
         title: entry.title,
         navigation_type: entry.navigation_type,
         timestamp_s: entry.timestamp_s,
@@ -968,7 +971,7 @@ fn browser_page_target_snapshot(
             cdp_target_id: page.target_id,
         },
         target_type: page.target_type,
-        url: page.url,
+        url: redact_url_for_public_readback(&page.url),
         title: page.title,
         opener_id: page.opener_id,
         opener_frame_id: page.opener_frame_id,
@@ -996,7 +999,7 @@ fn browser_bridge_page_target_snapshot(
             cdp_target_id: page.target_id,
         },
         target_type: page.target_type,
-        url: page.url,
+        url: redact_url_for_public_readback(&page.url),
         title: page.title,
         opener_id: page.opener_id,
         opener_frame_id: page.opener_frame_id,
@@ -1017,7 +1020,7 @@ fn browser_worker_snapshot(worker: synapse_a11y::CdpWorkerSnapshot) -> BrowserWo
     BrowserWorkerSnapshot {
         worker_id: worker.worker_id,
         worker_type: worker.worker_type,
-        url: worker.url,
+        url: redact_url_for_public_readback(&worker.url),
         title: worker.title,
         attached: worker.attached,
         destroyed: worker.destroyed,
@@ -1034,7 +1037,7 @@ fn browser_bridge_worker_snapshot(
     BrowserWorkerSnapshot {
         worker_id: worker.worker_id,
         worker_type: worker.worker_type,
-        url: worker.url,
+        url: redact_url_for_public_readback(&worker.url),
         title: worker.title,
         attached: worker.attached,
         destroyed: worker.destroyed,

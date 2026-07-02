@@ -2843,11 +2843,11 @@ mod tests {
         assert_eq!(report.cdp_target_owners.len(), 1);
         assert_eq!(
             report.cdp_target_owners[0].requested_url,
-            "https://example.invalid/issue1443?redacted#redacted"
+            "https://example.invalid/redacted?redacted#redacted"
         );
         assert_eq!(
             report.cdp_target_owners[0].target_url,
-            "https://example.invalid/issue1443?redacted#redacted"
+            "https://example.invalid/redacted?redacted#redacted"
         );
         assert!(!serde_json::to_string(&report.cdp_target_owners)?.contains("SYNAPSE_SECRET_1484"));
         assert!(!serde_json::to_string(&report.cdp_target_owners)?.contains("SYNAPSE_HASH_1484"));

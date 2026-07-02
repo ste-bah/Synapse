@@ -11,10 +11,12 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use synapse_core::error_codes;
 
+use crate::server::url_redaction::redact_url_fields_for_public_readback;
+
 const COOKIES_TOOL: &str = "browser_cookies";
 const STORAGE_TOOL: &str = "browser_storage";
 const CHROME_TAB_PREFIX: &str = "chrome-tab:";
-const REDACTION_POLICY: &str = "browser_storage_secret_value_v1";
+const REDACTION_POLICY: &str = "browser_storage_secret_value_and_url_v2";
 const REDACTED_VALUE: &str = "[redacted]";
 
 mod load_state_validation;
@@ -329,7 +331,9 @@ impl SynapseService {
                 ),
             )
         })?;
-        let redacted_value_count = redact_browser_secret_values(&mut readback);
+        let redacted_value_count = redact_browser_secret_values(&mut readback)
+            + u32::try_from(redact_url_fields_for_public_readback(&mut readback))
+                .unwrap_or(u32::MAX);
         log_redaction_summary(COOKIES_TOOL, cdp_target_id, redacted_value_count);
         Ok(BrowserCookiesResponse {
             ok: readback_bool(&readback, "ok", true),
@@ -379,7 +383,9 @@ impl SynapseService {
                 ),
             )
         })?;
-        let redacted_value_count = redact_browser_secret_values(&mut readback);
+        let redacted_value_count = redact_browser_secret_values(&mut readback)
+            + u32::try_from(redact_url_fields_for_public_readback(&mut readback))
+                .unwrap_or(u32::MAX);
         normalize_keyed_storage_get_result_value(
             &mut readback,
             params.operation,

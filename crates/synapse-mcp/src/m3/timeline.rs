@@ -31,6 +31,7 @@ use synapse_reflex::ReflexRuntime;
 use synapse_storage::{cf, decode_json, timeline as timeline_codec};
 
 use crate::m1::mcp_error;
+use crate::server::url_redaction::redact_url_fields_for_public_readback;
 
 use super::{
     M3ToolStub,
@@ -261,8 +262,9 @@ pub struct TimelineGetParams {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TimelineGetResponse {
-    /// Raw timeline rows in ascending `(ts_ns, seq)` storage order — the
-    /// day-view feed. Each row carries its stable `key_hex` identity.
+    /// Timeline rows in ascending `(ts_ns, seq)` storage order. Public
+    /// readback redacts URL-bearing payload fields while keeping stable
+    /// `key_hex` identity.
     pub rows: Vec<TimelineSearchMatch>,
     /// Rows examined this call (matching or not).
     pub scanned_rows: u64,
@@ -1137,6 +1139,8 @@ fn value_contains(value: &Value, needle_lower: &str) -> bool {
 }
 
 fn to_match(key: &[u8], seq: Option<u32>, record: TimelineRecord) -> TimelineSearchMatch {
+    let mut payload = record.payload;
+    redact_url_fields_for_public_readback(&mut payload);
     TimelineSearchMatch {
         key_hex: hex_encode(key),
         ts_ns: record.ts_ns,
@@ -1147,7 +1151,7 @@ fn to_match(key: &[u8], seq: Option<u32>, record: TimelineRecord) -> TimelineSea
             TimelineActor::Agent { session_id } => format!("agent:{session_id}"),
         },
         app: record.app,
-        payload: record.payload,
+        payload,
     }
 }
 
@@ -1322,6 +1326,43 @@ mod tests {
         };
         let filters = validate(&params).expect("cursor accepted");
         assert_eq!(filters.start_key, key_after(&key));
+    }
+
+    #[test]
+    fn timeline_match_redacts_url_fields_in_historical_payloads() {
+        let key = synapse_storage::timeline::timeline_key(1485, 1);
+        let row = record(
+            1485,
+            TimelineKind::BrowserNav,
+            "chrome.exe",
+            json!({
+                "url": "https://example.test/account/SYN1485?token=secret#frag",
+                "requested_url": "data:text/html,<title>SYN1485</title>",
+                "before_url": "data:text/html,<title>SYN1485_BEFORE</title>",
+                "before_title": "SYN1485_BEFORE",
+                "title": "SYN1485"
+            }),
+        );
+
+        let matched = to_match(&key, Some(1), row);
+
+        assert_eq!(
+            matched.payload["url"],
+            "https://example.test/redacted?redacted#redacted"
+        );
+        assert_eq!(matched.payload["requested_url"], "data:redacted");
+        assert_eq!(matched.payload["before_url"], "data:redacted");
+        assert_eq!(matched.payload["before_title"], "redacted");
+        assert_eq!(matched.payload["title"], "redacted");
+        assert!(!matched.payload.to_string().contains("account/SYN1485"));
+        assert!(!matched.payload.to_string().contains("token=secret"));
+        assert!(
+            !matched
+                .payload
+                .to_string()
+                .contains("<title>SYN1485</title>")
+        );
+        assert!(!matched.payload.to_string().contains("SYN1485_BEFORE"));
     }
 }
 

@@ -11,6 +11,7 @@ use synapse_reflex::ReflexRuntime;
 use synapse_storage::{DiskPressureLevel, GcReport, PressureReport, cf};
 
 use crate::m1::mcp_error;
+use crate::server::url_redaction::redact_url_fields_for_public_readback;
 
 use super::{
     M3ToolStub,
@@ -427,7 +428,7 @@ fn cf_row_samples(
                 .map(|(key, value)| StorageRowSample {
                     key_hex: hex_encode(&key),
                     value_len_bytes: value.len() as u64,
-                    value_utf8_prefix: utf8_prefix(&value, MAX_INSPECT_SAMPLE_VALUE_CHARS),
+                    value_utf8_prefix: redacted_utf8_prefix(&value, MAX_INSPECT_SAMPLE_VALUE_CHARS),
                     value_truncated: String::from_utf8_lossy(&value).chars().count()
                         > MAX_INSPECT_SAMPLE_VALUE_CHARS,
                 })
@@ -452,6 +453,16 @@ fn utf8_prefix(bytes: &[u8], max_chars: usize) -> String {
         .chars()
         .take(max_chars)
         .collect()
+}
+
+fn redacted_utf8_prefix(bytes: &[u8], max_chars: usize) -> String {
+    if let Ok(mut value) = serde_json::from_slice::<Value>(bytes) {
+        redact_url_fields_for_public_readback(&mut value);
+        if let Ok(encoded) = serde_json::to_string(&value) {
+            return encoded.chars().take(max_chars).collect();
+        }
+    }
+    utf8_prefix(bytes, max_chars)
 }
 
 fn validate_probe_params(params: &StoragePutProbeRowsParams) -> Result<(), ErrorData> {
@@ -779,4 +790,23 @@ fn lock_runtime(
             "reflex runtime lock poisoned",
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redacted_utf8_prefix;
+
+    #[test]
+    fn storage_inspect_prefix_redacts_url_fields() {
+        let value = br#"{"payload":{"url":"https://example.test/account/SYN1485?token=secret#frag","before_url":"data:text/html,<title>SYN1485</title>"},"note":"kept"}"#;
+
+        let prefix = redacted_utf8_prefix(value, 4096);
+
+        assert!(prefix.contains("\"url\":\"https://example.test/redacted?redacted#redacted\""));
+        assert!(prefix.contains("\"before_url\":\"data:redacted\""));
+        assert!(prefix.contains("\"note\":\"kept\""));
+        assert!(!prefix.contains("account/SYN1485"));
+        assert!(!prefix.contains("token=secret"));
+        assert!(!prefix.contains("<title>SYN1485</title>"));
+    }
 }

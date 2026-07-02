@@ -50,6 +50,7 @@ use crate::server::target_claims::{
 };
 use crate::server::url_redaction::{
     redact_title_for_public_url_readback, redact_url_for_public_readback,
+    redact_url_opt_for_public_readback,
 };
 use base64::Engine as _;
 use rmcp::schemars::JsonSchema;
@@ -392,7 +393,7 @@ impl SynapseService {
             }
         };
         if let Some(recorder) = recorder {
-            let _ = recorder.record_browser_navigation(event);
+            let _ = recorder.record_browser_navigation(redact_browser_navigation_event(event));
         } else {
             tracing::error!(
                 code = "TIMELINE_BROWSER_NAV_RECORDER_MISSING",
@@ -1854,7 +1855,7 @@ impl SynapseService {
             cdp_target_id: captured.target_id,
             tab_id: captured.tab_id,
             chrome_window_id: captured.chrome_window_id,
-            url: captured.url,
+            url: redact_url_for_public_readback(&captured.url),
             title: captured.title,
             device_pixel_ratio: captured.device_pixel_ratio,
             viewport_width_css: captured.viewport_width_css,
@@ -1941,7 +1942,7 @@ impl SynapseService {
             cdp_target_id: captured.target_id,
             tab_id: captured.tab_id,
             chrome_window_id: captured.chrome_window_id,
-            url: captured.url,
+            url: redact_url_for_public_readback(&captured.url),
             title: captured.title,
             landscape: captured.landscape,
             print_background: captured.print_background,
@@ -2599,7 +2600,7 @@ impl SynapseService {
                 operation: validated.params.operation,
                 source_of_truth: BROWSER_NAV_SOURCE_OF_TRUTH.to_owned(),
                 readback_source_of_truth: BROWSER_NAV_READBACK_SOURCE_OF_TRUTH.to_owned(),
-                navigation,
+                navigation: redact_cdp_navigate_tab_response_urls(navigation),
             })
             .map_err(|error| {
                 browser_nav_delegate_error(
@@ -3146,7 +3147,7 @@ impl SynapseService {
             operation,
             source_of_truth: BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH.to_owned(),
             readback_source_of_truth: BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH.to_owned(),
-            wait: response.0,
+            wait: redact_browser_wait_response_urls(response.0),
         }))
     }
 
@@ -5477,8 +5478,8 @@ impl SynapseService {
             chrome_window_id,
             capture_window_hwnd: None,
             cdp_target_id: cdp_target_id.clone(),
-            requested_url: requested_url.to_owned(),
-            target_url: opened.url.clone(),
+            requested_url: redact_url_for_public_readback(requested_url),
+            target_url: redact_url_for_public_readback(&opened.url),
             created_at_unix_ms: unix_ms_now(),
         })?;
         let current = TargetWire::Cdp {
@@ -5555,11 +5556,11 @@ impl SynapseService {
             human_os_foreground_after_hwnd,
             target_active: opened.target_active,
             target_highlighted: opened.target_highlighted,
-            requested_url: requested_url.to_owned(),
+            requested_url: redact_url_for_public_readback(requested_url),
             cdp_target_id,
             target_type: opened.target_type,
             target_title: opened.title,
-            target_url: opened.url,
+            target_url: redact_url_for_public_readback(&opened.url),
             target_attached: opened.target_attached,
             target_count_before: opened.target_count_before,
             target_count_after: opened.target_count_after,
@@ -5616,7 +5617,7 @@ impl SynapseService {
                 tab_id: None,
                 chrome_window_id: None,
                 target_type: target.target_type.clone(),
-                url: target.url.clone(),
+                url: redact_url_for_public_readback(&target.url),
                 title: target.title.clone(),
                 ready_state: String::new(),
                 active: false,
@@ -5699,7 +5700,7 @@ impl SynapseService {
             tab_id: Some(info.tab_id),
             chrome_window_id: info.chrome_window_id,
             target_type: info.target_type,
-            url: info.url,
+            url: redact_url_for_public_readback(&info.url),
             title: info.title,
             ready_state: info.ready_state,
             active: info.active,
@@ -6381,7 +6382,7 @@ impl SynapseService {
                     evaluated.scope
                 },
                 element_id: None,
-                url: evaluated.url,
+                url: redact_url_for_public_readback(&evaluated.url),
                 title: evaluated.title,
                 ready_state: evaluated.ready_state,
                 result_type: evaluated.result_type,
@@ -6492,7 +6493,7 @@ impl SynapseService {
             cdp_target_id: evaluated.target_id,
             scope: scope.to_owned(),
             element_id: element_id.map(ToOwned::to_owned),
-            url: evaluated.url,
+            url: redact_url_for_public_readback(&evaluated.url),
             title: evaluated.title,
             ready_state: evaluated.ready_state,
             result_type: evaluated.result_type,
@@ -6598,7 +6599,7 @@ impl SynapseService {
                     binding_active: result.binding_active,
                     active_binding_count: result.active_binding_count,
                     active_binding_names: result.active_binding_names,
-                    url: result.url,
+                    url: redact_url_for_public_readback(&result.url),
                     title: result.title,
                     ready_state: result.ready_state,
                     calls: result
@@ -6745,7 +6746,7 @@ impl SynapseService {
             binding_active: read.binding_active,
             active_binding_count: read.active_binding_count,
             active_binding_names: read.active_binding_names,
-            url: state.url,
+            url: redact_url_for_public_readback(&state.url),
             title: state.title,
             ready_state: state.ready_state,
             calls: read
@@ -6839,7 +6840,7 @@ impl SynapseService {
                     world_name: params.world_name.clone(),
                     include_command_line_api: params.include_command_line_api,
                     run_immediately: params.run_immediately,
-                    url: result.url,
+                    url: redact_url_for_public_readback(&result.url),
                     title: result.title,
                     ready_state: result.ready_state,
                     readback_backend: if result.readback_backend.trim().is_empty() {
@@ -6931,7 +6932,7 @@ impl SynapseService {
             world_name: params.world_name.clone(),
             include_command_line_api: params.include_command_line_api,
             run_immediately: params.run_immediately,
-            url: result.state.url,
+            url: redact_url_for_public_readback(&result.state.url),
             title: result.state.title,
             ready_state: result.state.ready_state,
             readback_backend:
@@ -7021,13 +7022,13 @@ impl SynapseService {
                     cdp_target_id: evaluated.target_id,
                     tag_name: payload.tag_name,
                     source_kind: payload.source_kind,
-                    requested_url: payload.requested_url,
-                    resolved_url: payload.resolved_url,
+                    requested_url: redact_url_opt_for_public_readback(payload.requested_url),
+                    resolved_url: redact_url_opt_for_public_readback(payload.resolved_url),
                     path: source.path.clone(),
                     script_type: script_type.map(ToOwned::to_owned),
                     content_len: payload.content_len,
                     element_marker: payload.element_marker,
-                    url: evaluated.url,
+                    url: redact_url_for_public_readback(&evaluated.url),
                     title: evaluated.title,
                     ready_state: evaluated.ready_state,
                     readback_backend: "chrome.debugger.Runtime.evaluate+tag.onload/onerror"
@@ -7083,13 +7084,13 @@ impl SynapseService {
             cdp_target_id: evaluated.target_id,
             tag_name: payload.tag_name,
             source_kind: payload.source_kind,
-            requested_url: payload.requested_url,
-            resolved_url: payload.resolved_url,
+            requested_url: redact_url_opt_for_public_readback(payload.requested_url),
+            resolved_url: redact_url_opt_for_public_readback(payload.resolved_url),
             path: source.path.clone(),
             script_type: script_type.map(ToOwned::to_owned),
             content_len: payload.content_len,
             element_marker: payload.element_marker,
-            url: evaluated.url,
+            url: redact_url_for_public_readback(&evaluated.url),
             title: evaluated.title,
             ready_state: evaluated.ready_state,
             readback_backend: "Runtime.evaluate+tag.onload/onerror".to_owned(),
@@ -7182,7 +7183,7 @@ impl SynapseService {
                     polling_interval_ms: wait.polling_interval_ms,
                     poll_count: waited.poll_count,
                     observed_text_len: waited.observed_text_len,
-                    url: waited.url,
+                    url: redact_url_for_public_readback(&waited.url),
                     title: waited.title,
                     ready_state: waited.ready_state,
                     readback_backend: waited.readback_backend,
@@ -7249,7 +7250,7 @@ impl SynapseService {
             polling_interval_ms: wait.polling_interval_ms,
             poll_count: payload.poll_count,
             observed_text_len: payload.observed_text_len,
-            url: evaluated.url,
+            url: redact_url_for_public_readback(&evaluated.url),
             title: evaluated.title,
             ready_state: evaluated.ready_state,
             readback_backend: "Runtime.evaluate(browser_wait_for)".to_owned(),
@@ -7345,7 +7346,7 @@ impl SynapseService {
                     in_flight_requests: waited.in_flight_requests,
                     network_idle_quiet_ms: waited.network_idle_quiet_ms,
                     lifecycle_network_idle_seen: waited.lifecycle_network_idle_seen,
-                    url: waited.url,
+                    url: redact_url_for_public_readback(&waited.url),
                     title: waited.title,
                     ready_state: waited.ready_state,
                     readback_backend: waited.readback_backend,
@@ -7400,7 +7401,7 @@ impl SynapseService {
             in_flight_requests: waited.in_flight_requests,
             network_idle_quiet_ms: waited.network_idle_quiet_ms,
             lifecycle_network_idle_seen: waited.lifecycle_network_idle_seen,
-            url: waited.url,
+            url: redact_url_for_public_readback(&waited.url),
             title: waited.title,
             ready_state: waited.ready_state,
             readback_backend:
@@ -7494,7 +7495,7 @@ impl SynapseService {
                     polling_interval_ms: wait.polling_interval_ms,
                     poll_count: waited.poll_count,
                     navigation_event_count: waited.navigation_event_count,
-                    url: waited.url,
+                    url: redact_url_for_public_readback(&waited.url),
                     title: waited.title,
                     ready_state: waited.ready_state,
                     readback_backend: waited.readback_backend,
@@ -7546,7 +7547,7 @@ impl SynapseService {
             polling_interval_ms: wait.polling_interval_ms,
             poll_count: waited.poll_count,
             navigation_event_count: waited.navigation_event_count,
-            url: waited.url,
+            url: redact_url_for_public_readback(&waited.url),
             title: waited.title,
             ready_state: waited.ready_state,
             readback_backend: "Page.frameNavigated + page-state polling(browser_wait_for_url)"
@@ -8049,7 +8050,7 @@ impl SynapseService {
                     truncated: waited.truncated,
                     element_id: waited.element_id,
                     frame: waited.frame.map(browser_chrome_bridge_located_frame),
-                    url: waited.url,
+                    url: redact_url_for_public_readback(&waited.url),
                     title: waited.title,
                     readback_backend: waited.readback_backend,
                     backend_tier_used: "chrome_tabs_extension".to_owned(),
@@ -8107,7 +8108,7 @@ impl SynapseService {
                     truncated: poll.truncated,
                     element_id: poll.element_id,
                     frame: poll.frame,
-                    url: poll.url,
+                    url: redact_url_for_public_readback(&poll.url),
                     title: poll.title,
                     readback_backend:
                         "cdp_locate + Runtime.callFunctionOn(browser_wait_for_selector)".to_owned(),
@@ -8230,7 +8231,7 @@ impl SynapseService {
                     value_type: waited.value_type,
                     value_description: waited.value_description,
                     unserializable_value: waited.unserializable_value,
-                    url: waited.url,
+                    url: redact_url_for_public_readback(&waited.url),
                     title: waited.title,
                     ready_state: waited.ready_state,
                     readback_backend: waited.readback_backend,
@@ -8305,7 +8306,7 @@ impl SynapseService {
             value_type: payload.value_type,
             value_description: payload.value_description,
             unserializable_value: payload.unserializable_value,
-            url: evaluated.url,
+            url: redact_url_for_public_readback(&evaluated.url),
             title: evaluated.title,
             ready_state: evaluated.ready_state,
             readback_backend: "Runtime.evaluate(browser_wait_for_function)".to_owned(),
@@ -8370,7 +8371,7 @@ impl SynapseService {
                     endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.tabs"
                         .to_owned(),
                     cdp_target_id: content.target_id,
-                    url: content.url,
+                    url: redact_url_for_public_readback(&content.url),
                     title: content.title,
                     ready_state: content.ready_state,
                     html: content.html,
@@ -8433,7 +8434,7 @@ impl SynapseService {
             transport: "raw_cdp".to_owned(),
             endpoint,
             cdp_target_id: evaluated.target_id,
-            url: evaluated.url,
+            url: redact_url_for_public_readback(&evaluated.url),
             title: evaluated.title,
             ready_state: evaluated.ready_state,
             html: payload.html,
@@ -8512,9 +8513,9 @@ impl SynapseService {
                         .map(|value| value.to_string())
                         .unwrap_or_else(|| "0".to_owned()),
                     html_len: set.html_len,
-                    before_url: set.before_url,
+                    before_url: redact_url_for_public_readback(&set.before_url),
                     before_title: set.before_title,
-                    after_url: set.after_url,
+                    after_url: redact_url_for_public_readback(&set.after_url),
                     after_title: set.after_title,
                     ready_state: set.ready_state,
                     history_current_index: set.history_current_index,
@@ -8522,12 +8523,12 @@ impl SynapseService {
                     seeded_url: if set.seeded_url.is_empty() {
                         None
                     } else {
-                        Some(set.seeded_url)
+                        Some(redact_url_for_public_readback(&set.seeded_url))
                     },
                     seeded_from_url: if set.seeded_from_url.is_empty() {
                         None
                     } else {
-                        Some(set.seeded_from_url)
+                        Some(redact_url_for_public_readback(&set.seeded_from_url))
                     },
                     seeded_reason: if set.seeded_reason.is_empty() {
                         None
@@ -8578,9 +8579,9 @@ impl SynapseService {
             cdp_target_id: set.target_id,
             frame_id: set.frame_id,
             html_len: set.html_len,
-            before_url: set.before.url,
+            before_url: redact_url_for_public_readback(&set.before.url),
             before_title: set.before.title,
-            after_url: set.after.url,
+            after_url: redact_url_for_public_readback(&set.after.url),
             after_title: set.after.title,
             ready_state: set.after.ready_state,
             history_current_index: set.after.history_current_index,
@@ -8791,7 +8792,7 @@ impl SynapseService {
             endpoint,
             cdp_target_id: evaluated.target_id,
             element_id: element_id.to_owned(),
-            url: evaluated.url,
+            url: redact_url_for_public_readback(&evaluated.url),
             title: evaluated.title,
             ready_state: evaluated.ready_state,
             element: inspection,
@@ -8864,7 +8865,7 @@ impl SynapseService {
             endpoint: "chrome_bridge".to_owned(),
             cdp_target_id: inspected.target_id,
             element_id: element_id.to_owned(),
-            url: inspected.url,
+            url: redact_url_for_public_readback(&inspected.url),
             title: inspected.title,
             ready_state: inspected.ready_state,
             element,
@@ -9109,7 +9110,7 @@ impl SynapseService {
                     truncated: located.truncated,
                     element_ids: located.element_ids,
                     frame: located.frame.map(browser_chrome_bridge_located_frame),
-                    url: located.url,
+                    url: redact_url_for_public_readback(&located.url),
                     title: located.title,
                     readback_backend: located.readback_backend,
                     required_foreground: false,
@@ -9144,7 +9145,10 @@ impl SynapseService {
                 truncated: false,
                 element_ids: Vec::new(),
                 frame,
-                url: scope.page_url.unwrap_or_default(),
+                url: scope
+                    .page_url
+                    .map(|url| redact_url_for_public_readback(&url))
+                    .unwrap_or_default(),
                 title: scope.page_title.unwrap_or_default(),
                 readback_backend: "Page.getFrameTree frame locator".to_owned(),
                 required_foreground: false,
@@ -9201,7 +9205,7 @@ impl SynapseService {
             truncated: located.truncated,
             element_ids,
             frame: scope.frame_readback,
-            url: located.url,
+            url: redact_url_for_public_readback(&located.url),
             title: located.title,
             readback_backend: readback_backend.to_owned(),
             required_foreground: false,
@@ -9252,8 +9256,8 @@ impl SynapseService {
             chrome_window_id: None,
             capture_window_hwnd: None,
             cdp_target_id: cdp_target_id.clone(),
-            requested_url: requested_url.to_owned(),
-            target_url: opened.target.url.clone(),
+            requested_url: redact_url_for_public_readback(requested_url),
+            target_url: redact_url_for_public_readback(&opened.target.url),
             created_at_unix_ms: unix_ms_now(),
         })?;
         let current = TargetWire::Cdp {
@@ -9317,11 +9321,11 @@ impl SynapseService {
             human_os_foreground_after_hwnd,
             target_active: false,
             target_highlighted: false,
-            requested_url: requested_url.to_owned(),
+            requested_url: redact_url_for_public_readback(requested_url),
             cdp_target_id,
             target_type: opened.target.target_type,
             target_title: opened.target.title,
-            target_url: opened.target.url,
+            target_url: redact_url_for_public_readback(&opened.target.url),
             target_attached: opened.target.attached,
             target_count_before: opened.target_count_before,
             target_count_after: opened.target_count_after,
@@ -9602,37 +9606,39 @@ impl SynapseService {
                 highlighted: None,
                 pinned: None,
             });
-            return Ok(CdpNavigateTabResponse {
-                session_id: session_id.to_owned(),
-                window_hwnd,
-                transport: "raw_cdp".to_owned(),
-                endpoint,
-                cdp_target_id: navigated.target_id,
-                action,
-                requested_url: navigated.requested_url,
-                before_url: navigated.before.url,
-                before_title: navigated.before.title,
-                after_url: navigated.after.url,
-                after_title: navigated.after.title,
-                ready_state: navigated.after.ready_state,
-                history_current_index: navigated.after.history_current_index,
-                history_entry_count: navigated.after.history_entry_count,
-                history_readback_source: "Page.getNavigationHistory".to_owned(),
-                readback_backend: "Runtime.evaluate+Page.getNavigationHistory".to_owned(),
-                navigation_error_text: navigated.navigation_error_text,
-                is_download: navigated.is_download,
-                download_status: None,
-                download_id: None,
-                download_url: None,
-                download_final_url: None,
-                download_filename: None,
-                download_state: None,
-                download_match_reason: None,
-                backend_tier_used: "cdp".to_owned(),
-                required_foreground: false,
-                target_candidate_count: 0,
-                target_selection_reason: "target_id".to_owned(),
-            });
+            return Ok(redact_cdp_navigate_tab_response_urls(
+                CdpNavigateTabResponse {
+                    session_id: session_id.to_owned(),
+                    window_hwnd,
+                    transport: "raw_cdp".to_owned(),
+                    endpoint,
+                    cdp_target_id: navigated.target_id,
+                    action,
+                    requested_url: navigated.requested_url,
+                    before_url: navigated.before.url,
+                    before_title: navigated.before.title,
+                    after_url: navigated.after.url,
+                    after_title: navigated.after.title,
+                    ready_state: navigated.after.ready_state,
+                    history_current_index: navigated.after.history_current_index,
+                    history_entry_count: navigated.after.history_entry_count,
+                    history_readback_source: "Page.getNavigationHistory".to_owned(),
+                    readback_backend: "Runtime.evaluate+Page.getNavigationHistory".to_owned(),
+                    navigation_error_text: navigated.navigation_error_text,
+                    is_download: navigated.is_download,
+                    download_status: None,
+                    download_id: None,
+                    download_url: None,
+                    download_final_url: None,
+                    download_filename: None,
+                    download_state: None,
+                    download_match_reason: None,
+                    backend_tier_used: "cdp".to_owned(),
+                    required_foreground: false,
+                    target_candidate_count: 0,
+                    target_selection_reason: "target_id".to_owned(),
+                },
+            ));
         }
 
         let action_wire = cdp_navigate_action_wire(action);
@@ -9701,37 +9707,39 @@ impl SynapseService {
             highlighted: None,
             pinned: None,
         });
-        Ok(CdpNavigateTabResponse {
-            session_id: session_id.to_owned(),
-            window_hwnd,
-            transport: "chrome_tabs_extension".to_owned(),
-            endpoint,
-            cdp_target_id: navigated.target_id,
-            action,
-            requested_url: navigated.requested_url,
-            before_url: navigated.before_url,
-            before_title: navigated.before_title,
-            after_url: navigated.after_url,
-            after_title: navigated.after_title,
-            ready_state: navigated.ready_state,
-            history_current_index: navigated.history_current_index,
-            history_entry_count: navigated.history_entry_count,
-            history_readback_source: navigated.history_readback_source,
-            readback_backend: navigated.readback_backend,
-            navigation_error_text: navigated.navigation_error_text,
-            is_download: navigated.is_download,
-            download_status: navigated.download_status,
-            download_id: navigated.download_id,
-            download_url: navigated.download_url,
-            download_final_url: navigated.download_final_url,
-            download_filename: navigated.download_filename,
-            download_state: navigated.download_state,
-            download_match_reason: navigated.download_match_reason,
-            backend_tier_used: "chrome_tabs".to_owned(),
-            required_foreground: false,
-            target_candidate_count: navigated.target_candidate_count,
-            target_selection_reason: navigated.target_selection_reason,
-        })
+        Ok(redact_cdp_navigate_tab_response_urls(
+            CdpNavigateTabResponse {
+                session_id: session_id.to_owned(),
+                window_hwnd,
+                transport: "chrome_tabs_extension".to_owned(),
+                endpoint,
+                cdp_target_id: navigated.target_id,
+                action,
+                requested_url: navigated.requested_url,
+                before_url: navigated.before_url,
+                before_title: navigated.before_title,
+                after_url: navigated.after_url,
+                after_title: navigated.after_title,
+                ready_state: navigated.ready_state,
+                history_current_index: navigated.history_current_index,
+                history_entry_count: navigated.history_entry_count,
+                history_readback_source: navigated.history_readback_source,
+                readback_backend: navigated.readback_backend,
+                navigation_error_text: navigated.navigation_error_text,
+                is_download: navigated.is_download,
+                download_status: navigated.download_status,
+                download_id: navigated.download_id,
+                download_url: navigated.download_url,
+                download_final_url: navigated.download_final_url,
+                download_filename: navigated.download_filename,
+                download_state: navigated.download_state,
+                download_match_reason: navigated.download_match_reason,
+                backend_tier_used: "chrome_tabs".to_owned(),
+                required_foreground: false,
+                target_candidate_count: navigated.target_candidate_count,
+                target_selection_reason: navigated.target_selection_reason,
+            },
+        ))
     }
 
     #[cfg(windows)]
@@ -9770,7 +9778,7 @@ impl SynapseService {
                 cdp_target_id: activated.target_id,
                 before_active: None,
                 active: true,
-                url: activated.url,
+                url: redact_url_for_public_readback(&activated.url),
                 title: activated.title,
                 readback_backend: "Target.activateTarget".to_owned(),
                 backend_tier_used: "cdp".to_owned(),
@@ -9835,7 +9843,7 @@ impl SynapseService {
             cdp_target_id: activated.target_id,
             before_active: activated.before_active,
             active: activated.active,
-            url: activated.url,
+            url: redact_url_for_public_readback(&activated.url),
             title: activated.title,
             readback_backend: activated.readback_backend,
             backend_tier_used: "chrome_tabs".to_owned(),
@@ -10255,6 +10263,73 @@ fn redact_browser_tab_entry_url(mut entry: BrowserTabEntry) -> BrowserTabEntry {
     entry
 }
 
+fn redact_browser_navigation_event(mut event: BrowserNavigationEvent) -> BrowserNavigationEvent {
+    event.url = redact_url_for_public_readback(&event.url);
+    event.requested_url = redact_url_opt_for_public_readback(event.requested_url);
+    event.before_url = redact_url_opt_for_public_readback(event.before_url);
+    event
+}
+
+fn redact_cdp_navigate_tab_response_urls(
+    mut response: CdpNavigateTabResponse,
+) -> CdpNavigateTabResponse {
+    response.requested_url = redact_url_opt_for_public_readback(response.requested_url);
+    response.before_url = redact_url_for_public_readback(&response.before_url);
+    response.after_url = redact_url_for_public_readback(&response.after_url);
+    response.download_url = redact_url_opt_for_public_readback(response.download_url);
+    response.download_final_url = redact_url_opt_for_public_readback(response.download_final_url);
+    response
+}
+
+fn redact_browser_wait_response_urls(mut response: BrowserWaitResponse) -> BrowserWaitResponse {
+    response.text = response.text.map(|mut value| {
+        value.url = redact_url_for_public_readback(&value.url);
+        value
+    });
+    response.load_state = response.load_state.map(|mut value| {
+        value.url = redact_url_for_public_readback(&value.url);
+        value
+    });
+    response.url = response.url.map(|mut value| {
+        value.url_pattern = redact_url_for_public_readback(&value.url_pattern);
+        value.url = redact_url_for_public_readback(&value.url);
+        value
+    });
+    response.selector = response.selector.map(|mut value| {
+        value.frame = value.frame.map(redact_browser_located_frame_urls);
+        value.url = redact_url_for_public_readback(&value.url);
+        value
+    });
+    response.function = response.function.map(|mut value| {
+        value.url = redact_url_for_public_readback(&value.url);
+        value
+    });
+    response.request = response.request.map(|mut value| {
+        value.url_pattern = redact_url_opt_for_public_readback(value.url_pattern);
+        value.matched_entry = redact_browser_network_wait_entry_urls(value.matched_entry);
+        value
+    });
+    response.response = response.response.map(|mut value| {
+        value.url_pattern = redact_url_opt_for_public_readback(value.url_pattern);
+        value.matched_entry = redact_browser_network_wait_entry_urls(value.matched_entry);
+        value
+    });
+    response
+}
+
+fn redact_browser_network_wait_entry_urls(
+    mut entry: BrowserNetworkWaitEntry,
+) -> BrowserNetworkWaitEntry {
+    entry.url = redact_url_opt_for_public_readback(entry.url);
+    entry.response_url = redact_url_opt_for_public_readback(entry.response_url);
+    entry
+}
+
+fn redact_browser_located_frame_urls(mut frame: BrowserLocatedFrame) -> BrowserLocatedFrame {
+    frame.url = redact_url_opt_for_public_readback(frame.url);
+    frame
+}
+
 fn select_single_active_browser_tab(
     tabs: &BrowserTabsResponse,
 ) -> Result<&BrowserTabEntry, ErrorData> {
@@ -10573,8 +10648,8 @@ fn browser_download_entry_from_bridge(
 ) -> BrowserDownloadEntry {
     BrowserDownloadEntry {
         id: entry.id,
-        url: entry.url,
-        final_url: entry.final_url,
+        url: redact_url_for_public_readback(&entry.url),
+        final_url: redact_url_for_public_readback(&entry.final_url),
         filename: entry.filename,
         filename_basename: entry.filename_basename,
         mime: entry.mime,
@@ -10591,7 +10666,7 @@ fn browser_download_entry_from_bridge(
         file_size: entry.file_size,
         exists: entry.exists,
         incognito: entry.incognito,
-        referrer: entry.referrer,
+        referrer: redact_url_for_public_readback(&entry.referrer),
     }
 }
 
@@ -10603,8 +10678,8 @@ fn browser_download_event_from_bridge(
         event_kind: event.event_kind,
         timestamp_unix_ms: event.timestamp_unix_ms,
         download_id: event.download_id,
-        url: event.url,
-        final_url: event.final_url,
+        url: redact_url_for_public_readback(&event.url),
+        final_url: redact_url_for_public_readback(&event.final_url),
         filename: event.filename,
         filename_basename: event.filename_basename,
         state: event.state,
@@ -10633,7 +10708,7 @@ fn console_message_from_entry(entry: synapse_a11y::ConsoleEntry) -> ConsoleMessa
         level: entry.level,
         text: entry.text,
         args: entry.args,
-        url: entry.url,
+        url: redact_url_opt_for_public_readback(entry.url),
         line: entry.line,
         column: entry.column,
         stack: entry.stack,
@@ -11668,12 +11743,12 @@ fn browser_network_entry_to_wire(entry: &synapse_a11y::CdpNetworkEntry) -> Brows
     BrowserNetworkWaitEntry {
         seq: entry.seq,
         request_id: entry.request_id.clone(),
-        url: entry.url.clone(),
+        url: redact_url_opt_for_public_readback(entry.url.clone()),
         method: entry.method.clone(),
         resource_type: entry.resource_type.clone(),
         request_headers: entry.request_headers.clone(),
         response_received: entry.response_received,
-        response_url: response.map(|response| response.url.clone()),
+        response_url: response.map(|response| redact_url_for_public_readback(&response.url)),
         status: response.map(|response| response.status),
         status_text: response.map(|response| response.status_text.clone()),
         response_headers: response.map(|response| response.headers.clone()),
@@ -11697,12 +11772,12 @@ fn chrome_bridge_network_entry_to_wire(
     BrowserNetworkWaitEntry {
         seq: entry.seq,
         request_id: entry.request_id,
-        url: entry.url,
+        url: redact_url_opt_for_public_readback(entry.url),
         method: entry.method,
         resource_type: entry.resource_type,
         request_headers: entry.request_headers,
         response_received: entry.response_received,
-        response_url: entry.response_url,
+        response_url: redact_url_opt_for_public_readback(entry.response_url),
         status: entry.status,
         status_text: entry.status_text,
         response_headers: entry.response_headers,
@@ -12707,7 +12782,7 @@ async fn resolve_browser_locate_scope(
                 }),
                 frame_requested: true,
                 frame_resolved: false,
-                page_url: Some(frames.page_url),
+                page_url: Some(redact_url_for_public_readback(&frames.page_url)),
                 page_title: Some(frames.page_title),
             });
         }
@@ -12740,7 +12815,7 @@ async fn resolve_browser_locate_scope(
         frame_readback: Some(browser_located_frame(selected, matches.len())),
         frame_requested: true,
         frame_resolved: true,
-        page_url: Some(frames.page_url),
+        page_url: Some(redact_url_for_public_readback(&frames.page_url)),
         page_title: Some(frames.page_title),
     })
 }
@@ -12797,7 +12872,7 @@ fn browser_located_frame(
         frame_id: Some(frame.frame_id.clone()),
         parent_frame_id: frame.parent_frame_id.clone(),
         cdp_target_id: Some(frame.cdp_target_id.clone()),
-        url: Some(frame.url.clone()),
+        url: Some(redact_url_for_public_readback(&frame.url)),
         name: frame.name.clone(),
         origin: Some(frame.origin.clone()),
         is_out_of_process: frame.is_out_of_process,
@@ -12817,7 +12892,7 @@ fn browser_chrome_bridge_located_frame(
         frame_id: frame.frame_id,
         parent_frame_id: frame.parent_frame_id,
         cdp_target_id: frame.cdp_target_id,
-        url: frame.url,
+        url: redact_url_opt_for_public_readback(frame.url),
         name: frame.name,
         origin: frame.origin,
         is_out_of_process: frame.is_out_of_process,
@@ -12995,7 +13070,10 @@ async fn browser_wait_for_selector_poll(
             truncated: false,
             element_id: None,
             frame: scope.frame_readback,
-            url: scope.page_url.unwrap_or_default(),
+            url: scope
+                .page_url
+                .map(|url| redact_url_for_public_readback(&url))
+                .unwrap_or_default(),
             title: scope.page_title.unwrap_or_default(),
         });
     }
@@ -13050,7 +13128,7 @@ async fn browser_wait_for_selector_poll(
         truncated: located.truncated,
         element_id,
         frame: scope.frame_readback,
-        url: located.url,
+        url: redact_url_for_public_readback(&located.url),
         title: located.title,
     })
 }
@@ -13321,6 +13399,14 @@ fn validate_browser_nav_url(operation: BrowserNavOperation, url: &str) -> Result
             "trim the URL before passing it to browser_nav",
         ));
     }
+    if reqwest::Url::parse(url).is_err() {
+        return Err(browser_nav_facade_error(
+            operation,
+            "url",
+            "browser_nav url must be an absolute URL",
+            "provide an absolute URL with a scheme; use browser_tabs operation=new with an empty string for about:blank",
+        ));
+    }
     Ok(())
 }
 
@@ -13447,6 +13533,12 @@ fn validate_cdp_navigation_url(url: &str) -> Result<(), ErrorData> {
             "cdp_navigate_tab url must not contain leading or trailing whitespace",
         ));
     }
+    if reqwest::Url::parse(url).is_err() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "cdp_navigate_tab url must be an absolute URL",
+        ));
+    }
     Ok(())
 }
 
@@ -13467,6 +13559,12 @@ fn validate_cdp_tab_url(url: &str) -> Result<(), ErrorData> {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "cdp_open_tab url must not contain leading or trailing whitespace; use an empty string for about:blank",
+        ));
+    }
+    if !url.is_empty() && reqwest::Url::parse(url).is_err() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "cdp_open_tab url must be an absolute URL; use an empty string for about:blank",
         ));
     }
     Ok(())
@@ -14631,7 +14729,7 @@ async fn browser_screenshot_passive_window_fallback(
         cdp_target_id: cdp_target_id.to_owned(),
         tab_id: fallback_metadata.tab_id.unwrap_or(0),
         chrome_window_id: fallback_metadata.chrome_window_id,
-        url: fallback_metadata.url,
+        url: redact_url_for_public_readback(&fallback_metadata.url),
         title: fallback_metadata.title,
         device_pixel_ratio: fallback_metadata.device_pixel_ratio.unwrap_or(0.0),
         viewport_width_css: fallback_metadata.viewport_width_css.unwrap_or(0.0),
@@ -17909,9 +18007,10 @@ mod tests {
         validate_browser_wait_for_load_state_params, validate_browser_wait_for_params,
         validate_browser_wait_for_request_params, validate_browser_wait_for_response_params,
         validate_browser_wait_for_selector_params, validate_browser_wait_for_url_params,
-        validate_screenshot_capture_facade_params, validate_screenshot_gif_facade_params,
-        validate_target_adopt_params, validate_target_get_params, validate_target_set_params,
-        validate_target_status_params, validate_target_window,
+        validate_cdp_navigation_url, validate_screenshot_capture_facade_params,
+        validate_screenshot_gif_facade_params, validate_target_adopt_params,
+        validate_target_get_params, validate_target_set_params, validate_target_status_params,
+        validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
@@ -18902,6 +19001,13 @@ mod tests {
         .expect("new permits empty url for about:blank");
 
         validate_browser_tabs_params(BrowserTabsParams {
+            operation: BrowserTabsOperation::New,
+            url: Some("data:text/html,%3Ctitle%3Eok%3C/title%3E".to_owned()),
+            ..BrowserTabsParams::default()
+        })
+        .expect("new permits absolute data URLs");
+
+        validate_browser_tabs_params(BrowserTabsParams {
             operation: BrowserTabsOperation::Close,
             cdp_target_id: Some("chrome-tab:11".to_owned()),
             ..BrowserTabsParams::default()
@@ -18939,6 +19045,17 @@ mod tests {
         .expect_err("new url is required");
         assert!(
             error.message.contains("operation=new requires url"),
+            "{error:?}"
+        );
+
+        let error = validate_browser_tabs_params(BrowserTabsParams {
+            operation: BrowserTabsOperation::New,
+            url: Some("::::SYN1485_INVALID_1155".to_owned()),
+            ..BrowserTabsParams::default()
+        })
+        .expect_err("new rejects relative/unparseable urls before chrome resolves them");
+        assert!(
+            error.message.contains("url must be an absolute URL"),
             "{error:?}"
         );
 
@@ -19151,6 +19268,23 @@ mod tests {
                 .contains("must not contain leading or trailing whitespace"),
             "{whitespace_url:?}"
         );
+
+        let invalid_url = validate_browser_nav_params(BrowserNavParams {
+            url: Some("::::SYN1485_INVALID_1155".to_owned()),
+            ..BrowserNavParams::default()
+        })
+        .expect_err("navigate rejects relative/unparseable urls before chrome resolves them");
+        assert!(
+            invalid_url.message.contains("url must be an absolute URL"),
+            "{invalid_url:?}"
+        );
+
+        let cdp_invalid = validate_cdp_navigation_url("::::SYN1485_INVALID_1155")
+            .expect_err("cdp navigation rejects relative/unparseable urls");
+        assert!(
+            cdp_invalid.message.contains("url must be an absolute URL"),
+            "{cdp_invalid:?}"
+        );
     }
 
     #[test]
@@ -19336,7 +19470,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_tab_entry_redacts_url_query_and_fragment() {
+    fn browser_tab_entry_redacts_path_query_and_fragment() {
         let entry = browser_tab_entry(
             0x1234,
             crate::chrome_debugger_bridge::ChromeDebuggerTabTarget {
@@ -19355,7 +19489,7 @@ mod tests {
             },
         );
 
-        assert_eq!(entry.url, "https://example.test/path?redacted#redacted");
+        assert_eq!(entry.url, "https://example.test/redacted?redacted#redacted");
         assert!(!entry.url.contains("SYNAPSE_SECRET_1484"));
         assert!(!entry.url.contains("SYNAPSE_TOKEN_1484"));
         assert!(!entry.url.contains("SYNAPSE_HASH_1484"));

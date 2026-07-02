@@ -20,6 +20,7 @@ use synapse_storage::{Db, cf};
 
 use super::{ErrorData, Json, Parameters, SynapseService, tool, tool_router};
 use crate::m1::{CdpTargetInfoParams, mcp_error};
+use crate::server::url_redaction::redact_url_for_public_readback;
 
 const AUDIT_PREFIX: &str = "verification/audit/v1/";
 const BINDING_PREFIX: &str = "verification/binding/v1/";
@@ -391,10 +392,11 @@ impl SynapseService {
         codes.truncate(max_codes);
         let read_at_unix_ms = unix_time_ms_now();
         let masked_codes: Vec<String> = codes.iter().map(|c| mask_code(&c.code)).collect();
+        let redacted_url = redact_url_for_public_readback(&info.url);
         let audit_row = VerificationAuditRow {
             schema_version: AUDIT_SCHEMA,
             source: source.to_owned(),
-            url: info.url.clone(),
+            url: redacted_url.clone(),
             title: info.title.clone(),
             masked_codes,
             code_count: codes.len(),
@@ -403,7 +405,7 @@ impl SynapseService {
         };
         let audit_key = self.verification_write_audit(&audit_row, read_at_unix_ms)?;
         Ok(VerificationReadOnce {
-            url: info.url,
+            url: redacted_url,
             title: info.title,
             text_len: text.len(),
             codes,

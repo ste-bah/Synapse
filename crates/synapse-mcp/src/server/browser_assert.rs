@@ -18,6 +18,9 @@ use crate::m1::{
     BrowserLayoutRelation, BrowserLocateEngine, BrowserLocateParams, BrowserLocateResponse,
     mcp_error,
 };
+use crate::server::url_redaction::{
+    redact_url_for_public_readback, redact_url_opt_for_public_readback,
+};
 use regex::Regex;
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
@@ -740,7 +743,7 @@ impl SynapseService {
             transport: "raw_cdp".to_owned(),
             endpoint,
             cdp_target_id: snapshot.target_id,
-            url: state.url,
+            url: redact_url_for_public_readback(&state.url),
             title: state.title,
             ready_state: state.ready_state,
             root_element_id: params.root_element_id.clone(),
@@ -911,11 +914,43 @@ fn browser_dom_response(
         operation,
         source_of_truth: DOM_SOURCE_OF_TRUTH.to_owned(),
         readback_source_of_truth: DOM_READBACK_SOURCE_OF_TRUTH.to_owned(),
-        content,
-        locate,
-        inspect,
-        aria_snapshot,
+        content: content.map(redact_browser_content_response_urls),
+        locate: locate.map(redact_browser_locate_response_urls),
+        inspect: inspect.map(redact_browser_inspect_response_urls),
+        aria_snapshot: aria_snapshot.map(redact_browser_aria_snapshot_response_urls),
     }
+}
+
+fn redact_browser_content_response_urls(
+    mut response: BrowserContentResponse,
+) -> BrowserContentResponse {
+    response.url = redact_url_for_public_readback(&response.url);
+    response
+}
+
+fn redact_browser_locate_response_urls(
+    mut response: BrowserLocateResponse,
+) -> BrowserLocateResponse {
+    response.url = redact_url_for_public_readback(&response.url);
+    response.frame = response.frame.map(|mut frame| {
+        frame.url = redact_url_opt_for_public_readback(frame.url);
+        frame
+    });
+    response
+}
+
+fn redact_browser_inspect_response_urls(
+    mut response: BrowserInspectResponse,
+) -> BrowserInspectResponse {
+    response.url = redact_url_for_public_readback(&response.url);
+    response
+}
+
+fn redact_browser_aria_snapshot_response_urls(
+    mut response: BrowserAriaSnapshotResponse,
+) -> BrowserAriaSnapshotResponse {
+    response.url = redact_url_for_public_readback(&response.url);
+    response
 }
 
 fn browser_dom_source_id(params: &BrowserDomParams) -> String {
@@ -1481,7 +1516,7 @@ async fn browser_aria_snapshot_bridge(
         transport: "chrome_tabs_extension".to_owned(),
         endpoint: "chrome_bridge".to_owned(),
         cdp_target_id: snapshot.target_id,
-        url: snapshot.url,
+        url: redact_url_for_public_readback(&snapshot.url),
         title: snapshot.title,
         ready_state: snapshot.ready_state,
         root_element_id: snapshot
@@ -1630,7 +1665,7 @@ async fn browser_assert_bridge_poll(
     if located.match_count == 0 {
         return Ok(AssertPoll {
             pass: false,
-            url: located.url,
+            url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: located.ready_state,
             match_count: 0,
@@ -1643,7 +1678,7 @@ async fn browser_assert_bridge_poll(
     if params.strict && located.match_count != 1 {
         return Ok(AssertPoll {
             pass: apply_negate(false, params.negate),
-            url: located.url,
+            url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: located.ready_state,
             match_count: located.match_count,
@@ -1659,7 +1694,7 @@ async fn browser_assert_bridge_poll(
     let Some(state) = located.state else {
         return Ok(AssertPoll {
             pass: false,
-            url: located.url,
+            url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: located.ready_state,
             match_count: located.match_count,
@@ -1710,7 +1745,7 @@ async fn browser_assert_poll(
     if located.match_count == 0 {
         let poll = AssertPoll {
             pass: false,
-            url: located.url,
+            url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: String::new(),
             match_count: 0,
@@ -1724,7 +1759,7 @@ async fn browser_assert_poll(
     if params.strict && located.match_count != 1 {
         let poll = AssertPoll {
             pass: apply_negate(false, params.negate),
-            url: located.url,
+            url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: String::new(),
             match_count: located.match_count,
@@ -1741,7 +1776,7 @@ async fn browser_assert_poll(
     let Some(backend_node_id) = located.backend_node_ids.first().copied() else {
         return Ok(AssertPoll {
             pass: false,
-            url: located.url,
+            url: redact_url_for_public_readback(&located.url),
             title: located.title,
             ready_state: String::new(),
             match_count: located.match_count,
@@ -1771,7 +1806,7 @@ async fn browser_assert_poll(
             {
                 return Ok(AssertPoll {
                     pass: apply_negate(false, params.negate),
-                    url: located.url,
+                    url: redact_url_for_public_readback(&located.url),
                     title: located.title,
                     ready_state: String::new(),
                     match_count: located.match_count,
@@ -1896,7 +1931,7 @@ fn assert_count_poll_from_count(
     let pass = apply_negate(base_pass, params.negate);
     Ok(AssertPoll {
         pass,
-        url,
+        url: redact_url_for_public_readback(&url),
         title,
         ready_state,
         match_count,
@@ -2053,7 +2088,7 @@ fn assert_element_poll(
     let pass = apply_negate(base_pass, params.negate);
     Ok(AssertPoll {
         pass,
-        url,
+        url: redact_url_for_public_readback(&url),
         title,
         ready_state,
         match_count,
@@ -2143,7 +2178,7 @@ fn browser_assert_response(
         transport: transport.to_owned(),
         endpoint,
         cdp_target_id: cdp_target_id.to_owned(),
-        url: poll.url,
+        url: redact_url_for_public_readback(&poll.url),
         title: poll.title,
         ready_state: poll.ready_state,
         matcher: params.matcher,
