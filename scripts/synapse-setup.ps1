@@ -187,6 +187,8 @@ function Format-SynapseChromeBridgeProfileInstallState {
 $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
 $processToolSurfaceHashAtStart = $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START
 $processToolSurfaceSnapshotAtStart = $env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START
+$script:SynapseMcpProtocolVersion = '2025-06-18'
+$script:SynapseMcpSessionDeleteTimeoutSec = 20
 $script:SynapseSetupMaintenanceLockStream = $null
 $script:SynapseSetupMaintenanceLockPath = $null
 $script:SynapseSetupMaintenanceLockReason = $null
@@ -1952,6 +1954,7 @@ function Invoke-SynapseMcpHttpPost {
     }
     if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
         $headers['Mcp-Session-Id'] = $SessionId
+        $headers['MCP-Protocol-Version'] = $script:SynapseMcpProtocolVersion
     }
 
     $request = [ordered]@{
@@ -1988,19 +1991,26 @@ function Close-SynapseMcpSetupSession {
     param(
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$Token,
-        [Parameter(Mandatory=$true)][string]$SessionId
+        [Parameter(Mandatory=$true)][string]$SessionId,
+        [switch]$Required
     )
 
     $headers = @{
         Authorization = "Bearer $Token"
         Accept = 'application/json, text/event-stream'
         'Mcp-Session-Id' = $SessionId
+        'MCP-Protocol-Version' = $script:SynapseMcpProtocolVersion
     }
+    $timeoutSec = $script:SynapseMcpSessionDeleteTimeoutSec
 
     try {
-        Invoke-WebRequest -Uri "http://$Bind/mcp" -Method Delete -Headers $headers -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop | Out-Null
+        Invoke-WebRequest -Uri "http://$Bind/mcp" -Method Delete -Headers $headers -TimeoutSec $timeoutSec -UseBasicParsing -ErrorAction Stop | Out-Null
     } catch {
-        Info "WARN: SYNAPSE_MCP_TOOL_SURFACE_SESSION_DELETE_FAILED bind=$Bind session_id=$SessionId error=$($_.Exception.Message) remediation=inspect health active_sessions and daemon logs; setup did not leave a process behind"
+        $diagnostic = "SYNAPSE_MCP_TOOL_SURFACE_SESSION_DELETE_FAILED bind=$Bind session_id=$SessionId timeout_sec=$timeoutSec error=$($_.Exception.Message) remediation=inspect health active_sessions plus MCP_SESSION_TEARDOWN_COMPLETED/MCP_HTTP_SESSION_LIFECYCLE_CLEANUP logs and candidate process/socket SoT"
+        if ($Required) {
+            Die $diagnostic
+        }
+        Info "WARN: $diagnostic"
     }
 }
 
@@ -2014,9 +2024,10 @@ function Invoke-SynapseSetupMcpTool {
     )
 
     $sessionId = $null
+    $mcpReadSucceeded = $false
     try {
         $initParams = [ordered]@{
-            protocolVersion = '2025-06-18'
+            protocolVersion = $script:SynapseMcpProtocolVersion
             capabilities = @{}
             clientInfo = [ordered]@{ name = 'synapse-setup'; version = '0' }
         }
@@ -2049,15 +2060,17 @@ function Invoke-SynapseSetupMcpTool {
                 $json = $null
             }
         }
-        return [pscustomobject]@{
+        $result = [pscustomobject]@{
             SessionId = $sessionId
             Message = $callMessage
             Text = $text
             Json = $json
         }
+        $mcpReadSucceeded = $true
+        return $result
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
-            Close-SynapseMcpSetupSession -Bind $Bind -Token $Token -SessionId $sessionId
+            Close-SynapseMcpSetupSession -Bind $Bind -Token $Token -SessionId $sessionId -Required:$mcpReadSucceeded
         }
     }
 }
@@ -2131,9 +2144,10 @@ function Read-SynapseDaemonToolSurface {
     )
 
     $sessionId = $null
+    $mcpReadSucceeded = $false
     try {
         $initParams = [ordered]@{
-            protocolVersion = '2025-06-18'
+            protocolVersion = $script:SynapseMcpProtocolVersion
             capabilities = @{}
             clientInfo = [ordered]@{ name = 'synapse-setup'; version = '0' }
         }
@@ -2221,7 +2235,7 @@ function Read-SynapseDaemonToolSurface {
         $setupCanonicalHash = Get-SynapseSha256Hex -Text $canonical
         $daemonPid = try { [int]$Health.pid } catch { $null }
 
-        return [pscustomobject]([ordered]@{
+        $surface = [pscustomobject]([ordered]@{
             schema = 2
             created_at_utc = [DateTime]::UtcNow.ToString('o')
             bind = $Bind
@@ -2233,9 +2247,11 @@ function Read-SynapseDaemonToolSurface {
             tool_names = $toolNames
             tool_schemas = $toolSchemas
         })
+        $mcpReadSucceeded = $true
+        return $surface
     } finally {
         if (-not [string]::IsNullOrWhiteSpace($sessionId)) {
-            Close-SynapseMcpSetupSession -Bind $Bind -Token $Token -SessionId $sessionId
+            Close-SynapseMcpSetupSession -Bind $Bind -Token $Token -SessionId $sessionId -Required:$mcpReadSucceeded
         }
     }
 }
