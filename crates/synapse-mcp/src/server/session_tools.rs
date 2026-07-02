@@ -191,8 +191,25 @@ pub struct PersistedCdpTargetOwnerReadback {
     pub requested_url: String,
     pub target_url: String,
     pub created_at_unix_ms: u64,
+    pub target_live: PersistedCdpTargetOwnerLiveReadback,
     pub cleanup_action: String,
     pub recovery_guidance: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PersistedCdpTargetOwnerLiveReadback {
+    pub source_of_truth: String,
+    pub status: String,
+    pub stale_orphan: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1034,6 +1051,27 @@ fn persisted_cdp_target_owner_readback(
         &owner_key,
         &row.owner.cdp_target_id,
     );
+    let target_live =
+        persisted_cdp_target_owner_live_readback(row.owner.window_hwnd, &row.owner.cdp_target_id);
+    let stale_orphan = target_live.stale_orphan;
+    let cleanup_action = if stale_orphan {
+        format!(
+            "stale_orphan: session list is read-only and did not delete this row; public close/cleanup may delete CF_SESSIONS:{row_key} only after a separate Chrome bridge tabs.query/readback proves target {} is absent",
+            row.owner.cdp_target_id
+        )
+    } else {
+        format!(
+            "call session_end with session_id={} while the Chrome bridge is healthy; browser_tabs/cdp_close_tab recovery requires an exact target_claim, active CDP session target, or exact explicit CDP target authority",
+            row.owner_session_id
+        )
+    };
+    let recovery_guidance = if stale_orphan {
+        "row points at an absent or unreadable browser window; do not silently drop it from read-only session list. Retry public close only with the exact original window_hwnd/cdp_target_id after Chrome bridge readback is available, or leave the row visible for forensic storage cleanup."
+            .to_owned()
+    } else {
+        "durable owner row remains until cleanup closes the tab or proves it already absent; use the already-open authenticated Chrome bridge, never foreground the human browser or launch a second Chrome profile"
+            .to_owned()
+    };
     PersistedCdpTargetOwnerReadback {
         source_of_truth: format!("CF_SESSIONS:{row_key}"),
         row_key,
@@ -1055,13 +1093,44 @@ fn persisted_cdp_target_owner_readback(
         requested_url: redact_url_for_public_readback(&row.owner.requested_url),
         target_url: redact_url_for_public_readback(&row.owner.target_url),
         created_at_unix_ms: row.owner.created_at_unix_ms,
-        cleanup_action: format!(
-            "call session_end with session_id={} while the Chrome bridge is healthy; cdp_close_tab recovery requires an exact target_claim for this target",
-            row.owner_session_id
-        ),
-        recovery_guidance:
-            "durable owner row remains until cleanup closes the tab or proves it already absent; use the already-open authenticated Chrome bridge, never foreground the human browser or launch a second Chrome profile"
-                .to_owned(),
+        target_live,
+        cleanup_action,
+        recovery_guidance,
+    }
+}
+
+fn persisted_cdp_target_owner_live_readback(
+    window_hwnd: i64,
+    _cdp_target_id: &str,
+) -> PersistedCdpTargetOwnerLiveReadback {
+    match super::m1_tools::validate_target_window(window_hwnd) {
+        Ok((window_title, process_name)) => PersistedCdpTargetOwnerLiveReadback {
+            source_of_truth:
+                "synapse_capture::validate_hwnd + UI foreground_context for owner window; target existence is not checked by read-only session list"
+                    .to_owned(),
+            status: "window_present_target_not_checked".to_owned(),
+            stale_orphan: false,
+            window_title: Some(window_title),
+            process_name: Some(process_name),
+            read_error_code: None,
+            read_error_message: None,
+        },
+        Err(error) => PersistedCdpTargetOwnerLiveReadback {
+            source_of_truth:
+                "synapse_capture::validate_hwnd + UI foreground_context for owner window"
+                    .to_owned(),
+            status: "window_absent_or_unreadable".to_owned(),
+            stale_orphan: true,
+            window_title: None,
+            process_name: None,
+            read_error_code: error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            read_error_message: Some(error.message.to_string()),
+        },
     }
 }
 
@@ -2406,7 +2475,7 @@ mod tests {
                 owner_started_at_unix_ms: Some(900),
                 owner: crate::server::CdpTargetOwner {
                     session_id: "session-cdp".to_owned(),
-                    window_hwnd: 0x1234,
+                    window_hwnd: -1,
                     endpoint: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/chrome.tabs"
                         .to_owned(),
                     chrome_window_id: Some(7),
@@ -2428,7 +2497,7 @@ mod tests {
                 window_hwnd,
                 cdp_target_id,
             } => {
-                assert_eq!(window_hwnd, 0x1234);
+                assert_eq!(window_hwnd, -1);
                 assert_eq!(cdp_target_id, "chrome-tab:600751746");
             }
             TargetWire::Window { .. } => panic!("expected CDP target readback"),
@@ -2446,15 +2515,21 @@ mod tests {
         assert!(!readback.requested_url.contains("SYNAPSE_SECRET_1484"));
         assert!(!readback.target_url.contains("SYNAPSE_TOKEN_1484"));
         assert!(!readback.target_url.contains("SYNAPSE_HASH_1484"));
+        assert_eq!(readback.target_live.status, "window_absent_or_unreadable");
+        assert!(readback.target_live.stale_orphan);
+        assert_eq!(
+            readback.target_live.read_error_code.as_deref(),
+            Some(error_codes::TARGET_WINDOW_NOT_FOUND)
+        );
         assert!(
             readback
                 .cleanup_action
-                .contains("call session_end with session_id=session-cdp")
+                .contains("stale_orphan: session list is read-only")
         );
         assert!(
             readback
                 .recovery_guidance
-                .contains("already-open authenticated Chrome bridge")
+                .contains("do not silently drop it from read-only session list")
         );
     }
 

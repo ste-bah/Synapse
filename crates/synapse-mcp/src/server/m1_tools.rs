@@ -2371,7 +2371,7 @@ impl SynapseService {
             return Err(error);
         }
         let (owner_key, owner) =
-            match self.cdp_target_owner_for_close(&session_id, &params.0.cdp_target_id) {
+            match self.cdp_target_owner_for_close(&session_id, &params.0.cdp_target_id, None) {
                 Ok(owner) => owner,
                 Err(error) => {
                     self.audit_action_denied_with_details_for_request(
@@ -4571,6 +4571,7 @@ impl SynapseService {
         &self,
         session_id: &str,
         target_id: &str,
+        explicit_target_authority: Option<&SessionTarget>,
     ) -> Result<(String, CdpTargetOwner), ErrorData> {
         let active_target = self.session_target(Some(session_id))?;
         let owners = self.cdp_target_owners_for_target_id(target_id)?;
@@ -4593,7 +4594,7 @@ impl SynapseService {
             session_id,
             target_id,
             active_target.as_ref(),
-            None,
+            explicit_target_authority,
         )? {
             Some(recovered) => Ok(recovered),
             None => Err(cdp_close_unowned_error(target_id, session_id, &owners)),
@@ -6055,7 +6056,15 @@ impl SynapseService {
                             .to_string(),
                     )
                 })?;
-                let (owner_key, owner) = self.cdp_target_owner_for_close(session_id, &target_id)?;
+                let explicit_target = SessionTarget::Cdp {
+                    window_hwnd: window_context.hwnd,
+                    cdp_target_id: target_id.clone(),
+                };
+                let (owner_key, owner) = self.cdp_target_owner_for_close(
+                    session_id,
+                    &target_id,
+                    Some(&explicit_target),
+                )?;
                 if owner.window_hwnd != window_context.hwnd {
                     return Err(mcp_error(
                         error_codes::ACTION_TARGET_INVALID,
@@ -9358,17 +9367,96 @@ impl SynapseService {
         owner: CdpTargetOwner,
     ) -> Result<CdpCloseTabResponse, ErrorData> {
         if is_chrome_debugger_endpoint(&owner.endpoint) {
-            let closed = crate::chrome_debugger_bridge::close_tab(owner.window_hwnd, cdp_target_id)
-                .await
-                .map_err(|error| {
-                    mcp_error(
+            let closed = match crate::chrome_debugger_bridge::close_tab(
+                owner.window_hwnd,
+                cdp_target_id,
+            )
+            .await
+            {
+                Ok(closed) => closed,
+                Err(error)
+                    if Self::chrome_bridge_close_target_already_absent(
+                        error.detail(),
+                        cdp_target_id,
+                    ) =>
+                {
+                    let listed = crate::chrome_debugger_bridge::list_tabs(
+                            owner.window_hwnd,
+                            owner.chrome_window_id,
+                            None,
+                            None,
+                        )
+                        .await
+                        .map_err(|readback_error| {
+                            mcp_error(
+                                readback_error.code(),
+                                format!(
+                                    "cdp_close_tab Chrome debugger reported target {cdp_target_id:?} already absent, but chrome.tabs.query/readback failed; leaving persisted owner row {owner_key:?} visible: close_error={}; readback_error={}",
+                                    error.detail(),
+                                    readback_error.detail()
+                                ),
+                            )
+                        })?;
+                    if listed
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.target_id.eq_ignore_ascii_case(cdp_target_id))
+                    {
+                        return Err(mcp_error(
+                            error_codes::ACTION_TARGET_INVALID,
+                            format!(
+                                "cdp_close_tab Chrome debugger reported target {cdp_target_id:?} already absent, but chrome.tabs.query/readback still returned it in window {:#x}; leaving persisted owner row {owner_key:?} visible for retry",
+                                owner.window_hwnd
+                            ),
+                        ));
+                    }
+                    let _removed = self.remove_cdp_target_owner(owner_key)?;
+                    let previous =
+                        self.clear_session_cdp_target_if_matches(session_id, cdp_target_id)?;
+                    let current = self.get_session_target_wire(session_id)?;
+                    let claim_released = self.release_closed_cdp_target_claim(
+                        session_id,
+                        owner.window_hwnd,
+                        cdp_target_id,
+                    )?;
+                    tracing::info!(
+                        code = "CDP_BACKGROUND_TAB_OWNER_RECLAIMED_ALREADY_ABSENT",
+                        session_id = %session_id,
+                        hwnd = owner.window_hwnd,
+                        endpoint = %owner.endpoint,
+                        cdp_target_id = %cdp_target_id,
+                        cdp_owner_key = %owner_key,
+                        requested_url = %owner.requested_url,
+                        target_url = %owner.target_url,
+                        owner_created_at_unix_ms = owner.created_at_unix_ms,
+                        target_count_before = listed.target_count,
+                        target_count_after = listed.target_count,
+                        target_claim_released = claim_released,
+                        close_error = %error.detail(),
+                        "readback=chrome.tabs.query outcome=already_absent_owner_row_reclaimed"
+                    );
+                    return Ok(CdpCloseTabResponse {
+                        session_id: session_id.to_owned(),
+                        window_hwnd: owner.window_hwnd,
+                        endpoint: owner.endpoint,
+                        cdp_target_id: cdp_target_id.to_owned(),
+                        closed: false,
+                        target_count_before: listed.target_count,
+                        target_count_after: listed.target_count,
+                        previous,
+                        current,
+                    });
+                }
+                Err(error) => {
+                    return Err(mcp_error(
                         error.code(),
                         format!(
                             "cdp_close_tab Chrome debugger chrome.tabs.remove/readback failed: {}",
                             error.detail()
                         ),
-                    )
-                })?;
+                    ));
+                }
+            };
             let _removed = self.remove_cdp_target_owner(owner_key)?;
             let previous = self.clear_session_cdp_target_if_matches(session_id, cdp_target_id)?;
             let current = self.get_session_target_wire(session_id)?;
@@ -9440,6 +9528,13 @@ impl SynapseService {
             previous,
             current,
         })
+    }
+
+    #[cfg(windows)]
+    fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> bool {
+        detail.contains("targetIdHint")
+            && detail.contains(target_id)
+            && detail.contains("did not match any chrome.tabs tab id")
     }
 
     #[cfg(windows)]
@@ -20972,7 +21067,7 @@ mod tests {
         service.cdp_target_owners_ref().lock().unwrap().clear();
 
         let unclaimed = service
-            .cdp_target_owner_for_close(current_session, target_id)
+            .cdp_target_owner_for_close(current_session, target_id, None)
             .expect_err("persisted close recovery must require an exact target claim");
         assert_eq!(
             unclaimed.data.as_ref().and_then(|data| data.get("code")),
@@ -20986,7 +21081,79 @@ mod tests {
 
         insert_test_target_claim(&service, current_session, 0x7777, target_id)?;
         let (recovered_key, recovered_owner) =
-            service.cdp_target_owner_for_close(current_session, target_id)?;
+            service.cdp_target_owner_for_close(current_session, target_id, None)?;
+        assert_eq!(recovered_key, owner_key);
+        assert_eq!(recovered_owner.session_id, current_session);
+        assert_eq!(recovered_owner.window_hwnd, 0x7777);
+
+        let rows = service.read_persisted_cdp_target_owners_for_target_id(target_id)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.owner_session_id, current_session);
+        assert_eq!(rows[0].1.owner_client_name.as_deref(), Some("codex-cli"));
+        Ok(())
+    }
+
+    #[test]
+    fn cdp_close_recovers_persisted_owner_with_exact_explicit_target_authority()
+    -> anyhow::Result<()> {
+        let dir = TempDir::new()?;
+        let service = service_with_temp_db(dir.path())?;
+        let owner_session = "issue1486-old-codex-session";
+        let current_session = "issue1486-current-codex-session";
+        let now = crate::server::session_registry::unix_time_ms_now();
+        seed_session_client(
+            &service,
+            owner_session,
+            "codex-cli",
+            now.saturating_sub(1_000),
+        )?;
+        seed_session_client(&service, current_session, "codex-cli", now)?;
+        close_session_registry_row(&service, owner_session, now.saturating_add(1))?;
+
+        let target_id = "chrome-tab:issue1486-explicit-authority";
+        let owner_key = service.register_cdp_target_owner(CdpTargetOwner {
+            session_id: owner_session.to_owned(),
+            window_hwnd: 0x7777,
+            endpoint: "chrome-extension://test/chrome.tabs".to_owned(),
+            chrome_window_id: None,
+            capture_window_hwnd: None,
+            cdp_target_id: target_id.to_owned(),
+            requested_url: "about:blank#issue1486".to_owned(),
+            target_url: "about:blank#issue1486".to_owned(),
+            created_at_unix_ms: now,
+        })?;
+        service.cdp_target_owners_ref().lock().unwrap().clear();
+
+        let unclaimed = service
+            .cdp_target_owner_for_close(current_session, target_id, None)
+            .expect_err("explicit target authority should be required without a claim");
+        assert_eq!(
+            unclaimed.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!(error_codes::ACTION_TARGET_INVALID))
+        );
+
+        let wrong_target = SessionTarget::Cdp {
+            window_hwnd: 0x7778,
+            cdp_target_id: target_id.to_owned(),
+        };
+        let wrong = service
+            .cdp_target_owner_for_close(current_session, target_id, Some(&wrong_target))
+            .expect_err("wrong explicit target window must not recover owner authority");
+        assert_eq!(
+            wrong.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!(error_codes::ACTION_TARGET_INVALID))
+        );
+        assert!(wrong.message.contains("exact explicit set_target request"));
+
+        let explicit_target = SessionTarget::Cdp {
+            window_hwnd: 0x7777,
+            cdp_target_id: target_id.to_owned(),
+        };
+        let (recovered_key, recovered_owner) = service.cdp_target_owner_for_close(
+            current_session,
+            target_id,
+            Some(&explicit_target),
+        )?;
         assert_eq!(recovered_key, owner_key);
         assert_eq!(recovered_owner.session_id, current_session);
         assert_eq!(recovered_owner.window_hwnd, 0x7777);
@@ -21037,7 +21204,7 @@ mod tests {
         )?;
 
         let (recovered_key, recovered_owner) =
-            service.cdp_target_owner_for_close(current_session, target_id)?;
+            service.cdp_target_owner_for_close(current_session, target_id, None)?;
         assert_eq!(recovered_key, owner_key);
         assert_eq!(recovered_owner.session_id, current_session);
         assert_eq!(recovered_owner.window_hwnd, 0x1401);
@@ -21090,7 +21257,7 @@ mod tests {
         )?;
 
         let error = service
-            .cdp_target_owner_for_close(current_session, target_id)
+            .cdp_target_owner_for_close(current_session, target_id, None)
             .expect_err("active target must not bypass client identity checks");
         assert_eq!(
             error.data.as_ref().and_then(|data| data.get("code")),
@@ -21132,7 +21299,7 @@ mod tests {
         insert_test_target_claim(&service, current_session, 0x8888, target_id)?;
 
         let error = service
-            .cdp_target_owner_for_close(current_session, target_id)
+            .cdp_target_owner_for_close(current_session, target_id, None)
             .expect_err("different client identity must not recover close authority");
         assert_eq!(
             error.data.as_ref().and_then(|data| data.get("code")),
@@ -21191,7 +21358,7 @@ mod tests {
         insert_test_target_claim(&service, current_session, 0x9999, target_id)?;
 
         let (recovered_key, recovered_owner) =
-            service.cdp_target_owner_for_close(current_session, target_id)?;
+            service.cdp_target_owner_for_close(current_session, target_id, None)?;
         assert_eq!(recovered_key, rows[0].0);
         assert_eq!(recovered_owner.session_id, current_session);
         assert_eq!(recovered_owner.window_hwnd, 0x9999);
@@ -21247,7 +21414,7 @@ mod tests {
         insert_test_target_claim(&service, parent_session, 0x1247, target_id)?;
 
         let (recovered_key, recovered_owner) =
-            service.cdp_target_owner_for_close(parent_session, target_id)?;
+            service.cdp_target_owner_for_close(parent_session, target_id, None)?;
         assert_eq!(recovered_key, owner_key);
         assert_eq!(recovered_owner.session_id, parent_session);
         assert_eq!(recovered_owner.window_hwnd, 0x1247);
@@ -21299,7 +21466,7 @@ mod tests {
         insert_test_target_claim(&service, parent_session, 0x1248, target_id)?;
 
         let error = service
-            .cdp_target_owner_for_close(parent_session, target_id)
+            .cdp_target_owner_for_close(parent_session, target_id, None)
             .expect_err("parent cleanup must not steal a still-live spawned child's tab");
         assert_eq!(
             error.data.as_ref().and_then(|data| data.get("code")),
