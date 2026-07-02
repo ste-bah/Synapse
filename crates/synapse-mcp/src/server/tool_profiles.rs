@@ -2452,6 +2452,9 @@ pub(crate) struct CodexRestartHandoffReadback {
     pub daemon_tool_surface_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_process_start_snapshot_status: Option<String>,
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub current_process_start_env_hash: Option<String>,
     pub live_daemon_pid: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_pid_matches_live_daemon: Option<bool>,
@@ -3994,6 +3997,7 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                current_process_start_env_hash: None,
                 live_daemon_pid: std::process::id(),
                 daemon_pid_matches_live_daemon: None,
                 daemon_pid_mismatch_detail: None,
@@ -4005,7 +4009,7 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
         sorted_missing_names(&host_snapshot.tool_names, public_tool_names);
     let live_stale_codex_process = latest_restart_handoff
         .as_ref()
-        .filter(|handoff| handoff.required_restart)
+        .filter(|handoff| restart_handoff_requires_current_codex_restart(handoff, &host_snapshot))
         .and_then(|handoff| handoff.stale_codex_pid)
         .and_then(live_codex_process_readback);
 
@@ -4037,10 +4041,9 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
             CodexClientSurfaceStatus::RestartRequiredForLiveCodexPid,
             "SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE",
         )
-    } else if latest_restart_handoff
-        .as_ref()
-        .is_some_and(|handoff| handoff.required_restart)
-    {
+    } else if latest_restart_handoff.as_ref().is_some_and(|handoff| {
+        restart_handoff_requires_current_codex_restart(handoff, &host_snapshot)
+    }) {
         (
             CodexClientSurfaceStatus::RestartHandoffPresentForDeadPid,
             "SYNAPSE_CODEX_RESTART_HANDOFF_STALE_PID_DEAD",
@@ -4063,6 +4066,40 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
         public_tools_missing_from_host_snapshot,
         host_snapshot_tools_missing_from_public_registry,
     }
+}
+
+fn restart_handoff_requires_current_codex_restart(
+    handoff: &CodexRestartHandoffReadback,
+    host_snapshot: &CodexToolSurfaceSnapshotReadback,
+) -> bool {
+    if !handoff.required_restart {
+        return false;
+    }
+
+    !restart_handoff_start_hash_matches_host_snapshot(handoff, host_snapshot)
+}
+
+fn restart_handoff_start_hash_matches_host_snapshot(
+    handoff: &CodexRestartHandoffReadback,
+    host_snapshot: &CodexToolSurfaceSnapshotReadback,
+) -> bool {
+    let Some(start_hash) = handoff.current_process_start_env_hash.as_deref() else {
+        return false;
+    };
+    let Some(host_hash) = host_snapshot.tool_surface_sha256.as_deref() else {
+        return false;
+    };
+    tool_surface_hashes_match(start_hash, host_hash)
+}
+
+fn tool_surface_hashes_match(left: &str, right: &str) -> bool {
+    fn canonical(hash: &str) -> &str {
+        hash.trim().strip_prefix("sha256:").unwrap_or(hash.trim())
+    }
+
+    let left = canonical(left);
+    let right = canonical(right);
+    !left.is_empty() && !right.is_empty() && left.eq_ignore_ascii_case(right)
 }
 
 fn codex_tool_surface_snapshot_readback(path: &Path) -> CodexToolSurfaceSnapshotReadback {
@@ -4150,6 +4187,7 @@ fn latest_codex_restart_handoff(dir: &Path) -> Option<CodexRestartHandoffReadbac
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                current_process_start_env_hash: None,
                 live_daemon_pid: std::process::id(),
                 daemon_pid_matches_live_daemon: None,
                 daemon_pid_mismatch_detail: None,
@@ -4216,6 +4254,7 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                current_process_start_env_hash: None,
                 live_daemon_pid: std::process::id(),
                 daemon_pid_matches_live_daemon: None,
                 daemon_pid_mismatch_detail: None,
@@ -4249,6 +4288,7 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
                 daemon_tool_count: None,
                 daemon_tool_surface_sha256: None,
                 current_process_start_snapshot_status: None,
+                current_process_start_env_hash: None,
                 live_daemon_pid: std::process::id(),
                 daemon_pid_matches_live_daemon: None,
                 daemon_pid_mismatch_detail: None,
@@ -4301,6 +4341,10 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
         current_process_start_snapshot_status: json_pointer_string(
             &value,
             "/current_process_start_surface/snapshot_status",
+        ),
+        current_process_start_env_hash: json_pointer_string(
+            &value,
+            "/current_process_start_surface/env_hash",
         ),
         live_daemon_pid,
         daemon_pid_matches_live_daemon,
@@ -5572,7 +5616,9 @@ mod tests {
                 "snapshot_path": null
             },
             "current_process_start_surface": {
-                "snapshot_status": "missing_env"
+                "snapshot_status": "readable",
+                "env_hash": "test-surface",
+                "env_snapshot_path": "C:\\Users\\hotra\\AppData\\Local\\synapse\\codex-start-snapshots\\test.json"
             },
             "active_issue": {
                 "issue_ref": "#1471"
@@ -5596,6 +5642,14 @@ mod tests {
             readback.daemon_pid_authoritative_for_configured_bind,
             Some(false)
         );
+        assert_eq!(
+            readback.current_process_start_snapshot_status.as_deref(),
+            Some("readable")
+        );
+        assert_eq!(
+            readback.current_process_start_env_hash.as_deref(),
+            Some("test-surface")
+        );
         assert_eq!(readback.live_daemon_pid, live_pid);
         assert_eq!(readback.daemon_pid_matches_live_daemon, Some(false));
         assert!(
@@ -5605,6 +5659,111 @@ mod tests {
                 .is_some_and(|detail| detail.contains("pre_handoff_candidate")
                     && detail.contains("preflight_candidate"))
         );
+    }
+
+    fn test_host_surface(hash: Option<&str>) -> CodexToolSurfaceSnapshotReadback {
+        CodexToolSurfaceSnapshotReadback {
+            path: "host.json".to_owned(),
+            exists: hash.is_some(),
+            len_bytes: None,
+            sha256: None,
+            read_error: None,
+            tool_count: Some(40),
+            tool_surface_sha256: hash.map(ToOwned::to_owned),
+            tool_names: names()
+                .into_iter()
+                .take(PUBLIC_TOOL_LIMIT)
+                .collect::<Vec<_>>(),
+        }
+    }
+
+    fn test_restart_handoff(
+        required_restart: bool,
+        start_hash: Option<&str>,
+    ) -> CodexRestartHandoffReadback {
+        CodexRestartHandoffReadback {
+            path: "handoff.json".to_owned(),
+            exists: true,
+            len_bytes: None,
+            sha256: None,
+            read_error: None,
+            created_at_utc: Some("2026-07-02T00:00:00Z".to_owned()),
+            reason_code: Some("SYNAPSE_CODEX_CURRENT_PROCESS_SCHEMA_STALE".to_owned()),
+            reason: Some("test".to_owned()),
+            phase: Some("post_handoff_current_daemon".to_owned()),
+            required_restart,
+            no_in_process_hot_refresh: required_restart,
+            stale_codex_pid: Some(std::process::id()),
+            stale_codex_command_line: Some("codex resume --yolo".to_owned()),
+            active_issue_ref: Some("#1488".to_owned()),
+            daemon_pid: Some(1),
+            daemon_bind: Some("127.0.0.1:7700".to_owned()),
+            daemon_pid_role: Some("installed_configured_daemon".to_owned()),
+            daemon_pid_authoritative_for_configured_bind: Some(true),
+            daemon_tool_count: Some(40),
+            daemon_tool_surface_sha256: Some("historical-surface".to_owned()),
+            current_process_start_snapshot_status: Some(if start_hash.is_some() {
+                "readable".to_owned()
+            } else {
+                "missing_env".to_owned()
+            }),
+            current_process_start_env_hash: start_hash.map(ToOwned::to_owned),
+            live_daemon_pid: std::process::id(),
+            daemon_pid_matches_live_daemon: Some(false),
+            daemon_pid_mismatch_detail: Some("historical daemon pid".to_owned()),
+        }
+    }
+
+    #[test]
+    fn restart_handoff_matching_current_start_hash_is_not_actionable() {
+        let host = test_host_surface(Some(
+            "594f2abc0412c9f6c87d7c1eba9c8f1eaeb7100a542f1002768b44b77d71e6fb",
+        ));
+        let handoff = test_restart_handoff(
+            true,
+            Some("sha256:594F2ABC0412C9F6C87D7C1EBA9C8F1EAEB7100A542F1002768B44B77D71E6FB"),
+        );
+
+        assert!(!restart_handoff_requires_current_codex_restart(
+            &handoff, &host
+        ));
+    }
+
+    #[test]
+    fn restart_handoff_different_current_start_hash_is_actionable() {
+        let host = test_host_surface(Some(
+            "594f2abc0412c9f6c87d7c1eba9c8f1eaeb7100a542f1002768b44b77d71e6fb",
+        ));
+        let handoff = test_restart_handoff(
+            true,
+            Some("fd2ee96bcb5a04bc7a0a53d2559713cfdd698d390bfb182521413bcf4954973d"),
+        );
+
+        assert!(restart_handoff_requires_current_codex_restart(
+            &handoff, &host
+        ));
+    }
+
+    #[test]
+    fn restart_handoff_missing_current_start_hash_fails_closed() {
+        let host = test_host_surface(Some(
+            "594f2abc0412c9f6c87d7c1eba9c8f1eaeb7100a542f1002768b44b77d71e6fb",
+        ));
+        let handoff = test_restart_handoff(true, None);
+
+        assert!(restart_handoff_requires_current_codex_restart(
+            &handoff, &host
+        ));
+    }
+
+    #[test]
+    fn non_required_restart_handoff_is_not_actionable() {
+        let host = test_host_surface(None);
+        let handoff = test_restart_handoff(false, None);
+
+        assert!(!restart_handoff_requires_current_codex_restart(
+            &handoff, &host
+        ));
     }
 
     #[test]
