@@ -26,6 +26,7 @@ fn error_codes_match_literal_names() {
     assert_literal!(A11Y_CDP_EXTENSION_TIMEOUT);
     assert_literal!(A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED);
     assert_literal!(CHROME_BRIDGE_EXTENSION_STALE);
+    assert_literal!(BROWSER_URL_SCHEME_UNSUPPORTED);
     assert_literal!(BROWSER_NAVIGATION_FAILED);
     assert_literal!(A11Y_UIA_WORKER_TIMEOUT);
     assert_literal!(A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE);

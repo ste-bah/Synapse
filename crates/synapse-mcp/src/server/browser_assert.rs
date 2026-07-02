@@ -30,6 +30,7 @@ const DOM_TOOL: &str = "browser_dom";
 const DOM_SOURCE_OF_TRUTH: &str = "Chrome bridge/raw-CDP DOM/ARIA readback for the target tab";
 const DOM_READBACK_SOURCE_OF_TRUTH: &str =
     "browser_content/browser_locate/browser_inspect/browser_aria_snapshot same-target readback";
+const DOM_RESTRICTED_SCHEME_REMEDIATION: &str = "navigate the target tab to an http(s) URL or another Chrome-extension-scriptable URL before retrying browser_dom; Chrome extensions cannot script restricted URL schemes such as data:, about:, chrome:, chrome-extension:, devtools:, or view-source:";
 
 const DEFAULT_ARIA_MAX_NODES: usize = 500;
 const MAX_ARIA_MAX_NODES: usize = 5_000;
@@ -996,6 +997,7 @@ fn browser_dom_delegate_error(
     error: ErrorData,
     remediation: &'static str,
 ) -> ErrorData {
+    let source_id = source_id.into();
     let cause_code = error
         .data
         .as_ref()
@@ -1004,6 +1006,30 @@ fn browser_dom_delegate_error(
         .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
         .to_owned();
     let cause = error.data.clone().unwrap_or(Value::Null);
+    if let Some(scheme) =
+        restricted_chrome_scripting_scheme(&cause_code, error.message.as_ref(), &cause)
+    {
+        let message = format!(
+            "{DOM_TOOL} operation={} cannot read target {source_id}: Chrome extension scripting is unavailable for restricted URL scheme {scheme:?}; original error: {}",
+            operation.as_str(),
+            error.message
+        );
+        return ErrorData::new(
+            error.code,
+            message,
+            Some(json!({
+                "code": error_codes::BROWSER_URL_SCHEME_UNSUPPORTED,
+                "operation": operation.as_str(),
+                "source_of_truth": DOM_SOURCE_OF_TRUTH,
+                "source_id": source_id,
+                "readback_source_of_truth": DOM_READBACK_SOURCE_OF_TRUTH,
+                "remediation": DOM_RESTRICTED_SCHEME_REMEDIATION,
+                "restricted_url_scheme": scheme,
+                "original_code": cause_code,
+                "cause": cause,
+            })),
+        );
+    }
     ErrorData::new(
         error.code,
         error.message.to_string(),
@@ -1011,11 +1037,64 @@ fn browser_dom_delegate_error(
             "code": cause_code,
             "operation": operation.as_str(),
             "source_of_truth": DOM_SOURCE_OF_TRUTH,
-            "source_id": source_id.into(),
+            "source_id": source_id,
             "readback_source_of_truth": DOM_READBACK_SOURCE_OF_TRUTH,
             "remediation": remediation,
             "cause": cause,
         })),
+    )
+}
+
+fn restricted_chrome_scripting_scheme(
+    cause_code: &str,
+    message: &str,
+    cause: &Value,
+) -> Option<String> {
+    if cause_code != error_codes::CHROME_SCRIPTING_EXECUTE_FAILED {
+        return None;
+    }
+    let mut haystack = message.to_owned();
+    haystack.push('\n');
+    haystack.push_str(&cause.to_string());
+    let url = chrome_scripting_error_url(&haystack)?;
+    let scheme = url.split_once(':')?.0.to_ascii_lowercase();
+    if is_restricted_chrome_scripting_scheme(&scheme) {
+        Some(scheme)
+    } else {
+        None
+    }
+}
+
+fn chrome_scripting_error_url(haystack: &str) -> Option<&str> {
+    let lower = haystack.to_ascii_lowercase();
+    for marker in ["url \"", "url '"] {
+        if let Some(start) = lower.find(marker) {
+            let start = start + marker.len();
+            let quote = marker.chars().last()?;
+            let rest = &haystack[start..];
+            return rest.split(quote).next();
+        }
+    }
+    for prefix in [
+        "data:",
+        "about:",
+        "chrome://",
+        "chrome-extension://",
+        "devtools://",
+        "edge://",
+        "view-source:",
+    ] {
+        if let Some(start) = lower.find(prefix) {
+            return Some(&haystack[start..]);
+        }
+    }
+    None
+}
+
+fn is_restricted_chrome_scripting_scheme(scheme: &str) -> bool {
+    matches!(
+        scheme,
+        "data" | "about" | "chrome" | "chrome-extension" | "devtools" | "edge" | "view-source"
     )
 }
 
@@ -2404,6 +2483,76 @@ mod tests {
                 .and_then(Value::as_str);
             assert_eq!(code, Some(error_codes::TOOL_PARAMS_INVALID));
         }
+    }
+
+    #[test]
+    fn browser_dom_delegate_error_reclassifies_restricted_url_scheme() {
+        let low_level = ErrorData::new(
+            rmcp::model::ErrorCode(-32099),
+            "pageContent read failed for tab 1: code=CHROME_SCRIPTING_EXECUTE_FAILED detail=Cannot access contents of url \"data:text/html,<h1>sentinel</h1>\". Extension manifest must request permission to access this host.",
+            Some(json!({
+                "code": error_codes::CHROME_SCRIPTING_EXECUTE_FAILED,
+            })),
+        );
+        let error = browser_dom_delegate_error(
+            BrowserDomOperation::Content,
+            "window_hwnd=0x1;cdp_target_id=chrome-tab:1",
+            low_level,
+            "verify the session owns the target tab, then retry browser_dom operation=content",
+        );
+        let data = error.data.as_ref().expect("facade data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::BROWSER_URL_SCHEME_UNSUPPORTED)
+        );
+        assert_eq!(
+            data.get("restricted_url_scheme").and_then(Value::as_str),
+            Some("data")
+        );
+        assert_eq!(
+            data.get("original_code").and_then(Value::as_str),
+            Some(error_codes::CHROME_SCRIPTING_EXECUTE_FAILED)
+        );
+        assert_eq!(
+            data.pointer("/cause/code").and_then(Value::as_str),
+            Some(error_codes::CHROME_SCRIPTING_EXECUTE_FAILED)
+        );
+        let remediation = data
+            .get("remediation")
+            .and_then(Value::as_str)
+            .expect("remediation");
+        assert!(remediation.contains("http(s) URL"));
+        assert!(!remediation.contains("owns the target"));
+        assert!(error.message.contains("restricted URL scheme"));
+    }
+
+    #[test]
+    fn browser_dom_delegate_error_keeps_generic_scripting_failures() {
+        let low_level = ErrorData::new(
+            rmcp::model::ErrorCode(-32099),
+            "pageContent read failed for tab 1: code=CHROME_SCRIPTING_EXECUTE_FAILED detail=execution context was destroyed",
+            Some(json!({
+                "code": error_codes::CHROME_SCRIPTING_EXECUTE_FAILED,
+            })),
+        );
+        let error = browser_dom_delegate_error(
+            BrowserDomOperation::Content,
+            "window_hwnd=0x1;cdp_target_id=chrome-tab:1",
+            low_level,
+            "verify the session owns the target tab, then retry browser_dom operation=content",
+        );
+        let data = error.data.as_ref().expect("facade data");
+        assert_eq!(
+            data.get("code").and_then(Value::as_str),
+            Some(error_codes::CHROME_SCRIPTING_EXECUTE_FAILED)
+        );
+        assert_eq!(
+            data.get("remediation").and_then(Value::as_str),
+            Some(
+                "verify the session owns the target tab, then retry browser_dom operation=content"
+            )
+        );
+        assert!(data.get("restricted_url_scheme").is_none());
     }
 
     fn assert_defaults() -> BrowserAssertParams {
