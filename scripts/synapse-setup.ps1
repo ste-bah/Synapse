@@ -471,6 +471,7 @@ namespace SynapseSetup
         private const uint WAIT_OBJECT_0 = 0x00000000;
         private const uint WAIT_TIMEOUT = 0x00000102;
         private const uint WAIT_FAILED = 0xffffffff;
+        private const uint WAIT_NOT_CALLED = 0xfffffffe;
         private const uint EXIT_TIMEOUT = 124;
         private const uint EXIT_ASSIGN_FAILED = 125;
         private const uint EXIT_RESUME_FAILED = 126;
@@ -593,9 +594,25 @@ namespace SynapseSetup
             string commandLine,
             string workingDirectory,
             uint timeoutMilliseconds,
-            out string failure)
+            out string failure,
+            out string diagnosticsJson)
         {
             failure = "";
+            diagnosticsJson = "";
+            string completionKind = "not_started";
+            string waitKind = "not_waited";
+            uint wait = WAIT_NOT_CALLED;
+            uint exitCode = 0xffffffff;
+            uint cleanupWait = WAIT_NOT_CALLED;
+            uint childPid = 0;
+            bool jobCreated = false;
+            bool processCreated = false;
+            bool assignedToJob = false;
+            bool resumed = false;
+            bool timedOut = false;
+            bool terminateJobCalled = false;
+            bool terminateJobOk = false;
+            string terminateJobError = "";
             IntPtr job = IntPtr.Zero;
             IntPtr limitPointer = IntPtr.Zero;
             PROCESS_INFORMATION processInfo = new PROCESS_INFORMATION();
@@ -605,8 +622,10 @@ namespace SynapseSetup
                 if (job == IntPtr.Zero)
                 {
                     failure = "PROCESS_JOB_CREATE_FAILED: " + new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                    completionKind = "job_create_failed";
                     return 127;
                 }
+                jobCreated = true;
 
                 JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
                 limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -616,6 +635,7 @@ namespace SynapseSetup
                 if (!SetInformationJobObject(job, JobObjectExtendedLimitInformation, limitPointer, (uint)limitSize))
                 {
                     failure = "PROCESS_JOB_LIMIT_FAILED: " + new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                    completionKind = "job_limit_failed";
                     return 127;
                 }
 
@@ -636,56 +656,115 @@ namespace SynapseSetup
                 if (!created)
                 {
                     failure = "PROCESS_JOB_CREATE_PROCESS_FAILED: " + new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                    completionKind = "process_create_failed";
                     return 127;
                 }
+                processCreated = true;
+                childPid = processInfo.dwProcessId;
 
                 if (!AssignProcessToJobObject(job, processInfo.hProcess))
                 {
                     failure = "PROCESS_JOB_ASSIGN_FAILED: " + new Win32Exception(Marshal.GetLastWin32Error()).Message;
-                    TerminateProcess(processInfo.hProcess, EXIT_ASSIGN_FAILED);
+                    completionKind = "job_assign_failed";
+                    bool terminated = TerminateProcess(processInfo.hProcess, EXIT_ASSIGN_FAILED);
+                    terminateJobCalled = false;
+                    terminateJobOk = terminated;
+                    if (!terminated)
+                    {
+                        terminateJobError = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                    }
                     return (int)EXIT_ASSIGN_FAILED;
                 }
+                assignedToJob = true;
 
                 if (ResumeThread(processInfo.hThread) == 0xffffffff)
                 {
                     failure = "PROCESS_JOB_RESUME_FAILED: " + new Win32Exception(Marshal.GetLastWin32Error()).Message;
-                    TerminateJobObject(job, EXIT_RESUME_FAILED);
+                    completionKind = "resume_failed";
+                    terminateJobCalled = true;
+                    terminateJobOk = TerminateJobObject(job, EXIT_RESUME_FAILED);
+                    if (!terminateJobOk)
+                    {
+                        terminateJobError = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                    }
                     return (int)EXIT_RESUME_FAILED;
                 }
+                resumed = true;
 
-                uint wait = WaitForSingleObject(
+                wait = WaitForSingleObject(
                     processInfo.hProcess,
                     timeoutMilliseconds == 0 ? INFINITE : timeoutMilliseconds);
+                waitKind = WaitKind(wait);
                 if (wait == WAIT_TIMEOUT)
                 {
-                    TerminateJobObject(job, EXIT_TIMEOUT);
-                    WaitForSingleObject(processInfo.hProcess, 15000);
+                    timedOut = true;
+                    completionKind = "timeout";
+                    terminateJobCalled = true;
+                    terminateJobOk = TerminateJobObject(job, EXIT_TIMEOUT);
+                    if (!terminateJobOk)
+                    {
+                        terminateJobError = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                    }
+                    cleanupWait = WaitForSingleObject(processInfo.hProcess, 15000);
                     failure = "PROCESS_JOB_TIMEOUT: child process tree exceeded timeout_ms=" + timeoutMilliseconds;
                     return (int)EXIT_TIMEOUT;
                 }
                 if (wait == WAIT_FAILED)
                 {
                     failure = "PROCESS_JOB_WAIT_FAILED: " + new Win32Exception(Marshal.GetLastWin32Error()).Message;
-                    TerminateJobObject(job, 127);
+                    completionKind = "wait_failed";
+                    terminateJobCalled = true;
+                    terminateJobOk = TerminateJobObject(job, 127);
+                    if (!terminateJobOk)
+                    {
+                        terminateJobError = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                    }
                     return 127;
                 }
                 if (wait != WAIT_OBJECT_0)
                 {
                     failure = "PROCESS_JOB_WAIT_UNEXPECTED: wait_result=" + wait;
-                    TerminateJobObject(job, 127);
+                    completionKind = "wait_unexpected";
+                    terminateJobCalled = true;
+                    terminateJobOk = TerminateJobObject(job, 127);
+                    if (!terminateJobOk)
+                    {
+                        terminateJobError = new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                    }
                     return 127;
                 }
 
-                uint exitCode;
                 if (!GetExitCodeProcess(processInfo.hProcess, out exitCode))
                 {
                     failure = "PROCESS_JOB_EXIT_CODE_FAILED: " + new Win32Exception(Marshal.GetLastWin32Error()).Message;
+                    completionKind = "exit_code_failed";
                     return 127;
                 }
+                completionKind = "child_exit";
                 return unchecked((int)exitCode);
             }
             finally
             {
+                diagnosticsJson = BuildDiagnosticsJson(
+                    applicationName,
+                    commandLine,
+                    workingDirectory,
+                    timeoutMilliseconds,
+                    jobCreated,
+                    processCreated,
+                    childPid,
+                    assignedToJob,
+                    resumed,
+                    wait,
+                    waitKind,
+                    timedOut,
+                    exitCode,
+                    completionKind,
+                    terminateJobCalled,
+                    terminateJobOk,
+                    terminateJobError,
+                    cleanupWait,
+                    failure);
                 if (limitPointer != IntPtr.Zero)
                 {
                     Marshal.FreeHGlobal(limitPointer);
@@ -704,6 +783,97 @@ namespace SynapseSetup
                 }
             }
         }
+
+        private static string WaitKind(uint wait)
+        {
+            if (wait == WAIT_NOT_CALLED) return "not_called";
+            if (wait == WAIT_OBJECT_0) return "WAIT_OBJECT_0";
+            if (wait == WAIT_TIMEOUT) return "WAIT_TIMEOUT";
+            if (wait == WAIT_FAILED) return "WAIT_FAILED";
+            return "unexpected_" + wait.ToString();
+        }
+
+        private static string JsonEscape(string value)
+        {
+            if (value == null) return "";
+            StringBuilder escaped = new StringBuilder();
+            foreach (char c in value)
+            {
+                switch (c)
+                {
+                    case '\\': escaped.Append("\\\\"); break;
+                    case '"': escaped.Append("\\\""); break;
+                    case '\b': escaped.Append("\\b"); break;
+                    case '\f': escaped.Append("\\f"); break;
+                    case '\n': escaped.Append("\\n"); break;
+                    case '\r': escaped.Append("\\r"); break;
+                    case '\t': escaped.Append("\\t"); break;
+                    default:
+                        if (c < 0x20)
+                        {
+                            escaped.Append("\\u");
+                            escaped.Append(((int)c).ToString("x4"));
+                        }
+                        else
+                        {
+                            escaped.Append(c);
+                        }
+                        break;
+                }
+            }
+            return escaped.ToString();
+        }
+
+        private static string BuildDiagnosticsJson(
+            string applicationName,
+            string commandLine,
+            string workingDirectory,
+            uint timeoutMilliseconds,
+            bool jobCreated,
+            bool processCreated,
+            uint childPid,
+            bool assignedToJob,
+            bool resumed,
+            uint waitResult,
+            string waitKind,
+            bool timedOut,
+            uint exitCode,
+            string completionKind,
+            bool terminateJobCalled,
+            bool terminateJobOk,
+            string terminateJobError,
+            uint cleanupWait,
+            string failure)
+        {
+            int signedExitCode = unchecked((int)exitCode);
+            StringBuilder json = new StringBuilder();
+            json.Append("{");
+            json.Append("\"schema\":\"synapse_process_job_result/v1\"");
+            json.Append(",\"application_name\":\"").Append(JsonEscape(applicationName)).Append("\"");
+            json.Append(",\"command_line\":\"").Append(JsonEscape(commandLine)).Append("\"");
+            json.Append(",\"working_directory\":\"").Append(JsonEscape(workingDirectory)).Append("\"");
+            json.Append(",\"timeout_ms\":").Append(timeoutMilliseconds);
+            json.Append(",\"job_created\":").Append(jobCreated ? "true" : "false");
+            json.Append(",\"process_created\":").Append(processCreated ? "true" : "false");
+            json.Append(",\"child_pid\":").Append(childPid == 0 ? "null" : childPid.ToString());
+            json.Append(",\"assigned_to_job\":").Append(assignedToJob ? "true" : "false");
+            json.Append(",\"resumed\":").Append(resumed ? "true" : "false");
+            json.Append(",\"wait_result\":").Append(waitResult);
+            json.Append(",\"wait_kind\":\"").Append(JsonEscape(waitKind)).Append("\"");
+            json.Append(",\"timed_out\":").Append(timedOut ? "true" : "false");
+            json.Append(",\"exit_code_unsigned\":").Append(exitCode);
+            json.Append(",\"exit_code_signed\":").Append(signedExitCode);
+            json.Append(",\"exit_code_hex\":\"0x").Append(exitCode.ToString("X8")).Append("\"");
+            json.Append(",\"completion_kind\":\"").Append(JsonEscape(completionKind)).Append("\"");
+            json.Append(",\"terminate_job_called\":").Append(terminateJobCalled ? "true" : "false");
+            json.Append(",\"terminate_job_ok\":").Append(terminateJobOk ? "true" : "false");
+            json.Append(",\"terminate_job_error\":\"").Append(JsonEscape(terminateJobError)).Append("\"");
+            json.Append(",\"cleanup_wait_result\":").Append(cleanupWait);
+            json.Append(",\"cleanup_wait_kind\":\"").Append(JsonEscape(WaitKind(cleanupWait))).Append("\"");
+            json.Append(",\"failure\":\"").Append(JsonEscape(failure)).Append("\"");
+            json.Append("}");
+            return json.ToString();
+        }
     }
 }
 '@ | Out-Null
@@ -715,7 +885,8 @@ function Invoke-SynapseProcessInKillOnCloseJob {
         [string[]]$ArgumentList = @(),
         [Parameter(Mandatory=$true)][string]$WorkingDirectory,
         [Parameter(Mandatory=$true)][int]$TimeoutMinutes,
-        [string]$LogPath
+        [string]$LogPath,
+        [System.Management.Automation.PSReference]$Diagnostics
     )
 
     Ensure-SynapseSetupProcessJobType
@@ -741,20 +912,172 @@ function Invoke-SynapseProcessInKillOnCloseJob {
 
     $timeoutMilliseconds = [uint32]([math]::Min([int64]$TimeoutMinutes * 60 * 1000, [uint32]::MaxValue))
     $failure = ''
+    $processJobDiagnosticsJson = ''
+    $startedAt = (Get-Date).ToUniversalTime().ToString('o')
+    $compilerProcessesBefore = @(Get-SynapseBuildToolProcessSnapshot)
     $exitCode = [SynapseSetup.ProcessJob]::Run(
         $applicationPath,
         $commandLine,
         $WorkingDirectory,
         $timeoutMilliseconds,
-        [ref]$failure)
-    if (-not [string]::IsNullOrWhiteSpace($failure)) {
-        $tail = ''
-        if ($LogPath -and (Test-Path $LogPath)) {
-            $tail = (Get-Content -Path $LogPath -Tail 40 -ErrorAction SilentlyContinue) -join "`n"
+        [ref]$failure,
+        [ref]$processJobDiagnosticsJson)
+    $completedAt = (Get-Date).ToUniversalTime().ToString('o')
+    $compilerProcessesAfter = @(Get-SynapseBuildToolProcessSnapshot)
+    $processJobDiagnostics = $null
+    if (-not [string]::IsNullOrWhiteSpace($processJobDiagnosticsJson)) {
+        try {
+            $processJobDiagnostics = $processJobDiagnosticsJson | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            $processJobDiagnostics = [pscustomobject]@{
+                schema = 'synapse_process_job_result_parse_failed/v1'
+                raw = $processJobDiagnosticsJson
+                parse_error = $_.Exception.Message
+            }
         }
-        Die "PROCESS_JOB_FAILED command=$targetCommand exit=$exitCode reason=$failure log=$LogPath tail=`n$tail"
+    }
+    $childProcessAfter = $null
+    if ($processJobDiagnostics -and $processJobDiagnostics.child_pid) {
+        $childPid = [int]$processJobDiagnostics.child_pid
+        $childProcessAfter = Get-CimInstance Win32_Process -Filter "ProcessId=$childPid" -ErrorAction SilentlyContinue |
+            Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine
+    }
+    $diagnosticObject = [ordered]@{
+        schema = 'synapse_setup_process_job_invocation/v1'
+        command = $targetCommand
+        application_path = $applicationPath
+        working_directory = $WorkingDirectory
+        timeout_minutes = $TimeoutMinutes
+        timeout_ms = $timeoutMilliseconds
+        log_path = $LogPath
+        started_at_utc = $startedAt
+        completed_at_utc = $completedAt
+        exit_code = $exitCode
+        failure = $failure
+        process_job = $processJobDiagnostics
+        child_process_after = $childProcessAfter
+        build_tool_processes_before = $compilerProcessesBefore
+        build_tool_processes_after = $compilerProcessesAfter
+        cleanup_result = [ordered]@{
+            process_table_after_read = $true
+            child_process_alive_after = ($null -ne $childProcessAfter)
+            live_build_tool_process_count_after = @($compilerProcessesAfter).Count
+        }
+    }
+    if ($PSBoundParameters.ContainsKey('Diagnostics')) {
+        $Diagnostics.Value = [pscustomobject]$diagnosticObject
     }
     return $exitCode
+}
+
+function Get-SynapseBuildToolProcessSnapshot {
+    @(Get-CimInstance Win32_Process -Filter "Name='cargo.exe' OR Name='rustc.exe'" -ErrorAction SilentlyContinue |
+        Sort-Object ProcessId |
+        Select-Object ProcessId, ParentProcessId, Name, ExecutablePath, CommandLine)
+}
+
+function Get-SynapseBuildLogSignal {
+    param([string]$Path)
+
+    $signal = [ordered]@{
+        path = $Path
+        exists = $false
+        has_compiler_error = $false
+        compiler_error_matches = @()
+        tail_80 = ''
+    }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]$signal
+    }
+    $signal.exists = $true
+    $signal.tail_80 = (Get-Content -LiteralPath $Path -Tail 80 -ErrorAction SilentlyContinue) -join "`n"
+    $matches = @(Select-String -LiteralPath $Path -Pattern '(?i)(^error(\[.*\])?:|^error:|fatal error|could not compile|failed to run custom build command|panicked at)' -ErrorAction SilentlyContinue |
+        Select-Object -First 20 LineNumber, Line)
+    $signal.has_compiler_error = ($matches.Count -gt 0)
+    $signal.compiler_error_matches = @($matches)
+    return [pscustomobject]$signal
+}
+
+function Get-SynapseArtifactReadback {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $readback = [ordered]@{
+        path = $Path
+        exists = $false
+        length_bytes = $null
+        sha256 = $null
+        exclusive_open = 'not_checked'
+        exclusive_open_error = $null
+    }
+    if (-not (Test-Path -LiteralPath $Path)) {
+        $readback.exclusive_open = 'missing'
+        return [pscustomobject]$readback
+    }
+    $item = Get-Item -LiteralPath $Path -ErrorAction Stop
+    $readback.exists = $true
+    $readback.length_bytes = $item.Length
+    try {
+        $readback.sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+    } catch {
+        $readback.sha256 = $null
+        $readback.exclusive_open_error = "hash_failed: $($_.Exception.Message)"
+    }
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+        try {
+            $readback.exclusive_open = 'ok'
+        } finally {
+            $stream.Dispose()
+        }
+    } catch {
+        $readback.exclusive_open = 'locked_or_unreadable'
+        $readback.exclusive_open_error = $_.Exception.Message
+    }
+    return [pscustomobject]$readback
+}
+
+function Get-SynapseReleaseBuildFailureKind {
+    param(
+        [Parameter(Mandatory=$true)]$Diagnostics,
+        [Parameter(Mandatory=$true)]$LogSignal,
+        [Parameter(Mandatory=$true)]$ArtifactReadback
+    )
+
+    $job = $Diagnostics.process_job
+    if ($job -and $job.completion_kind -eq 'timeout') {
+        return [pscustomobject]@{
+            code = 'SYNAPSE_RELEASE_BUILD_TIMEOUT'
+            remediation = 'increase BuildTimeoutMinutes only after verifying rustc/cargo are still making progress, or inspect build_tool_processes_after and setup-build.log for a stuck compiler/linker'
+        }
+    }
+    if ($job -and -not [string]::IsNullOrWhiteSpace([string]$job.failure) -and $job.completion_kind -ne 'child_exit') {
+        return [pscustomobject]@{
+            code = 'SYNAPSE_RELEASE_BUILD_PROCESS_JOB_FAILED'
+            remediation = 'inspect process_job.failure, wait_kind, terminate_job_ok, and cleanup_wait_kind; repair the Windows process/job-object failure before rerunning setup'
+        }
+    }
+    if ($ArtifactReadback.exclusive_open -eq 'locked_or_unreadable') {
+        return [pscustomobject]@{
+            code = 'SYNAPSE_RELEASE_BUILD_ARTIFACT_LOCKED'
+            remediation = 'inspect the process table for a build or scanner process holding the release artifact; do not close protected terminal/IDE/WSL host processes'
+        }
+    }
+    if ($LogSignal.has_compiler_error) {
+        return [pscustomobject]@{
+            code = 'SYNAPSE_RELEASE_BUILD_COMPILER_FAILED'
+            remediation = 'repair the compiler error lines recorded in setup-build.log before rerunning setup'
+        }
+    }
+    if ($job -and [int]$job.exit_code_signed -eq -1) {
+        return [pscustomobject]@{
+            code = 'SYNAPSE_RELEASE_BUILD_CHILD_EXIT_NO_COMPILER_ERROR'
+            remediation = 'child process exited -1 without compiler diagnostics; inspect process_job child_pid, wait_kind, build_tool_processes_before/after, artifact_readback, and Windows host logs for external termination or toolchain process death'
+        }
+    }
+    return [pscustomobject]@{
+        code = 'SYNAPSE_RELEASE_BUILD_CHILD_EXIT'
+        remediation = 'child process exited nonzero; inspect setup-build.log, process_job, build_tool_processes_before/after, and artifact_readback for the root cause'
+    }
 }
 
 function Install-CodexSynapseTokenLoader {
@@ -3352,18 +3675,70 @@ if (-not $SkipBuild) {
     }
     Info "Build parallelism: CARGO_BUILD_JOBS=$($env:CARGO_BUILD_JOBS) (logical CPUs: $([Environment]::ProcessorCount))"
     $buildLog = Join-Path $LogDir 'setup-build.log'
+    $buildDiagnosticsPath = Join-Path $LogDir 'setup-build-diagnostics.json'
+    if (Test-Path -LiteralPath $buildDiagnosticsPath) { Remove-Item -LiteralPath $buildDiagnosticsPath -Force }
+    $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
     Info "Build process tree is job-owned; log: $buildLog"
+    $buildInvocationDiagnostics = $null
     $buildExit = Invoke-SynapseProcessInKillOnCloseJob `
         -FilePath $cargo `
         -ArgumentList @('build','--release','-p','synapse-mcp') `
         -WorkingDirectory $SourceDir `
         -TimeoutMinutes $BuildTimeoutMinutes `
-        -LogPath $buildLog
+        -LogPath $buildLog `
+        -Diagnostics ([ref]$buildInvocationDiagnostics)
     if ($buildExit -ne 0) {
-        $tail = if (Test-Path $buildLog) { (Get-Content -Path $buildLog -Tail 80 -ErrorAction SilentlyContinue) -join "`n" } else { '' }
-        Die "cargo build failed (exit $buildExit). Build log: $buildLog. Tail:`n$tail"
+        $buildLogSignal = Get-SynapseBuildLogSignal -Path $buildLog
+        $artifactReadback = Get-SynapseArtifactReadback -Path $built
+        $failureKind = Get-SynapseReleaseBuildFailureKind `
+            -Diagnostics $buildInvocationDiagnostics `
+            -LogSignal $buildLogSignal `
+            -ArtifactReadback $artifactReadback
+        $buildDiagnostics = [ordered]@{
+            schema = 'synapse_setup_release_build_failure/v1'
+            code = $failureKind.code
+            source_dir = $SourceDir
+            cargo = $cargo
+            cargo_target_dir = $CargoTarget
+            expected_artifact = $built
+            build_log = $buildLog
+            build_timeout_minutes = $BuildTimeoutMinutes
+            build_exit = $buildExit
+            remediation = $failureKind.remediation
+            invocation = $buildInvocationDiagnostics
+            log_signal = $buildLogSignal
+            artifact_readback = $artifactReadback
+        }
+        $buildDiagnostics | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $buildDiagnosticsPath -Encoding UTF8
+        $job = $buildInvocationDiagnostics.process_job
+        $childPid = if ($job -and $job.child_pid) { $job.child_pid } else { '<unknown>' }
+        $completionKind = if ($job -and $job.completion_kind) { $job.completion_kind } else { '<unknown>' }
+        $waitKind = if ($job -and $job.wait_kind) { $job.wait_kind } else { '<unknown>' }
+        $terminateJobOk = if ($job) { [string]$job.terminate_job_ok } else { '<unknown>' }
+        $cleanupWaitKind = if ($job -and $job.cleanup_wait_kind) { $job.cleanup_wait_kind } else { '<unknown>' }
+        $compilerError = if ($buildLogSignal.has_compiler_error) { 'true' } else { 'false' }
+        $childAliveAfter = if ($buildInvocationDiagnostics.cleanup_result) { [string]$buildInvocationDiagnostics.cleanup_result.child_process_alive_after } else { '<unknown>' }
+        $afterBuildToolCount = @($buildInvocationDiagnostics.build_tool_processes_after).Count
+        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes={6} terminate_job_ok={7} cleanup_wait={8} compiler_error={9} live_build_tool_processes_after={10} artifact_exists={11} artifact_sha256={12} artifact_exclusive_open={13} diagnostics={14} log={15} remediation={16}`nTail:`n{17}" -f `
+            $failureKind.code,
+            $buildExit,
+            $childPid,
+            $childAliveAfter,
+            $completionKind,
+            $waitKind,
+            $BuildTimeoutMinutes,
+            $terminateJobOk,
+            $cleanupWaitKind,
+            $compilerError,
+            $afterBuildToolCount,
+            $artifactReadback.exists,
+            ($(if ($artifactReadback.sha256) { $artifactReadback.sha256 } else { '<none>' })),
+            $artifactReadback.exclusive_open,
+            $buildDiagnosticsPath,
+            $buildLog,
+            $failureKind.remediation,
+            $buildLogSignal.tail_80)
     }
-    $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
 }
