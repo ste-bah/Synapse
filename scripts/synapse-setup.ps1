@@ -1080,6 +1080,28 @@ function Get-SynapseReleaseBuildFailureKind {
     }
 }
 
+function Get-SynapseCargoVersionFailureKind {
+    param([Parameter(Mandatory=$true)]$Diagnostics)
+
+    $job = $Diagnostics.process_job
+    if ($job -and $job.completion_kind -eq 'timeout') {
+        return [pscustomobject]@{
+            code = 'SYNAPSE_CARGO_VERSION_TIMEOUT'
+            remediation = 'cargo --version did not return inside the setup preflight timeout; inspect child_pid, wait_kind, terminate_job_ok, and process table before rerunning setup'
+        }
+    }
+    if ($job -and -not [string]::IsNullOrWhiteSpace([string]$job.failure) -and $job.completion_kind -ne 'child_exit') {
+        return [pscustomobject]@{
+            code = 'SYNAPSE_CARGO_VERSION_PROCESS_JOB_FAILED'
+            remediation = 'repair the Windows process/job-object failure recorded in setup-cargo-version-diagnostics.json before rerunning setup'
+        }
+    }
+    return [pscustomobject]@{
+        code = 'SYNAPSE_CARGO_VERSION_FAILED'
+        remediation = 'cargo --version exited nonzero; inspect setup-cargo-version.log and setup-cargo-version-diagnostics.json, then repair the Rust toolchain before rerunning setup'
+    }
+}
+
 function Install-CodexSynapseTokenLoader {
     param(
         [Parameter(Mandatory=$true)][string]$CodexCommandPath,
@@ -3636,7 +3658,77 @@ if (-not $SkipBuild) {
     if ($SourceDir -match '^\\\\' -or $SourceDir -match '^[Zz]:\\home\\') {
         Die "-SourceDir '$SourceDir' looks like a UNC / WSL-mapped path. Build from a real local copy: building over \\wsl.localhost bakes transient drive paths into the binary."
     }
-    Info "cargo: $((& $cargo --version))"
+    New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+    $cargoVersionLog = Join-Path $LogDir 'setup-cargo-version.log'
+    $cargoVersionDiagnosticsPath = Join-Path $LogDir 'setup-cargo-version-diagnostics.json'
+    if (Test-Path -LiteralPath $cargoVersionDiagnosticsPath) { Remove-Item -LiteralPath $cargoVersionDiagnosticsPath -Force }
+    $cargoVersionDiagnostics = $null
+    $cargoVersionExit = Invoke-SynapseProcessInKillOnCloseJob `
+        -FilePath $cargo `
+        -ArgumentList @('--version') `
+        -WorkingDirectory $SourceDir `
+        -TimeoutMinutes 1 `
+        -LogPath $cargoVersionLog `
+        -Diagnostics ([ref]$cargoVersionDiagnostics)
+    $cargoVersionLogSignal = Get-SynapseBuildLogSignal -Path $cargoVersionLog
+    if ($cargoVersionExit -ne 0) {
+        $failureKind = Get-SynapseCargoVersionFailureKind -Diagnostics $cargoVersionDiagnostics
+        $versionFailure = [ordered]@{
+            schema = 'synapse_setup_cargo_version_failure/v1'
+            code = $failureKind.code
+            source_dir = $SourceDir
+            cargo = $cargo
+            version_log = $cargoVersionLog
+            preflight_timeout_minutes = 1
+            version_exit = $cargoVersionExit
+            remediation = $failureKind.remediation
+            invocation = $cargoVersionDiagnostics
+            log_signal = $cargoVersionLogSignal
+        }
+        $versionFailure | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $cargoVersionDiagnosticsPath -Encoding UTF8
+        $job = $cargoVersionDiagnostics.process_job
+        $childPid = if ($job -and $job.child_pid) { $job.child_pid } else { '<unknown>' }
+        $completionKind = if ($job -and $job.completion_kind) { $job.completion_kind } else { '<unknown>' }
+        $waitKind = if ($job -and $job.wait_kind) { $job.wait_kind } else { '<unknown>' }
+        $terminateJobOk = if ($job) { [string]$job.terminate_job_ok } else { '<unknown>' }
+        $cleanupWaitKind = if ($job -and $job.cleanup_wait_kind) { $job.cleanup_wait_kind } else { '<unknown>' }
+        $childAliveAfter = if ($cargoVersionDiagnostics.cleanup_result) { [string]$cargoVersionDiagnostics.cleanup_result.child_process_alive_after } else { '<unknown>' }
+        Die ("{0} exit={1} child_pid={2} child_alive_after={3} completion={4} wait={5} timeout_minutes=1 terminate_job_ok={6} cleanup_wait={7} diagnostics={8} log={9} remediation={10}`nTail:`n{11}" -f `
+            $failureKind.code,
+            $cargoVersionExit,
+            $childPid,
+            $childAliveAfter,
+            $completionKind,
+            $waitKind,
+            $terminateJobOk,
+            $cleanupWaitKind,
+            $cargoVersionDiagnosticsPath,
+            $cargoVersionLog,
+            $failureKind.remediation,
+            $cargoVersionLogSignal.tail_80)
+    }
+    $cargoVersionText = if (Test-Path -LiteralPath $cargoVersionLog) {
+        ((Get-Content -LiteralPath $cargoVersionLog -ErrorAction SilentlyContinue) -join "`n").Trim()
+    } else {
+        ''
+    }
+    if ([string]::IsNullOrWhiteSpace($cargoVersionText)) {
+        $emptyVersionFailure = [ordered]@{
+            schema = 'synapse_setup_cargo_version_failure/v1'
+            code = 'SYNAPSE_CARGO_VERSION_EMPTY'
+            source_dir = $SourceDir
+            cargo = $cargo
+            version_log = $cargoVersionLog
+            preflight_timeout_minutes = 1
+            version_exit = $cargoVersionExit
+            remediation = 'cargo --version exited 0 but produced no version text; repair Rust toolchain stdout/stderr before setup continues'
+            invocation = $cargoVersionDiagnostics
+            log_signal = $cargoVersionLogSignal
+        }
+        $emptyVersionFailure | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $cargoVersionDiagnosticsPath -Encoding UTF8
+        Die "SYNAPSE_CARGO_VERSION_EMPTY log=$cargoVersionLog remediation=cargo --version exited 0 but produced no version text; repair Rust toolchain stdout/stderr before setup continues"
+    }
+    Info "cargo: $cargoVersionText"
 }
 
 # ---------------------------------------------------------------------------
