@@ -96,6 +96,7 @@ struct ToolEvent {
     foreground_read_error: Option<Value>,
     session_target: Option<Value>,
     session_target_read_error: Option<Value>,
+    effective_target: Option<Value>,
     error: Option<Value>,
     panic: Option<Value>,
     detail: Option<Value>,
@@ -278,6 +279,7 @@ pub(crate) fn begin_tool_call(start: ToolCallStart) -> anyhow::Result<ToolCallGu
         foreground_read_error: start.foreground_read_error,
         session_target: start.session_target,
         session_target_read_error: start.session_target_read_error,
+        effective_target: None,
         error: None,
         panic: None,
         detail: None,
@@ -316,6 +318,7 @@ pub(crate) fn record_context_event(input: ContextEvent) -> anyhow::Result<u64> {
         foreground_read_error: input.foreground_read_error,
         session_target: None,
         session_target_read_error: None,
+        effective_target: None,
         error: None,
         panic: None,
         detail: Some(input.detail),
@@ -325,16 +328,27 @@ pub(crate) fn record_context_event(input: ContextEvent) -> anyhow::Result<u64> {
 }
 
 impl ToolCallGuard {
-    pub(crate) fn finish_ok(self) -> anyhow::Result<()> {
-        finish_tool_call(self.seq, "ok", None, None)
+    pub(crate) fn finish_ok_with_effective_target(
+        self,
+        effective_target: Option<Value>,
+    ) -> anyhow::Result<()> {
+        finish_tool_call(self.seq, "ok", None, None, effective_target)
     }
 
     pub(crate) fn finish_error(self, error: Value) -> anyhow::Result<()> {
-        finish_tool_call(self.seq, "error", Some(error), None)
+        finish_tool_call(self.seq, "error", Some(error), None, None)
+    }
+
+    pub(crate) fn finish_error_with_effective_target(
+        self,
+        error: Value,
+        effective_target: Option<Value>,
+    ) -> anyhow::Result<()> {
+        finish_tool_call(self.seq, "error", Some(error), None, effective_target)
     }
 
     pub(crate) fn finish_panic(self, panic: Value) -> anyhow::Result<()> {
-        finish_tool_call(self.seq, "panic", None, Some(panic))
+        finish_tool_call(self.seq, "panic", None, Some(panic), None)
     }
 }
 
@@ -468,6 +482,7 @@ fn finish_tool_call(
     status: &'static str,
     error: Option<Value>,
     panic: Option<Value>,
+    effective_target: Option<Value>,
 ) -> anyhow::Result<()> {
     let slot = state_slot();
     let mut guard = slot
@@ -483,6 +498,7 @@ fn finish_tool_call(
     status.clone_into(&mut event.status);
     event.finished_at_unix_ms = Some(finished_at_unix_ms);
     event.duration_ms = Some(finished_at_unix_ms.saturating_sub(event.started_at_unix_ms));
+    event.effective_target = effective_target;
     event.error = error;
     event.panic = panic;
     write_tool_event(state, &event)
@@ -743,7 +759,7 @@ mod tests {
             session_target_read_error: None,
         })
         .unwrap();
-        guard.finish_ok().unwrap();
+        guard.finish_ok_with_effective_target(None).unwrap();
 
         let last: ToolEvent = read_optional_json(Path::new(&paths.tool_last_path))
             .unwrap()
@@ -751,11 +767,66 @@ mod tests {
         assert_eq!(last.tool, "health");
         assert_eq!(last.status, "ok");
         assert_eq!(last.mcp_session_id.as_deref(), Some("session-a"));
+        assert_eq!(last.effective_target, None);
 
         let events = fs::read_to_string(&paths.tool_events_path).unwrap();
         assert_eq!(events.lines().count(), 2);
         assert!(events.contains("\"status\":\"started\""));
         assert!(events.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn records_effective_target_on_tool_finish() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure(DaemonLifecycleConfig {
+            mode: "http",
+            bind_addr: Some("127.0.0.1:7700".to_owned()),
+            db_path: temp.path().to_path_buf(),
+        })
+        .unwrap();
+
+        let guard = begin_tool_call(ToolCallStart {
+            tool: "browser_dom".to_owned(),
+            mcp_session_id: Some("session-a".to_owned()),
+            audit_context: None,
+            audit_context_read_error: None,
+            foreground: None,
+            foreground_read_error: None,
+            session_target: Some(json!({
+                "kind": "cdp",
+                "window_hwnd": 1,
+                "cdp_target_id": "chrome-tab:session",
+            })),
+            session_target_read_error: None,
+        })
+        .unwrap();
+        guard
+            .finish_ok_with_effective_target(Some(json!({
+                "kind": "cdp",
+                "window_hwnd": 2,
+                "cdp_target_id": "chrome-tab:explicit",
+                "source": "structured_content.content",
+            })))
+            .unwrap();
+
+        let last: ToolEvent = read_optional_json(Path::new(&paths.tool_last_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            last.session_target
+                .as_ref()
+                .and_then(|target| target.get("cdp_target_id"))
+                .and_then(Value::as_str),
+            Some("chrome-tab:session")
+        );
+        assert_eq!(
+            last.effective_target
+                .as_ref()
+                .and_then(|target| target.get("cdp_target_id"))
+                .and_then(Value::as_str),
+            Some("chrome-tab:explicit")
+        );
     }
 
     #[test]

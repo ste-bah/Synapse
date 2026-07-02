@@ -3,7 +3,7 @@ use super::{
     SynapseService, mcp_error, tool_handler,
 };
 use futures_util::FutureExt as _;
-use rmcp::model::ErrorCode;
+use rmcp::model::{CallToolResult, ErrorCode};
 use serde_json::{Value, json};
 use std::panic::AssertUnwindSafe;
 use synapse_core::error_codes;
@@ -97,13 +97,18 @@ impl ServerHandler for SynapseService {
         };
         match result {
             Ok(Ok(result)) => {
-                lifecycle_guard.finish_ok().map_err(lifecycle_mcp_error)?;
+                let effective_target = effective_target_from_tool_result(&result);
+                lifecycle_guard
+                    .finish_ok_with_effective_target(effective_target)
+                    .map_err(lifecycle_mcp_error)?;
                 Ok(result)
             }
             Ok(Err(error)) => {
                 let error = normalize_tool_error(&tool_name, error);
+                let error_snapshot = error_snapshot(&error);
+                let effective_target = effective_target_from_error_snapshot(&error_snapshot);
                 lifecycle_guard
-                    .finish_error(error_snapshot(&error))
+                    .finish_error_with_effective_target(error_snapshot, effective_target)
                     .map_err(lifecycle_mcp_error)?;
                 Err(error)
             }
@@ -280,6 +285,134 @@ fn error_snapshot(error: &ErrorData) -> Value {
     })
 }
 
+fn effective_target_from_tool_result(result: &CallToolResult) -> Option<Value> {
+    result
+        .structured_content
+        .as_ref()
+        .and_then(|value| effective_target_from_value(value, "structured_content"))
+}
+
+fn effective_target_from_error_snapshot(error: &Value) -> Option<Value> {
+    let data = error.get("data")?;
+    effective_target_from_value(data, "error.data").or_else(|| {
+        data.get("source_id")
+            .and_then(Value::as_str)
+            .and_then(|source_id| {
+                effective_target_from_source_id(source_id, "error.data.source_id")
+            })
+    })
+}
+
+fn effective_target_from_value(value: &Value, source: &'static str) -> Option<Value> {
+    let object = value.as_object()?;
+    if let Some(target) = effective_target_from_fields(object, source) {
+        return Some(target);
+    }
+    if let Some(target) = object
+        .get("target")
+        .and_then(|value| effective_target_from_value(value, "structured_content.target"))
+    {
+        return Some(target);
+    }
+    for (field, nested_source) in [
+        ("content", "structured_content.content"),
+        ("locate", "structured_content.locate"),
+        ("inspect", "structured_content.inspect"),
+        ("aria_snapshot", "structured_content.aria_snapshot"),
+        ("capture", "structured_content.capture"),
+        ("current", "structured_content.current"),
+    ] {
+        if let Some(target) = object
+            .get(field)
+            .and_then(|value| effective_target_from_value(value, nested_source))
+        {
+            return Some(target);
+        }
+    }
+    None
+}
+
+fn effective_target_from_fields(
+    object: &serde_json::Map<String, Value>,
+    source: &'static str,
+) -> Option<Value> {
+    let cdp_target_id = object
+        .get("cdp_target_id")
+        .or_else(|| object.get("cdpTargetId"))
+        .and_then(Value::as_str)
+        .filter(|target_id| !target_id.trim().is_empty());
+    let window_hwnd = object
+        .get("window_hwnd")
+        .or_else(|| object.get("windowHwnd"))
+        .and_then(Value::as_i64);
+    match (window_hwnd, cdp_target_id) {
+        (Some(window_hwnd), Some(cdp_target_id)) => Some(json!({
+            "kind": "cdp",
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": cdp_target_id,
+            "source": source,
+        })),
+        (None, Some(cdp_target_id)) => Some(json!({
+            "kind": "cdp",
+            "cdp_target_id": cdp_target_id,
+            "source": source,
+        })),
+        (Some(hwnd), None) => Some(json!({
+            "kind": "window",
+            "hwnd": hwnd,
+            "source": source,
+        })),
+        (None, None) => None,
+    }
+}
+
+fn effective_target_from_source_id(source_id: &str, source: &'static str) -> Option<Value> {
+    let mut window_hwnd = None;
+    let mut cdp_target_id = None;
+    for part in source_id.split(';') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+        match key.trim() {
+            "window_hwnd" => window_hwnd = parse_hwnd_literal(value.trim()),
+            "cdp_target_id" => {
+                let target = value.trim();
+                if !target.is_empty() {
+                    cdp_target_id = Some(target.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+    match (window_hwnd, cdp_target_id) {
+        (Some(window_hwnd), Some(cdp_target_id)) => Some(json!({
+            "kind": "cdp",
+            "window_hwnd": window_hwnd,
+            "cdp_target_id": cdp_target_id,
+            "source": source,
+        })),
+        (None, Some(cdp_target_id)) => Some(json!({
+            "kind": "cdp",
+            "cdp_target_id": cdp_target_id,
+            "source": source,
+        })),
+        (Some(hwnd), None) => Some(json!({
+            "kind": "window",
+            "hwnd": hwnd,
+            "source": source,
+        })),
+        (None, None) => None,
+    }
+}
+
+fn parse_hwnd_literal(value: &str) -> Option<i64> {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .and_then(|hex| i64::from_str_radix(hex, 16).ok())
+        .or_else(|| value.parse::<i64>().ok())
+}
+
 fn profile_policy_denied(error: &ErrorData) -> bool {
     error
         .data
@@ -331,4 +464,70 @@ fn tool_panic_mcp_error(tool_name: &str, mcp_session_id: Option<&str>) -> ErrorD
             "daemon_lifecycle": crate::daemon_lifecycle::diagnostic_value(),
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_effective_target_from_browser_dom_content_result() {
+        let result = CallToolResult::structured(json!({
+            "operation": "content",
+            "content": {
+                "window_hwnd": 47060598,
+                "cdp_target_id": "chrome-tab:600757323",
+                "html": "<html>large payload must not be copied into target metadata</html>"
+            }
+        }));
+
+        let target = effective_target_from_tool_result(&result).expect("effective target");
+        assert_eq!(target.get("kind").and_then(Value::as_str), Some("cdp"));
+        assert_eq!(
+            target.get("window_hwnd").and_then(Value::as_i64),
+            Some(47060598)
+        );
+        assert_eq!(
+            target.get("cdp_target_id").and_then(Value::as_str),
+            Some("chrome-tab:600757323")
+        );
+        assert_eq!(
+            target.get("source").and_then(Value::as_str),
+            Some("structured_content.content")
+        );
+        assert!(target.get("html").is_none());
+    }
+
+    #[test]
+    fn extracts_effective_target_from_error_source_id() {
+        let error = json!({
+            "data": {
+                "source_id": "window_hwnd=0x2ce1676;cdp_target_id=chrome-tab:600757326;query_len=9"
+            }
+        });
+
+        let target = effective_target_from_error_snapshot(&error).expect("effective target");
+        assert_eq!(
+            target.get("window_hwnd").and_then(Value::as_i64),
+            Some(47060598)
+        );
+        assert_eq!(
+            target.get("cdp_target_id").and_then(Value::as_str),
+            Some("chrome-tab:600757326")
+        );
+        assert_eq!(
+            target.get("source").and_then(Value::as_str),
+            Some("error.data.source_id")
+        );
+    }
+
+    #[test]
+    fn ignores_tool_result_without_target_metadata() {
+        let result = CallToolResult::structured(json!({
+            "ok": true,
+            "html": "<html>no target fields</html>"
+        }));
+
+        assert!(effective_target_from_tool_result(&result).is_none());
+    }
 }
