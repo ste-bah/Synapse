@@ -216,10 +216,24 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "workspace_subscribe",
 ];
 
+/// Sentinel `operation_enum` for flat, single-purpose facades that expose NO
+/// `operation` discriminator in their input schema (e.g. `health`, `observe`,
+/// `find`, `read_text`, `subscribe`). The schema-parity gate
+/// `facade_contract_operations_match_live_schema` treats a contract carrying
+/// this sentinel as "the built tool must have no `operation` property", and any
+/// other `operation_enum` value as "the tool's serialized `operation` enum must
+/// exactly equal the contract's declared operation list". Naming a real
+/// `*Operation` enum here for a flat tool (as the contracts historically did,
+/// with fabricated enum names like `HealthOperation` that never existed) is
+/// therefore rejected by the gate. Keep the single operation entry as the
+/// documented source-of-truth/error/remediation for the flat call.
+pub(crate) const FLAT_FACADE_OPERATION_ENUM: &str =
+    "(none: single-purpose tool, no operation param)";
+
 const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "health",
-        "HealthOperation",
+        FLAT_FACADE_OPERATION_ENUM,
         "daemon health payload + sanitized tools/list surface",
         &[op(
             "status",
@@ -272,7 +286,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     ),
     facade_contract(
         "subscribe",
-        "SubscribeOperation",
+        FLAT_FACADE_OPERATION_ENUM,
         "SSE subscriber registry + MCP session id",
         &[op(
             "events",
@@ -286,7 +300,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     ),
     facade_contract(
         "observe",
-        "ObserveOperation",
+        FLAT_FACADE_OPERATION_ENUM,
         "capture backend readback + perception observation payload",
         &[op(
             "current",
@@ -300,7 +314,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     ),
     facade_contract(
         "find",
-        "FindOperation",
+        FLAT_FACADE_OPERATION_ENUM,
         "perception index over latest observation readback",
         &[op(
             "elements",
@@ -314,7 +328,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     ),
     facade_contract(
         "read_text",
-        "ReadTextOperation",
+        FLAT_FACADE_OPERATION_ENUM,
         "OCR/accessibility/browser text readback",
         &[op(
             "text",
@@ -770,25 +784,52 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "browser_storage",
         "BrowserStorageOperation",
-        "browser cookies/local storage/session storage readback",
+        "session-owned chrome-tab local/session storage + Playwright storageState readback",
         &[
             op(
-                "read",
+                "get",
                 false,
                 true,
-                "target-scoped browser storage readback",
+                "target-scoped localStorage/sessionStorage readback via chrome.scripting",
                 None,
                 error_codes::ACTION_TARGET_INVALID,
-                "bind the tab and request one supported storage namespace",
+                "bind a session-owned chrome-tab target and request the local or session store",
             ),
             op(
-                "write",
+                "set",
                 true,
                 true,
-                "target-scoped browser storage mutation",
-                Some("target-scoped browser storage readback after mutation"),
+                "target-scoped localStorage/sessionStorage after write",
+                Some("target-scoped localStorage/sessionStorage readback after the set"),
                 error_codes::TOOL_PARAMS_INVALID,
-                "pass a supported storage namespace/key/value and verify the readback",
+                "pass a non-empty key plus value and verify the post-write readback",
+            ),
+            op(
+                "clear",
+                true,
+                true,
+                "target-scoped localStorage/sessionStorage after removal",
+                Some("target-scoped localStorage/sessionStorage readback after the clear"),
+                error_codes::ACTION_TARGET_INVALID,
+                "bind a session-owned chrome-tab target, then verify the store/key is absent",
+            ),
+            op(
+                "save_state",
+                false,
+                true,
+                "exported Playwright-style storageState (cookies + per-origin localStorage) readback",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "bind a session-owned chrome-tab target and read the exported storageState object",
+            ),
+            op(
+                "load_state",
+                true,
+                true,
+                "target-scoped cookies + localStorage after applying storageState",
+                Some("target-scoped storage readback after storageState import"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "pass a valid storageState object and verify the imported cookies/localStorage readback",
             ),
         ],
     ),
@@ -5174,6 +5215,221 @@ mod tests {
                 !operation.mutates_state || operation.readback_source_of_truth.is_some()
             })
         }));
+    }
+
+    /// Recursively collect every `enum`/`const` string reachable from an
+    /// `operation` schema node, resolving `$ref` into the schema-root `$defs`
+    /// and descending `oneOf`/`anyOf` (covers schemars enum shapes:
+    /// inline `enum`, `$ref` to a `$defs` enum, a `$defs` `oneOf` of `const`
+    /// variants with per-variant docs, and the `Option<Enum>` `anyOf[ref,null]`
+    /// shape). This mirrors what an MCP client actually parses from the wire.
+    fn collect_operation_enum_consts(root: &Value, node: &Value, out: &mut BTreeSet<String>) {
+        if let Some(values) = node.get("enum").and_then(Value::as_array) {
+            for value in values {
+                if let Some(text) = value.as_str() {
+                    out.insert(text.to_owned());
+                }
+            }
+        }
+        if let Some(text) = node.get("const").and_then(Value::as_str) {
+            out.insert(text.to_owned());
+        }
+        for combinator in ["oneOf", "anyOf", "allOf"] {
+            if let Some(variants) = node.get(combinator).and_then(Value::as_array) {
+                for variant in variants {
+                    collect_operation_enum_consts(root, variant, out);
+                }
+            }
+        }
+        if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+            if let Some(name) = reference.strip_prefix("#/$defs/") {
+                if let Some(def) = root.get("$defs").and_then(|defs| defs.get(name)) {
+                    collect_operation_enum_consts(root, def, out);
+                }
+            }
+        }
+    }
+
+    /// The set of operation wire-names the built tool schema exposes, or `None`
+    /// when the tool has no `operation` property (a flat single-purpose facade).
+    fn schema_operation_names(schema: &Value) -> Option<BTreeSet<String>> {
+        let operation = schema.get("properties")?.get("operation")?;
+        let mut out = BTreeSet::new();
+        collect_operation_enum_consts(schema, operation, &mut out);
+        Some(out)
+    }
+
+    /// Pure comparison of the vendored contracts against a map of built tool
+    /// input schemas, returning one human-readable failure per drift. Kept as a
+    /// standalone function so both the live-surface gate and the synthetic
+    /// non-vacuity test below exercise the exact same detection logic.
+    fn facade_contract_schema_failures(
+        contracts: &[FacadeToolContractSpec],
+        schema_by_name: &std::collections::BTreeMap<String, Value>,
+    ) -> Vec<String> {
+        let mut failures = Vec::new();
+        for contract in contracts {
+            let Some(schema) = schema_by_name.get(contract.tool_name) else {
+                failures.push(format!(
+                    "{}: contract present but tool missing from built surface",
+                    contract.tool_name
+                ));
+                continue;
+            };
+            let contract_ops = contract
+                .operations
+                .iter()
+                .map(|operation| operation.operation.to_owned())
+                .collect::<BTreeSet<String>>();
+            match schema_operation_names(schema) {
+                None => {
+                    if contract.operation_enum != FLAT_FACADE_OPERATION_ENUM {
+                        failures.push(format!(
+                            "{}: tool has NO `operation` property but contract operation_enum={:?}; flat facades must use FLAT_FACADE_OPERATION_ENUM",
+                            contract.tool_name, contract.operation_enum
+                        ));
+                    }
+                }
+                Some(schema_ops) => {
+                    if contract.operation_enum == FLAT_FACADE_OPERATION_ENUM {
+                        failures.push(format!(
+                            "{}: contract marked flat but tool exposes operation enum {schema_ops:?}",
+                            contract.tool_name
+                        ));
+                    } else if schema_ops != contract_ops {
+                        let in_schema_only = schema_ops
+                            .difference(&contract_ops)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let in_contract_only = contract_ops
+                            .difference(&schema_ops)
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        failures.push(format!(
+                            "{}: operation drift — schema-only={in_schema_only:?} contract-only={in_contract_only:?}",
+                            contract.tool_name
+                        ));
+                    }
+                }
+            }
+        }
+        failures
+    }
+
+    fn built_tool_schema_map() -> std::collections::BTreeMap<String, Value> {
+        crate::server::schema_sanitize::sanitize_tools(
+            crate::server::SynapseService::tool_router().list_all(),
+        )
+        .iter()
+        .map(|tool| {
+            (
+                tool.name.as_ref().to_owned(),
+                Value::Object((*tool.input_schema).clone()),
+            )
+        })
+        .collect()
+    }
+
+    // ROOT-CAUSE GATE (metadata drift): the structural validators above prove
+    // every public tool HAS a contract, but never proved the contract's
+    // operation list matches the tool's real serialized `operation` enum. That
+    // gap let `browser_storage` ship a contract declaring read/write while the
+    // tool actually exposed get/set/clear/save_state/load_state, and let flat
+    // tools (health/observe/find/read_text/subscribe) name `*Operation` enums
+    // that never existed. This gate closes it by deriving the operation set from
+    // the real built tool surface (the same schema an MCP client parses) and
+    // asserting exact parity with FACADE_TOOL_CONTRACTS — the vendored,
+    // code-reviewed source of truth. Adding/removing/renaming a facade operation
+    // now fails here until the contract is updated in the same change.
+    #[test]
+    fn facade_contract_operations_match_live_schema() {
+        let schema_by_name = built_tool_schema_map();
+        let failures = facade_contract_schema_failures(FACADE_TOOL_CONTRACTS, &schema_by_name);
+        assert!(
+            failures.is_empty(),
+            "FACADE_TOOL_CONTRACTS drifted from the built tool schema:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    // Non-vacuity guard: prove the gate above actually detects the two drift
+    // classes it exists to catch, using the REAL built schemas but deliberately
+    // wrong contracts (the exact historical bugs). If the detector ever silently
+    // stops flagging drift, this test fails instead of the real gate passing for
+    // the wrong reason.
+    #[test]
+    fn facade_contract_schema_gate_detects_known_drift() {
+        let schema_by_name = built_tool_schema_map();
+
+        // Class 1: an enum-backed tool whose contract lists the wrong ops.
+        const WRONG_OPS: &[FacadeOperationContractSpec] = &[
+            op(
+                "read",
+                false,
+                true,
+                "wrong",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "wrong",
+            ),
+            op(
+                "write",
+                true,
+                true,
+                "wrong",
+                Some("wrong"),
+                error_codes::TOOL_PARAMS_INVALID,
+                "wrong",
+            ),
+        ];
+        const WRONG_ENUM_CONTRACT: &[FacadeToolContractSpec] = &[facade_contract(
+            "browser_storage",
+            "BrowserStorageOperation",
+            "wrong",
+            WRONG_OPS,
+        )];
+        let failures = facade_contract_schema_failures(WRONG_ENUM_CONTRACT, &schema_by_name);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("browser_storage")
+                && failures[0].contains("operation drift")
+                && failures[0].contains("save_state"),
+            "{failures:?}"
+        );
+
+        // Class 2: a flat tool whose contract fabricates a non-existent enum.
+        const FLAT_OPS: &[FacadeOperationContractSpec] = &[op(
+            "status",
+            false,
+            false,
+            "wrong",
+            None,
+            error_codes::TOOL_INTERNAL_ERROR,
+            "wrong",
+        )];
+        const FABRICATED_FLAT_CONTRACT: &[FacadeToolContractSpec] = &[facade_contract(
+            "health",
+            "HealthOperation",
+            "wrong",
+            FLAT_OPS,
+        )];
+        let failures = facade_contract_schema_failures(FABRICATED_FLAT_CONTRACT, &schema_by_name);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("health")
+                && failures[0].contains("NO `operation`")
+                && failures[0].contains("FLAT_FACADE_OPERATION_ENUM"),
+            "{failures:?}"
+        );
+
+        // Correctly-marked flat tool must NOT be flagged.
+        const CORRECT_FLAT_CONTRACT: &[FacadeToolContractSpec] = &[facade_contract(
+            "health",
+            FLAT_FACADE_OPERATION_ENUM,
+            "ok",
+            FLAT_OPS,
+        )];
+        assert!(facade_contract_schema_failures(CORRECT_FLAT_CONTRACT, &schema_by_name).is_empty());
     }
 
     #[test]

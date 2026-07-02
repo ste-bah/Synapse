@@ -610,9 +610,30 @@ fn parse_string_array_const_allow_empty(
     const_name: &str,
 ) -> anyhow::Result<BTreeSet<String>> {
     let marker = format!("const {const_name}: &[&str] = &[");
-    let start = source
-        .find(&marker)
-        .with_context(|| format!("{const_name} const missing"))?;
+    let Some(start) = source.find(&marker) else {
+        // Alias form `const X: &[&str] = OTHER_CONST;` — resolve the alias to the
+        // const it points at. tool_profiles.rs aliases several policy consts to
+        // PUBLIC_TOOL_NAMES; the inline-array-only parser silently broke when
+        // that landed under [skip ci], disabling this whole gate. Following the
+        // alias keeps the gate live regardless of alias vs inline authoring.
+        let alias_marker = format!("const {const_name}: &[&str] = ");
+        let alias_start = source
+            .find(&alias_marker)
+            .with_context(|| format!("{const_name} const missing"))?;
+        let after_alias = &source[alias_start + alias_marker.len()..];
+        let end = after_alias
+            .find(';')
+            .with_context(|| format!("{const_name} alias terminator missing"))?;
+        let target = after_alias[..end].trim();
+        ensure!(
+            !target.is_empty()
+                && target
+                    .chars()
+                    .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit() || ch == '_'),
+            "{const_name} alias RHS is not a const identifier: {target:?}"
+        );
+        return parse_string_array_const_allow_empty(source, target);
+    };
     let after_start = &source[start + marker.len()..];
     let end = after_start
         .find("];")
