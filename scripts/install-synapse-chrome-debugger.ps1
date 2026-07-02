@@ -526,10 +526,10 @@ $bridgeBuildId = [string]$Matches[1]
 if ($bridgeBuildId -notmatch '^[A-Za-z0-9._-]+$') {
     throw "SYNAPSE_CHROME_EXTENSION_BUILD_ID_INVALID build_id=$bridgeBuildId remediation=BRIDGE_BUILD_ID must be safe for a Windows directory name"
 }
-if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_BUILD_SHA256\s*=\s*"([^"]+)";') {
-    throw "SYNAPSE_CHROME_EXTENSION_BUILD_SHA_MISSING path=$sourceServiceWorkerPath remediation=service_worker.js must expose BRIDGE_BUILD_SHA256 for setup readback"
+if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_DECLARED_BUILD_SHA256\s*=\s*"([^"]+)";') {
+    throw "SYNAPSE_CHROME_EXTENSION_BUILD_SHA_MISSING path=$sourceServiceWorkerPath remediation=service_worker.js must expose BRIDGE_DECLARED_BUILD_SHA256 for declared build metadata; physical integrity comes from service_worker_sha256"
 }
-$bridgeBuildSha256 = [string]$Matches[1]
+$bridgeDeclaredBuildSha256 = [string]$Matches[1]
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_ROOT_UNAVAILABLE remediation=LOCALAPPDATA is required to deploy the unpacked Chrome bridge to a checkout-independent stable directory"
 }
@@ -553,7 +553,8 @@ $extensionDeploy = [pscustomobject]@{
     deployed_dir = $extensionDir
     stable_root = $stableRootFull
     build_id = $bridgeBuildId
-    build_sha256 = $bridgeBuildSha256
+    declared_build_sha256 = $bridgeDeclaredBuildSha256
+    build_sha256 = $bridgeDeclaredBuildSha256
     manifest_sha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
     service_worker_sha256 = (Get-FileHash -LiteralPath (Join-Path $extensionDir 'service_worker.js') -Algorithm SHA256).Hash
 }
@@ -1876,7 +1877,9 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
     bridge_self_reload_command = 'cdp_bridge_reload'
     bridge_build_id_expected = $bridgeBuildId
-    bridge_build_sha256_expected = $bridgeBuildSha256
+    bridge_declared_build_sha256_expected = $bridgeDeclaredBuildSha256
+    bridge_build_sha256_expected = $bridgeDeclaredBuildSha256
+    bridge_service_worker_sha256_expected = $extensionDeploy.service_worker_sha256
     bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'evaluateScript', 'initScript', 'exposeBinding', 'handleDialog', 'fileUpload', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'downloads', 'domAction', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'pageScreenshot', 'pagePdf', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'reloadSelf', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
     background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_plus_chrome.cookies_plus_chrome.downloads_plus_chrome.webNavigation_plus_chrome.webRequest_plus_chrome_tabs_captureVisibleTab_for_typed_dom_actions_storage_cookies_downloads_waits_page_screenshots_and_chrome_debugger_runtime_evaluate_init_scripts_handle_dialog_file_upload_cdp_input_hover_tap_drag_page_print_to_pdf_viewport_emulation_device_emulation_geolocation_emulation_locale_emulation_media_emulation_and_network_conditions_no_native_messaging_plus_chrome.management_external_popup_suppression'
     reconnect_driver = 'bounded_websocket_reconnect_with_chrome_alarms_mv3_wake'

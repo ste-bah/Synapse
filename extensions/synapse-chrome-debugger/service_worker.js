@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
 const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-30-window-id-v2";
-const BRIDGE_BUILD_SHA256 = "4b2998af1e4c6a12d3d5137bd7fe3955b5dd9afa0d1d4ad3d95228a39ad901d3";
+const BRIDGE_DECLARED_BUILD_SHA256 = "4b2998af1e4c6a12d3d5137bd7fe3955b5dd9afa0d1d4ad3d95228a39ad901d3";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -144,6 +144,15 @@ let popupRiskSuppressionState = {
   remaining_hazards: [],
   failures: []
 };
+let serviceWorkerIntegrityState = {
+  status: "not_checked",
+  source: chrome.runtime.getURL("service_worker.js"),
+  serviceWorkerSha256: null,
+  byteLength: null,
+  error: null,
+  checkedAtUnixMs: 0,
+  reason: "not_checked"
+};
 
 async function startBridge() {
   if (chrome.runtime.id !== EXPECTED_EXTENSION_ID) {
@@ -227,6 +236,7 @@ async function registerDaemon() {
   }
   hostId = registered.host_id;
   bridgeToken = registered.bridge_token;
+  await refreshServiceWorkerIntegrity("registerDaemon");
   await postDaemonMessage({
     type: "hello",
     transport: "direct_http",
@@ -983,13 +993,63 @@ async function handleCommand(command) {
   }
 }
 
+async function refreshServiceWorkerIntegrity(reason) {
+  const source = chrome.runtime.getURL("service_worker.js");
+  const checkedAtUnixMs = Date.now();
+  try {
+    if (!crypto?.subtle?.digest) {
+      throw new Error("crypto.subtle.digest unavailable");
+    }
+    const response = await fetch(source, { cache: "no-store" });
+    if (!response.ok) {
+      throw new Error(`fetch service_worker.js failed status=${response.status}`);
+    }
+    const bytes = await response.arrayBuffer();
+    const digest = await crypto.subtle.digest("SHA-256", bytes);
+    serviceWorkerIntegrityState = {
+      status: "ok",
+      source,
+      serviceWorkerSha256: arrayBufferToHex(digest),
+      byteLength: bytes.byteLength,
+      error: null,
+      checkedAtUnixMs,
+      reason
+    };
+  } catch (error) {
+    serviceWorkerIntegrityState = {
+      status: "error",
+      source,
+      serviceWorkerSha256: null,
+      byteLength: null,
+      error: errorMessage(error),
+      checkedAtUnixMs,
+      reason
+    };
+  }
+  return serviceWorkerIntegrityState;
+}
+
+function arrayBufferToHex(buffer) {
+  return Array.from(new Uint8Array(buffer))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 function bridgeIdentity() {
   return {
     extensionId: chrome.runtime.id,
     version: chrome.runtime.getManifest().version,
     protocolVersion: PROTOCOL_VERSION,
     buildId: BRIDGE_BUILD_ID,
-    buildSha256: BRIDGE_BUILD_SHA256,
+    buildSha256: BRIDGE_DECLARED_BUILD_SHA256,
+    declaredBuildSha256: BRIDGE_DECLARED_BUILD_SHA256,
+    serviceWorkerSha256: serviceWorkerIntegrityState.serviceWorkerSha256,
+    serviceWorkerSha256Status: serviceWorkerIntegrityState.status,
+    serviceWorkerSha256Source: serviceWorkerIntegrityState.source,
+    serviceWorkerByteLength: serviceWorkerIntegrityState.byteLength,
+    serviceWorkerSha256Error: serviceWorkerIntegrityState.error,
+    serviceWorkerSha256CheckedAtUnixMs: serviceWorkerIntegrityState.checkedAtUnixMs,
+    serviceWorkerSha256Reason: serviceWorkerIntegrityState.reason,
     debuggerApiAvailable: runtimeDebuggerApiAvailable(),
     capabilities: [...COMMAND_CAPABILITIES],
     commandCapabilities: [...COMMAND_CAPABILITIES],

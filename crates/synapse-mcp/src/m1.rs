@@ -1540,6 +1540,22 @@ pub struct CdpBridgeHostReadback {
     pub extension_build_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_build_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_declared_build_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_service_worker_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_service_worker_sha256_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_service_worker_sha256_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_service_worker_byte_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_service_worker_sha256_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_service_worker_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_service_worker_path: Option<String>,
     pub extension_capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extension_user_agent: Option<String>,
@@ -1569,6 +1585,18 @@ pub struct CdpBridgeReloadAckReadback {
     pub protocol_version: u32,
     pub build_id: String,
     pub build_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_build_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_sha256_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_sha256_source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_byte_length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_sha256_error: Option<String>,
     pub debugger_api_available: bool,
     pub capabilities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
     sync::{
         Arc, Mutex, OnceLock,
@@ -41,7 +41,7 @@ const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecg
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-30-window-id-v2";
-const EXPECTED_EXTENSION_BUILD_SHA256: &str =
+const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
     "4b2998af1e4c6a12d3d5137bd7fe3955b5dd9afa0d1d4ad3d95228a39ad901d3";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
@@ -254,22 +254,42 @@ impl ChromeDebuggerBridgeError {
     }
 
     fn stale(command_kind: &str, host_id: &str, host: &HostRecord, reason: &str) -> Self {
+        let profile_install_state = synapse_chrome_profile_install_state();
+        let expected_worker_sha256 = profile_install_state
+            .active_profile_service_worker_sha256
+            .as_deref()
+            .unwrap_or("not_available");
+        let expected_worker_path = profile_install_state
+            .active_profile_extension_path
+            .as_ref()
+            .map(|path| quote_detail_value(&path.join("service_worker.js").to_string_lossy()))
+            .unwrap_or_else(|| "<none>".to_owned());
         Self {
             code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
             detail: format!(
-                "Chrome bridge extension is stale for command {command_kind:?}; host_id={host_id} reason={reason} extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} extension_build_sha256={} capabilities={} expected_build_id={} expected_build_sha256={} required_capabilities={} remediation=run scripts\\install-synapse-chrome-debugger.ps1 to deploy the bundled bridge into the stable %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> directory, then call cdp_bridge_reload from a bridge that advertises reloadSelf; if the loaded worker predates reloadSelf, fail closed and wait for a Chrome restart/reload rather than using foreground chrome://extensions automation",
+                "Chrome bridge extension is stale for command {command_kind:?}; host_id={host_id} reason={reason} extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} extension_declared_build_sha256={} extension_service_worker_sha256={} extension_service_worker_sha256_status={} extension_service_worker_sha256_error={} expected_build_id={} expected_service_worker_sha256={} expected_service_worker_path={} capabilities={} required_capabilities={} remediation=run scripts\\install-synapse-chrome-debugger.ps1 to deploy the bundled bridge into the stable %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> directory, then call cdp_bridge_reload from a bridge that advertises reloadSelf; if the loaded worker predates reloadSelf, fail closed and wait for a Chrome restart/reload rather than using foreground chrome://extensions automation",
                 host.extension_id.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_version.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_protocol_version
                     .map(|value| value.to_string())
                     .unwrap_or_else(|| "not_seen_yet".to_owned()),
                 host.extension_build_id.as_deref().unwrap_or("not_seen_yet"),
-                host.extension_build_sha256
+                host.extension_declared_build_sha256
                     .as_deref()
                     .unwrap_or("not_seen_yet"),
-                format_capabilities(&host.extension_capabilities),
+                host.extension_service_worker_sha256
+                    .as_deref()
+                    .unwrap_or("not_seen_yet"),
+                host.extension_service_worker_sha256_status
+                    .as_deref()
+                    .unwrap_or("not_seen_yet"),
+                host.extension_service_worker_sha256_error
+                    .as_deref()
+                    .unwrap_or("none"),
                 EXPECTED_EXTENSION_BUILD_ID,
-                EXPECTED_EXTENSION_BUILD_SHA256,
+                expected_worker_sha256,
+                expected_worker_path,
+                format_capabilities(&host.extension_capabilities),
                 REQUIRED_DIRECT_HTTP_CAPABILITIES.join(",")
             ),
         }
@@ -435,6 +455,9 @@ fn synapse_chrome_self_permission_warning(rows: &[String], policy_shield_present
 #[derive(Clone, Debug)]
 struct SynapseChromeProfileInstallState {
     detail: String,
+    active_profile_extension_path: Option<PathBuf>,
+    active_profile_service_worker_sha256: Option<String>,
+    active_profile_service_worker_error: Option<String>,
 }
 
 impl SynapseChromeProfileInstallState {
@@ -443,6 +466,21 @@ impl SynapseChromeProfileInstallState {
             detail: format!(
                 "synapse_chrome_bridge_profile_installation scanned=false installed=unknown reason={reason}"
             ),
+            active_profile_extension_path: None,
+            active_profile_service_worker_sha256: None,
+            active_profile_service_worker_error: Some(reason.to_owned()),
+        }
+    }
+
+    #[cfg(test)]
+    fn test_installed() -> Self {
+        Self {
+            detail: "synapse_chrome_bridge_profile_installation scanned=true installed=true active_profile=\"Profile Test\" active_profile_installed=true active_profile_extension_path=\"C:\\synapse-test\\extension\" active_profile_service_worker_sha256=1111111111111111111111111111111111111111111111111111111111111111 active_profile_service_worker_error=none reason=test_installed".to_owned(),
+            active_profile_extension_path: Some(PathBuf::from(r"C:\synapse-test\extension")),
+            active_profile_service_worker_sha256: Some(
+                "1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
+            ),
+            active_profile_service_worker_error: None,
         }
     }
 }
@@ -462,12 +500,16 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
                 "synapse_chrome_bridge_profile_installation scanned=false installed=unknown user_data_root={} reason=user_data_root_unreadable",
                 quote_detail_value(&user_data_root.to_string_lossy())
             ),
+            active_profile_extension_path: None,
+            active_profile_service_worker_sha256: None,
+            active_profile_service_worker_error: Some("user_data_root_unreadable".to_owned()),
         };
     };
 
     let mut profile_count = 0_usize;
     let mut parse_error_count = 0_usize;
     let mut installed_profiles = BTreeSet::new();
+    let mut installed_profile_paths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for profile_dir in profile_dirs.flatten() {
         let Ok(file_type) = profile_dir.file_type() else {
             continue;
@@ -493,13 +535,22 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
                 parse_error_count += 1;
                 continue;
             };
-            if pref
+            if let Some(setting) = pref
                 .get("extensions")
                 .and_then(|value| value.get("settings"))
                 .and_then(|settings| settings.get(EXTENSION_ID))
-                .is_some()
             {
                 profile_installed = true;
+                if let Some(extension_path) = setting
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .filter(|path| !path.trim().is_empty())
+                {
+                    installed_profile_paths
+                        .entry(profile.clone())
+                        .or_default()
+                        .insert(extension_path.to_owned());
+                }
             }
         }
         if profile_installed {
@@ -517,6 +568,30 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
     let active_profile_installed = active_profile
         .as_ref()
         .map(|profile| installed_profiles.contains(profile));
+    let active_profile_extension_path = active_profile
+        .as_ref()
+        .and_then(|profile| installed_profile_paths.get(profile))
+        .and_then(|paths| {
+            paths
+                .iter()
+                .map(PathBuf::from)
+                .find(|path| path.join("service_worker.js").is_file())
+                .or_else(|| paths.iter().next().map(PathBuf::from))
+        });
+    let (active_profile_service_worker_sha256, active_profile_service_worker_error) =
+        match active_profile_extension_path.as_ref() {
+            Some(extension_path) => {
+                let worker_path = extension_path.join("service_worker.js");
+                match sha256_file_hex_lower(&worker_path) {
+                    Ok(hash) => (Some(hash), None),
+                    Err(error) => (None, Some(format!("service_worker_hash_error={error}"))),
+                }
+            }
+            None => (
+                None,
+                Some("active_profile_extension_path_missing".to_owned()),
+            ),
+        };
     let reason = if profile_count == 0 {
         "no_profile_dirs"
     } else if !installed {
@@ -542,10 +617,20 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
             .collect::<Vec<_>>()
             .join(",")
     };
+    let active_profile_extension_path_detail = active_profile_extension_path
+        .as_ref()
+        .map(|path| quote_detail_value(&path.to_string_lossy()))
+        .unwrap_or_else(|| "<none>".to_owned());
+    let active_profile_service_worker_sha256_detail = active_profile_service_worker_sha256
+        .as_deref()
+        .unwrap_or("not_available");
+    let active_profile_service_worker_error_detail = active_profile_service_worker_error
+        .as_deref()
+        .unwrap_or("none");
 
     SynapseChromeProfileInstallState {
         detail: format!(
-            "synapse_chrome_bridge_profile_installation scanned=true installed={} user_data_root={} profile_count={} installed_profile_count={} installed_profiles={} active_profile={} active_profile_installed={} parse_error_count={} reason={} cdp_bridge_reload_can_install_absent_extension=false remediation=run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> and auto-loads that stable unpacked directory in the active profile. cdp_bridge_reload can only reload an already-registered bridge host and cannot install an absent Chrome extension",
+            "synapse_chrome_bridge_profile_installation scanned=true installed={} user_data_root={} profile_count={} installed_profile_count={} installed_profiles={} active_profile={} active_profile_installed={} active_profile_extension_path={} active_profile_service_worker_sha256={} active_profile_service_worker_error={} parse_error_count={} reason={} cdp_bridge_reload_can_install_absent_extension=false remediation=run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> and auto-loads that stable unpacked directory in the active profile. cdp_bridge_reload can only reload an already-registered bridge host and cannot install an absent Chrome extension",
             installed,
             quote_detail_value(&user_data_root.to_string_lossy()),
             profile_count,
@@ -553,9 +638,15 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
             installed_profile_detail,
             active_profile_detail,
             active_profile_installed_detail,
+            active_profile_extension_path_detail,
+            active_profile_service_worker_sha256_detail,
+            active_profile_service_worker_error_detail,
             parse_error_count,
             reason
         ),
+        active_profile_extension_path,
+        active_profile_service_worker_sha256,
+        active_profile_service_worker_error,
     }
 }
 
@@ -1638,6 +1729,12 @@ fn sha256_hex_lower(bytes: &[u8]) -> String {
         let _ = write!(encoded, "{byte:02x}");
     }
     encoded
+}
+
+fn sha256_file_hex_lower(path: &Path) -> Result<String, String> {
+    std::fs::read(path)
+        .map(|bytes| sha256_hex_lower(&bytes))
+        .map_err(|error| error.to_string())
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -4072,6 +4169,18 @@ pub(crate) struct ChromeBridgeReloadCommandAck {
     pub build_id: String,
     #[serde(rename = "buildSha256")]
     pub build_sha256: String,
+    #[serde(default, rename = "declaredBuildSha256")]
+    pub declared_build_sha256: Option<String>,
+    #[serde(default, rename = "serviceWorkerSha256")]
+    pub service_worker_sha256: Option<String>,
+    #[serde(default, rename = "serviceWorkerSha256Status")]
+    pub service_worker_sha256_status: Option<String>,
+    #[serde(default, rename = "serviceWorkerSha256Source")]
+    pub service_worker_sha256_source: Option<String>,
+    #[serde(default, rename = "serviceWorkerByteLength")]
+    pub service_worker_byte_length: Option<u64>,
+    #[serde(default, rename = "serviceWorkerSha256Error")]
+    pub service_worker_sha256_error: Option<String>,
     #[serde(default, rename = "debuggerApiAvailable")]
     pub debugger_api_available: bool,
     #[serde(default)]
@@ -4090,6 +4199,14 @@ pub(crate) struct ChromeBridgeHostSnapshot {
     pub extension_protocol_version: Option<u32>,
     pub extension_build_id: Option<String>,
     pub extension_build_sha256: Option<String>,
+    pub extension_declared_build_sha256: Option<String>,
+    pub extension_service_worker_sha256: Option<String>,
+    pub extension_service_worker_sha256_status: Option<String>,
+    pub extension_service_worker_sha256_source: Option<String>,
+    pub extension_service_worker_byte_length: Option<u64>,
+    pub extension_service_worker_sha256_error: Option<String>,
+    pub expected_service_worker_sha256: Option<String>,
+    pub expected_service_worker_path: Option<String>,
     pub extension_capabilities: Vec<String>,
     pub extension_user_agent: Option<String>,
     pub extension_debugger_api_available: Option<bool>,
@@ -4234,6 +4351,12 @@ struct HostRecord {
     extension_protocol_version: Option<u32>,
     extension_build_id: Option<String>,
     extension_build_sha256: Option<String>,
+    extension_declared_build_sha256: Option<String>,
+    extension_service_worker_sha256: Option<String>,
+    extension_service_worker_sha256_status: Option<String>,
+    extension_service_worker_sha256_source: Option<String>,
+    extension_service_worker_byte_length: Option<u64>,
+    extension_service_worker_sha256_error: Option<String>,
     extension_capabilities: BTreeSet<String>,
     extension_user_agent: Option<String>,
     extension_debugger_api_available: Option<bool>,
@@ -4257,6 +4380,14 @@ struct ChromeBridgeHealthRecord {
     extension_protocol_version: Option<u32>,
     extension_build_id: Option<String>,
     extension_build_sha256: Option<String>,
+    extension_declared_build_sha256: Option<String>,
+    extension_service_worker_sha256: Option<String>,
+    extension_service_worker_sha256_status: Option<String>,
+    extension_service_worker_sha256_source: Option<String>,
+    extension_service_worker_byte_length: Option<u64>,
+    extension_service_worker_sha256_error: Option<String>,
+    expected_service_worker_sha256: Option<String>,
+    expected_service_worker_path: Option<String>,
     extension_capabilities: BTreeSet<String>,
     extension_user_agent: Option<String>,
     extension_debugger_api_available: Option<bool>,
@@ -4353,6 +4484,15 @@ fn bridge_missing_required_capabilities(capabilities: &BTreeSet<String>) -> Vec<
 }
 
 fn bridge_command_stale_reason(host: &HostRecord, kind: &str) -> Option<String> {
+    let profile_install_state = synapse_chrome_profile_install_state();
+    bridge_command_stale_reason_with_profile_state(host, kind, &profile_install_state)
+}
+
+fn bridge_command_stale_reason_with_profile_state(
+    host: &HostRecord,
+    kind: &str,
+    profile_install_state: &SynapseChromeProfileInstallState,
+) -> Option<String> {
     if host.transport.as_deref() != Some("direct_http") {
         return None;
     }
@@ -4369,13 +4509,27 @@ fn bridge_command_stale_reason(host: &HostRecord, kind: &str) -> Option<String> 
             host.extension_build_id.as_deref().unwrap_or("not_seen_yet")
         ));
     }
-    if host.extension_build_sha256.as_deref() != Some(EXPECTED_EXTENSION_BUILD_SHA256) {
-        identity_reasons.push(format!(
-            "build_sha256={} expected={EXPECTED_EXTENSION_BUILD_SHA256}",
-            host.extension_build_sha256
-                .as_deref()
-                .unwrap_or("not_seen_yet")
-        ));
+    if let Some(reason) = service_worker_integrity_stale_reason(
+        host.extension_service_worker_sha256.as_deref(),
+        host.extension_service_worker_sha256_status.as_deref(),
+        host.extension_service_worker_sha256_error.as_deref(),
+        profile_install_state
+            .active_profile_service_worker_sha256
+            .as_deref(),
+        profile_install_state
+            .active_profile_extension_path
+            .as_ref()
+            .map(|path| {
+                path.join("service_worker.js")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .as_deref(),
+        profile_install_state
+            .active_profile_service_worker_error
+            .as_deref(),
+    ) {
+        identity_reasons.push(reason);
     }
     if kind == "reloadSelf" {
         if host.extension_capabilities.contains(kind) {
@@ -4412,6 +4566,50 @@ fn bridge_command_stale_reason(host: &HostRecord, kind: &str) -> Option<String> 
     None
 }
 
+fn service_worker_integrity_stale_reason(
+    actual_sha256: Option<&str>,
+    actual_status: Option<&str>,
+    actual_error: Option<&str>,
+    expected_sha256: Option<&str>,
+    expected_worker_path: Option<&str>,
+    expected_error: Option<&str>,
+) -> Option<String> {
+    let expected_worker_path = expected_worker_path
+        .map(quote_detail_value)
+        .unwrap_or_else(|| "<none>".to_owned());
+    let actual_status = actual_status.unwrap_or("not_seen_yet");
+    let actual_error = actual_error.unwrap_or("none");
+    match (actual_sha256, expected_sha256) {
+        (Some(actual), Some(expected))
+            if actual.trim().eq_ignore_ascii_case(expected.trim()) && actual_status == "ok" =>
+        {
+            None
+        }
+        (Some(actual), Some(expected)) => Some(format!(
+            "service_worker_sha256={} expected={} service_worker_sha256_status={} service_worker_sha256_error={} expected_service_worker_path={}",
+            actual.trim().to_ascii_lowercase(),
+            expected.trim().to_ascii_lowercase(),
+            actual_status,
+            quote_detail_value(actual_error),
+            expected_worker_path
+        )),
+        (None, Some(expected)) => Some(format!(
+            "service_worker_sha256=not_seen_yet expected={} service_worker_sha256_status={} service_worker_sha256_error={} expected_service_worker_path={}",
+            expected.trim().to_ascii_lowercase(),
+            actual_status,
+            quote_detail_value(actual_error),
+            expected_worker_path
+        )),
+        (_, None) => Some(format!(
+            "service_worker_sha256_expected=not_available service_worker_sha256_status={} service_worker_sha256_error={} expected_service_worker_path={} expected_profile_error={}",
+            actual_status,
+            quote_detail_value(actual_error),
+            expected_worker_path,
+            quote_detail_value(expected_error.unwrap_or("expected_service_worker_sha256_missing"))
+        )),
+    }
+}
+
 fn bridge_identity_stale_reasons(host: &ChromeBridgeHealthRecord) -> Vec<String> {
     let mut reasons = Vec::new();
     if host.extension_id.as_deref() != Some(EXTENSION_ID) {
@@ -4426,13 +4624,15 @@ fn bridge_identity_stale_reasons(host: &ChromeBridgeHealthRecord) -> Vec<String>
             host.extension_build_id.as_deref().unwrap_or("not_seen_yet")
         ));
     }
-    if host.extension_build_sha256.as_deref() != Some(EXPECTED_EXTENSION_BUILD_SHA256) {
-        reasons.push(format!(
-            "build_sha256={} expected={EXPECTED_EXTENSION_BUILD_SHA256}",
-            host.extension_build_sha256
-                .as_deref()
-                .unwrap_or("not_seen_yet")
-        ));
+    if let Some(reason) = service_worker_integrity_stale_reason(
+        host.extension_service_worker_sha256.as_deref(),
+        host.extension_service_worker_sha256_status.as_deref(),
+        host.extension_service_worker_sha256_error.as_deref(),
+        host.expected_service_worker_sha256.as_deref(),
+        host.expected_service_worker_path.as_deref(),
+        None,
+    ) {
+        reasons.push(reason);
     }
     if host.extension_debugger_api_available != Some(true) {
         reasons.push(format!(
@@ -4450,6 +4650,15 @@ fn bridge_identity_stale_reasons(host: &ChromeBridgeHealthRecord) -> Vec<String>
 }
 
 fn host_record_to_health_record(host_id: &str, host: &HostRecord) -> ChromeBridgeHealthRecord {
+    let profile_install_state = synapse_chrome_profile_install_state();
+    host_record_to_health_record_with_profile_state(host_id, host, &profile_install_state)
+}
+
+fn host_record_to_health_record_with_profile_state(
+    host_id: &str,
+    host: &HostRecord,
+    profile_install_state: &SynapseChromeProfileInstallState,
+) -> ChromeBridgeHealthRecord {
     ChromeBridgeHealthRecord {
         host_id: host_id.to_owned(),
         origin: host.origin.clone(),
@@ -4458,6 +4667,23 @@ fn host_record_to_health_record(host_id: &str, host: &HostRecord) -> ChromeBridg
         extension_protocol_version: host.extension_protocol_version,
         extension_build_id: host.extension_build_id.clone(),
         extension_build_sha256: host.extension_build_sha256.clone(),
+        extension_declared_build_sha256: host.extension_declared_build_sha256.clone(),
+        extension_service_worker_sha256: host.extension_service_worker_sha256.clone(),
+        extension_service_worker_sha256_status: host.extension_service_worker_sha256_status.clone(),
+        extension_service_worker_sha256_source: host.extension_service_worker_sha256_source.clone(),
+        extension_service_worker_byte_length: host.extension_service_worker_byte_length,
+        extension_service_worker_sha256_error: host.extension_service_worker_sha256_error.clone(),
+        expected_service_worker_sha256: profile_install_state
+            .active_profile_service_worker_sha256
+            .clone(),
+        expected_service_worker_path: profile_install_state
+            .active_profile_extension_path
+            .as_ref()
+            .map(|path| {
+                path.join("service_worker.js")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
         extension_capabilities: host.extension_capabilities.clone(),
         extension_user_agent: host.extension_user_agent.clone(),
         extension_debugger_api_available: host.extension_debugger_api_available,
@@ -4482,6 +4708,14 @@ fn health_record_to_host_snapshot(host: &ChromeBridgeHealthRecord) -> ChromeBrid
         extension_protocol_version: host.extension_protocol_version,
         extension_build_id: host.extension_build_id.clone(),
         extension_build_sha256: host.extension_build_sha256.clone(),
+        extension_declared_build_sha256: host.extension_declared_build_sha256.clone(),
+        extension_service_worker_sha256: host.extension_service_worker_sha256.clone(),
+        extension_service_worker_sha256_status: host.extension_service_worker_sha256_status.clone(),
+        extension_service_worker_sha256_source: host.extension_service_worker_sha256_source.clone(),
+        extension_service_worker_byte_length: host.extension_service_worker_byte_length,
+        extension_service_worker_sha256_error: host.extension_service_worker_sha256_error.clone(),
+        expected_service_worker_sha256: host.expected_service_worker_sha256.clone(),
+        expected_service_worker_path: host.expected_service_worker_path.clone(),
         extension_capabilities: host.extension_capabilities.iter().cloned().collect(),
         extension_user_agent: host.extension_user_agent.clone(),
         extension_debugger_api_available: host.extension_debugger_api_available,
@@ -4529,6 +4763,12 @@ impl ChromeDebuggerBridge {
             extension_protocol_version: None,
             extension_build_id: None,
             extension_build_sha256: None,
+            extension_declared_build_sha256: None,
+            extension_service_worker_sha256: None,
+            extension_service_worker_sha256_status: None,
+            extension_service_worker_sha256_source: None,
+            extension_service_worker_byte_length: None,
+            extension_service_worker_sha256_error: None,
             extension_capabilities: BTreeSet::new(),
             extension_user_agent: None,
             extension_debugger_api_available: None,
@@ -4619,6 +4859,36 @@ impl ChromeDebuggerBridge {
                     .get("buildSha256")
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
+                host.extension_declared_build_sha256 = request
+                    .message
+                    .get("declaredBuildSha256")
+                    .and_then(Value::as_str)
+                    .or_else(|| request.message.get("buildSha256").and_then(Value::as_str))
+                    .map(ToOwned::to_owned);
+                host.extension_service_worker_sha256 = request
+                    .message
+                    .get("serviceWorkerSha256")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                host.extension_service_worker_sha256_status = request
+                    .message
+                    .get("serviceWorkerSha256Status")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                host.extension_service_worker_sha256_source = request
+                    .message
+                    .get("serviceWorkerSha256Source")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                host.extension_service_worker_byte_length = request
+                    .message
+                    .get("serviceWorkerByteLength")
+                    .and_then(Value::as_u64);
+                host.extension_service_worker_sha256_error = request
+                    .message
+                    .get("serviceWorkerSha256Error")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
                 host.extension_user_agent = request
                     .message
                     .get("userAgent")
@@ -4641,7 +4911,12 @@ impl ChromeDebuggerBridge {
                     extension_version = host.extension_version.as_deref().unwrap_or_default(),
                     extension_protocol_version = host.extension_protocol_version.unwrap_or_default(),
                     extension_build_id = host.extension_build_id.as_deref().unwrap_or_default(),
-                    extension_build_sha256 = host.extension_build_sha256.as_deref().unwrap_or_default(),
+                    extension_declared_build_sha256 = host.extension_declared_build_sha256.as_deref().unwrap_or_default(),
+                    extension_service_worker_sha256 = host.extension_service_worker_sha256.as_deref().unwrap_or_default(),
+                    extension_service_worker_sha256_status = host.extension_service_worker_sha256_status.as_deref().unwrap_or_default(),
+                    extension_service_worker_sha256_source = host.extension_service_worker_sha256_source.as_deref().unwrap_or_default(),
+                    extension_service_worker_byte_length = host.extension_service_worker_byte_length.unwrap_or_default(),
+                    extension_service_worker_sha256_error = host.extension_service_worker_sha256_error.as_deref().unwrap_or_default(),
                     debugger_api_available = host.extension_debugger_api_available.unwrap_or(true),
                     capabilities = %format_capabilities(&host.extension_capabilities),
                     popup_risk_suppression = %popup_risk_suppression,
@@ -5209,25 +5484,12 @@ pub(crate) fn health_subsystem() -> SubsystemHealth {
                 .active_host_id
                 .as_ref()
                 .and_then(|host_id| inner.hosts.get(host_id).map(|host| (host_id, host)))
-                .map(|(host_id, host)| ChromeBridgeHealthRecord {
-                    host_id: host_id.clone(),
-                    origin: host.origin.clone(),
-                    extension_id: host.extension_id.clone(),
-                    extension_version: host.extension_version.clone(),
-                    extension_protocol_version: host.extension_protocol_version,
-                    extension_build_id: host.extension_build_id.clone(),
-                    extension_build_sha256: host.extension_build_sha256.clone(),
-                    extension_capabilities: host.extension_capabilities.clone(),
-                    extension_user_agent: host.extension_user_agent.clone(),
-                    extension_debugger_api_available: host.extension_debugger_api_available,
-                    extension_popup_risk_suppression: host.extension_popup_risk_suppression.clone(),
-                    pid: host.pid,
-                    parent_window: host.parent_window.clone(),
-                    transport: host.transport.clone(),
-                    registered_unix_ms: host.registered_unix_ms,
-                    last_seen_unix_ms: host.last_seen_unix_ms,
-                    last_disconnect_detail: host.last_disconnect_detail.clone(),
-                    last_detach_reason: host.last_detach_reason.clone(),
+                .map(|(host_id, host)| {
+                    host_record_to_health_record_with_profile_state(
+                        host_id,
+                        host,
+                        &profile_install_state,
+                    )
                 });
             (
                 active_host,
@@ -5271,7 +5533,7 @@ fn chrome_bridge_health_from_snapshot(
     layout_infobar_risks: &[String],
 ) -> SubsystemHealth {
     let self_policy_shield = synapse_chrome_self_policy_shield_status();
-    let profile_install_state = SynapseChromeProfileInstallState::not_scanned("snapshot_test");
+    let profile_install_state = SynapseChromeProfileInstallState::test_installed();
     chrome_bridge_health_from_snapshot_with_self_policy(
         active_host,
         host_count,
@@ -5336,10 +5598,39 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
         .map(|value| value.to_string())
         .unwrap_or_else(|| "not_seen_yet".to_owned());
     let extension_build_id = host.extension_build_id.as_deref().unwrap_or("not_seen_yet");
-    let extension_build_sha256 = host
-        .extension_build_sha256
+    let extension_declared_build_sha256 = host
+        .extension_declared_build_sha256
         .as_deref()
         .unwrap_or("not_seen_yet");
+    let extension_service_worker_sha256 = host
+        .extension_service_worker_sha256
+        .as_deref()
+        .unwrap_or("not_seen_yet");
+    let extension_service_worker_sha256_status = host
+        .extension_service_worker_sha256_status
+        .as_deref()
+        .unwrap_or("not_seen_yet");
+    let extension_service_worker_sha256_source = host
+        .extension_service_worker_sha256_source
+        .as_deref()
+        .unwrap_or("not_seen_yet");
+    let extension_service_worker_byte_length = host
+        .extension_service_worker_byte_length
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "not_seen_yet".to_owned());
+    let extension_service_worker_sha256_error = host
+        .extension_service_worker_sha256_error
+        .as_deref()
+        .unwrap_or("none");
+    let expected_service_worker_sha256 = host
+        .expected_service_worker_sha256
+        .as_deref()
+        .unwrap_or("not_available");
+    let expected_service_worker_path = host
+        .expected_service_worker_path
+        .as_deref()
+        .map(quote_detail_value)
+        .unwrap_or_else(|| "<none>".to_owned());
     let extension_capabilities = format_capabilities(&host.extension_capabilities);
     let extension_user_agent = host.extension_user_agent.as_deref().unwrap_or("");
     let extension_debugger_api_available = host
@@ -5383,7 +5674,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     SubsystemHealth {
         status: status.to_owned(),
         detail: Some(format!(
-            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_build_sha256={} expected_extension_build_sha256={} extension_debugger_api_available={} expected_extension_debugger_api_available=true extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} {} {} {} {} {} install_guidance={}",
+            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_declared_build_sha256={} expected_extension_declared_build_sha256={} extension_service_worker_sha256={} expected_extension_service_worker_sha256={} expected_extension_service_worker_path={} extension_service_worker_sha256_status={} extension_service_worker_sha256_source={} extension_service_worker_byte_length={} extension_service_worker_sha256_error={} extension_debugger_api_available={} expected_extension_debugger_api_available=true extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} {} {} {} {} {} install_guidance={}",
             tab_control_available,
             extension_stale,
             extension_stale_reasons,
@@ -5396,8 +5687,15 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
             extension_protocol_version,
             extension_build_id,
             EXPECTED_EXTENSION_BUILD_ID,
-            extension_build_sha256,
-            EXPECTED_EXTENSION_BUILD_SHA256,
+            extension_declared_build_sha256,
+            EXPECTED_EXTENSION_DECLARED_BUILD_SHA256,
+            extension_service_worker_sha256,
+            expected_service_worker_sha256,
+            expected_service_worker_path,
+            extension_service_worker_sha256_status,
+            extension_service_worker_sha256_source,
+            extension_service_worker_byte_length,
+            extension_service_worker_sha256_error,
             extension_debugger_api_available,
             extension_capabilities,
             REQUIRED_DIRECT_HTTP_CAPABILITIES.join(","),
@@ -8344,6 +8642,92 @@ mod tests {
 
     use super::*;
 
+    const TEST_SERVICE_WORKER_SHA256: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+
+    fn test_popup_risk_suppression() -> Value {
+        json!({
+            "ok": true,
+            "status": "clear",
+            "management_available": true,
+            "hazard_count": 0,
+            "disabled_count": 0,
+            "remaining_hazard_count": 0,
+            "failure_count": 0,
+            "remaining_hazards": [],
+            "failures": []
+        })
+    }
+
+    fn test_chrome_bridge_health_record() -> ChromeBridgeHealthRecord {
+        ChromeBridgeHealthRecord {
+            host_id: "chrome-native-test".to_owned(),
+            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
+            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
+            extension_version: Some("0.1.0".to_owned()),
+            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
+            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
+            extension_build_sha256: Some(EXPECTED_EXTENSION_DECLARED_BUILD_SHA256.to_owned()),
+            extension_declared_build_sha256: Some(
+                EXPECTED_EXTENSION_DECLARED_BUILD_SHA256.to_owned(),
+            ),
+            extension_service_worker_sha256: Some(TEST_SERVICE_WORKER_SHA256.to_owned()),
+            extension_service_worker_sha256_status: Some("ok".to_owned()),
+            extension_service_worker_sha256_source: Some(format!(
+                "chrome-extension://{EXTENSION_ID}/service_worker.js"
+            )),
+            extension_service_worker_byte_length: Some(1234),
+            extension_service_worker_sha256_error: None,
+            expected_service_worker_sha256: Some(TEST_SERVICE_WORKER_SHA256.to_owned()),
+            expected_service_worker_path: Some(
+                r"C:\synapse-test\extension\service_worker.js".to_owned(),
+            ),
+            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+            extension_user_agent: Some("Chrome test".to_owned()),
+            extension_debugger_api_available: Some(true),
+            extension_popup_risk_suppression: Some(test_popup_risk_suppression()),
+            pid: 42,
+            parent_window: None,
+            transport: Some("direct_http".to_owned()),
+            registered_unix_ms: 1000,
+            last_seen_unix_ms: 2000,
+            last_disconnect_detail: None,
+            last_detach_reason: None,
+        }
+    }
+
+    fn test_host_record() -> HostRecord {
+        HostRecord {
+            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
+            extension_id: Some(EXTENSION_ID.to_owned()),
+            extension_version: None,
+            extension_protocol_version: None,
+            extension_build_id: None,
+            extension_build_sha256: None,
+            extension_declared_build_sha256: None,
+            extension_service_worker_sha256: None,
+            extension_service_worker_sha256_status: None,
+            extension_service_worker_sha256_source: None,
+            extension_service_worker_byte_length: None,
+            extension_service_worker_sha256_error: None,
+            extension_capabilities: BTreeSet::new(),
+            extension_user_agent: None,
+            extension_debugger_api_available: None,
+            extension_popup_risk_suppression: None,
+            pid: 42,
+            parent_window: None,
+            transport: Some("direct_http".to_owned()),
+            bridge_token_digest: [0; 32],
+            registered_unix_ms: 1000,
+            last_seen_unix_ms: 2000,
+            last_disconnect_detail: None,
+            last_detach_reason: None,
+        }
+    }
+
     // #1342: a downloads wait/save/move must give the daemon a response budget
     // that outlives the caller's in-extension waitTimeoutMs; list keeps default.
     #[test]
@@ -8507,6 +8891,11 @@ mod tests {
         };
         let profile_install_state = SynapseChromeProfileInstallState {
             detail: "synapse_chrome_bridge_profile_installation scanned=true installed=false profile_count=6 installed_profile_count=0 active_profile=\"Profile 5\" active_profile_installed=false reason=extension_id_absent_from_preferences_and_secure_preferences cdp_bridge_reload_can_install_absent_extension=false remediation=test".to_owned(),
+            active_profile_extension_path: None,
+            active_profile_service_worker_sha256: None,
+            active_profile_service_worker_error: Some(
+                "extension_id_absent_from_preferences_and_secure_preferences".to_owned(),
+            ),
         };
         let health = chrome_bridge_health_from_snapshot_with_self_policy(
             None,
@@ -8556,39 +8945,8 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_reports_ready_active_host() {
-        let host = ChromeBridgeHealthRecord {
-            host_id: "chrome-native-test".to_owned(),
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            extension_version: Some("0.1.0".to_owned()),
-            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
-            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
-            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
-            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-            extension_user_agent: Some("Chrome test".to_owned()),
-            extension_debugger_api_available: Some(true),
-            extension_popup_risk_suppression: Some(json!({
-                "ok": true,
-                "status": "clear",
-                "management_available": true,
-                "hazard_count": 0,
-                "disabled_count": 0,
-                "remaining_hazard_count": 0,
-                "failure_count": 0,
-                "remaining_hazards": [],
-                "failures": []
-            })),
-            pid: 42,
-            parent_window: Some("1001".to_owned()),
-            transport: Some("direct_http".to_owned()),
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let mut host = test_chrome_bridge_health_record();
+        host.parent_window = Some("1001".to_owned());
 
         let health = chrome_bridge_health_from_snapshot(Some(&host), 1, 2, 3, &[], &[], &[]);
 
@@ -8608,39 +8966,9 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_blocks_runtime_debugger_api_unavailable() {
-        let host = ChromeBridgeHealthRecord {
-            host_id: "chrome-native-test".to_owned(),
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            extension_version: Some("0.1.0".to_owned()),
-            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
-            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
-            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
-            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-            extension_user_agent: Some("Chrome test".to_owned()),
-            extension_debugger_api_available: Some(false),
-            extension_popup_risk_suppression: Some(json!({
-                "ok": true,
-                "status": "clear",
-                "management_available": true,
-                "hazard_count": 0,
-                "disabled_count": 0,
-                "remaining_hazard_count": 0,
-                "failure_count": 0,
-                "remaining_hazards": [],
-                "failures": []
-            })),
-            pid: 42,
-            parent_window: Some("1001".to_owned()),
-            transport: Some("direct_http".to_owned()),
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let mut host = test_chrome_bridge_health_record();
+        host.extension_debugger_api_available = Some(false);
+        host.parent_window = Some("1001".to_owned());
 
         let health = chrome_bridge_health_from_snapshot(Some(&host), 1, 0, 0, &[], &[], &[]);
 
@@ -8653,29 +8981,8 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_blocks_external_popup_risk_until_suppressed() {
-        let host = ChromeBridgeHealthRecord {
-            host_id: "chrome-native-test".to_owned(),
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            extension_version: Some("0.1.0".to_owned()),
-            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
-            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
-            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
-            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-            extension_user_agent: Some("Chrome test".to_owned()),
-            extension_debugger_api_available: Some(true),
-            extension_popup_risk_suppression: None,
-            pid: 42,
-            parent_window: None,
-            transport: Some("direct_http".to_owned()),
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let mut host = test_chrome_bridge_health_record();
+        host.extension_popup_risk_suppression = None;
 
         let health = chrome_bridge_health_from_snapshot(
             Some(&host),
@@ -8697,39 +9004,18 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_allows_external_popup_risk_when_bridge_management_suppressed() {
-        let host = ChromeBridgeHealthRecord {
-            host_id: "chrome-native-test".to_owned(),
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            extension_version: Some("0.1.0".to_owned()),
-            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
-            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
-            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
-            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-            extension_user_agent: Some("Chrome test".to_owned()),
-            extension_debugger_api_available: Some(true),
-            extension_popup_risk_suppression: Some(json!({
-                "ok": true,
-                "status": "suppressed",
-                "management_available": true,
-                "hazard_count": 1,
-                "disabled_count": 1,
-                "remaining_hazard_count": 0,
-                "failure_count": 0,
-                "remaining_hazards": [],
-                "failures": []
-            })),
-            pid: 42,
-            parent_window: None,
-            transport: Some("direct_http".to_owned()),
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let mut host = test_chrome_bridge_health_record();
+        host.extension_popup_risk_suppression = Some(json!({
+            "ok": true,
+            "status": "suppressed",
+            "management_available": true,
+            "hazard_count": 1,
+            "disabled_count": 1,
+            "remaining_hazard_count": 0,
+            "failure_count": 0,
+            "remaining_hazards": [],
+            "failures": []
+        }));
 
         let health = chrome_bridge_health_from_snapshot(
             Some(&host),
@@ -8753,39 +9039,7 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_allows_physical_profile_risk_when_live_management_is_clear() {
-        let host = ChromeBridgeHealthRecord {
-            host_id: "chrome-native-test".to_owned(),
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            extension_version: Some("0.1.0".to_owned()),
-            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
-            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
-            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
-            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-            extension_user_agent: Some("Chrome test".to_owned()),
-            extension_debugger_api_available: Some(true),
-            extension_popup_risk_suppression: Some(json!({
-                "ok": true,
-                "status": "clear",
-                "management_available": true,
-                "hazard_count": 0,
-                "disabled_count": 0,
-                "remaining_hazard_count": 0,
-                "failure_count": 0,
-                "remaining_hazards": [],
-                "failures": []
-            })),
-            pid: 42,
-            parent_window: None,
-            transport: Some("direct_http".to_owned()),
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let host = test_chrome_bridge_health_record();
 
         let health = chrome_bridge_health_from_snapshot(
             Some(&host),
@@ -8813,39 +9067,7 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_reports_external_layout_infobar_risk_as_warning() {
-        let host = ChromeBridgeHealthRecord {
-            host_id: "chrome-native-test".to_owned(),
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            extension_version: Some("0.1.0".to_owned()),
-            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
-            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
-            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
-            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-            extension_user_agent: Some("Chrome test".to_owned()),
-            extension_debugger_api_available: Some(true),
-            extension_popup_risk_suppression: Some(json!({
-                "ok": true,
-                "status": "clear",
-                "management_available": true,
-                "hazard_count": 0,
-                "disabled_count": 0,
-                "remaining_hazard_count": 0,
-                "failure_count": 0,
-                "remaining_hazards": [],
-                "failures": []
-            })),
-            pid: 42,
-            parent_window: None,
-            transport: Some("direct_http".to_owned()),
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let host = test_chrome_bridge_health_record();
 
         let health = chrome_bridge_health_from_snapshot(
             Some(&host),
@@ -8925,39 +9147,7 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_blocks_stale_active_self_permission() {
-        let host = ChromeBridgeHealthRecord {
-            host_id: "chrome-native-test".to_owned(),
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            extension_version: Some("0.1.0".to_owned()),
-            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
-            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
-            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
-            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-            extension_user_agent: Some("Chrome test".to_owned()),
-            extension_debugger_api_available: Some(true),
-            extension_popup_risk_suppression: Some(json!({
-                "ok": true,
-                "status": "clear",
-                "management_available": true,
-                "hazard_count": 0,
-                "disabled_count": 0,
-                "remaining_hazard_count": 0,
-                "failure_count": 0,
-                "remaining_hazards": [],
-                "failures": []
-            })),
-            pid: 42,
-            parent_window: None,
-            transport: Some("direct_http".to_owned()),
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let host = test_chrome_bridge_health_record();
 
         let self_rows = [format!(
             "profile=Default pref=Preferences extension_id={EXTENSION_ID} name=\"Synapse Chrome Bridge\" active_api=nativeMessaging manifest_api=nativeMessaging granted_hazard_api=nativeMessaging synapse_self_popup_risk=true risk_basis=active_or_manifest_hazard_without_disable_reason state=1 active_bit=true disable_reasons=[]"
@@ -8973,39 +9163,7 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_warns_on_self_granted_only_residue_without_policy_shield() {
-        let host = ChromeBridgeHealthRecord {
-            host_id: "chrome-native-test".to_owned(),
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            extension_version: Some("0.1.0".to_owned()),
-            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
-            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
-            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
-            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-            extension_user_agent: Some("Chrome test".to_owned()),
-            extension_debugger_api_available: Some(true),
-            extension_popup_risk_suppression: Some(json!({
-                "ok": true,
-                "status": "clear",
-                "management_available": true,
-                "hazard_count": 0,
-                "disabled_count": 0,
-                "remaining_hazard_count": 0,
-                "failure_count": 0,
-                "remaining_hazards": [],
-                "failures": []
-            })),
-            pid: 42,
-            parent_window: None,
-            transport: Some("direct_http".to_owned()),
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let host = test_chrome_bridge_health_record();
 
         let self_rows = [format!(
             "profile=Default pref=Secure Preferences extension_id={EXTENSION_ID} name=\"Synapse Chrome Bridge\" active_api=alarms,tabs,debugger manifest_api=alarms,tabs,debugger granted_hazard_api=nativeMessaging synapse_self_popup_risk=true risk_basis=granted_only_stale state=<absent> active_bit=<absent> disable_reasons=[]"
@@ -9015,7 +9173,7 @@ mod tests {
             detail: "synapse_chrome_self_policy_shield_present=false reason=test_missing"
                 .to_owned(),
         };
-        let profile_install_state = SynapseChromeProfileInstallState::not_scanned("test");
+        let profile_install_state = SynapseChromeProfileInstallState::test_installed();
         let health = chrome_bridge_health_from_snapshot_with_self_policy(
             Some(&host),
             1,
@@ -9039,39 +9197,7 @@ mod tests {
 
     #[test]
     fn chrome_bridge_health_warns_on_self_granted_only_residue_with_policy_shield() {
-        let host = ChromeBridgeHealthRecord {
-            host_id: "chrome-native-test".to_owned(),
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            extension_version: Some("0.1.0".to_owned()),
-            extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
-            extension_build_id: Some(EXPECTED_EXTENSION_BUILD_ID.to_owned()),
-            extension_build_sha256: Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned()),
-            extension_capabilities: REQUIRED_DIRECT_HTTP_CAPABILITIES
-                .iter()
-                .map(|capability| (*capability).to_owned())
-                .collect(),
-            extension_user_agent: Some("Chrome test".to_owned()),
-            extension_debugger_api_available: Some(true),
-            extension_popup_risk_suppression: Some(json!({
-                "ok": true,
-                "status": "clear",
-                "management_available": true,
-                "hazard_count": 0,
-                "disabled_count": 0,
-                "remaining_hazard_count": 0,
-                "failure_count": 0,
-                "remaining_hazards": [],
-                "failures": []
-            })),
-            pid: 42,
-            parent_window: None,
-            transport: Some("direct_http".to_owned()),
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let host = test_chrome_bridge_health_record();
 
         let self_rows = [format!(
             "profile=Default pref=Secure Preferences extension_id={EXTENSION_ID} name=\"Synapse Chrome Bridge\" active_api=alarms,tabs,debugger manifest_api=alarms,tabs,debugger granted_hazard_api=nativeMessaging synapse_self_popup_risk=true risk_basis=granted_only_stale state=<absent> active_bit=<absent> disable_reasons=[]"
@@ -9080,7 +9206,7 @@ mod tests {
             present: true,
             detail: "synapse_chrome_self_policy_shield_present=true reason=test_present".to_owned(),
         };
-        let profile_install_state = SynapseChromeProfileInstallState::not_scanned("test");
+        let profile_install_state = SynapseChromeProfileInstallState::test_installed();
         let health = chrome_bridge_health_from_snapshot_with_self_policy(
             Some(&host),
             1,
@@ -9103,72 +9229,108 @@ mod tests {
 
     #[test]
     fn direct_http_bridge_refuses_new_commands_without_capability_readback() {
-        let mut host = HostRecord {
-            origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
-            extension_id: Some(EXTENSION_ID.to_owned()),
-            extension_version: None,
-            extension_protocol_version: None,
-            extension_build_id: None,
-            extension_build_sha256: None,
-            extension_capabilities: BTreeSet::new(),
-            extension_user_agent: None,
-            extension_debugger_api_available: None,
-            extension_popup_risk_suppression: None,
-            pid: 42,
-            parent_window: None,
-            transport: Some("direct_http".to_owned()),
-            bridge_token_digest: [0; 32],
-            registered_unix_ms: 1000,
-            last_seen_unix_ms: 2000,
-            last_disconnect_detail: None,
-            last_detach_reason: None,
-        };
+        let profile_install_state = SynapseChromeProfileInstallState::test_installed();
+        let mut host = test_host_record();
 
-        let reason = bridge_command_stale_reason(&host, "openTab").expect("missing identity");
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "openTab",
+            &profile_install_state,
+        )
+        .expect("missing identity");
         assert!(reason.contains("build_id=not_seen_yet"));
-        assert!(reason.contains("build_sha256=not_seen_yet"));
-        let reason = bridge_command_stale_reason(&host, "reloadSelf").expect("stale reason");
+        assert!(reason.contains("service_worker_sha256=not_seen_yet"));
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "reloadSelf",
+            &profile_install_state,
+        )
+        .expect("stale reason");
         assert!(reason.contains("missing_capability=reloadSelf"));
 
         host.extension_capabilities = ["openTab", "closeTab", "targetInfo"]
             .into_iter()
             .map(str::to_owned)
             .collect();
-        let reason = bridge_command_stale_reason(&host, "targetInfoPageText")
-            .expect("missing identity still fails before capability fallback");
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "targetInfoPageText",
+            &profile_install_state,
+        )
+        .expect("missing identity still fails before capability fallback");
         assert!(reason.contains("build_id=not_seen_yet"));
-        let reason = bridge_command_stale_reason(&host, "reloadSelf").expect("missing capability");
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "reloadSelf",
+            &profile_install_state,
+        )
+        .expect("missing capability");
         assert!(reason.contains("missing_capability=reloadSelf"));
 
         host.extension_build_id = Some("old-build".to_owned());
-        host.extension_build_sha256 = Some("old-sha".to_owned());
+        host.extension_declared_build_sha256 = Some("old-sha".to_owned());
+        host.extension_service_worker_sha256 = Some("old-worker-sha".to_owned());
+        host.extension_service_worker_sha256_status = Some("ok".to_owned());
         host.extension_capabilities = REQUIRED_DIRECT_HTTP_CAPABILITIES
             .iter()
             .map(|capability| (*capability).to_owned())
             .collect();
-        let reason = bridge_command_stale_reason(&host, "openTab").expect("stale build blocked");
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "openTab",
+            &profile_install_state,
+        )
+        .expect("stale build blocked");
         assert!(reason.contains("build_id=old-build"));
-        assert!(reason.contains("build_sha256=old-sha"));
-        assert_eq!(bridge_command_stale_reason(&host, "reloadSelf"), None);
+        assert!(reason.contains("service_worker_sha256=old-worker-sha"));
+        assert_eq!(
+            bridge_command_stale_reason_with_profile_state(
+                &host,
+                "reloadSelf",
+                &profile_install_state,
+            ),
+            None
+        );
 
         host.extension_build_id = Some(EXPECTED_EXTENSION_BUILD_ID.to_owned());
-        host.extension_build_sha256 = Some(EXPECTED_EXTENSION_BUILD_SHA256.to_owned());
-        let reason = bridge_command_stale_reason(&host, "openTab")
-            .expect("missing runtime debugger API readback is unsafe");
+        host.extension_declared_build_sha256 =
+            Some(EXPECTED_EXTENSION_DECLARED_BUILD_SHA256.to_owned());
+        host.extension_service_worker_sha256 = Some(TEST_SERVICE_WORKER_SHA256.to_owned());
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "openTab",
+            &profile_install_state,
+        )
+        .expect("missing runtime debugger API readback is unsafe");
         assert!(reason.contains("debugger_api_available=not_seen_yet"));
 
         host.extension_debugger_api_available = Some(true);
-        assert_eq!(bridge_command_stale_reason(&host, "openTab"), None);
+        assert_eq!(
+            bridge_command_stale_reason_with_profile_state(
+                &host,
+                "openTab",
+                &profile_install_state,
+            ),
+            None
+        );
 
         host.extension_debugger_api_available = Some(false);
-        let reason = bridge_command_stale_reason(&host, "openTab")
-            .expect("runtime debugger API availability false is unsafe");
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "openTab",
+            &profile_install_state,
+        )
+        .expect("runtime debugger API availability false is unsafe");
         assert!(reason.contains("debugger_api_available=false"));
 
         host.extension_debugger_api_available = Some(true);
         host.extension_capabilities.clear();
-        let reason = bridge_command_stale_reason(&host, "openTab")
-            .expect("exact identity without capability readback is still unsafe");
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "openTab",
+            &profile_install_state,
+        )
+        .expect("exact identity without capability readback is still unsafe");
         assert!(reason.contains("capabilities_not_advertised"));
         assert!(reason.contains("required=alarmReconnect"));
 
@@ -9176,16 +9338,34 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        let reason = bridge_command_stale_reason(&host, "targetInfoPageText")
-            .expect("missing targetInfoPageText capability");
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "targetInfoPageText",
+            &profile_install_state,
+        )
+        .expect("missing targetInfoPageText capability");
         assert!(reason.contains("missing_capability=targetInfoPageText"));
 
         host.extension_capabilities = REQUIRED_DIRECT_HTTP_CAPABILITIES
             .iter()
             .map(|capability| (*capability).to_owned())
             .collect();
-        assert_eq!(bridge_command_stale_reason(&host, "reloadSelf"), None);
-        assert_eq!(bridge_command_stale_reason(&host, "openTab"), None);
+        assert_eq!(
+            bridge_command_stale_reason_with_profile_state(
+                &host,
+                "reloadSelf",
+                &profile_install_state,
+            ),
+            None
+        );
+        assert_eq!(
+            bridge_command_stale_reason_with_profile_state(
+                &host,
+                "openTab",
+                &profile_install_state,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -9198,6 +9378,18 @@ mod tests {
             extension_protocol_version: Some(BRIDGE_PROTOCOL_VERSION),
             extension_build_id: Some("synapse-chrome-bridge-older-but-reload-capable".to_owned()),
             extension_build_sha256: Some("old-sha".to_owned()),
+            extension_declared_build_sha256: Some("old-sha".to_owned()),
+            extension_service_worker_sha256: Some("old-worker-sha".to_owned()),
+            extension_service_worker_sha256_status: Some("ok".to_owned()),
+            extension_service_worker_sha256_source: Some(format!(
+                "chrome-extension://{EXTENSION_ID}/service_worker.js"
+            )),
+            extension_service_worker_byte_length: Some(1234),
+            extension_service_worker_sha256_error: None,
+            expected_service_worker_sha256: Some(TEST_SERVICE_WORKER_SHA256.to_owned()),
+            expected_service_worker_path: Some(
+                r"C:\synapse-test\extension\service_worker.js".to_owned(),
+            ),
             extension_capabilities: vec!["reloadSelf".to_owned()],
             extension_user_agent: Some("Chrome test".to_owned()),
             extension_debugger_api_available: Some(false),
