@@ -291,6 +291,7 @@ pub(crate) mod timeline_digest;
 mod timeline_facades;
 mod timeline_query;
 mod tool_profiles;
+pub(crate) mod url_redaction;
 mod verification;
 mod workspace_blackboard;
 

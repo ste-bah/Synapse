@@ -31,6 +31,7 @@ use super::{
     CdpTargetOwner, SessionTarget, SharedCdpTargetOwners, SharedSessionTargets, SynapseService,
     session_registry::{SharedSessionRegistry, unix_time_ms_now},
     target_claims::{self, SharedTargetClaims, TargetClaimCleanupReport},
+    url_redaction::redact_url_for_public_readback,
 };
 
 const MCP_SESSION_STORE_PREFIX: &str = "mcp/session/v1/";
@@ -878,8 +879,8 @@ impl SynapseService {
                 window_hwnd: owner.window_hwnd,
                 endpoint: owner.endpoint.clone(),
                 cdp_target_id: owner.cdp_target_id.clone(),
-                requested_url: owner.requested_url.clone(),
-                target_url: owner.target_url.clone(),
+                requested_url: redact_url_for_public_readback(&owner.requested_url),
+                target_url: redact_url_for_public_readback(&owner.target_url),
                 created_at_unix_ms: owner.created_at_unix_ms,
             })
             .collect::<Vec<_>>();
@@ -2378,8 +2379,8 @@ fn session_cdp_target_owner_readback(
         window_hwnd: owner.window_hwnd,
         endpoint: owner.endpoint,
         cdp_target_id: owner.cdp_target_id,
-        requested_url: owner.requested_url,
-        target_url: owner.target_url,
+        requested_url: redact_url_for_public_readback(&owner.requested_url),
+        target_url: redact_url_for_public_readback(&owner.target_url),
         created_at_unix_ms: owner.created_at_unix_ms,
     }
 }
@@ -2817,8 +2818,12 @@ mod tests {
             chrome_window_id: Some(1443),
             capture_window_hwnd: None,
             cdp_target_id: target_id.to_owned(),
-            requested_url: "https://example.invalid/issue1443".to_owned(),
-            target_url: "https://example.invalid/issue1443".to_owned(),
+            requested_url:
+                "https://example.invalid/issue1443?body=SYNAPSE_SECRET_1484#frag=SYNAPSE_HASH_1484"
+                    .to_owned(),
+            target_url:
+                "https://example.invalid/issue1443?body=SYNAPSE_SECRET_1484#frag=SYNAPSE_HASH_1484"
+                    .to_owned(),
             created_at_unix_ms: 1_443,
         })?;
 
@@ -2836,6 +2841,16 @@ mod tests {
         assert_eq!(report.memory_cdp_owner_count_before, 1);
         assert_eq!(report.persisted_cdp_owner_count_before, 1);
         assert_eq!(report.cdp_target_owners.len(), 1);
+        assert_eq!(
+            report.cdp_target_owners[0].requested_url,
+            "https://example.invalid/issue1443?redacted#redacted"
+        );
+        assert_eq!(
+            report.cdp_target_owners[0].target_url,
+            "https://example.invalid/issue1443?redacted#redacted"
+        );
+        assert!(!serde_json::to_string(&report.cdp_target_owners)?.contains("SYNAPSE_SECRET_1484"));
+        assert!(!serde_json::to_string(&report.cdp_target_owners)?.contains("SYNAPSE_HASH_1484"));
         assert!(!report.tab_close_attempted);
         assert!(!report.tab_close_succeeded);
         assert!(report.recovery_action.contains("rebind"));

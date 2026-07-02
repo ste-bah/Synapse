@@ -48,6 +48,9 @@ use crate::server::target_claims::{
     TargetClaimParams, TargetClaimResponse, TargetClaimStatusParams, TargetClaimStatusResponse,
     TargetClaimTargetParam, TargetReleaseParams, TargetReleaseResponse,
 };
+use crate::server::url_redaction::{
+    redact_title_for_public_url_readback, redact_url_for_public_readback,
+};
 use base64::Engine as _;
 use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
@@ -6028,7 +6031,7 @@ impl SynapseService {
                     Some(BrowserTabsMutation {
                         operation: BrowserTabsOperation::New,
                         requested_cdp_target_id: None,
-                        requested_url: Some(url),
+                        requested_url: Some(redact_url_for_public_readback(&url)),
                         previous: opened.previous,
                         current: Some(opened.current),
                         selected_tab: None,
@@ -6198,7 +6201,7 @@ impl SynapseService {
             active_tab_count,
             used_human_os_foreground_window,
             source_of_truth: "chrome.tabs.query via normal Synapse Chrome bridge".to_owned(),
-            mutation,
+            mutation: mutation.map(redact_browser_tabs_mutation_urls),
             tabs,
         })
     }
@@ -10119,6 +10122,7 @@ fn browser_tab_entry(
     window_hwnd: i64,
     tab: crate::chrome_debugger_bridge::ChromeDebuggerTabTarget,
 ) -> BrowserTabEntry {
+    let url = tab.url;
     BrowserTabEntry {
         target: TargetWire::Cdp {
             window_hwnd,
@@ -10130,14 +10134,30 @@ fn browser_tab_entry(
         chrome_window_id: tab.chrome_window_id,
         index: tab.index,
         target_type: tab.target_type,
-        url: tab.url,
-        title: tab.title,
+        title: redact_title_for_public_url_readback(&url, tab.title),
+        url: redact_url_for_public_readback(&url),
         ready_state: tab.ready_state,
         active: tab.active,
         highlighted: tab.highlighted,
         pinned: tab.pinned,
         target_attached: tab.target_attached,
     }
+}
+
+fn redact_browser_tabs_mutation_urls(mut mutation: BrowserTabsMutation) -> BrowserTabsMutation {
+    mutation.requested_url = mutation
+        .requested_url
+        .map(|url| redact_url_for_public_readback(&url));
+    mutation.selected_tab = mutation.selected_tab.map(redact_browser_tab_entry_url);
+    mutation.activated_tab = mutation.activated_tab.map(redact_browser_tab_entry_url);
+    mutation
+}
+
+fn redact_browser_tab_entry_url(mut entry: BrowserTabEntry) -> BrowserTabEntry {
+    let url = entry.url;
+    entry.title = redact_title_for_public_url_readback(&url, entry.title);
+    entry.url = redact_url_for_public_readback(&url);
+    entry
 }
 
 fn select_single_active_browser_tab(
@@ -17777,12 +17797,12 @@ mod tests {
         TargetClaimTargetParam, TargetOperation, TargetParams, TargetWire,
         attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
         background_tab_activation_foregrounded_requested_window, browser_nav_delegate_error,
-        browser_wait_for_selector_condition, cdp_activate_resolution_request_details,
-        cdp_navigation_error_code, cdp_target_info_resolution_request_details,
-        chrome_capture_visible_tab_data_url_to_bgra, chrome_page_vitals_info,
-        downscale_captured_bitmap, hidden_desktop_pip_ended_response, hidden_worker_target_miss,
-        mcp_error, ocr_cache_key, page_text_info_from_parts, perception_window_hwnd,
-        resolve_browser_tag_source, resolve_capture_target_window_context,
+        browser_tab_entry, browser_wait_for_selector_condition,
+        cdp_activate_resolution_request_details, cdp_navigation_error_code,
+        cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
+        chrome_page_vitals_info, downscale_captured_bitmap, hidden_desktop_pip_ended_response,
+        hidden_worker_target_miss, mcp_error, ocr_cache_key, page_text_info_from_parts,
+        perception_window_hwnd, resolve_browser_tag_source, resolve_capture_target_window_context,
         screenshot_downscale_scale, select_single_active_browser_tab, sha256_hex,
         target_claim_param_from_set, target_wire, template_value, unavailable_page_vitals_info,
         validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
@@ -19218,6 +19238,62 @@ mod tests {
             pinned: false,
             target_attached: false,
         }
+    }
+
+    #[test]
+    fn browser_tab_entry_redacts_url_query_and_fragment() {
+        let entry = browser_tab_entry(
+            0x1234,
+            crate::chrome_debugger_bridge::ChromeDebuggerTabTarget {
+                target_id: "chrome-tab:1484".to_owned(),
+                tab_id: 1484,
+                chrome_window_id: Some(7),
+                index: 0,
+                target_type: "page".to_owned(),
+                url: "https://example.test/path?body=SYNAPSE_SECRET_1484&token=SYNAPSE_TOKEN_1484#frag=SYNAPSE_HASH_1484".to_owned(),
+                title: "Example".to_owned(),
+                ready_state: "complete".to_owned(),
+                active: false,
+                highlighted: false,
+                pinned: false,
+                target_attached: false,
+            },
+        );
+
+        assert_eq!(entry.url, "https://example.test/path?redacted#redacted");
+        assert!(!entry.url.contains("SYNAPSE_SECRET_1484"));
+        assert!(!entry.url.contains("SYNAPSE_TOKEN_1484"));
+        assert!(!entry.url.contains("SYNAPSE_HASH_1484"));
+        assert_eq!(entry.cdp_target_id, "chrome-tab:1484");
+        assert_eq!(entry.tab_id, 1484);
+    }
+
+    #[test]
+    fn browser_tab_entry_redacts_data_url_title_payload() {
+        let entry = browser_tab_entry(
+            0x1234,
+            crate::chrome_debugger_bridge::ChromeDebuggerTabTarget {
+                target_id: "chrome-tab:1484".to_owned(),
+                tab_id: 1484,
+                chrome_window_id: Some(7),
+                index: 0,
+                target_type: "page".to_owned(),
+                url: "data:text/html,%3Ctitle%3ESYNAPSE_SECRET_1484_DATA%3C/title%3E".to_owned(),
+                title: "SYNAPSE_SECRET_1484_DATA".to_owned(),
+                ready_state: "complete".to_owned(),
+                active: false,
+                highlighted: false,
+                pinned: false,
+                target_attached: false,
+            },
+        );
+
+        assert_eq!(entry.url, "data:redacted");
+        assert_eq!(entry.title, "redacted");
+        assert!(!entry.url.contains("SYNAPSE_SECRET_1484_DATA"));
+        assert!(!entry.title.contains("SYNAPSE_SECRET_1484_DATA"));
+        assert_eq!(entry.cdp_target_id, "chrome-tab:1484");
+        assert_eq!(entry.tab_id, 1484);
     }
 
     #[test]

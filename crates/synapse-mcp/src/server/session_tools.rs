@@ -21,6 +21,7 @@ use super::{
     session_registry::{SessionRegistryRead, SpawnedAgentRead, unix_time_ms_now},
     target_claims::{self, TargetClaimRead},
     tool, tool_router,
+    url_redaction::redact_url_for_public_readback,
 };
 
 const ATTACHED_AGENT_REGISTRY_SOURCE_OF_TRUTH: &str = "session_registry spawned_agent rows + agent_state tracker rows + OS process table live-pid probe + visible top-level window enumeration";
@@ -1051,8 +1052,8 @@ fn persisted_cdp_target_owner_readback(
         chrome_window_id: row.owner.chrome_window_id,
         capture_window_hwnd: row.owner.capture_window_hwnd,
         cdp_target_id: row.owner.cdp_target_id,
-        requested_url: row.owner.requested_url,
-        target_url: row.owner.target_url,
+        requested_url: redact_url_for_public_readback(&row.owner.requested_url),
+        target_url: redact_url_for_public_readback(&row.owner.target_url),
         created_at_unix_ms: row.owner.created_at_unix_ms,
         cleanup_action: format!(
             "call session_end with session_id={} while the Chrome bridge is healthy; cdp_close_tab recovery requires an exact target_claim for this target",
@@ -2411,8 +2412,8 @@ mod tests {
                     chrome_window_id: Some(7),
                     capture_window_hwnd: Some(0x1234),
                     cdp_target_id: "chrome-tab:600751746".to_owned(),
-                    requested_url: "about:blank#issue1268".to_owned(),
-                    target_url: "about:blank#issue1268".to_owned(),
+                    requested_url: "https://example.test/issue1268?body=SYNAPSE_SECRET_1484&token=SYNAPSE_TOKEN_1484#frag=SYNAPSE_HASH_1484".to_owned(),
+                    target_url: "https://example.test/issue1268?body=SYNAPSE_SECRET_1484&token=SYNAPSE_TOKEN_1484#frag=SYNAPSE_HASH_1484".to_owned(),
                     created_at_unix_ms: 1_000,
                 },
             },
@@ -2434,6 +2435,17 @@ mod tests {
         }
         assert_eq!(readback.owner_session_id, "session-cdp");
         assert_eq!(readback.chrome_window_id, Some(7));
+        assert_eq!(
+            readback.requested_url,
+            "https://example.test/issue1268?redacted#redacted"
+        );
+        assert_eq!(
+            readback.target_url,
+            "https://example.test/issue1268?redacted#redacted"
+        );
+        assert!(!readback.requested_url.contains("SYNAPSE_SECRET_1484"));
+        assert!(!readback.target_url.contains("SYNAPSE_TOKEN_1484"));
+        assert!(!readback.target_url.contains("SYNAPSE_HASH_1484"));
         assert!(
             readback
                 .cleanup_action
