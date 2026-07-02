@@ -368,6 +368,12 @@ pub(super) async fn serve(
             result.context("join HTTP MCP transport")?
                 .context("serve HTTP MCP transport")?;
             if shutdown_cancel.is_cancelled() {
+                tracing::info!(
+                    code = "MCP_HTTP_SERVER_STOPPED",
+                    source = "http_endpoint",
+                    pid = std::process::id(),
+                    "HTTP listener task stopped after shutdown endpoint cancellation"
+                );
                 connection_closed_cancel.cancel();
                 let cleanup = cleanup_active_session_inputs_for_shutdown(
                     &runtime.session_lifecycle,
@@ -390,7 +396,7 @@ pub(super) async fn serve(
             time::sleep(DRAIN_RESPONSE_GRACE_TIMEOUT).await;
             shutdown_cancel.cancel();
             connection_closed_cancel.cancel();
-            wait_for_server_stop(&mut server_task).await?;
+            wait_for_server_stop(&mut server_task, "signal").await?;
             let cleanup = cleanup_active_session_inputs_for_shutdown(
                 &runtime.session_lifecycle,
                 &runtime.session_manager,
@@ -422,8 +428,37 @@ pub(super) async fn serve(
             "activity recorder stopped at daemon shutdown"
         );
     }
+    tracing::info!(
+        code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_START",
+        source = "http_service_completed",
+        pid = std::process::id(),
+        "writing daemon lifecycle graceful HTTP service completion"
+    );
     crate::daemon_lifecycle::record_graceful_exit("http_service_completed")
+        .map_err(|error| {
+            tracing::error!(
+                code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_FAILED",
+                source = "http_service_completed",
+                pid = std::process::id(),
+                error = %error,
+                "failed to write daemon lifecycle graceful HTTP service completion"
+            );
+            error
+        })
         .context("record daemon lifecycle graceful HTTP service completion")?;
+    tracing::info!(
+        code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_OK",
+        source = "http_service_completed",
+        pid = std::process::id(),
+        "daemon lifecycle graceful HTTP service completion written"
+    );
+    tracing::info!(
+        code = "MCP_HTTP_PROCESS_EXIT_DECISION",
+        source = "http_service_completed",
+        pid = std::process::id(),
+        exit_code = 0,
+        "HTTP daemon process returning success after graceful shutdown"
+    );
     Ok(code)
 }
 
@@ -7103,16 +7138,25 @@ async fn health(State(state): State<HttpState>) -> Json<Health> {
 
 async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     let active_sessions = state.session_manager.sessions.read().await.len();
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("<missing>");
     let drain = state.drain_state.mark_draining("http_shutdown");
+    tracing::warn!(
+        code = "MCP_HTTP_SHUTDOWN_DRAIN_STARTED",
+        pid = std::process::id(),
+        active_sessions,
+        user_agent,
+        drain = ?drain,
+        delay_ms = DRAIN_RESPONSE_GRACE_TIMEOUT.as_millis(),
+        "HTTP shutdown request accepted and daemon drain state marked before cancellation"
+    );
     let shutdown_cancel = state.shutdown_cancel.clone();
     tokio::spawn(async move {
         time::sleep(DRAIN_RESPONSE_GRACE_TIMEOUT).await;
         shutdown_cancel.cancel();
     });
-    let user_agent = headers
-        .get(axum::http::header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("<missing>");
     tracing::warn!(
         code = "MCP_HTTP_SHUTDOWN_REQUESTED",
         pid = std::process::id(),
@@ -7261,17 +7305,37 @@ fn spawn_server(
     })
 }
 
-async fn wait_for_server_stop(server_task: &mut JoinHandle<io::Result<()>>) -> anyhow::Result<()> {
-    match tokio::time::timeout(Duration::from_secs(2), &mut *server_task).await {
+async fn wait_for_server_stop(
+    server_task: &mut JoinHandle<io::Result<()>>,
+    source: &'static str,
+) -> anyhow::Result<()> {
+    let timeout = Duration::from_secs(2);
+    let started = Instant::now();
+    tracing::info!(
+        code = "MCP_HTTP_SERVER_STOP_WAIT",
+        source,
+        timeout_ms = timeout.as_millis(),
+        "waiting for HTTP listener task to stop"
+    );
+    match tokio::time::timeout(timeout, &mut *server_task).await {
         Ok(result) => {
             result
                 .context("join stopped HTTP MCP transport")?
                 .context("stop HTTP MCP transport")?;
+            tracing::info!(
+                code = "MCP_HTTP_SERVER_STOPPED",
+                source,
+                elapsed_ms = started.elapsed().as_millis(),
+                "HTTP listener task stopped"
+            );
         }
         Err(_elapsed) => {
             server_task.abort();
             tracing::warn!(
                 code = "MCP_HTTP_SHUTDOWN_TIMEOUT",
+                source,
+                timeout_ms = timeout.as_millis(),
+                elapsed_ms = started.elapsed().as_millis(),
                 "HTTP transport did not stop within shutdown timeout"
             );
         }
