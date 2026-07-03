@@ -55,7 +55,7 @@ const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
 const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
-const ACT_FACADE_SOURCE_OF_TRUTH: &str = "target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
+const ACT_FACADE_SOURCE_OF_TRUTH: &str = "act facade CF_ACTION_LOG command audit row + target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
 const TARGET_ACT_SECRET_SAFE_REDACTION_POLICY: &str = "target_act_secret_safe_v1";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
@@ -582,6 +582,10 @@ impl SynapseService {
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActResponse>, ErrorData> {
         let params = params.0;
+        let operation = params.operation;
+        let operation_name = act_operation_name(operation);
+        let actor_session_id =
+            super::context::mcp_session_id_from_request_context(&request_context)?;
         let trace_verb = params
             .action
             .as_ref()
@@ -594,94 +598,143 @@ impl SynapseService {
             verb = trace_verb,
             "tool.invocation kind=act"
         );
+        let command_payload = act_command_audit_payload(&params);
+        let command_before = act_command_audit_before(operation);
+        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "act",
+            operation_name,
+            actor_session_id.clone(),
+            None,
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
 
-        match params.operation {
-            ActOperation::Invoke => {
-                validate_act_invoke_params(&params)?;
-                let action_params = require_act_action(&params, ActOperation::Invoke)?;
-                let action = self
-                    .target_act(Parameters(action_params), request_context)
-                    .await?
-                    .0;
-                Ok(Json(ActResponse {
-                    operation: ActOperation::Invoke,
-                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                    action: Some(action),
-                    foreground: None,
-                    lease: None,
-                }))
+        let result: Result<ActResponse, ErrorData> = async {
+            match operation {
+                ActOperation::Invoke => {
+                    validate_act_invoke_params(&params)?;
+                    let action_params = require_act_action(&params, ActOperation::Invoke)?;
+                    let action = self
+                        .target_act(Parameters(action_params), request_context)
+                        .await?
+                        .0;
+                    Ok(ActResponse {
+                        operation: ActOperation::Invoke,
+                        source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                        action: Some(action),
+                        foreground: None,
+                        lease: None,
+                    })
+                }
+                ActOperation::Foreground => {
+                    validate_act_foreground_params(&params)?;
+                    let action_params = require_act_action(&params, ActOperation::Foreground)?;
+                    let reason = params.reason.clone().ok_or_else(|| {
+                        act_facade_error(
+                            ActOperation::Foreground,
+                            "act operation=foreground requires reason",
+                            "pass a non-empty reason explaining why the audited foreground lane is required",
+                            "reason",
+                        )
+                    })?;
+                    let response = self
+                        .act_foreground(
+                            Parameters(ActForegroundParams {
+                                reason,
+                                action: action_params,
+                                ttl_ms: params.ttl_ms,
+                            }),
+                            request_context,
+                        )
+                        .await?
+                        .0;
+                    Ok(ActResponse {
+                        operation: ActOperation::Foreground,
+                        source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                        action: Some(response.action),
+                        foreground: Some(response.escalation),
+                        lease: None,
+                    })
+                }
+                ActOperation::LeaseAcquire => {
+                    validate_act_lease_acquire_params(&params)?;
+                    let ttl_ms = params
+                        .ttl_ms
+                        .unwrap_or(synapse_action::DEFAULT_LEASE_TTL_MS);
+                    let lease = self
+                        .control_lease_acquire(
+                            Parameters(super::lease_tools::ControlLeaseAcquireParams { ttl_ms }),
+                            request_context,
+                        )
+                        .await?
+                        .0;
+                    Ok(ActResponse {
+                        operation: ActOperation::LeaseAcquire,
+                        source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                        action: None,
+                        foreground: None,
+                        lease: Some(lease),
+                    })
+                }
+                ActOperation::LeaseStatus => {
+                    validate_act_lease_read_params(&params, ActOperation::LeaseStatus)?;
+                    let lease = self.control_lease_status(request_context).await?.0;
+                    Ok(ActResponse {
+                        operation: ActOperation::LeaseStatus,
+                        source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                        action: None,
+                        foreground: None,
+                        lease: Some(lease),
+                    })
+                }
+                ActOperation::LeaseRelease => {
+                    validate_act_lease_read_params(&params, ActOperation::LeaseRelease)?;
+                    let lease = self.control_lease_release(request_context).await?.0;
+                    Ok(ActResponse {
+                        operation: ActOperation::LeaseRelease,
+                        source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                        action: None,
+                        foreground: None,
+                        lease: Some(lease),
+                    })
+                }
             }
-            ActOperation::Foreground => {
-                validate_act_foreground_params(&params)?;
-                let action_params = require_act_action(&params, ActOperation::Foreground)?;
-                let reason = params.reason.ok_or_else(|| {
-                    act_facade_error(
-                        ActOperation::Foreground,
-                        "act operation=foreground requires reason",
-                        "pass a non-empty reason explaining why the audited foreground lane is required",
-                        "reason",
+        }
+        .await;
+
+        match result {
+            Ok(response) => {
+                self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
+                    "act",
+                    operation_name,
+                    actor_session_id.clone(),
+                    None,
+                    command_payload,
+                    command_before,
+                    act_command_audit_success_after(&response),
+                    "ok",
+                ))?;
+                Ok(Json(response))
+            }
+            Err(error) => {
+                self.command_audit_final(
+                    super::command_audit::CommandAuditInput::mcp(
+                        "act",
+                        operation_name,
+                        actor_session_id,
+                        None,
+                        command_payload,
+                        command_before,
+                        act_command_audit_error_after(operation),
+                        "error",
                     )
-                })?;
-                let response = self
-                    .act_foreground(
-                        Parameters(ActForegroundParams {
-                            reason,
-                            action: action_params,
-                            ttl_ms: params.ttl_ms,
-                        }),
-                        request_context,
-                    )
-                    .await?
-                    .0;
-                Ok(Json(ActResponse {
-                    operation: ActOperation::Foreground,
-                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                    action: Some(response.action),
-                    foreground: Some(response.escalation),
-                    lease: None,
-                }))
-            }
-            ActOperation::LeaseAcquire => {
-                validate_act_lease_acquire_params(&params)?;
-                let ttl_ms = params
-                    .ttl_ms
-                    .unwrap_or(synapse_action::DEFAULT_LEASE_TTL_MS);
-                let lease = self
-                    .control_lease_acquire(
-                        Parameters(super::lease_tools::ControlLeaseAcquireParams { ttl_ms }),
-                        request_context,
-                    )
-                    .await?
-                    .0;
-                Ok(Json(ActResponse {
-                    operation: ActOperation::LeaseAcquire,
-                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                    action: None,
-                    foreground: None,
-                    lease: Some(lease),
-                }))
-            }
-            ActOperation::LeaseStatus => {
-                validate_act_lease_read_params(&params, ActOperation::LeaseStatus)?;
-                let lease = self.control_lease_status(request_context).await?.0;
-                Ok(Json(ActResponse {
-                    operation: ActOperation::LeaseStatus,
-                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                    action: None,
-                    foreground: None,
-                    lease: Some(lease),
-                }))
-            }
-            ActOperation::LeaseRelease => {
-                validate_act_lease_read_params(&params, ActOperation::LeaseRelease)?;
-                let lease = self.control_lease_release(request_context).await?.0;
-                Ok(Json(ActResponse {
-                    operation: ActOperation::LeaseRelease,
-                    source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
-                    action: None,
-                    foreground: None,
-                    lease: Some(lease),
-                }))
+                    .with_error(
+                        super::command_audit::command_audit_error_from_error_data(&error),
+                    ),
+                )?;
+                Err(error)
             }
         }
     }
@@ -5423,6 +5476,42 @@ fn act_operation_name(operation: ActOperation) -> &'static str {
         ActOperation::LeaseStatus => "lease_status",
         ActOperation::LeaseRelease => "lease_release",
     }
+}
+
+fn act_command_audit_payload(params: &ActParams) -> Value {
+    json!({
+        "operation": act_operation_name(params.operation),
+        "action_present": params.action.is_some(),
+        "action_verb": params.action.as_ref().map(|action| action.verb.as_str()),
+        "reason_present": params.reason.as_ref().is_some_and(|reason| !reason.trim().is_empty()),
+        "ttl_ms": params.ttl_ms,
+    })
+}
+
+fn act_command_audit_before(operation: ActOperation) -> Value {
+    json!({
+        "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
+        "operation": act_operation_name(operation),
+        "lease": synapse_action::lease::status(),
+    })
+}
+
+fn act_command_audit_success_after(response: &ActResponse) -> Value {
+    json!({
+        "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
+        "operation": act_operation_name(response.operation),
+        "lease": response.lease,
+        "action_status": response.action.as_ref().map(|action| action.status.as_str()),
+        "profile_restored": response.foreground.as_ref().map(|foreground| foreground.profile_restored),
+    })
+}
+
+fn act_command_audit_error_after(operation: ActOperation) -> Value {
+    json!({
+        "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
+        "operation": act_operation_name(operation),
+        "lease": synapse_action::lease::status(),
+    })
 }
 
 fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
