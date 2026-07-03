@@ -44,6 +44,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio::task::JoinHandle;
 
+use crate::cdp_value::{cdp_enum_str as enum_str, cdp_number_f64_or_zero};
 use crate::{A11yError, A11yResult};
 
 /// Default ring-buffer capacity (entries) per captured target. Bounded so a
@@ -668,20 +669,9 @@ fn value_to_text(value: &Value) -> String {
     }
 }
 
-/// Serializes a `#[serde(rename = ...)]` CDP enum to its protocol string.
-fn enum_str<T: Serialize>(value: &T) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default()
-}
-
 /// CDP `Timestamp` serializes as a JSON number (ms since epoch).
 fn ts_ms<T: Serialize>(value: &T) -> f64 {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|v| v.as_f64())
-        .unwrap_or(0.0)
+    cdp_number_f64_or_zero(value)
 }
 
 fn truncate(text: &str) -> String {

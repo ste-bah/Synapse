@@ -12,6 +12,7 @@ mod cdp_emulation;
 mod cdp_files;
 mod cdp_lifecycle;
 mod cdp_network;
+mod cdp_value;
 mod error;
 mod events;
 mod ids;

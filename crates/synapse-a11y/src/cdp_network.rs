@@ -36,6 +36,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::task::JoinHandle;
 
+use crate::cdp_value::{cdp_enum_str as enum_str, cdp_number_f64};
 use crate::{A11yError, A11yResult};
 
 /// Default network buffer capacity (request records) per captured target.
@@ -483,8 +484,9 @@ impl RingBuffer {
         entry.resource_type = event.r#type.as_ref().map(enum_str);
         entry.request_headers = Some(headers_value(&event.request.headers));
         entry.request_has_post_data = event.request.has_post_data;
-        entry.request_timestamp_s = Some(timestamp_s(&event.timestamp));
-        entry.request_wall_time_ms = Some(timestamp_s(&event.wall_time) * 1000.0);
+        entry.request_timestamp_s = cdp_number_f64(&event.timestamp);
+        entry.request_wall_time_ms =
+            cdp_number_f64(&event.wall_time).map(|timestamp_s| timestamp_s * 1000.0);
         entry.initiator = serde_json::to_value(&event.initiator).ok();
     }
 
@@ -495,10 +497,10 @@ impl RingBuffer {
         entry.resource_type = Some(enum_str(&event.r#type));
         entry.response = Some(response_snapshot(
             &event.response,
-            Some(timestamp_s(&event.timestamp)),
+            cdp_number_f64(&event.timestamp),
             Some(&enum_str(&event.r#type)),
         ));
-        entry.response_timestamp_s = Some(timestamp_s(&event.timestamp));
+        entry.response_timestamp_s = cdp_number_f64(&event.timestamp);
         entry.response_received = true;
         entry.loading_failed = false;
         entry.failure_error_text = None;
@@ -511,7 +513,7 @@ impl RingBuffer {
         let entry = self.entry_for_event(event.request_id.inner());
         entry.loading_finished = true;
         entry.loading_failed = false;
-        entry.finished_timestamp_s = Some(timestamp_s(&event.timestamp));
+        entry.finished_timestamp_s = cdp_number_f64(&event.timestamp);
         entry.encoded_data_length = Some(event.encoded_data_length);
     }
 
@@ -520,7 +522,7 @@ impl RingBuffer {
         entry.resource_type = Some(enum_str(&event.r#type));
         entry.loading_finished = false;
         entry.loading_failed = true;
-        entry.failed_timestamp_s = Some(timestamp_s(&event.timestamp));
+        entry.failed_timestamp_s = cdp_number_f64(&event.timestamp);
         entry.failure_error_text = Some(event.error_text.clone());
         entry.failure_canceled = event.canceled;
         entry.failure_blocked_reason = event.blocked_reason.as_ref().map(enum_str);
@@ -593,15 +595,16 @@ impl WebSocketRingBuffer {
     fn apply_handshake_request(&mut self, event: &EventWebSocketWillSendHandshakeRequest) {
         let seq = self.reserve_seq();
         let entry = self.entry_for_seq(event.request_id.inner(), seq);
-        entry.handshake_request_timestamp_s = Some(timestamp_s(&event.timestamp));
-        entry.handshake_request_wall_time_ms = Some(timestamp_s(&event.wall_time) * 1000.0);
+        entry.handshake_request_timestamp_s = cdp_number_f64(&event.timestamp);
+        entry.handshake_request_wall_time_ms =
+            cdp_number_f64(&event.wall_time).map(|timestamp_s| timestamp_s * 1000.0);
         entry.handshake_request_headers = Some(headers_value(&event.request.headers));
     }
 
     fn apply_handshake_response(&mut self, event: &EventWebSocketHandshakeResponseReceived) {
         let seq = self.reserve_seq();
         let entry = self.entry_for_seq(event.request_id.inner(), seq);
-        entry.handshake_response_timestamp_s = Some(timestamp_s(&event.timestamp));
+        entry.handshake_response_timestamp_s = cdp_number_f64(&event.timestamp);
         entry.status = Some(event.response.status);
         entry.status_text = Some(event.response.status_text.clone());
         entry.handshake_response_headers = Some(headers_value(&event.response.headers));
@@ -620,7 +623,7 @@ impl WebSocketRingBuffer {
             websocket_frame_snapshot(
                 seq,
                 "sent",
-                Some(timestamp_s(&event.timestamp)),
+                cdp_number_f64(&event.timestamp),
                 &event.response,
             ),
         );
@@ -635,7 +638,7 @@ impl WebSocketRingBuffer {
             websocket_frame_snapshot(
                 seq,
                 "received",
-                Some(timestamp_s(&event.timestamp)),
+                cdp_number_f64(&event.timestamp),
                 &event.response,
             ),
         );
@@ -650,7 +653,7 @@ impl WebSocketRingBuffer {
             CdpWebSocketFrame {
                 seq,
                 direction: "error".to_owned(),
-                timestamp_s: Some(timestamp_s(&event.timestamp)),
+                timestamp_s: cdp_number_f64(&event.timestamp),
                 opcode: None,
                 mask: None,
                 payload_data: None,
@@ -667,7 +670,7 @@ impl WebSocketRingBuffer {
         let seq = self.reserve_seq();
         let entry = self.entry_for_seq(event.request_id.inner(), seq);
         entry.closed = true;
-        entry.closed_timestamp_s = Some(timestamp_s(&event.timestamp));
+        entry.closed_timestamp_s = cdp_number_f64(&event.timestamp);
     }
 }
 
@@ -2414,10 +2417,9 @@ fn response_snapshot(
             .timing
             .as_ref()
             .and_then(|timing| serde_json::to_value(timing).ok()),
-        response_time_ms: response
-            .response_time
-            .as_ref()
-            .map(|t| timestamp_s(t) * 1000.0),
+        response_time_ms: response.response_time.as_ref().and_then(|timestamp| {
+            cdp_number_f64(timestamp).map(|timestamp_s| timestamp_s * 1000.0)
+        }),
         from_disk_cache: response.from_disk_cache,
         from_service_worker: response.from_service_worker,
         from_prefetch_cache: response.from_prefetch_cache,
@@ -2435,20 +2437,6 @@ fn now_unix_ms() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs_f64() * 1000.0)
-        .unwrap_or(0.0)
-}
-
-fn enum_str<T: Serialize>(value: &T) -> String {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .unwrap_or_default()
-}
-
-fn timestamp_s<T: Serialize>(value: &T) -> f64 {
-    serde_json::to_value(value)
-        .ok()
-        .and_then(|v| v.as_f64())
         .unwrap_or(0.0)
 }
 
