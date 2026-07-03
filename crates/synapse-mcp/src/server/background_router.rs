@@ -533,8 +533,8 @@ pub struct TargetActResponse {
     pub ok: bool,
     /// `ok`, `verify_needed`, `refused`, or `error`.
     pub status: String,
-    /// `delivered_and_verified`, `delivered_unverified`, `refused_before_delivery`,
-    /// or `failed_before_delivery`.
+    /// `delivered_and_verified`, `delivered_and_pixel_verified`,
+    /// `delivered_unverified`, `refused_before_delivery`, or `failed_before_delivery`.
     pub delivery_state: String,
     /// The background primitive this verb routed to.
     pub delegated_tool: String,
@@ -1096,7 +1096,13 @@ impl SynapseService {
                 } else {
                     None
                 };
-                let type_params = target_act_type_params(text, params.wait_timeout_ms)?;
+                let verify_target_window_hwnd =
+                    target_act_optional_session_target_window_hwnd(self, &request_context)?;
+                let type_params = target_act_type_params(
+                    text,
+                    params.wait_timeout_ms,
+                    verify_target_window_hwnd,
+                )?;
                 let response = self
                     .act_type(Parameters(type_params), request_context)
                     .await;
@@ -1286,7 +1292,7 @@ impl SynapseService {
             verb: verb.as_str().to_owned(),
             ok,
             status: status.to_owned(),
-            delivery_state: target_act_delivery_state(ok, status).to_owned(),
+            delivery_state: target_act_delivery_state_from_result(ok, status, &result).to_owned(),
             delegated_tool: delegated_tool.to_owned(),
             routing: target_act_routing_description(),
             result,
@@ -5801,6 +5807,26 @@ fn target_act_routing_description() -> String {
     "capability-preserving; delegated to the session-targeted primitive, inheriting action audit plus lane/lease/foreground guards and refusing implicit human OS foreground use before input".to_owned()
 }
 
+fn target_act_optional_session_target_window_hwnd(
+    service: &SynapseService,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<Option<i64>, ErrorData> {
+    let Some(session_id) = super::context::mcp_session_id_from_request_context(request_context)?
+    else {
+        return Ok(None);
+    };
+    let target = service.session_target(Some(&session_id))?;
+    Ok(target_act_target_window_hwnd(target.as_ref()))
+}
+
+const fn target_act_target_window_hwnd(target: Option<&SessionTarget>) -> Option<i64> {
+    match target {
+        Some(SessionTarget::Window { hwnd }) => Some(*hwnd),
+        Some(SessionTarget::Cdp { window_hwnd, .. }) => Some(*window_hwnd),
+        None => None,
+    }
+}
+
 fn target_act_result<T: Serialize>(value: &T) -> Result<Value, ErrorData> {
     serde_json::to_value(value).map_err(|error| {
         mcp_error(
@@ -6232,7 +6258,7 @@ async fn target_act_insert_or_append_text(
         }
     }
 
-    let type_params = target_act_type_params(text, params.wait_timeout_ms)?;
+    let type_params = target_act_type_params(text, params.wait_timeout_ms, None)?;
     let type_response = service
         .act_type(Parameters(type_params), request_context.clone())
         .await;
@@ -7020,11 +7046,13 @@ fn target_act_click_point_params(
 fn target_act_type_params(
     text: String,
     wait_timeout_ms: Option<u64>,
+    verify_target_window_hwnd: Option<i64>,
 ) -> Result<ActTypeParams, ErrorData> {
     let verify_timeout_ms = target_act_type_verify_timeout(wait_timeout_ms)?;
     serde_json::from_value(json!({
         "text": text,
         "verify_delta": true,
+        "verify_target_window_hwnd": verify_target_window_hwnd,
         "verify_timeout_ms": verify_timeout_ms
     }))
     .map_err(|error| {
@@ -7373,6 +7401,16 @@ fn target_act_error_result(delegated_tool: &'static str, error: ErrorData) -> Va
     })
 }
 
+fn target_act_delivery_state_from_result(ok: bool, status: &str, result: &Value) -> &'static str {
+    if ok
+        && status == TARGET_ACT_STATUS_OK
+        && target_act_result_has_visual_pixel_verification(result)
+    {
+        return "delivered_and_pixel_verified";
+    }
+    target_act_delivery_state(ok, status)
+}
+
 fn target_act_delivery_state(ok: bool, status: &str) -> &'static str {
     if ok && status == TARGET_ACT_STATUS_OK {
         return "delivered_and_verified";
@@ -7381,6 +7419,29 @@ fn target_act_delivery_state(ok: bool, status: &str) -> &'static str {
         TARGET_ACT_STATUS_VERIFY_NEEDED => "delivered_unverified",
         TARGET_ACT_STATUS_REFUSED => "refused_before_delivery",
         _ => "failed_before_delivery",
+    }
+}
+
+fn target_act_result_has_visual_pixel_verification(value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            let source_is_visual = object
+                .get("source_of_truth")
+                .and_then(Value::as_str)
+                .is_some_and(|source| source.contains("ui_or_pixels"));
+            let postcondition_is_visual = object
+                .get("postcondition")
+                .is_some_and(target_act_result_has_visual_pixel_verification);
+            source_is_visual
+                || postcondition_is_visual
+                || object
+                    .values()
+                    .any(target_act_result_has_visual_pixel_verification)
+        }
+        Value::Array(items) => items
+            .iter()
+            .any(target_act_result_has_visual_pixel_verification),
+        _ => false,
     }
 }
 
@@ -9173,18 +9234,19 @@ mod tests {
 
     #[test]
     fn target_act_type_params_constructs_act_type_request() {
-        let params = target_act_type_params("issue-1267".to_owned(), Some(750))
+        let params = target_act_type_params("issue-1267".to_owned(), Some(750), Some(0x1234))
             .expect("target_act type params should construct act_type params");
 
         assert_eq!(params.text, "issue-1267");
         assert_eq!(params.verify_timeout_ms, 750);
         assert!(params.verify_delta);
+        assert_eq!(params.verify_target_window_hwnd, Some(0x1234));
         assert!(params.into_element.is_none());
     }
 
     #[test]
     fn target_act_type_wait_timeout_is_bounded() {
-        let error = target_act_type_params("issue-1267".to_owned(), Some(30_000))
+        let error = target_act_type_params("issue-1267".to_owned(), Some(30_000), None)
             .expect_err("type wait timeout must be bounded");
 
         assert_eq!(
@@ -9382,6 +9444,19 @@ mod tests {
         assert_eq!(
             target_act_delivery_state(false, TARGET_ACT_STATUS_ERROR),
             "failed_before_delivery"
+        );
+        assert_eq!(
+            target_act_delivery_state_from_result(
+                true,
+                TARGET_ACT_STATUS_OK,
+                &json!({
+                    "postcondition": {
+                        "source_of_truth": "target_window_ui_or_pixels",
+                        "observed_delta": true,
+                    }
+                }),
+            ),
+            "delivered_and_pixel_verified"
         );
     }
 

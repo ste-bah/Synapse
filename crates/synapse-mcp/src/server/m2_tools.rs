@@ -367,6 +367,15 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
+        let visual_delta_target_window_hwnd =
+            match act_type_visual_delta_target_window(&params, browser_url_policy.as_ref()) {
+                Ok(hwnd) => hwnd,
+                Err(error) => {
+                    let result: Result<ActTypeResponse, ErrorData> = Err(error);
+                    self.audit_action_result_for_request("act_type", &result, &request_context)?;
+                    return result.map(Json);
+                }
+            };
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
         let verify_timeout_ms = params.verify_timeout_ms;
         let emitted = emitted_text(&params);
@@ -476,7 +485,7 @@ impl SynapseService {
             match self
                 .capture_act_type_text_signature(
                     160,
-                    browser_url_policy.is_none(),
+                    browser_url_policy.is_none() && visual_delta_target_window_hwnd.is_none(),
                     browser_url_policy.is_some(),
                     session_id.as_deref(),
                 )
@@ -492,11 +501,36 @@ impl SynapseService {
         } else {
             None
         };
+        let before_visual_signature =
+            if act_type_should_capture_visual_signature(&params, visual_delta_target_window_hwnd) {
+                match self
+                    .capture_action_delta_signature(
+                        160,
+                        None,
+                        false,
+                        visual_delta_target_window_hwnd,
+                    )
+                    .await
+                {
+                    Ok(signature) => Some(signature),
+                    Err(error) => {
+                        let result: Result<ActTypeResponse, ErrorData> = Err(error);
+                        self.audit_action_result_for_request(
+                            "act_type",
+                            &result,
+                            &request_context,
+                        )?;
+                        return result.map(Json);
+                    }
+                }
+            } else {
+                None
+            };
         let result = act_type_with_handle(handle, recording, params).await;
         let result = match (result, before_text_signature) {
-            (Ok(response), Some(before)) => {
-                self.verify_act_type_response(
-                    response,
+            (Ok(response), Some(before)) => match self
+                .verify_act_type_response(
+                    response.clone(),
                     before,
                     verify_timeout_ms,
                     &emitted,
@@ -504,7 +538,25 @@ impl SynapseService {
                     session_id.as_deref(),
                 )
                 .await
-            }
+            {
+                Ok(response) => Ok(response),
+                Err(error) if act_type_error_allows_visual_delta(&error) => {
+                    match before_visual_signature {
+                        Some(before_visual) => {
+                            self.verify_act_type_visual_delta_response(
+                                response,
+                                before_visual,
+                                verify_timeout_ms,
+                                visual_delta_target_window_hwnd,
+                                &error,
+                            )
+                            .await
+                        }
+                        None => Err(error),
+                    }
+                }
+                Err(error) => Err(error),
+            },
             (other, _) => other,
         };
         self.audit_action_result_for_request("act_type", &result, &request_context)?;
@@ -2270,6 +2322,10 @@ const fn click_delta_source_of_truth(target_window_hwnd: Option<i64>) -> &'stati
     }
 }
 
+fn visual_delta_text_integrity(source_of_truth: &str) -> String {
+    format!("verify_delta_visual_readback:{source_of_truth}")
+}
+
 fn acquire_tool_foreground_input_lease(
     service: &SynapseService,
     tool: &'static str,
@@ -3852,6 +3908,43 @@ impl SynapseService {
         )
     }
 
+    async fn verify_act_type_visual_delta_response(
+        &self,
+        mut response: ActTypeResponse,
+        before: ClickDeltaSignature,
+        verify_timeout_ms: u32,
+        target_window_hwnd: Option<i64>,
+        semantic_error: &ErrorData,
+    ) -> Result<ActTypeResponse, ErrorData> {
+        let after = self
+            .capture_action_delta_signature(160, None, false, target_window_hwnd)
+            .await?;
+        let source_of_truth = click_delta_source_of_truth(target_window_hwnd);
+        let postcondition = verify_captured_action_delta(
+            "act_type",
+            source_of_truth,
+            verify_timeout_ms,
+            before,
+            after,
+            None,
+            ForegroundChangePolicy::reject(),
+        )?;
+        tracing::info!(
+            code = "M2_ACT_TYPE_VISUAL_DELTA_VERIFIED",
+            tool = "act_type",
+            target_window_hwnd,
+            source_of_truth,
+            semantic_error_code = click_error_data_code(semantic_error)
+                .unwrap_or(error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE),
+            semantic_error_detail = %semantic_error.message,
+            "act_type semantic text readback could not prove the delivered input; visual target-window SoT changed after delivery"
+        );
+        response.postcondition = postcondition;
+        response.target_readback_required = false;
+        response.target_text_integrity = visual_delta_text_integrity(source_of_truth);
+        Ok(response)
+    }
+
     async fn verify_act_press_response(
         &self,
         mut response: ActPressResponse,
@@ -4015,11 +4108,19 @@ impl SynapseService {
     ) -> Result<ActPressResponse, ErrorData> {
         let expected_effect = hwnd_keyboard_expected_effect(&params)?;
         let before = self.capture_hwnd_keyboard_delta_signature(root_hwnd)?;
+        let before_visual = if params.verify_delta {
+            Some(
+                self.capture_click_delta_signature(160, Some(root_hwnd))
+                    .await?,
+            )
+        } else {
+            None
+        };
         let verify_timeout_ms = params.verify_timeout_ms;
         let mut response = act_press_postmessage_target(root_hwnd, params).await?;
         tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
         let after = self.capture_hwnd_keyboard_delta_signature(root_hwnd)?;
-        response.postcondition = verify_hwnd_keyboard_delta_signature(
+        response.postcondition = match verify_hwnd_keyboard_delta_signature(
             "act_press",
             "target_hwnd_text_or_selection",
             verify_timeout_ms,
@@ -4027,7 +4128,37 @@ impl SynapseService {
             after,
             expected_effect,
             "observed target HWND text/selection change after PostMessage keyboard delivery",
-        )?;
+        ) {
+            Ok(postcondition) => postcondition,
+            Err(error)
+                if click_error_data_code(&error) == Some(error_codes::ACTION_NO_OBSERVED_DELTA) =>
+            {
+                let Some(before_visual) = before_visual else {
+                    return Err(error);
+                };
+                tracing::info!(
+                    code = "M2_ACT_PRESS_VISUAL_DELTA_AFTER_HWND_NO_TEXT_DELTA",
+                    tool = "act_press",
+                    root_hwnd,
+                    semantic_error_code = error_codes::ACTION_NO_OBSERVED_DELTA,
+                    semantic_error_detail = %error.message,
+                    "act_press target HWND text/selection readback showed no delta; checking target-window UI/pixel SoT"
+                );
+                let after_visual = self
+                    .capture_click_delta_signature(160, Some(root_hwnd))
+                    .await?;
+                verify_captured_action_delta(
+                    "act_press",
+                    "target_window_ui_or_pixels",
+                    verify_timeout_ms,
+                    before_visual,
+                    after_visual,
+                    None,
+                    ForegroundChangePolicy::reject(),
+                )?
+            }
+            Err(error) => return Err(error),
+        };
         Ok(response)
     }
 
@@ -4600,6 +4731,51 @@ fn act_type_should_capture_text_signature(params: &ActTypeParams) -> bool {
     params.verify_delta && params.into_element.is_none()
 }
 
+fn act_type_should_capture_visual_signature(
+    params: &ActTypeParams,
+    target_window_hwnd: Option<i64>,
+) -> bool {
+    params.verify_delta && params.into_element.is_none() && target_window_hwnd.is_some()
+}
+
+fn act_type_visual_delta_target_window(
+    params: &ActTypeParams,
+    browser_url_policy: Option<&ActTypeBrowserUrlPolicy>,
+) -> Result<Option<i64>, ErrorData> {
+    let Some(hwnd) = params.verify_target_window_hwnd else {
+        return Ok(None);
+    };
+    if !params.verify_delta {
+        return Err(act_type_visual_delta_params_invalid(
+            "verify_delta",
+            "verify_target_window_hwnd requires verify_delta=true",
+            "verify_delta_required",
+        ));
+    }
+    if params.into_element.is_some() {
+        return Err(act_type_visual_delta_params_invalid(
+            "into_element",
+            "verify_target_window_hwnd applies only to foreground typing, not into_element routing",
+            "foreground_typing_required",
+        ));
+    }
+    if browser_url_policy.is_some() {
+        return Err(act_type_visual_delta_params_invalid(
+            "expected_browser_url_regex",
+            "verify_target_window_hwnd cannot replace browser URL verification; remove one postcondition",
+            "conflicting_postconditions",
+        ));
+    }
+    if hwnd <= 0 {
+        return Err(act_type_visual_delta_params_invalid(
+            "verify_target_window_hwnd",
+            "verify_target_window_hwnd must be a positive top-level HWND",
+            "invalid_hwnd",
+        ));
+    }
+    Ok(Some(hwnd))
+}
+
 fn act_type_requires_foreground_route(
     params: &ActTypeParams,
     fallback_target: Option<&ActTypeForegroundFallbackTarget>,
@@ -4709,6 +4885,33 @@ fn act_type_url_policy_params_invalid(
     ErrorData::new(
         ErrorCode(-32099),
         detail.clone(),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "tool": "act_type",
+            "field": field,
+            "reason": reason,
+            "detail": detail,
+        })),
+    )
+}
+
+fn act_type_visual_delta_params_invalid(
+    field: &'static str,
+    detail: impl Into<String>,
+    reason: &'static str,
+) -> ErrorData {
+    let detail = detail.into();
+    tracing::error!(
+        code = error_codes::TOOL_PARAMS_INVALID,
+        tool = "act_type",
+        field,
+        reason,
+        detail = %detail,
+        "act_type visual delta parameters invalid"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("act_type verify_target_window_hwnd invalid: {detail}"),
         Some(json!({
             "code": error_codes::TOOL_PARAMS_INVALID,
             "tool": "act_type",
@@ -5788,6 +5991,33 @@ fn verify_act_type_text_response(
             .unwrap_or("unknown")
     );
     Ok(response)
+}
+
+fn act_type_error_allows_visual_delta(error: &ErrorData) -> bool {
+    match click_error_data_code(error) {
+        Some(error_codes::ACTION_VERIFY_SURFACE_UNAVAILABLE) => true,
+        Some(error_codes::ACTION_NO_OBSERVED_DELTA) => {
+            act_type_no_observed_delta_has_no_text_surface(error)
+        }
+        _ => false,
+    }
+}
+
+fn act_type_no_observed_delta_has_no_text_surface(error: &ErrorData) -> bool {
+    let readback = error.data.as_ref().and_then(|data| {
+        data.pointer("/verify_delta/readback")
+            .or_else(|| data.get("readback"))
+    });
+    let Some(readback) = readback else {
+        return false;
+    };
+    let before_has_text = readback
+        .pointer("/before/has_text_readback")
+        .and_then(Value::as_bool);
+    let after_has_text = readback
+        .pointer("/after/has_text_readback")
+        .and_then(Value::as_bool);
+    before_has_text == Some(false) && after_has_text == Some(false)
 }
 
 fn act_type_text_source_of_truth(
@@ -8548,6 +8778,105 @@ mod tests {
             data.get("code").and_then(Value::as_str),
             Some(error_codes::ACTION_NO_OBSERVED_DELTA)
         );
+        assert!(act_type_error_allows_visual_delta(&error));
+    }
+
+    #[test]
+    fn act_type_visual_delta_only_reconciles_missing_text_surface() {
+        let no_surface_before =
+            act_type_text_readback_with_source(None, Some("document"), None, None);
+        let no_surface_after = no_surface_before.clone();
+        let response = act_type_response_for_verify_delta();
+
+        let no_surface_error = verify_act_type_text_response(
+            response.clone(),
+            no_surface_before,
+            no_surface_after,
+            "before-no-surface".to_owned(),
+            "after-no-surface".to_owned(),
+            250,
+            "issue1368",
+        )
+        .expect_err("missing text surface should not be semantically verified");
+        assert!(
+            act_type_error_allows_visual_delta(&no_surface_error),
+            "missing semantic surface can be reconciled by a separate visual SoT"
+        );
+
+        let unchanged_text_before = act_type_text_readback_with_source(
+            None,
+            Some("document"),
+            Some("unchanged"),
+            Some(ACT_TYPE_TEXT_SOURCE_UIA_VALUE),
+        );
+        let unchanged_text_after = unchanged_text_before.clone();
+        let unchanged_text_error = verify_act_type_text_response(
+            response,
+            unchanged_text_before,
+            unchanged_text_after,
+            "before-text".to_owned(),
+            "after-text".to_owned(),
+            250,
+            "issue1368",
+        )
+        .expect_err("unchanged real text surface should remain fail-closed");
+        assert!(
+            !act_type_error_allows_visual_delta(&unchanged_text_error),
+            "visual delta must not cover up a real semantic text no-op"
+        );
+    }
+
+    #[test]
+    fn act_type_visual_delta_target_window_params_fail_closed() {
+        let mut params = act_type_params(false, None);
+        params.verify_target_window_hwnd = Some(0x1234);
+        let error = act_type_visual_delta_target_window(&params, None)
+            .expect_err("target HWND visual verification requires verify_delta");
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("reason"))
+                .and_then(Value::as_str),
+            Some("verify_delta_required")
+        );
+
+        let mut params = act_type_params(true, Some("^https://example\\.test/$"));
+        params.verify_target_window_hwnd = Some(0x1234);
+        let policy = act_type_browser_url_policy(&params)
+            .expect("valid URL policy should compile before conflict check");
+        let error = act_type_visual_delta_target_window(&params, policy.as_ref())
+            .expect_err("visual target HWND cannot replace URL verification");
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("reason"))
+                .and_then(Value::as_str),
+            Some("conflicting_postconditions")
+        );
+    }
+
+    #[test]
+    fn act_type_visual_delta_postcondition_uses_target_window_pixels() {
+        let before = click_signature(100, 10, "egui-test.exe", "Synthetic Editor", 1);
+        let after = click_signature(100, 10, "egui-test.exe", "Synthetic Editor", 2);
+        let postcondition = verify_captured_action_delta(
+            "act_type",
+            "target_window_ui_or_pixels",
+            250,
+            before,
+            after,
+            None,
+            ForegroundChangePolicy::reject(),
+        )
+        .expect("target-window visual delta should verify");
+
+        assert_eq!(
+            postcondition.source_of_truth.as_deref(),
+            Some("target_window_ui_or_pixels")
+        );
+        assert_eq!(postcondition.observed_delta, Some(true));
     }
 
     #[test]

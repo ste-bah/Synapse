@@ -76,6 +76,12 @@ pub struct ActTypeParams {
     #[serde(default)]
     #[schemars(
         default,
+        description = "Optional top-level HWND that foreground act_type visual verification must use as its physical Source of Truth when semantic text readback is unavailable. Requires verify_delta=true and no into_element or expected_browser_url_regex."
+    )]
+    pub verify_target_window_hwnd: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        default,
         description = "When set with verify_delta=true, verify the after-read browser target URL against this regex. Intended for navigation where focus may move from an address field to the document; Synapse uses the session browser target readback (Chrome bridge chrome.tabs or raw CDP) and fails closed before input when no URL SoT is available."
     )]
     pub expected_browser_url_regex: Option<String>,
@@ -1318,6 +1324,7 @@ mod tests {
             press_enter_after: false,
             backend: default_type_backend(),
             verify_delta: false,
+            verify_target_window_hwnd: None,
             expected_browser_url_regex: None,
             verify_timeout_ms: default_verify_timeout_ms(),
             auto_wait: false,
@@ -1420,6 +1427,7 @@ mod tests {
             press_enter_after: false,
             backend: TypeBackend::Software,
             verify_delta: false,
+            verify_target_window_hwnd: None,
             expected_browser_url_regex: None,
             verify_timeout_ms: default_verify_timeout_ms(),
             auto_wait: false,
@@ -1462,6 +1470,7 @@ mod tests {
             press_enter_after: false,
             backend: TypeBackend::Software,
             verify_delta: true,
+            verify_target_window_hwnd: None,
             expected_browser_url_regex: None,
             verify_timeout_ms: default_verify_timeout_ms(),
             auto_wait: false,
@@ -1494,6 +1503,7 @@ mod tests {
             press_enter_after: false,
             backend: TypeBackend::Software,
             verify_delta: false,
+            verify_target_window_hwnd: None,
             expected_browser_url_regex: None,
             verify_timeout_ms: default_verify_timeout_ms(),
             auto_wait: false,
@@ -1530,6 +1540,7 @@ mod tests {
             press_enter_after: false,
             backend: default_type_backend(),
             verify_delta: true,
+            verify_target_window_hwnd: None,
             expected_browser_url_regex: None,
             verify_timeout_ms: 1,
             auto_wait: false,
@@ -1558,6 +1569,7 @@ mod tests {
             press_enter_after: false,
             backend: TypeBackend::Software,
             verify_delta: false,
+            verify_target_window_hwnd: None,
             expected_browser_url_regex: None,
             verify_timeout_ms: default_verify_timeout_ms(),
             auto_wait: false,
