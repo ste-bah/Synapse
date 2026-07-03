@@ -148,7 +148,7 @@ args: { "operation": "status", "status": { "job_id": "<returned job id>" } }
 
 Historical source: `git show 8ca2667a^:crates/synapse-mcp/src/server/tool_profiles.rs` `NORMAL_ALLOWED_EXACT`, plus the historical `NORMAL_ALLOWED_PREFIXES` expansion for `agent_template_*` and `task_*`.
 
-The audit in `docs2/SYNAPSE_LOG_AND_TOOL_SURFACE_AUDIT.md` saw 152 live visible tools. The historical exact-plus-prefix inventory below contains 153 names because prefix expansion records every dynamic route that the profile allowed. Every name below is either routed to a current facade, an explicit advanced profile route, or removed from the normal public surface.
+The historical audit saw 152 live visible tools. The historical exact-plus-prefix inventory below contains 153 names because prefix expansion records every dynamic route that the profile allowed. Every name below is either routed to a current facade, an explicit advanced profile route, or removed from the normal public surface.
 
 | Old public name(s) | Current route | Status |
 | --- | --- | --- |

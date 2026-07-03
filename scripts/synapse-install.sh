@@ -183,7 +183,7 @@ SRC_WIN="$WIN_USERPROFILE\\synapse-src"
 say "Syncing source -> $SRC_WIN"
 mkdir -p "$SRC_WSL"
 rsync -a --delete \
-  --exclude='/target' --exclude='/.git' --exclude='/docs2' \
+  --exclude='/target' --exclude='/.git' \
   --exclude='/.playwright-mcp' --exclude='*.log' \
   "$REPO_ROOT/" "$SRC_WSL/"
 [ -f "$SRC_WSL/Cargo.toml" ] || die "Source sync failed: $SRC_WSL/Cargo.toml missing."

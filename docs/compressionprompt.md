@@ -555,14 +555,14 @@ with prose narrative stripped, and questions/answers themselves edited per §4.9
 **Compression ratio.** ~2.1x.
 **Round-trip.** Model regenerates the original prose narratives correctly from the bare pairs because narrative is exactly what models reconstruct well.
 
-### 8.4 — A real-world test: try this on `hardeningprompt.md`
+### 8.4 — A real-world test: try this on a large doctrine prompt
 
-`docs2/hardeningprompt.md` (this repo) is ~14 axes × ~1000 lines of prose. Apply the procedure:
+Choose a large doctrine prompt with repeated axis/policy prose. Apply the procedure:
 
 1. **Load-bearing set.** RFC 2119 keywords, axis names, primitive lists, deny-list paths, threshold numbers.
 2. **Likely cuts.** Per-axis "why this matters" preambles, repeated "in this section we will..." framings, parallel restatements between universal and project-specific sections.
 3. **Likely structural improvements.** Per-axis: replace the prose intro with a 4-row table — `Goal | Primitives | Threat-model template | Per-PR checklist`. Reserve prose for the case studies and worked examples.
-4. **Reference compression.** Each axis cross-references the doctrine (`docs2/AICodingAgentSuperPrompt.md`) for the universal rule and only keeps the project-specific delta locally.
+4. **Reference compression.** Each axis cross-references the canonical operator doctrine for the universal rule and only keeps the project-specific delta locally.
 5. **Expected reduction.** 40–60% by token count, with no behavioural loss (verify by §5.5 round-trip on a sample of three axes before applying to all 14).
 
 ---
