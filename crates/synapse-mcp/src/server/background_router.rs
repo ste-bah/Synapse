@@ -217,6 +217,8 @@ pub struct TargetActParams {
     #[serde(default, alias = "positionY", alias = "offset_y", alias = "offsetY")]
     pub position_y: Option<i32>,
     /// `click` / `dblclick`: Playwright-style element-relative position.
+    /// With `coordinate_space` and no top-level `x`/`y`, this is accepted as the
+    /// coordinate pair for target-owned coordinate clicks.
     #[serde(default)]
     pub position: Option<TargetActClickPosition>,
     /// `click` / `type`: coordinate X for target-owned coordinate fallback.
@@ -3556,11 +3558,13 @@ async fn target_act_coordinate_click(
             "target_act coordinate click requires both x and y",
         )
     })?;
-    if target_act_click_position(params)?.is_some() {
+    if !target_act_coordinate_uses_nested_position(params)
+        && target_act_click_position(params)?.is_some()
+    {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
-                "target_act verb={action} position is for element-relative browser DOM clicks; coordinate clicks already use x/y"
+                "target_act verb={action} position is for element-relative browser DOM clicks; coordinate clicks already use x/y unless coordinate_space is set and x/y are omitted"
             ),
         ));
     }
@@ -5163,28 +5167,48 @@ async fn target_act_scroll(
 fn target_act_coordinate(
     params: &TargetActParams,
 ) -> Result<Option<TargetActCoordinate>, ErrorData> {
-    match (params.x, params.y) {
-        (Some(x), Some(y)) => Ok(Some(TargetActCoordinate {
+    let top_level = match (params.x, params.y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        _ => Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act coordinate fallback requires both x and y; one coordinate was missing",
+        ))?,
+    };
+    let nested_position = params
+        .coordinate_space
+        .zip(params.position)
+        .map(|(space, position)| (position.x, position.y, space));
+    match (top_level, nested_position) {
+        (Some(_), Some(_)) => Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act coordinate input is ambiguous: use either x/y or position with coordinate_space, not both",
+        )),
+        (Some((x, y)), None) => Ok(Some(TargetActCoordinate {
             x,
             y,
             space: params
                 .coordinate_space
                 .unwrap_or(TargetActCoordinateSpace::Screen),
         })),
+        (None, Some((x, y, space))) => Ok(Some(TargetActCoordinate { x, y, space })),
         (None, None) => {
             if params.coordinate_space.is_some() {
                 return Err(mcp_error(
                     error_codes::TOOL_PARAMS_INVALID,
-                    "target_act coordinate_space requires both x and y",
+                    "target_act coordinate_space requires x/y or nested position {x,y}",
                 ));
             }
             Ok(None)
         }
-        _ => Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            "target_act coordinate fallback requires both x and y; one coordinate was missing",
-        )),
     }
+}
+
+fn target_act_coordinate_uses_nested_position(params: &TargetActParams) -> bool {
+    params.coordinate_space.is_some()
+        && params.position.is_some()
+        && params.x.is_none()
+        && params.y.is_none()
 }
 
 fn target_act_is_click_like_dom_action(action: &str) -> bool {
@@ -8515,6 +8539,53 @@ mod tests {
 
         assert_eq!(coordinate.space, TargetActCoordinateSpace::Screen);
         assert_eq!(coordinate.space.as_bridge_str(), "screen");
+    }
+
+    #[test]
+    fn target_act_coordinate_space_accepts_nested_position() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "click",
+            "coordinate_space": "window",
+            "position": {
+                "x": 42,
+                "y": 77
+            }
+        }))
+        .expect("nested coordinate position params should deserialize");
+        let coordinate = target_act_coordinate(&params)
+            .expect("nested coordinate position should validate")
+            .expect("coordinate should be present");
+
+        assert_eq!(coordinate.x, 42);
+        assert_eq!(coordinate.y, 77);
+        assert_eq!(coordinate.space, TargetActCoordinateSpace::Window);
+        assert!(target_act_coordinate_uses_nested_position(&params));
+        assert_eq!(
+            target_act_click_position(&params).expect("DOM click position remains readable"),
+            Some((42, 77))
+        );
+    }
+
+    #[test]
+    fn target_act_coordinate_space_rejects_ambiguous_position_sources() {
+        let params: TargetActParams = serde_json::from_value(json!({
+            "verb": "click",
+            "coordinate_space": "window",
+            "x": 42,
+            "y": 77,
+            "position": {
+                "x": 42,
+                "y": 77
+            }
+        }))
+        .expect("ambiguous coordinate params should deserialize");
+        let error = target_act_coordinate(&params)
+            .expect_err("mixed x/y and nested position must fail closed");
+
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
     }
 
     #[test]
