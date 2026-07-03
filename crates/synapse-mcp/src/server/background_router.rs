@@ -57,6 +57,7 @@ const TARGET_ACT_STATUS_ERROR: &str = "error";
 const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
 const ACT_FACADE_SOURCE_OF_TRUTH: &str = "act facade CF_ACTION_LOG command audit row + target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
 const TARGET_ACT_SECRET_SAFE_REDACTION_POLICY: &str = "target_act_secret_safe_v1";
+const TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION: &str = "call act operation=foreground with the same action payload and a non-empty reason; the facade acquires the foreground input lease, temporarily sets break_glass, runs target_act, restores the prior profile, and releases the lease";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -7299,7 +7300,7 @@ fn target_act_foreground_lost_error(
     let remediation = if holds_lease {
         "this session holds the foreground input lease but could not re-assert the target's foreground (the human or another window is actively holding it); retry, or wait for the human to release foreground"
     } else {
-        "acquire the foreground input lease (control_lease_acquire) so target_act can re-assert the claimed target's foreground automatically, or call verb=focus_window immediately before the click"
+        TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION
     };
     let message = format!(
         "target_act native/window coordinate click: the target 0x{target_root:x} is not the OS foreground at click time; foreground moved to root=0x{foreground_root:x} process={} title={:?}. {remediation}.{}",
@@ -7323,6 +7324,10 @@ fn target_act_foreground_lost_error(
             "foreground_title": foreground.window_title,
             "session_holds_foreground_lease": holds_lease,
             "self_heal_attempted": holds_lease,
+            "recommended_public_tool": "act",
+            "recommended_public_operation": "foreground",
+            "recommended_public_route": TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION,
+            "hidden_routes_not_required": ["control_lease_acquire", "act_focus_window", "target_act verb=focus_window"],
         })),
     )
 }
@@ -7417,6 +7422,28 @@ mod tests {
             .as_ref()
             .and_then(|data| data.get(field))
             .and_then(Value::as_u64)
+    }
+
+    fn synthetic_foreground_context() -> synapse_core::ForegroundContext {
+        synapse_core::ForegroundContext {
+            hwnd: 0x2000,
+            pid: 42,
+            process_name: "synthetic-editor.exe".to_owned(),
+            process_path: "C:\\synthetic\\synthetic-editor.exe".to_owned(),
+            window_title: "Synthetic Editor".to_owned(),
+            window_bounds: Rect {
+                x: 0,
+                y: 0,
+                w: 800,
+                h: 600,
+            },
+            monitor_index: 0,
+            dpi_scale: 1.0,
+            profile_id: None,
+            steam_appid: None,
+            is_fullscreen: false,
+            is_dwm_composed: true,
+        }
     }
 
     fn sanitized_tool_input_schema(tool_name: &str) -> Value {
@@ -9305,6 +9332,30 @@ mod tests {
             let error = mcp_error(code, "synthetic delegated refusal");
             assert_eq!(target_act_error_status(&error), TARGET_ACT_STATUS_REFUSED);
         }
+    }
+
+    #[test]
+    fn target_act_foreground_lost_guidance_uses_public_act_facade() {
+        let foreground = synthetic_foreground_context();
+        let error = target_act_foreground_lost_error(0x1000, 0x2000, &foreground, false, None);
+        let message = error.message.to_string();
+
+        assert!(message.contains("act operation=foreground"));
+        assert!(message.contains("same action payload"));
+        assert!(!message.contains("control_lease_acquire"));
+        assert!(!message.contains("verb=focus_window immediately"));
+        assert_eq!(
+            act_error_field(&error, "recommended_public_tool").as_deref(),
+            Some("act")
+        );
+        assert_eq!(
+            act_error_field(&error, "recommended_public_operation").as_deref(),
+            Some("foreground")
+        );
+        assert_eq!(
+            act_error_field(&error, "recommended_public_route").as_deref(),
+            Some(TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION)
+        );
     }
 
     #[test]
