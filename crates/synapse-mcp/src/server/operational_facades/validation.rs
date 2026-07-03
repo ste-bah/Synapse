@@ -7,7 +7,8 @@ use crate::server::ErrorData;
 use super::{
     HYGIENE_TOOL, MODEL_TOOL, SETUP_TOOL, STORAGE_TOOL,
     types::{
-        HygieneParams, ModelParams, SetupParams, StorageParams, TelemetryOperation, TelemetryParams,
+        HygieneParams, ModelParams, SetupOperation, SetupParams, StorageParams, TelemetryOperation,
+        TelemetryParams,
     },
 };
 pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), ErrorData> {
@@ -52,6 +53,15 @@ pub(super) fn validate_hygiene_params(params: &HygieneParams) -> Result<(), Erro
 }
 
 pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorData> {
+    match params.operation {
+        SetupOperation::Status if params.doctor.is_none() && params.repair.is_none() => {
+            return Ok(());
+        }
+        SetupOperation::Doctor if params.status.is_none() && params.repair.is_none() => {
+            return Ok(());
+        }
+        _ => {}
+    }
     validate_exact_spec(
         SETUP_TOOL,
         params.operation.as_str(),
@@ -108,7 +118,8 @@ mod tests {
 
     use super::*;
     use crate::server::operational_facades::types::{
-        StorageOperation, TelemetryOperation, TelemetryStatusParams,
+        SetupParams, SetupRepairParams, SetupStatusParams, StorageOperation, TelemetryOperation,
+        TelemetryStatusParams,
     };
 
     #[test]
@@ -154,5 +165,63 @@ mod tests {
             status: Some(TelemetryStatusParams::default()),
         };
         validate_telemetry_params(&ok).expect("status payload accepted");
+    }
+
+    #[test]
+    fn setup_status_and_doctor_accept_operation_only() {
+        let status = SetupParams {
+            operation: SetupOperation::Status,
+            status: None,
+            doctor: None,
+            repair: None,
+        };
+        validate_setup_params(&status).expect("setup status has no required fields");
+
+        let doctor = SetupParams {
+            operation: SetupOperation::Doctor,
+            status: None,
+            doctor: None,
+            repair: None,
+        };
+        validate_setup_params(&doctor).expect("setup doctor has no required fields");
+
+        let explicit_status = SetupParams {
+            operation: SetupOperation::Status,
+            status: Some(SetupStatusParams::default()),
+            doctor: None,
+            repair: None,
+        };
+        validate_setup_params(&explicit_status).expect("explicit empty status payload accepted");
+    }
+
+    #[test]
+    fn setup_payloadless_status_keeps_mismatches_fail_closed() {
+        let mismatched_extra = SetupParams {
+            operation: SetupOperation::Status,
+            status: None,
+            doctor: Some(SetupStatusParams::default()),
+            repair: None,
+        };
+        validate_setup_params(&mismatched_extra)
+            .expect_err("mismatched setup payload still rejected");
+
+        let repair_missing_payload = SetupParams {
+            operation: SetupOperation::Repair,
+            status: None,
+            doctor: None,
+            repair: None,
+        };
+        validate_setup_params(&repair_missing_payload)
+            .expect_err("setup repair still requires its payload");
+
+        let repair_ok = SetupParams {
+            operation: SetupOperation::Repair,
+            status: None,
+            doctor: None,
+            repair: Some(SetupRepairParams {
+                reason: "issue1493 regression".to_owned(),
+            }),
+        };
+        validate_setup_params(&repair_ok).expect("setup repair payload still accepted");
     }
 }
