@@ -1209,6 +1209,7 @@ mod tests {
             use_invoke_pattern: false,
             coordinate_fallback_on_unsupported: default_coordinate_fallback_on_unsupported(),
             verify_delta: false,
+            verify_target_window_hwnd: None,
             verify_timeout_ms: default_verify_timeout_ms(),
             auto_wait: false,
             auto_wait_timeout_ms: crate::m2::default_auto_wait_timeout_ms(),

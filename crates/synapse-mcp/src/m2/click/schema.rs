@@ -43,6 +43,12 @@ pub struct ActClickParams {
     #[serde(default)]
     #[schemars(default)]
     pub verify_delta: bool,
+    #[serde(default)]
+    #[schemars(
+        default,
+        description = "Optional target top-level HWND that verify_delta must use as the physical Source of Truth for point clicks. Intended for target-scoped routers that already validated and bound the native window; stale or conflicting HWNDs fail closed before input."
+    )]
+    pub verify_target_window_hwnd: Option<i64>,
     #[serde(default = "default_verify_timeout_ms")]
     #[schemars(default = "default_verify_timeout_ms", range(min = 50, max = 5000))]
     pub verify_timeout_ms: u32,
@@ -159,6 +165,8 @@ impl<'de> Deserialize<'de> for ActClickParams {
             coordinate_fallback_on_unsupported: bool,
             #[serde(default)]
             verify_delta: bool,
+            #[serde(default)]
+            verify_target_window_hwnd: Option<i64>,
             #[serde(default = "default_verify_timeout_ms")]
             verify_timeout_ms: u32,
             #[serde(default)]
@@ -192,6 +200,7 @@ impl<'de> Deserialize<'de> for ActClickParams {
             use_invoke_pattern: raw.use_invoke_pattern,
             coordinate_fallback_on_unsupported: raw.coordinate_fallback_on_unsupported,
             verify_delta: raw.verify_delta,
+            verify_target_window_hwnd: raw.verify_target_window_hwnd,
             verify_timeout_ms: raw.verify_timeout_ms,
             auto_wait: raw.auto_wait,
             auto_wait_timeout_ms: raw.auto_wait_timeout_ms,

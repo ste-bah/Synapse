@@ -3709,23 +3709,31 @@ async fn target_act_coordinate_click(
                     ));
                 }
             };
-            if let Err(error) = target_act_window_coordinate_foreground_preflight(hwnd, &session_id)
-            {
-                service.audit_action_denied_with_details_for_session(
-                    "target_act",
-                    &error,
-                    &request_details,
-                    &session_id,
-                );
-                return Ok((
-                    "act_click",
-                    false,
-                    target_act_error_status(&error),
-                    target_act_error_result("act_click", error),
-                ));
-            }
-            let click_params =
-                target_act_click_point_params(point, clicks, params.button, &params.modifiers)?;
+            let target_root_hwnd =
+                match target_act_window_coordinate_foreground_preflight(hwnd, &session_id) {
+                    Ok(root_hwnd) => root_hwnd,
+                    Err(error) => {
+                        service.audit_action_denied_with_details_for_session(
+                            "target_act",
+                            &error,
+                            &request_details,
+                            &session_id,
+                        );
+                        return Ok((
+                            "act_click",
+                            false,
+                            target_act_error_status(&error),
+                            target_act_error_result("act_click", error),
+                        ));
+                    }
+                };
+            let click_params = target_act_click_point_params(
+                point,
+                clicks,
+                params.button,
+                &params.modifiers,
+                Some(target_root_hwnd),
+            )?;
             let response = service
                 .act_click(Parameters(click_params), request_context.clone())
                 .await;
@@ -6941,6 +6949,7 @@ fn target_act_click_point_params(
     clicks: u8,
     button: Option<TargetActMouseButton>,
     modifiers: &[TargetActClickModifier],
+    verify_target_window_hwnd: Option<i64>,
 ) -> Result<ActClickParams, ErrorData> {
     let modifiers = target_act_click_modifiers_act_value(modifiers)?;
     serde_json::from_value(json!({
@@ -6952,6 +6961,7 @@ fn target_act_click_point_params(
         "clicks": clicks,
         "modifiers": modifiers,
         "verify_delta": true,
+        "verify_target_window_hwnd": verify_target_window_hwnd,
         "verify_timeout_ms": default_verify_timeout_ms()
     }))
     .map_err(|error| {
@@ -7160,7 +7170,7 @@ fn target_act_window_coordinate_to_screen_point(
 fn target_act_window_coordinate_foreground_preflight(
     hwnd: i64,
     session_id: &str,
-) -> Result<(), ErrorData> {
+) -> Result<i64, ErrorData> {
     let target_root = synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
         mcp_error(
             error.code(),
@@ -7185,7 +7195,7 @@ fn target_act_window_coordinate_foreground_preflight(
         )
     })?;
     if foreground_root == target_root {
-        return Ok(());
+        return Ok(target_root);
     }
 
     // #1351: verb=focus_window may have verified the target as foreground, but the
@@ -7226,7 +7236,7 @@ fn target_act_window_coordinate_foreground_preflight(
                 session_id,
                 "readback=foreground self-healed lease-held re-focus before native coordinate click"
             );
-            return Ok(());
+            return Ok(target_root);
         }
         let detail = after.map(|context| {
             format!(

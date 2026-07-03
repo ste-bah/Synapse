@@ -550,9 +550,39 @@ pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i
                     ),
                 )
             })?;
+            if let Some(expected) = params.verify_target_window_hwnd {
+                let expected_root = verified_top_level_hwnd(expected).map_err(|detail| {
+                    mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        format!(
+                            "act_click verify_target_window_hwnd 0x{expected:x} could not be normalized for element-target verification: {detail}"
+                        ),
+                    )
+                })?;
+                if expected_root != hwnd {
+                    return Err(mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        format!(
+                            "act_click verify_target_window_hwnd 0x{expected_root:x} does not match element target root HWND 0x{hwnd:x}"
+                        ),
+                    ));
+                }
+            }
             Ok(Some(hwnd))
         }
-        ActClickTarget::Point(_) => Ok(None),
+        ActClickTarget::Point(_) => params
+            .verify_target_window_hwnd
+            .map(|hwnd| {
+                verified_top_level_hwnd(hwnd).map_err(|detail| {
+                    mcp_error(
+                        error_codes::ACTION_TARGET_INVALID,
+                        format!(
+                            "act_click verify_target_window_hwnd 0x{hwnd:x} could not be normalized for point-target verification: {detail}"
+                        ),
+                    )
+                })
+            })
+            .transpose(),
     }
 }
 
