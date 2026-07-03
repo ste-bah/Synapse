@@ -6,19 +6,22 @@
 //! final outcome. Durable trigger keys are written before execution so daemon
 //! restarts do not double-fire the same schedule window or intent evidence.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use chrono::{Datelike, Local, TimeZone};
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use synapse_core::error_codes;
+use synapse_core::intent::IntentCandidate;
 use synapse_core::types::{RoutineDowClass, RoutineLifecycle, RoutineRecord};
-use synapse_storage::{Db, cf, decode_json, encode_json};
+use synapse_storage::{Db, cf, decode_json, encode_json, routines as routine_codec};
 
 use crate::m1::mcp_error;
 
-use super::episodes::{hex_encode, key_after, local_day_start, now_ts_ns};
+use super::episodes::{hex_encode, key_after, local_day_start, next_local_day_start, now_ts_ns};
 use super::intent::{IntentCurrentParams, current_intents};
 use super::permissions::{Permission, RequiredPermissions, required};
 use super::profile_authoring::load_routine_automation_record;
@@ -26,16 +29,18 @@ use super::routines::{load_routine_record, load_state_row, validate_routine_id_p
 
 const ARMED_ROUTINE_PREFIX: &str = "armed_routine/v1/";
 const ARMED_ROUTINE_RUN_PREFIX: &str = "armed_routine_run/v1/";
+const ARMED_ROUTINE_SCHEDULE_DUE_PREFIX: &str = "armed_routine_due/v1/schedule/";
+const ARMED_ROUTINE_SCHEDULE_DUE_BY_ID_PREFIX: &str = "armed_routine_due_by_id/v1/schedule/";
 const ARMED_ROUTINE_RECORD_VERSION: u32 = 1;
 const ARMED_ROUTINE_RUN_RECORD_VERSION: u32 = 1;
+const ARMED_ROUTINE_SCHEDULE_DUE_INDEX_RECORD_VERSION: u32 = 1;
 const DEFAULT_FAILURE_THRESHOLD: u32 = 3;
 const MAX_FAILURE_THRESHOLD: u32 = 20;
 const MIN_SCHEDULE_WINDOW_MINUTES: u32 = 5;
 const MAX_SCAN_ROWS: usize = 200_000;
 const SCAN_CHUNK_ROWS: usize = 4_096;
 
-pub const ARMED_ROUTINE_SOURCE_OF_TRUTH: &str =
-    "CF_KV armed_routine/v1 and armed_routine_run/v1 rows plus plan_execution/v1 rows";
+pub const ARMED_ROUTINE_SOURCE_OF_TRUTH: &str = "CF_KV armed_routine/v1, armed_routine_due/v1/schedule, armed_routine_due_by_id/v1/schedule, and armed_routine_run/v1 rows plus CF_ROUTINES/CF_ROUTINE_STATE joins and plan_execution/v1 rows";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -167,6 +172,26 @@ pub struct ArmedRoutineRunRecord {
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub evidence: Value,
     pub source_of_truth: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ArmedRoutineScheduleDueIndexRecord {
+    record_version: u32,
+    row_kind: String,
+    routine_id: String,
+    due_ts_ns: u64,
+    primary_key_hex: String,
+    primary_value_sha256: String,
+    routine_key_hex: String,
+    routine_value_sha256: String,
+}
+
+#[derive(Clone, Debug)]
+struct RoutineSourceRow {
+    record: RoutineRecord,
+    key: Vec<u8>,
+    value: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -437,112 +462,183 @@ pub fn due_armed_runs(
     validate_tick_params(params)?;
     let now = params.now_ts_ns.unwrap_or_else(now_ts_ns);
     let mode = params.trigger_mode.unwrap_or_default();
-    let all = load_all_armed_routines(db)?;
     let mut evaluated = 0_u32;
     let mut due = Vec::new();
     let mut skipped = Vec::new();
+    let mut evaluated_routine_ids = BTreeSet::new();
 
-    let intent_candidates = if matches!(
-        mode,
-        ArmedRoutineTickTriggerMode::Intent | ArmedRoutineTickTriggerMode::Both
-    ) {
-        Some(
-            current_intents(
-                db,
-                &IntentCurrentParams {
-                    now_ts_ns: Some(now),
-                    lookback_hours: params.lookback_hours,
-                    min_confidence: Some(0.0),
-                    max_candidates: Some(50),
-                    include_agent_activity: false,
-                },
-            )?
-            .candidates,
-        )
-    } else {
-        None
-    };
+    let intent_candidates = intent_candidates_for_tick(db, params, now, mode)?;
 
-    for record in all {
-        if params
-            .routine_id
-            .as_ref()
-            .is_some_and(|routine_id| routine_id != &record.routine_id)
-        {
-            continue;
-        }
+    if let Some(routine_id) = &params.routine_id {
+        let Some(record) = load_armed_routine_record(db, routine_id)? else {
+            return Ok((now, evaluated, due, skipped));
+        };
         evaluated = evaluated.saturating_add(1);
-        if !record.enabled {
-            skipped.push(skip(&record.routine_id, "armed_record_disabled"));
-            continue;
-        }
-        let Some(routine) = load_routine_record(db.as_ref(), &record.routine_id)? else {
-            skipped.push(skip(&record.routine_id, "routine_not_mined"));
-            continue;
-        };
-        if let Some(state) = load_state_row(db.as_ref(), &record.routine_id)?
-            && matches!(
-                state.lifecycle,
-                RoutineLifecycle::Disabled | RoutineLifecycle::Archived
-            )
-        {
-            skipped.push(skip(&record.routine_id, "routine_lifecycle_disabled"));
-            continue;
-        }
-        let Some(automation) = load_routine_automation_record(db, &record.routine_id)? else {
-            skipped.push(skip(&record.routine_id, "automation_not_installed"));
-            continue;
-        };
-        if automation.state != "installed" {
-            skipped.push(skip(&record.routine_id, "automation_not_installed"));
-            continue;
-        }
-
-        if matches!(
+        evaluated_routine_ids.insert(record.routine_id.clone());
+        evaluate_armed_record_due(
+            db,
+            &record,
+            now,
             mode,
-            ArmedRoutineTickTriggerMode::Schedule | ArmedRoutineTickTriggerMode::Both
-        ) && record.schedule_enabled
-            && let Some(schedule_due) = schedule_due_run(&record, &routine, now)?
-        {
-            due.push(schedule_due);
-            continue;
-        }
+            intent_candidates.as_deref(),
+            &mut due,
+            &mut skipped,
+        )?;
+        return Ok((now, evaluated, due, skipped));
+    }
 
-        if matches!(
-            mode,
-            ArmedRoutineTickTriggerMode::Intent | ArmedRoutineTickTriggerMode::Both
-        ) && record.intent_enabled
-            && let Some(candidates) = &intent_candidates
-            && let Some(candidate) = candidates
-                .iter()
-                .find(|candidate| candidate.routine_id == record.routine_id)
-        {
-            let matched_prefix_len =
-                u32::try_from(candidate.matched_prefix_len).unwrap_or(u32::MAX);
-            let trigger_key = format!(
-                "intent:{}:{}:{}",
-                record.routine_id, matched_prefix_len, candidate.last_matched_end_ts_ns
-            );
-            if record.last_intent_fire_key.as_deref() == Some(trigger_key.as_str()) {
-                skipped.push(skip(&record.routine_id, "intent_already_fired"));
+    if matches!(
+        mode,
+        ArmedRoutineTickTriggerMode::Schedule | ArmedRoutineTickTriggerMode::Both
+    ) {
+        for index in load_due_schedule_indexes(db, now)? {
+            let (record, primary_value) = load_armed_primary_from_schedule_index(db, &index)?;
+            evaluated = evaluated.saturating_add(1);
+            evaluated_routine_ids.insert(record.routine_id.clone());
+            let due_before = due.len();
+            let skipped_before = skipped.len();
+            evaluate_armed_record_due(
+                db,
+                &record,
+                now,
+                ArmedRoutineTickTriggerMode::Schedule,
+                None,
+                &mut due,
+                &mut skipped,
+            )?;
+            if due.len() == due_before && skipped.len() > skipped_before {
+                refresh_schedule_due_index(db, &record, &primary_value, now)?;
+            }
+        }
+    }
+
+    if let Some(candidates) = intent_candidates.as_deref() {
+        for candidate in candidates {
+            if evaluated_routine_ids.contains(&candidate.routine_id) {
                 continue;
             }
-            due.push(ArmedRoutineDueRun {
-                routine_id: record.routine_id.clone(),
-                trigger_kind: ArmedRoutineTriggerKind::Intent,
-                trigger_key,
-                due_ts_ns: now,
-                plan_ref: Some(automation.plan_ref),
-                intent: Some(ArmedRoutineIntentEvidence {
-                    confidence: candidate.confidence,
-                    matched_prefix_len,
-                    total_steps: u32::try_from(candidate.total_steps).unwrap_or(u32::MAX),
-                    last_matched_end_ts_ns: candidate.last_matched_end_ts_ns,
-                }),
-            });
+            let Some(record) = load_armed_routine_record(db, &candidate.routine_id)? else {
+                continue;
+            };
+            evaluated = evaluated.saturating_add(1);
+            evaluated_routine_ids.insert(record.routine_id.clone());
+            evaluate_armed_record_due(
+                db,
+                &record,
+                now,
+                ArmedRoutineTickTriggerMode::Intent,
+                Some(candidates),
+                &mut due,
+                &mut skipped,
+            )?;
         }
     }
     Ok((now, evaluated, due, skipped))
+}
+
+fn intent_candidates_for_tick(
+    db: &Arc<Db>,
+    params: &ArmedRoutineTickParams,
+    now: u64,
+    mode: ArmedRoutineTickTriggerMode,
+) -> Result<Option<Vec<IntentCandidate>>, ErrorData> {
+    if !matches!(
+        mode,
+        ArmedRoutineTickTriggerMode::Intent | ArmedRoutineTickTriggerMode::Both
+    ) {
+        return Ok(None);
+    }
+    current_intents(
+        db,
+        &IntentCurrentParams {
+            now_ts_ns: Some(now),
+            lookback_hours: params.lookback_hours,
+            min_confidence: Some(0.0),
+            max_candidates: Some(50),
+            include_agent_activity: false,
+        },
+    )
+    .map(|response| Some(response.candidates))
+}
+
+fn evaluate_armed_record_due(
+    db: &Arc<Db>,
+    record: &ArmedRoutineRecord,
+    now: u64,
+    mode: ArmedRoutineTickTriggerMode,
+    intent_candidates: Option<&[IntentCandidate]>,
+    due: &mut Vec<ArmedRoutineDueRun>,
+    skipped: &mut Vec<ArmedRoutineTickSkip>,
+) -> Result<(), ErrorData> {
+    if !record.enabled {
+        skipped.push(skip(&record.routine_id, "armed_record_disabled"));
+        return Ok(());
+    }
+    let Some(routine) = load_routine_record(db.as_ref(), &record.routine_id)? else {
+        skipped.push(skip(&record.routine_id, "routine_not_mined"));
+        return Ok(());
+    };
+    if let Some(state) = load_state_row(db.as_ref(), &record.routine_id)?
+        && matches!(
+            state.lifecycle,
+            RoutineLifecycle::Disabled | RoutineLifecycle::Archived
+        )
+    {
+        skipped.push(skip(&record.routine_id, "routine_lifecycle_disabled"));
+        return Ok(());
+    }
+    let Some(automation) = load_routine_automation_record(db, &record.routine_id)? else {
+        skipped.push(skip(&record.routine_id, "automation_not_installed"));
+        return Ok(());
+    };
+    if automation.state != "installed" {
+        skipped.push(skip(&record.routine_id, "automation_not_installed"));
+        return Ok(());
+    }
+
+    if matches!(
+        mode,
+        ArmedRoutineTickTriggerMode::Schedule | ArmedRoutineTickTriggerMode::Both
+    ) && record.schedule_enabled
+        && let Some(schedule_due) = schedule_due_run(record, &routine, now)?
+    {
+        due.push(schedule_due);
+        return Ok(());
+    }
+
+    if matches!(
+        mode,
+        ArmedRoutineTickTriggerMode::Intent | ArmedRoutineTickTriggerMode::Both
+    ) && record.intent_enabled
+        && let Some(candidates) = intent_candidates
+        && let Some(candidate) = candidates
+            .iter()
+            .find(|candidate| candidate.routine_id == record.routine_id)
+    {
+        let matched_prefix_len = u32::try_from(candidate.matched_prefix_len).unwrap_or(u32::MAX);
+        let trigger_key = format!(
+            "intent:{}:{}:{}",
+            record.routine_id, matched_prefix_len, candidate.last_matched_end_ts_ns
+        );
+        if record.last_intent_fire_key.as_deref() == Some(trigger_key.as_str()) {
+            skipped.push(skip(&record.routine_id, "intent_already_fired"));
+            return Ok(());
+        }
+        due.push(ArmedRoutineDueRun {
+            routine_id: record.routine_id.clone(),
+            trigger_kind: ArmedRoutineTriggerKind::Intent,
+            trigger_key,
+            due_ts_ns: now,
+            plan_ref: Some(automation.plan_ref),
+            intent: Some(ArmedRoutineIntentEvidence {
+                confidence: candidate.confidence,
+                matched_prefix_len,
+                total_steps: u32::try_from(candidate.total_steps).unwrap_or(u32::MAX),
+                last_matched_end_ts_ns: candidate.last_matched_end_ts_ns,
+            }),
+        });
+    }
+    Ok(())
 }
 
 pub fn claim_armed_run(
@@ -761,6 +857,693 @@ fn circular_minute_distance(a: u32, b: u32) -> u32 {
     raw.min(1440 - raw)
 }
 
+fn schedule_window_segments(mean_minute_of_day: u32, tolerance_minutes: u32) -> Vec<(u32, u32)> {
+    let mean = mean_minute_of_day % 1440;
+    let tolerance = tolerance_minutes.max(MIN_SCHEDULE_WINDOW_MINUTES).min(720);
+    if tolerance >= 720 {
+        return vec![(0, 1439)];
+    }
+    let start = i64::from(mean) - i64::from(tolerance);
+    let end = i64::from(mean) + i64::from(tolerance);
+    if start < 0 {
+        vec![
+            (0, u32::try_from(end).unwrap_or(1439)),
+            (u32::try_from(1440 + start).unwrap_or(0), 1439),
+        ]
+    } else if end >= 1440 {
+        vec![
+            (0, u32::try_from(end - 1440).unwrap_or(0)),
+            (u32::try_from(start).unwrap_or(0), 1439),
+        ]
+    } else {
+        vec![(
+            u32::try_from(start).unwrap_or(0),
+            u32::try_from(end).unwrap_or(1439),
+        )]
+    }
+}
+
+fn next_schedule_due_ts(
+    record: &ArmedRoutineRecord,
+    routine: &RoutineRecord,
+    anchor_ts_ns: u64,
+) -> Result<Option<u64>, ErrorData> {
+    if !record.enabled || !record.schedule_enabled {
+        return Ok(None);
+    }
+    const NANOS_PER_MINUTE: u64 = 60_000_000_000;
+    let anchor_day_start = local_day_start(anchor_ts_ns)?;
+    let anchor_minute =
+        u32::try_from(anchor_ts_ns.saturating_sub(anchor_day_start) / NANOS_PER_MINUTE)
+            .unwrap_or(0)
+            .min(1439);
+    let mut day_start = anchor_day_start;
+    for day_offset in 0..14 {
+        let weekday = weekday_for_ts(day_start)?;
+        let trigger_key = format!("schedule:{}:{day_start}", record.routine_id);
+        if dow_matches(&routine.dow_class, weekday)
+            && record.last_schedule_fire_key.as_deref() != Some(trigger_key.as_str())
+        {
+            let segments =
+                schedule_window_segments(routine.mean_minute_of_day, routine.tolerance_minutes);
+            for (segment_start, segment_end) in segments {
+                if day_offset == 0 && anchor_minute > segment_end {
+                    continue;
+                }
+                let due_minute = segment_start;
+                let due_ts = day_start.saturating_add(u64::from(due_minute) * NANOS_PER_MINUTE);
+                return Ok(Some(due_ts));
+            }
+        }
+        day_start = next_local_day_start(day_start)?;
+    }
+    Ok(None)
+}
+
+fn load_exact_cf_value(
+    db: &Db,
+    cf_name: &str,
+    key: &[u8],
+    context: &'static str,
+) -> Result<Option<Vec<u8>>, ErrorData> {
+    let rows = db.scan_cf_prefix(cf_name, key).map_err(storage_error)?;
+    let mut exact_values = rows
+        .into_iter()
+        .filter_map(|(row_key, value)| (row_key == key).then_some(value))
+        .collect::<Vec<_>>();
+    if exact_values.len() > 1 {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_EXACT_KEY_DUPLICATE: {context} key {} appeared more than once in {cf_name}",
+                String::from_utf8_lossy(key)
+            ),
+        ));
+    }
+    Ok(exact_values.pop())
+}
+
+fn load_routine_record_with_raw(
+    db: &Db,
+    routine_id: &str,
+) -> Result<Option<RoutineSourceRow>, ErrorData> {
+    let key = routine_codec::routine_key(routine_id).map_err(|error| invalid(error.to_string()))?;
+    let Some(value) = load_exact_cf_value(db, cf::CF_ROUTINES, &key, "routine primary row")? else {
+        return Ok(None);
+    };
+    let record: RoutineRecord = decode_json(&value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!("ROUTINE_ROW_DECODE_FAILED in CF_ROUTINES for {routine_id}: {error}"),
+        )
+    })?;
+    if record.routine_id != routine_id {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ROUTINE_ID_MISMATCH in CF_ROUTINES: row key {routine_id} holds routine_id {}",
+                record.routine_id
+            ),
+        ));
+    }
+    Ok(Some(RoutineSourceRow { record, key, value }))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex_encode(&digest[..])
+}
+
+fn routine_id_hex(routine_id: &str) -> String {
+    hex_encode(routine_id.as_bytes())
+}
+
+fn schedule_due_index_key(routine_id: &str, due_ts_ns: u64) -> Vec<u8> {
+    format!(
+        "{ARMED_ROUTINE_SCHEDULE_DUE_PREFIX}{due_ts_ns:020}/{}",
+        routine_id_hex(routine_id)
+    )
+    .into_bytes()
+}
+
+fn schedule_due_by_id_index_key(routine_id: &str) -> Vec<u8> {
+    format!(
+        "{ARMED_ROUTINE_SCHEDULE_DUE_BY_ID_PREFIX}{}",
+        routine_id_hex(routine_id)
+    )
+    .into_bytes()
+}
+
+fn decode_schedule_due_index(
+    index_key: &[u8],
+    value: &[u8],
+    context: &'static str,
+) -> Result<ArmedRoutineScheduleDueIndexRecord, ErrorData> {
+    let index: ArmedRoutineScheduleDueIndexRecord = decode_json(value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_DECODE_FAILED during {context} at {}: {error}",
+                String::from_utf8_lossy(index_key)
+            ),
+        )
+    })?;
+    if index.record_version != ARMED_ROUTINE_SCHEDULE_DUE_INDEX_RECORD_VERSION {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_VERSION_UNSUPPORTED for {}: expected {}, got {}",
+                index.routine_id,
+                ARMED_ROUTINE_SCHEDULE_DUE_INDEX_RECORD_VERSION,
+                index.record_version
+            ),
+        ));
+    }
+    if index.row_kind != "armed_routine_schedule_due_index" {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_ROW_KIND_INVALID for {}: {}",
+                index.routine_id, index.row_kind
+            ),
+        ));
+    }
+    Ok(index)
+}
+
+fn load_schedule_due_by_id_index(
+    db: &Arc<Db>,
+    routine_id: &str,
+) -> Result<Option<ArmedRoutineScheduleDueIndexRecord>, ErrorData> {
+    let key = schedule_due_by_id_index_key(routine_id);
+    let Some(value) = load_exact_cf_value(db, cf::CF_KV, &key, "armed schedule due by-id index")?
+    else {
+        return Ok(None);
+    };
+    let index = decode_schedule_due_index(&key, &value, "by-id load")?;
+    if index.routine_id != routine_id {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_BY_ID_KEY_MISMATCH: key for {routine_id} contains {}",
+                index.routine_id
+            ),
+        ));
+    }
+    Ok(Some(index))
+}
+
+fn validate_schedule_due_index_key(
+    key: &[u8],
+    index: &ArmedRoutineScheduleDueIndexRecord,
+    context: &'static str,
+) -> Result<(), ErrorData> {
+    let expected = schedule_due_index_key(&index.routine_id, index.due_ts_ns);
+    if key != expected {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_KEY_MISMATCH during {context}: key={}, expected={}",
+                String::from_utf8_lossy(key),
+                String::from_utf8_lossy(&expected)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_schedule_due_by_id_backlink(
+    db: &Arc<Db>,
+    index: &ArmedRoutineScheduleDueIndexRecord,
+) -> Result<(), ErrorData> {
+    let Some(by_id) = load_schedule_due_by_id_index(db, &index.routine_id)? else {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_BY_ID_INDEX_MISSING: due index for {} has no by-id backlink",
+                index.routine_id
+            ),
+        ));
+    };
+    if by_id != *index {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_BY_ID_INDEX_MISMATCH for {}: due row and by-id row disagree",
+                index.routine_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn load_due_schedule_indexes(
+    db: &Arc<Db>,
+    now: u64,
+) -> Result<Vec<ArmedRoutineScheduleDueIndexRecord>, ErrorData> {
+    let mut out = Vec::new();
+    let mut scanned = 0_usize;
+    let prefix = ARMED_ROUTINE_SCHEDULE_DUE_PREFIX.as_bytes();
+    let mut start = prefix.to_vec();
+    loop {
+        if scanned >= MAX_SCAN_ROWS {
+            return Err(internal(format!(
+                "ARMED_ROUTINE_DUE_INDEX_SCAN_BUDGET_EXHAUSTED after {MAX_SCAN_ROWS} CF_KV rows"
+            )));
+        }
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
+            .map_err(storage_error)?;
+        if rows.is_empty() {
+            break;
+        }
+        for (key, value) in &rows {
+            if !key.starts_with(prefix) {
+                return Ok(out);
+            }
+            scanned = scanned.saturating_add(1);
+            let index = decode_schedule_due_index(key, value, "due scan")?;
+            validate_schedule_due_index_key(key, &index, "due scan")?;
+            if index.due_ts_ns > now {
+                return Ok(out);
+            }
+            validate_schedule_due_by_id_backlink(db, &index)?;
+            out.push(index);
+        }
+        if !more {
+            break;
+        }
+        let Some((last, _value)) = rows.last() else {
+            break;
+        };
+        start = key_after(last);
+    }
+    Ok(out)
+}
+
+fn load_armed_primary_from_schedule_index(
+    db: &Arc<Db>,
+    index: &ArmedRoutineScheduleDueIndexRecord,
+) -> Result<(ArmedRoutineRecord, Vec<u8>), ErrorData> {
+    let primary_key = armed_routine_key(&index.routine_id).into_bytes();
+    let expected_primary_key_hex = hex_encode(&primary_key);
+    if index.primary_key_hex != expected_primary_key_hex {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_PRIMARY_KEY_MISMATCH for {}: index_key={}, expected_key={}",
+                index.routine_id, index.primary_key_hex, expected_primary_key_hex
+            ),
+        ));
+    }
+    let Some(primary_value) = load_exact_cf_value(
+        db,
+        cf::CF_KV,
+        &primary_key,
+        "armed routine primary from due index",
+    )?
+    else {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_DANGLING: routine_id {} points at missing primary key {}",
+                index.routine_id,
+                String::from_utf8_lossy(&primary_key)
+            ),
+        ));
+    };
+    let actual_hash = sha256_hex(&primary_value);
+    if index.primary_value_sha256 != actual_hash {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_PRIMARY_HASH_MISMATCH for {}: index_hash={}, actual_hash={}",
+                index.routine_id, index.primary_value_sha256, actual_hash
+            ),
+        ));
+    }
+    let record: ArmedRoutineRecord = decode_json(&primary_value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_ROW_DECODE_FAILED for {} from due index: {error}",
+                index.routine_id
+            ),
+        )
+    })?;
+    if record.routine_id != index.routine_id {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_RECORD_MISMATCH: index for {} points at primary row for {}",
+                index.routine_id, record.routine_id
+            ),
+        ));
+    }
+    let Some(routine_source) = load_routine_record_with_raw(db, &index.routine_id)? else {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_ROUTINE_DANGLING: routine_id {} points at missing CF_ROUTINES row",
+                index.routine_id
+            ),
+        ));
+    };
+    let routine_key_hex = hex_encode(&routine_source.key);
+    let routine_value_sha256 = sha256_hex(&routine_source.value);
+    if index.routine_key_hex != routine_key_hex
+        || index.routine_value_sha256 != routine_value_sha256
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "ARMED_ROUTINE_DUE_INDEX_ROUTINE_HASH_MISMATCH for {}: index_key={}, actual_key={}, index_hash={}, actual_hash={}",
+                index.routine_id,
+                index.routine_key_hex,
+                routine_key_hex,
+                index.routine_value_sha256,
+                routine_value_sha256
+            ),
+        ));
+    }
+    Ok((record, primary_value))
+}
+
+struct ScheduleDueIndexMutation {
+    deletes: Vec<Vec<u8>>,
+    puts: Vec<(Vec<u8>, Vec<u8>)>,
+    expected: Option<ArmedRoutineScheduleDueIndexRecord>,
+}
+
+fn build_schedule_due_index_record(
+    db: &Arc<Db>,
+    record: &ArmedRoutineRecord,
+    primary_key: &[u8],
+    primary_value: &[u8],
+    anchor_ts_ns: u64,
+) -> Result<Option<ArmedRoutineScheduleDueIndexRecord>, ErrorData> {
+    if !record.enabled || !record.schedule_enabled {
+        return Ok(None);
+    }
+    let Some(routine_source) = load_routine_record_with_raw(db, &record.routine_id)? else {
+        return Ok(None);
+    };
+    if let Some(state) = load_state_row(db.as_ref(), &record.routine_id)?
+        && matches!(
+            state.lifecycle,
+            RoutineLifecycle::Disabled | RoutineLifecycle::Archived
+        )
+    {
+        return Ok(None);
+    }
+    let Some(automation) = load_routine_automation_record(db, &record.routine_id)? else {
+        return Ok(None);
+    };
+    if automation.state != "installed" || automation.plan_ref.trim().is_empty() {
+        return Ok(None);
+    }
+    let Some(due_ts_ns) = next_schedule_due_ts(record, &routine_source.record, anchor_ts_ns)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(ArmedRoutineScheduleDueIndexRecord {
+        record_version: ARMED_ROUTINE_SCHEDULE_DUE_INDEX_RECORD_VERSION,
+        row_kind: "armed_routine_schedule_due_index".to_owned(),
+        routine_id: record.routine_id.clone(),
+        due_ts_ns,
+        primary_key_hex: hex_encode(primary_key),
+        primary_value_sha256: sha256_hex(primary_value),
+        routine_key_hex: hex_encode(&routine_source.key),
+        routine_value_sha256: sha256_hex(&routine_source.value),
+    }))
+}
+
+fn schedule_due_index_mutation(
+    db: &Arc<Db>,
+    record: &ArmedRoutineRecord,
+    primary_key: &[u8],
+    primary_value: &[u8],
+    anchor_ts_ns: u64,
+) -> Result<ScheduleDueIndexMutation, ErrorData> {
+    let mut deletes = Vec::new();
+    let by_id_key = schedule_due_by_id_index_key(&record.routine_id);
+    if let Some(existing) = load_schedule_due_by_id_index(db, &record.routine_id)? {
+        deletes.push(by_id_key.clone());
+        deletes.push(schedule_due_index_key(
+            &existing.routine_id,
+            existing.due_ts_ns,
+        ));
+    }
+
+    let expected =
+        build_schedule_due_index_record(db, record, primary_key, primary_value, anchor_ts_ns)?;
+    let mut puts = Vec::new();
+    if let Some(index) = &expected {
+        let due_key = schedule_due_index_key(&index.routine_id, index.due_ts_ns);
+        let index_value = encode_json(index).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "failed to encode armed routine due index for {}: {error}",
+                    index.routine_id
+                ),
+            )
+        })?;
+        puts.push((due_key, index_value.clone()));
+        puts.push((by_id_key, index_value));
+    }
+
+    Ok(ScheduleDueIndexMutation {
+        deletes,
+        puts,
+        expected,
+    })
+}
+
+fn validate_schedule_due_index_readback(
+    db: &Arc<Db>,
+    routine_id: &str,
+    mutation: &ScheduleDueIndexMutation,
+) -> Result<(), ErrorData> {
+    if let Some(index) = &mutation.expected {
+        let due_key = schedule_due_index_key(&index.routine_id, index.due_ts_ns);
+        let Some(due_value) = load_exact_cf_value(db, cf::CF_KV, &due_key, "due index readback")?
+        else {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "ARMED_ROUTINE_DUE_INDEX_READBACK_MISSING for {} at {}",
+                    index.routine_id,
+                    String::from_utf8_lossy(&due_key)
+                ),
+            ));
+        };
+        let due_readback = decode_schedule_due_index(&due_key, &due_value, "due readback")?;
+        if due_readback != *index {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "ARMED_ROUTINE_DUE_INDEX_READBACK_MISMATCH for {}",
+                    index.routine_id
+                ),
+            ));
+        }
+
+        let by_id_key = schedule_due_by_id_index_key(&index.routine_id);
+        let Some(by_id_value) =
+            load_exact_cf_value(db, cf::CF_KV, &by_id_key, "due by-id readback")?
+        else {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "ARMED_ROUTINE_DUE_BY_ID_READBACK_MISSING for {}",
+                    index.routine_id
+                ),
+            ));
+        };
+        let by_id_readback = decode_schedule_due_index(&by_id_key, &by_id_value, "by-id readback")?;
+        if by_id_readback != *index {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "ARMED_ROUTINE_DUE_BY_ID_READBACK_MISMATCH for {}",
+                    index.routine_id
+                ),
+            ));
+        }
+    } else {
+        let by_id_key = schedule_due_by_id_index_key(routine_id);
+        if load_exact_cf_value(db, cf::CF_KV, &by_id_key, "due by-id absence readback")?.is_some() {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!("ARMED_ROUTINE_DUE_BY_ID_DELETE_READBACK_PRESENT for {routine_id}"),
+            ));
+        }
+    }
+
+    for deleted_key in &mutation.deletes {
+        if let Some(index) = &mutation.expected {
+            if deleted_key == &schedule_due_index_key(&index.routine_id, index.due_ts_ns)
+                || deleted_key == &schedule_due_by_id_index_key(&index.routine_id)
+            {
+                continue;
+            }
+        }
+        if load_exact_cf_value(db, cf::CF_KV, deleted_key, "deleted due index readback")?.is_some()
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "ARMED_ROUTINE_DUE_INDEX_DELETE_READBACK_PRESENT at {}",
+                    String::from_utf8_lossy(deleted_key)
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn refresh_schedule_due_index(
+    db: &Arc<Db>,
+    record: &ArmedRoutineRecord,
+    primary_value: &[u8],
+    anchor_ts_ns: u64,
+) -> Result<(), ErrorData> {
+    let primary_key = armed_routine_key(&record.routine_id).into_bytes();
+    let mutation =
+        schedule_due_index_mutation(db, record, &primary_key, primary_value, anchor_ts_ns)?;
+    db.mutate_batch_pressure_bypass(cf::CF_KV, mutation.deletes.clone(), mutation.puts.clone())
+        .map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "failed to refresh armed routine due index for {}: {error}",
+                    record.routine_id
+                ),
+            )
+        })?;
+    validate_schedule_due_index_readback(db, &record.routine_id, &mutation)
+}
+
+fn scan_index_keys(db: &Arc<Db>, prefix: &[u8]) -> Result<Vec<Vec<u8>>, ErrorData> {
+    let mut out = Vec::new();
+    let mut scanned = 0_usize;
+    let mut start = prefix.to_vec();
+    loop {
+        if scanned >= MAX_SCAN_ROWS {
+            return Err(internal(format!(
+                "ARMED_ROUTINE_INDEX_SCAN_BUDGET_EXHAUSTED after {MAX_SCAN_ROWS} CF_KV rows"
+            )));
+        }
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
+            .map_err(storage_error)?;
+        if rows.is_empty() {
+            break;
+        }
+        for (key, _value) in &rows {
+            if !key.starts_with(prefix) {
+                return Ok(out);
+            }
+            scanned = scanned.saturating_add(1);
+            out.push(key.clone());
+        }
+        if !more {
+            break;
+        }
+        let Some((last, _value)) = rows.last() else {
+            break;
+        };
+        start = key_after(last);
+    }
+    Ok(out)
+}
+
+pub fn reindex_armed_routine_schedule_due_indexes(db: &Arc<Db>) -> Result<(), ErrorData> {
+    let armed = load_all_armed_routines(db)?;
+    let mut deletes = scan_index_keys(db, ARMED_ROUTINE_SCHEDULE_DUE_PREFIX.as_bytes())?;
+    deletes.extend(scan_index_keys(
+        db,
+        ARMED_ROUTINE_SCHEDULE_DUE_BY_ID_PREFIX.as_bytes(),
+    )?);
+    let anchor = now_ts_ns();
+    let mut expected = Vec::new();
+    let mut puts = Vec::new();
+    for record in &armed {
+        let primary_key = armed_routine_key(&record.routine_id).into_bytes();
+        let Some(primary_value) =
+            load_exact_cf_value(db, cf::CF_KV, &primary_key, "armed primary during reindex")?
+        else {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "ARMED_ROUTINE_REINDEX_PRIMARY_MISSING for {}",
+                    record.routine_id
+                ),
+            ));
+        };
+        let decoded: ArmedRoutineRecord = decode_json(&primary_value).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "ARMED_ROUTINE_REINDEX_PRIMARY_DECODE_FAILED for {}: {error}",
+                    record.routine_id
+                ),
+            )
+        })?;
+        if decoded != *record {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "ARMED_ROUTINE_REINDEX_PRIMARY_MISMATCH for {}",
+                    record.routine_id
+                ),
+            ));
+        }
+        if let Some(index) =
+            build_schedule_due_index_record(db, record, &primary_key, &primary_value, anchor)?
+        {
+            let index_value = encode_json(&index).map_err(|error| {
+                mcp_error(
+                    error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "failed to encode armed routine due index for {} during reindex: {error}",
+                        index.routine_id
+                    ),
+                )
+            })?;
+            puts.push((
+                schedule_due_index_key(&index.routine_id, index.due_ts_ns),
+                index_value.clone(),
+            ));
+            puts.push((schedule_due_by_id_index_key(&index.routine_id), index_value));
+            expected.push(index);
+        }
+    }
+
+    db.mutate_batch_pressure_bypass(cf::CF_KV, deletes, puts)
+        .map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!("failed to rebuild armed routine due indexes atomically: {error}"),
+            )
+        })?;
+
+    for index in expected {
+        let routine_id = index.routine_id.clone();
+        validate_schedule_due_index_readback(
+            db,
+            &routine_id,
+            &ScheduleDueIndexMutation {
+                deletes: Vec::new(),
+                puts: Vec::new(),
+                expected: Some(index),
+            },
+        )?;
+    }
+    Ok(())
+}
+
 fn load_all_armed_routines(db: &Arc<Db>) -> Result<Vec<ArmedRoutineRecord>, ErrorData> {
     let mut out = Vec::new();
     let mut scanned = 0_usize;
@@ -827,6 +1610,7 @@ fn read_armed_required(db: &Arc<Db>, routine_id: &str) -> Result<ArmedRoutineRec
 
 fn write_armed_routine_record(db: &Arc<Db>, record: &ArmedRoutineRecord) -> Result<(), ErrorData> {
     let key = armed_routine_key(&record.routine_id);
+    let key_bytes = key.into_bytes();
     let value = encode_json(record).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
@@ -836,12 +1620,16 @@ fn write_armed_routine_record(db: &Arc<Db>, record: &ArmedRoutineRecord) -> Resu
             ),
         )
     })?;
-    db.put_batch_pressure_bypass(cf::CF_KV, [(key.into_bytes(), value)])
+    let index_mutation =
+        schedule_due_index_mutation(db, record, &key_bytes, &value, record.updated_at_ns)?;
+    let mut puts = index_mutation.puts.clone();
+    puts.push((key_bytes.clone(), value.clone()));
+    db.mutate_batch_pressure_bypass(cf::CF_KV, index_mutation.deletes.clone(), puts)
         .map_err(|error| {
             mcp_error(
                 error_codes::STORAGE_WRITE_FAILED,
                 format!(
-                    "failed to persist armed routine row for {}: {error}",
+                    "failed to persist armed routine row and due indexes for {}: {error}",
                     record.routine_id
                 ),
             )
@@ -856,6 +1644,7 @@ fn write_armed_routine_record(db: &Arc<Db>, record: &ArmedRoutineRecord) -> Resu
             ),
         ));
     }
+    validate_schedule_due_index_readback(db, &record.routine_id, &index_mutation)?;
     Ok(())
 }
 
@@ -887,12 +1676,17 @@ fn write_armed_and_run_records(
             format!("failed to encode armed routine run row: {error}"),
         )
     })?;
-    db.put_batch_pressure_bypass(cf::CF_KV, [(armed_key, armed_value), (run_key, run_value)])
+    let index_mutation =
+        schedule_due_index_mutation(db, armed, &armed_key, &armed_value, armed.updated_at_ns)?;
+    let mut puts = index_mutation.puts.clone();
+    puts.push((armed_key, armed_value));
+    puts.push((run_key, run_value));
+    db.mutate_batch_pressure_bypass(cf::CF_KV, index_mutation.deletes.clone(), puts)
         .map_err(|error| {
             mcp_error(
                 error_codes::STORAGE_WRITE_FAILED,
                 format!(
-                    "failed to persist armed routine run {}: {error}",
+                    "failed to persist armed routine run {} and due indexes atomically: {error}",
                     run.run_id
                 ),
             )
@@ -916,6 +1710,7 @@ fn write_armed_and_run_records(
             format!("ARMED_ROUTINE_RUN_READBACK_MISMATCH for {}", run.run_id),
         ));
     }
+    validate_schedule_due_index_readback(db, &armed.routine_id, &index_mutation)?;
     Ok(())
 }
 
@@ -1098,6 +1893,153 @@ mod tests {
             )],
         )
         .expect("write automation");
+    }
+
+    fn setup_armed_schedule(db: &Arc<Db>, now: u64) -> ArmedRoutineRecord {
+        let routine = routine(now);
+        write_routine(db, &routine);
+        write_state(db, &routine.routine_id, RoutineLifecycle::Confirmed);
+        write_automation(db, &routine.routine_id);
+        arm_routine(
+            db,
+            &routine.routine_id,
+            ArmRoutineConfig::from_optional(Some(true), Some(false), Some(2)),
+            "test-session",
+            None,
+        )
+        .expect("arm")
+    }
+
+    fn delete_schedule_due_indexes(db: &Arc<Db>, routine_id: &str) {
+        if let Some(index) = load_schedule_due_by_id_index(db, routine_id).expect("load by-id") {
+            db.mutate_batch_pressure_bypass(
+                cf::CF_KV,
+                [
+                    schedule_due_by_id_index_key(routine_id),
+                    schedule_due_index_key(routine_id, index.due_ts_ns),
+                ],
+                Vec::<(Vec<u8>, Vec<u8>)>::new(),
+            )
+            .expect("delete indexes");
+        }
+    }
+
+    #[test]
+    fn arm_writes_schedule_due_index_with_primary_hash_readback() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+
+        let index = load_schedule_due_by_id_index(&db, &armed.routine_id)
+            .expect("load by-id index")
+            .expect("index exists");
+        assert_eq!(index.routine_id, armed.routine_id);
+        assert_eq!(
+            index.primary_key_hex,
+            hex_encode(armed_routine_key(&armed.routine_id).as_bytes())
+        );
+
+        let due_key = schedule_due_index_key(&armed.routine_id, index.due_ts_ns);
+        let due_value = load_exact_cf_value(&db, cf::CF_KV, &due_key, "test due index")
+            .expect("read due index")
+            .expect("due index exists");
+        let due_index = decode_schedule_due_index(&due_key, &due_value, "test due index")
+            .expect("decode due index");
+        assert_eq!(due_index, index);
+    }
+
+    #[test]
+    fn schedule_tick_does_not_scan_unindexed_armed_primary_rows() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+        delete_schedule_due_indexes(&db, &armed.routine_id);
+
+        let params = ArmedRoutineTickParams {
+            now_ts_ns: Some(now),
+            trigger_mode: Some(ArmedRoutineTickTriggerMode::Schedule),
+            ..ArmedRoutineTickParams::default()
+        };
+        let (_now, evaluated, due, skipped) = due_armed_runs(&db, &params).expect("due");
+        assert_eq!(evaluated, 0);
+        assert!(due.is_empty());
+        assert!(skipped.is_empty());
+        assert!(
+            load_armed_routine_record(&db, &armed.routine_id)
+                .expect("load primary")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn schedule_tick_rejects_dangling_due_index() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+        let primary_key = armed_routine_key(&armed.routine_id).into_bytes();
+        db.mutate_batch_pressure_bypass(cf::CF_KV, [primary_key], Vec::<(Vec<u8>, Vec<u8>)>::new())
+            .expect("delete primary only");
+
+        let params = ArmedRoutineTickParams {
+            now_ts_ns: Some(now),
+            trigger_mode: Some(ArmedRoutineTickTriggerMode::Schedule),
+            ..ArmedRoutineTickParams::default()
+        };
+        let error = due_armed_runs(&db, &params).expect_err("dangling index must fail");
+        assert!(error.message.contains("ARMED_ROUTINE_DUE_INDEX_DANGLING"));
+    }
+
+    #[test]
+    fn schedule_tick_rejects_stale_routine_hash_in_due_index() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+        let mut changed_routine = load_routine_record(db.as_ref(), &armed.routine_id)
+            .expect("load routine")
+            .expect("routine exists");
+        changed_routine.mean_minute_of_day = (changed_routine.mean_minute_of_day + 30) % 1440;
+        write_routine(&db, &changed_routine);
+
+        let params = ArmedRoutineTickParams {
+            now_ts_ns: Some(now),
+            trigger_mode: Some(ArmedRoutineTickTriggerMode::Schedule),
+            ..ArmedRoutineTickParams::default()
+        };
+        let error = due_armed_runs(&db, &params).expect_err("stale routine hash must fail");
+        assert!(
+            error
+                .message
+                .contains("ARMED_ROUTINE_DUE_INDEX_ROUTINE_HASH_MISMATCH")
+        );
+    }
+
+    #[test]
+    fn schedule_tick_repairs_archived_routine_due_index() {
+        let (_dir, db) = temp_db();
+        let now = now_ts_ns();
+        let armed = setup_armed_schedule(&db, now);
+        assert!(
+            load_schedule_due_by_id_index(&db, &armed.routine_id)
+                .expect("load index")
+                .is_some()
+        );
+        write_state(&db, &armed.routine_id, RoutineLifecycle::Archived);
+
+        let params = ArmedRoutineTickParams {
+            now_ts_ns: Some(now),
+            trigger_mode: Some(ArmedRoutineTickTriggerMode::Schedule),
+            ..ArmedRoutineTickParams::default()
+        };
+        let (_now, evaluated, due, skipped) = due_armed_runs(&db, &params).expect("due");
+        assert_eq!(evaluated, 1);
+        assert!(due.is_empty());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].reason, "routine_lifecycle_disabled");
+        assert!(
+            load_schedule_due_by_id_index(&db, &armed.routine_id)
+                .expect("load repaired index")
+                .is_none()
+        );
     }
 
     #[test]

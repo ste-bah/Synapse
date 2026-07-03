@@ -47,6 +47,7 @@ use crate::m1::mcp_error;
 
 use super::armed_routines::{
     ArmRoutineConfig, ArmedRoutineRecord, arm_routine, disarm_routine, load_armed_routine_record,
+    reindex_armed_routine_schedule_due_indexes,
 };
 use super::episodes::{
     decode_episode_row, hex_encode, key_after, local_day_start, next_local_day_start, now_ts_ns,
@@ -715,7 +716,9 @@ pub fn mine_and_store_routines(
                         )
                         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
                     }
-                    reconcile_state_rows(db, &[], now_ts_ns(), &mut scanned_rows)?
+                    let counters = reconcile_state_rows(db, &[], now_ts_ns(), &mut scanned_rows)?;
+                    reindex_armed_routine_schedule_due_indexes(db)?;
+                    counters
                 };
                 return Ok(RoutineMineResponse {
                     range_start_ns: 0,
@@ -804,6 +807,7 @@ pub fn mine_and_store_routines(
         // this reconcile fails the error is loud, lifecycle rows are intact,
         // and the next mining run repairs the presence bookkeeping.
         state_counters = reconcile_state_rows(db, &mining.routines, mined_at, &mut scanned_rows)?;
+        reindex_armed_routine_schedule_due_indexes(db)?;
         tracing::info!(
             code = "ROUTINE_MINE_REPLACED",
             range_start_ns = range_start_snapped,
