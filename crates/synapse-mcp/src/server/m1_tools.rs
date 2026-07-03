@@ -14330,6 +14330,7 @@ fn resolve_capture_target_window_context(hwnd: i64) -> Result<ForegroundContext,
 }
 
 const WINDOW_SCREENSHOT_TIMEOUT_MS: u64 = 1500;
+const TRANSIENT_HWND_MAX_EDGE_PX: i32 = 64;
 
 fn capture_screen_screenshot_to_file(
     params: &CaptureScreenshotParams,
@@ -14375,21 +14376,7 @@ fn capture_target_window_screenshot_to_file(
         WINDOW_SCREENSHOT_TIMEOUT_MS,
     )
     .map_err(|error| {
-        let target_detail = foreground
-            .as_ref()
-            .map(|context| {
-                format!(
-                    "pid={} process={} title={:?}",
-                    context.pid, context.process_name, context.window_title
-                )
-            })
-            .unwrap_or_else(|| "pid/title/process unavailable".to_owned());
-        mcp_error(
-            error.code(),
-            format!(
-                "capture_screenshot failed for target window {window_hwnd:#x} ({target_detail}) region {region:?}: {error}; recommended_next_action=retry capture_screenshot after confirming the target HWND/PID/title is still live and visually stable"
-            ),
-        )
+        capture_target_window_screenshot_error(window_hwnd, region, foreground.as_ref(), error)
     })?;
     let capture_backend = captured.capture_backend;
     let capture_retry_evidence =
@@ -14411,6 +14398,151 @@ fn capture_target_window_screenshot_to_file(
         foreground,
         capture_retry_evidence,
     )
+}
+
+#[derive(Clone, Debug)]
+struct CaptureTargetWindowCandidateDiagnostic {
+    message: String,
+    candidates: Vec<Value>,
+}
+
+fn capture_target_window_screenshot_error(
+    window_hwnd: i64,
+    region: Rect,
+    foreground: Option<&ForegroundContext>,
+    error: synapse_capture::CaptureError,
+) -> ErrorData {
+    let target_detail = foreground
+        .map(|context| {
+            format!(
+                "pid={} process={} title={:?} bounds={:?}",
+                context.pid, context.process_name, context.window_title, context.window_bounds
+            )
+        })
+        .unwrap_or_else(|| "pid/title/process/bounds unavailable".to_owned());
+    let candidate_diagnostic = capture_target_window_transient_candidate_diagnostic(
+        window_hwnd,
+        foreground,
+        "capture_screenshot",
+    );
+    let candidate_message = candidate_diagnostic
+        .as_ref()
+        .map(|diagnostic| format!("; transient_hwnd_diagnostic={}", diagnostic.message))
+        .unwrap_or_default();
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "capture_screenshot failed for target window {window_hwnd:#x} ({target_detail}) region {region:?}: {error}; recommended_next_action=retry capture_screenshot after confirming the target HWND/PID/title is still live and visually stable{candidate_message}"
+        ),
+        Some(json!({
+            "code": error.code(),
+            "target_window_hwnd": window_hwnd,
+            "target_region": region,
+            "target_pid": foreground.map(|context| context.pid),
+            "target_process": foreground.map(|context| context.process_name.as_str()),
+            "target_title": foreground.map(|context| context.window_title.as_str()),
+            "target_window_bounds": foreground.map(|context| context.window_bounds),
+            "probable_transient_startup_hwnd": foreground
+                .map(capture_context_looks_like_transient_startup_hwnd)
+                .unwrap_or(false),
+            "same_pid_visible_window_candidates": candidate_diagnostic
+                .as_ref()
+                .map(|diagnostic| diagnostic.candidates.clone())
+                .unwrap_or_default(),
+            "recommended_next_action": "retry capture_screenshot after confirming the target HWND/PID/title is still live and visually stable; if same_pid_visible_window_candidates is non-empty, rebind to the named candidate HWND explicitly before retrying",
+        })),
+    )
+}
+
+fn capture_target_window_transient_candidate_diagnostic(
+    window_hwnd: i64,
+    target: Option<&ForegroundContext>,
+    caller: &'static str,
+) -> Option<CaptureTargetWindowCandidateDiagnostic> {
+    let target = target?;
+    if !capture_context_looks_like_transient_startup_hwnd(target) {
+        return None;
+    }
+    let contexts = match synapse_a11y::visible_top_level_window_contexts() {
+        Ok(contexts) => contexts,
+        Err(error) => {
+            tracing::warn!(
+                code = "CAPTURE_TARGET_WINDOW_CANDIDATE_ENUMERATION_FAILED",
+                hwnd = window_hwnd,
+                pid = target.pid,
+                caller,
+                error = %error,
+                "could not enumerate same-PID visible window candidates after target capture failure"
+            );
+            return None;
+        }
+    };
+    capture_target_window_transient_candidate_diagnostic_from_contexts(
+        window_hwnd,
+        target,
+        contexts,
+    )
+}
+
+fn capture_target_window_transient_candidate_diagnostic_from_contexts(
+    window_hwnd: i64,
+    target: &ForegroundContext,
+    contexts: impl IntoIterator<Item = ForegroundContext>,
+) -> Option<CaptureTargetWindowCandidateDiagnostic> {
+    if !capture_context_looks_like_transient_startup_hwnd(target) {
+        return None;
+    }
+    let candidates: Vec<_> = contexts
+        .into_iter()
+        .filter(|context| context.pid == target.pid)
+        .filter(|context| context.hwnd != window_hwnd)
+        .filter(|context| !context.window_title.trim().is_empty())
+        .filter(|context| {
+            context.window_bounds.w > target.window_bounds.w
+                || context.window_bounds.h > target.window_bounds.h
+        })
+        .take(5)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let candidate_summary = candidates
+        .iter()
+        .map(|context| {
+            format!(
+                "hwnd={:#x} pid={} process={} title={:?} bounds={:?}",
+                context.hwnd,
+                context.pid,
+                context.process_name,
+                context.window_title,
+                context.window_bounds
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(CaptureTargetWindowCandidateDiagnostic {
+        message: format!(
+            "target HWND looks like a transient startup/stub window; same-PID visible candidates: {candidate_summary}"
+        ),
+        candidates: candidates
+            .iter()
+            .map(|context| {
+                json!({
+                    "hwnd": context.hwnd,
+                    "pid": context.pid,
+                    "process_name": context.process_name,
+                    "window_title": context.window_title,
+                    "window_bounds": context.window_bounds,
+                })
+            })
+            .collect(),
+    })
+}
+
+fn capture_context_looks_like_transient_startup_hwnd(context: &ForegroundContext) -> bool {
+    context.window_title.trim().is_empty()
+        || context.window_bounds.w <= TRANSIENT_HWND_MAX_EDGE_PX
+        || context.window_bounds.h <= TRANSIENT_HWND_MAX_EDGE_PX
 }
 
 /// #1341/#1343: true when a browser_screenshot bridge capture failed because the
@@ -18018,6 +18150,7 @@ mod tests {
         attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
         background_tab_activation_foregrounded_requested_window, browser_nav_delegate_error,
         browser_tab_entry, browser_wait_for_selector_condition,
+        capture_target_window_transient_candidate_diagnostic_from_contexts,
         cdp_activate_resolution_request_details, cdp_navigation_error_code,
         cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
         chrome_page_vitals_info, downscale_captured_bitmap, hidden_desktop_pip_ended_response,
@@ -18062,7 +18195,9 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::{collections::BTreeSet, num::NonZeroUsize, path::Path};
-    use synapse_core::{OcrResult, OcrWord, PERCEIVED_TEXT_UNTRUSTED_NOTICE, Rect, error_codes};
+    use synapse_core::{
+        ForegroundContext, OcrResult, OcrWord, PERCEIVED_TEXT_UNTRUSTED_NOTICE, Rect, error_codes,
+    };
     use synapse_storage::cf;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -18089,6 +18224,29 @@ mod tests {
             width,
             height,
             bytes,
+        }
+    }
+
+    fn synthetic_window_context(
+        hwnd: i64,
+        pid: u32,
+        process_name: &str,
+        title: &str,
+        bounds: Rect,
+    ) -> ForegroundContext {
+        ForegroundContext {
+            hwnd,
+            pid,
+            process_name: process_name.to_owned(),
+            process_path: format!("C:\\synthetic\\{process_name}"),
+            window_title: title.to_owned(),
+            window_bounds: bounds,
+            monitor_index: 0,
+            dpi_scale: 1.0,
+            profile_id: None,
+            steam_appid: None,
+            is_fullscreen: false,
+            is_dwm_composed: true,
         }
     }
 
@@ -20778,6 +20936,75 @@ mod tests {
             .and_then(serde_json::Value::as_str);
         assert_eq!(code, Some(error_codes::TARGET_WINDOW_NOT_FOUND));
         println!("readback=capture_screenshot edge=dead_hwnd code={code:?}");
+    }
+
+    #[test]
+    fn capture_target_window_transient_hwnd_names_same_pid_candidates() {
+        let target = synthetic_window_context(
+            0x101,
+            77,
+            "synthetic-editor.exe",
+            "",
+            Rect {
+                x: 10,
+                y: 10,
+                w: 22,
+                h: 22,
+            },
+        );
+        let candidate = synthetic_window_context(
+            0x202,
+            77,
+            "synthetic-editor.exe",
+            "Synthetic Editor - world view",
+            Rect {
+                x: 10,
+                y: 10,
+                w: 1280,
+                h: 720,
+            },
+        );
+        let same_hwnd = synthetic_window_context(
+            0x101,
+            77,
+            "synthetic-editor.exe",
+            "Same HWND",
+            Rect {
+                x: 10,
+                y: 10,
+                w: 1280,
+                h: 720,
+            },
+        );
+        let other_pid = synthetic_window_context(
+            0x303,
+            88,
+            "other.exe",
+            "Other Process",
+            Rect {
+                x: 0,
+                y: 0,
+                w: 1920,
+                h: 1080,
+            },
+        );
+
+        let diagnostic = capture_target_window_transient_candidate_diagnostic_from_contexts(
+            target.hwnd,
+            &target,
+            [candidate, same_hwnd, other_pid],
+        )
+        .expect("transient target should report same-PID visible candidate");
+
+        assert!(diagnostic.message.contains("transient startup/stub window"));
+        assert!(diagnostic.message.contains("hwnd=0x202"));
+        assert_eq!(diagnostic.candidates.len(), 1);
+        assert_eq!(
+            diagnostic.candidates[0]
+                .get("window_title")
+                .and_then(Value::as_str),
+            Some("Synthetic Editor - world view")
+        );
     }
 
     #[test]
