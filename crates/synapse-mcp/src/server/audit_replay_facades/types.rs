@@ -321,6 +321,8 @@ pub struct AuditLifecycleTailResponse {
     pub max_line_bytes: usize,
     pub total_lines_read: u64,
     pub matched_lines_seen: u64,
+    pub oversized_lines_seen: u64,
+    pub oversized_lines_skipped: u64,
     pub returned_count: usize,
     pub rows: Vec<AuditLifecycleRowSummary>,
 }

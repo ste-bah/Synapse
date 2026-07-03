@@ -6,6 +6,7 @@ use std::{
 };
 
 use rmcp::model::ErrorCode;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use synapse_core::error_codes;
 
@@ -13,11 +14,18 @@ use crate::{daemon_lifecycle, server::ErrorData};
 
 use super::{
     AUDIT_SOT, AUDIT_TOOL,
-    errors::{io_error, lifecycle_corrupt_error},
+    errors::{io_error, lifecycle_corrupt_error, lifecycle_oversized_error},
     types::{AuditLifecycleRowSummary, AuditLifecycleTailParams, AuditLifecycleTailResponse},
     util::{nested_string, prefixed_sha256, sha256_text, string_field},
     validation::validate_lifecycle_params,
 };
+
+#[derive(Debug, Deserialize)]
+struct LifecycleFilterProbe {
+    event_kind: Option<String>,
+    status: Option<String>,
+    tool: Option<String>,
+}
 pub(super) fn lifecycle_path(key: &str) -> Result<PathBuf, ErrorData> {
     let diagnostic = daemon_lifecycle::diagnostic_value();
     let path = diagnostic
@@ -59,6 +67,8 @@ pub(super) fn read_lifecycle_tail(
     let reader = BufReader::new(file);
     let mut total_lines_read = 0_u64;
     let mut matched_lines_seen = 0_u64;
+    let mut oversized_lines_seen = 0_u64;
+    let mut oversized_lines_skipped = 0_u64;
     let mut rows = VecDeque::with_capacity(params.limit);
     for line in reader.split(b'\n') {
         let mut bytes = line.map_err(|error| {
@@ -83,10 +93,26 @@ pub(super) fn read_lifecycle_tail(
             ));
         }
         if bytes.len() > params.max_line_bytes {
-            return Err(lifecycle_corrupt_error(
+            oversized_lines_seen = oversized_lines_seen.saturating_add(1);
+            let probe: LifecycleFilterProbe = serde_json::from_slice(&bytes).map_err(|error| {
+                lifecycle_corrupt_error(
+                    path,
+                    total_lines_read,
+                    format!("oversized_row JSON decode failed: {error}"),
+                )
+            })?;
+            if !lifecycle_probe_matches(&probe, params) {
+                oversized_lines_skipped = oversized_lines_skipped.saturating_add(1);
+                continue;
+            }
+            return Err(lifecycle_oversized_error(
                 path,
                 total_lines_read,
-                "line exceeded max_line_bytes",
+                bytes.len(),
+                params.max_line_bytes,
+                &probe.tool,
+                &probe.status,
+                &probe.event_kind,
             ));
         }
         let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -111,9 +137,29 @@ pub(super) fn read_lifecycle_tail(
         max_line_bytes: params.max_line_bytes,
         total_lines_read,
         matched_lines_seen,
+        oversized_lines_seen,
+        oversized_lines_skipped,
         returned_count: rows.len(),
         rows,
     })
+}
+
+fn lifecycle_probe_matches(
+    probe: &LifecycleFilterProbe,
+    params: &AuditLifecycleTailParams,
+) -> bool {
+    params
+        .tool
+        .as_deref()
+        .is_none_or(|tool| probe.tool.as_deref() == Some(tool))
+        && params
+            .status
+            .as_deref()
+            .is_none_or(|status| probe.status.as_deref() == Some(status))
+        && params
+            .event_kind
+            .as_deref()
+            .is_none_or(|event_kind| probe.event_kind.as_deref() == Some(event_kind))
 }
 
 fn lifecycle_matches(value: &Value, params: &AuditLifecycleTailParams) -> bool {
