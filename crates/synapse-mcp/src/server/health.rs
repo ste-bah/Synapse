@@ -1,6 +1,8 @@
-use super::{BTreeMap, Health, SubsystemHealth, SynapseService};
+use super::{BTreeMap, ErrorData, Health, SubsystemHealth, SynapseService};
+use rmcp::model::Tool;
 use serde_json::{Map, Value};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::Backend;
 
@@ -184,16 +186,22 @@ impl SynapseService {
     }
 
     fn tool_surface_fingerprint(&self, session_id: Option<&str>) -> ToolSurfaceFingerprint {
-        let mut tools = match self.tools_for_session_profile(session_id) {
+        let mut tools = match self.health_tool_surface(session_id) {
             Ok(tools) => tools,
             Err(error) => {
                 tracing::error!(
-                    code = "MCP_TOOL_SURFACE_PROFILE_READ_FAILED",
+                    code = "MCP_TOOL_SURFACE_HEALTH_READ_FAILED",
                     session_id,
                     error = ?error,
-                    "failed to resolve MCP tool profile while computing health tool surface"
+                    "failed to resolve MCP health tool surface"
                 );
-                super::schema_sanitize::sanitize_tools(self.tool_router.list_all())
+                return ToolSurfaceFingerprint {
+                    names: Vec::new(),
+                    sha256: "TOOL_SURFACE_HEALTH_READ_FAILED".to_owned(),
+                    error: Some(format!(
+                        "failed to resolve MCP health tool surface: {error}"
+                    )),
+                };
             }
         };
         tools.sort_by(|left, right| left.name.cmp(&right.name));
@@ -229,6 +237,20 @@ impl SynapseService {
             sha256: hex_lower(&hasher.finalize()),
             error: None,
         }
+    }
+
+    fn health_tool_surface(&self, session_id: Option<&str>) -> Result<Vec<Tool>, ErrorData> {
+        if session_id.is_some() {
+            return self.tools_for_session_profile(session_id);
+        }
+        let public_snapshot = self.public_tool_registry_snapshot()?;
+        let public_names = public_snapshot
+            .public_tool_names
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut tools = self.full_sanitized_tools();
+        tools.retain(|tool| public_names.contains(tool.name.as_ref()));
+        Ok(tools)
     }
 
     fn storage_health(&self) -> SubsystemHealth {

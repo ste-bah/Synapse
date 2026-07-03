@@ -65,6 +65,30 @@ $ErrorActionPreference = 'Stop'
 function Info($m) { Write-Host "[issue-daemon] $m" }
 function Die($m) { throw "[issue-daemon] FATAL: $m" }
 
+function Get-SynapseFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        Die "SYNAPSE_ISSUE_DAEMON_FILE_HASH_MISSING path=$Path remediation=build or copy the daemon binary before hashing it"
+    }
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+            $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+            try {
+                $hash = $sha.ComputeHash($stream)
+            } finally {
+                $stream.Dispose()
+            }
+        } finally {
+            $sha.Dispose()
+        }
+        return (($hash | ForEach-Object { $_.ToString('X2') }) -join '').ToLowerInvariant()
+    } catch {
+        Die "SYNAPSE_ISSUE_DAEMON_FILE_HASH_FAILED path=$Path error=$($_.Exception.Message) remediation=verify the binary is readable and retry issue-daemon launch"
+    }
+}
+
 function Resolve-ExistingPath {
     param([Parameter(Mandatory = $true)][string]$Path)
     return [System.IO.Path]::GetFullPath((Resolve-Path -LiteralPath $Path -ErrorAction Stop).Path)
@@ -216,8 +240,8 @@ if ($runExeFull -ieq $sourceExe) {
 
 New-Item -ItemType Directory -Path $runDir -Force | Out-Null
 Copy-Item -LiteralPath $sourceExe -Destination $runExeFull -Force
-$sourceHash = (Get-FileHash -LiteralPath $sourceExe -Algorithm SHA256).Hash.ToLowerInvariant()
-$runHash = (Get-FileHash -LiteralPath $runExeFull -Algorithm SHA256).Hash.ToLowerInvariant()
+$sourceHash = Get-SynapseFileSha256 -Path $sourceExe
+$runHash = Get-SynapseFileSha256 -Path $runExeFull
 if ($sourceHash -ne $runHash) {
     Die "SYNAPSE_ISSUE_DAEMON_COPY_HASH_MISMATCH source=$sourceHash copy=$runHash remediation=delete the copied exe and retry"
 }

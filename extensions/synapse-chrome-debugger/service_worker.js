@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
 const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-30-window-id-v2";
-const BRIDGE_DECLARED_BUILD_SHA256 = "4b2998af1e4c6a12d3d5137bd7fe3955b5dd9afa0d1d4ad3d95228a39ad901d3";
+const BRIDGE_DECLARED_BUILD_SHA256 = "a3e3013060a20b95af67da6f5be3cdd45b36f85b9ea64ebf304577b389225fea";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -52,6 +52,7 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "localeEmulation",
   "mediaEmulation",
   "networkConditions",
+  "maintenancePauseReconnect",
   "domAction",
   "coordinateClick",
   "reloadSelf",
@@ -68,6 +69,8 @@ const ERROR_EXTENSION_TIMEOUT = "A11Y_CDP_EXTENSION_TIMEOUT";
 const ERROR_EXTENSION_STALE = "CHROME_BRIDGE_EXTENSION_STALE";
 const ERROR_EXTENSION_ID_MISMATCH = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
 const ERROR_DAEMON_UNAVAILABLE = "SYNAPSE_CHROME_DAEMON_UNAVAILABLE";
+const ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED =
+  "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED";
 const ERROR_CHROME_SCRIPTING_EXECUTE_FAILED = "CHROME_SCRIPTING_EXECUTE_FAILED";
 const ERROR_CHROME_DOM_SELECTOR_INVALID = "CHROME_DOM_SELECTOR_INVALID";
 const ERROR_CHROME_DOM_ELEMENT_NOT_FOUND = "CHROME_DOM_ELEMENT_NOT_FOUND";
@@ -87,6 +90,11 @@ const DISCONNECTED_KEEPALIVE_MS = 20000;
 const RECONNECT_WAKE_ALARM_NAME = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_DELAY_MINUTES = 0.5;
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES = 0.5;
+const MAINTENANCE_RECONNECT_PAUSE_STORAGE_KEY = "synapseMaintenanceReconnectPause";
+const WEBSOCKET_CLOSE_CODE_RECONNECT_CLEANUP = 3001;
+const WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS = 0;
+const MAINTENANCE_RECONNECT_PAUSE_MIN_MS = 1000;
+const MAINTENANCE_RECONNECT_PAUSE_MAX_MS = 900000;
 const AGENT_NAVIGATION_CLAIM_TTL_MS = 30000;
 const MAX_RECENT_NAVIGATION_KEYS = 128;
 const MAX_PAGE_TEXT_CHARS = 4096;
@@ -122,6 +130,10 @@ let reconnectTimer = null;
 let reconnectAttempt = 0;
 let disconnectedKeepAliveTimer = null;
 let permanentlyDisabled = false;
+let maintenanceReconnectPauseUntilMs = 0;
+let maintenanceReconnectPauseReason = "";
+let maintenanceReconnectPauseLoaded = false;
+let maintenanceReconnectPauseLoadInFlight = null;
 const agentNavigationClaims = new Map();
 const recentNavigationKeys = [];
 const pageEventBuffers = new Map();
@@ -154,6 +166,113 @@ let serviceWorkerIntegrityState = {
   reason: "not_checked"
 };
 
+function maintenanceReconnectPauseStorage() {
+  return chrome.storage?.session || null;
+}
+
+function normalizeStoredMaintenanceReconnectPause(record) {
+  if (!record || typeof record !== "object") {
+    return null;
+  }
+  const pauseUntilMs = Number(record.pause_until_unix_ms);
+  const reason = String(record.reason || "").trim();
+  if (!Number.isFinite(pauseUntilMs) || pauseUntilMs <= 0 || !reason) {
+    return null;
+  }
+  return {
+    pauseUntilMs,
+    reason
+  };
+}
+
+async function removeStoredMaintenanceReconnectPause(reason) {
+  const storage = maintenanceReconnectPauseStorage();
+  if (!storage?.remove) {
+    return;
+  }
+  try {
+    await storage.remove(MAINTENANCE_RECONNECT_PAUSE_STORAGE_KEY);
+  } catch (error) {
+    console.warn(
+      `Synapse maintenance reconnect pause storage cleanup failed: ` +
+        `reason=${reason} error=${errorMessage(error)}`
+    );
+  }
+}
+
+async function persistMaintenanceReconnectPause(pauseUntilMs, reason) {
+  const storage = maintenanceReconnectPauseStorage();
+  if (!storage?.set) {
+    throw bridgeError(
+      ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED,
+      "chrome.storage.session is unavailable; maintenance pause cannot survive MV3 worker restart"
+    );
+  }
+  const record = {
+    pause_until_unix_ms: pauseUntilMs,
+    reason,
+    stored_at_unix_ms: Date.now(),
+    bridge_build_id: BRIDGE_BUILD_ID,
+    extension_id: chrome.runtime.id
+  };
+  try {
+    await storage.set({ [MAINTENANCE_RECONNECT_PAUSE_STORAGE_KEY]: record });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED,
+      `chrome.storage.session.set failed for maintenance pause: ${errorMessage(error)}`
+    );
+  }
+}
+
+async function loadMaintenanceReconnectPause(reason) {
+  if (maintenanceReconnectPauseLoaded) {
+    return;
+  }
+  if (maintenanceReconnectPauseLoadInFlight) {
+    await maintenanceReconnectPauseLoadInFlight;
+    return;
+  }
+  maintenanceReconnectPauseLoadInFlight = (async () => {
+    const storage = maintenanceReconnectPauseStorage();
+    if (!storage?.get) {
+      maintenanceReconnectPauseLoaded = true;
+      return;
+    }
+    let result;
+    try {
+      result = await storage.get(MAINTENANCE_RECONNECT_PAUSE_STORAGE_KEY);
+    } catch (error) {
+      disableBridgePermanently(
+        `maintenance pause storage read failed during ${reason}: ${errorMessage(error)}`,
+        ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED
+      );
+      return;
+    }
+    const stored = normalizeStoredMaintenanceReconnectPause(
+      result?.[MAINTENANCE_RECONNECT_PAUSE_STORAGE_KEY]
+    );
+    const now = Date.now();
+    if (stored && stored.pauseUntilMs > now) {
+      maintenanceReconnectPauseUntilMs = stored.pauseUntilMs;
+      maintenanceReconnectPauseReason = stored.reason;
+      ensureReconnectWakeAlarm();
+      console.warn(
+        `Synapse daemon bridge restored persisted maintenance pause: ` +
+          `remaining_ms=${stored.pauseUntilMs - now} reason=${stored.reason} trigger=${reason}`
+      );
+    } else if (stored) {
+      maintenanceReconnectPauseUntilMs = 0;
+      maintenanceReconnectPauseReason = "";
+      removeStoredMaintenanceReconnectPause(`expired:${reason}`);
+    }
+    maintenanceReconnectPauseLoaded = true;
+  })().finally(() => {
+    maintenanceReconnectPauseLoadInFlight = null;
+  });
+  await maintenanceReconnectPauseLoadInFlight;
+}
+
 async function startBridge() {
   if (chrome.runtime.id !== EXPECTED_EXTENSION_ID) {
     disableBridgePermanently(
@@ -165,6 +284,7 @@ async function startBridge() {
     return;
   }
   ensureReconnectWakeAlarm();
+  await loadMaintenanceReconnectPause("startup");
   await ensureExternalPopupRiskSuppression("startup");
   connectDaemon();
 }
@@ -172,12 +292,38 @@ async function startBridge() {
 function startBridgeFromEvent() {
   startBridge().catch((error) => {
     console.error(`Synapse daemon bridge startup failed: ${errorMessage(error)}`);
-    connectDaemon();
+    if (!permanentlyDisabled) {
+      connectDaemon();
+    }
   });
 }
 
 function connectDaemon() {
   if (permanentlyDisabled) {
+    return;
+  }
+  if (!maintenanceReconnectPauseLoaded) {
+    loadMaintenanceReconnectPause("connectDaemon")
+      .then(() => {
+        if (!permanentlyDisabled) {
+          connectDaemon();
+        }
+      })
+      .catch((error) => {
+        disableBridgePermanently(
+          `maintenance pause storage restore failed before connect: ${errorMessage(error)}`,
+          ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED
+        );
+      });
+    return;
+  }
+  const pauseRemainingMs = maintenanceReconnectPauseRemainingMs();
+  if (pauseRemainingMs > 0) {
+    ensureReconnectWakeAlarm();
+    console.warn(
+      `Synapse daemon bridge reconnect paused for maintenance: ` +
+        `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason}`
+    );
     return;
   }
   if (connectInFlight) {
@@ -266,6 +412,18 @@ function scheduleReconnect(detail, code) {
   closeWebSocket();
   hostId = null;
   bridgeToken = null;
+  const pauseRemainingMs = maintenanceReconnectPauseRemainingMs();
+  if (pauseRemainingMs > 0) {
+    clearReconnectTimer();
+    stopDisconnectedKeepAlive();
+    ensureReconnectWakeAlarm();
+    console.warn(
+      `Synapse daemon bridge reconnect suppressed during maintenance: code=${code} ` +
+        `remaining_ms=${pauseRemainingMs} reason=${maintenanceReconnectPauseReason} ` +
+        `detail=${detail}`
+    );
+    return;
+  }
   const delayMs = Math.min(
     RECONNECT_MAX_MS,
     RECONNECT_INITIAL_MS * 2 ** Math.min(reconnectAttempt, 5)
@@ -297,6 +455,19 @@ function resetReconnectState() {
   clearReconnectTimer();
   stopDisconnectedKeepAlive();
   ensureReconnectWakeAlarm();
+}
+
+function maintenanceReconnectPauseRemainingMs(now = Date.now()) {
+  if (maintenanceReconnectPauseUntilMs <= now) {
+    const hadPause = maintenanceReconnectPauseUntilMs > 0 || maintenanceReconnectPauseReason;
+    maintenanceReconnectPauseUntilMs = 0;
+    maintenanceReconnectPauseReason = "";
+    if (hadPause) {
+      removeStoredMaintenanceReconnectPause("expired");
+    }
+    return 0;
+  }
+  return maintenanceReconnectPauseUntilMs - now;
 }
 
 async function ensureExternalPopupRiskSuppression(reason) {
@@ -691,7 +862,23 @@ function handleReconnectWakeAlarm(alarm) {
   if (alarm?.name !== RECONNECT_WAKE_ALARM_NAME || permanentlyDisabled) {
     return;
   }
-  startBridgeFromEvent();
+  loadMaintenanceReconnectPause("reconnectWakeAlarm")
+    .then(() => {
+      if (permanentlyDisabled) {
+        return;
+      }
+      if (maintenanceReconnectPauseRemainingMs() > 0) {
+        ensureReconnectWakeAlarm();
+        return;
+      }
+      startBridgeFromEvent();
+    })
+    .catch((error) => {
+      disableBridgePermanently(
+        `maintenance pause storage restore failed during reconnect alarm: ${errorMessage(error)}`,
+        ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED
+      );
+    });
 }
 
 function handleManagementStateChanged(info) {
@@ -710,17 +897,52 @@ function handleManagementStateChanged(info) {
   });
 }
 
-function closeWebSocket() {
+function closeWebSocket(options = {}) {
   stopWebSocketKeepAlive();
   const socket = webSocket;
+  const readyStateBefore = socket ? socket.readyState : null;
+  const result = {
+    had_socket: Boolean(socket),
+    ready_state_before: readyStateBefore,
+    close_requested: false,
+    close_error: null
+  };
   webSocket = null;
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
     try {
-      socket.close();
-    } catch (_) {
-      // Closing is best-effort during reconnect cleanup.
+      socket.close(
+        WEBSOCKET_CLOSE_CODE_RECONNECT_CLEANUP,
+        String(options.reason || "synapse bridge reconnect cleanup")
+      );
+      result.close_requested = true;
+    } catch (error) {
+      result.close_error = errorMessage(error);
+      if (options.failOnError === true) {
+        throw bridgeError(
+          ERROR_DAEMON_UNAVAILABLE,
+          `Synapse daemon bridge websocket close failed during maintenance: ${result.close_error}`
+        );
+      }
     }
   }
+  return result;
+}
+
+function requestWebSocketCloseAfterResponse(reason) {
+  const socket = webSocket;
+  const readyStateBefore = socket ? socket.readyState : null;
+  const result = {
+    had_socket: Boolean(socket),
+    ready_state_before: readyStateBefore,
+    close_requested: false,
+    close_deferred: false,
+    close_error: null
+  };
+  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+    result.close_requested = true;
+    result.close_deferred = true;
+  }
+  return result;
 }
 
 chrome.runtime.onInstalled.addListener(startBridgeFromEvent);
@@ -873,6 +1095,7 @@ async function handleCommand(command) {
   try {
     let result;
     let reloadAfterResponse = false;
+    let closeWebSocketAfterResponse = null;
     await requireExternalPopupRisksSuppressed(kind, params);
     if (kind === "snapshot") {
       result = rejectAttachCommand(kind, params);
@@ -950,6 +1173,11 @@ async function handleCommand(command) {
       result = await handleMediaEmulation(params);
     } else if (kind === "networkConditions") {
       result = await handleNetworkConditions(params);
+    } else if (kind === "maintenancePauseReconnect") {
+      result = await handleMaintenancePauseReconnect(params);
+      if (result?.websocket_close?.close_deferred === true) {
+        closeWebSocketAfterResponse = "synapse maintenance reconnect pause";
+      }
     } else if (kind === "typeActiveElement") {
       result = await handleTypeActiveElement(params);
     } else if (kind === "setFieldValue") {
@@ -985,6 +1213,18 @@ async function handleCommand(command) {
       );
     }
     await postResponse(id, true, result, null);
+    if (closeWebSocketAfterResponse) {
+      setTimeout(() => {
+        try {
+          closeWebSocket({
+            failOnError: false,
+            reason: closeWebSocketAfterResponse
+          });
+        } catch (error) {
+          console.error(`Synapse post-response websocket close failed: ${errorMessage(error)}`);
+        }
+      }, WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS);
+    }
     if (reloadAfterResponse) {
       scheduleRuntimeReload(result.reload_delay_ms);
     }
@@ -11050,6 +11290,40 @@ function handleReloadSelf(params = {}) {
     host_id: hostId,
     reload_requested_at_unix_ms: Date.now(),
     reload_delay_ms: delayMs
+  };
+}
+
+async function handleMaintenancePauseReconnect(params = {}) {
+  const pauseMs = normalizeMaintenanceReconnectPauseMs(params.pauseMs);
+  const reason = normalizeMaintenanceReconnectPauseReason(params.reason);
+  const now = Date.now();
+  const pauseUntilMs = now + pauseMs;
+  await persistMaintenanceReconnectPause(pauseUntilMs, reason);
+  maintenanceReconnectPauseLoaded = true;
+  maintenanceReconnectPauseUntilMs = pauseUntilMs;
+  maintenanceReconnectPauseReason = reason;
+  clearReconnectTimer();
+  stopDisconnectedKeepAlive();
+  const websocketClose = requestWebSocketCloseAfterResponse(
+    "synapse maintenance reconnect pause"
+  );
+  ensureReconnectWakeAlarm();
+  console.warn(
+    `Synapse daemon bridge reconnect paused for maintenance: ` +
+      `pause_ms=${pauseMs} pause_until_unix_ms=${maintenanceReconnectPauseUntilMs} ` +
+      `reason=${reason} persisted=true websocket_close=${JSON.stringify(websocketClose)}`
+  );
+  return {
+    ok: true,
+    host_id: hostId,
+    pause_ms: pauseMs,
+    pause_until_unix_ms: maintenanceReconnectPauseUntilMs,
+    reason,
+    reconnect_suppressed: true,
+    persisted: true,
+    websocket_close: websocketClose,
+    bridge_build_id: BRIDGE_BUILD_ID,
+    extension_id: chrome.runtime.id
   };
 }
 
@@ -21145,6 +21419,30 @@ function normalizeReloadDelay(value) {
     throw bridgeError(ERROR_ATTACH_FAILED, "reloadDelayMs must be an integer from 0 through 5000");
   }
   return number;
+}
+
+function normalizeMaintenanceReconnectPauseMs(value) {
+  const number = Number(value);
+  if (
+    !Number.isInteger(number) ||
+    number < MAINTENANCE_RECONNECT_PAUSE_MIN_MS ||
+    number > MAINTENANCE_RECONNECT_PAUSE_MAX_MS
+  ) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `pauseMs must be an integer from ${MAINTENANCE_RECONNECT_PAUSE_MIN_MS} ` +
+        `through ${MAINTENANCE_RECONNECT_PAUSE_MAX_MS}`
+    );
+  }
+  return number;
+}
+
+function normalizeMaintenanceReconnectPauseReason(value) {
+  const reason = String(value || "").trim();
+  if (!reason || reason.length > 256) {
+    throw bridgeError(ERROR_ATTACH_FAILED, "maintenance reconnect pause reason must be 1..=256 chars");
+  }
+  return reason;
 }
 
 function normalizeEvaluateExpression(value) {

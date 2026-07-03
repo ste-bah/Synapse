@@ -3223,7 +3223,7 @@ impl SynapseService {
         Ok(readback)
     }
 
-    fn full_sanitized_tools(&self) -> Vec<Tool> {
+    pub(crate) fn full_sanitized_tools(&self) -> Vec<Tool> {
         super::schema_sanitize::sanitize_tools(self.tool_router.list_all())
     }
 

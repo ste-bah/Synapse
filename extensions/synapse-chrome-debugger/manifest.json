@@ -12,6 +12,7 @@
     "downloads",
     "management",
     "scripting",
+    "storage",
     "tabs",
     "webRequest",
     "webNavigation"

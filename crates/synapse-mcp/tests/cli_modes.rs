@@ -29,7 +29,19 @@ async fn http_mode_serves_health_until_shutdown() -> anyhow::Result<()> {
     let wrong = read_health_once(&bind, Some("wrong-token")).await;
     let shutdown_missing = read_shutdown_once(&bind, None).await;
     let shutdown_wrong = read_shutdown_once(&bind, Some("wrong-token")).await;
+    let pause_missing =
+        read_maintenance_pause_once(&bind, None, "issue1410 endpoint auth", 120_000).await;
+    let pause_wrong = read_maintenance_pause_once(
+        &bind,
+        Some("wrong-token"),
+        "issue1410 endpoint auth",
+        120_000,
+    )
+    .await;
+    let pause_unavailable =
+        read_maintenance_pause_once(&bind, Some(token), "issue1410 no active host", 120_000).await;
     let shutdown = read_shutdown_once(&bind, Some(token)).await;
+    let mcp_during_drain = read_mcp_initialize_once(&bind, token).await;
     wait_child_exit(&mut child).await?;
 
     let response = response?;
@@ -37,10 +49,21 @@ async fn http_mode_serves_health_until_shutdown() -> anyhow::Result<()> {
     let wrong = wrong?;
     let shutdown_missing = shutdown_missing?;
     let shutdown_wrong = shutdown_wrong?;
+    let pause_missing = pause_missing?;
+    let pause_wrong = pause_wrong?;
+    let pause_unavailable = pause_unavailable?;
     let shutdown = shutdown?;
+    let mcp_during_drain = mcp_during_drain?;
     let logs = read_logs(dir.path())?;
     assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
     assert!(response.contains(r#""ok":true"#), "{response}");
+    assert!(response.contains(r#""tool_count":40"#), "{response}");
+    assert!(
+        response
+            .contains("public_tool_count=40 max_public_tool_count=40 implementation_tool_count="),
+        "{response}"
+    );
+    assert!(!response.contains(r#""act_click""#), "{response}");
     assert!(
         missing.starts_with("HTTP/1.1 401 Unauthorized"),
         "{missing}"
@@ -54,12 +77,156 @@ async fn http_mode_serves_health_until_shutdown() -> anyhow::Result<()> {
         shutdown_wrong.starts_with("HTTP/1.1 401 Unauthorized"),
         "{shutdown_wrong}"
     );
+    assert!(
+        pause_missing.starts_with("HTTP/1.1 401 Unauthorized"),
+        "{pause_missing}"
+    );
+    assert!(
+        pause_wrong.starts_with("HTTP/1.1 401 Unauthorized"),
+        "{pause_wrong}"
+    );
+    assert!(
+        pause_unavailable.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "{pause_unavailable}"
+    );
+    assert!(
+        pause_unavailable
+            .to_ascii_lowercase()
+            .contains("connection: close"),
+        "{pause_unavailable}"
+    );
+    assert!(
+        pause_unavailable.contains("A11Y_CDP_EXTENSION_UNAVAILABLE"),
+        "{pause_unavailable}"
+    );
     assert!(shutdown.starts_with("HTTP/1.1 202 Accepted"), "{shutdown}");
+    assert!(
+        shutdown.to_ascii_lowercase().contains("connection: close"),
+        "{shutdown}"
+    );
     assert!(shutdown.contains(r#""shutdown":"requested""#), "{shutdown}");
+    assert!(
+        mcp_during_drain.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "{mcp_during_drain}"
+    );
+    assert!(
+        mcp_during_drain
+            .to_ascii_lowercase()
+            .contains("connection: close"),
+        "{mcp_during_drain}"
+    );
+    assert!(
+        mcp_during_drain.contains("DAEMON_RESTARTING"),
+        "{mcp_during_drain}"
+    );
     assert!(logs.contains("MCP_HTTP_SHUTDOWN_REQUESTED"), "{logs}");
     assert!(logs.contains("MCP_SHUTDOWN_GRACEFUL"), "{logs}");
+    assert!(
+        logs.contains("HTTP MCP request refused because daemon is draining"),
+        "{logs}"
+    );
     assert!(logs.contains("SAFETY_RELEASE_ALL_FIRED"), "{logs}");
     assert!(logs.contains("MCP_M2_EMITTER_SHUTDOWN_DONE"), "{logs}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_shutdown_exits_with_open_keep_alive_client() -> anyhow::Result<()> {
+    let _guard = cli_mode_test_lock().lock().await;
+    let dir = TempDir::new()?;
+    let bind = free_loopback_bind()?;
+    let token = "cli-mode-keep-alive-token";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
+        .args(["--mode", "http", "--bind", &bind])
+        .env("SYNAPSE_LOG_DIR", dir.path())
+        .env("APPDATA", dir.path())
+        .env("LOCALAPPDATA", dir.path())
+        .env("SYNAPSE_BEARER_TOKEN", token)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    wait_for_health(&bind, Some(token)).await?;
+    let mut keep_alive = open_keep_alive_health(&bind, token).await?;
+    let shutdown = read_shutdown_once(&bind, Some(token)).await?;
+    wait_child_exit(&mut child).await?;
+    let rebound = TcpListener::bind(&bind)
+        .with_context(|| format!("rebind {bind} after daemon shutdown with keep-alive client"))?;
+    drop(rebound);
+
+    let logs = read_logs(dir.path())?;
+    assert!(shutdown.starts_with("HTTP/1.1 202 Accepted"), "{shutdown}");
+    assert!(
+        shutdown.to_ascii_lowercase().contains("connection: close"),
+        "{shutdown}"
+    );
+    assert!(logs.contains("MCP_HTTP_SHUTDOWN_TOKEN_CANCELLED"), "{logs}");
+    assert!(logs.contains("MCP_HTTP_CONNECTIONS_CANCELLED"), "{logs}");
+    assert!(
+        logs.contains("MCP_HTTP_SERVER_STOPPED") || logs.contains("MCP_HTTP_SERVER_ABORTED"),
+        "{logs}"
+    );
+
+    let mut one = [0_u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(1), keep_alive.read(&mut one)).await;
+    assert!(
+        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        "keep-alive client still readable/open after daemon exit: {closed:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_shutdown_closes_active_mcp_sse_session() -> anyhow::Result<()> {
+    let _guard = cli_mode_test_lock().lock().await;
+    let dir = TempDir::new()?;
+    let bind = free_loopback_bind()?;
+    let token = "cli-mode-mcp-sse-token";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_synapse-mcp"))
+        .args(["--mode", "http", "--bind", &bind])
+        .env("SYNAPSE_LOG_DIR", dir.path())
+        .env("APPDATA", dir.path())
+        .env("LOCALAPPDATA", dir.path())
+        .env("SYNAPSE_BEARER_TOKEN", token)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    wait_for_health(&bind, Some(token)).await?;
+    let initialize = read_mcp_initialize_once(&bind, token).await?;
+    let session_id = header_value(&initialize, "mcp-session-id")
+        .context("initialize returned no MCP session")?;
+    let mut sse = open_mcp_sse_stream(&bind, token, &session_id).await?;
+    let shutdown = read_shutdown_once(&bind, Some(token)).await?;
+    wait_child_exit(&mut child).await?;
+    let rebound = TcpListener::bind(&bind)
+        .with_context(|| format!("rebind {bind} after daemon shutdown with active MCP SSE"))?;
+    drop(rebound);
+
+    let mut remaining = Vec::new();
+    let closed =
+        tokio::time::timeout(Duration::from_secs(2), sse.read_to_end(&mut remaining)).await;
+    assert!(
+        matches!(closed, Ok(Ok(_)) | Ok(Err(_))),
+        "MCP SSE client still open after daemon exit: {closed:?}"
+    );
+
+    let logs = read_logs(dir.path())?;
+    assert!(shutdown.starts_with("HTTP/1.1 202 Accepted"), "{shutdown}");
+    assert!(shutdown.contains(r#""sessions_before":1"#), "{shutdown}");
+    assert!(shutdown.contains(r#""close_attempted":1"#), "{shutdown}");
+    assert!(logs.contains("MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED"), "{logs}");
+    assert!(
+        logs.contains("MCP_HTTP_SOCKET_SHUTDOWN_ON_DROP_ENABLED"),
+        "{logs}"
+    );
+    if cfg!(windows) {
+        assert!(
+            logs.contains("MCP_HTTP_ACCEPTED_SOCKET_DROP_SHUTDOWN"),
+            "{logs}"
+        );
+    }
+    assert!(logs.contains(&session_id), "{logs}");
     Ok(())
 }
 
@@ -380,6 +547,152 @@ async fn read_shutdown_once(bind: &str, token: Option<&str>) -> anyhow::Result<S
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
     String::from_utf8(response).context("decode HTTP shutdown response")
+}
+
+async fn read_maintenance_pause_once(
+    bind: &str,
+    token: Option<&str>,
+    reason: &str,
+    pause_ms: u64,
+) -> anyhow::Result<String> {
+    let mut stream = TcpStream::connect(bind).await?;
+    let auth = token.map_or(String::new(), |token| {
+        format!("Authorization: Bearer {token}\r\n")
+    });
+    let body = format!(r#"{{"reason":"{reason}","pause_ms":{pause_ms}}}"#);
+    let request = format!(
+        "POST /chrome-debugger/native/maintenance-pause HTTP/1.1\r\nHost: {bind}\r\n{auth}User-Agent: synapse-cli-mode-test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    String::from_utf8(response).context("decode HTTP maintenance-pause response")
+}
+
+async fn read_mcp_initialize_once(bind: &str, token: &str) -> anyhow::Result<String> {
+    let mut stream = TcpStream::connect(bind).await?;
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cli-mode-test","version":"0.0.0"}}}"#;
+    let request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {bind}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await?;
+    String::from_utf8(response).context("decode HTTP MCP initialize response")
+}
+
+async fn open_keep_alive_health(bind: &str, token: &str) -> anyhow::Result<TcpStream> {
+    let mut stream = TcpStream::connect(bind).await?;
+    let request = format!(
+        "GET /health HTTP/1.1\r\nHost: {bind}\r\nAuthorization: Bearer {token}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_single_http_response(&mut stream).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(
+        response.to_ascii_lowercase().contains("connection: close"),
+        "{response}"
+    );
+    assert!(response.contains(r#""ok":true"#), "{response}");
+    Ok(stream)
+}
+
+async fn open_mcp_sse_stream(
+    bind: &str,
+    token: &str,
+    session_id: &str,
+) -> anyhow::Result<TcpStream> {
+    let mut stream = TcpStream::connect(bind).await?;
+    let request = format!(
+        "GET /mcp HTTP/1.1\r\nHost: {bind}\r\nAuthorization: Bearer {token}\r\nAccept: text/event-stream\r\nMcp-Session-Id: {session_id}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await?;
+    let response = read_http_headers(&mut stream).await?;
+    assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: text/event-stream"),
+        "{response}"
+    );
+    Ok(stream)
+}
+
+async fn read_http_headers(stream: &mut TcpStream) -> anyhow::Result<String> {
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .context("timed out reading HTTP response headers")??;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read]);
+        if let Some(end) = find_header_end(&response) {
+            response.truncate(end + 4);
+            break;
+        }
+    }
+    String::from_utf8(response).context("decode HTTP response headers")
+}
+
+async fn read_single_http_response(stream: &mut TcpStream) -> anyhow::Result<String> {
+    let mut response = Vec::new();
+    let mut header_end = None;
+    let mut expected_len = None;
+    let mut chunk = [0_u8; 1024];
+
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut chunk))
+            .await
+            .context("timed out reading HTTP response")??;
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(&chunk[..read]);
+        if header_end.is_none() {
+            header_end = find_header_end(&response);
+            if let Some(end) = header_end {
+                let headers = String::from_utf8_lossy(&response[..end]);
+                expected_len = content_length(&headers).map(|len| end + 4 + len);
+            }
+        }
+        if expected_len.is_some_and(|len| response.len() >= len) {
+            break;
+        }
+    }
+
+    String::from_utf8(response).context("decode single HTTP response")
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn header_value(response: &str, name: &str) -> Option<String> {
+    response
+        .lines()
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_owned())
+        })
 }
 
 async fn wait_child_exit(child: &mut Child) -> anyhow::Result<()> {

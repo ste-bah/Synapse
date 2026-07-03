@@ -12,12 +12,22 @@ param(
     # Default behavior auto-loads the bundled unpacked extension into the
     # already-open active Chrome profile when the profile row is absent.
     [switch]$SkipAutoInstall,
+    # Maintenance/self-heal entry point: when the expected unpacked extension row
+    # is already installed and ready but no daemon bridge host is registered, use
+    # the already-open Chrome extensions page UI to invoke its Reload button.
+    [switch]$ReloadExistingExtensionViaUi,
     [ValidateRange(5, 300)]
     [int]$AutoInstallTimeoutSeconds = 90
 )
 
 $ErrorActionPreference = 'Stop'
-Import-Module Microsoft.PowerShell.Security -ErrorAction SilentlyContinue
+if ($SkipAutoInstall -and $ReloadExistingExtensionViaUi) {
+    throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_RELOAD_CONFLICT skip_auto_install=true reload_existing_extension_via_ui=true remediation=choose either the read-only skip path or the existing-extension UI reload path; setup must not silently ignore one of these mutually exclusive modes"
+}
+# `Get-Acl` is diagnostic-only below. Some hidden Windows PowerShell launch
+# environments have Security type data loaded while the cmdlet is not callable;
+# importing then fails with duplicate type-data errors. Let the diagnostic reader
+# report an acl_error instead of aborting bridge installation.
 
 function ConvertTo-CompressedJson {
     param(
@@ -26,6 +36,30 @@ function ConvertTo-CompressedJson {
         [int]$Depth = 12
     )
     ConvertTo-Json -InputObject $Value -Depth $Depth -Compress
+}
+
+function Get-SynapseFileSha256 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "SYNAPSE_CHROME_FILE_HASH_MISSING path=$Path remediation=write the extension artifact before hashing it"
+    }
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+            $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+            try {
+                $hash = $sha.ComputeHash($stream)
+            } finally {
+                $stream.Dispose()
+            }
+        } finally {
+            $sha.Dispose()
+        }
+        return (($hash | ForEach-Object { $_.ToString('X2') }) -join '')
+    } catch {
+        throw "SYNAPSE_CHROME_FILE_HASH_FAILED path=$Path error=$($_.Exception.Message) remediation=verify the extension artifact is readable and retry the Chrome bridge install"
+    }
 }
 
 function Get-RegistryAclDiagnostic {
@@ -555,8 +589,8 @@ $extensionDeploy = [pscustomobject]@{
     build_id = $bridgeBuildId
     declared_build_sha256 = $bridgeDeclaredBuildSha256
     build_sha256 = $bridgeDeclaredBuildSha256
-    manifest_sha256 = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash
-    service_worker_sha256 = (Get-FileHash -LiteralPath (Join-Path $extensionDir 'service_worker.js') -Algorithm SHA256).Hash
+    manifest_sha256 = Get-SynapseFileSha256 -Path $manifestPath
+    service_worker_sha256 = Get-SynapseFileSha256 -Path (Join-Path $extensionDir 'service_worker.js')
 }
 $requiredPermissions = @($extensionManifest.permissions)
 $optionalPermissions = @($extensionManifest.optional_permissions)
@@ -1125,6 +1159,38 @@ function Set-SynapseAutomationEditValue {
     }
 }
 
+function Set-SynapseChromeAddressBarUrl {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Window,
+        [Parameter(Mandatory = $true)]
+        [string]$Url
+    )
+
+    $addressBar = Find-SynapseAutomationElementByName `
+        -Root $Window.element `
+        -Name 'Address and search bar' `
+        -ControlType ([System.Windows.Automation.ControlType]::Edit)
+    if (-not $addressBar) {
+        throw "SYNAPSE_CHROME_ADDRESS_BAR_NOT_FOUND chrome_window_hwnd=$($Window.hwnd) chrome_window_pid=$($Window.pid) title=$($Window.title) remediation=Chrome did not expose the address bar through UI Automation; setup refuses clipboard/key-only navigation or launching another Chrome profile"
+    }
+
+    try {
+        $addressBar.SetFocus()
+    } catch {
+        throw "SYNAPSE_CHROME_ADDRESS_BAR_FOCUS_FAILED chrome_window_hwnd=$($Window.hwnd) chrome_window_pid=$($Window.pid) error=$($_.Exception.Message) remediation=repair the existing Chrome window focus/UIA state before bridge UI repair"
+    }
+    Start-Sleep -Milliseconds 100
+    try {
+        $valuePattern = $addressBar.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+        $valuePattern.SetValue($Url)
+    } catch {
+        throw "SYNAPSE_CHROME_ADDRESS_BAR_SET_VALUE_FAILED chrome_window_hwnd=$($Window.hwnd) chrome_window_pid=$($Window.pid) url=$Url error=$($_.Exception.Message) remediation=Chrome address bar did not accept UIA ValuePattern input; setup refuses to navigate by arbitrary coordinate clicks"
+    }
+    Start-Sleep -Milliseconds 100
+    Send-SynapseNativeKeyTap -VirtualKey 0x0D
+}
+
 function Send-SynapseNativeKeyDown {
     param([byte]$VirtualKey)
     [SynapseChromeBridgeAutoInstall.Win32]::keybd_event($VirtualKey, 0, 0, [UIntPtr]::Zero)
@@ -1218,6 +1284,157 @@ function Get-SynapseChromeWindowByHwnd {
     @(Get-SynapseChromeTopLevelWindows | Where-Object { $_.hwnd -eq $Hwnd } | Select-Object -First 1)[0]
 }
 
+function Read-SynapseChromeExtensionDetailsUiState {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Window
+    )
+
+    $reloadButton = Find-SynapseAutomationElementByAutomationId `
+        -Root $Window.element `
+        -AutomationId 'dev-reload-button' `
+        -ControlType ([System.Windows.Automation.ControlType]::Button)
+    $enableToggle = Find-SynapseAutomationElementByAutomationId `
+        -Root $Window.element `
+        -AutomationId 'enableToggle' `
+        -ControlType ([System.Windows.Automation.ControlType]::Button)
+    $serviceWorker = Find-SynapseAutomationElementByName `
+        -Root $Window.element `
+        -Name 'service worker' `
+        -ControlType ([System.Windows.Automation.ControlType]::Hyperlink)
+    $extensionName = Find-SynapseAutomationElementByName `
+        -Root $Window.element `
+        -Name 'Synapse Chrome Bridge' `
+        -ControlType $null
+
+    $enableToggleName = if ($enableToggle) { [string]$enableToggle.Current.Name } else { '<missing>' }
+    [pscustomobject]@{
+        hwnd = [int64]$Window.hwnd
+        pid = [int]$Window.pid
+        title = [string]$Window.title
+        class_name = [string]$Window.class_name
+        reload_button_present = ($null -ne $reloadButton)
+        enable_toggle_present = ($null -ne $enableToggle)
+        enable_toggle_name = $enableToggleName
+        enable_toggle_on = ($enableToggleName -match '^On\b|extension enabled')
+        service_worker_link_present = ($null -ne $serviceWorker)
+        extension_name_present = ($null -ne $extensionName)
+    }
+}
+
+function Invoke-SynapseChromeBridgeExistingUiReload {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ChromeUserDataRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$ExtensionId,
+        [Parameter(Mandatory = $true)]
+        [string]$ExtensionDir,
+        [Parameter(Mandatory = $true)]
+        [string]$ActiveProfile,
+        [Parameter(Mandatory = $true)]
+        $Before,
+        [Parameter(Mandatory = $true)]
+        [int]$TimeoutSeconds
+    )
+
+    $expectedReady = ($Before.installed -and $Before.manifest_path_matches -and $Before.ready)
+    $nonstableReady = ($Before.installed -and $Before.enabled_and_permissioned -and $Before.manifest_dir_exists)
+    if (-not $expectedReady -and -not $nonstableReady) {
+        $missing = if ($Before.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $Before.missing_active_api_permissions -join ',' }
+        $disableReasons = if ($Before.disable_reasons.Count -eq 0) { '<none>' } else { $Before.disable_reasons -join ',' }
+        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_ROW_NOT_READY active_profile=$ActiveProfile installed=$($Before.installed) manifest_path_matches=$($Before.manifest_path_matches) ready=$($Before.ready) enabled_and_permissioned=$($Before.enabled_and_permissioned) manifest_dir_exists=$($Before.manifest_dir_exists) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=UI reload is only valid for an already-installed, enabled Synapse bridge row; repair the profile row before trying to reload it"
+    }
+
+    Initialize-SynapseChromeBridgeAutoInstallInterop
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $candidateWindows = @(Get-SynapseChromeTopLevelWindows -ChromeUserDataRoot $ChromeUserDataRoot | Where-Object {
+        $_.title -notmatch '^Select the extension directory\.?$'
+    })
+    $windows = @($candidateWindows | Where-Object { $_.chrome_profile_eligible -eq $true })
+    if ($windows.Count -eq 0) {
+        $rejected = Format-SynapseChromeWindowRejectSummary -Windows $candidateWindows
+        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_NO_ELIGIBLE_CHROME_WINDOW active_profile=$ActiveProfile user_data_root=$ChromeUserDataRoot rejected_windows=$rejected remediation=open the already-authenticated Chrome profile for this user-data root; setup refuses to launch a second Chrome window or drive a dedicated automation profile"
+    }
+
+    $chromeWindow = @($windows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
+    [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync([IntPtr]$chromeWindow.hwnd, 9) | Out-Null
+    [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$chromeWindow.hwnd) | Out-Null
+    Start-Sleep -Milliseconds 300
+
+    Set-SynapseChromeAddressBarUrl `
+        -Window $chromeWindow `
+        -Url "chrome://extensions/?id=$ExtensionId"
+
+    $details = Wait-SynapseUntil -Deadline $deadline -Probe {
+        $currentWindow = @(Get-SynapseChromeTopLevelWindows -ChromeUserDataRoot $ChromeUserDataRoot | Where-Object {
+            $_.hwnd -eq $chromeWindow.hwnd
+        } | Select-Object -First 1)
+        if ($currentWindow.Count -eq 0) {
+            return $null
+        }
+        $reloadButton = Find-SynapseAutomationElementByAutomationId `
+            -Root $currentWindow[0].element `
+            -AutomationId 'dev-reload-button' `
+            -ControlType ([System.Windows.Automation.ControlType]::Button)
+        if (-not $reloadButton) {
+            return $null
+        }
+        [pscustomobject]@{
+            window = $currentWindow[0]
+            reload_button = $reloadButton
+            ui_before = Read-SynapseChromeExtensionDetailsUiState -Window $currentWindow[0]
+        }
+    }
+    if (-not $details) {
+        $latestWindow = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
+        $latestTitle = if ($latestWindow) { [string]$latestWindow.title } else { '<missing>' }
+        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_BUTTON_NOT_FOUND active_profile=$ActiveProfile timeout_s=$TimeoutSeconds chrome_window_hwnd=$($chromeWindow.hwnd) chrome_window_pid=$($chromeWindow.pid) latest_title=$latestTitle user_data_dir=$($chromeWindow.chrome_user_data_dir) match_reason=$($chromeWindow.chrome_profile_match_reason) remediation=Chrome did not expose the Synapse extension details Reload button through UI Automation; setup refuses to click arbitrary browser coordinates or launch another Chrome profile"
+    }
+
+    if (-not $details.ui_before.enable_toggle_present -or -not $details.ui_before.enable_toggle_on) {
+        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_EXTENSION_DISABLED active_profile=$ActiveProfile chrome_window_hwnd=$($details.window.hwnd) chrome_window_pid=$($details.window.pid) enable_toggle_present=$($details.ui_before.enable_toggle_present) enable_toggle_name=$($details.ui_before.enable_toggle_name) remediation=the existing Synapse Chrome Bridge must be enabled before setup may reload it"
+    }
+
+    Invoke-SynapseAutomationElement -Element $details.reload_button -Description 'Synapse Chrome Bridge Reload'
+    Start-Sleep -Milliseconds 1500
+    $afterWindow = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
+    if (-not $afterWindow) {
+        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_WINDOW_LOST active_profile=$ActiveProfile chrome_window_hwnd=$($chromeWindow.hwnd) chrome_window_pid=$($chromeWindow.pid) remediation=Chrome window disappeared after reload; keep the already-open authenticated profile available and rerun setup"
+    }
+    $uiAfter = Read-SynapseChromeExtensionDetailsUiState -Window $afterWindow
+    $after = Test-SynapseChromeBridgeProfileRow `
+        -ChromeUserDataRoot $ChromeUserDataRoot `
+        -ProfileName $ActiveProfile `
+        -ExtensionId $ExtensionId `
+        -ExtensionDir $ExtensionDir
+    $afterExpectedReady = ($after.installed -and $after.manifest_path_matches -and $after.ready)
+    $afterNonstableReady = ($after.installed -and $after.enabled_and_permissioned -and $after.manifest_dir_exists)
+    if (-not $afterExpectedReady -and -not $afterNonstableReady) {
+        $missingAfter = if ($after.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $after.missing_active_api_permissions -join ',' }
+        $disableAfter = if ($after.disable_reasons.Count -eq 0) { '<none>' } else { $after.disable_reasons -join ',' }
+        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_PROFILE_ROW_NOT_READY_AFTER active_profile=$ActiveProfile installed=$($after.installed) manifest_path_matches=$($after.manifest_path_matches) ready=$($after.ready) enabled_and_permissioned=$($after.enabled_and_permissioned) manifest_dir_exists=$($after.manifest_dir_exists) missing_active_api_permissions=$missingAfter disable_reasons=$disableAfter remediation=Chrome Reload changed the physical profile row unexpectedly; inspect the active profile Preferences/Secure Preferences before accepting bridge setup"
+    }
+
+    $reloadReason = if ($Before.manifest_path_matches) { 'existing_ready_extension_ui_reload_invoked' } else { 'existing_ready_extension_nonstable_path_ui_reload_invoked' }
+    return [pscustomobject]@{
+        attempted = $true
+        changed = $true
+        reason = $reloadReason
+        active_profile = $ActiveProfile
+        required_foreground = $true
+        chrome_window_hwnd = $chromeWindow.hwnd
+        chrome_window_pid = $chromeWindow.pid
+        chrome_window_user_data_dir = $chromeWindow.chrome_user_data_dir
+        chrome_window_profile_match_reason = $chromeWindow.chrome_profile_match_reason
+        extension_details_url = "chrome://extensions/?id=$ExtensionId"
+        ui_before = $details.ui_before
+        ui_after = $uiAfter
+        before = $Before
+        after = $after
+    }
+}
+
 function Invoke-SynapseChromeBridgeAutoInstall {
     param(
         [Parameter(Mandatory = $true)]
@@ -1255,6 +1472,15 @@ function Invoke-SynapseChromeBridgeAutoInstall {
 
     if ($before.installed -and $before.manifest_path_matches) {
         if ($before.ready) {
+            if ($ReloadExistingExtensionViaUi) {
+                return Invoke-SynapseChromeBridgeExistingUiReload `
+                    -ChromeUserDataRoot $ChromeUserDataRoot `
+                    -ExtensionId $ExtensionId `
+                    -ExtensionDir $ExtensionDir `
+                    -ActiveProfile $activeProfile `
+                    -Before $before `
+                    -TimeoutSeconds $TimeoutSeconds
+            }
             return [pscustomobject]@{
                 attempted = $true
                 changed = $false
@@ -1290,6 +1516,15 @@ function Invoke-SynapseChromeBridgeAutoInstall {
     # the pending path migration in the readback so health and operators can see that the
     # bridge is still loaded from a non-stable directory.
     if ($before.installed -and $before.enabled_and_permissioned -and $before.manifest_dir_exists) {
+        if ($ReloadExistingExtensionViaUi) {
+            return Invoke-SynapseChromeBridgeExistingUiReload `
+                -ChromeUserDataRoot $ChromeUserDataRoot `
+                -ExtensionId $ExtensionId `
+                -ExtensionDir $ExtensionDir `
+                -ActiveProfile $activeProfile `
+                -Before $before `
+                -TimeoutSeconds $TimeoutSeconds
+        }
         return [pscustomobject]@{
             attempted = $true
             changed = $false

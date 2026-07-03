@@ -42,7 +42,7 @@ const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-30-window-id-v2";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "4b2998af1e4c6a12d3d5137bd7fe3955b5dd9afa0d1d4ad3d95228a39ad901d3";
+    "a3e3013060a20b95af67da6f5be3cdd45b36f85b9ea64ebf304577b389225fea";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -90,6 +90,7 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "localeEmulation",
     "mediaEmulation",
     "networkConditions",
+    "maintenancePauseReconnect",
     "reloadSelf",
     "targetInfo",
     "targetInfoPageText",
@@ -101,6 +102,10 @@ const NATIVE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const DIRECT_WS_COMMAND_WAIT: Duration = Duration::from_secs(25);
 const DEFAULT_RELOAD_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_RELOAD_WAIT_TIMEOUT_MS: u64 = 30_000;
+const MAINTENANCE_RECONNECT_PAUSE_COMMAND: &str = "maintenancePauseReconnect";
+const DEFAULT_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 120_000;
+const MIN_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 1_000;
+const MAX_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 900_000;
 const RELOAD_RECONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
@@ -4231,6 +4236,34 @@ pub(crate) struct ChromeBridgeReloadResult {
     pub waited_ms: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeBridgeMaintenancePauseAck {
+    pub ok: bool,
+    pub host_id: Option<String>,
+    pub pause_ms: u64,
+    pub pause_until_unix_ms: u64,
+    pub reason: String,
+    pub reconnect_suppressed: bool,
+    pub persisted: bool,
+    pub websocket_close: ChromeBridgeWebSocketCloseAck,
+    pub bridge_build_id: Option<String>,
+    pub extension_id: Option<String>,
+    #[serde(default)]
+    pub daemon_disconnect_requested: bool,
+    #[serde(default)]
+    pub daemon_disconnect_host_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct ChromeBridgeWebSocketCloseAck {
+    pub had_socket: bool,
+    pub ready_state_before: Option<u16>,
+    pub close_requested: bool,
+    #[serde(default)]
+    pub close_deferred: bool,
+    pub close_error: Option<String>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct NativeRegisterResponse {
     ok: bool,
@@ -4254,6 +4287,12 @@ pub(crate) struct NativeRegisterRequest {
 pub(crate) struct NativeMessageRequest {
     host_id: String,
     message: Value,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct NativeMaintenancePauseRequest {
+    pause_ms: Option<u64>,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4500,6 +4539,15 @@ fn bridge_command_stale_reason_with_profile_state(
         return Some(format!(
             "extension_id_mismatch actual={} expected={EXTENSION_ID}",
             host.extension_id.as_deref().unwrap_or("not_seen_yet")
+        ));
+    }
+    if kind == MAINTENANCE_RECONNECT_PAUSE_COMMAND {
+        if host.extension_capabilities.contains(kind) {
+            return None;
+        }
+        return Some(format!(
+            "missing_capability={MAINTENANCE_RECONNECT_PAUSE_COMMAND} loaded_capabilities={}",
+            format_capabilities(&host.extension_capabilities)
         ));
     }
     let mut identity_reasons = Vec::new();
@@ -5169,6 +5217,69 @@ impl ChromeDebuggerBridge {
         }
     }
 
+    async fn maintenance_pause_reconnect(
+        &self,
+        reason: String,
+        pause_ms: u64,
+    ) -> Result<ChromeBridgeMaintenancePauseAck, ChromeDebuggerBridgeError> {
+        let result = self
+            .send_command_with_timeout(
+                MAINTENANCE_RECONNECT_PAUSE_COMMAND,
+                json!({
+                    "pauseMs": pause_ms,
+                    "reason": reason,
+                    "requestedAtUnixMs": now_unix_ms(),
+                }),
+                Duration::from_secs(5),
+            )
+            .await?;
+        let mut ack =
+            serde_json::from_value::<ChromeBridgeMaintenancePauseAck>(result).map_err(|error| {
+                ChromeDebuggerBridgeError::protocol(format!(
+                    "decode Chrome bridge maintenancePauseReconnect acknowledgement: {error}"
+                ))
+            })?;
+        let active_socket_was_open = matches!(ack.websocket_close.ready_state_before, Some(0 | 1));
+        let websocket_close_failed = ack.websocket_close.close_error.is_some()
+            || (active_socket_was_open
+                && !ack.websocket_close.close_requested
+                && !ack.websocket_close.close_deferred);
+        if !ack.ok
+            || !ack.reconnect_suppressed
+            || !ack.persisted
+            || websocket_close_failed
+            || ack.pause_ms != pause_ms
+            || ack.reason.trim() != reason.trim()
+        {
+            return Err(ChromeDebuggerBridgeError::protocol(format!(
+                "Chrome bridge maintenancePauseReconnect acknowledgement failed postcondition: ok={} reconnect_suppressed={} persisted={} websocket_had_socket={} websocket_ready_state_before={:?} websocket_close_requested={} websocket_close_deferred={} websocket_close_error={:?} pause_ms={} expected_pause_ms={} reason={:?} expected_reason={:?}",
+                ack.ok,
+                ack.reconnect_suppressed,
+                ack.persisted,
+                ack.websocket_close.had_socket,
+                ack.websocket_close.ready_state_before,
+                ack.websocket_close.close_requested,
+                ack.websocket_close.close_deferred,
+                ack.websocket_close.close_error,
+                ack.pause_ms,
+                pause_ms,
+                ack.reason,
+                reason
+            )));
+        }
+        if active_socket_was_open
+            && let Some(host_id) = ack.host_id.as_deref().filter(|host_id| !host_id.is_empty())
+        {
+            self.disconnect_direct_http_host(
+                host_id,
+                "maintenance pause acknowledged; daemon closing direct HTTP WebSocket before restart",
+            );
+            ack.daemon_disconnect_requested = true;
+            ack.daemon_disconnect_host_id = Some(host_id.to_owned());
+        }
+        Ok(ack)
+    }
+
     async fn next_command(
         &self,
         host_id: &str,
@@ -5461,6 +5572,7 @@ impl ChromeDebuggerBridge {
             pending_failed = pending_ids.len(),
             "Chrome debugger direct HTTP WebSocket disconnected"
         );
+        self.notify.notify_waiters();
     }
 }
 
@@ -7289,10 +7401,44 @@ pub(crate) fn validate_reload_wait_timeout(
     Ok(value)
 }
 
+fn validate_maintenance_reconnect_pause_ms(
+    value: Option<u64>,
+) -> Result<u64, ChromeDebuggerBridgeError> {
+    let value = value.unwrap_or(DEFAULT_MAINTENANCE_RECONNECT_PAUSE_MS);
+    if !(MIN_MAINTENANCE_RECONNECT_PAUSE_MS..=MAX_MAINTENANCE_RECONNECT_PAUSE_MS).contains(&value) {
+        return Err(ChromeDebuggerBridgeError::params_invalid(format!(
+            "chrome bridge maintenance reconnect pause_ms must be {MIN_MAINTENANCE_RECONNECT_PAUSE_MS}..={MAX_MAINTENANCE_RECONNECT_PAUSE_MS}, got {value}; remediation=use a bounded maintenance pause long enough for setup handoff but not an unbounded reconnect blackout"
+        )));
+    }
+    Ok(value)
+}
+
+fn validate_maintenance_reconnect_pause_reason(
+    value: &str,
+) -> Result<String, ChromeDebuggerBridgeError> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 256 {
+        return Err(ChromeDebuggerBridgeError::params_invalid(format!(
+            "chrome bridge maintenance reconnect pause reason must be 1..=256 chars, got length={}; remediation=send a short operator-visible setup reason for the reconnect suppression window",
+            value.len()
+        )));
+    }
+    Ok(value.to_owned())
+}
+
 pub(crate) async fn reload_bridge(
     wait_timeout_ms: u64,
 ) -> Result<ChromeBridgeReloadResult, ChromeDebuggerBridgeError> {
     bridge().reload_self(wait_timeout_ms).await
+}
+
+pub(crate) async fn maintenance_pause_reconnect(
+    reason: &str,
+    pause_ms: Option<u64>,
+) -> Result<ChromeBridgeMaintenancePauseAck, ChromeDebuggerBridgeError> {
+    let pause_ms = validate_maintenance_reconnect_pause_ms(pause_ms)?;
+    let reason = validate_maintenance_reconnect_pause_reason(reason)?;
+    bridge().maintenance_pause_reconnect(reason, pause_ms).await
 }
 
 pub(crate) fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: &Uri) -> bool {
@@ -7360,6 +7506,34 @@ pub(crate) async fn http_message(Json(request): Json<NativeMessageRequest>) -> R
             })),
         )
             .into_response(),
+    }
+}
+
+pub(crate) async fn http_maintenance_pause(
+    Json(request): Json<NativeMaintenancePauseRequest>,
+) -> Response {
+    match maintenance_pause_reconnect(&request.reason, request.pause_ms).await {
+        Ok(pause) => Json(json!({
+            "ok": true,
+            "pause": pause,
+        }))
+        .into_response(),
+        Err(error) => {
+            let status = if error.code() == error_codes::TOOL_PARAMS_INVALID {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            };
+            (
+                status,
+                Json(json!({
+                    "ok": false,
+                    "code": error.code(),
+                    "detail": error.detail(),
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -8566,6 +8740,15 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_selection_reason": result.get("target_selection_reason"),
             "extension_id": result.get("extension_id"),
         }),
+        "maintenancePauseReconnect" => json!({
+            "host_id": result.get("host_id"),
+            "pause_ms": result.get("pause_ms"),
+            "pause_until_unix_ms": result.get("pause_until_unix_ms"),
+            "reason": result.get("reason"),
+            "reconnect_suppressed": result.get("reconnect_suppressed"),
+            "bridge_build_id": result.get("bridge_build_id"),
+            "extension_id": result.get("extension_id"),
+        }),
         _ => return None,
     };
     serde_json::to_string(&summary).ok()
@@ -8841,6 +9024,10 @@ mod tests {
         assert!(!is_direct_http_extension_bridge_request(
             &headers,
             &Uri::from_static("/chrome-debugger/native/register"),
+        ));
+        assert!(!is_direct_http_extension_bridge_request(
+            &headers,
+            &Uri::from_static("/chrome-debugger/native/maintenance-pause"),
         ));
         assert!(!is_direct_http_extension_bridge_request(
             &headers,
@@ -9365,6 +9552,86 @@ mod tests {
                 &profile_install_state,
             ),
             None
+        );
+    }
+
+    #[test]
+    fn maintenance_pause_validation_is_bounded() {
+        assert_eq!(
+            validate_maintenance_reconnect_pause_ms(None).expect("default accepted"),
+            DEFAULT_MAINTENANCE_RECONNECT_PAUSE_MS
+        );
+        assert_eq!(
+            validate_maintenance_reconnect_pause_ms(Some(MIN_MAINTENANCE_RECONNECT_PAUSE_MS))
+                .expect("min accepted"),
+            MIN_MAINTENANCE_RECONNECT_PAUSE_MS
+        );
+        assert_eq!(
+            validate_maintenance_reconnect_pause_ms(Some(MAX_MAINTENANCE_RECONNECT_PAUSE_MS))
+                .expect("max accepted"),
+            MAX_MAINTENANCE_RECONNECT_PAUSE_MS
+        );
+        for invalid in [
+            MIN_MAINTENANCE_RECONNECT_PAUSE_MS - 1,
+            MAX_MAINTENANCE_RECONNECT_PAUSE_MS + 1,
+        ] {
+            let error = validate_maintenance_reconnect_pause_ms(Some(invalid))
+                .expect_err("invalid maintenance pause rejected");
+            assert_eq!(error.code(), error_codes::TOOL_PARAMS_INVALID);
+            assert!(error.detail().contains("pause_ms must be"));
+            assert!(error.detail().contains(&format!("got {invalid}")));
+        }
+
+        assert_eq!(
+            validate_maintenance_reconnect_pause_reason(" issue1410 setup ")
+                .expect("reason trimmed"),
+            "issue1410 setup"
+        );
+        let error =
+            validate_maintenance_reconnect_pause_reason("").expect_err("empty reason rejected");
+        assert_eq!(error.code(), error_codes::TOOL_PARAMS_INVALID);
+        assert!(error.detail().contains("reason must be 1..=256 chars"));
+    }
+
+    #[test]
+    fn maintenance_pause_only_requires_pause_capability() {
+        let profile_install_state = SynapseChromeProfileInstallState::test_installed();
+        let mut host = test_host_record();
+
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            MAINTENANCE_RECONNECT_PAUSE_COMMAND,
+            &profile_install_state,
+        )
+        .expect("missing maintenance capability");
+        assert!(reason.contains("missing_capability=maintenancePauseReconnect"));
+
+        host.extension_capabilities = [MAINTENANCE_RECONNECT_PAUSE_COMMAND]
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        host.extension_build_id = Some("old-build".to_owned());
+        host.extension_declared_build_sha256 = Some("old-sha".to_owned());
+        host.extension_service_worker_sha256 = Some("old-worker-sha".to_owned());
+        host.extension_service_worker_sha256_status = Some("mismatch".to_owned());
+        host.extension_debugger_api_available = Some(false);
+
+        assert_eq!(
+            bridge_command_stale_reason_with_profile_state(
+                &host,
+                MAINTENANCE_RECONNECT_PAUSE_COMMAND,
+                &profile_install_state,
+            ),
+            None
+        );
+
+        assert!(
+            bridge_command_stale_reason_with_profile_state(
+                &host,
+                "openTab",
+                &profile_install_state,
+            )
+            .is_some()
         );
     }
 

@@ -111,6 +111,9 @@ param(
     [string]$TaskName    = 'SynapseMcpDaemon',
     [string]$MaintenanceLockPath = "$env:LOCALAPPDATA\synapse\setup-maintenance.lock.json",
     [ValidateRange(1, 1440)][int]$BuildTimeoutMinutes = 90,
+    [int]$PostExitParentPid = 0,
+    [string]$PostExitContinuationReason = '',
+    [string]$PostExitManifestPath = '',
     [switch]$ForceRestart,
     [switch]$SkipClientWiring,
     [switch]$Remove,
@@ -118,9 +121,170 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$SynapseChromeBridgeMaintenancePauseMs = 720000
+$SynapseChromeBridgeMaintenanceCloseDrainMs = 7000
+$SynapseChromeBridgeReconnectAlarmCushionMs = 45000
+$SynapseChromeBridgeDefaultPostStartWaitMs = 30000
+$SynapseChromeBridgeMaintenancePauseGuardMs = 60000
+$SynapseChromeBridgeMaxPostStartWaitMs = $SynapseChromeBridgeMaintenancePauseMs + $SynapseChromeBridgeReconnectAlarmCushionMs + $SynapseChromeBridgeDefaultPostStartWaitMs
+$SynapseBindFinalDeadOwnerSettleSeconds = 15
+$script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
+$script:SynapseBindPostExitContinuationRequired = $false
+$script:SynapseBindPostExitContinuationDetail = $null
+$script:SynapsePostExitStartOnly = ($PostExitParentPid -gt 0 -and $PostExitContinuationReason -eq 'dead_owner_bind_after_install')
+$script:SynapseSetupRepairManifestPath = $env:SYNAPSE_SETUP_REPAIR_MANIFEST
+function Write-SynapsePostExitManifestState {
+    param(
+        [Parameter(Mandatory=$true)][string]$State,
+        [string]$Message = '',
+        [int]$ExitCode = 0,
+        [AllowNull()]$Readback
+    )
+
+    if (-not $script:SynapsePostExitStartOnly) {
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($PostExitManifestPath)) {
+        throw "SYNAPSE_POST_EXIT_MANIFEST_PATH_MISSING reason=$PostExitContinuationReason remediation=post-exit continuation must receive -PostExitManifestPath so completion/failure state is physically recorded"
+    }
+    if (-not (Test-Path -LiteralPath $PostExitManifestPath -PathType Leaf)) {
+        throw "SYNAPSE_POST_EXIT_MANIFEST_MISSING path=$PostExitManifestPath remediation=inspect the continuation launcher arguments and rerun setup; completion/failure cannot be accepted without manifest readback"
+    }
+
+    $manifest = Get-Content -Raw -LiteralPath $PostExitManifestPath | ConvertFrom-Json
+    $now = (Get-Date).ToUniversalTime().ToString('o')
+    $manifest | Add-Member -NotePropertyName state -NotePropertyValue $State -Force
+    $manifest | Add-Member -NotePropertyName exit_code -NotePropertyValue $ExitCode -Force
+    $manifest | Add-Member -NotePropertyName updated_at_utc -NotePropertyValue $now -Force
+    if ($State -eq 'completed') {
+        $manifest | Add-Member -NotePropertyName completed_at_utc -NotePropertyValue $now -Force
+        $manifest | Add-Member -NotePropertyName failure -NotePropertyValue $null -Force
+    } elseif ($State -eq 'failed') {
+        $manifest | Add-Member -NotePropertyName failed_at_utc -NotePropertyValue $now -Force
+        $manifest | Add-Member -NotePropertyName failure -NotePropertyValue ([ordered]@{
+            message = $Message
+            remediation = 'inspect stdout/stderr/readback fields and rerun setup after fixing the named fatal condition'
+        }) -Force
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Message)) {
+        $manifest | Add-Member -NotePropertyName message -NotePropertyValue $Message -Force
+    }
+    if ($null -ne $Readback) {
+        $manifest | Add-Member -NotePropertyName readback -NotePropertyValue $Readback -Force
+    }
+    $json = ($manifest | ConvertTo-Json -Depth 40) + "`n"
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($PostExitManifestPath, $json, $encoding)
+}
+
+function Write-SynapseSetupRepairManifestState {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('completed','failed','handoff_started')][string]$State,
+        [string]$Message = '',
+        [int]$ExitCode = 0,
+        [AllowNull()]$Readback,
+        [string]$ContinuationManifestPath = ''
+    )
+
+    if ([string]::IsNullOrWhiteSpace($script:SynapseSetupRepairManifestPath)) {
+        return
+    }
+    if (-not (Test-Path -LiteralPath $script:SynapseSetupRepairManifestPath -PathType Leaf)) {
+        throw "SYNAPSE_SETUP_REPAIR_MANIFEST_MISSING path=$script:SynapseSetupRepairManifestPath remediation=external setup repair must stamp completion/failure in the parent manifest; inspect launch env SYNAPSE_SETUP_REPAIR_MANIFEST"
+    }
+
+    $manifest = Get-Content -Raw -LiteralPath $script:SynapseSetupRepairManifestPath | ConvertFrom-Json
+    $now = (Get-Date).ToUniversalTime().ToString('o')
+    $manifest | Add-Member -NotePropertyName state -NotePropertyValue $State -Force
+    $manifest | Add-Member -NotePropertyName exit_code -NotePropertyValue $ExitCode -Force
+    $manifest | Add-Member -NotePropertyName updated_at_utc -NotePropertyValue $now -Force
+    if ($State -eq 'completed') {
+        $manifest | Add-Member -NotePropertyName completed_at_utc -NotePropertyValue $now -Force
+        $manifest | Add-Member -NotePropertyName failure -NotePropertyValue $null -Force
+    } elseif ($State -eq 'failed') {
+        $manifest | Add-Member -NotePropertyName failed_at_utc -NotePropertyValue $now -Force
+        $manifest | Add-Member -NotePropertyName failure -NotePropertyValue ([ordered]@{
+            message = $Message
+            remediation = 'inspect stdout/stderr/readback fields and rerun setup repair after fixing the named fatal condition'
+        }) -Force
+    } elseif ($State -eq 'handoff_started') {
+        $manifest | Add-Member -NotePropertyName handoff_started_at_utc -NotePropertyValue $now -Force
+        $manifest | Add-Member -NotePropertyName failure -NotePropertyValue $null -Force
+        if (-not [string]::IsNullOrWhiteSpace($ContinuationManifestPath)) {
+            $manifest | Add-Member -NotePropertyName continuation_manifest_path -NotePropertyValue $ContinuationManifestPath -Force
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Message)) {
+        $manifest | Add-Member -NotePropertyName message -NotePropertyValue $Message -Force
+    }
+    if ($null -ne $Readback) {
+        $manifest | Add-Member -NotePropertyName readback -NotePropertyValue $Readback -Force
+    }
+    $json = ($manifest | ConvertTo-Json -Depth 40) + "`n"
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($script:SynapseSetupRepairManifestPath, $json, $encoding)
+}
+
 function Info($m)  { Write-Host "[synapse-setup] $m" }
 function Step($m)  { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
-function Die($m)   { throw "[synapse-setup] FATAL: $m" }
+function Die($m)   {
+    if (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupRepairManifestPath)) {
+        $state = 'failed'
+        $continuationManifestPath = ''
+        if ($m -match 'SYNAPSE_BIND_POST_EXIT_CONTINUATION_STARTED') {
+            $state = 'handoff_started'
+            if ($m -match 'manifest=([^ ]+)') {
+                $continuationManifestPath = $Matches[1]
+            }
+        }
+        try {
+            Write-SynapseSetupRepairManifestState `
+                -State $state `
+                -Message $m `
+                -ExitCode 1 `
+                -Readback $null `
+                -ContinuationManifestPath $continuationManifestPath
+        } catch {
+            throw "[synapse-setup] FATAL: $m ; SYNAPSE_SETUP_REPAIR_MANIFEST_FAILURE_WRITE_FAILED path=$script:SynapseSetupRepairManifestPath error=$($_.Exception.Message)"
+        }
+    }
+    if ($script:SynapsePostExitStartOnly) {
+        try {
+            Write-SynapsePostExitManifestState -State 'failed' -Message $m -ExitCode 1 -Readback $null
+        } catch {
+            throw "[synapse-setup] FATAL: $m ; SYNAPSE_POST_EXIT_MANIFEST_FAILURE_WRITE_FAILED path=$PostExitManifestPath error=$($_.Exception.Message)"
+        }
+    }
+    throw "[synapse-setup] FATAL: $m"
+}
+
+function Get-SynapseUnixTimeMilliseconds {
+    return [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+}
+
+function Assert-SynapseChromeBridgeMaintenancePauseBudget {
+    param(
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Phase
+    )
+
+    if ($null -eq $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) {
+        return
+    }
+
+    $nowMs = Get-SynapseUnixTimeMilliseconds
+    $remainingMs = [int64]$script:SynapseChromeBridgeMaintenancePauseUntilUnixMs - [int64]$nowMs
+    if ($remainingMs -le [int64]$SynapseChromeBridgeMaintenancePauseGuardMs) {
+        Die ("SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_EXPIRING reason={0} bind={1} phase={2} pause_until_unix_ms={3} remaining_ms={4} guard_ms={5} remediation=setup refuses to continue daemon bind drain after the Chrome bridge maintenance pause is close to expiry. The Chrome bridge can reconnect and recreate NetworkService peers after this point; rerun setup with a maintenance pause that covers the full drain budget or investigate why Windows still reports stale dead-owner TCP rows." -f `
+            $Reason,
+            $Bind,
+            $Phase,
+            $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs,
+            $remainingMs,
+            $SynapseChromeBridgeMaintenancePauseGuardMs)
+    }
+}
 
 function Invoke-SynapseChromeBridgeVerifier {
     param(
@@ -184,6 +348,53 @@ function Format-SynapseChromeBridgeProfileInstallState {
         $extensionDir)
 }
 
+function Invoke-SynapseChromeBridgeUiRepair {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$InstallerPath,
+        [Parameter(Mandatory = $true)]
+        [string]$NativeHostExePath
+    )
+
+    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
+        Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_MISSING path=$InstallerPath remediation=setup requires the repo script that can repair the already-installed Chrome bridge through the already-open Chrome profile"
+    }
+    $readback = & $InstallerPath `
+        -SynapseNativeHostExe $NativeHostExePath `
+        -ReloadExistingExtensionViaUi `
+        -AutoInstallTimeoutSeconds 45
+    if (-not $readback.ok) {
+        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_INSTALLER_FAILED path=$InstallerPath remediation=installer did not return ok=true after the existing Chrome extension UI repair path"
+    }
+    $autoInstall = $readback.synapse_chrome_auto_install
+    if (-not $autoInstall) {
+        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_READBACK_MISSING path=$InstallerPath remediation=installer did not return synapse_chrome_auto_install readback for the UI repair path"
+    }
+    $allowedReasons = @(
+        'existing_ready_extension_ui_reload_invoked',
+        'existing_ready_extension_nonstable_path_ui_reload_invoked',
+        'installed_unpacked_extension_in_active_profile'
+    )
+    if ($allowedReasons -notcontains [string]$autoInstall.reason) {
+        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_NOT_PERFORMED reason=$($autoInstall.reason) attempted=$($autoInstall.attempted) changed=$($autoInstall.changed) remediation=post-start absent-host repair must either invoke the existing extension Reload control or install the bundled unpacked bridge into the already-open active profile"
+    }
+    $profileInstallState = $readback.synapse_chrome_profile_install_state
+    if (-not $profileInstallState -or $profileInstallState.active_profile_installed -ne $true) {
+        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_PROFILE_NOT_INSTALLED reason=$($autoInstall.reason) active_profile=$($profileInstallState.active_profile) remediation=post-start UI repair did not leave the active Chrome profile with the bundled Synapse bridge row installed"
+    }
+    $uiBefore = if ($autoInstall.ui_before) { ($autoInstall.ui_before | ConvertTo-Json -Depth 8 -Compress) } else { '<none>' }
+    $uiAfter = if ($autoInstall.ui_after) { ($autoInstall.ui_after | ConvertTo-Json -Depth 8 -Compress) } else { '<none>' }
+    Info ("Chrome bridge UI repair completed reason={0} active_profile={1} chrome_window_pid={2} chrome_window_hwnd={3} ui_before={4} ui_after={5} {6}" -f `
+        $autoInstall.reason,
+        $autoInstall.active_profile,
+        $autoInstall.chrome_window_pid,
+        $autoInstall.chrome_window_hwnd,
+        $uiBefore,
+        $uiAfter,
+        (Format-SynapseChromeBridgeProfileInstallState -Readback $readback))
+    return $readback
+}
+
 $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
 $processToolSurfaceHashAtStart = $env:SYNAPSE_TOOL_SURFACE_HASH_AT_CODEX_START
 $processToolSurfaceSnapshotAtStart = $env:SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START
@@ -224,6 +435,20 @@ function Get-SynapseCurrentCodexAncestor {
     return ($lineage | Where-Object {
         $_.Name -ieq 'codex.exe' -or $_.CommandLine -match '@openai[\\/]+codex|codex\.js|codex-win32'
     } | Select-Object -First 1)
+}
+
+function Test-SynapseCodexProcess {
+    param([AllowNull()]$Process)
+
+    if ($null -eq $Process) {
+        return $false
+    }
+    $name = [string]$Process.Name
+    $commandLine = [string]$Process.CommandLine
+    return (
+        $name -ieq 'codex.exe' -or
+        $commandLine -match '@openai[\\/]+codex|codex\.js|codex-win32|openai\.chatgpt'
+    )
 }
 
 function Read-SynapseSetupMaintenanceLockOwner {
@@ -338,8 +563,49 @@ function Release-SynapseSetupMaintenanceLock {
     }
 }
 
+function Wait-SynapsePostExitParent {
+    param(
+        [int]$ParentPid,
+        [string]$Reason
+    )
+
+    if ($ParentPid -le 0) {
+        return
+    }
+
+    $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+    if ($null -eq $parent) {
+        Info "SYNAPSE_POST_EXIT_PARENT_ALREADY_GONE parent_pid=$ParentPid reason=$Reason"
+        return
+    }
+
+    Info "SYNAPSE_POST_EXIT_PARENT_WAIT parent_pid=$ParentPid reason=$Reason"
+    try {
+        Wait-Process -Id $ParentPid -Timeout 180 -ErrorAction Stop
+    } catch {
+        $stillAlive = [bool](Get-Process -Id $ParentPid -ErrorAction SilentlyContinue)
+        if ($stillAlive) {
+            Die "SYNAPSE_POST_EXIT_PARENT_STILL_RUNNING parent_pid=$ParentPid reason=$Reason remediation=the setup continuation waits for the parent runner to exit before reacquiring the maintenance lock; inspect the parent process and setup logs, never kill terminal/IDE/WSL hosts globally"
+        }
+    }
+    Start-Sleep -Seconds 1
+    Info "SYNAPSE_POST_EXIT_PARENT_GONE parent_pid=$ParentPid reason=$Reason"
+}
+
 trap {
     $errorText = $_ | Out-String
+    try {
+        $preserveHandoff = $false
+        if (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupRepairManifestPath) -and (Test-Path -LiteralPath $script:SynapseSetupRepairManifestPath -PathType Leaf)) {
+            $currentRepairManifest = Get-Content -Raw -LiteralPath $script:SynapseSetupRepairManifestPath | ConvertFrom-Json
+            $preserveHandoff = ([string]$currentRepairManifest.state -eq 'handoff_started')
+        }
+        if (-not $preserveHandoff) {
+            Write-SynapseSetupRepairManifestState -State 'failed' -Message (($errorText -replace '\s+', ' ').Trim()) -ExitCode 1 -Readback $null
+        }
+    } catch {
+        Info "WARN: could not write setup repair manifest failure state path=$script:SynapseSetupRepairManifestPath error=$($_.Exception.Message)"
+    }
     Release-SynapseSetupMaintenanceLock -State failed -ErrorMessage $errorText
     break
 }
@@ -356,6 +622,12 @@ function Quote-WindowsCommandArgument {
 function Quote-VbsString {
     param([Parameter(Mandatory=$true)][string]$Value)
     return '"' + ($Value -replace '"', '""') + '"'
+}
+
+function Quote-PowerShellSingleQuotedString {
+    param([AllowNull()][string]$Value)
+    if ($null -eq $Value) { $Value = '' }
+    return "'" + ($Value -replace "'", "''") + "'"
 }
 
 function Vbs-Literal {
@@ -1019,7 +1291,7 @@ function Get-SynapseArtifactReadback {
     $readback.exists = $true
     $readback.length_bytes = $item.Length
     try {
-        $readback.sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $Path -ErrorAction Stop).Hash
+        $readback.sha256 = Get-SynapseFileSha256 -Path $Path
     } catch {
         $readback.sha256 = $null
         $readback.exclusive_open_error = "hash_failed: $($_.Exception.Message)"
@@ -1638,6 +1910,27 @@ function Get-SynapseBindEndpoint {
     [pscustomobject]@{ Address = $address; Port = $port }
 }
 
+function Test-SynapseBindAvailable {
+    param(
+        [Parameter(Mandatory=$true)][string]$Bind
+    )
+
+    $endpoint = Get-SynapseBindEndpoint -Bind $Bind
+    $listener = $null
+    try {
+        $ipAddress = [System.Net.IPAddress]::Parse($endpoint.Address)
+        $listener = [System.Net.Sockets.TcpListener]::new($ipAddress, [int]$endpoint.Port)
+        $listener.Start()
+        return [pscustomobject]@{ Ok = $true; Error = $null }
+    } catch {
+        return [pscustomobject]@{ Ok = $false; Error = $_.Exception.Message }
+    } finally {
+        if ($null -ne $listener) {
+            try { $listener.Stop() } catch { }
+        }
+    }
+}
+
 function Get-SynapseTcpClientSnapshot {
     param([Parameter(Mandatory=$true)][string]$Bind)
 
@@ -1659,12 +1952,12 @@ function Get-SynapseTcpClientSnapshot {
             $_.RemotePort -eq $connection.LocalPort
         } | Select-Object -First 1)
         $peerOwnerPid = if ($peer.Count -gt 0) { [int]$peer[0].OwningProcess } else { 0 }
-        $peerOwner = if ($peerOwnerPid -gt 0) { Get-Process -Id $peerOwnerPid -ErrorAction SilentlyContinue } else { $null }
-        $peerOwnerLine = if ($peerOwnerPid -gt 0) {
-            (Get-CimInstance Win32_Process -Filter "ProcessId=$peerOwnerPid" -ErrorAction SilentlyContinue).CommandLine
+        $peerOwner = if ($peerOwnerPid -gt 0) {
+            Get-CimInstance Win32_Process -Filter "ProcessId=$peerOwnerPid" -ErrorAction SilentlyContinue
         } else {
             $null
         }
+        $peerOwnerExists = ($null -ne $peerOwner)
         [pscustomobject]@{
             State = $connection.State
             LocalAddress = $connection.LocalAddress
@@ -1675,9 +1968,10 @@ function Get-SynapseTcpClientSnapshot {
             OwnerName = (Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue).ProcessName
             OwnerCommandLine = (Get-CimInstance Win32_Process -Filter "ProcessId=$($connection.OwningProcess)" -ErrorAction SilentlyContinue).CommandLine
             PeerOwningProcess = $peerOwnerPid
-            PeerOwnerName = $peerOwner.ProcessName
-            PeerOwnerCommandLine = $peerOwnerLine
-            HasLivePeer = ($peerOwnerPid -gt 0)
+            PeerOwnerExists = $peerOwnerExists
+            PeerOwnerName = $peerOwner.Name
+            PeerOwnerCommandLine = $peerOwner.CommandLine
+            HasLivePeer = $peerOwnerExists
         }
     }
 }
@@ -1714,7 +2008,7 @@ function Format-SynapseTcpClientSnapshot {
         return '<none>'
     }
     return (($Snapshot | ForEach-Object {
-        "state=$($_.State) local=$($_.LocalAddress):$($_.LocalPort) remote=$($_.RemoteAddress):$($_.RemotePort) owner_pid=$($_.OwningProcess) owner=$($_.OwnerName) peer_pid=$($_.PeerOwningProcess) peer=$($_.PeerOwnerName) has_live_peer=$($_.HasLivePeer) peer_cmd=$($_.PeerOwnerCommandLine)"
+        "state=$($_.State) local=$($_.LocalAddress):$($_.LocalPort) remote=$($_.RemoteAddress):$($_.RemotePort) owner_pid=$($_.OwningProcess) owner=$($_.OwnerName) peer_pid=$($_.PeerOwningProcess) peer_exists=$($_.PeerOwnerExists) peer=$($_.PeerOwnerName) has_live_peer=$($_.HasLivePeer) peer_cmd=$($_.PeerOwnerCommandLine)"
     }) -join "`n")
 }
 
@@ -1728,33 +2022,604 @@ function Format-SynapseTcpBindListenerSnapshot {
     }) -join "`n")
 }
 
+function Get-SynapseProtectedProcessNames {
+    return @(
+        'cmd.exe',
+        'powershell.exe',
+        'pwsh.exe',
+        'WindowsTerminal.exe',
+        'OpenConsole.exe',
+        'conhost.exe',
+        'wsl.exe',
+        'wslhost.exe',
+        'Code.exe',
+        'codex.exe',
+        'claude.exe',
+        'node.exe'
+    )
+}
+
+function Get-SynapseTcpClientPeerCloseDecision {
+    param(
+        [Parameter(Mandatory=$true)]$TcpClient
+    )
+
+    if (-not $TcpClient.HasLivePeer -or [int]$TcpClient.PeerOwningProcess -le 0) {
+        return [pscustomobject]@{
+            CanClose = $false
+            Reason = 'no_live_peer'
+            PeerProcess = $null
+            Kind = $null
+        }
+    }
+
+    $peerPid = [int]$TcpClient.PeerOwningProcess
+    $peerProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$peerPid" -ErrorAction SilentlyContinue
+    if (-not $peerProcess) {
+        return [pscustomobject]@{
+            CanClose = $false
+            Reason = 'peer_exited'
+            PeerProcess = $null
+            Kind = $null
+        }
+    }
+
+    $protectedNames = Get-SynapseProtectedProcessNames
+    if ($protectedNames -contains $peerProcess.Name) {
+        return [pscustomobject]@{
+            CanClose = $false
+            Reason = "protected_process:$($peerProcess.Name)"
+            PeerProcess = $peerProcess
+            Kind = $null
+        }
+    }
+
+    $commandLine = [string]$peerProcess.CommandLine
+    $isChromeNetworkService = (
+        $peerProcess.Name -ieq 'chrome.exe' -and
+        $commandLine -match '(?i)--type=utility' -and
+        $commandLine -match '(?i)--utility-sub-type=network\.mojom\.NetworkService'
+    )
+    if ($isChromeNetworkService) {
+        return [pscustomobject]@{
+            CanClose = $true
+            Reason = 'exact_chrome_network_service_peer'
+            PeerProcess = $peerProcess
+            Kind = 'chrome_network_service'
+        }
+    }
+
+    return [pscustomobject]@{
+        CanClose = $false
+        Reason = "unowned_peer:$($peerProcess.Name)"
+        PeerProcess = $peerProcess
+        Kind = $null
+    }
+}
+
+function Stop-SynapseStaleBindClientPeersForMaintenance {
+    param(
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][object[]]$TcpClients
+    )
+
+    $liveClients = @($TcpClients | Where-Object { $_.HasLivePeer -and [int]$_.PeerOwningProcess -gt 0 })
+    if ($liveClients.Count -eq 0) {
+        return [pscustomobject]@{
+            ClosedCount = 0
+            ClosedPeerPids = @()
+            RefusedPeerPids = @()
+        }
+    }
+
+    $decisions = @($liveClients | ForEach-Object {
+        $decision = Get-SynapseTcpClientPeerCloseDecision -TcpClient $_
+        [pscustomobject]@{
+            TcpClient = $_
+            CanClose = $decision.CanClose
+            Reason = $decision.Reason
+            PeerProcess = $decision.PeerProcess
+            Kind = $decision.Kind
+        }
+    })
+    $closable = @($decisions | Where-Object { $_.CanClose })
+    $refused = @($decisions | Where-Object { -not $_.CanClose })
+    $refusedPeerPids = @($refused | ForEach-Object { [int]$_.TcpClient.PeerOwningProcess } | Where-Object { $_ -gt 0 } | Sort-Object -Unique)
+
+    if ($refused.Count -gt 0) {
+        $refusedDetail = (($refused | ForEach-Object {
+            $peer = $_.PeerProcess
+            $peerPid = if ($peer) { [int]$peer.ProcessId } else { [int]$_.TcpClient.PeerOwningProcess }
+            $peerName = if ($peer) { $peer.Name } else { '<missing>' }
+            $peerCommandLine = if ($peer) { $peer.CommandLine } else { '<missing>' }
+            "peer_pid=$peerPid peer=$peerName reason=$($_.Reason) tcp=local:$($_.TcpClient.LocalAddress):$($_.TcpClient.LocalPort)->remote:$($_.TcpClient.RemoteAddress):$($_.TcpClient.RemotePort) peer_cmd=$peerCommandLine"
+        }) -join "`n")
+        Info ("FORCE_RESTART: SYNAPSE_FORCE_RESTART_TCP_PEER_CLOSE_REFUSED reason={0} bind={1} refused_count={2}`nrefused:`n{3}`nremediation=setup only closes exact known non-terminal client peers that are safe to restart, such as Chrome NetworkService. Protected terminal/IDE/WSL/Codex/Claude/Node peers are left running and the bind must release naturally or setup fails closed." -f `
+            $Reason,
+            $Bind,
+            $refused.Count,
+            $refusedDetail)
+    }
+
+    if ($closable.Count -eq 0) {
+        return [pscustomobject]@{
+            ClosedCount = 0
+            ClosedPeerPids = @()
+            RefusedPeerPids = $refusedPeerPids
+        }
+    }
+
+    $closedPeerPids = @()
+    foreach ($peerGroup in ($closable | Group-Object { [int]$_.PeerProcess.ProcessId })) {
+        $first = $peerGroup.Group[0]
+        $peer = $first.PeerProcess
+        $peerPid = [int]$peer.ProcessId
+        $peerCommandLine = [string]$peer.CommandLine
+        $tcpDetail = (($peerGroup.Group | ForEach-Object {
+            "local:$($_.TcpClient.LocalAddress):$($_.TcpClient.LocalPort)->remote:$($_.TcpClient.RemoteAddress):$($_.TcpClient.RemotePort)"
+        }) -join ',')
+        Info ("FORCE_RESTART: SYNAPSE_FORCE_RESTART_CLOSE_TCP_PEER reason={0} bind={1} peer_pid={2} peer={3} kind={4} tcp={5} peer_cmd={6}`nremediation=Windows kept a dead-owner Synapse listener row because this exact live client peer still owned a socket to the stopped daemon. Closing this exact Chrome NetworkService process lets Chrome restart networking without closing the browser profile, then setup separately re-probes the bind before starting a daemon." -f `
+            $Reason,
+            $Bind,
+            $peerPid,
+            $peer.Name,
+            $first.Kind,
+            $tcpDetail,
+            $peerCommandLine)
+        try {
+            Stop-Process -Id $peerPid -Force -ErrorAction Stop
+            $closedPeerPids += $peerPid
+        } catch {
+            Die ("SYNAPSE_FORCE_RESTART_TCP_PEER_CLOSE_FAILED reason={0} bind={1} peer_pid={2} peer={3} error={4} remediation=setup could not close the exact live client peer that is holding the dead-owner daemon socket; inspect the peer process and rerun setup after it exits" -f `
+                $Reason,
+                $Bind,
+                $peerPid,
+                $peer.Name,
+                $_.Exception.Message)
+        }
+    }
+
+    Start-Sleep -Seconds 2
+    foreach ($closedPid in $closedPeerPids) {
+        $after = Get-CimInstance Win32_Process -Filter "ProcessId=$closedPid" -ErrorAction SilentlyContinue
+        if ($after) {
+            Die ("SYNAPSE_FORCE_RESTART_TCP_PEER_STILL_RUNNING reason={0} bind={1} peer_pid={2} peer={3} command_line={4} remediation=exact client peer did not exit after Stop-Process; inspect it before retrying setup" -f `
+                $Reason,
+                $Bind,
+                $closedPid,
+                $after.Name,
+                $after.CommandLine)
+        }
+    }
+
+    Info ("FORCE_RESTART: SYNAPSE_FORCE_RESTART_TCP_PEER_CLOSE_VERIFIED reason={0} bind={1} closed_peer_pids={2}" -f `
+        $Reason,
+        $Bind,
+        ($closedPeerPids -join ','))
+    return [pscustomobject]@{
+        ClosedCount = $closedPeerPids.Count
+        ClosedPeerPids = @($closedPeerPids)
+        RefusedPeerPids = $refusedPeerPids
+    }
+}
+
 function Wait-SynapseBindReleased {
     param(
         [Parameter(Mandatory=$true)][string]$Reason,
         [Parameter(Mandatory=$true)][string]$Bind,
-        [int]$TimeoutSeconds = 15
+        [int]$TimeoutSeconds = 15,
+        [switch]$ForceRestart
     )
 
+    if ($script:SynapseBindPostExitContinuationRequired) {
+        $detail = $script:SynapseBindPostExitContinuationDetail
+        $detailReason = if ($detail -and $detail.reason) { [string]$detail.reason } else { '<unknown>' }
+        Info ("SYNAPSE_BIND_POST_EXIT_CONTINUATION_ALREADY_REQUIRED reason={0} bind={1} original_reason={2} remediation=the verified daemon bytes will be installed and a post-exit continuation will reacquire the maintenance lock after this setup process exits; skipping duplicate bind-drain wait inside the same process." -f `
+            $Reason,
+            $Bind,
+            $detailReason)
+        return
+    }
+
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $lastDeadOwnerLog = [DateTime]::MinValue
+    $lastSafePeerCloseDeferredLog = [DateTime]::MinValue
+    $closedForceRestartPeerPids = @{}
+    $refusedForceRestartPeerPids = @{}
+    $deferredForceRestartPeerPids = @{}
+    $maxForceRestartPeerClosePids = 5
     do {
+        Assert-SynapseChromeBridgeMaintenancePauseBudget -Reason $Reason -Bind $Bind -Phase 'initial_bind_wait'
         $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
-        if ($listeners.Count -eq 0) {
-            Info "Synapse bind release verified reason=$Reason bind=$Bind listener_count=0"
+        $probe = Test-SynapseBindAvailable -Bind $Bind
+        if ($listeners.Count -eq 0 -and $probe.Ok) {
+            Info "Synapse bind release verified reason=$Reason bind=$Bind listener_count=0 bind_probe=ok"
             return
+        }
+        $liveListeners = @($listeners | Where-Object { $_.OwnerExists })
+        $staleListeners = @($listeners | Where-Object { -not $_.OwnerExists })
+        if ($liveListeners.Count -eq 0 -and $staleListeners.Count -gt 0 -and $probe.Ok) {
+            Info ("Synapse bind release accepted stale dead-owner listener rows reason={0} bind={1} timeout_s={2} stale_listener_count={3} bind_probe=ok`nstale_listeners:`n{4}`nremediation=Windows can report LISTEN rows briefly after the owning process exits; setup verified a new listener can bind before continuing." -f `
+                $Reason,
+                $Bind,
+                $TimeoutSeconds,
+                $staleListeners.Count,
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners))
+            return
+        }
+        if ($liveListeners.Count -eq 0 -and -not $probe.Ok -and (((Get-Date) - $lastDeadOwnerLog).TotalSeconds -ge 10)) {
+            $lastDeadOwnerLog = Get-Date
+            Info ("Synapse bind release waiting on Windows dead-owner TCP drain reason={0} bind={1} listener_count={2} stale_listener_count={3} bind_probe_error={4}`nstale_listeners:`n{5}`nremediation=setup will not reuse or steal the port; it waits until a normal bind probe proves the address is actually reusable." -f `
+                $Reason,
+                $Bind,
+                $listeners.Count,
+                $staleListeners.Count,
+                $probe.Error,
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners))
+        }
+        if ($ForceRestart -and $liveListeners.Count -eq 0 -and $staleListeners.Count -gt 0 -and -not $probe.Ok) {
+            $tcpClients = @(Get-SynapseTcpClientSnapshot -Bind $Bind)
+            $liveTcpClients = @($tcpClients | Where-Object { $_.HasLivePeer -and [int]$_.PeerOwningProcess -gt 0 })
+            $unclosableLiveTcpClients = @($liveTcpClients | Where-Object {
+                $decision = Get-SynapseTcpClientPeerCloseDecision -TcpClient $_
+                -not $decision.CanClose
+            })
+            if ($unclosableLiveTcpClients.Count -gt 0) {
+                if (((Get-Date) - $lastSafePeerCloseDeferredLog).TotalSeconds -ge 10) {
+                    $lastSafePeerCloseDeferredLog = Get-Date
+                    Info ("Synapse bind release safe-peer close deferred reason={0} bind={1} unclosable_live_peer_count={2} live_peer_count={3}`ntcp_clients:`n{4}`nremediation=setup will not churn restartable peers while protected/unowned clients still hold the dead-owner daemon socket; it waits for those clients to release naturally, then may close exact safe peers if needed." -f `
+                        $Reason,
+                        $Bind,
+                        $unclosableLiveTcpClients.Count,
+                        $liveTcpClients.Count,
+                        (Format-SynapseTcpClientSnapshot -Snapshot $liveTcpClients))
+                }
+            } else {
+            $newLiveTcpClients = @($liveTcpClients | Where-Object {
+                $peerPidKey = [string][int]$_.PeerOwningProcess
+                -not $closedForceRestartPeerPids.ContainsKey($peerPidKey) -and -not $refusedForceRestartPeerPids.ContainsKey($peerPidKey) -and -not $deferredForceRestartPeerPids.ContainsKey($peerPidKey)
+            })
+            if ($newLiveTcpClients.Count -gt 0) {
+                $newPeerPids = @($newLiveTcpClients | ForEach-Object { [int]$_.PeerOwningProcess } | Sort-Object -Unique)
+                $newClosablePeerPids = @($newLiveTcpClients | Where-Object {
+                    $decision = Get-SynapseTcpClientPeerCloseDecision -TcpClient $_
+                    $decision.CanClose
+                } | ForEach-Object { [int]$_.PeerOwningProcess } | Sort-Object -Unique)
+                if (($closedForceRestartPeerPids.Count + $newClosablePeerPids.Count) -gt $maxForceRestartPeerClosePids) {
+                    foreach ($peerPid in @($newClosablePeerPids)) {
+                        $deferredForceRestartPeerPids[[string]$peerPid] = $true
+                    }
+                    Info ("SYNAPSE_FORCE_RESTART_TCP_PEER_CLOSE_LIMIT_REACHED_WAITING reason={0} bind={1} max_peer_pids={2} already_closed_peer_pids={3} deferred_peer_pids={4}`ntcp_clients:`n{5}`nremediation=Chrome NetworkService can restart faster than Windows releases the stopped daemon socket. Setup stops closing additional safe peers at the hard cap and continues the bounded dead-owner bind drain; final success still requires a normal bind probe, and final failure reports the remaining physical TCP/process SoT." -f `
+                        $Reason,
+                        $Bind,
+                        $maxForceRestartPeerClosePids,
+                        (($closedForceRestartPeerPids.Keys | Sort-Object) -join ','),
+                        ($newClosablePeerPids -join ','),
+                        (Format-SynapseTcpClientSnapshot -Snapshot $liveTcpClients))
+                    continue
+                }
+                $peerClose = Stop-SynapseStaleBindClientPeersForMaintenance -Reason $Reason -Bind $Bind -TcpClients $newLiveTcpClients
+                foreach ($peerPid in @($peerClose.ClosedPeerPids)) {
+                    $closedForceRestartPeerPids[[string]$peerPid] = $true
+                }
+                foreach ($peerPid in @($peerClose.RefusedPeerPids)) {
+                    $refusedForceRestartPeerPids[[string]$peerPid] = $true
+                }
+                if ([int]$peerClose.ClosedCount -gt 0) {
+                    continue
+                }
+            }
+            }
         }
         Start-Sleep -Milliseconds 250
     } while ((Get-Date) -lt $deadline)
 
+    $extendedDeadline = (Get-Date).AddSeconds([Math]::Max(300, $TimeoutSeconds))
+    $enteredExtendedDrain = $false
+    while ((Get-Date) -lt $extendedDeadline) {
+        Assert-SynapseChromeBridgeMaintenancePauseBudget -Reason $Reason -Bind $Bind -Phase 'extended_dead_owner_drain'
+        $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+        $probe = Test-SynapseBindAvailable -Bind $Bind
+        $tcpClients = @(Get-SynapseTcpClientSnapshot -Bind $Bind)
+        $processes = @(Get-SynapseMcpProcessSnapshot)
+        $liveListeners = @($listeners | Where-Object { $_.OwnerExists })
+        $staleListeners = @($listeners | Where-Object { -not $_.OwnerExists })
+        if ($listeners.Count -eq 0 -and $probe.Ok) {
+            Info ("Synapse bind release verified after dead-owner drain reason={0} bind={1} initial_timeout_s={2} listener_count=0 bind_probe=ok tcp_client_count={3} process_count={4}" -f `
+                $Reason,
+                $Bind,
+                $TimeoutSeconds,
+                $tcpClients.Count,
+                $processes.Count)
+            return
+        }
+        if ($liveListeners.Count -eq 0 -and $staleListeners.Count -gt 0 -and $probe.Ok) {
+            Info ("Synapse bind release accepted stale dead-owner listener rows after drain reason={0} bind={1} initial_timeout_s={2} stale_listener_count={3} tcp_client_count={4} process_count={5} bind_probe=ok`nstale_listeners:`n{6}`ntcp_clients:`n{7}`nremediation=Windows still reports stale LISTEN rows, but setup separately proved a normal listener can bind." -f `
+                $Reason,
+                $Bind,
+                $TimeoutSeconds,
+                $staleListeners.Count,
+                $tcpClients.Count,
+                $processes.Count,
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners),
+                (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients))
+            return
+        }
+        if ($liveListeners.Count -gt 0 -or $processes.Count -gt 0) {
+            break
+        }
+        if ($ForceRestart -and $staleListeners.Count -gt 0 -and -not $probe.Ok -and $tcpClients.Count -gt 0) {
+            $liveTcpClients = @($tcpClients | Where-Object { $_.HasLivePeer -and [int]$_.PeerOwningProcess -gt 0 })
+            if ($liveTcpClients.Count -eq 0) {
+                if (-not $enteredExtendedDrain -or (((Get-Date) - $lastDeadOwnerLog).TotalSeconds -ge 10)) {
+                    Info ("Synapse bind release live-peer close not attempted yet reason={0} bind={1} tcp_client_count={2} live_peer_count=0 remediation=setup will keep waiting; TIME_WAIT or ownerless rows do not consume the exact live-peer close attempt." -f `
+                        $Reason,
+                        $Bind,
+                        $tcpClients.Count)
+                }
+            } else {
+                $unclosableLiveTcpClients = @($liveTcpClients | Where-Object {
+                    $decision = Get-SynapseTcpClientPeerCloseDecision -TcpClient $_
+                    -not $decision.CanClose
+                })
+                if ($unclosableLiveTcpClients.Count -gt 0) {
+                    $codexPinnedTcpClients = @(Get-SynapseCodexPeerRows -TcpClients $unclosableLiveTcpClients)
+                    if ($codexPinnedTcpClients.Count -gt 0 -and $processes.Count -eq 0 -and $staleListeners.Count -gt 0 -and -not $probe.Ok) {
+                        $codexPeerPids = @($codexPinnedTcpClients |
+                            ForEach-Object { [int]$_.PeerOwningProcess } |
+                            Sort-Object -Unique)
+                        $script:SynapseBindPostExitContinuationRequired = $true
+                        $script:SynapseBindPostExitContinuationDetail = [ordered]@{
+                            schema = 'synapse_bind_post_exit_continuation_required/v1'
+                            reason = $Reason
+                            bind = $Bind
+                            timeout_s = $TimeoutSeconds
+                            phase = 'protected_codex_dead_owner_bind'
+                            stale_listener_count = $staleListeners.Count
+                            codex_peer_pids = @($codexPeerPids)
+                            bind_probe_ok = $probe.Ok
+                            bind_probe_error = $probe.Error
+                            observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+                            stale_listeners = @($staleListeners)
+                            tcp_clients = @($tcpClients)
+                            protected_codex_tcp_clients = @($codexPinnedTcpClients)
+                            processes = @($processes)
+                            remediation = 'the stopped daemon has no live owner, but Windows still exposes a dead-owner listener pinned by protected Codex MCP peers inside this setup process; install the verified bytes, then start a post-exit continuation after this runner exits instead of killing Codex or terminal/IDE/WSL hosts'
+                        }
+                        Info ("SYNAPSE_BIND_POST_EXIT_CONTINUATION_REQUIRED reason={0} bind={1} phase=protected_codex_dead_owner_bind codex_peer_pids={2} stale_listener_count={3} bind_probe_error={4}`nstale_listeners:`n{5}`ntcp_clients:`n{6}`nremediation=setup will install the verified daemon bytes and then start a hidden post-exit continuation after the current runner exits; it will not kill protected Codex, terminal, IDE, or WSL host processes." -f `
+                            $Reason,
+                            $Bind,
+                            ($codexPeerPids -join ','),
+                            $staleListeners.Count,
+                            $probe.Error,
+                            (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners),
+                            (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients))
+                        return
+                    }
+                    if (-not $enteredExtendedDrain -or (((Get-Date) - $lastSafePeerCloseDeferredLog).TotalSeconds -ge 10)) {
+                        $lastSafePeerCloseDeferredLog = Get-Date
+                        Info ("Synapse bind release safe-peer close deferred reason={0} bind={1} unclosable_live_peer_count={2} live_peer_count={3}`ntcp_clients:`n{4}`nremediation=setup will not churn restartable peers while protected/unowned clients still hold the dead-owner daemon socket; it waits for those clients to release naturally, then may close exact safe peers if needed." -f `
+                            $Reason,
+                            $Bind,
+                            $unclosableLiveTcpClients.Count,
+                            $liveTcpClients.Count,
+                            (Format-SynapseTcpClientSnapshot -Snapshot $liveTcpClients))
+                    }
+                } else {
+                $newLiveTcpClients = @($liveTcpClients | Where-Object {
+                    $peerPidKey = [string][int]$_.PeerOwningProcess
+                    -not $closedForceRestartPeerPids.ContainsKey($peerPidKey) -and -not $refusedForceRestartPeerPids.ContainsKey($peerPidKey) -and -not $deferredForceRestartPeerPids.ContainsKey($peerPidKey)
+                })
+                if ($newLiveTcpClients.Count -eq 0) {
+                    if (-not $enteredExtendedDrain -or (((Get-Date) - $lastDeadOwnerLog).TotalSeconds -ge 10)) {
+                        Info ("Synapse bind release live-peer close already classified reason={0} bind={1} live_peer_count={2} closed_peer_pids={3} refused_peer_pids={4} remediation=setup will keep waiting for Windows to release the socket after exact safe-peer close attempts and protected-peer refusals already completed." -f `
+                            $Reason,
+                            $Bind,
+                            $liveTcpClients.Count,
+                            (($closedForceRestartPeerPids.Keys | Sort-Object) -join ','),
+                            (($refusedForceRestartPeerPids.Keys | Sort-Object) -join ',') + "$(if ($deferredForceRestartPeerPids.Count -gt 0) { '; deferred_peer_pids=' + (($deferredForceRestartPeerPids.Keys | Sort-Object) -join ',') } else { '' })")
+                    }
+                } else {
+                    $newPeerPids = @($newLiveTcpClients | ForEach-Object { [int]$_.PeerOwningProcess } | Sort-Object -Unique)
+                    $newClosablePeerPids = @($newLiveTcpClients | Where-Object {
+                        $decision = Get-SynapseTcpClientPeerCloseDecision -TcpClient $_
+                        $decision.CanClose
+                    } | ForEach-Object { [int]$_.PeerOwningProcess } | Sort-Object -Unique)
+                    if (($closedForceRestartPeerPids.Count + $newClosablePeerPids.Count) -gt $maxForceRestartPeerClosePids) {
+                        foreach ($peerPid in @($newClosablePeerPids)) {
+                            $deferredForceRestartPeerPids[[string]$peerPid] = $true
+                        }
+                        Info ("SYNAPSE_FORCE_RESTART_TCP_PEER_CLOSE_LIMIT_REACHED_WAITING reason={0} bind={1} max_peer_pids={2} already_closed_peer_pids={3} deferred_peer_pids={4}`ntcp_clients:`n{5}`nremediation=Chrome NetworkService can restart faster than Windows releases the stopped daemon socket. Setup stops closing additional safe peers at the hard cap and continues the bounded dead-owner bind drain; final success still requires a normal bind probe, and final failure reports the remaining physical TCP/process SoT." -f `
+                            $Reason,
+                            $Bind,
+                            $maxForceRestartPeerClosePids,
+                            (($closedForceRestartPeerPids.Keys | Sort-Object) -join ','),
+                            ($newClosablePeerPids -join ','),
+                            (Format-SynapseTcpClientSnapshot -Snapshot $liveTcpClients))
+                        continue
+                    }
+                    $peerClose = Stop-SynapseStaleBindClientPeersForMaintenance -Reason $Reason -Bind $Bind -TcpClients $newLiveTcpClients
+                    foreach ($peerPid in @($peerClose.ClosedPeerPids)) {
+                        $closedForceRestartPeerPids[[string]$peerPid] = $true
+                    }
+                    foreach ($peerPid in @($peerClose.RefusedPeerPids)) {
+                        $refusedForceRestartPeerPids[[string]$peerPid] = $true
+                    }
+                    if ([int]$peerClose.ClosedCount -gt 0) {
+                        continue
+                    }
+                }
+                }
+            }
+        }
+        if (-not $enteredExtendedDrain -or (((Get-Date) - $lastDeadOwnerLog).TotalSeconds -ge 10)) {
+            $enteredExtendedDrain = $true
+            $lastDeadOwnerLog = Get-Date
+            Info ("Synapse bind release extended dead-owner drain reason={0} bind={1} initial_timeout_s={2} listener_count={3} stale_listener_count={4} tcp_client_count={5} process_count={6} bind_probe_ok={7} bind_probe_error={8}`nstale_listeners:`n{9}`ntcp_clients:`n{10}`nremediation=setup is waiting for Windows to release dead-owner TCP rows; it will continue only after a normal bind probe succeeds." -f `
+                $Reason,
+                $Bind,
+                $TimeoutSeconds,
+                $listeners.Count,
+                $staleListeners.Count,
+                $tcpClients.Count,
+                $processes.Count,
+                $probe.Ok,
+                $probe.Error,
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners),
+                (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients))
+        }
+        Start-Sleep -Seconds 1
+    }
+
     $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+    $probe = Test-SynapseBindAvailable -Bind $Bind
     $tcpClients = @(Get-SynapseTcpClientSnapshot -Bind $Bind)
     $processes = @(Get-SynapseMcpProcessSnapshot)
-    Die ("SYNAPSE_BIND_STILL_LISTENING reason={0} bind={1} timeout_s={2} listener_count={3} process_count={4}`nlisteners:`n{5}`ntcp_clients:`n{6}`nprocesses:`n{7}`nremediation=the configured HTTP bind is still occupied after daemon shutdown. Do not start another daemon or switch ports. Close/restart the exact live MCP client peer listed here if it owns the remaining connection, or restart the current Codex process when it is the peer; never close terminal/IDE/WSL processes globally." -f `
+    $liveListeners = @($listeners | Where-Object { $_.OwnerExists })
+    $staleListeners = @($listeners | Where-Object { -not $_.OwnerExists })
+    if ($liveListeners.Count -eq 0 -and $staleListeners.Count -gt 0 -and $probe.Ok) {
+        Info ("Synapse bind release accepted stale dead-owner listener rows reason={0} bind={1} timeout_s={2} stale_listener_count={3} tcp_client_count={4} process_count={5} bind_probe=ok`nstale_listeners:`n{6}`ntcp_clients:`n{7}`nremediation=Windows can report LISTEN rows briefly after the owning process exits; setup verified a new listener can bind before continuing." -f `
+            $Reason,
+            $Bind,
+            $TimeoutSeconds,
+            $staleListeners.Count,
+            $tcpClients.Count,
+            $processes.Count,
+            (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners),
+            (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients))
+        return
+    }
+    if ($ForceRestart -and $liveListeners.Count -eq 0 -and $staleListeners.Count -gt 0 -and $processes.Count -eq 0 -and $tcpClients.Count -eq 0 -and -not $probe.Ok) {
+        Info ("SYNAPSE_BIND_FINAL_DEAD_OWNER_SETTLE reason={0} bind={1} settle_s={2} stale_listener_count={3} bind_probe_error={4}`nstale_listeners:`n{5}`nremediation=no live daemon process and no TCP peer client remain; setup performs one bounded final kernel-state settle/readback before fatal so a disappearing Windows dead-owner row is not mistaken for a live owner." -f `
+            $Reason,
+            $Bind,
+            $SynapseBindFinalDeadOwnerSettleSeconds,
+            $staleListeners.Count,
+            $probe.Error,
+            (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners))
+        $settleDeadline = (Get-Date).AddSeconds($SynapseBindFinalDeadOwnerSettleSeconds)
+        while ((Get-Date) -lt $settleDeadline) {
+            Assert-SynapseChromeBridgeMaintenancePauseBudget -Reason $Reason -Bind $Bind -Phase 'final_dead_owner_settle'
+            Start-Sleep -Milliseconds 250
+            $settleListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+            $settleProbe = Test-SynapseBindAvailable -Bind $Bind
+            $settleTcpClients = @(Get-SynapseTcpClientSnapshot -Bind $Bind)
+            $settleProcesses = @(Get-SynapseMcpProcessSnapshot)
+            $settleLiveListeners = @($settleListeners | Where-Object { $_.OwnerExists })
+            $settleStaleListeners = @($settleListeners | Where-Object { -not $_.OwnerExists })
+            if ($settleListeners.Count -eq 0 -and $settleProbe.Ok) {
+                Info ("Synapse bind release verified after final dead-owner settle reason={0} bind={1} listener_count=0 bind_probe=ok tcp_client_count={2} process_count={3}" -f `
+                    $Reason,
+                    $Bind,
+                    $settleTcpClients.Count,
+                    $settleProcesses.Count)
+                return
+            }
+            if ($settleLiveListeners.Count -eq 0 -and $settleStaleListeners.Count -gt 0 -and $settleProbe.Ok) {
+                Info ("Synapse bind release accepted stale dead-owner listener rows after final settle reason={0} bind={1} stale_listener_count={2} tcp_client_count={3} process_count={4} bind_probe=ok`nstale_listeners:`n{5}`ntcp_clients:`n{6}`nremediation=Windows still reports stale LISTEN rows, but setup separately proved a normal listener can bind." -f `
+                    $Reason,
+                    $Bind,
+                    $settleStaleListeners.Count,
+                    $settleTcpClients.Count,
+                    $settleProcesses.Count,
+                    (Format-SynapseTcpBindListenerSnapshot -Snapshot $settleStaleListeners),
+                    (Format-SynapseTcpClientSnapshot -Snapshot $settleTcpClients))
+                return
+            }
+            if ($settleLiveListeners.Count -gt 0 -or $settleProcesses.Count -gt 0 -or $settleTcpClients.Count -gt 0) {
+                Info ("SYNAPSE_BIND_FINAL_DEAD_OWNER_SETTLE_ABORTED reason={0} bind={1} live_listener_count={2} tcp_client_count={3} process_count={4} bind_probe_ok={5}`nlive_listeners:`n{6}`ntcp_clients:`n{7}`nprocesses:`n{8}`nremediation=a live owner/client appeared during final settle; setup will fail closed with the current physical SoT instead of assuming the stale-row case." -f `
+                    $Reason,
+                    $Bind,
+                    $settleLiveListeners.Count,
+                    $settleTcpClients.Count,
+                    $settleProcesses.Count,
+                    $settleProbe.Ok,
+                    (Format-SynapseTcpBindListenerSnapshot -Snapshot $settleLiveListeners),
+                    (Format-SynapseTcpClientSnapshot -Snapshot $settleTcpClients),
+                    (Format-SynapseMcpProcessSnapshot -Snapshot $settleProcesses))
+                break
+            }
+        }
+        $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+        $probe = Test-SynapseBindAvailable -Bind $Bind
+        $tcpClients = @(Get-SynapseTcpClientSnapshot -Bind $Bind)
+        $processes = @(Get-SynapseMcpProcessSnapshot)
+        $liveListeners = @($listeners | Where-Object { $_.OwnerExists })
+        $staleListeners = @($listeners | Where-Object { -not $_.OwnerExists })
+        if ($liveListeners.Count -eq 0 -and $staleListeners.Count -gt 0 -and $processes.Count -eq 0 -and $tcpClients.Count -eq 0 -and -not $probe.Ok) {
+            $script:SynapseBindPostExitContinuationRequired = $true
+            $script:SynapseBindPostExitContinuationDetail = [ordered]@{
+                schema = 'synapse_bind_post_exit_continuation_required/v1'
+                reason = $Reason
+                bind = $Bind
+                timeout_s = $TimeoutSeconds
+                stale_listener_count = $staleListeners.Count
+                bind_probe_ok = $probe.Ok
+                bind_probe_error = $probe.Error
+                observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+                stale_listeners = @($staleListeners)
+                tcp_clients = @($tcpClients)
+                processes = @($processes)
+                remediation = 'the stopped daemon has no live owner and no TCP peers, but Windows keeps the dead-owner listener unavailable inside this setup process; install the verified bytes, then start a post-exit continuation that waits for this runner to release process-scoped/kernel state before daemon start'
+            }
+            Info ("SYNAPSE_BIND_POST_EXIT_CONTINUATION_REQUIRED reason={0} bind={1} stale_listener_count={2} bind_probe_error={3}`nstale_listeners:`n{4}`nremediation=setup will install the verified daemon bytes and then start a hidden post-exit continuation instead of starting a daemon while the bind probe still fails." -f `
+                $Reason,
+                $Bind,
+                $staleListeners.Count,
+                $probe.Error,
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners))
+            return
+        }
+    }
+    if ($ForceRestart -and $liveListeners.Count -eq 0 -and $staleListeners.Count -gt 0 -and $processes.Count -eq 0 -and -not $probe.Ok) {
+        $liveTcpClients = @($tcpClients | Where-Object { $_.HasLivePeer -and [int]$_.PeerOwningProcess -gt 0 })
+        $codexPinnedTcpClients = @(Get-SynapseCodexPeerRows -TcpClients $liveTcpClients)
+        if ($codexPinnedTcpClients.Count -gt 0) {
+            $codexPeerPids = @($codexPinnedTcpClients |
+                ForEach-Object { [int]$_.PeerOwningProcess } |
+                Sort-Object -Unique)
+            $script:SynapseBindPostExitContinuationRequired = $true
+            $script:SynapseBindPostExitContinuationDetail = [ordered]@{
+                schema = 'synapse_bind_post_exit_continuation_required/v1'
+                reason = $Reason
+                bind = $Bind
+                timeout_s = $TimeoutSeconds
+                phase = 'protected_codex_dead_owner_bind_final'
+                stale_listener_count = $staleListeners.Count
+                codex_peer_pids = @($codexPeerPids)
+                bind_probe_ok = $probe.Ok
+                bind_probe_error = $probe.Error
+                observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+                stale_listeners = @($staleListeners)
+                tcp_clients = @($tcpClients)
+                protected_codex_tcp_clients = @($codexPinnedTcpClients)
+                processes = @($processes)
+                remediation = 'the stopped daemon has no live owner, but a protected Codex MCP peer appeared only at the final dead-owner readback; install the verified bytes, then start a post-exit continuation after this runner exits instead of killing Codex or terminal/IDE/WSL hosts'
+            }
+            Info ("SYNAPSE_BIND_POST_EXIT_CONTINUATION_REQUIRED reason={0} bind={1} phase=protected_codex_dead_owner_bind_final codex_peer_pids={2} stale_listener_count={3} bind_probe_error={4}`nstale_listeners:`n{5}`ntcp_clients:`n{6}`nremediation=setup will install the verified daemon bytes and then start a hidden post-exit continuation after the current runner exits; it will not kill protected Codex, terminal, IDE, or WSL host processes." -f `
+                $Reason,
+                $Bind,
+                ($codexPeerPids -join ','),
+                $staleListeners.Count,
+                $probe.Error,
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners),
+                (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients))
+            return
+        }
+    }
+    Die ("SYNAPSE_BIND_STILL_LISTENING reason={0} bind={1} timeout_s={2} listener_count={3} live_listener_count={4} stale_listener_count={5} process_count={6} bind_probe_ok={7} bind_probe_error={8}`nlive_listeners:`n{9}`nstale_listeners:`n{10}`ntcp_clients:`n{11}`nprocesses:`n{12}`nremediation=the configured HTTP bind is still occupied after daemon shutdown or Windows has not released dead-owner TCP rows after the extended drain. Do not start another daemon or switch ports. Close/restart the exact live MCP client peer listed here if it owns the remaining connection, or restart the current Codex process when it is the peer; never close terminal/IDE/WSL processes globally." -f `
         $Reason,
         $Bind,
         $TimeoutSeconds,
         $listeners.Count,
+        $liveListeners.Count,
+        $staleListeners.Count,
         $processes.Count,
-        (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners),
+        $probe.Ok,
+        $probe.Error,
+        (Format-SynapseTcpBindListenerSnapshot -Snapshot $liveListeners),
+        (Format-SynapseTcpBindListenerSnapshot -Snapshot $staleListeners),
         (Format-SynapseTcpClientSnapshot -Snapshot $tcpClients),
         (Format-SynapseMcpProcessSnapshot -Snapshot $processes))
 }
@@ -2113,7 +2978,9 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     param(
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$Token,
-        [Parameter(Mandatory=$true)]$Health
+        [Parameter(Mandatory=$true)]$Health,
+        [Parameter(Mandatory=$true)][string]$ChromeBridgeInstallerPath,
+        [Parameter(Mandatory=$true)][string]$ChromeNativeHostExePath
     )
 
     $chromeBridge = $Health.subsystems.chrome_bridge
@@ -2126,11 +2993,40 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     }
 
     $currentHealth = $Health
-    for ($attempt = 0; $attempt -lt 15; $attempt++) {
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $postStartWaitMs = $SynapseChromeBridgeDefaultPostStartWaitMs
+    if ($null -ne $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) {
+        $remainingPauseMs = [Math]::Max(0, [int64]$script:SynapseChromeBridgeMaintenancePauseUntilUnixMs - [int64]$nowMs)
+        $postStartWaitMs = [Math]::Max(
+            [int64]$postStartWaitMs,
+            [int64]$remainingPauseMs + [int64]$SynapseChromeBridgeReconnectAlarmCushionMs)
+        $postStartWaitMs = [Math]::Min([int64]$postStartWaitMs, [int64]$SynapseChromeBridgeMaxPostStartWaitMs)
+    }
+    $deadlineMs = [int64]$nowMs + [int64]$postStartWaitMs
+    $attempt = 0
+    while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $deadlineMs) {
         if ($detail -notmatch 'no_active_chrome_bridge_host') {
             break
         }
-        Info "Chrome bridge host absent after daemon start; waiting for alarmReconnect readback attempt=$($attempt + 1)/15"
+        $attempt += 1
+        $currentMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        $pauseRemainingMs = 0
+        if ($null -ne $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) {
+            $pauseRemainingMs = [Math]::Max(0, [int64]$script:SynapseChromeBridgeMaintenancePauseUntilUnixMs - [int64]$currentMs)
+        }
+        if ($pauseRemainingMs -gt 0) {
+            Info ("Chrome bridge host absent after daemon start while maintenance reconnect pause remains active; skipping alarmReconnect wait and invoking bounded existing-Chrome UI repair. attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2}" -f `
+                $attempt,
+                $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs,
+                $pauseRemainingMs)
+            break
+        }
+        $waitRemainingMs = [Math]::Max(0, [int64]$deadlineMs - [int64]$currentMs)
+        Info ("Chrome bridge host absent after daemon start; waiting for alarmReconnect readback attempt={0} pause_until_unix_ms={1} pause_remaining_ms={2} wait_remaining_ms={3}" -f `
+            $attempt,
+            ($(if ($null -eq $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs) { '<none>' } else { $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs })),
+            $pauseRemainingMs,
+            $waitRemainingMs)
         Start-Sleep -Seconds 2
         try {
             $currentHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4
@@ -2147,7 +3043,40 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
         }
     }
     if ($detail -match 'no_active_chrome_bridge_host') {
-        Die "SYNAPSE_CHROME_BRIDGE_HOST_ABSENT_AFTER_SETUP_WAIT status=$status detail=$detail remediation=setup waited for the already-installed bridge host to reconnect after daemon start; keep the active Chrome profile open and rerun scripts\\install-synapse-chrome-debugger.ps1 if the host does not register"
+        Info "Chrome bridge host still absent after alarmReconnect wait; invoking bounded existing-Chrome UI repair for the installed bridge. status=$status detail=$detail"
+        $uiRepairReadback = Invoke-SynapseChromeBridgeUiRepair `
+            -InstallerPath $ChromeBridgeInstallerPath `
+            -NativeHostExePath $ChromeNativeHostExePath
+        $repairReason = [string]$uiRepairReadback.synapse_chrome_auto_install.reason
+        $uiDeadlineMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [int64]45000
+        $uiAttempt = 0
+        do {
+            $uiAttempt += 1
+            Start-Sleep -Seconds 2
+            try {
+                $currentHealth = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $Token" } -TimeoutSec 4
+            } catch {
+                Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_HEALTH_FAILED bind=$Bind error=$($_.Exception.Message) remediation=daemon was live before Chrome bridge UI repair but /health failed afterward"
+            }
+            $chromeBridge = $currentHealth.subsystems.chrome_bridge
+            $status = [string]$chromeBridge.status
+            $detail = [string]$chromeBridge.detail
+            $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'pageScreenshot'
+            if ($isClean) {
+                Info "Chrome bridge OK after existing-Chrome UI repair: reason=$repairReason stale=false capability=pageScreenshot"
+                return $currentHealth
+            }
+            $waitRemainingMs = [Math]::Max(0, [int64]$uiDeadlineMs - [int64][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
+            Info ("Chrome bridge still not clean after UI repair; waiting for registration attempt={0} repair_reason={1} status={2} wait_remaining_ms={3} detail={4}" -f `
+                $uiAttempt,
+                $repairReason,
+                $status,
+                $waitRemainingMs,
+                $detail)
+        } while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $uiDeadlineMs)
+
+        $repairAutoInstall = $uiRepairReadback.synapse_chrome_auto_install | ConvertTo-Json -Depth 12 -Compress
+        Die "SYNAPSE_CHROME_BRIDGE_HOST_ABSENT_AFTER_UI_REPAIR status=$status detail=$detail ui_repair=$repairAutoInstall remediation=setup invoked the already-open Chrome extension UI reload/install path and still did not observe an active bridge host in /health; inspect the Chrome extension details UI, service-worker console, and daemon chrome_bridge health before accepting setup"
     }
 
     Info "WARN: Chrome bridge not clean after daemon start; requesting in-place browser_debugger.reload_bridge through the new live MCP daemon. status=$status detail=$detail"
@@ -2307,7 +3236,23 @@ function Get-SynapseFileSha256 {
     if (-not (Test-Path -LiteralPath $Path)) {
         Die "SYNAPSE_FILE_HASH_MISSING path=$Path remediation=build or install the daemon binary before hashing it"
     }
-    return (Get-FileHash -Algorithm SHA256 -LiteralPath $Path).Hash
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+            $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+            try {
+                $hash = $sha.ComputeHash($stream)
+            } finally {
+                $stream.Dispose()
+            }
+        } finally {
+            $sha.Dispose()
+        }
+        return (($hash | ForEach-Object { $_.ToString('X2') }) -join '')
+    } catch {
+        Die "SYNAPSE_FILE_HASH_FAILED path=$Path error=$($_.Exception.Message) remediation=verify the file exists, is readable by this user, and is not protected by an exclusive writer before retrying setup"
+    }
 }
 
 function New-SynapseSetupRunDirectory {
@@ -2856,6 +3801,421 @@ function ConvertTo-SynapseHandoffDiffObject {
     }
 }
 
+function ConvertTo-SynapseTcpClientEvidenceObject {
+    param([object[]]$TcpClients)
+
+    return @($TcpClients | ForEach-Object {
+        [ordered]@{
+            state = [string]$_.State
+            local_address = [string]$_.LocalAddress
+            local_port = [int]$_.LocalPort
+            remote_address = [string]$_.RemoteAddress
+            remote_port = [int]$_.RemotePort
+            owning_process = [int]$_.OwningProcess
+            owner_name = [string]$_.OwnerName
+            owner_command_line = [string]$_.OwnerCommandLine
+            peer_owning_process = [int]$_.PeerOwningProcess
+            peer_owner_exists = [bool]$_.PeerOwnerExists
+            peer_owner_name = [string]$_.PeerOwnerName
+            peer_owner_command_line = [string]$_.PeerOwnerCommandLine
+            has_live_peer = [bool]$_.HasLivePeer
+        }
+    })
+}
+
+function ConvertTo-SynapseListenerEvidenceObject {
+    param([object[]]$Listeners)
+
+    return @($Listeners | ForEach-Object {
+        [ordered]@{
+            state = [string]$_.State
+            local_address = [string]$_.LocalAddress
+            local_port = [int]$_.LocalPort
+            owning_process = [int]$_.OwningProcess
+            owner_exists = [bool]$_.OwnerExists
+            owner_name = [string]$_.OwnerName
+            owner_command_line = [string]$_.OwnerCommandLine
+            creation_time = [string]$_.CreationTime
+        }
+    })
+}
+
+function Get-SynapseCodexPeerRows {
+    param([object[]]$TcpClients)
+
+    return @($TcpClients | Where-Object {
+        if (-not $_.HasLivePeer -or [int]$_.PeerOwningProcess -le 0) {
+            $false
+        } else {
+            $peer = Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$_.PeerOwningProcess)" -ErrorAction SilentlyContinue
+            Test-SynapseCodexProcess -Process $peer
+        }
+    })
+}
+
+function Write-SynapseCodexSocketRestartHandoff {
+    param(
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][object[]]$CodexTcpClients,
+        [Parameter(Mandatory=$true)][object[]]$TcpClients,
+        [Parameter(Mandatory=$true)][object[]]$StaleListeners,
+        [Parameter(Mandatory=$true)][AllowNull()][string]$BindProbeError,
+        [AllowNull()][string]$SourceDir,
+        [AllowNull()][string]$TokenPath,
+        [AllowNull()][string]$ActiveIssue
+    )
+
+    $root = Join-Path $env:LOCALAPPDATA 'synapse\codex-restart-handoffs'
+    $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
+    $firstCodexPid = @($CodexTcpClients | ForEach-Object { [int]$_.PeerOwningProcess } | Sort-Object -Unique | Select-Object -First 1)
+    $codexPidForName = if ($firstCodexPid.Count -gt 0) { [int]$firstCodexPid[0] } else { 0 }
+    $baseName = "codex-socket-handoff-$codexPidForName-$stamp"
+    $jsonPath = Join-Path $root "$baseName.json"
+    $mdPath = Join-Path $root "$baseName.md"
+    $recoveryNotesPath = Get-SynapseRecoveryNotesPath -SourceDir $SourceDir
+    $activeIssueRef = Get-SynapseNormalizedIssueRef -Issue $ActiveIssue
+    $activeIssueNumber = Get-SynapseIssueNumberFromRef -IssueRef $activeIssueRef
+    $activeIssueRead = if ([string]::IsNullOrWhiteSpace($activeIssueNumber)) {
+        $null
+    } else {
+        "gh issue view $activeIssueNumber --repo ChrisRoyse/Synapse --comments"
+    }
+    $codexPeers = @($CodexTcpClients | ForEach-Object {
+        $peerPid = [int]$_.PeerOwningProcess
+        $peer = Get-CimInstance Win32_Process -Filter "ProcessId=$peerPid" -ErrorAction SilentlyContinue
+        [ordered]@{
+            pid = $peerPid
+            name = if ($peer) { [string]$peer.Name } else { [string]$_.PeerOwnerName }
+            command_line = if ($peer) { [string]$peer.CommandLine } else { [string]$_.PeerOwnerCommandLine }
+            tcp_local = "$($_.LocalAddress):$($_.LocalPort)"
+            tcp_remote = "$($_.RemoteAddress):$($_.RemotePort)"
+        }
+    })
+    $codexPeerPids = @($codexPeers | ForEach-Object { [int]$_.pid } | Sort-Object -Unique)
+    $postRestartRequiredReads = @(
+        'C:\Users\hotra\Downloads\AICodingAgentSuperPrompt.md',
+        'C:\code\Synapse\docs\compressionprompt.md',
+        'C:\code\Synapse\AGENTS.md',
+        $recoveryNotesPath
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $githubReads = @(
+        'gh issue view 351 --repo ChrisRoyse/Synapse --comments',
+        $activeIssueRead,
+        'gh issue view 1405 --repo ChrisRoyse/Synapse --comments',
+        'gh issue list --repo ChrisRoyse/Synapse --state open --limit 100'
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
+    $restartCommandHint = if ([string]::IsNullOrWhiteSpace($activeIssueRef)) {
+        "Close the exact Codex peer process(es) named in this handoff by ending their owning Codex session(s), start a new Codex session through the patched launcher, verify those stale peer PID(s) are gone, then resume from GitHub issue state."
+    } else {
+        "Close the exact Codex peer process(es) named in this handoff by ending their owning Codex session(s), start a new Codex session through the patched launcher, verify those stale peer PID(s) are gone, then resume $activeIssueRef."
+    }
+
+    $record = [ordered]@{
+        schema_version = 1
+        artifact_kind = 'synapse_codex_socket_restart_handoff'
+        created_at_utc = [DateTime]::UtcNow.ToString('o')
+        reason_code = 'SYNAPSE_CODEX_CURRENT_PROCESS_SOCKET_STALE'
+        reason = $Reason
+        phase = 'dead_owner_bind_drain'
+        required_restart = $true
+        no_in_process_socket_release = $true
+        explanation = 'The old synapse-mcp daemon exited, but Windows still reports dead-owner listener/socket rows because a live Codex MCP client peer is attached to the stopped daemon socket. Setup must not kill Codex, terminal, IDE, or WSL processes globally; restart the exact Codex session named here so Windows releases the stale socket, then rerun setup repair.'
+        bind = $Bind
+        bind_probe = [ordered]@{
+            ok = $false
+            error = $BindProbeError
+        }
+        codex_peer_pids = $codexPeerPids
+        codex_peers = $codexPeers
+        stale_listeners = ConvertTo-SynapseListenerEvidenceObject -Listeners $StaleListeners
+        tcp_clients = ConvertTo-SynapseTcpClientEvidenceObject -TcpClients $TcpClients
+        active_issue = [ordered]@{
+            issue_ref = $activeIssueRef
+            issue_number = $activeIssueNumber
+            source = 'ActiveIssue parameter or SYNAPSE_ACTIVE_ISSUE environment variable'
+            status = if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown' } else { 'provided' }
+        }
+        github_reads = $githubReads
+        post_restart_required_reads = $postRestartRequiredReads
+        post_restart_verification = @(
+            'Run git status --short --branch and confirm the working tree matches this handoff/recovery note.',
+            "Read the OS process table and confirm stale Codex peer PID(s) $($codexPeerPids -join ',') no longer exist.",
+            'Read Get-NetTCPConnection for 127.0.0.1:7700 and confirm no rows point at the stopped daemon PID from this handoff.',
+            'Run deferred Synapse tool discovery, then call real mcp__synapse.health and setup status from the fresh Codex session.',
+            'Rerun setup.repair through the real MCP setup facade; direct HTTP/stdio helper calls are diagnostics only.'
+        )
+        restart_command_hint = $restartCommandHint
+        repo_readback = Get-SynapseHandoffGitReadback -SourceDir $SourceDir
+        token_path = $TokenPath
+        recovery_notes_path = $recoveryNotesPath
+    }
+
+    try {
+        New-Item -ItemType Directory -Force -Path $root | Out-Null
+        Write-SynapseUtf8NoBomFile -Path $jsonPath -Text (($record | ConvertTo-Json -Depth 40) + "`n")
+        $md = @(
+            '# Synapse Codex Socket Restart Handoff',
+            '',
+            "- Reason: SYNAPSE_CODEX_CURRENT_PROCESS_SOCKET_STALE ($Reason)",
+            '- Phase: dead_owner_bind_drain',
+            "- Created UTC: $($record.created_at_utc)",
+            "- Bind: $Bind",
+            "- Codex peer PID(s): $($codexPeerPids -join ',')",
+            "- Active issue: $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown; recover from caller/session context or open issue queue' } else { $activeIssueRef })",
+            '',
+            '## Required Restart',
+            'The running Codex peer still has a TCP connection to the stopped daemon. Setup cannot safely kill Codex or terminal/IDE/WSL hosts. End the exact Codex session owning the listed PID(s), start a new Codex session through the patched launcher, and prove those PID(s) disappeared before retrying setup repair.',
+            '',
+            '## Socket Evidence',
+            '```text',
+            "stale_listeners:",
+            (Format-SynapseTcpBindListenerSnapshot -Snapshot $StaleListeners),
+            '',
+            "tcp_clients:",
+            (Format-SynapseTcpClientSnapshot -Snapshot $TcpClients),
+            '',
+            "bind_probe_error=$BindProbeError",
+            '```',
+            '',
+            '## Read After Restart'
+        )
+        foreach ($item in $postRestartRequiredReads) {
+            $md += "- $item"
+        }
+        $md += @(
+            '',
+            '## GitHub Reads'
+        )
+        foreach ($item in $record.github_reads) {
+            $md += "- $item"
+        }
+        $md += @(
+            '',
+            '## Verification'
+        )
+        foreach ($item in $record.post_restart_verification) {
+            $md += "- $item"
+        }
+        $md += @(
+            '',
+            "JSON artifact: $jsonPath",
+            ''
+        )
+        Write-SynapseUtf8NoBomFile -Path $mdPath -Text (($md -join "`n") + "`n")
+
+        if (-not [string]::IsNullOrWhiteSpace($recoveryNotesPath)) {
+            $notes = @(
+                '# Synapse Recovery Notes',
+                '',
+                '## Latest Codex Socket Restart Handoff',
+                '',
+                "- Reason: SYNAPSE_CODEX_CURRENT_PROCESS_SOCKET_STALE ($Reason)",
+                '- Phase: dead_owner_bind_drain',
+                "- Created UTC: $($record.created_at_utc)",
+                "- JSON: $jsonPath",
+                "- Markdown: $mdPath",
+                "- Stale Codex peer PID(s): $($codexPeerPids -join ',')",
+                "- Daemon bind: $Bind",
+                "- Active issue: $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'unknown; recover from caller/session context or open issue queue' } else { $activeIssueRef })",
+                '',
+                "After restart, re-read AGENTS.md, #351, #1405, $(if ([string]::IsNullOrWhiteSpace($activeIssueRef)) { 'the active issue from the caller/session context' } else { $activeIssueRef }), git status, and this file before resuming. Prove the stale Codex peer PID(s) are gone and rerun real mcp__synapse setup repair; direct helper calls are diagnostics only.",
+                ''
+            )
+            Write-SynapseUtf8NoBomFile -Path $recoveryNotesPath -Text (($notes -join "`n") + "`n")
+        }
+    } catch {
+        Die "SYNAPSE_CODEX_SOCKET_RESTART_HANDOFF_WRITE_FAILED reason=$Reason bind=$Bind path=$jsonPath error=$($_.Exception.Message) remediation=repair permissions on %LOCALAPPDATA%\synapse\codex-restart-handoffs and the repo STATE directory, then rerun setup"
+    }
+
+    Info "SYNAPSE_CODEX_CURRENT_PROCESS_SOCKET_STALE handoff_written reason=$Reason json=$jsonPath markdown=$mdPath recovery_notes=$recoveryNotesPath codex_peer_pids=$($codexPeerPids -join ',')"
+    return [pscustomobject]@{
+        JsonPath = $jsonPath
+        MarkdownPath = $mdPath
+        RecoveryNotesPath = $recoveryNotesPath
+        CodexPeerPids = $codexPeerPids
+    }
+}
+
+function Start-SynapsePostExitSetupContinuation {
+    param(
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$SourceDir,
+        [Parameter(Mandatory=$true)][string]$ExePath,
+        [Parameter(Mandatory=$true)][string]$ChromeNativeHostExePath,
+        [Parameter(Mandatory=$true)][string]$CargoTarget,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$ProfilesDir,
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [Parameter(Mandatory=$true)][string]$TokenPath,
+        [Parameter(Mandatory=$true)][string]$CodexToolSurfaceSnapshotPath,
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
+        [string]$ActiveIssue,
+        [object]$DeadOwnerDetail
+    )
+
+    $root = Join-Path $env:LOCALAPPDATA 'synapse\setup-continuations'
+    New-Item -ItemType Directory -Force -Path $root | Out-Null
+    $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ')
+    $runId = "post-exit-$PID-$stamp"
+    $runDir = Join-Path $root $runId
+    New-Item -ItemType Directory -Force -Path $runDir | Out-Null
+    $manifestPath = Join-Path $runDir 'continuation.json'
+    $stdoutPath = Join-Path $runDir 'stdout.log'
+    $stderrPath = Join-Path $runDir 'stderr.log'
+    $wrapperPath = Join-Path $runDir 'launch-continuation.ps1'
+    $launcherPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $launcherPath)) {
+        Die "SYNAPSE_POST_EXIT_CONTINUATION_POWERSHELL_MISSING path=$launcherPath remediation=repair Windows PowerShell before retrying setup"
+    }
+
+    $args = @(
+        '-NoProfile',
+        '-ExecutionPolicy',
+        'Bypass',
+        '-File',
+        $PSCommandPath,
+        '-SourceDir',
+        $SourceDir,
+        '-Bind',
+        $Bind,
+        '-ExePath',
+        $ExePath,
+        '-ChromeNativeHostExePath',
+        $ChromeNativeHostExePath,
+        '-CargoTarget',
+        $CargoTarget,
+        '-DbPath',
+        $DbPath,
+        '-ProfilesDir',
+        $ProfilesDir,
+        '-LogDir',
+        $LogDir,
+        '-TokenPath',
+        $TokenPath,
+        '-CodexToolSurfaceSnapshotPath',
+        $CodexToolSurfaceSnapshotPath,
+        '-TaskName',
+        $TaskName,
+        '-MaintenanceLockPath',
+        $MaintenanceLockPath,
+        '-BuildTimeoutMinutes',
+        ([string]$BuildTimeoutMinutes),
+        '-PostExitParentPid',
+        ([string]$PID),
+        '-PostExitContinuationReason',
+        'dead_owner_bind_after_install',
+        '-PostExitManifestPath',
+        $manifestPath,
+        '-ForceRestart',
+        '-SkipBuild'
+    )
+    if (-not [string]::IsNullOrWhiteSpace($ActiveIssue)) {
+        $args += @('-ActiveIssue', $ActiveIssue)
+    }
+    if ($SkipClientWiring) {
+        $args += '-SkipClientWiring'
+    }
+    $continuationTaskName = "SynapsePostExitSetup-$runId"
+    $taskArgument = "-NoProfile -ExecutionPolicy Bypass -File $(Quote-WindowsCommandArgument -Value $wrapperPath)"
+    $argLiteralLines = @($args | ForEach-Object { "    $(Quote-PowerShellSingleQuotedString -Value $_)" })
+    $wrapperLines = @(
+        '$ErrorActionPreference = ''Stop''',
+        "`$taskName = $(Quote-PowerShellSingleQuotedString -Value $continuationTaskName)",
+        "`$launcherPath = $(Quote-PowerShellSingleQuotedString -Value $launcherPath)",
+        "`$sourceDir = $(Quote-PowerShellSingleQuotedString -Value $SourceDir)",
+        "`$stdoutPath = $(Quote-PowerShellSingleQuotedString -Value $stdoutPath)",
+        "`$stderrPath = $(Quote-PowerShellSingleQuotedString -Value $stderrPath)",
+        '$argList = @('
+    )
+    $wrapperLines += $argLiteralLines
+    $wrapperLines += @(
+        ')',
+        '$exitCode = 1',
+        'try {',
+        '    Set-Location -LiteralPath $sourceDir',
+        '    & $launcherPath @argList 1> $stdoutPath 2> $stderrPath 3>&1 4>&1 5>&1 6>&1',
+        '    if ($null -ne $global:LASTEXITCODE) {',
+        '        $exitCode = [int]$global:LASTEXITCODE',
+        '    } else {',
+        '        $exitCode = 0',
+        '    }',
+        '} catch {',
+        '    try { ($_ | Out-String) | Add-Content -LiteralPath $stderrPath -Encoding UTF8 } catch {}',
+        '    $exitCode = 1',
+        '} finally {',
+        '    try { Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}',
+        '}',
+        'exit $exitCode'
+    )
+    Write-SynapseUtf8NoBomFile -Path $wrapperPath -Text (($wrapperLines -join "`n") + "`n")
+
+    $manifest = [ordered]@{
+        schema = 'synapse_setup_post_exit_continuation/v1'
+        state = 'launching'
+        run_id = $runId
+        reason = $Reason
+        bind = $Bind
+        parent_pid = $PID
+        launch_mode = 'scheduled_task'
+        task_name = $continuationTaskName
+        task_argument = $taskArgument
+        launcher_path = $launcherPath
+        wrapper_path = $wrapperPath
+        setup_script_path = $PSCommandPath
+        source_dir = $SourceDir
+        stdout_log = $stdoutPath
+        stderr_log = $stderrPath
+        command_args = $args
+        active_issue = $ActiveIssue
+        dead_owner_detail = $DeadOwnerDetail
+        created_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        remediation = 'continuation waits for parent setup process exit, reacquires setup maintenance lock, then reruns setup with -SkipBuild against the installed verified daemon bytes'
+    }
+    Write-SynapseUtf8NoBomFile -Path $manifestPath -Text (($manifest | ConvertTo-Json -Depth 24) + "`n")
+
+    try {
+        if (Get-ScheduledTask -TaskName $continuationTaskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $continuationTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+        $action = New-ScheduledTaskAction -Execute $launcherPath -Argument $taskArgument -WorkingDirectory $SourceDir
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(5)
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 2)
+        $settings.Hidden = $true
+        Register-ScheduledTask -TaskName $continuationTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description "Synapse post-exit setup continuation $runId" | Out-Null
+        Start-ScheduledTask -TaskName $continuationTaskName
+        Start-Sleep -Seconds 1
+        $child = Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and ($_.CommandLine -like "*$wrapperPath*" -or $_.CommandLine -like "*$runId*") } |
+            Sort-Object CreationDate -Descending |
+            Select-Object -First 1
+    } catch {
+        Die "SYNAPSE_POST_EXIT_CONTINUATION_START_FAILED run_id=$runId manifest=$manifestPath error=$($_.Exception.Message) remediation=repair process creation permissions and rerun setup; no daemon was started while the bind probe failed"
+    }
+
+    $manifest.state = 'started'
+    $manifest.child_pid = if ($child) { [int]$child.ProcessId } else { 0 }
+    $manifest.task_state = try { (Get-ScheduledTask -TaskName $continuationTaskName -ErrorAction Stop).State.ToString() } catch { "unknown:$($_.Exception.Message)" }
+    $manifest.started_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+    Write-SynapseUtf8NoBomFile -Path $manifestPath -Text (($manifest | ConvertTo-Json -Depth 24) + "`n")
+
+    Info "SYNAPSE_POST_EXIT_CONTINUATION_STARTED run_id=$runId launch_mode=scheduled_task task_name=$continuationTaskName parent_pid=$PID child_pid=$($manifest.child_pid) manifest=$manifestPath wrapper=$wrapperPath stdout=$stdoutPath stderr=$stderrPath"
+    return [pscustomobject]@{
+        RunId = $runId
+        RunDir = $runDir
+        ManifestPath = $manifestPath
+        StdoutPath = $stdoutPath
+        StderrPath = $stderrPath
+        ChildPid = $manifest.child_pid
+        LaunchMode = 'scheduled_task'
+        TaskName = $continuationTaskName
+        WrapperPath = $wrapperPath
+    }
+}
+
 function Write-SynapseCodexRestartHandoff {
     param(
         [Parameter(Mandatory=$true)][string]$Phase,
@@ -3306,6 +4666,207 @@ function Request-SynapseGracefulShutdown {
     [pscustomobject]@{ Ok = $true; Code = 'OK'; Response = $response; Error = $null }
 }
 
+function Read-SynapseHttpErrorResponseBody {
+    param([Parameter(Mandatory=$true)]$ErrorRecord)
+
+    $response = $ErrorRecord.Exception.Response
+    if ($null -eq $response) {
+        return $null
+    }
+    try {
+        $stream = $response.GetResponseStream()
+        if ($null -eq $stream) {
+            return $null
+        }
+        $reader = New-Object System.IO.StreamReader($stream)
+        try {
+            return $reader.ReadToEnd()
+        } finally {
+            $reader.Dispose()
+        }
+    } catch {
+        return "SYNAPSE_HTTP_ERROR_BODY_READ_FAILED error=$($_.Exception.Message)"
+    }
+}
+
+function Read-SynapseHttpErrorStatus {
+    param([Parameter(Mandatory=$true)]$ErrorRecord)
+
+    $response = $ErrorRecord.Exception.Response
+    if ($null -eq $response) {
+        return $null
+    }
+    try {
+        return [int]$response.StatusCode
+    } catch {
+        return $null
+    }
+}
+
+function Request-SynapseChromeBridgeMaintenancePause {
+    param(
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [int]$PauseMs = $SynapseChromeBridgeMaintenancePauseMs
+    )
+
+    try {
+        $health = Invoke-RestMethod `
+            -Method Get `
+            -Uri "http://$Bind/health" `
+            -Headers @{ Authorization = "Bearer $Token" } `
+            -UserAgent "synapse-setup/$Reason" `
+            -TimeoutSec 4
+    } catch {
+        return [pscustomobject]@{
+            Ok = $false
+            Skipped = $false
+            Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_FAILED'
+            Response = $null
+            Error = $_.Exception.Message
+            Detail = $null
+        }
+    }
+
+    $chromeBridge = $health.subsystems.chrome_bridge
+    if ($null -eq $chromeBridge) {
+        return [pscustomobject]@{
+            Ok = $false
+            Skipped = $false
+            Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_HEALTH_MISSING'
+            Response = $health
+            Error = 'health.subsystems.chrome_bridge missing'
+            Detail = $null
+        }
+    }
+
+    $status = "$($chromeBridge.status)"
+    $detail = "$($chromeBridge.detail)"
+    if ($detail -match 'no_active_chrome_bridge_host') {
+        return [pscustomobject]@{
+            Ok = $true
+            Skipped = $true
+            Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SKIPPED_NO_ACTIVE_HOST'
+            Response = $health
+            Error = $null
+            Detail = $detail
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($status)) {
+        return [pscustomobject]@{
+            Ok = $false
+            Skipped = $false
+            Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_STATUS_UNREADABLE'
+            Response = $health
+            Error = 'health.subsystems.chrome_bridge.status missing'
+            Detail = $detail
+        }
+    }
+
+    $body = [ordered]@{
+        pause_ms = $PauseMs
+        reason = $Reason
+    } | ConvertTo-Json -Compress -Depth 4
+
+    $attempts = @()
+    $maxAttempts = 5
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            $response = Invoke-RestMethod `
+                -Method Post `
+                -Uri "http://$Bind/chrome-debugger/native/maintenance-pause" `
+                -Headers @{ Authorization = "Bearer $Token" } `
+                -ContentType 'application/json' `
+                -UserAgent "synapse-setup/$Reason" `
+                -Body $body `
+                -TimeoutSec 8
+        } catch {
+            $responseBody = Read-SynapseHttpErrorResponseBody -ErrorRecord $_
+            $statusCode = Read-SynapseHttpErrorStatus -ErrorRecord $_
+            $attempts += [pscustomobject]@{
+                attempt = $attempt
+                code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_REQUEST_FAILED'
+                ok = $false
+                status = $statusCode
+                error = $_.Exception.Message
+                response = $responseBody
+            }
+            if ($attempt -lt $maxAttempts) {
+                Start-Sleep -Seconds 1
+                continue
+            }
+            return [pscustomobject]@{
+                Ok = $false
+                Skipped = $false
+                Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_REQUEST_FAILED'
+                Response = $attempts
+                Error = "attempts=$($attempts.Count) last_status=$statusCode message=$($_.Exception.Message)"
+                Detail = $detail
+                Attempts = $attempts
+            }
+        }
+
+        $pause = $response.pause
+        $websocketClose = $null
+        if ($null -ne $pause) {
+            $websocketClose = $pause.websocket_close
+        }
+        $activeSocketWasOpen = $false
+        if ($null -ne $websocketClose -and $null -ne $websocketClose.ready_state_before) {
+            $readyStateBefore = [int]$websocketClose.ready_state_before
+            $activeSocketWasOpen = ($readyStateBefore -eq 0 -or $readyStateBefore -eq 1)
+        }
+        $websocketCloseFailed = $false
+        if ($null -eq $websocketClose) {
+            $websocketCloseFailed = $true
+        } elseif ($null -ne $websocketClose.close_error) {
+            $websocketCloseFailed = $true
+        } elseif ($activeSocketWasOpen -and $websocketClose.close_requested -ne $true) {
+            $websocketCloseFailed = $true
+        }
+
+        $attemptReadback = [pscustomobject]@{
+            attempt = $attempt
+            code = 'OK'
+            ok = ($response.ok -eq $true)
+            status = 200
+            pause_ms = if ($null -eq $pause) { $null } else { $pause.pause_ms }
+            reconnect_suppressed = if ($null -eq $pause) { $null } else { $pause.reconnect_suppressed }
+            persisted = if ($null -eq $pause) { $null } else { $pause.persisted }
+            websocket_close = $websocketClose
+        }
+        $attempts += $attemptReadback
+
+        if ($response.ok -eq $true -and $null -ne $pause -and $pause.reconnect_suppressed -eq $true -and $pause.persisted -eq $true -and -not $websocketCloseFailed) {
+            return [pscustomobject]@{
+                Ok = $true
+                Skipped = $false
+                Code = 'OK'
+                Response = $response
+                Error = $null
+                Detail = $detail
+                Attempts = $attempts
+            }
+        }
+
+        $attemptReadback.code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_RESPONSE_INVALID'
+        if ($attempt -lt $maxAttempts) {
+            Start-Sleep -Seconds 1
+        }
+    }
+
+    [pscustomobject]@{
+        Ok = $false
+        Skipped = $false
+        Code = 'SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_RESPONSE_INVALID'
+        Response = $attempts
+        Error = "attempts=$($attempts.Count) last_response=$($attempts[-1] | ConvertTo-Json -Compress -Depth 8)"
+        Detail = $detail
+        Attempts = $attempts
+    }
+}
+
 function Get-SynapseActiveSessionCount {
     param([Parameter(Mandatory=$true)]$Health)
 
@@ -3537,7 +5098,7 @@ function Stop-SynapseMcpProcesses {
         Info ("Synapse process stop ignored non-target processes:`n{0}" -f (Format-SynapseMcpProcessSnapshot -Snapshot $ignoredBefore))
     }
     if ($before.Count -eq 0) {
-        Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds $TimeoutSeconds
+        Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds $TimeoutSeconds -ForceRestart:$ForceRestart
         return
     }
 
@@ -3555,6 +5116,19 @@ function Stop-SynapseMcpProcesses {
     }
 
     if ($httpProcesses.Count -gt 0) {
+        if ($ForceRestart) {
+            $liveTcpClients = @(Get-SynapseTcpClientSnapshot -Bind $Bind | Where-Object { $_.HasLivePeer })
+            if ($liveTcpClients.Count -gt 0) {
+                $targetPids = (($httpProcesses | ForEach-Object { [int]$_.ProcessId }) -join ',')
+                Info ("FORCE_RESTART: SYNAPSE_FORCE_RESTART_LIVE_CLIENTS_GRACEFUL_FIRST reason={0} bind={1} target_pids={2} live_tcp_client_count={3}`ntcp_clients:`n{4}`nremediation=-ForceRestart is explicit maintenance. Setup still asks the HTTP daemon to shut down first so it can close accepted sockets cleanly; if Windows keeps dead-owner rows because client peers remain connected, setup closes only exact known non-terminal peers and then requires a normal bind probe before installing or starting anything." -f `
+                    $Reason,
+                    $Bind,
+                    $targetPids,
+                    $liveTcpClients.Count,
+                    (Format-SynapseTcpClientSnapshot -Snapshot $liveTcpClients))
+            }
+        }
+
         $tokenRead = Read-SynapseSetupTokenForRestartGuard -TokenPath $TokenPath
         if (-not $tokenRead.Ok) {
             $message = ("{0} reason={1} process_count={2} {3} remediation=graceful shutdown requires the daemon bearer token; repair token state before setup, or use -ForceRestart only after manually verifying no held inputs and no live clients." -f `
@@ -3569,6 +5143,50 @@ function Stop-SynapseMcpProcesses {
             }
         } else {
             $expectedPids = @($httpProcesses | ForEach-Object { [int]$_.ProcessId })
+            if ($ForceRestart) {
+                $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
+                $pause = Request-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $tokenRead.Token -Reason $Reason -PauseMs $SynapseChromeBridgeMaintenancePauseMs
+                if (-not $pause.Ok) {
+                    Die ("{0} reason={1} bind={2} error={3} detail={4} response={5} remediation=forced daemon maintenance requires the already-open Chrome bridge to acknowledge a bounded reconnect pause before shutdown when an active bridge host exists. Reload the installed bridge through the existing Chrome profile or inspect daemon/extension logs; setup will not chase an unbounded stream of recreated Chrome NetworkService peers." -f `
+                        $pause.Code,
+                        $Reason,
+                        $Bind,
+                        $pause.Error,
+                        $pause.Detail,
+                        ($(if ($null -eq $pause.Response) { '<none>' } else { $pause.Response | ConvertTo-Json -Compress -Depth 8 })))
+                }
+                if ($pause.Skipped) {
+                    Info ("FORCE_RESTART: {0} reason={1} bind={2} detail={3}" -f `
+                        $pause.Code,
+                        $Reason,
+                        $Bind,
+                        $pause.Detail)
+                } else {
+                    $pauseUntil = $pause.Response.pause.pause_until_unix_ms
+                    if ($null -ne $pauseUntil) {
+                        try {
+                            $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = [int64]$pauseUntil
+                        } catch {
+                            $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
+                        }
+                    }
+                    Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_ACK reason={0} bind={1} pause={2}" -f `
+                        $Reason,
+                        $Bind,
+                        ($pause.Response.pause | ConvertTo-Json -Compress -Depth 8))
+                    $webSocketClose = $pause.Response.pause.websocket_close
+                    if ($webSocketClose -and $webSocketClose.had_socket -eq $true -and $webSocketClose.close_requested -eq $true) {
+                        Info ("FORCE_RESTART: SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_SOCKET_DRAIN_WAIT reason={0} bind={1} wait_ms={2} had_socket={3} close_requested={4} close_deferred={5} remediation=the bridge intentionally sends the pause response before closing its active WebSocket, so setup waits for the bounded response-drain window before daemon shutdown." -f `
+                            $Reason,
+                            $Bind,
+                            $SynapseChromeBridgeMaintenanceCloseDrainMs,
+                            $webSocketClose.had_socket,
+                            $webSocketClose.close_requested,
+                            ($(if ($null -eq $webSocketClose.close_deferred) { '<missing>' } else { $webSocketClose.close_deferred })))
+                        Start-Sleep -Milliseconds $SynapseChromeBridgeMaintenanceCloseDrainMs
+                    }
+                }
+            }
             $shutdown = Request-SynapseGracefulShutdown -Bind $Bind -Token $tokenRead.Token -ExpectedPids $expectedPids -Reason $Reason
             if (-not $shutdown.Ok) {
                 $message = ("{0} reason={1} bind={2} error={3} response={4} remediation=the running daemon did not accept authenticated graceful shutdown; inspect daemon logs and token/bind state. Use -ForceRestart only for a coordinated legacy-runtime transition after manual input-state readback." -f `
@@ -3601,7 +5219,7 @@ function Stop-SynapseMcpProcesses {
             })
             if ($remainingHttpPids.Count -eq 0) {
                 Info "Synapse graceful shutdown verified reason=$Reason http_process_count=0"
-                Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds $TimeoutSeconds
+                Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds $TimeoutSeconds -ForceRestart:$ForceRestart
                 break
             }
         } while ((Get-Date) -lt $deadline)
@@ -3628,7 +5246,7 @@ function Stop-SynapseMcpProcesses {
 
     $remaining = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
     if ($remaining.Count -eq 0) {
-        Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds $TimeoutSeconds
+        Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds $TimeoutSeconds -ForceRestart:$ForceRestart
         $ignoredAfter = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath -Invert)
         Info "Synapse process stop verified reason=$Reason target_after_count=0 ignored_non_target_after_count=$($ignoredAfter.Count)"
         return
@@ -3665,7 +5283,7 @@ function Stop-SynapseMcpProcesses {
         Start-Sleep -Milliseconds 250
         $after = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
         if ($after.Count -eq 0) {
-            Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds $TimeoutSeconds
+            Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds $TimeoutSeconds -ForceRestart:$ForceRestart
             $ignoredAfter = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath -Invert)
             Info "Synapse process stop verified reason=$Reason target_after_count=0 ignored_non_target_after_count=$($ignoredAfter.Count)"
             return
@@ -3775,6 +5393,7 @@ function Stop-SynapseChromeNativeHostProcesses {
 # Uninstall path
 # ---------------------------------------------------------------------------
 $maintenanceReason = if ($Remove) { 'remove' } else { 'setup' }
+Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
 
 if ($Remove) {
@@ -4076,19 +5695,23 @@ Assert-CodexCandidateHandoffPreservesCurrentProcess `
     -TokenPath $TokenPath `
     -ActiveIssue $ActiveIssue
 
-Step "Preflighting Chrome direct localhost bridge before daemon handoff"
 $chromeBridgeInstaller = Join-Path $PSScriptRoot 'install-synapse-chrome-debugger.ps1'
-$chromeBridgePreflight = Invoke-SynapseChromeBridgeVerifier `
-    -InstallerPath $chromeBridgeInstaller `
-    -NativeHostExePath $ChromeNativeHostExePath
-Info ("Chrome direct bridge verifier preflight completed transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4} popup_shield={5} {6}" -f `
-    $chromeBridgePreflight.daemon_bridge_transport, `
-    $chromeBridgePreflight.extension_id, `
-    $chromeBridgePreflight.native_host_registry_present, `
-    $chromeBridgePreflight.native_host_manifest_present, `
-    (($chromeBridgePreflight.chrome_policy_cleanup | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
-    (($chromeBridgePreflight.chrome_policy_popup_shield | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
-    (Format-SynapseChromeBridgeProfileInstallState -Readback $chromeBridgePreflight))
+if ($script:SynapsePostExitStartOnly) {
+    Info "SYNAPSE_POST_EXIT_SKIP_CHROME_BRIDGE_PREFLIGHT reason=$PostExitContinuationReason bind=$Bind remediation=post-exit continuation must not reload or reconnect the Chrome bridge before the daemon bind is reusable; daemon /health after start remains the bridge Source-of-Truth readback."
+} else {
+    Step "Preflighting Chrome direct localhost bridge before daemon handoff"
+    $chromeBridgePreflight = Invoke-SynapseChromeBridgeVerifier `
+        -InstallerPath $chromeBridgeInstaller `
+        -NativeHostExePath $ChromeNativeHostExePath
+    Info ("Chrome direct bridge verifier preflight completed transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4} popup_shield={5} {6}" -f `
+        $chromeBridgePreflight.daemon_bridge_transport, `
+        $chromeBridgePreflight.extension_id, `
+        $chromeBridgePreflight.native_host_registry_present, `
+        $chromeBridgePreflight.native_host_manifest_present, `
+        (($chromeBridgePreflight.chrome_policy_cleanup | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
+        (($chromeBridgePreflight.chrome_policy_popup_shield | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
+        (Format-SynapseChromeBridgeProfileInstallState -Readback $chromeBridgePreflight))
+}
 
 # ---------------------------------------------------------------------------
 # 5. Drain the running daemon, then install the proven binary
@@ -4098,7 +5721,7 @@ Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPat
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 }
-Stop-SynapseMcpProcesses -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart
+Stop-SynapseMcpProcesses -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Null
 $backupPath = $null
 $oldInstalledHash = $null
@@ -4128,18 +5751,22 @@ $ver = (& $ExePath --version) 2>&1
 Info "Installed binary reports: $ver"
 Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash"
 
-Step "Verifying Chrome direct localhost bridge"
-$chromeBridgeReadback = Invoke-SynapseChromeBridgeVerifier `
-    -InstallerPath $chromeBridgeInstaller `
-    -NativeHostExePath $ChromeNativeHostExePath
-Info ("Chrome direct bridge verifier completed transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4} popup_shield={5} {6}" -f `
-    $chromeBridgeReadback.daemon_bridge_transport, `
-    $chromeBridgeReadback.extension_id, `
-    $chromeBridgeReadback.native_host_registry_present, `
-    $chromeBridgeReadback.native_host_manifest_present, `
-    (($chromeBridgeReadback.chrome_policy_cleanup | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
-    (($chromeBridgeReadback.chrome_policy_popup_shield | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
-    (Format-SynapseChromeBridgeProfileInstallState -Readback $chromeBridgeReadback))
+if ($script:SynapsePostExitStartOnly) {
+    Info "SYNAPSE_POST_EXIT_SKIP_CHROME_BRIDGE_VERIFY reason=$PostExitContinuationReason bind=$Bind remediation=post-exit continuation avoids creating bridge peers while the dead-owner bind is still draining; daemon /health after start verifies the active Chrome bridge."
+} else {
+    Step "Verifying Chrome direct localhost bridge"
+    $chromeBridgeReadback = Invoke-SynapseChromeBridgeVerifier `
+        -InstallerPath $chromeBridgeInstaller `
+        -NativeHostExePath $ChromeNativeHostExePath
+    Info ("Chrome direct bridge verifier completed transport={0} extension_id={1} native_host_registry_present={2} native_host_manifest_present={3} policy_cleanup={4} popup_shield={5} {6}" -f `
+        $chromeBridgeReadback.daemon_bridge_transport, `
+        $chromeBridgeReadback.extension_id, `
+        $chromeBridgeReadback.native_host_registry_present, `
+        $chromeBridgeReadback.native_host_manifest_present, `
+        (($chromeBridgeReadback.chrome_policy_cleanup | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
+        (($chromeBridgeReadback.chrome_policy_popup_shield | ForEach-Object { "$($_.hive):$($_.reason)" }) -join ','), `
+        (Format-SynapseChromeBridgeProfileInstallState -Readback $chromeBridgeReadback))
+}
 
 # ---------------------------------------------------------------------------
 # 6. Deploy bundled profiles next to the exe (executable-relative lookup) +
@@ -4156,11 +5783,37 @@ if ($srcProfiles -and (Test-Path $srcProfiles)) {
     Die "SYNAPSE_PROFILES_MISSING source=$srcProfiles deployed=$ProfilesDir remediation=profile-dependent tools need bundled or deployed profiles before daemon start"
 } else { Info "Reusing existing profiles at $ProfilesDir." }
 
+if ($script:SynapseBindPostExitContinuationRequired) {
+    $continuation = Start-SynapsePostExitSetupContinuation `
+        -Reason 'install_binary' `
+        -Bind $Bind `
+        -SourceDir $SourceDir `
+        -ExePath $ExePath `
+        -ChromeNativeHostExePath $ChromeNativeHostExePath `
+        -CargoTarget $CargoTarget `
+        -DbPath $DbPath `
+        -ProfilesDir $ProfilesDir `
+        -LogDir $LogDir `
+        -TokenPath $TokenPath `
+        -CodexToolSurfaceSnapshotPath $CodexToolSurfaceSnapshotPath `
+        -TaskName $TaskName `
+        -MaintenanceLockPath $MaintenanceLockPath `
+        -ActiveIssue $ActiveIssue `
+        -DeadOwnerDetail $script:SynapseBindPostExitContinuationDetail
+    Die ("SYNAPSE_BIND_POST_EXIT_CONTINUATION_STARTED reason=install_binary bind={0} child_pid={1} manifest={2} stdout={3} stderr={4} remediation=the verified daemon bytes and profiles were installed, but Windows kept the dead-owner listener unavailable until this setup process exits. A hidden continuation has been launched and will wait for parent_pid={5}, reacquire the maintenance lock, start the daemon through the normal setup path, and write its own stdout/stderr/readbacks. Inspect the continuation manifest/logs and final process/socket SoT before accepting repair." -f `
+        $Bind,
+        $continuation.ChildPid,
+        $continuation.ManifestPath,
+        $continuation.StdoutPath,
+        $continuation.StderrPath,
+        $PID)
+}
+
 # ---------------------------------------------------------------------------
 # 7. Register + start the auto-start HTTP daemon (interactive desktop session)
 # ---------------------------------------------------------------------------
 Step "Registering auto-start daemon task '$TaskName'"
-Wait-SynapseBindReleased -Reason 'pre_start' -Bind $Bind -TimeoutSeconds 1
+Wait-SynapseBindReleased -Reason 'pre_start' -Bind $Bind -TimeoutSeconds 300
 $legacyLauncher = Join-Path $LogDir 'synapse-daemon-launch.cmd'
 $hiddenLauncher = Join-Path $LogDir 'synapse-daemon-launch-hidden.vbs'
 $launcherLog = Join-Path $LogDir 'daemon-launcher.log'
@@ -4224,7 +5877,7 @@ if (-not $ok) {
         if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
             Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         }
-        Stop-SynapseMcpProcesses -Reason 'install_health_failed_rollback' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart -TimeoutSeconds 10
+        Stop-SynapseMcpProcesses -Reason 'install_health_failed_rollback' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart -TimeoutSeconds 300
         Copy-Item -LiteralPath $backupPath -Destination $ExePath -Force
         $rollbackHash = Get-SynapseFileSha256 -Path $ExePath
         if ($rollbackHash -ne $oldInstalledHash) {
@@ -4266,7 +5919,12 @@ if (-not $ok) {
 
     Die $failureDetail
 }
-$h = Assert-SynapseChromeBridgeLiveAfterSetup -Bind $Bind -Token $token -Health $h
+$h = Assert-SynapseChromeBridgeLiveAfterSetup `
+    -Bind $Bind `
+    -Token $token `
+    -Health $h `
+    -ChromeBridgeInstallerPath $chromeBridgeInstaller `
+    -ChromeNativeHostExePath $ChromeNativeHostExePath
 $healthPid = [int]$h.pid
 $daemonLineage = Get-ProcessLineage -StartPid $healthPid
 $cmdAncestor = $daemonLineage | Where-Object { $_.Name -ieq 'cmd.exe' } | Select-Object -First 1
@@ -4387,6 +6045,47 @@ if (-not $SkipClientWiring) {
         Info "Skipped client wiring because -SkipClientWiring was set; no current Codex ancestor was found for a freshness handoff."
     }
 }
+
+if ($script:SynapsePostExitStartOnly) {
+    $completionReadback = [ordered]@{
+        daemon_pid = $healthPid
+        bind = $Bind
+        db_path = $DbPath
+        daemon_run_current_path = (Join-Path $DbPath 'daemon-run-current.json')
+        installed_binary_path = $ExePath
+        installed_binary_sha256 = $installedHash
+        codex_tool_surface_snapshot_path = $CodexToolSurfaceSnapshotPath
+        tool_count = $toolSurface.tool_count
+        tool_surface_sha256 = $toolSurface.tool_surface_sha256
+        chrome_bridge_status = $h.subsystems.chrome_bridge.status
+        chrome_bridge_detail = $h.subsystems.chrome_bridge.detail
+    }
+    Write-SynapsePostExitManifestState `
+        -State 'completed' `
+        -Message 'post-exit setup continuation completed after daemon, Chrome bridge, tool-surface, and client-config readbacks passed' `
+        -ExitCode 0 `
+        -Readback $completionReadback
+    Info "SYNAPSE_POST_EXIT_CONTINUATION_COMPLETED manifest=$PostExitManifestPath daemon_pid=$healthPid tool_count=$($toolSurface.tool_count) tool_surface_sha256=$($toolSurface.tool_surface_sha256)"
+}
+
+$setupRepairCompletionReadback = [ordered]@{
+    daemon_pid = $healthPid
+    bind = $Bind
+    db_path = $DbPath
+    daemon_run_current_path = (Join-Path $DbPath 'daemon-run-current.json')
+    installed_binary_path = $ExePath
+    installed_binary_sha256 = $installedHash
+    codex_tool_surface_snapshot_path = $CodexToolSurfaceSnapshotPath
+    tool_count = $toolSurface.tool_count
+    tool_surface_sha256 = $toolSurface.tool_surface_sha256
+    chrome_bridge_status = $h.subsystems.chrome_bridge.status
+    chrome_bridge_detail = $h.subsystems.chrome_bridge.detail
+}
+Write-SynapseSetupRepairManifestState `
+    -State 'completed' `
+    -Message 'setup repair completed after daemon, Chrome bridge, tool-surface, and client-config readbacks passed' `
+    -ExitCode 0 `
+    -Readback $setupRepairCompletionReadback
 
 Step "Done"
 Info "Synapse daemon is live on http://$Bind (MCP: http://$Bind/mcp)."

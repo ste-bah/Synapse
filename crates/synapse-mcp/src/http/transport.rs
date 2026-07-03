@@ -5,12 +5,19 @@ use std::{
     io::{self, Read as _},
     net::SocketAddr,
     path::PathBuf,
+    pin::Pin,
     process::ExitCode,
-    sync::Arc,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
+#[cfg(windows)]
+use axum::serve::Listener;
 use axum::{
     Json, Router,
     body::Body,
@@ -26,6 +33,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt, stream::SplitSink};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
+    session::local::SessionError,
     session::{SessionState, SessionStore, SessionStoreError, local::LocalSessionManager},
 };
 use serde::{Deserialize, Serialize};
@@ -36,12 +44,20 @@ use synapse_action::ActionStateSnapshot;
 use synapse_core::{AgentEventKind, AgentEventRecord, EventFilter, EventSource, Health};
 use synapse_storage::{Db, cf};
 use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
     net::TcpListener,
     sync::{broadcast, watch},
     task::JoinHandle,
     time,
 };
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use windows::Win32::Networking::WinSock::{
+    SD_BOTH, SOCKET, WSAGetLastError, shutdown as winsock_shutdown,
+};
+
+#[cfg(windows)]
+use std::os::windows::io::AsRawSocket;
 
 use crate::{
     http::auth::{self, HttpAuth},
@@ -78,6 +94,7 @@ struct HttpState {
     session_manager: Arc<LocalSessionManager>,
     shutdown_cancel: CancellationToken,
     drain_state: crate::server::drain::DaemonDrainState,
+    active_http_sockets: ActiveHttpSockets,
     sse_state: SseState,
     /// Journal handle for the push-telemetry ingress (#899); the same DB the
     /// MCP session store writes through.
@@ -106,6 +123,327 @@ struct DaemonShutdownInputCleanupReport {
     lease_still_held_after_cleanup: bool,
     failure_count: usize,
     session_reports: Vec<crate::server::session_lifecycle::SessionShutdownInputCleanupReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct McpSessionShutdownCloseReport {
+    reason: &'static str,
+    sessions_before: usize,
+    close_attempted: usize,
+    close_succeeded: usize,
+    already_terminated: usize,
+    failure_count: usize,
+    session_ids: Vec<String>,
+    failures: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveHttpSocketShutdownReport {
+    reason: &'static str,
+    tracked_before: usize,
+    shutdown_attempted: usize,
+    shutdown_succeeded: usize,
+    failure_count: usize,
+    tracked_after: usize,
+    sockets: Vec<ActiveHttpSocketShutdownRow>,
+    failures: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveHttpSocketShutdownOnDropReport {
+    reason: &'static str,
+    enabled_now: bool,
+    was_enabled: bool,
+    tracked_now: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ActiveHttpSocketShutdownRow {
+    raw_socket: usize,
+    peer_addr: String,
+    accepted_at_unix_ms: u128,
+}
+
+#[derive(Clone, Default)]
+struct ActiveHttpSockets {
+    #[cfg(windows)]
+    inner: Arc<Mutex<BTreeMap<usize, ActiveHttpSocketInfo>>>,
+    #[cfg(windows)]
+    shutdown_on_drop: Arc<AtomicBool>,
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct ActiveHttpSocketInfo {
+    raw_socket: usize,
+    peer_addr: String,
+    accepted_at_unix_ms: u128,
+}
+
+impl ActiveHttpSockets {
+    #[cfg(windows)]
+    fn begin_shutdown_on_drop(&self, reason: &'static str) -> ActiveHttpSocketShutdownOnDropReport {
+        let was_enabled = self.shutdown_on_drop.swap(true, Ordering::SeqCst);
+        let tracked_now = self.inner.lock().map_or(0, |sockets| sockets.len());
+        ActiveHttpSocketShutdownOnDropReport {
+            reason,
+            enabled_now: true,
+            was_enabled,
+            tracked_now,
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn begin_shutdown_on_drop(&self, reason: &'static str) -> ActiveHttpSocketShutdownOnDropReport {
+        ActiveHttpSocketShutdownOnDropReport {
+            reason,
+            enabled_now: false,
+            was_enabled: false,
+            tracked_now: 0,
+        }
+    }
+
+    #[cfg(windows)]
+    fn shutdown_on_drop_enabled(&self) -> bool {
+        self.shutdown_on_drop.load(Ordering::SeqCst)
+    }
+
+    #[cfg(windows)]
+    fn register(&self, raw_socket: usize, peer_addr: SocketAddr) {
+        let info = ActiveHttpSocketInfo {
+            raw_socket,
+            peer_addr: peer_addr.to_string(),
+            accepted_at_unix_ms: u128::from(crate::server::session_registry::unix_time_ms_now()),
+        };
+        match self.inner.lock() {
+            Ok(mut sockets) => {
+                sockets.insert(raw_socket, info);
+                tracing::debug!(
+                    code = "MCP_HTTP_ACCEPTED_SOCKET_TRACKED",
+                    raw_socket,
+                    peer_addr = %peer_addr,
+                    tracked_count = sockets.len(),
+                    "tracked accepted HTTP socket for shutdown"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = "MCP_HTTP_ACCEPTED_SOCKET_TRACK_FAILED",
+                    raw_socket,
+                    peer_addr = %peer_addr,
+                    error = %error,
+                    "accepted HTTP socket registry lock poisoned"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn unregister(&self, raw_socket: usize) {
+        match self.inner.lock() {
+            Ok(mut sockets) => {
+                let removed = sockets.remove(&raw_socket).is_some();
+                tracing::debug!(
+                    code = "MCP_HTTP_ACCEPTED_SOCKET_UNTRACKED",
+                    raw_socket,
+                    removed,
+                    tracked_count = sockets.len(),
+                    "untracked accepted HTTP socket"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = "MCP_HTTP_ACCEPTED_SOCKET_UNTRACK_FAILED",
+                    raw_socket,
+                    error = %error,
+                    "accepted HTTP socket registry lock poisoned while untracking"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn shutdown_socket_on_drop(&self, raw_socket: usize, reason: &'static str) {
+        if !self.shutdown_on_drop_enabled() {
+            return;
+        }
+        let shutdown_result = unsafe { winsock_shutdown(SOCKET(raw_socket), SD_BOTH) };
+        if shutdown_result == 0 {
+            tracing::warn!(
+                code = "MCP_HTTP_ACCEPTED_SOCKET_DROP_SHUTDOWN",
+                raw_socket,
+                reason,
+                "accepted HTTP socket was shut down during drop after daemon restart drain began"
+            );
+        } else {
+            let error = unsafe { WSAGetLastError() };
+            tracing::warn!(
+                code = "MCP_HTTP_ACCEPTED_SOCKET_DROP_SHUTDOWN_FAILED",
+                raw_socket,
+                reason,
+                wsa_error = error.0,
+                "accepted HTTP socket drop shutdown failed after daemon restart drain began"
+            );
+        }
+    }
+
+    fn shutdown_all(&self, reason: &'static str) -> ActiveHttpSocketShutdownReport {
+        #[cfg(windows)]
+        {
+            let _ = self.begin_shutdown_on_drop(reason);
+            let tracked = match self.inner.lock() {
+                Ok(sockets) => sockets.values().cloned().collect::<Vec<_>>(),
+                Err(error) => {
+                    return ActiveHttpSocketShutdownReport {
+                        reason,
+                        tracked_before: 0,
+                        shutdown_attempted: 0,
+                        shutdown_succeeded: 0,
+                        failure_count: 1,
+                        tracked_after: 0,
+                        sockets: Vec::new(),
+                        failures: vec![format!("registry_lock_poisoned:{error}")],
+                    };
+                }
+            };
+            let mut failures = Vec::new();
+            let mut succeeded = 0;
+            for socket in &tracked {
+                let shutdown_result =
+                    unsafe { winsock_shutdown(SOCKET(socket.raw_socket), SD_BOTH) };
+                if shutdown_result == 0 {
+                    succeeded += 1;
+                } else {
+                    let error = unsafe { WSAGetLastError() };
+                    failures.push(format!(
+                        "raw_socket={} peer_addr={} wsa_error={}",
+                        socket.raw_socket, socket.peer_addr, error.0
+                    ));
+                }
+            }
+            let tracked_after = self.inner.lock().map_or(0, |sockets| sockets.len());
+            ActiveHttpSocketShutdownReport {
+                reason,
+                tracked_before: tracked.len(),
+                shutdown_attempted: tracked.len(),
+                shutdown_succeeded: succeeded,
+                failure_count: failures.len(),
+                tracked_after,
+                sockets: tracked
+                    .into_iter()
+                    .map(|socket| ActiveHttpSocketShutdownRow {
+                        raw_socket: socket.raw_socket,
+                        peer_addr: socket.peer_addr,
+                        accepted_at_unix_ms: socket.accepted_at_unix_ms,
+                    })
+                    .collect(),
+                failures,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            ActiveHttpSocketShutdownReport {
+                reason,
+                tracked_before: 0,
+                shutdown_attempted: 0,
+                shutdown_succeeded: 0,
+                failure_count: 0,
+                tracked_after: 0,
+                sockets: Vec::new(),
+                failures: Vec::new(),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+struct TrackedTcpListener {
+    inner: TcpListener,
+    sockets: ActiveHttpSockets,
+}
+
+#[cfg(windows)]
+impl Listener for TrackedTcpListener {
+    type Io = TrackedTcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            match self.inner.accept().await {
+                Ok((stream, addr)) => {
+                    if let Err(error) = stream.set_zero_linger() {
+                        tracing::error!(
+                            code = "MCP_HTTP_ACCEPTED_SOCKET_ZERO_LINGER_FAILED",
+                            error = %error,
+                            peer_addr = %addr,
+                            "failed to configure accepted HTTP socket for abortive close on daemon shutdown"
+                        );
+                    }
+                    let raw_socket = stream.as_raw_socket() as usize;
+                    self.sockets.register(raw_socket, addr);
+                    return (
+                        TrackedTcpStream {
+                            inner: stream,
+                            sockets: self.sockets.clone(),
+                            raw_socket,
+                        },
+                        addr,
+                    );
+                }
+                Err(error) => handle_http_accept_error(error).await,
+            }
+        }
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.inner.local_addr()
+    }
+}
+
+#[cfg(windows)]
+struct TrackedTcpStream {
+    inner: tokio::net::TcpStream,
+    sockets: ActiveHttpSockets,
+    raw_socket: usize,
+}
+
+#[cfg(windows)]
+impl Drop for TrackedTcpStream {
+    fn drop(&mut self) {
+        self.sockets
+            .shutdown_socket_on_drop(self.raw_socket, "tracked_tcp_stream_drop");
+        self.sockets.unregister(self.raw_socket);
+    }
+}
+
+#[cfg(windows)]
+impl AsyncRead for TrackedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[cfg(windows)]
+impl AsyncWrite for TrackedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 pub(super) async fn serve(
@@ -195,9 +533,7 @@ pub(super) async fn serve(
             "non-loopback HTTP bind allowed by explicit operator flag"
         );
     }
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("bind HTTP MCP transport to {addr}"))?;
+    let listener = bind_http_listener(addr).await?;
     let local_addr = listener
         .local_addr()
         .context("read HTTP listener address")?;
@@ -351,8 +687,15 @@ pub(super) async fn serve(
     let _operator_hotkey_guard = crate::safety::install_operator_hotkey(service.clone())
         .context("install operator panic hotkey")?;
     let m2_emitter_done = service.m2_emitter_done_receiver();
-    let runtime = router(&shutdown_cancel, local_addr, sse_state, service)
-        .context("build HTTP MCP router")?;
+    let active_http_sockets = ActiveHttpSockets::default();
+    let runtime = router(
+        &shutdown_cancel,
+        local_addr,
+        sse_state,
+        service,
+        active_http_sockets.clone(),
+    )
+    .context("build HTTP MCP router")?;
 
     tracing::info!(
         code = "MCP_HTTP_STARTED",
@@ -360,9 +703,16 @@ pub(super) async fn serve(
         "starting streamable HTTP MCP transport"
     );
 
-    let mut server_task = spawn_server(listener, runtime.app, shutdown_cancel.clone());
+    let shutdown_cancel_for_http_endpoint = shutdown_cancel.clone();
+    let mut server_task = spawn_server(
+        listener,
+        runtime.app,
+        shutdown_cancel.clone(),
+        active_http_sockets.clone(),
+    );
     let m2_done_after_server_stop = m2_emitter_done.clone();
-    let m2_done_after_signal = m2_emitter_done;
+    let m2_done_after_signal = m2_emitter_done.clone();
+    let m2_done_after_http_endpoint = m2_emitter_done;
     let code = tokio::select! {
         result = &mut server_task => {
             result.context("join HTTP MCP transport")?
@@ -375,6 +725,13 @@ pub(super) async fn serve(
                     "HTTP listener task stopped after shutdown endpoint cancellation"
                 );
                 connection_closed_cancel.cancel();
+                let socket_shutdown = active_http_sockets.shutdown_all("server_task_completed");
+                tracing::warn!(
+                    code = "MCP_HTTP_ACTIVE_SOCKETS_SHUTDOWN",
+                    source = "server_task_completed",
+                    socket_shutdown = ?socket_shutdown,
+                    "accepted HTTP sockets explicitly shut down during daemon shutdown"
+                );
                 let cleanup = cleanup_active_session_inputs_for_shutdown(
                     &runtime.session_lifecycle,
                     &runtime.session_manager,
@@ -392,10 +749,32 @@ pub(super) async fn serve(
         signal = wait_for_shutdown_signal("http") => {
             signal?;
             let drain = runtime.drain_state.mark_draining("signal");
+            let shutdown_on_drop = active_http_sockets.begin_shutdown_on_drop("signal");
+            tracing::warn!(
+                code = "MCP_HTTP_SOCKET_SHUTDOWN_ON_DROP_ENABLED",
+                source = "signal",
+                shutdown_on_drop = ?shutdown_on_drop,
+                "accepted HTTP socket drop now performs socket shutdown during daemon restart drain"
+            );
             tracing::info!(code = "MCP_SHUTDOWN_GRACEFUL", "HTTP shutdown signal received");
+            let session_close =
+                close_active_mcp_sessions_for_shutdown(&runtime.session_manager, "signal").await;
+            tracing::warn!(
+                code = "MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED",
+                source = "signal",
+                session_close = ?session_close,
+                "active MCP sessions closed before daemon cancellation so streamable HTTP clients release old daemon sockets"
+            );
             time::sleep(DRAIN_RESPONSE_GRACE_TIMEOUT).await;
             shutdown_cancel.cancel();
             connection_closed_cancel.cancel();
+            let socket_shutdown = active_http_sockets.shutdown_all("signal");
+            tracing::warn!(
+                code = "MCP_HTTP_ACTIVE_SOCKETS_SHUTDOWN",
+                source = "signal",
+                socket_shutdown = ?socket_shutdown,
+                "accepted HTTP sockets explicitly shut down during daemon shutdown"
+            );
             wait_for_server_stop(&mut server_task, "signal").await?;
             let cleanup = cleanup_active_session_inputs_for_shutdown(
                 &runtime.session_lifecycle,
@@ -409,6 +788,56 @@ pub(super) async fn serve(
                 "readback=session_input_ownership edge=signal_shutdown after_cleanup"
             );
             wait_for_m2_emitter_done(m2_done_after_signal, "signal").await;
+            ExitCode::SUCCESS
+        }
+        _ = shutdown_cancel_for_http_endpoint.cancelled() => {
+            tracing::info!(
+                code = "MCP_HTTP_SHUTDOWN_TOKEN_CANCELLED",
+                source = "http_endpoint",
+                pid = std::process::id(),
+                "HTTP shutdown endpoint cancellation observed by daemon supervisor"
+            );
+            let shutdown_on_drop = active_http_sockets.begin_shutdown_on_drop("http_endpoint");
+            tracing::warn!(
+                code = "MCP_HTTP_SOCKET_SHUTDOWN_ON_DROP_ENABLED",
+                source = "http_endpoint",
+                shutdown_on_drop = ?shutdown_on_drop,
+                "accepted HTTP socket drop now performs socket shutdown during daemon restart drain"
+            );
+            let session_close =
+                close_active_mcp_sessions_for_shutdown(&runtime.session_manager, "http_endpoint").await;
+            tracing::warn!(
+                code = "MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED",
+                source = "http_endpoint",
+                session_close = ?session_close,
+                "active MCP sessions closed before daemon cancellation so streamable HTTP clients release old daemon sockets"
+            );
+            connection_closed_cancel.cancel();
+            let socket_shutdown = active_http_sockets.shutdown_all("http_endpoint");
+            tracing::warn!(
+                code = "MCP_HTTP_ACTIVE_SOCKETS_SHUTDOWN",
+                source = "http_endpoint",
+                socket_shutdown = ?socket_shutdown,
+                "accepted HTTP sockets explicitly shut down during daemon shutdown"
+            );
+            tracing::info!(
+                code = "MCP_HTTP_CONNECTIONS_CANCELLED",
+                source = "http_endpoint",
+                pid = std::process::id(),
+                "connection-scoped work cancelled before waiting for HTTP listener stop"
+            );
+            wait_for_server_stop(&mut server_task, "http_endpoint").await?;
+            let cleanup = cleanup_active_session_inputs_for_shutdown(
+                &runtime.session_lifecycle,
+                &runtime.session_manager,
+                "http_endpoint",
+            ).await;
+            tracing::info!(
+                code = "MCP_HTTP_SHUTDOWN_INPUT_CLEANUP",
+                cleanup = ?cleanup,
+                "readback=session_input_ownership edge=http_endpoint_shutdown after_cleanup"
+            );
+            wait_for_m2_emitter_done(m2_done_after_http_endpoint, "http_endpoint").await;
             ExitCode::SUCCESS
         }
     };
@@ -462,11 +891,24 @@ pub(super) async fn serve(
     Ok(code)
 }
 
+async fn bind_http_listener(addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("bind HTTP MCP transport to {addr}"))?;
+    tracing::info!(
+        code = "MCP_HTTP_BIND_NORMAL",
+        bind = %addr,
+        "HTTP listener bound with normal bind path"
+    );
+    Ok(listener)
+}
+
 fn router(
     shutdown_cancel: &CancellationToken,
     bind_addr: SocketAddr,
     sse_state: SseState,
     service: SynapseService,
+    active_http_sockets: ActiveHttpSockets,
 ) -> anyhow::Result<HttpRouterRuntime> {
     let auth = Arc::new(HttpAuth::load(bind_addr).context("load HTTP bearer token")?);
     tracing::info!(
@@ -524,6 +966,7 @@ fn router(
         session_manager: Arc::clone(&session_manager),
         shutdown_cancel: shutdown_cancel.clone(),
         drain_state: drain_state.clone(),
+        active_http_sockets,
         sse_state,
         agent_events_db,
     };
@@ -565,7 +1008,15 @@ fn router(
             "/chrome-debugger/native/ws",
             get(crate::chrome_debugger_bridge::http_ws),
         )
+        .route(
+            "/chrome-debugger/native/maintenance-pause",
+            post(crate::chrome_debugger_bridge::http_maintenance_pause),
+        )
         .nest_service("/mcp", mcp_service)
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            refuse_mcp_while_draining,
+        ))
         .layer(middleware::from_fn_with_state(
             session_request,
             session::require_mcp_session,
@@ -811,7 +1262,8 @@ fn router(
     let app = Router::new()
         .merge(dashboard_routes)
         .merge(protected_routes)
-        .with_state(state);
+        .with_state(state)
+        .layer(middleware::map_response(force_connection_close));
     Ok(HttpRouterRuntime {
         app,
         session_manager,
@@ -1079,6 +1531,52 @@ async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTree
         .keys()
         .map(|session_id| session_id.as_ref().to_owned())
         .collect()
+}
+
+async fn close_active_mcp_sessions_for_shutdown(
+    session_manager: &LocalSessionManager,
+    reason: &'static str,
+) -> McpSessionShutdownCloseReport {
+    let (sessions_before, sessions) = {
+        let mut guard = session_manager.sessions.write().await;
+        let sessions_before = guard.len();
+        let sessions = guard
+            .drain()
+            .map(|(session_id, handle)| (session_id.as_ref().to_owned(), handle))
+            .collect::<Vec<_>>();
+        (sessions_before, sessions)
+    };
+    let close_attempted = sessions.len();
+    let session_ids = sessions
+        .iter()
+        .map(|(session_id, _)| session_id.clone())
+        .collect::<Vec<_>>();
+    let mut close_succeeded = 0;
+    let mut already_terminated = 0;
+    let mut failures = Vec::new();
+    for (session_id, handle) in sessions {
+        match handle.close().await {
+            Ok(()) => {
+                close_succeeded += 1;
+            }
+            Err(SessionError::SessionServiceTerminated) => {
+                already_terminated += 1;
+            }
+            Err(error) => {
+                failures.push(format!("{session_id}: {error}"));
+            }
+        }
+    }
+    McpSessionShutdownCloseReport {
+        reason,
+        sessions_before,
+        close_attempted,
+        close_succeeded,
+        already_terminated,
+        failure_count: failures.len(),
+        session_ids,
+        failures,
+    }
 }
 
 async fn cleanup_active_session_inputs_for_shutdown(
@@ -7143,14 +7641,26 @@ async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Respons
         .and_then(|value| value.to_str().ok())
         .unwrap_or("<missing>");
     let drain = state.drain_state.mark_draining("http_shutdown");
+    let shutdown_on_drop = state
+        .active_http_sockets
+        .begin_shutdown_on_drop("http_shutdown");
     tracing::warn!(
         code = "MCP_HTTP_SHUTDOWN_DRAIN_STARTED",
         pid = std::process::id(),
         active_sessions,
         user_agent,
         drain = ?drain,
+        shutdown_on_drop = ?shutdown_on_drop,
         delay_ms = DRAIN_RESPONSE_GRACE_TIMEOUT.as_millis(),
         "HTTP shutdown request accepted and daemon drain state marked before cancellation"
+    );
+    let session_close =
+        close_active_mcp_sessions_for_shutdown(&state.session_manager, "http_shutdown").await;
+    tracing::warn!(
+        code = "MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED",
+        pid = std::process::id(),
+        session_close = ?session_close,
+        "active MCP sessions closed before daemon cancellation so streamable HTTP clients release old daemon sockets"
     );
     let shutdown_cancel = state.shutdown_cancel.clone();
     tokio::spawn(async move {
@@ -7173,15 +7683,68 @@ async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Respons
     );
     (
         StatusCode::ACCEPTED,
+        [(header::CONNECTION, HeaderValue::from_static("close"))],
         Json(serde_json::json!({
             "ok": true,
             "pid": std::process::id(),
             "shutdown": "requested",
             "drain": drain,
             "active_sessions_before_shutdown": active_sessions,
+            "session_close": session_close,
         })),
     )
         .into_response()
+}
+
+async fn force_connection_close(mut response: Response) -> Response {
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    }
+    response
+}
+
+async fn refuse_mcp_while_draining(
+    State(state): State<HttpState>,
+    request: Request<Body>,
+    next: middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    if !path.starts_with("/mcp") {
+        return next.run(request).await;
+    }
+    let drain_snapshot = state.drain_state.snapshot();
+    if !drain_snapshot.draining && !state.shutdown_cancel.is_cancelled() {
+        return next.run(request).await;
+    }
+    let snapshot = if drain_snapshot.draining {
+        drain_snapshot
+    } else {
+        state.drain_state.mark_draining("shutdown_token")
+    };
+    tracing::warn!(
+        code = synapse_core::error_codes::DAEMON_RESTARTING,
+        path = %path,
+        method = %request.method(),
+        drain = ?snapshot,
+        "HTTP MCP request refused because daemon is draining for restart"
+    );
+    let mut response = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "code": synapse_core::error_codes::DAEMON_RESTARTING,
+            "retryable": true,
+            "path": path,
+            "drain": snapshot,
+            "message": "daemon is restarting; initialize a new MCP session after the replacement daemon is healthy"
+        })),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    response
 }
 
 async fn events(
@@ -7297,12 +7860,33 @@ fn spawn_server(
     listener: TcpListener,
     app: Router,
     shutdown_cancel: CancellationToken,
+    active_http_sockets: ActiveHttpSockets,
 ) -> JoinHandle<io::Result<()>> {
     tokio::spawn(async move {
+        #[cfg(windows)]
+        let listener = TrackedTcpListener {
+            inner: listener,
+            sockets: active_http_sockets,
+        };
+        #[cfg(not(windows))]
+        let _ = active_http_sockets;
         axum::serve(listener, app)
             .with_graceful_shutdown(async move { shutdown_cancel.cancelled_owned().await })
             .await
     })
+}
+
+async fn handle_http_accept_error(error: io::Error) {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+    ) {
+        return;
+    }
+    tracing::error!(code = "MCP_HTTP_ACCEPT_ERROR", error = %error, "HTTP accept error");
+    tokio::time::sleep(Duration::from_secs(1)).await;
 }
 
 async fn wait_for_server_stop(
@@ -7338,6 +7922,36 @@ async fn wait_for_server_stop(
                 elapsed_ms = started.elapsed().as_millis(),
                 "HTTP transport did not stop within shutdown timeout"
             );
+            match tokio::time::timeout(timeout, &mut *server_task).await {
+                Ok(Ok(Ok(()))) => {
+                    tracing::info!(
+                        code = "MCP_HTTP_SERVER_STOPPED_AFTER_ABORT",
+                        source,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "HTTP listener task stopped after abort request"
+                    );
+                }
+                Ok(Ok(Err(error))) => {
+                    return Err(error).context("stop aborted HTTP MCP transport");
+                }
+                Ok(Err(join_error)) if join_error.is_cancelled() => {
+                    tracing::warn!(
+                        code = "MCP_HTTP_SERVER_ABORTED",
+                        source,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "HTTP listener task aborted after shutdown timeout"
+                    );
+                }
+                Ok(Err(join_error)) => {
+                    return Err(join_error).context("join aborted HTTP MCP transport");
+                }
+                Err(_elapsed) => {
+                    anyhow::bail!(
+                        "HTTP listener task did not stop after abort request within {}ms",
+                        timeout.as_millis()
+                    );
+                }
+            }
         }
     }
     Ok(())
