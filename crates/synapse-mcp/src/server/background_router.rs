@@ -533,6 +533,9 @@ pub struct TargetActResponse {
     pub ok: bool,
     /// `ok`, `verify_needed`, `refused`, or `error`.
     pub status: String,
+    /// `delivered_and_verified`, `delivered_unverified`, `refused_before_delivery`,
+    /// or `failed_before_delivery`.
+    pub delivery_state: String,
     /// The background primitive this verb routed to.
     pub delegated_tool: String,
     pub routing: String,
@@ -1083,6 +1086,7 @@ impl SynapseService {
                             verb: verb.as_str().to_owned(),
                             ok,
                             status: status.to_owned(),
+                            delivery_state: target_act_delivery_state(ok, status).to_owned(),
                             delegated_tool: delegated_tool.to_owned(),
                             routing: target_act_routing_description(),
                             result,
@@ -1209,6 +1213,11 @@ impl SynapseService {
                                 verb: verb.as_str().to_owned(),
                                 ok: false,
                                 status: target_act_error_status(&error).to_owned(),
+                                delivery_state: target_act_delivery_state(
+                                    false,
+                                    target_act_error_status(&error),
+                                )
+                                .to_owned(),
                                 delegated_tool: "act_focus_window".to_owned(),
                                 routing: target_act_routing_description(),
                                 result: target_act_error_result("act_focus_window", error),
@@ -1228,6 +1237,11 @@ impl SynapseService {
                             verb: verb.as_str().to_owned(),
                             ok: false,
                             status: target_act_error_status(&error).to_owned(),
+                            delivery_state: target_act_delivery_state(
+                                false,
+                                target_act_error_status(&error),
+                            )
+                            .to_owned(),
                             delegated_tool: "act_focus_window".to_owned(),
                             routing: target_act_routing_description(),
                             result: target_act_error_result("act_focus_window", error),
@@ -1246,6 +1260,11 @@ impl SynapseService {
                                 verb: verb.as_str().to_owned(),
                                 ok: false,
                                 status: target_act_error_status(&error).to_owned(),
+                                delivery_state: target_act_delivery_state(
+                                    false,
+                                    target_act_error_status(&error),
+                                )
+                                .to_owned(),
                                 delegated_tool: "act_focus_window".to_owned(),
                                 routing: target_act_routing_description(),
                                 result: target_act_error_result("act_focus_window", error),
@@ -1267,6 +1286,7 @@ impl SynapseService {
             verb: verb.as_str().to_owned(),
             ok,
             status: status.to_owned(),
+            delivery_state: target_act_delivery_state(ok, status).to_owned(),
             delegated_tool: delegated_tool.to_owned(),
             routing: target_act_routing_description(),
             result,
@@ -7353,6 +7373,17 @@ fn target_act_error_result(delegated_tool: &'static str, error: ErrorData) -> Va
     })
 }
 
+fn target_act_delivery_state(ok: bool, status: &str) -> &'static str {
+    if ok && status == TARGET_ACT_STATUS_OK {
+        return "delivered_and_verified";
+    }
+    match status {
+        TARGET_ACT_STATUS_VERIFY_NEEDED => "delivered_unverified",
+        TARGET_ACT_STATUS_REFUSED => "refused_before_delivery",
+        _ => "failed_before_delivery",
+    }
+}
+
 fn target_act_error_status(error: &ErrorData) -> &'static str {
     match target_act_error_code(error) {
         Some(
@@ -9332,6 +9363,26 @@ mod tests {
             let error = mcp_error(code, "synthetic delegated refusal");
             assert_eq!(target_act_error_status(&error), TARGET_ACT_STATUS_REFUSED);
         }
+    }
+
+    #[test]
+    fn target_act_delivery_state_distinguishes_verification_failures() {
+        assert_eq!(
+            target_act_delivery_state(true, TARGET_ACT_STATUS_OK),
+            "delivered_and_verified"
+        );
+        assert_eq!(
+            target_act_delivery_state(false, TARGET_ACT_STATUS_VERIFY_NEEDED),
+            "delivered_unverified"
+        );
+        assert_eq!(
+            target_act_delivery_state(false, TARGET_ACT_STATUS_REFUSED),
+            "refused_before_delivery"
+        );
+        assert_eq!(
+            target_act_delivery_state(false, TARGET_ACT_STATUS_ERROR),
+            "failed_before_delivery"
+        );
     }
 
     #[test]
