@@ -51,6 +51,10 @@ use super::routines::{
 const SUGGESTION_PREFIX: &str = "suggestion/v1/";
 /// Schema version for [`SuggestionRecord`].
 const SUGGESTION_RECORD_VERSION: u32 = 1;
+/// `CF_KV` key prefix for suggestion-id to primary-row index entries.
+const SUGGESTION_ID_INDEX_PREFIX: &str = "suggestion_id/v1/";
+/// Schema version for [`SuggestionIdIndexRecord`].
+const SUGGESTION_ID_INDEX_RECORD_VERSION: u32 = 1;
 /// The engine actor recorded on feedback it generates.
 const SUGGESTION_ACTOR: &str = "suggestion-engine";
 const ASSIST_EVENT_KIND: &str = "assist.opportunity";
@@ -213,6 +217,18 @@ pub struct SuggestionRecord {
     pub resolved_ts_ns: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_note: Option<String>,
+}
+
+/// Secondary index entry for O(1) `suggestion_id` lookups.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SuggestionIdIndexRecord {
+    record_version: u32,
+    suggestion_id: String,
+    routine_id: String,
+    created_ts_ns: u64,
+    primary_key_hex: String,
+    primary_value_sha256: String,
 }
 
 /// Why a candidate did NOT surface (or that it did). Ordered by the gate's
@@ -410,6 +426,11 @@ fn suggestion_key(routine_id: &str, created_ts_ns: u64) -> Vec<u8> {
     format!("{SUGGESTION_PREFIX}{routine_id}/{created_ts_ns:020}").into_bytes()
 }
 
+fn suggestion_id_index_key(suggestion_id: &str) -> Vec<u8> {
+    let id_hex = hex_encode(suggestion_id.as_bytes());
+    format!("{SUGGESTION_ID_INDEX_PREFIX}{id_hex}/primary").into_bytes()
+}
+
 fn event_scan_start_key(ts_ns: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(12);
     key.extend_from_slice(&ts_ns.to_be_bytes());
@@ -430,6 +451,11 @@ fn hex_encode(bytes: &[u8]) -> String {
         output.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     output
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    hex_encode(&digest[..])
 }
 
 fn sha256_short_hex(material: &str) -> String {
@@ -693,7 +719,125 @@ fn load_all_suggestions(db: &Arc<Db>) -> Result<Vec<(Vec<u8>, SuggestionRecord)>
     Ok(out)
 }
 
+fn load_exact_kv_value(
+    db: &Arc<Db>,
+    key: &[u8],
+    context: &'static str,
+) -> Result<Option<Vec<u8>>, ErrorData> {
+    let rows = db.scan_cf_prefix(cf::CF_KV, key).map_err(storage_error)?;
+    let mut exact_values = rows
+        .into_iter()
+        .filter_map(|(row_key, value)| (row_key == key).then_some(value))
+        .collect::<Vec<_>>();
+    if exact_values.len() > 1 {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_EXACT_KEY_DUPLICATE: {context} key {} appeared more than once in CF_KV",
+                String::from_utf8_lossy(key)
+            ),
+        ));
+    }
+    Ok(exact_values.pop())
+}
+
+fn suggestion_id_index_record(
+    record: &SuggestionRecord,
+    primary_key: &[u8],
+    primary_value: &[u8],
+) -> SuggestionIdIndexRecord {
+    SuggestionIdIndexRecord {
+        record_version: SUGGESTION_ID_INDEX_RECORD_VERSION,
+        suggestion_id: record.suggestion_id.clone(),
+        routine_id: record.routine_id.clone(),
+        created_ts_ns: record.created_ts_ns,
+        primary_key_hex: hex_encode(primary_key),
+        primary_value_sha256: sha256_hex(primary_value),
+    }
+}
+
+fn decode_suggestion_id_index(
+    expected_suggestion_id: &str,
+    index_key: &[u8],
+    value: &[u8],
+) -> Result<SuggestionIdIndexRecord, ErrorData> {
+    let index: SuggestionIdIndexRecord = decode_json(value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_DECODE_FAILED in CF_KV at {}: {error}",
+                String::from_utf8_lossy(index_key)
+            ),
+        )
+    })?;
+    if index.record_version != SUGGESTION_ID_INDEX_RECORD_VERSION {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_VERSION_UNSUPPORTED for {expected_suggestion_id}: expected {}, got {}",
+                SUGGESTION_ID_INDEX_RECORD_VERSION, index.record_version
+            ),
+        ));
+    }
+    if index.suggestion_id != expected_suggestion_id {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_KEY_MISMATCH: key for {expected_suggestion_id} contains suggestion_id {}",
+                index.suggestion_id
+            ),
+        ));
+    }
+    Ok(index)
+}
+
+fn load_suggestion_id_index(
+    db: &Arc<Db>,
+    suggestion_id: &str,
+) -> Result<Option<SuggestionIdIndexRecord>, ErrorData> {
+    let index_key = suggestion_id_index_key(suggestion_id);
+    let Some(value) = load_exact_kv_value(db, &index_key, "suggestion id index")? else {
+        return Ok(None);
+    };
+    decode_suggestion_id_index(suggestion_id, &index_key, &value).map(Some)
+}
+
+fn validate_suggestion_id_index(
+    index: &SuggestionIdIndexRecord,
+    record: &SuggestionRecord,
+    primary_key: &[u8],
+    primary_value: &[u8],
+    context: &'static str,
+) -> Result<(), ErrorData> {
+    let expected_primary_key_hex = hex_encode(primary_key);
+    let expected_primary_value_sha256 = sha256_hex(primary_value);
+    if index.suggestion_id != record.suggestion_id
+        || index.routine_id != record.routine_id
+        || index.created_ts_ns != record.created_ts_ns
+        || index.primary_key_hex != expected_primary_key_hex
+        || index.primary_value_sha256 != expected_primary_value_sha256
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_MISMATCH during {context}: suggestion_id={}, index_routine={}, record_routine={}, index_created={}, record_created={}, index_key={}, expected_key={}, index_hash={}, expected_hash={}",
+                record.suggestion_id,
+                index.routine_id,
+                record.routine_id,
+                index.created_ts_ns,
+                record.created_ts_ns,
+                index.primary_key_hex,
+                expected_primary_key_hex,
+                index.primary_value_sha256,
+                expected_primary_value_sha256
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn write_suggestion(db: &Arc<Db>, record: &SuggestionRecord) -> Result<(), ErrorData> {
+    validate_suggestion_id("suggestion_write", &record.suggestion_id)?;
     let key = suggestion_key(&record.routine_id, record.created_ts_ns);
     let value = encode_json(record).map_err(|error| {
         mcp_error(
@@ -704,40 +848,164 @@ fn write_suggestion(db: &Arc<Db>, record: &SuggestionRecord) -> Result<(), Error
             ),
         )
     })?;
-    db.put_batch_pressure_bypass(cf::CF_KV, [(key.clone(), value)])
-        .map_err(|error| {
-            mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+    let index_key = suggestion_id_index_key(&record.suggestion_id);
+    let index = suggestion_id_index_record(record, &key, &value);
+    if let Some(existing_index) = load_suggestion_id_index(db, &record.suggestion_id)? {
+        let expected_primary_key_hex = hex_encode(&key);
+        if existing_index.primary_key_hex != expected_primary_key_hex
+            || existing_index.routine_id != record.routine_id
+            || existing_index.created_ts_ns != record.created_ts_ns
+        {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
                 format!(
-                    "failed to persist suggestion {}: {error}",
-                    record.suggestion_id
+                    "SUGGESTION_ID_COLLISION: suggestion_id {} is already indexed to routine_id={}, created_ts_ns={}, primary_key_hex={}; refusing to point it at routine_id={}, created_ts_ns={}, primary_key_hex={}",
+                    record.suggestion_id,
+                    existing_index.routine_id,
+                    existing_index.created_ts_ns,
+                    existing_index.primary_key_hex,
+                    record.routine_id,
+                    record.created_ts_ns,
+                    expected_primary_key_hex
                 ),
-            )
-        })?;
-    // Read-your-write against the physical row.
-    let rows = db.scan_cf_prefix(cf::CF_KV, &key).map_err(storage_error)?;
-    match rows.first() {
-        Some((_, value)) => {
-            let readback: SuggestionRecord = decode_json(value).map_err(storage_error)?;
-            if &readback != record {
-                return Err(mcp_error(
-                    error_codes::STORAGE_CORRUPTED,
-                    format!(
-                        "SUGGESTION_READBACK_MISMATCH for {}: persisted row != value just written",
-                        record.suggestion_id
-                    ),
-                ));
-            }
-            Ok(())
+            ));
         }
-        None => Err(mcp_error(
+    }
+    let index_value = encode_json(&index).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "failed to encode suggestion_id index for {}: {error}",
+                record.suggestion_id
+            ),
+        )
+    })?;
+    db.mutate_batch_pressure_bypass(
+        cf::CF_KV,
+        Vec::<Vec<u8>>::new(),
+        [
+            (key.clone(), value.clone()),
+            (index_key.clone(), index_value.clone()),
+        ],
+    )
+    .map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "failed to persist suggestion {} and suggestion_id index atomically: {error}",
+                record.suggestion_id
+            ),
+        )
+    })?;
+    let Some(primary_readback_value) = load_exact_kv_value(db, &key, "suggestion primary row")?
+    else {
+        return Err(mcp_error(
             error_codes::STORAGE_CORRUPTED,
             format!(
                 "SUGGESTION_READBACK_MISSING: row for {} vanished immediately after write",
                 record.suggestion_id
             ),
-        )),
+        ));
+    };
+    let primary_readback: SuggestionRecord =
+        decode_json(&primary_readback_value).map_err(storage_error)?;
+    if &primary_readback != record {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_READBACK_MISMATCH for {}: persisted row != value just written",
+                record.suggestion_id
+            ),
+        ));
     }
+    let Some(index_readback_value) =
+        load_exact_kv_value(db, &index_key, "suggestion id index readback")?
+    else {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_READBACK_MISSING: index row for {} vanished immediately after write",
+                record.suggestion_id
+            ),
+        ));
+    };
+    let index_readback =
+        decode_suggestion_id_index(&record.suggestion_id, &index_key, &index_readback_value)?;
+    if index_readback != index {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_READBACK_MISMATCH for {}: persisted index != value just written",
+                record.suggestion_id
+            ),
+        ));
+    }
+    validate_suggestion_id_index(
+        &index_readback,
+        record,
+        &key,
+        &primary_readback_value,
+        "write readback",
+    )
+}
+
+fn load_suggestion_primary_from_index(
+    db: &Arc<Db>,
+    index: &SuggestionIdIndexRecord,
+) -> Result<SuggestionRecord, ErrorData> {
+    let primary_key = suggestion_key(&index.routine_id, index.created_ts_ns);
+    let expected_primary_key_hex = hex_encode(&primary_key);
+    if index.primary_key_hex != expected_primary_key_hex {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_PRIMARY_KEY_MISMATCH for {}: index_key={}, expected_key={}",
+                index.suggestion_id, index.primary_key_hex, expected_primary_key_hex
+            ),
+        ));
+    }
+    let Some(primary_value) = load_exact_kv_value(db, &primary_key, "suggestion primary lookup")?
+    else {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_DANGLING: suggestion_id {} points at missing primary key {}",
+                index.suggestion_id,
+                String::from_utf8_lossy(&primary_key)
+            ),
+        ));
+    };
+    let actual_hash = sha256_hex(&primary_value);
+    if index.primary_value_sha256 != actual_hash {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_HASH_MISMATCH for {}: index_hash={}, actual_hash={}",
+                index.suggestion_id, index.primary_value_sha256, actual_hash
+            ),
+        ));
+    }
+    let record: SuggestionRecord = decode_json(&primary_value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_PRIMARY_ROW_DECODE_FAILED for {} at {}: {error}",
+                index.suggestion_id,
+                String::from_utf8_lossy(&primary_key)
+            ),
+        )
+    })?;
+    validate_suggestion_id_index(index, &record, &primary_key, &primary_value, "indexed load")?;
+    if record.suggestion_id != index.suggestion_id {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ID_INDEX_RECORD_MISMATCH: index for {} points at primary row for {}",
+                index.suggestion_id, record.suggestion_id
+            ),
+        ));
+    }
+    Ok(record)
 }
 
 pub fn load_suggestion_by_id(
@@ -745,19 +1013,10 @@ pub fn load_suggestion_by_id(
     suggestion_id: &str,
 ) -> Result<Option<SuggestionRecord>, ErrorData> {
     validate_suggestion_id("suggestion", suggestion_id)?;
-    let mut matches = load_all_suggestions(db)?
-        .into_iter()
-        .filter_map(|(_key, record)| (record.suggestion_id == suggestion_id).then_some(record))
-        .collect::<Vec<_>>();
-    if matches.len() > 1 {
-        return Err(mcp_error(
-            error_codes::STORAGE_CORRUPTED,
-            format!(
-                "SUGGESTION_ID_COLLISION: suggestion_id {suggestion_id} appears in more than one CF_KV row"
-            ),
-        ));
-    }
-    Ok(matches.pop())
+    let Some(index) = load_suggestion_id_index(db, suggestion_id)? else {
+        return Ok(None);
+    };
+    load_suggestion_primary_from_index(db, &index).map(Some)
 }
 
 pub fn accept_suggestion_for_execution(
@@ -1335,6 +1594,104 @@ mod tests {
             .expect("load readback")
             .expect("accepted suggestion exists");
         assert_eq!(readback, accepted);
+
+        let index_key = suggestion_id_index_key(&record.suggestion_id);
+        let index_value = load_exact_kv_value(&db, &index_key, "test index")
+            .expect("read index")
+            .expect("index exists");
+        let index = decode_suggestion_id_index(&record.suggestion_id, &index_key, &index_value)
+            .expect("decode index");
+        assert_eq!(index.suggestion_id, record.suggestion_id);
+        assert_eq!(index.routine_id, record.routine_id);
+        assert_eq!(index.created_ts_ns, record.created_ts_ns);
+        assert_eq!(
+            index.primary_key_hex,
+            hex_encode(&suggestion_key(&record.routine_id, record.created_ts_ns))
+        );
+    }
+
+    #[test]
+    fn load_suggestion_by_id_does_not_scan_unindexed_primary_rows() {
+        let (_dir, db) = temp_db();
+        let record = live_suggestion();
+        let key = suggestion_key(&record.routine_id, record.created_ts_ns);
+        let value = encode_json(&record).expect("encode suggestion");
+        db.put_batch_pressure_bypass(cf::CF_KV, [(key.clone(), value)])
+            .expect("write primary without index");
+
+        let readback = load_suggestion_by_id(&db, &record.suggestion_id)
+            .expect("missing index is not storage corruption");
+        assert_eq!(readback, None);
+
+        let primary_value = load_exact_kv_value(&db, &key, "test primary")
+            .expect("read primary")
+            .expect("primary row remains");
+        let primary: SuggestionRecord = decode_json(&primary_value).expect("decode primary");
+        assert_eq!(primary, record);
+    }
+
+    #[test]
+    fn write_suggestion_rejects_duplicate_id_for_different_primary_row() {
+        let (_dir, db) = temp_db();
+        let record = live_suggestion();
+        write_suggestion(&db, &record).expect("write original");
+
+        let mut collision = record.clone();
+        collision.routine_id = "rt1-collision".to_owned();
+        collision.created_ts_ns = T + 42;
+        let error = write_suggestion(&db, &collision).expect_err("collision must fail");
+        assert!(error.message.contains("SUGGESTION_ID_COLLISION"));
+
+        let readback = load_suggestion_by_id(&db, &record.suggestion_id)
+            .expect("load original")
+            .expect("original remains indexed");
+        assert_eq!(readback, record);
+    }
+
+    #[test]
+    fn load_suggestion_by_id_rejects_dangling_index() {
+        let (_dir, db) = temp_db();
+        let record = live_suggestion();
+        write_suggestion(&db, &record).expect("write suggestion");
+        let primary_key = suggestion_key(&record.routine_id, record.created_ts_ns);
+
+        db.mutate_batch_pressure_bypass(cf::CF_KV, [primary_key], Vec::<(Vec<u8>, Vec<u8>)>::new())
+            .expect("delete primary only");
+
+        let error = load_suggestion_by_id(&db, &record.suggestion_id)
+            .expect_err("dangling index must fail");
+        assert!(error.message.contains("SUGGESTION_ID_INDEX_DANGLING"));
+    }
+
+    #[test]
+    fn load_suggestion_by_id_rejects_primary_hash_mismatch() {
+        let (_dir, db) = temp_db();
+        let mut record = live_suggestion();
+        write_suggestion(&db, &record).expect("write suggestion");
+
+        record.status = SuggestionStatus::Accepted;
+        record.resolved_ts_ns = Some(T + 5);
+        let primary_key = suggestion_key(&record.routine_id, record.created_ts_ns);
+        let stale_primary = encode_json(&record).expect("encode stale primary");
+        db.put_batch_pressure_bypass(cf::CF_KV, [(primary_key, stale_primary)])
+            .expect("overwrite primary without index");
+
+        let error =
+            load_suggestion_by_id(&db, &record.suggestion_id).expect_err("hash mismatch must fail");
+        assert!(error.message.contains("SUGGESTION_ID_INDEX_HASH_MISMATCH"));
+    }
+
+    #[test]
+    fn load_suggestion_by_id_rejects_corrupt_index_row() {
+        let (_dir, db) = temp_db();
+        let record = live_suggestion();
+        let index_key = suggestion_id_index_key(&record.suggestion_id);
+        db.put_batch_pressure_bypass(cf::CF_KV, [(index_key, b"{".to_vec())])
+            .expect("write corrupt index");
+
+        let error =
+            load_suggestion_by_id(&db, &record.suggestion_id).expect_err("corrupt index must fail");
+        assert!(error.message.contains("SUGGESTION_ID_INDEX_DECODE_FAILED"));
     }
 
     fn assist_event(ts_ns: u64) -> StoredEvent {
