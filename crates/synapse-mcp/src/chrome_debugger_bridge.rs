@@ -807,7 +807,7 @@ fn chrome_policy_set_value_access_status(subkey: &str) -> String {
     };
     if status != windows::Win32::Foundation::ERROR_SUCCESS {
         return format!(
-            "policy_set_value_access=false policy_set_value_access_reason=reg_open_key_set_value_failed status={} remediation=repair HKCU\\{subkey} ACL or run setup from an elevated maintenance context; until then rely on live chrome.management suppression and fail-closed command gates",
+            "policy_set_value_access=false policy_set_value_access_reason=reg_open_key_set_value_failed status={} expected_acl=admin_only_managed_policy_root remediation=do not weaken HKCU\\{subkey} ACL for non-elevated setup; run scripts\\synapse-setup.ps1 from an elevated PowerShell only when the optional Chrome ExtensionSettings policy shield must be applied; until then rely on live chrome.management suppression and fail-closed command gates",
             status.0
         );
     }
@@ -927,7 +927,7 @@ fn external_chrome_popup_risk_warning(rows: &[String], suppression_ok: bool) -> 
         );
     }
     format!(
-        "external_chrome_popup_risk_blocking=true external_chrome_popup_risk_scope=external_suppression_required risk_count={} external_chrome_popup_risk={} remediation=let the installed Synapse Chrome Bridge management fallback disable the named external debugger/nativeMessaging extensions, or repair HKCU\\Software\\Policies\\Google\\Chrome ACL and rerun scripts\\install-synapse-chrome-debugger.ps1 so ExtensionSettings blocks debugger/nativeMessaging; normal bridge commands fail closed while this risk remains unsuppressed",
+        "external_chrome_popup_risk_blocking=true external_chrome_popup_risk_scope=external_suppression_required risk_count={} external_chrome_popup_risk={} remediation=let the installed Synapse Chrome Bridge management fallback disable the named external debugger/nativeMessaging extensions, or rerun scripts\\synapse-setup.ps1 from an elevated PowerShell so ExtensionSettings blocks debugger/nativeMessaging; do not weaken the admin-only HKCU Chrome policy ACL; normal bridge commands fail closed while this risk remains unsuppressed",
         rows.len(),
         format_external_chrome_popup_risks(rows)
     )
@@ -1072,7 +1072,7 @@ fn ensure_normal_bridge_external_popup_suppressed(
     Err(ChromeDebuggerBridgeError {
         code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
         detail: format!(
-            "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing any Chrome tabs/scripting command; hwnd={hwnd} reason=external debugger/nativeMessaging popup risk remains unsuppressed external_chrome_popup_risk={} bridge_popup_risk_suppression={} remediation=let the installed Synapse Chrome Bridge management fallback disable the named extension IDs, disable them in Chrome, or repair HKCU\\Software\\Policies\\Google\\Chrome ACL so scripts\\install-synapse-chrome-debugger.ps1 can apply ExtensionSettings blocked_permissions for debugger/nativeMessaging",
+            "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing any Chrome tabs/scripting command; hwnd={hwnd} reason=external debugger/nativeMessaging popup risk remains unsuppressed external_chrome_popup_risk={} bridge_popup_risk_suppression={} remediation=let the installed Synapse Chrome Bridge management fallback disable the named extension IDs, disable them in Chrome, or rerun scripts\\synapse-setup.ps1 from an elevated PowerShell so ExtensionSettings can apply blocked_permissions for debugger/nativeMessaging; do not weaken the admin-only HKCU Chrome policy ACL",
             format_external_chrome_popup_risks(&risks),
             suppression_summary
         ),

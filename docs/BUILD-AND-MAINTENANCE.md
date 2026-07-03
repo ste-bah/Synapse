@@ -32,6 +32,35 @@ self-elevates and adds the repo build-output exclusions:
 pwsh -File .\scripts\add-defender-exclusions.ps1
 ```
 
+## Chrome Policy Popup Shield
+
+Synapse tries to write a reversible Chrome `ExtensionSettings` popup shield at
+`HKCU:\Software\Policies\Google\Chrome\ExtensionSettings`. That policy blocks
+debugger/nativeMessaging permissions for hazards that can surface Chrome popups
+during background automation.
+
+The intended ACL on a hardened configured host is admin-only for writes. It is
+valid for the key owner to be `BUILTIN\Administrators` or `SYSTEM`, with the
+medium-integrity user token limited to `ReadKey`. Do not weaken that ACL to make
+normal setup write Chrome managed policy.
+
+The policy shield is defense-in-depth, not the runtime enforcement boundary.
+Runtime safety is the installed Synapse Chrome Bridge `chrome.management`
+suppression readback plus daemon fail-closed command gates.
+
+To apply the policy shield, use an elevated PowerShell from the repo:
+
+```powershell
+pwsh -File .\scripts\synapse-setup.ps1 -SourceDir C:\code\Synapse -ForceRestart
+```
+
+Then verify `mcp__synapse.health` reports
+`synapse_chrome_self_policy_shield_present=true`. Without elevation, setup may
+warn with `SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED_NONBLOCKING`; the
+required readback is that `chrome_bridge.status=ok`, live management suppression
+has `remaining_hazard_count=0` and `failure_count=0`, and browser commands fail
+closed if that suppression changes.
+
 ## Repo Maintenance
 
 `scripts/repo-maintenance.ps1` is dry-run by default. It scans git repos under

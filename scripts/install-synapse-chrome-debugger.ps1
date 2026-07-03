@@ -319,7 +319,7 @@ function Set-SynapseChromeExternalDebuggerPolicy {
             phase = 'read_or_create'
             error = $_.Exception.Message
             acl = $acl
-            remediation = 'repair HKCU\Software\Policies\Google\Chrome ACL or run from elevated PowerShell so Synapse can apply the external debugger/nativeMessaging popup shield; otherwise the installed Synapse Chrome Bridge must suppress the hazard through chrome.management or normal bridge commands fail closed before touching Chrome'
+            remediation = 'do not weaken the admin-only HKCU\Software\Policies\Google\Chrome ACL for non-elevated setup; run scripts\synapse-setup.ps1 from an elevated PowerShell only when the optional Chrome ExtensionSettings popup shield must be applied; otherwise the installed Synapse Chrome Bridge must suppress the hazard through chrome.management or normal bridge commands fail closed before touching Chrome'
             shielded_entries = @()
             unchanged_entries = @()
         }
@@ -396,7 +396,7 @@ function Set-SynapseChromeExternalDebuggerPolicy {
                 phase = 'write_extension_settings'
                 error = $_.Exception.Message
                 acl = $acl
-                remediation = 'repair HKCU\Software\Policies\Google\Chrome ACL or run from elevated PowerShell so Synapse can apply the external debugger/nativeMessaging popup shield; otherwise the installed Synapse Chrome Bridge must suppress the hazard through chrome.management or normal bridge commands fail closed before touching Chrome'
+                remediation = 'do not weaken the admin-only HKCU\Software\Policies\Google\Chrome ACL for non-elevated setup; run scripts\synapse-setup.ps1 from an elevated PowerShell only when the optional Chrome ExtensionSettings popup shield must be applied; otherwise the installed Synapse Chrome Bridge must suppress the hazard through chrome.management or normal bridge commands fail closed before touching Chrome'
                 shielded_entries = @($shieldedEntries)
                 unchanged_entries = @($unchangedEntries)
             }

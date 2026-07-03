@@ -73,6 +73,16 @@
   emulation plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag
   dispatch in the already-open authenticated Chrome profile.
 
+  A correctly hardened host can make
+  HKCU:\Software\Policies\Google\Chrome an admin-only managed-policy root even
+  for users who are local administrators but currently run under a medium
+  integrity UAC token. Non-elevated setup must not weaken that ACL. If the
+  policy-level defense-in-depth is required, run this setup script from an
+  elevated PowerShell and verify /health reports
+  synapse_chrome_self_policy_shield_present=true. If elevation is not used,
+  /health must still prove live chrome.management suppression is clear, and
+  normal browser commands fail closed if suppression is not confirmed.
+
 .PARAMETER MaintenanceLockPath
   File-lock Source of Truth that serializes setup/remove across multiple
   agents. The file contents name the owning PID and cleanup policy; the held
