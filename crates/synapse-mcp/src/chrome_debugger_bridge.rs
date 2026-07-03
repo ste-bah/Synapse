@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::ExitCode,
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex, OnceLock, RwLock as StdRwLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -102,6 +102,7 @@ const NATIVE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const DIRECT_WS_COMMAND_WAIT: Duration = Duration::from_secs(25);
 const DEFAULT_RELOAD_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_RELOAD_WAIT_TIMEOUT_MS: u64 = 30_000;
+const CHROME_PROFILE_SCAN_CACHE_TTL: Duration = Duration::from_secs(5);
 const MAINTENANCE_RECONNECT_PAUSE_COMMAND: &str = "maintenancePauseReconnect";
 const DEFAULT_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 120_000;
 const MIN_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 1_000;
@@ -323,7 +324,7 @@ fn external_chrome_surface_hint() -> String {
 }
 
 fn external_chrome_popup_risks() -> Vec<String> {
-    let mut rows = external_chrome_profile_surfaces();
+    let mut rows = chrome_profile_scan().scan.external_profile_surfaces;
     rows.extend(external_chrome_native_messaging_processes());
     rows.sort();
     rows.dedup();
@@ -331,97 +332,7 @@ fn external_chrome_popup_risks() -> Vec<String> {
 }
 
 fn synapse_chrome_self_profile_surfaces() -> Vec<String> {
-    let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") else {
-        return Vec::new();
-    };
-    let user_data_root = PathBuf::from(local_appdata)
-        .join("Google")
-        .join("Chrome")
-        .join("User Data");
-    let Ok(profile_dirs) = std::fs::read_dir(user_data_root) else {
-        return Vec::new();
-    };
-
-    let mut rows = Vec::new();
-    for profile_dir in profile_dirs.flatten() {
-        let Ok(file_type) = profile_dir.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() || profile_dir.file_name() == "Snapshots" {
-            continue;
-        }
-        let profile = profile_dir.file_name().to_string_lossy().into_owned();
-        let mut runtime_by_id: HashMap<String, ChromeExtensionRuntimeState> = HashMap::new();
-        for pref_file in ["Preferences", "Secure Preferences"] {
-            let pref_path = profile_dir.path().join(pref_file);
-            let Ok(raw) = std::fs::read_to_string(&pref_path) else {
-                continue;
-            };
-            let Ok(pref) = serde_json::from_str::<Value>(&raw) else {
-                rows.push(format!(
-                    "profile={profile} pref={pref_file} parse_error=true"
-                ));
-                continue;
-            };
-            let Some(setting) = pref
-                .get("extensions")
-                .and_then(|value| value.get("settings"))
-                .and_then(|settings| settings.get(EXTENSION_ID))
-            else {
-                continue;
-            };
-            let mut runtime_state = chrome_extension_runtime_state(setting);
-            if pref_file == "Preferences" {
-                runtime_by_id.insert(EXTENSION_ID.to_owned(), runtime_state.clone());
-            } else if let Some(preferences_runtime_state) = runtime_by_id.get(EXTENSION_ID) {
-                runtime_state = preferences_runtime_state.clone();
-            }
-            let active_permissions = active_api_permissions(setting);
-            let manifest_permissions = manifest_api_permissions(setting);
-            let granted_permissions = granted_api_permissions(setting);
-            let active_or_manifest_hazards = synapse_self_hazard_api_permissions(
-                active_permissions
-                    .iter()
-                    .chain(manifest_permissions.iter())
-                    .map(String::as_str),
-            );
-            let granted_hazards =
-                synapse_self_hazard_api_permissions(granted_permissions.iter().map(String::as_str));
-            if active_or_manifest_hazards.is_empty() && granted_hazards.is_empty() {
-                continue;
-            }
-            let disabled =
-                !runtime_state.disable_reasons.is_empty() || runtime_state.state == Some(0);
-            let active_hazard_enabled = !disabled && !active_or_manifest_hazards.is_empty();
-            let granted_only = active_or_manifest_hazards.is_empty() && !granted_hazards.is_empty();
-            if !active_hazard_enabled && !granted_only {
-                continue;
-            }
-            let risk_basis = if active_hazard_enabled {
-                "active_or_manifest_hazard_without_disable_reason"
-            } else {
-                "granted_only_stale"
-            };
-            rows.push(format!(
-                "profile={profile} pref={pref_file} extension_id={EXTENSION_ID} name=\"Synapse Chrome Bridge\" active_api={} manifest_api={} granted_hazard_api={} synapse_self_popup_risk=true risk_basis={risk_basis} state={} active_bit={} disable_reasons={}",
-                active_permissions.join(","),
-                manifest_permissions.join(","),
-                granted_hazards.join(","),
-                runtime_state
-                    .state
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "<absent>".to_owned()),
-                runtime_state
-                    .active_bit
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "<absent>".to_owned()),
-                format_disable_reasons(&runtime_state.disable_reasons)
-            ));
-        }
-    }
-    rows.sort();
-    rows.dedup();
-    rows
+    chrome_profile_scan().scan.self_profile_surfaces
 }
 
 fn synapse_chrome_self_active_popup_risks(rows: &[String]) -> Vec<String> {
@@ -465,6 +376,179 @@ struct SynapseChromeProfileInstallState {
     active_profile_service_worker_error: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct ChromeProfileScan {
+    install_state: SynapseChromeProfileInstallState,
+    self_profile_surfaces: Vec<String>,
+    external_profile_surfaces: Vec<String>,
+}
+
+impl ChromeProfileScan {
+    fn not_scanned(reason: &str) -> Self {
+        Self {
+            install_state: SynapseChromeProfileInstallState::not_scanned(reason),
+            self_profile_surfaces: Vec::new(),
+            external_profile_surfaces: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ChromeProfileScanCacheEntry {
+    captured_at: Instant,
+    captured_unix_ms: u64,
+    epoch: u64,
+    scan: ChromeProfileScan,
+}
+
+#[derive(Clone, Debug)]
+struct ChromeProfileScanRead {
+    scan: ChromeProfileScan,
+    cache_status: &'static str,
+    cache_age_ms: u64,
+    cache_epoch: u64,
+    cache_captured_unix_ms: u64,
+}
+
+impl ChromeProfileScanRead {
+    fn install_state(&self) -> SynapseChromeProfileInstallState {
+        let mut state = self.scan.install_state.clone();
+        state.detail = format!(
+            "{} profile_scan_cache_status={} profile_scan_cache_age_ms={} profile_scan_cache_ttl_ms={} profile_scan_cache_epoch={} profile_scan_cache_captured_unix_ms={}",
+            state.detail,
+            self.cache_status,
+            self.cache_age_ms,
+            duration_millis_u64(CHROME_PROFILE_SCAN_CACHE_TTL),
+            self.cache_epoch,
+            self.cache_captured_unix_ms,
+        );
+        state
+    }
+}
+
+fn chrome_profile_scan_cache() -> &'static StdRwLock<Option<ChromeProfileScanCacheEntry>> {
+    static CACHE: OnceLock<StdRwLock<Option<ChromeProfileScanCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| StdRwLock::new(None))
+}
+
+fn chrome_profile_scan_cache_epoch() -> &'static AtomicU64 {
+    static EPOCH: AtomicU64 = AtomicU64::new(0);
+    &EPOCH
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn chrome_profile_scan() -> ChromeProfileScanRead {
+    let now = Instant::now();
+    let cache = chrome_profile_scan_cache();
+    match cache.read() {
+        Ok(guard) => {
+            if let Some(entry) = guard.as_ref() {
+                let age = now.saturating_duration_since(entry.captured_at);
+                if age <= CHROME_PROFILE_SCAN_CACHE_TTL {
+                    return ChromeProfileScanRead {
+                        scan: entry.scan.clone(),
+                        cache_status: "hit",
+                        cache_age_ms: duration_millis_u64(age),
+                        cache_epoch: entry.epoch,
+                        cache_captured_unix_ms: entry.captured_unix_ms,
+                    };
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                code = "CHROME_PROFILE_SCAN_CACHE_READ_POISONED",
+                detail = %error,
+                "Chrome profile scan cache read lock poisoned; bypassing cache"
+            );
+            return ChromeProfileScanRead {
+                scan: scan_chrome_profiles_uncached(),
+                cache_status: "lock_poisoned",
+                cache_age_ms: 0,
+                cache_epoch: chrome_profile_scan_cache_epoch().load(Ordering::Relaxed),
+                cache_captured_unix_ms: now_unix_ms(),
+            };
+        }
+    }
+
+    match cache.write() {
+        Ok(mut guard) => {
+            let now = Instant::now();
+            if let Some(entry) = guard.as_ref() {
+                let age = now.saturating_duration_since(entry.captured_at);
+                if age <= CHROME_PROFILE_SCAN_CACHE_TTL {
+                    return ChromeProfileScanRead {
+                        scan: entry.scan.clone(),
+                        cache_status: "hit_after_wait",
+                        cache_age_ms: duration_millis_u64(age),
+                        cache_epoch: entry.epoch,
+                        cache_captured_unix_ms: entry.captured_unix_ms,
+                    };
+                }
+            }
+            let scan = scan_chrome_profiles_uncached();
+            let captured_unix_ms = now_unix_ms();
+            let epoch = chrome_profile_scan_cache_epoch().load(Ordering::Relaxed);
+            *guard = Some(ChromeProfileScanCacheEntry {
+                captured_at: now,
+                captured_unix_ms,
+                epoch,
+                scan: scan.clone(),
+            });
+            ChromeProfileScanRead {
+                scan,
+                cache_status: "miss",
+                cache_age_ms: 0,
+                cache_epoch: epoch,
+                cache_captured_unix_ms: captured_unix_ms,
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                code = "CHROME_PROFILE_SCAN_CACHE_WRITE_POISONED",
+                detail = %error,
+                "Chrome profile scan cache write lock poisoned; bypassing cache"
+            );
+            ChromeProfileScanRead {
+                scan: scan_chrome_profiles_uncached(),
+                cache_status: "lock_poisoned",
+                cache_age_ms: 0,
+                cache_epoch: chrome_profile_scan_cache_epoch().load(Ordering::Relaxed),
+                cache_captured_unix_ms: now_unix_ms(),
+            }
+        }
+    }
+}
+
+fn invalidate_chrome_profile_scan_cache(reason: &str) {
+    let epoch = chrome_profile_scan_cache_epoch().fetch_add(1, Ordering::Relaxed) + 1;
+    match chrome_profile_scan_cache().write() {
+        Ok(mut guard) => {
+            let had_entry = guard.is_some();
+            *guard = None;
+            tracing::info!(
+                code = "CHROME_PROFILE_SCAN_CACHE_INVALIDATED",
+                reason,
+                had_entry,
+                epoch,
+                "Chrome profile scan cache invalidated"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                code = "CHROME_PROFILE_SCAN_CACHE_INVALIDATE_POISONED",
+                reason,
+                detail = %error,
+                epoch,
+                "Chrome profile scan cache invalidation failed because lock is poisoned"
+            );
+        }
+    }
+}
+
 impl SynapseChromeProfileInstallState {
     fn not_scanned(reason: &str) -> Self {
         Self {
@@ -491,8 +575,12 @@ impl SynapseChromeProfileInstallState {
 }
 
 fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
+    chrome_profile_scan().install_state()
+}
+
+fn scan_chrome_profiles_uncached() -> ChromeProfileScan {
     let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") else {
-        return SynapseChromeProfileInstallState::not_scanned("localappdata_missing");
+        return ChromeProfileScan::not_scanned("localappdata_missing");
     };
     let user_data_root = PathBuf::from(local_appdata)
         .join("Google")
@@ -500,23 +588,37 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
         .join("User Data");
     let active_profile_candidates = chrome_active_profile_candidates(&user_data_root);
     let Ok(profile_dirs) = std::fs::read_dir(&user_data_root) else {
-        return SynapseChromeProfileInstallState {
-            detail: format!(
-                "synapse_chrome_bridge_profile_installation scanned=false installed=unknown user_data_root={} reason=user_data_root_unreadable",
-                quote_detail_value(&user_data_root.to_string_lossy())
-            ),
-            active_profile_extension_path: None,
-            active_profile_service_worker_sha256: None,
-            active_profile_service_worker_error: Some("user_data_root_unreadable".to_owned()),
+        return ChromeProfileScan {
+            install_state: SynapseChromeProfileInstallState {
+                detail: format!(
+                    "synapse_chrome_bridge_profile_installation scanned=false installed=unknown user_data_root={} reason=user_data_root_unreadable",
+                    quote_detail_value(&user_data_root.to_string_lossy())
+                ),
+                active_profile_extension_path: None,
+                active_profile_service_worker_sha256: None,
+                active_profile_service_worker_error: Some("user_data_root_unreadable".to_owned()),
+            },
+            self_profile_surfaces: Vec::new(),
+            external_profile_surfaces: Vec::new(),
         };
     };
 
     let mut profile_count = 0_usize;
     let mut parse_error_count = 0_usize;
+    let mut profile_dir_error_count = 0_usize;
+    let mut profile_file_type_error_count = 0_usize;
+    let mut preference_read_error_count = 0_usize;
     let mut installed_profiles = BTreeSet::new();
     let mut installed_profile_paths: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for profile_dir in profile_dirs.flatten() {
+    let mut self_profile_surfaces = Vec::new();
+    let mut external_profile_surfaces = Vec::new();
+    for profile_dir in profile_dirs {
+        let Ok(profile_dir) = profile_dir else {
+            profile_dir_error_count += 1;
+            continue;
+        };
         let Ok(file_type) = profile_dir.file_type() else {
+            profile_file_type_error_count += 1;
             continue;
         };
         if !file_type.is_dir() || profile_dir.file_name() == "Snapshots" {
@@ -532,12 +634,20 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
         }
         profile_count += 1;
         let mut profile_installed = false;
-        for (_pref_file, pref_path) in profile_pref_paths {
+        let mut runtime_by_id: HashMap<String, ChromeExtensionRuntimeState> = HashMap::new();
+        for (pref_file, pref_path) in profile_pref_paths {
             let Ok(raw) = std::fs::read_to_string(&pref_path) else {
+                preference_read_error_count += 1;
                 continue;
             };
             let Ok(pref) = serde_json::from_str::<Value>(&raw) else {
                 parse_error_count += 1;
+                self_profile_surfaces.push(format!(
+                    "profile={profile} pref={pref_file} parse_error=true"
+                ));
+                external_profile_surfaces.push(format!(
+                    "profile={profile} pref={pref_file} parse_error=true"
+                ));
                 continue;
             };
             if let Some(setting) = pref
@@ -546,6 +656,53 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
                 .and_then(|settings| settings.get(EXTENSION_ID))
             {
                 profile_installed = true;
+                let mut runtime_state = chrome_extension_runtime_state(setting);
+                if pref_file == "Preferences" {
+                    runtime_by_id.insert(EXTENSION_ID.to_owned(), runtime_state.clone());
+                } else if let Some(preferences_runtime_state) = runtime_by_id.get(EXTENSION_ID) {
+                    runtime_state = preferences_runtime_state.clone();
+                }
+                let active_permissions = active_api_permissions(setting);
+                let manifest_permissions = manifest_api_permissions(setting);
+                let granted_permissions = granted_api_permissions(setting);
+                let active_or_manifest_hazards = synapse_self_hazard_api_permissions(
+                    active_permissions
+                        .iter()
+                        .chain(manifest_permissions.iter())
+                        .map(String::as_str),
+                );
+                let granted_hazards = synapse_self_hazard_api_permissions(
+                    granted_permissions.iter().map(String::as_str),
+                );
+                if !active_or_manifest_hazards.is_empty() || !granted_hazards.is_empty() {
+                    let disabled =
+                        !runtime_state.disable_reasons.is_empty() || runtime_state.state == Some(0);
+                    let active_hazard_enabled = !disabled && !active_or_manifest_hazards.is_empty();
+                    let granted_only =
+                        active_or_manifest_hazards.is_empty() && !granted_hazards.is_empty();
+                    if active_hazard_enabled || granted_only {
+                        let risk_basis = if active_hazard_enabled {
+                            "active_or_manifest_hazard_without_disable_reason"
+                        } else {
+                            "granted_only_stale"
+                        };
+                        self_profile_surfaces.push(format!(
+                            "profile={profile} pref={pref_file} extension_id={EXTENSION_ID} name=\"Synapse Chrome Bridge\" active_api={} manifest_api={} granted_hazard_api={} synapse_self_popup_risk=true risk_basis={risk_basis} state={} active_bit={} disable_reasons={}",
+                            active_permissions.join(","),
+                            manifest_permissions.join(","),
+                            granted_hazards.join(","),
+                            runtime_state
+                                .state
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "<absent>".to_owned()),
+                            runtime_state
+                                .active_bit
+                                .map(|value| value.to_string())
+                                .unwrap_or_else(|| "<absent>".to_owned()),
+                            format_disable_reasons(&runtime_state.disable_reasons)
+                        ));
+                    }
+                }
                 if let Some(extension_path) = setting
                     .get("path")
                     .and_then(Value::as_str)
@@ -557,11 +714,81 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
                         .insert(extension_path.to_owned());
                 }
             }
+            let Some(settings) = pref
+                .get("extensions")
+                .and_then(|value| value.get("settings"))
+                .and_then(Value::as_object)
+            else {
+                continue;
+            };
+            for (extension_id, setting) in settings {
+                if extension_id == EXTENSION_ID {
+                    continue;
+                }
+                let mut runtime_state = chrome_extension_runtime_state(setting);
+                if pref_file == "Preferences" {
+                    runtime_by_id.insert(extension_id.clone(), runtime_state.clone());
+                } else if let Some(preferences_runtime_state) = runtime_by_id.get(extension_id) {
+                    runtime_state = preferences_runtime_state.clone();
+                }
+                let active_permissions = active_api_permissions(setting);
+                let manifest_permissions = manifest_api_permissions(setting);
+                let granted_permissions = granted_api_permissions(setting);
+                let active_or_manifest_hazards = hazard_api_permissions(
+                    active_permissions
+                        .iter()
+                        .chain(manifest_permissions.iter())
+                        .map(String::as_str),
+                );
+                let granted_hazards =
+                    hazard_api_permissions(granted_permissions.iter().map(String::as_str));
+                if active_or_manifest_hazards.is_empty() && granted_hazards.is_empty() {
+                    continue;
+                }
+                if !external_popup_risk_enabled(
+                    &runtime_state,
+                    !active_or_manifest_hazards.is_empty(),
+                    !granted_hazards.is_empty(),
+                ) {
+                    continue;
+                }
+                let risk_basis = if active_or_manifest_hazards.is_empty() {
+                    "state_enabled_granted_hazard"
+                } else if runtime_state.state == Some(1) {
+                    "state_enabled_active_or_manifest_hazard"
+                } else {
+                    "active_or_manifest_hazard_without_disable_reason"
+                };
+                let name = setting
+                    .get("manifest")
+                    .and_then(|manifest| manifest.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unnamed>");
+                external_profile_surfaces.push(format!(
+                    "profile={profile} pref={pref_file} extension_id={extension_id} name={name:?} active_api={} manifest_api={} granted_hazard_api={} popup_risk=true risk_basis={risk_basis} state={} active_bit={} disable_reasons={}",
+                    active_permissions.join(","),
+                    manifest_permissions.join(","),
+                    granted_hazards.join(","),
+                    runtime_state
+                        .state
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "<absent>".to_owned()),
+                    runtime_state
+                        .active_bit
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "<absent>".to_owned()),
+                    format_disable_reasons(&runtime_state.disable_reasons)
+                ));
+            }
         }
         if profile_installed {
             installed_profiles.insert(profile);
         }
     }
+    self_profile_surfaces.sort();
+    self_profile_surfaces.dedup();
+    external_profile_surfaces.sort();
+    external_profile_surfaces.dedup();
 
     let installed_profile_count = installed_profiles.len();
     let installed = installed_profile_count > 0;
@@ -633,25 +860,32 @@ fn synapse_chrome_profile_install_state() -> SynapseChromeProfileInstallState {
         .as_deref()
         .unwrap_or("none");
 
-    SynapseChromeProfileInstallState {
-        detail: format!(
-            "synapse_chrome_bridge_profile_installation scanned=true installed={} user_data_root={} profile_count={} installed_profile_count={} installed_profiles={} active_profile={} active_profile_installed={} active_profile_extension_path={} active_profile_service_worker_sha256={} active_profile_service_worker_error={} parse_error_count={} reason={} cdp_bridge_reload_can_install_absent_extension=false remediation=run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> and auto-loads that stable unpacked directory in the active profile. browser_debugger.reload_bridge can only reload an already-registered bridge host and cannot install an absent Chrome extension",
-            installed,
-            quote_detail_value(&user_data_root.to_string_lossy()),
-            profile_count,
-            installed_profile_count,
-            installed_profile_detail,
-            active_profile_detail,
-            active_profile_installed_detail,
-            active_profile_extension_path_detail,
-            active_profile_service_worker_sha256_detail,
-            active_profile_service_worker_error_detail,
-            parse_error_count,
-            reason
-        ),
-        active_profile_extension_path,
-        active_profile_service_worker_sha256,
-        active_profile_service_worker_error,
+    ChromeProfileScan {
+        install_state: SynapseChromeProfileInstallState {
+            detail: format!(
+                "synapse_chrome_bridge_profile_installation scanned=true installed={} user_data_root={} profile_count={} installed_profile_count={} installed_profiles={} active_profile={} active_profile_installed={} active_profile_extension_path={} active_profile_service_worker_sha256={} active_profile_service_worker_error={} profile_dir_error_count={} profile_file_type_error_count={} preference_read_error_count={} parse_error_count={} reason={} cdp_bridge_reload_can_install_absent_extension=false remediation=run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> and auto-loads that stable unpacked directory in the active profile. browser_debugger.reload_bridge can only reload an already-registered bridge host and cannot install an absent Chrome extension",
+                installed,
+                quote_detail_value(&user_data_root.to_string_lossy()),
+                profile_count,
+                installed_profile_count,
+                installed_profile_detail,
+                active_profile_detail,
+                active_profile_installed_detail,
+                active_profile_extension_path_detail,
+                active_profile_service_worker_sha256_detail,
+                active_profile_service_worker_error_detail,
+                profile_dir_error_count,
+                profile_file_type_error_count,
+                preference_read_error_count,
+                parse_error_count,
+                reason
+            ),
+            active_profile_extension_path,
+            active_profile_service_worker_sha256,
+            active_profile_service_worker_error,
+        },
+        self_profile_surfaces,
+        external_profile_surfaces,
     }
 }
 
@@ -1214,110 +1448,6 @@ fn compact_popup_risk_entries(value: Option<&Value>) -> String {
     } else {
         format!("{shown}|+{extra} more")
     }
-}
-
-fn external_chrome_profile_surfaces() -> Vec<String> {
-    let Some(local_appdata) = std::env::var_os("LOCALAPPDATA") else {
-        return Vec::new();
-    };
-    let user_data_root = PathBuf::from(local_appdata)
-        .join("Google")
-        .join("Chrome")
-        .join("User Data");
-    let Ok(profile_dirs) = std::fs::read_dir(user_data_root) else {
-        return Vec::new();
-    };
-
-    let mut rows = Vec::new();
-    for profile_dir in profile_dirs.flatten() {
-        let Ok(file_type) = profile_dir.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() || profile_dir.file_name() == "Snapshots" {
-            continue;
-        }
-        let profile = profile_dir.file_name().to_string_lossy().into_owned();
-        let mut runtime_by_id: HashMap<String, ChromeExtensionRuntimeState> = HashMap::new();
-        for pref_file in ["Preferences", "Secure Preferences"] {
-            let pref_path = profile_dir.path().join(pref_file);
-            let Ok(raw) = std::fs::read_to_string(&pref_path) else {
-                continue;
-            };
-            let Ok(pref) = serde_json::from_str::<Value>(&raw) else {
-                rows.push(format!(
-                    "profile={profile} pref={pref_file} parse_error=true"
-                ));
-                continue;
-            };
-            let Some(settings) = pref
-                .get("extensions")
-                .and_then(|value| value.get("settings"))
-                .and_then(Value::as_object)
-            else {
-                continue;
-            };
-            for (extension_id, setting) in settings {
-                if extension_id == EXTENSION_ID {
-                    continue;
-                }
-                let mut runtime_state = chrome_extension_runtime_state(setting);
-                if pref_file == "Preferences" {
-                    runtime_by_id.insert(extension_id.clone(), runtime_state.clone());
-                } else if let Some(preferences_runtime_state) = runtime_by_id.get(extension_id) {
-                    runtime_state = preferences_runtime_state.clone();
-                }
-                let active_permissions = active_api_permissions(setting);
-                let manifest_permissions = manifest_api_permissions(setting);
-                let granted_permissions = granted_api_permissions(setting);
-                let active_or_manifest_hazards = hazard_api_permissions(
-                    active_permissions
-                        .iter()
-                        .chain(manifest_permissions.iter())
-                        .map(String::as_str),
-                );
-                let granted_hazards =
-                    hazard_api_permissions(granted_permissions.iter().map(String::as_str));
-                if active_or_manifest_hazards.is_empty() && granted_hazards.is_empty() {
-                    continue;
-                }
-                if !external_popup_risk_enabled(
-                    &runtime_state,
-                    !active_or_manifest_hazards.is_empty(),
-                    !granted_hazards.is_empty(),
-                ) {
-                    continue;
-                }
-                let risk_basis = if active_or_manifest_hazards.is_empty() {
-                    "state_enabled_granted_hazard"
-                } else if runtime_state.state == Some(1) {
-                    "state_enabled_active_or_manifest_hazard"
-                } else {
-                    "active_or_manifest_hazard_without_disable_reason"
-                };
-                let name = setting
-                    .get("manifest")
-                    .and_then(|manifest| manifest.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("<unnamed>");
-                rows.push(format!(
-                    "profile={profile} pref={pref_file} extension_id={extension_id} name={name:?} active_api={} manifest_api={} granted_hazard_api={} popup_risk=true risk_basis={risk_basis} state={} active_bit={} disable_reasons={}",
-                    active_permissions.join(","),
-                    manifest_permissions.join(","),
-                    granted_hazards.join(","),
-                    runtime_state
-                        .state
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "<absent>".to_owned()),
-                    runtime_state
-                        .active_bit
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "<absent>".to_owned()),
-                    format_disable_reasons(&runtime_state.disable_reasons)
-                ));
-            }
-        }
-    }
-    rows
 }
 
 fn active_api_permissions(setting: &Value) -> Vec<String> {
@@ -5165,6 +5295,7 @@ impl ChromeDebuggerBridge {
         wait_timeout_ms: u64,
     ) -> Result<ChromeBridgeReloadResult, ChromeDebuggerBridgeError> {
         let wait_timeout = Duration::from_millis(wait_timeout_ms);
+        invalidate_chrome_profile_scan_cache("reload_self_before_snapshot");
         let before = self.active_host_snapshot()?;
         let mut params = json!({
             "expectedExtensionId": EXTENSION_ID,
@@ -5183,6 +5314,7 @@ impl ChromeDebuggerBridge {
                     ))
                 })
             })?;
+        invalidate_chrome_profile_scan_cache("reload_self_after_ack");
         let started = Instant::now();
         loop {
             if started.elapsed() >= wait_timeout {
@@ -5586,10 +5718,14 @@ fn bridge() -> &'static ChromeDebuggerBridge {
 }
 
 pub(crate) fn health_subsystem() -> SubsystemHealth {
-    let popup_risks = external_chrome_popup_risks();
-    let self_profile_risks = synapse_chrome_self_profile_surfaces();
+    let profile_scan = chrome_profile_scan();
+    let mut popup_risks = profile_scan.scan.external_profile_surfaces.clone();
+    popup_risks.extend(external_chrome_native_messaging_processes());
+    popup_risks.sort();
+    popup_risks.dedup();
+    let self_profile_risks = profile_scan.scan.self_profile_surfaces.clone();
     let layout_infobar_risks = external_chrome_layout_infobar_processes();
-    let profile_install_state = synapse_chrome_profile_install_state();
+    let profile_install_state = profile_scan.install_state();
     let snapshot = match bridge().inner.lock() {
         Ok(inner) => {
             let active_host = inner
