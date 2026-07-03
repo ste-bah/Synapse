@@ -29,7 +29,7 @@ use crate::m2::{
     default_auto_wait_timeout_ms, default_verify_timeout_ms,
 };
 use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
-use rmcp::schemars::JsonSchema;
+use rmcp::schemars::{JsonSchema, schema_for};
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
@@ -38,6 +38,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use synapse_core::{AccessibleNode, ElementId, Point, Rect, UiaPattern, error_codes};
@@ -384,6 +385,143 @@ struct TargetActCoordinate {
     space: TargetActCoordinateSpace,
 }
 
+fn target_act_params_schema_defs() -> Map<String, Value> {
+    let schema = serde_json::to_value(schema_for!(TargetActParams))
+        .unwrap_or_else(|error| panic!("target_act params schema should serialize: {error}"));
+    let mut schema = match schema {
+        Value::Object(object) => object,
+        _ => panic!("target_act params schema should be an object"),
+    };
+    schema.remove("$schema");
+    let mut defs = match schema.remove("$defs") {
+        Some(Value::Object(defs)) => defs,
+        Some(other) => panic!("target_act params $defs should be an object, got {other}"),
+        None => Map::new(),
+    };
+    defs.insert("TargetActParams".to_owned(), Value::Object(schema));
+    defs
+}
+
+fn act_input_schema() -> Arc<Map<String, Value>> {
+    let target_act_defs = target_act_params_schema_defs();
+    let min_ttl_ms = synapse_action::MIN_LEASE_TTL_MS;
+    let max_ttl_ms = synapse_action::MAX_LEASE_TTL_MS;
+    let default_ttl_ms = synapse_action::DEFAULT_LEASE_TTL_MS;
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "$defs": target_act_defs,
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["invoke", "foreground", "lease_acquire", "lease_status", "lease_release"],
+                "default": "invoke",
+                "description": "Act facade operation. Omit only for the default invoke operation."
+            },
+            "action": {
+                "anyOf": [
+                    { "$ref": "#/$defs/TargetActParams" },
+                    { "type": "null" }
+                ],
+                "description": "Target action payload. Accepted by operation=invoke and operation=foreground only."
+            },
+            "reason": {
+                "type": ["string", "null"],
+                "minLength": 1,
+                "description": "Foreground escalation reason. Required by operation=foreground; rejected by invoke and lease operations."
+            },
+            "ttl_ms": {
+                "type": ["integer", "null"],
+                "minimum": min_ttl_ms,
+                "maximum": max_ttl_ms,
+                "default": default_ttl_ms,
+                "description": "Foreground input lease lifetime in milliseconds. Accepted by operation=foreground and operation=lease_acquire."
+            }
+        },
+        "oneOf": [
+            {
+                "title": "act operation=invoke",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["action"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "invoke",
+                        "default": "invoke",
+                        "description": "Default target-scoped action operation."
+                    },
+                    "action": { "$ref": "#/$defs/TargetActParams" }
+                }
+            },
+            {
+                "title": "act operation=foreground",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation", "action", "reason"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "foreground",
+                        "description": "Run one action through the audited foreground escalation path."
+                    },
+                    "action": { "$ref": "#/$defs/TargetActParams" },
+                    "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Required non-empty foreground escalation reason."
+                    },
+                    "ttl_ms": { "$ref": "#/properties/ttl_ms" }
+                }
+            },
+            {
+                "title": "act operation=lease_acquire",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "lease_acquire",
+                        "description": "Acquire the foreground input lease for this MCP session."
+                    },
+                    "ttl_ms": { "$ref": "#/properties/ttl_ms" }
+                }
+            },
+            {
+                "title": "act operation=lease_status",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "lease_status",
+                        "description": "Read the foreground input lease status."
+                    }
+                }
+            },
+            {
+                "title": "act operation=lease_release",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "lease_release",
+                        "description": "Release this session's foreground input lease."
+                    }
+                }
+            }
+        ]
+    });
+    match schema {
+        Value::Object(object) => Arc::new(object),
+        _ => Arc::new(Map::new()),
+    }
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetActResponse {
@@ -435,7 +573,8 @@ pub struct ActForegroundResponse {
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. operation=lease_acquire/status/release exposes the foreground input lease as a facade route without adding raw control_lease_* tools to the public surface. Raw foreground primitives remain profile-gated; this facade only delegates to capability-preserving routes and returns the action/lease readback source of truth."
+        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. operation=lease_acquire/status/release exposes the foreground input lease as a facade route without adding raw control_lease_* tools to the public surface. Raw foreground primitives remain profile-gated; this facade only delegates to capability-preserving routes and returns the action/lease readback source of truth.",
+        input_schema = act_input_schema()
     )]
     pub async fn act(
         &self,
@@ -7133,6 +7272,7 @@ fn target_act_error_code(error: &ErrorData) -> Option<&str> {
 mod tests {
     use super::*;
     use rmcp::schemars::schema_for;
+    use std::collections::BTreeSet;
 
     fn read_action() -> TargetActParams {
         serde_json::from_value(json!({ "verb": "read" }))
@@ -7154,6 +7294,35 @@ mod tests {
             .as_ref()
             .and_then(|data| data.get(field))
             .and_then(Value::as_u64)
+    }
+
+    fn sanitized_tool_input_schema(tool_name: &str) -> Value {
+        let tools = crate::server::schema_sanitize::sanitize_tools(
+            crate::server::SynapseService::tool_router().list_all(),
+        );
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name.as_ref() == tool_name)
+            .unwrap_or_else(|| panic!("{tool_name} tool missing"));
+        Value::Object((*tool.input_schema).clone())
+    }
+
+    fn act_schema_variant<'a>(schema: &'a Value, operation: &str) -> &'a Value {
+        schema["oneOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("act schema oneOf missing"))
+            .iter()
+            .find(|variant| variant["properties"]["operation"]["const"] == operation)
+            .unwrap_or_else(|| panic!("act schema operation={operation} variant missing"))
+    }
+
+    fn schema_property_names(schema: &Value) -> BTreeSet<String> {
+        schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("schema properties missing"))
+            .keys()
+            .cloned()
+            .collect()
     }
 
     #[test]
@@ -7286,23 +7455,18 @@ mod tests {
 
     #[test]
     fn act_facade_operation_schema_is_closed_enum() {
-        let schema = serde_json::to_value(schema_for!(ActParams))
-            .unwrap_or_else(|error| panic!("act params schema should serialize: {error}"));
+        let schema = sanitized_tool_input_schema("act");
         let operation_schema = schema
             .pointer("/properties/operation")
             .unwrap_or_else(|| panic!("act schema must include operation: {schema}"));
-        assert_eq!(
-            operation_schema.pointer("/$ref").and_then(Value::as_str),
-            Some("#/$defs/ActOperation")
-        );
-        let enum_schema = schema
-            .pointer("/$defs/ActOperation/enum")
+        let enum_schema = operation_schema
+            .pointer("/enum")
             .and_then(Value::as_array)
-            .unwrap_or_else(|| panic!("ActOperation enum schema missing: {schema}"));
+            .unwrap_or_else(|| panic!("ActOperation enum schema missing: {operation_schema}"));
         let enum_values = enum_schema
             .iter()
             .filter_map(Value::as_str)
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
         assert!(
             enum_values.contains("invoke")
                 && enum_values.contains("foreground")
@@ -7310,6 +7474,73 @@ mod tests {
                 && enum_values.contains("lease_status")
                 && enum_values.contains("lease_release"),
             "act operation schema must enumerate invoke/foreground/lease operations: {operation_schema}"
+        );
+    }
+
+    #[test]
+    fn act_facade_public_schema_is_operation_specific() {
+        let schema = sanitized_tool_input_schema("act");
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], Value::Bool(false));
+        assert_eq!(
+            schema["properties"]["ttl_ms"]["minimum"],
+            synapse_action::MIN_LEASE_TTL_MS
+        );
+        assert_eq!(
+            schema["properties"]["ttl_ms"]["maximum"],
+            synapse_action::MAX_LEASE_TTL_MS
+        );
+
+        let variants = schema["oneOf"]
+            .as_array()
+            .expect("act schema oneOf present");
+        assert_eq!(variants.len(), 5);
+        for variant in variants {
+            assert_eq!(variant["type"], "object");
+            assert_eq!(variant["additionalProperties"], Value::Bool(false));
+        }
+
+        let invoke_fields = schema_property_names(act_schema_variant(&schema, "invoke"));
+        assert_eq!(
+            invoke_fields,
+            BTreeSet::from(["action".to_owned(), "operation".to_owned()])
+        );
+
+        let foreground = act_schema_variant(&schema, "foreground");
+        let foreground_fields = schema_property_names(foreground);
+        assert_eq!(
+            foreground_fields,
+            BTreeSet::from([
+                "action".to_owned(),
+                "operation".to_owned(),
+                "reason".to_owned(),
+                "ttl_ms".to_owned()
+            ])
+        );
+        assert_eq!(foreground["properties"]["reason"]["type"], "string");
+        assert_eq!(foreground["properties"]["reason"]["minLength"], 1);
+
+        let lease_acquire_fields =
+            schema_property_names(act_schema_variant(&schema, "lease_acquire"));
+        assert_eq!(
+            lease_acquire_fields,
+            BTreeSet::from(["operation".to_owned(), "ttl_ms".to_owned()])
+        );
+        assert!(!lease_acquire_fields.contains("action"));
+        assert!(!lease_acquire_fields.contains("reason"));
+
+        let lease_status_fields =
+            schema_property_names(act_schema_variant(&schema, "lease_status"));
+        assert_eq!(
+            lease_status_fields,
+            BTreeSet::from(["operation".to_owned()])
+        );
+
+        let lease_release_fields =
+            schema_property_names(act_schema_variant(&schema, "lease_release"));
+        assert_eq!(
+            lease_release_fields,
+            BTreeSet::from(["operation".to_owned()])
         );
     }
 
