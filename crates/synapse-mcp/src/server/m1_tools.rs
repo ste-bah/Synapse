@@ -38,8 +38,8 @@ use super::{
     set_target_input_schema, tool, tool_router,
 };
 use crate::m1::{
-    BrowserTabsMutation, BrowserTabsOperation, ClipboardTimelineSample, FsTimelineEvent,
-    effective_ocr_backend, hidden_desktop_input_from_worker_snapshot,
+    BrowserTabsMutation, BrowserTabsOperation, CaptureRetryEvidence, ClipboardTimelineSample,
+    FsTimelineEvent, effective_ocr_backend, hidden_desktop_input_from_worker_snapshot,
 };
 use crate::m3::activity_recorder::BrowserNavigationEvent;
 use crate::server::session_continuity::PersistedCdpTargetOwner;
@@ -1528,6 +1528,7 @@ impl SynapseService {
             captured.capture_backend,
             bitmap_sha256,
             Some(captured.context),
+            None,
         )
     }
 
@@ -1637,6 +1638,7 @@ impl SynapseService {
                 "chrome_debugger_page_capture_screenshot_bgra",
                 bitmap_sha256,
                 None,
+                None,
             );
         }
         let page_bitmap =
@@ -1669,6 +1671,7 @@ impl SynapseService {
             "raw_cdp_page_capture_screenshot_bgra",
             bitmap_sha256,
             target_context,
+            None,
         )
     }
 
@@ -1837,6 +1840,7 @@ impl SynapseService {
             bitmap_sha256,
             None,
             params.quality,
+            None,
         )?;
         let page_region = browser_screenshot_page_region(captured.clip_css)?;
         Ok(BrowserScreenshotResponse {
@@ -14351,6 +14355,7 @@ fn capture_screen_screenshot_to_file(
         "gdi_screen_region_bgra",
         bitmap_sha256,
         foreground,
+        None,
     )
 }
 
@@ -14370,14 +14375,30 @@ fn capture_target_window_screenshot_to_file(
         WINDOW_SCREENSHOT_TIMEOUT_MS,
     )
     .map_err(|error| {
+        let target_detail = foreground
+            .as_ref()
+            .map(|context| {
+                format!(
+                    "pid={} process={} title={:?}",
+                    context.pid, context.process_name, context.window_title
+                )
+            })
+            .unwrap_or_else(|| "pid/title/process unavailable".to_owned());
         mcp_error(
             error.code(),
             format!(
-                "capture_screenshot failed for target window {window_hwnd:#x} region {region:?}: {error}"
+                "capture_screenshot failed for target window {window_hwnd:#x} ({target_detail}) region {region:?}: {error}; recommended_next_action=retry capture_screenshot after confirming the target HWND/PID/title is still live and visually stable"
             ),
         )
     })?;
     let capture_backend = captured.capture_backend;
+    let capture_retry_evidence =
+        (captured.capture_retry_count > 0).then_some(CaptureRetryEvidence {
+            attempts: captured.capture_attempts,
+            retry_count: captured.capture_retry_count,
+            elapsed_ms: captured.capture_elapsed_ms,
+            retry_backoff_ms: captured.capture_retry_backoff_ms,
+        });
     let captured = captured.bitmap;
     let bitmap_sha256 = sha256_hex(&captured.bytes);
     write_screenshot_bitmap(
@@ -14388,6 +14409,7 @@ fn capture_target_window_screenshot_to_file(
         capture_backend,
         bitmap_sha256,
         foreground,
+        capture_retry_evidence,
     )
 }
 
@@ -14695,6 +14717,7 @@ async fn browser_screenshot_passive_window_fallback(
         bitmap_sha256,
         None,
         params.quality,
+        None,
     )?;
     tracing::warn!(
         code = "BROWSER_SCREENSHOT_PASSIVE_WINDOW_FALLBACK",
@@ -15523,6 +15546,7 @@ fn write_screenshot_bitmap(
     capture_backend: &str,
     bitmap_sha256: String,
     foreground: Option<ForegroundContext>,
+    capture_retry_evidence: Option<CaptureRetryEvidence>,
 ) -> Result<CaptureScreenshotResponse, ErrorData> {
     write_screenshot_bitmap_with_quality(
         params,
@@ -15533,6 +15557,7 @@ fn write_screenshot_bitmap(
         bitmap_sha256,
         foreground,
         None,
+        capture_retry_evidence,
     )
 }
 
@@ -15545,6 +15570,7 @@ fn write_screenshot_bitmap_with_quality(
     _bitmap_sha256: String,
     foreground: Option<ForegroundContext>,
     jpeg_quality: Option<u8>,
+    capture_retry_evidence: Option<CaptureRetryEvidence>,
 ) -> Result<CaptureScreenshotResponse, ErrorData> {
     let temp_path = screenshot_temp_path(&output_path);
     if temp_path.try_exists().map_err(|error| {
@@ -15623,6 +15649,7 @@ fn write_screenshot_bitmap_with_quality(
         bytes_written: metadata.len(),
         bitmap_sha256,
         foreground,
+        capture_retry_evidence,
     })
 }
 

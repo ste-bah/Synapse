@@ -1,4 +1,10 @@
-use std::{cell::RefCell, ffi::c_void, mem::size_of, slice, time::Duration};
+use std::{
+    cell::RefCell,
+    ffi::c_void,
+    mem::size_of,
+    slice, thread,
+    time::{Duration, Instant},
+};
 
 use synapse_core::Rect;
 use windows::{
@@ -37,6 +43,9 @@ use super::common::{capture_unsupported, hwnd_from_i64};
 thread_local! {
     static SCREEN_CAPTURE_SCRATCH: RefCell<Option<GdiCaptureScratch>> = const { RefCell::new(None) };
 }
+
+const WGC_WINDOW_FRAME_MAX_ATTEMPTS: u32 = 3;
+const WGC_WINDOW_FRAME_RETRY_BACKOFF_MS: u64 = 75;
 
 pub fn captured_frame_region_to_software_bitmap(
     frame: &CapturedFrame,
@@ -89,9 +98,13 @@ pub fn window_region_to_bgra_bitmap(
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
     validate_bitmap_region(region)?;
     match graphics_capture_window_region_to_bgra_bitmap(hwnd, region, timeout_ms) {
-        Ok(bitmap) if !is_all_zero_bgra(&bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
-            bitmap,
+        Ok(capture) if !is_all_zero_bgra(&capture.bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
+            bitmap: capture.bitmap,
             capture_backend: "graphics_capture_window_bgra",
+            capture_attempts: capture.attempts,
+            capture_retry_count: capture.retry_count,
+            capture_elapsed_ms: capture.elapsed_ms,
+            capture_retry_backoff_ms: capture.retry_backoff_ms,
         }),
         Ok(_bitmap) => {
             tracing::error!(
@@ -140,9 +153,13 @@ pub fn window_full_frame_to_bgra_bitmap(
     timeout_ms: u64,
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
     match graphics_capture_window_full_frame_to_bgra_bitmap(hwnd, timeout_ms) {
-        Ok(bitmap) if !is_all_zero_bgra(&bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
-            bitmap,
+        Ok(capture) if !is_all_zero_bgra(&capture.bitmap.bytes) => Ok(CapturedWindowBgraBitmap {
+            bitmap: capture.bitmap,
             capture_backend: "graphics_capture_window_bgra",
+            capture_attempts: capture.attempts,
+            capture_retry_count: capture.retry_count,
+            capture_elapsed_ms: capture.elapsed_ms,
+            capture_retry_backoff_ms: capture.retry_backoff_ms,
         }),
         Ok(_bitmap) => {
             tracing::error!(
@@ -199,6 +216,10 @@ pub fn window_region_to_bgra_bitmap_printwindow(
             bytes,
         },
         capture_backend: "printwindow",
+        capture_attempts: 1,
+        capture_retry_count: 0,
+        capture_elapsed_ms: 0,
+        capture_retry_backoff_ms: 0,
     })
 }
 
@@ -261,13 +282,106 @@ pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, C
     Ok(window_region)
 }
 
+#[derive(Debug)]
+struct WgcWindowFrameCapture {
+    bitmap: CapturedBgraBitmap,
+    attempts: u32,
+    retry_count: u32,
+    elapsed_ms: u64,
+    retry_backoff_ms: u64,
+}
+
+enum WgcWindowFrameAttemptError {
+    Timeout { detail: String },
+    Other(CaptureError),
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn graphics_capture_window_frame<F>(
     hwnd: i64,
     timeout_ms: u64,
     select_region: F,
-) -> Result<CapturedBgraBitmap, CaptureError>
+) -> Result<WgcWindowFrameCapture, CaptureError>
 where
-    F: FnOnce(&CapturedFrame) -> Rect,
+    F: Fn(&CapturedFrame) -> Rect,
+{
+    let started = Instant::now();
+    for attempt in 1..=WGC_WINDOW_FRAME_MAX_ATTEMPTS {
+        match graphics_capture_window_frame_once(hwnd, timeout_ms, &select_region) {
+            Ok(bitmap) => {
+                let retry_count = attempt.saturating_sub(1);
+                if retry_count > 0 {
+                    tracing::info!(
+                        code = "CAPTURE_WGC_WINDOW_FRAME_RETRY_SUCCEEDED",
+                        hwnd,
+                        attempts = attempt,
+                        retry_count,
+                        elapsed_ms = elapsed_ms(started),
+                        "WGC window frame arrived after bounded retry"
+                    );
+                }
+                return Ok(WgcWindowFrameCapture {
+                    bitmap,
+                    attempts: attempt,
+                    retry_count,
+                    elapsed_ms: elapsed_ms(started),
+                    retry_backoff_ms: WGC_WINDOW_FRAME_RETRY_BACKOFF_MS,
+                });
+            }
+            Err(WgcWindowFrameAttemptError::Timeout { detail })
+                if attempt < WGC_WINDOW_FRAME_MAX_ATTEMPTS =>
+            {
+                tracing::warn!(
+                    code = "CAPTURE_WGC_WINDOW_FRAME_TIMEOUT_RETRY",
+                    hwnd,
+                    attempt,
+                    max_attempts = WGC_WINDOW_FRAME_MAX_ATTEMPTS,
+                    timeout_ms,
+                    retry_backoff_ms = WGC_WINDOW_FRAME_RETRY_BACKOFF_MS,
+                    elapsed_ms = elapsed_ms(started),
+                    detail = %detail,
+                    "WGC window frame timed out; retrying after bounded backoff"
+                );
+                thread::sleep(Duration::from_millis(WGC_WINDOW_FRAME_RETRY_BACKOFF_MS));
+            }
+            Err(WgcWindowFrameAttemptError::Timeout { detail }) => {
+                let total_elapsed_ms = elapsed_ms(started);
+                tracing::error!(
+                    code = "CAPTURE_WGC_WINDOW_FRAME_TIMEOUT_EXHAUSTED",
+                    hwnd,
+                    attempts = attempt,
+                    timeout_ms,
+                    retry_backoff_ms = WGC_WINDOW_FRAME_RETRY_BACKOFF_MS,
+                    elapsed_ms = total_elapsed_ms,
+                    detail = %detail,
+                    "WGC window frame did not arrive after bounded retries"
+                );
+                return Err(CaptureError::ThreadFailed {
+                    detail: format!(
+                        "timed out after {timeout_ms} ms waiting for WGC window frame after {attempt} attempts over {total_elapsed_ms} ms for hwnd {hwnd:#x}; retry_backoff_ms={WGC_WINDOW_FRAME_RETRY_BACKOFF_MS}; last_timeout={detail}; recommended_next_action=retry capture after confirming the target window is live, visible, and visually stable"
+                    ),
+                });
+            }
+            Err(WgcWindowFrameAttemptError::Other(error)) => return Err(error),
+        }
+    }
+    Err(CaptureError::ThreadFailed {
+        detail: format!(
+            "WGC window frame retry loop exhausted unexpectedly for hwnd {hwnd:#x}; max_attempts={WGC_WINDOW_FRAME_MAX_ATTEMPTS}"
+        ),
+    })
+}
+
+fn graphics_capture_window_frame_once<F>(
+    hwnd: i64,
+    timeout_ms: u64,
+    select_region: &F,
+) -> Result<CapturedBgraBitmap, WgcWindowFrameAttemptError>
+where
+    F: Fn(&CapturedFrame) -> Rect,
 {
     let timeout = Duration::from_millis(timeout_ms.max(1));
     let handle = spawn_capture_loop(CaptureConfig {
@@ -277,28 +391,38 @@ where
         secondary_windows: false,
         dirty_region_only: false,
         backend_preference: CaptureBackendPreference::GraphicsCaptureApi,
-    })?;
+    })
+    .map_err(WgcWindowFrameAttemptError::Other)?;
     let receiver = handle.receiver();
     let frame = match receiver.recv_timeout(timeout) {
         Ok(frame) => frame,
-        Err(error) => {
+        Err(crossbeam::channel::RecvTimeoutError::Timeout) => {
             let stop_result = handle.stop();
-            return Err(match stop_result {
+            return match stop_result {
+                Ok(()) => Err(WgcWindowFrameAttemptError::Timeout {
+                    detail: format!("timed out after {timeout_ms} ms waiting for WGC window frame"),
+                }),
+                Err(stop_error) => Err(WgcWindowFrameAttemptError::Other(stop_error)),
+            };
+        }
+        Err(crossbeam::channel::RecvTimeoutError::Disconnected) => {
+            let stop_result = handle.stop();
+            return Err(WgcWindowFrameAttemptError::Other(match stop_result {
                 Ok(()) => CaptureError::ThreadFailed {
                     detail: format!(
-                        "timed out after {timeout_ms} ms waiting for WGC window frame: {error}"
+                        "WGC window frame channel disconnected before a frame arrived for hwnd {hwnd:#x}"
                     ),
                 },
                 Err(stop_error) => stop_error,
-            });
+            }));
         }
     };
     let region = select_region(&frame);
     let result = captured_frame_region_to_bgra_bitmap(&frame, region);
     let stop_result = handle.stop();
     match stop_result {
-        Ok(()) => result,
-        Err(error) => Err(error),
+        Ok(()) => result.map_err(WgcWindowFrameAttemptError::Other),
+        Err(error) => Err(WgcWindowFrameAttemptError::Other(error)),
     }
 }
 
@@ -306,14 +430,14 @@ fn graphics_capture_window_region_to_bgra_bitmap(
     hwnd: i64,
     region: Rect,
     timeout_ms: u64,
-) -> Result<CapturedBgraBitmap, CaptureError> {
+) -> Result<WgcWindowFrameCapture, CaptureError> {
     graphics_capture_window_frame(hwnd, timeout_ms, |_frame| region)
 }
 
 fn graphics_capture_window_full_frame_to_bgra_bitmap(
     hwnd: i64,
     timeout_ms: u64,
-) -> Result<CapturedBgraBitmap, CaptureError> {
+) -> Result<WgcWindowFrameCapture, CaptureError> {
     graphics_capture_window_frame(hwnd, timeout_ms, |frame| Rect {
         x: 0,
         y: 0,

@@ -356,6 +356,17 @@ pub struct CaptureScreenshotResponse {
     pub bitmap_sha256: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground: Option<ForegroundContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_retry_evidence: Option<CaptureRetryEvidence>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureRetryEvidence {
+    pub attempts: u32,
+    pub retry_count: u32,
+    pub elapsed_ms: u64,
+    pub retry_backoff_ms: u64,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]

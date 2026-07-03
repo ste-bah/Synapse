@@ -84,6 +84,10 @@ pub struct CapturedBgraBitmap {
 pub struct CapturedWindowBgraBitmap {
     pub bitmap: CapturedBgraBitmap,
     pub capture_backend: &'static str,
+    pub capture_attempts: u32,
+    pub capture_retry_count: u32,
+    pub capture_elapsed_ms: u64,
+    pub capture_retry_backoff_ms: u64,
 }
 
 // Note: a `CapturedFrame::synthetic(..)` constructor used to exist here for
