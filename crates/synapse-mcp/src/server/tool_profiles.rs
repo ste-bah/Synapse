@@ -3972,7 +3972,7 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
             tool_names: Vec::new(),
         },
     };
-    let latest_restart_handoff =
+    let mut latest_restart_handoff =
         match env_path_checked("LOCALAPPDATA", ["synapse", "codex-restart-handoffs"]) {
             Ok(path) => latest_codex_restart_handoff(&path),
             Err(error) => Some(CodexRestartHandoffReadback {
@@ -4007,11 +4007,26 @@ fn codex_client_surface_snapshot(public_tool_names: &[String]) -> CodexClientSur
         sorted_missing_names(public_tool_names, &host_snapshot.tool_names);
     let host_snapshot_tools_missing_from_public_registry =
         sorted_missing_names(&host_snapshot.tool_names, public_tool_names);
+    let host_snapshot_is_current = host_snapshot.read_error.is_none()
+        && host_snapshot.exists
+        && public_tools_missing_from_host_snapshot.is_empty();
+    let restart_handoff_requires_current = latest_restart_handoff.as_ref().is_some_and(|handoff| {
+        host_snapshot_is_current
+            && restart_handoff_requires_current_codex_restart(handoff, &host_snapshot)
+    });
     let live_stale_codex_process = latest_restart_handoff
         .as_ref()
-        .filter(|handoff| restart_handoff_requires_current_codex_restart(handoff, &host_snapshot))
+        .filter(|_| restart_handoff_requires_current)
         .and_then(|handoff| handoff.stale_codex_pid)
         .and_then(live_codex_process_readback);
+    if let Some(handoff) = latest_restart_handoff.as_mut() {
+        resolve_restart_handoff_current_action_readback(
+            handoff,
+            host_snapshot_is_current,
+            restart_handoff_requires_current,
+            live_stale_codex_process.is_some(),
+        );
+    }
 
     let (status, diagnostic_code) = if host_snapshot.read_error.is_some() && host_snapshot.exists {
         (
@@ -4077,6 +4092,24 @@ fn restart_handoff_requires_current_codex_restart(
     }
 
     !restart_handoff_start_hash_matches_host_snapshot(handoff, host_snapshot)
+}
+
+fn resolve_restart_handoff_current_action_readback(
+    handoff: &mut CodexRestartHandoffReadback,
+    host_snapshot_is_current: bool,
+    restart_handoff_requires_current: bool,
+    live_stale_codex_process_present: bool,
+) {
+    if handoff.read_error.is_some() || !host_snapshot_is_current || !handoff.required_restart {
+        return;
+    }
+    if restart_handoff_requires_current && live_stale_codex_process_present {
+        return;
+    }
+    // The persisted handoff file remains the raw audit artifact via path/sha.
+    // The profile/telemetry payload reports whether action is required now.
+    handoff.required_restart = false;
+    handoff.no_in_process_hot_refresh = false;
 }
 
 fn restart_handoff_start_hash_matches_host_snapshot(
@@ -5754,6 +5787,58 @@ mod tests {
         assert!(restart_handoff_requires_current_codex_restart(
             &handoff, &host
         ));
+    }
+
+    #[test]
+    fn restart_handoff_readback_clears_current_action_when_start_hash_matches() {
+        let mut handoff = test_restart_handoff(
+            true,
+            Some("sha256:594F2ABC0412C9F6C87D7C1EBA9C8F1EAEB7100A542F1002768B44B77D71E6FB"),
+        );
+
+        resolve_restart_handoff_current_action_readback(&mut handoff, true, false, true);
+
+        assert!(!handoff.required_restart);
+        assert!(!handoff.no_in_process_hot_refresh);
+    }
+
+    #[test]
+    fn restart_handoff_readback_clears_current_action_when_stale_pid_dead() {
+        let mut handoff = test_restart_handoff(
+            true,
+            Some("fd2ee96bcb5a04bc7a0a53d2559713cfdd698d390bfb182521413bcf4954973d"),
+        );
+
+        resolve_restart_handoff_current_action_readback(&mut handoff, true, true, false);
+
+        assert!(!handoff.required_restart);
+        assert!(!handoff.no_in_process_hot_refresh);
+    }
+
+    #[test]
+    fn restart_handoff_readback_keeps_action_for_live_stale_codex_pid() {
+        let mut handoff = test_restart_handoff(
+            true,
+            Some("fd2ee96bcb5a04bc7a0a53d2559713cfdd698d390bfb182521413bcf4954973d"),
+        );
+
+        resolve_restart_handoff_current_action_readback(&mut handoff, true, true, true);
+
+        assert!(handoff.required_restart);
+        assert!(handoff.no_in_process_hot_refresh);
+    }
+
+    #[test]
+    fn restart_handoff_readback_keeps_action_when_host_snapshot_not_current() {
+        let mut handoff = test_restart_handoff(
+            true,
+            Some("fd2ee96bcb5a04bc7a0a53d2559713cfdd698d390bfb182521413bcf4954973d"),
+        );
+
+        resolve_restart_handoff_current_action_readback(&mut handoff, false, true, false);
+
+        assert!(handoff.required_restart);
+        assert!(handoff.no_in_process_hot_refresh);
     }
 
     #[test]
