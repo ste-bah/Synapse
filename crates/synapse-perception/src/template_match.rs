@@ -368,9 +368,9 @@ fn normalized_cross_correlation(
         for x in 0..template_w {
             let template_delta = f64::from(template.get_pixel(x, y).0[0]) - template_mean;
             let slot_delta = f64::from(slot.get_pixel(offset_x + x, offset_y + y).0[0]) - slot_mean;
-            numerator += template_delta * slot_delta;
-            template_energy += template_delta * template_delta;
-            slot_energy += slot_delta * slot_delta;
+            numerator = template_delta.mul_add(slot_delta, numerator);
+            template_energy = template_delta.mul_add(template_delta, template_energy);
+            slot_energy = slot_delta.mul_add(slot_delta, slot_energy);
         }
     }
 

@@ -166,7 +166,7 @@ impl RingBuffer {
 
     /// Highest assigned seq, or 0 when empty. Equal to `next_seq` (the cursor a
     /// caller should pass to receive only strictly-newer entries).
-    fn cursor(&self) -> u64 {
+    const fn cursor(&self) -> u64 {
         self.next_seq
     }
 }
@@ -202,8 +202,7 @@ fn registry() -> &'static CaptureRegistry {
 fn now_unix_ms() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .unwrap_or(0.0)
+        .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
 /// Arms (or re-arms) persistent console capture for `target_id` over `endpoint`.
@@ -355,6 +354,7 @@ pub async fn console_capture_ensure(
 /// Reads a filtered, cursor-delimited slice of a target's console buffer without
 /// consuming it. Returns `None` if the target was never armed (so the caller can
 /// surface a precise "not armed" error rather than an empty success).
+#[must_use]
 pub fn console_capture_read(
     target_id: &str,
     filter: &ConsoleReadFilter,
@@ -402,6 +402,7 @@ pub fn console_capture_read(
 
 /// Tears down capture for a target (e.g. when its tab is closed). Idempotent.
 /// Returns `true` if a capture was removed.
+#[must_use]
 pub fn console_capture_stop(target_id: &str) -> bool {
     registry()
         .slots
@@ -414,7 +415,7 @@ pub fn console_capture_stop(target_id: &str) -> bool {
 /// Number of targets with a registered capture slot (live or not-yet-reaped).
 #[must_use]
 pub fn console_capture_active_count() -> usize {
-    registry().slots.lock().map(|s| s.len()).unwrap_or(0)
+    registry().slots.lock().map_or(0, |s| s.len())
 }
 
 fn lookup_live(target_id: &str) -> Option<Arc<CaptureSlot>> {
@@ -577,14 +578,13 @@ fn format_stack(stack: &StackTrace) -> String {
 fn top_frame_location(stack: Option<&StackTrace>) -> (Option<String>, Option<u32>, Option<u32>) {
     stack
         .and_then(|s| s.call_frames.first())
-        .map(|f| {
+        .map_or((None, None, None), |f| {
             (
                 Some(f.url.clone()),
                 u32::try_from(f.line_number + 1).ok(),
                 u32::try_from(f.column_number + 1).ok(),
             )
         })
-        .unwrap_or((None, None, None))
 }
 
 /// Renders a CDP `RemoteObject` console argument to a structured JSON value.
@@ -658,8 +658,7 @@ fn parse_number(raw: &str) -> Value {
     serde_json::from_str::<f64>(raw)
         .ok()
         .and_then(serde_json::Number::from_f64)
-        .map(Value::Number)
-        .unwrap_or_else(|| Value::String(raw.to_owned()))
+        .map_or_else(|| Value::String(raw.to_owned()), Value::Number)
 }
 
 fn value_to_text(value: &Value) -> String {

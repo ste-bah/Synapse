@@ -36,11 +36,11 @@ pub enum CdpDialogDefaultPolicy {
 }
 
 impl CdpDialogDefaultPolicy {
-    fn accept(self) -> bool {
+    const fn accept(self) -> bool {
         matches!(self, Self::Accept)
     }
 
-    fn auto_action(self) -> Option<CdpDialogAutoAction> {
+    const fn auto_action(self) -> Option<CdpDialogAutoAction> {
         match self {
             Self::Accept => Some(CdpDialogAutoAction::Accepted),
             Self::Dismiss => Some(CdpDialogAutoAction::Dismissed),
@@ -66,7 +66,7 @@ pub enum CdpDialogHandleAction {
 }
 
 impl CdpDialogHandleAction {
-    fn accept(self) -> bool {
+    const fn accept(self) -> bool {
         matches!(self, Self::Accept)
     }
 }
@@ -262,7 +262,7 @@ impl DialogState {
         self.closed_count = self.closed_count.saturating_add(1);
     }
 
-    fn cursor(&self) -> u64 {
+    const fn cursor(&self) -> u64 {
         self.next_seq
     }
 
@@ -449,6 +449,7 @@ pub async fn cdp_dialog_capture_start(
 /// Updates the default auto-policy for a live dialog capture.
 ///
 /// Returns `false` if the target has not been armed or its listener has ended.
+#[must_use]
 pub fn dialog_capture_set_default_policy(
     target_id: &str,
     default_policy: CdpDialogDefaultPolicy,
@@ -558,6 +559,7 @@ pub async fn cdp_dialog_handle_pending(
 }
 
 /// Reads a filtered, cursor-delimited dialog history for a target.
+#[must_use]
 pub fn dialog_capture_read(
     target_id: &str,
     filter: &CdpDialogReadFilter,
@@ -589,6 +591,7 @@ pub fn dialog_capture_read(
 }
 
 /// Returns current dialog capture status for an armed target.
+#[must_use]
 pub fn dialog_capture_status(target_id: &str) -> Option<CdpDialogCaptureStatus> {
     let target_id = target_id.trim();
     let slot = lookup_live(target_id)?;
@@ -596,6 +599,7 @@ pub fn dialog_capture_status(target_id: &str) -> Option<CdpDialogCaptureStatus> 
 }
 
 /// Stops dialog capture for a target.
+#[must_use]
 pub fn dialog_capture_stop(target_id: &str) -> bool {
     registry()
         .slots
@@ -606,17 +610,14 @@ pub fn dialog_capture_stop(target_id: &str) -> bool {
 }
 
 /// Number of currently live dialog capture slots.
+#[must_use]
 pub fn dialog_capture_active_count() -> usize {
-    registry()
-        .slots
-        .lock()
-        .map(|slots| {
-            slots
-                .values()
-                .filter(|slot| !slot.listener_task.is_finished())
-                .count()
-        })
-        .unwrap_or(0)
+    registry().slots.lock().map_or(0, |slots| {
+        slots
+            .values()
+            .filter(|slot| !slot.listener_task.is_finished())
+            .count()
+    })
 }
 
 fn lookup_live(target_id: &str) -> Option<Arc<DialogCaptureSlot>> {
@@ -777,8 +778,7 @@ fn frame_id_string(frame_id: &FrameId) -> String {
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().try_into().unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_millis().try_into().unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]

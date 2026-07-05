@@ -362,7 +362,7 @@ impl SynapseService {
             "tool": tool,
             "status": status,
             "error_code": error_code,
-            "foreground": human_os_foreground.clone(),
+            "foreground": human_os_foreground,
             "human_os_foreground": human_os_foreground,
             "agent_logical_foreground": self.action_audit_agent_logical_foreground(session_id.as_deref()),
             "foreground_lane": self.action_audit_foreground_lane(session_id.as_deref()),

@@ -2135,11 +2135,7 @@ fn target_act_next_stale_notepad_tab(
         .filter(|tab| !tab.keep)
         .min_by_key(|tab| {
             (
-                if target_act_rect_has_area(tab.bbox) {
-                    0
-                } else {
-                    1
-                },
+                i32::from(!target_act_rect_has_area(tab.bbox)),
                 tab.bbox.x,
                 tab.bbox.y,
                 tab.name.clone(),
@@ -6479,7 +6475,7 @@ async fn target_act_focus_for_text_insert(
     Ok(None)
 }
 
-const TARGET_ACT_SET_SELECTION_JS: &str = r#"(el, start, end) => {
+const TARGET_ACT_SET_SELECTION_JS: &str = r"(el, start, end) => {
     if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || end < start) {
         throw new Error(`invalid selection range ${start}..${end}`);
     }
@@ -6572,7 +6568,7 @@ const TARGET_ACT_SET_SELECTION_JS: &str = r#"(el, start, end) => {
         after_end: after.end,
         selected_text: selectedText()
     };
-}"#;
+}";
 
 async fn target_act_set_selection(
     service: &SynapseService,

@@ -72,7 +72,6 @@ fn main() {
                 v.result
                     .result
                     .value
-                    .clone()
                     .and_then(|x| x.as_str().map(ToOwned::to_owned))
                     .unwrap_or_default()
             }

@@ -23,6 +23,26 @@ use crate::{A11yError, A11yResult};
 
 const BOX_STABILITY_EPSILON_CSS_PX: f64 = 0.25;
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    reason = "CDP integer CSS-pixel fields require rounding a prevalidated finite f64"
+)]
+fn rounded_finite_css_px_to_i64(field: &str, value: f64) -> A11yResult<i64> {
+    if !value.is_finite() {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!("{field} CSS pixel value was not finite: {value}"),
+        });
+    }
+    let rounded = value.round();
+    if rounded < i64::MIN as f64 || rounded > i64::MAX as f64 {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!("{field} CSS pixel value {value} is outside the i64 CDP range"),
+        });
+    }
+    Ok(rounded as i64)
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct CdpActionabilityPoint {
     pub x: f64,
@@ -87,7 +107,7 @@ pub struct CdpActionabilityDomState {
     pub node_description: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpActionabilityFailure {
     pub predicate: String,
     pub reason: String,
@@ -381,10 +401,10 @@ fn rect_from_quad(quad: &[f64]) -> Option<CdpActionabilityRect> {
 async fn wait_for_two_animation_frames(page: &chromiumoxide::Page) {
     let Ok(params) = EvaluateParams::builder()
         .expression(
-            r#"new Promise(resolve => {
+            r"new Promise(resolve => {
                 const raf = window.requestAnimationFrame || (cb => setTimeout(cb, 16));
                 raf(() => raf(() => resolve(true)));
-            })"#,
+            })",
         )
         .await_promise(true)
         .return_by_value(true)
@@ -433,8 +453,8 @@ async fn hit_test_action_point(
     }
 
     let location = GetNodeForLocationParams::builder()
-        .x(point.x.round() as i64)
-        .y(point.y.round() as i64)
+        .x(rounded_finite_css_px_to_i64("action point x", point.x)?)
+        .y(rounded_finite_css_px_to_i64("action point y", point.y)?)
         .include_user_agent_shadow_dom(true)
         .ignore_pointer_events_none(false)
         .build()
@@ -765,11 +785,15 @@ mod tests {
     }
 
     fn model(x: f64, y: f64, width: f64, height: f64) -> CdpActionabilityBoxModel {
+        let width_i64 = rounded_finite_css_px_to_i64("test model width", width)
+            .unwrap_or_else(|err| panic!("test model width should be finite and in range: {err}"));
+        let height_i64 = rounded_finite_css_px_to_i64("test model height", height)
+            .unwrap_or_else(|err| panic!("test model height should be finite and in range: {err}"));
         CdpActionabilityBoxModel {
             content: rect(x, y, width, height),
             border: rect(x - 1.0, y - 1.0, width + 2.0, height + 2.0),
-            width: width.round() as i64,
-            height: height.round() as i64,
+            width: width_i64,
+            height: height_i64,
         }
     }
 

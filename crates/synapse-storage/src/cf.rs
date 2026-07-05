@@ -28,15 +28,18 @@ pub const CF_EPISODES: &str = "CF_EPISODES";
 /// Derived routines mined from `CF_EPISODES` (#848). Fully rebuildable:
 /// re-mining replaces the entire CF atomically.
 pub const CF_ROUTINES: &str = "CF_ROUTINES";
-/// Operator-owned routine lifecycle state (#849): confirmations, disables,
-/// labels, transition audit trail, confidence history. NOT derived state —
-/// it must survive every `CF_ROUTINES` replace-all, keyed by the same
-/// stable routine id.
+/// Operator-owned routine lifecycle state (#849).
+///
+/// Stores confirmations, disables, labels, transition audit trail, and
+/// confidence history. NOT derived state — it must survive every
+/// `CF_ROUTINES` replace-all, keyed by the same stable routine id.
 pub const CF_ROUTINE_STATE: &str = "CF_ROUTINE_STATE";
-/// Durable agent lifecycle/telemetry event journal (#897), keyed
-/// `(ts_ns, seq)` like `CF_TIMELINE`. One row per agent event (spawn, state
-/// change, tool call, turn, message, lease, exit) with OTel GenAI-aligned
-/// attributes. Append-only; retention is TTL + GC, never rewritten.
+/// Durable agent lifecycle/telemetry event journal (#897).
+///
+/// Keys use `(ts_ns, seq)` like `CF_TIMELINE`. One row is stored per agent
+/// event (spawn, state change, tool call, turn, message, lease, exit) with
+/// `OTel` GenAI-aligned attributes. Append-only; retention is TTL + GC, never
+/// rewritten.
 pub const CF_AGENT_EVENTS: &str = "CF_AGENT_EVENTS";
 /// Normalized spawned-agent transcripts (#900), keyed
 /// `spawn_id || 0x00 || line_no BE`.

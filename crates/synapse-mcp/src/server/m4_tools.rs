@@ -618,7 +618,7 @@ fn shell_facade_error(
     let message = message.into();
     ErrorData::new(
         ErrorCode(-32099),
-        message.clone(),
+        message,
         Some(json!({
             "code": error_codes::TOOL_PARAMS_INVALID,
             "operation": operation.as_str(),
@@ -638,7 +638,7 @@ fn process_facade_error(
     let message = message.into();
     ErrorData::new(
         ErrorCode(-32099),
-        message.clone(),
+        message,
         Some(json!({
             "code": error_codes::TOOL_PARAMS_INVALID,
             "operation": operation.as_str(),
@@ -1789,7 +1789,7 @@ impl SynapseService {
         let result = cancel_shell_job(&params, Some(&session_id));
         let after_status = shell_job_status(
             &ActRunShellStatusParams {
-                job_id: params.job_id.clone(),
+                job_id: params.job_id,
                 tail_bytes: 1024,
             },
             Some(&session_id),
@@ -2815,7 +2815,7 @@ impl SynapseService {
                     json!({
                         "reason": "agent_spawn_shell_preflight_failed",
                         "source_error_message": error.message.clone(),
-                        "source_error_data": error.data.clone(),
+                        "source_error_data": error.data,
                     }),
                 );
                 return Err(augment_agent_spawn_error_with_artifacts(
@@ -2913,7 +2913,7 @@ impl SynapseService {
                         "reason": "agent_spawn_shell_launch_failed",
                         "launch_host": launch_host.to_json(),
                         "source_error_message": error.message.clone(),
-                        "source_error_data": error.data.clone(),
+                        "source_error_data": error.data,
                         "spawn_timing": timing.readback(&in_flight, params.wait_timeout_ms),
                     }),
                 );
@@ -5051,7 +5051,7 @@ fn write_agent_spawn_orphan_terminal_artifacts(
             "stdout_path": stdout_path.display().to_string(),
             "stderr_path": stderr_path.display().to_string(),
             "completion_status_path": completion_status_path.display().to_string(),
-            "details": details.clone(),
+            "details": details,
         });
         let bytes = serde_json::to_vec_pretty(&final_message).map_err(|error| {
             mcp_error(
@@ -5172,8 +5172,10 @@ fn stdout_summary_lossy(path: &Path) -> (u64, Option<String>) {
 
 fn validate_spawn_target(target: &Option<ActSpawnAgentTarget>) -> Result<(), ErrorData> {
     match target {
-        Some(ActSpawnAgentTarget::Window { window_hwnd })
-        | Some(ActSpawnAgentTarget::Cdp { window_hwnd, .. }) => {
+        Some(
+            ActSpawnAgentTarget::Window { window_hwnd }
+            | ActSpawnAgentTarget::Cdp { window_hwnd, .. },
+        ) => {
             validate_target_window(*window_hwnd)?;
         }
         None => {}
@@ -5194,19 +5196,13 @@ fn resolve_agent_working_dir(working_dir: Option<&str>) -> Result<PathBuf, Error
     let canonical = fs::canonicalize(&path).map_err(|error| {
         mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "act_spawn_agent working_dir {:?} could not be resolved: {error}",
-                path
-            ),
+            format!("act_spawn_agent working_dir {path:?} could not be resolved: {error}"),
         )
     })?;
     if !canonical.is_dir() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "act_spawn_agent working_dir {:?} is not a directory",
-                canonical
-            ),
+            format!("act_spawn_agent working_dir {canonical:?} is not a directory"),
         ));
     }
     Ok(canonical)
@@ -6161,14 +6157,6 @@ fn agent_spawn_powershell_script(
                 "$claudeArgs = @('-p'{model_arg},'--verbose','--output-format','stream-json','--input-format','text',{permission_args},'--mcp-config',{mcp_config_path},'--strict-mcp-config','--settings',{hook_settings_path},'--add-dir',{working_dir},'--debug-file',{debug_path})\n\
 $prompt | & claude @claudeArgs 1> {stdout_path} 2> {stderr_path}\n\
 ",
-                model_arg = model_arg,
-                permission_args = permission_args,
-                working_dir = working_dir,
-                mcp_config_path = mcp_config_path,
-                hook_settings_path = hook_settings_path,
-                debug_path = debug_path,
-                stdout_path = stdout_path,
-                stderr_path = stderr_path,
             )
         }
         ActSpawnAgentCli::LocalModel => {
@@ -6215,7 +6203,7 @@ $prompt | & claude @claudeArgs 1> {stdout_path} 2> {stderr_path}\n\
                     target_json = ps_single_quote(&target_json),
                 );
             } else {
-                local_args = format!("$localArgs = {local_args}", local_args = local_args);
+                local_args = format!("$localArgs = {local_args}");
             }
             local_args
                 .push_str("\n$localArgs += @('--local-agent-trusted-unattended-exact-contract')");

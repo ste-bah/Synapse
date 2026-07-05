@@ -219,6 +219,27 @@ pub const SAFETY_SHELL_DENIED_BY_POLICY: &str = "SAFETY_SHELL_DENIED_BY_POLICY";
 /// `SetForegroundWindow`, which bypass Synapse's foreground input lease and act
 /// on the human foreground.
 pub const SAFETY_SHELL_GLOBAL_INPUT_DENIED: &str = "SAFETY_SHELL_GLOBAL_INPUT_DENIED";
+/// Shell command assigns to a PowerShell automatic/read-only variable.
+///
+/// PowerShell variable names are case-insensitive, so an agent-chosen name like
+/// `$home` silently collides with the read-only `$HOME` automatic variable: the
+/// assignment fails and any later use of the name evaluates to the operator's
+/// home directory. Combined with a recursive delete this can target
+/// `C:\Users\<user>` instead of a scratch path. Synapse fails closed on the
+/// assignment before the command reaches the OS (#1507).
+pub const SAFETY_SHELL_RESERVED_VARIABLE_COLLISION: &str =
+    "SAFETY_SHELL_RESERVED_VARIABLE_COLLISION";
+/// Recursive delete/move whose target cannot be proven contained in the active
+/// workspace.
+///
+/// Applies to `Remove-Item`/`rm`/`rd`/`Move-Item` (and `cmd` `del /s` / `rmdir
+/// /s`) used recursively against a target that resolves to — or is derived from
+/// an automatic variable that can resolve to — a path outside the shell job's
+/// working directory, such as the user home, a drive root, or the Windows/
+/// tooling directories. Synapse refuses rather than run an unbounded recursive
+/// delete it cannot prove safe (#1507).
+pub const SAFETY_SHELL_RECURSIVE_DELETE_UNCONTAINED: &str =
+    "SAFETY_SHELL_RECURSIVE_DELETE_UNCONTAINED";
 pub const SAFETY_LAUNCH_DENIED_BY_POLICY: &str = "SAFETY_LAUNCH_DENIED_BY_POLICY";
 pub const SAFETY_SECRET_REDACTED: &str = "SAFETY_SECRET_REDACTED";
 pub const SAFETY_PERMISSION_DENIED: &str = "SAFETY_PERMISSION_DENIED";

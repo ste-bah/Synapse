@@ -59,7 +59,7 @@ impl PlanStepExecutionStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlanStepExecutionReport {
     pub index: u32,
@@ -78,7 +78,7 @@ pub struct PlanStepExecutionReport {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlanExecutionRecord {
     pub record_version: u32,
@@ -193,7 +193,7 @@ pub fn write_plan_execution(db: &Arc<Db>, record: &PlanExecutionRecord) -> Resul
             ),
         )
     })?;
-    db.put_batch_pressure_bypass(cf::CF_KV, [(key.clone(), value)])
+    db.put_batch_pressure_bypass(cf::CF_KV, [(key, value)])
         .map_err(|error| {
             mcp_error(
                 error_codes::STORAGE_WRITE_FAILED,

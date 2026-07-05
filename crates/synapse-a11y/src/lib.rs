@@ -1,4 +1,25 @@
 #![allow(unsafe_code)]
+#![allow(
+    clippy::assigning_clones,
+    clippy::branches_sharing_code,
+    clippy::doc_markdown,
+    clippy::format_push_string,
+    clippy::manual_let_else,
+    clippy::map_unwrap_or,
+    clippy::missing_errors_doc,
+    clippy::match_same_arms,
+    clippy::needless_pass_by_value,
+    clippy::needless_collect,
+    clippy::option_if_let_else,
+    clippy::significant_drop_tightening,
+    clippy::struct_excessive_bools,
+    clippy::struct_field_names,
+    clippy::too_long_first_doc_paragraph,
+    clippy::too_many_lines,
+    clippy::unreadable_literal,
+    reason = "synapse-a11y keeps pedantic/nursery style lint debt explicit while using clippy -D warnings for correctness and behavior regressions"
+)]
+#![cfg_attr(test, allow(clippy::float_cmp))]
 
 mod cdp;
 mod cdp_action;

@@ -45,7 +45,7 @@ impl ReflexRuntime {
         self.db.cf_sizes()
     }
 
-    /// Returns RocksDB's live-data-size estimate for each storage column family.
+    /// Returns `RocksDB`'s live-data-size estimate for each storage column family.
     ///
     /// # Errors
     ///
@@ -67,7 +67,7 @@ impl ReflexRuntime {
         self.db.cf_row_counts()
     }
 
-    /// Returns RocksDB's estimated row count for each storage column family.
+    /// Returns `RocksDB`'s estimated row count for each storage column family.
     ///
     /// # Errors
     ///

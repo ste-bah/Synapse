@@ -3065,7 +3065,7 @@ impl SynapseService {
                         row.record.profile,
                         row.record.source.clone(),
                         row.record.reason.clone(),
-                        row.record.set_by_session_id.clone(),
+                        row.record.set_by_session_id,
                     );
                 }
                 Ok(row)
@@ -3196,7 +3196,7 @@ impl SynapseService {
         })?;
         let db = self.m3_storage()?;
         let key = tool_profile_key(session_id);
-        db.put_batch_pressure_bypass(cf::CF_SESSIONS, [(key.clone(), encoded.clone())])
+        db.put_batch_pressure_bypass(cf::CF_SESSIONS, [(key, encoded.clone())])
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let readback = self
             .read_tool_profile_assignment(session_id)?

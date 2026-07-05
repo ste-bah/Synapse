@@ -899,13 +899,16 @@ fn native_text_selection(id: &ElementId, hwnd: HWND) -> A11yResult<(u32, u32)> {
 
 fn native_set_text_selection(id: &ElementId, hwnd: HWND, start: u32, end: u32) -> A11yResult<()> {
     const EM_SETSEL: u32 = 0x00B1;
+    let end = isize::try_from(end).map_err(|_| A11yError::ElementValueUnsupported {
+        detail: format!("selection end {end} exceeds isize::MAX for native text element {id}"),
+    })?;
     let mut result = 0_usize;
     send_native_text_message(
         id,
         hwnd,
         EM_SETSEL,
         WPARAM(start as usize),
-        LPARAM(end as isize),
+        LPARAM(end),
         NATIVE_TEXT_MESSAGE_TIMEOUT_MS,
         "EM_SETSEL",
         &mut result,
@@ -1112,7 +1115,7 @@ fn send_native_text_message(
             lparam,
             SMTO_ABORTIFHUNG,
             timeout_ms,
-            Some(result as *mut usize),
+            Some(std::ptr::from_mut::<usize>(result)),
         )
     };
     if send_result.0 == 0 {

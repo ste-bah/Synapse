@@ -79,7 +79,7 @@ mod windows_impl {
         group: Option<String>,
     }
 
-    pub(super) fn run() -> anyhow::Result<()> {
+    pub fn run() -> anyhow::Result<()> {
         ensure_com();
         let mut args = std::env::args().skip(1).collect::<VecDeque<_>>();
         let command = args.pop_front().unwrap_or_else(|| "list".to_owned());
@@ -242,7 +242,7 @@ mod windows_impl {
     }
 
     fn extract_actions(xml: &str) -> anyhow::Result<Vec<ToastActionReadback>> {
-        let action_re = Regex::new(r#"<action\b([^>]*)/?>"#)?;
+        let action_re = Regex::new(r"<action\b([^>]*)/?>")?;
         let attr_re = Regex::new(r#"([A-Za-z_:][\w:.-]*)="([^"]*)""#)?;
         let mut actions = Vec::new();
         for action in action_re.captures_iter(xml) {

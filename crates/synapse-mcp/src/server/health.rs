@@ -493,16 +493,18 @@ impl SynapseService {
                             )
                         },
                     );
+                    let search_tools = crate::m4::shell_search_tool_readback();
                     SubsystemHealth {
                         status: if emitter_available { "ok" } else { "error" }.to_owned(),
                         detail: Some(format!(
-                            "emitter_available={} recording_enabled={} operator_hotkey={} allow_shell_patterns={} allow_launch_patterns={} {}",
+                            "emitter_available={} recording_enabled={} operator_hotkey={} allow_shell_patterns={} allow_launch_patterns={} {} {}",
                             emitter_available,
                             state.recording_enabled(),
                             operator_hotkey,
                             allow_shell,
                             allow_launch,
-                            lease_detail
+                            lease_detail,
+                            search_tools
                         )),
                         backend_resolution: Some(backend_resolution_health(source, policy)),
                         run_shell_inline_await_limit_ms: Some(

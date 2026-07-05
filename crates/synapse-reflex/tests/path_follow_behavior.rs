@@ -151,7 +151,7 @@ const fn context(tick_ms: u64) -> PathFollowContext {
     }
 }
 
-fn mouse_move(x: i32, y: i32) -> Action {
+const fn mouse_move(x: i32, y: i32) -> Action {
     Action::MouseMove {
         to: MouseTarget::Screen {
             point: Point { x, y },

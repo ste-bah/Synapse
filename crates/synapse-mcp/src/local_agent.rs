@@ -1870,11 +1870,11 @@ impl Runner {
             let body = response.text().await.unwrap_or_default();
             bail!("MODEL_ENDPOINT_UNREACHABLE: endpoint returned HTTP {status}: {body}");
         }
-        if !stream {
+        if stream {
+            parse_streaming_response(response).await
+        } else {
             let text = response.text().await.context("read non-stream response")?;
             parse_non_stream_response(&text)
-        } else {
-            parse_streaming_response(response).await
         }
     }
 
@@ -3138,7 +3138,7 @@ fn task_contract_model_status_value(
         "ordered_function_names": contract.ordered_tools_json(),
         "completed_function_names": completed,
         "completed_function_counts": completed_task_tool_counts,
-        "remaining_function_names": remaining.clone(),
+        "remaining_function_names": remaining,
         "all_required_functions_complete": all_required_functions_complete,
     });
     let Value::Object(map) = &mut status else {
@@ -4164,9 +4164,7 @@ fn system_prompt(tool_exposure: ToolExposure, tools: &[Tool]) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!(
-                "{BASE}\n\nYour provider caps tool count below the full Synapse surface, so tools route through two meta-tools:\n- {catalog} — list/inspect tools (name=<tool> for one, query=<text> to search).\n- {call_tool} {{name, arguments}} — execute any real Synapse tool.\nThis reaches every Synapse tool (perception, action, agent, task, dashboard, local-model). Tools: {names}",
-                catalog = SYNAPSE_TOOL_CATALOG,
-                call_tool = SYNAPSE_TOOL_CALL,
+                "{BASE}\n\nYour provider caps tool count below the full Synapse surface, so tools route through two meta-tools:\n- {SYNAPSE_TOOL_CATALOG} — list/inspect tools (name=<tool> for one, query=<text> to search).\n- {SYNAPSE_TOOL_CALL} {{name, arguments}} — execute any real Synapse tool.\nThis reaches every Synapse tool (perception, action, agent, task, dashboard, local-model). Tools: {names}",
             )
         }
         // Internalized: the surface is in the weights and the model was trained
@@ -5690,12 +5688,12 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
     #[test]
     fn local_agent_timeout_budget_excludes_approval_wait() {
         let started = Instant::now()
-            .checked_sub(Duration::from_millis(240_000))
+            .checked_sub(Duration::from_mins(4))
             .expect("test duration must fit within Instant range");
-        let active = local_agent_active_elapsed(started, Duration::from_millis(180_000));
-        assert!(active < Duration::from_millis(90_000), "{active:?}");
+        let active = local_agent_active_elapsed(started, Duration::from_mins(3));
+        assert!(active < Duration::from_secs(90), "{active:?}");
 
-        let fully_blocked = local_agent_active_elapsed(started, Duration::from_millis(300_000));
+        let fully_blocked = local_agent_active_elapsed(started, Duration::from_mins(5));
         assert_eq!(fully_blocked, Duration::ZERO);
     }
 
@@ -6491,7 +6489,7 @@ cdp_open_tab, target_claim.\n\n\
             "max_tokens": 128
         });
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_mins(1))
             .build()?;
         let mut request = client
             .post(endpoint.clone())

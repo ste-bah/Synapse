@@ -75,7 +75,7 @@ impl ArmedRoutineRunStatus {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArmedRoutineRecord {
     pub record_version: u32,
@@ -135,7 +135,7 @@ pub struct ArmedRoutineDueRun {
     pub intent: Option<ArmedRoutineIntentEvidence>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArmedRoutineTickSkip {
     pub routine_id: String,
@@ -233,7 +233,7 @@ pub struct ArmedRoutineTickParams {
     pub launch_timeout_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArmedRoutineTickRun {
     pub routine_id: String,
@@ -254,7 +254,7 @@ pub struct ArmedRoutineTickRun {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ArmedRoutineTickResponse {
     pub now_ts_ns: u64,
@@ -1623,7 +1623,7 @@ fn write_armed_routine_record(db: &Arc<Db>, record: &ArmedRoutineRecord) -> Resu
     let index_mutation =
         schedule_due_index_mutation(db, record, &key_bytes, &value, record.updated_at_ns)?;
     let mut puts = index_mutation.puts.clone();
-    puts.push((key_bytes.clone(), value.clone()));
+    puts.push((key_bytes, value));
     db.mutate_batch_pressure_bypass(cf::CF_KV, index_mutation.deletes.clone(), puts)
         .map_err(|error| {
             mcp_error(

@@ -3,7 +3,7 @@
 //! These tests run against the real Windows notification platform — no mocks.
 //! The daemon raises actual toasts (popup-suppressed so test runs do not spam
 //! banners), and the test verifies delivery through two independent sources
-//! of truth: Action Center history read directly via WinRT from the test
+//! of truth: Action Center history read directly via `WinRT` from the test
 //! process, and the AUMID registration read back from the registry via
 //! reg.exe.
 #![cfg(windows)]
@@ -21,14 +21,14 @@ const AUMID: &str = "Synapse.Daemon";
 const GROUP: &str = "synapse";
 
 /// Initialize COM on this thread and intentionally never uninitialize:
-/// tearing down the last MTA invalidates windows-rs's cached WinRT factories
+/// tearing down the last MTA invalidates windows-rs's cached `WinRT` factories
 /// and later calls crash. Leaking the init is correct for a test process.
 fn ensure_com() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
 }
 
 /// Source-of-truth readback: count toasts with `tag` in Action Center history
-/// for the Synapse AUMID, straight from WinRT in the test process.
+/// for the Synapse AUMID, straight from `WinRT` in the test process.
 fn action_center_count(tag: &str) -> anyhow::Result<u32> {
     ensure_com();
     let history = ToastNotificationManager::History().context("History()")?;

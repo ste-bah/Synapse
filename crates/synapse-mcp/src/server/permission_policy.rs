@@ -109,7 +109,7 @@ fn split_subcommands(command: &str) -> Vec<String> {
                 current.clear();
                 i += 2;
             }
-            ('|', _) | (';', _) | ('\n', _) | ('\r', _) => {
+            ('|' | ';' | '\n' | '\r', _) => {
                 push_trimmed(&mut out, &current);
                 current.clear();
                 i += 1;

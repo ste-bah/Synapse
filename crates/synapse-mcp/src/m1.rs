@@ -3459,6 +3459,47 @@ pub fn current_input(state: &M1State, depth: u32) -> Result<ObservationInput, Er
     Ok(input)
 }
 
+/// Builds an observation input for a global-only observe — one whose requested
+/// slots (`fs`/`clipboard`/`audio`) read host-wide state and need no window.
+///
+/// This path performs **no** window or foreground perception: it does not read
+/// the human foreground window and does not resolve a target `HWND`, so it is
+/// safe (and correct) even when the session's active target is a Chrome CDP tab
+/// that the window/foreground perception path refuses to downgrade (#1508). The
+/// caller populates the requested global slots (fs recent, clipboard, audio)
+/// onto the returned input.
+pub fn global_only_input(state: &M1State) -> ObservationInput {
+    // An honest "no window was observed" foreground: hwnd 0, empty process and
+    // title. A global-only observe deliberately reads no window, so the
+    // foreground carries no borrowed/foreground identity.
+    let foreground = synapse_core::ForegroundContext {
+        hwnd: 0,
+        pid: 0,
+        process_name: String::new(),
+        process_path: String::new(),
+        window_title: String::new(),
+        window_bounds: synapse_core::Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        },
+        monitor_index: 0,
+        dpi_scale: 1.0,
+        profile_id: None,
+        steam_appid: None,
+        is_fullscreen: false,
+        is_dwm_composed: false,
+    };
+    let mut input = ObservationInput::new(foreground);
+    input.capture_config = Some(state.active_capture_config.clone());
+    input.capture_runtime = Some(state.capture_runtime_readback());
+    if state.perception_mode != PerceptionMode::Auto {
+        input.mode_override = Some(state.perception_mode);
+    }
+    input
+}
+
 pub fn observe_input(
     state: &M1State,
     params: &ObserveParams,

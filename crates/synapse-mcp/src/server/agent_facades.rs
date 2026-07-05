@@ -1276,7 +1276,7 @@ fn template_rows_readback(rows: &[super::agent_templates::TemplateRowReadback]) 
         })
         .collect::<Vec<_>>()
         .join(",");
-    format!("CF_KV template row writeback [{}]", rows)
+    format!("CF_KV template row writeback [{rows}]")
 }
 
 fn agent_control_readback(action: &'static str, response: &AgentInterruptResponse) -> String {

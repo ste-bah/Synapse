@@ -596,16 +596,16 @@ fn consecutive_tick_late_signals_are_coalesced() -> Result<(), Box<dyn Error>> {
     db.flush()?;
 
     let late = late_events.drain();
-    let tick_late_audits = read_audits(&db)?
+    let tick_late_audit_count = read_audits(&db)?
         .into_iter()
         .filter(|audit| audit.error_code.as_deref() == Some(error_codes::REFLEX_TICK_LATE))
-        .collect::<Vec<_>>();
+        .count();
     let queued_actions = drain_actions(&mut action_rx);
 
     assert_eq!(samples.len(), 3);
     assert!(samples.iter().all(|sample| sample.late));
     assert_eq!(late.len(), 1);
-    assert_eq!(tick_late_audits.len(), 1);
+    assert_eq!(tick_late_audit_count, 1);
     assert_eq!(
         queued_actions.len(),
         ACTION_QUEUE_CAPACITY,
@@ -1374,7 +1374,7 @@ fn named_key(value: &str) -> Key {
     }
 }
 
-fn aim_track_params(target: Point) -> AimTrackParams {
+const fn aim_track_params(target: Point) -> AimTrackParams {
     let mut params = AimTrackParams::new(AimTrackTarget::Point(target));
     params.deadzone_px = 0.0;
     params.max_speed_px_per_tick = 1.0;

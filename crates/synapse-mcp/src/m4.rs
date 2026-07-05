@@ -3842,7 +3842,8 @@ fn validate_run_shell_params(params: &ActRunShellParams) -> Result<(), ErrorData
     validate_run_shell_environment(&params.env)?;
     validate_run_shell_command_shape(params, command)?;
     validate_run_shell_chromium_debug_policy(params)?;
-    if let Some(marker) = detect_shell_global_input(&shell_command_line(params)) {
+    let command_line = shell_command_line(params);
+    if let Some(marker) = detect_shell_global_input(&command_line) {
         return Err(shell_tool_error(
             error_codes::SAFETY_SHELL_GLOBAL_INPUT_DENIED,
             "act_run_shell command performs global OS keyboard/mouse/foreground input, which bypasses the foreground input lease and lands on the human operator's foreground window; use Synapse's lease-gated action primitives or a background target-specific tool instead of injecting input through a shell",
@@ -3852,6 +3853,44 @@ fn validate_run_shell_params(params: &ActRunShellParams) -> Result<(), ErrorData
                 "reason": "global_input_via_shell_denied",
                 "command": params.command,
                 "remediation": "use lease-gated act_press/act_type/act_stroke for input or a target-specific background browser tool for tab/window selection",
+            }),
+        ));
+    }
+    if let Some(variable) = detect_shell_reserved_variable_assignment(&command_line) {
+        return Err(shell_tool_error(
+            error_codes::SAFETY_SHELL_RESERVED_VARIABLE_COLLISION,
+            &format!(
+                "act_run_shell assigns to the PowerShell automatic/read-only variable ${variable}; PowerShell variable names are case-insensitive, so this collides with the built-in ${} and the assignment silently fails while later uses keep the built-in value (this is how #1507 targeted the operator home directory). Choose a non-reserved variable name.",
+                variable.to_ascii_uppercase()
+            ),
+            json!({
+                "code": error_codes::SAFETY_SHELL_RESERVED_VARIABLE_COLLISION,
+                "reserved_variable": variable,
+                "reason": "reserved_powershell_variable_assignment",
+                "reserved_variables": SHELL_RESERVED_PS_VARIABLES,
+                "remediation": format!(
+                    "rename the variable (e.g. $calyx_home instead of ${variable}); do not assign to PowerShell automatic variables"
+                ),
+            }),
+        ));
+    }
+    if let Some(reference) = detect_uncontained_recursive_delete(&command_line) {
+        let resolved = resolve_uncontained_path_reference(reference);
+        return Err(shell_tool_error(
+            error_codes::SAFETY_SHELL_RECURSIVE_DELETE_UNCONTAINED,
+            &format!(
+                "act_run_shell performs a recursive delete/move whose target references {reference}, which resolves to {} — a path outside the shell job working directory that Synapse cannot prove is contained. Refusing rather than run an unbounded recursive delete against an operator/home/tooling path (#1507). Target an explicit absolute path inside the workspace instead.",
+                resolved
+                    .as_deref()
+                    .unwrap_or("an operator/home/system path")
+            ),
+            json!({
+                "code": error_codes::SAFETY_SHELL_RECURSIVE_DELETE_UNCONTAINED,
+                "path_reference": reference,
+                "resolved_target": resolved,
+                "working_dir": params.working_dir,
+                "reason": "recursive_delete_target_not_workspace_contained",
+                "remediation": "pass an explicit absolute path under the working_dir; do not delete paths derived from $HOME/$env:USERPROFILE/$PROFILE/system roots",
             }),
         ));
     }
@@ -5595,6 +5634,80 @@ fn child_base_environment() -> BTreeMap<String, (String, String)> {
     env
 }
 
+/// Resolves a bare executable name (`rg`, `findstr`, …) against a semicolon
+/// PATH plus PATHEXT, returning the first matching file. Mirrors how Windows
+/// resolves a bare command name so the readback matches what a shell job's own
+/// executable resolution would find.
+#[cfg(windows)]
+fn resolve_program_on_path(program: &str, path: &str, pathext: &str) -> Option<String> {
+    let exts: Vec<&str> = pathext
+        .split(';')
+        .map(str::trim)
+        .filter(|ext| !ext.is_empty())
+        .collect();
+    for dir in path.split(';').map(str::trim).filter(|dir| !dir.is_empty()) {
+        let base = Path::new(dir.trim_matches('"'));
+        // Honor an already-qualified name (e.g. "rg.exe") before appending exts.
+        let direct = base.join(program);
+        if direct.is_file() {
+            return Some(direct.to_string_lossy().into_owned());
+        }
+        for ext in &exts {
+            let candidate = base.join(format!("{program}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+/// Reports which bounded-search tools resolve inside the exact child-process
+/// environment Synapse shell jobs receive — not the daemon's own PATH.
+///
+/// Agents are told to prefer `rg` for fast bounded FSV scans, but `rg` may be
+/// absent from the machine entirely (it is not a Windows built-in, and it lived
+/// in `~/.cargo/bin` which is easy to wipe). Without a deterministic
+/// availability signal an agent only learns `rg` is missing *after* a shell job
+/// fails with `is not recognized`, and a harness that does not fail closed on
+/// stderr can mistake that for a completed scan (#1505, #1506). This readback
+/// lets an agent pick a resolvable primitive up front. `findstr` (a Windows
+/// built-in) and PowerShell `Select-String` are the documented always-available
+/// fallbacks when `rg` is absent.
+#[must_use]
+pub fn shell_search_tool_readback() -> String {
+    #[cfg(windows)]
+    {
+        let env = child_base_environment();
+        let path = env_value(&env, "PATH").unwrap_or_default();
+        let pathext = env_value(&env, "PATHEXT").unwrap_or(WINDOWS_DEFAULT_PATHEXT);
+        let rg = resolve_program_on_path("rg", path, pathext);
+        let findstr = resolve_program_on_path("findstr", path, pathext);
+        let git = resolve_program_on_path("git", path, pathext);
+        let powershell = resolve_program_on_path("powershell", path, pathext)
+            .or_else(|| resolve_program_on_path("pwsh", path, pathext));
+        let primary = if rg.is_some() {
+            "rg"
+        } else if findstr.is_some() {
+            "findstr"
+        } else {
+            "powershell_select_string"
+        };
+        format!(
+            "shell_search_tools rg={} findstr={} git={} powershell={} primary={primary} documented_fallback=powershell_select_string",
+            rg.as_deref().unwrap_or("absent"),
+            findstr.as_deref().unwrap_or("absent"),
+            git.as_deref().unwrap_or("absent"),
+            powershell.as_deref().unwrap_or("absent"),
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        "shell_search_tools platform=non_windows primary=which_rg_or_grep documented_fallback=grep"
+            .to_owned()
+    }
+}
+
 fn env_value<'a>(env: &'a BTreeMap<String, (String, String)>, key: &str) -> Option<&'a str> {
     env.get(&key.to_ascii_uppercase())
         .map(|(_key, value)| value.as_str())
@@ -6836,7 +6949,7 @@ fn create_shell_job_paths(
         let paths = shell_job_paths_from_root(&root, &job_id);
         match fs::create_dir(&paths.job_dir) {
             Ok(()) => return Ok((job_id, paths)),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(shell_tool_error(
                     error_codes::STORAGE_WRITE_FAILED,
@@ -7446,7 +7559,7 @@ fn ssh_family_client_for_executable(command: &str) -> Option<&'static str> {
     }
 }
 
-fn shell_spawn_command<'a>(command: &'a str) -> Cow<'a, str> {
+fn shell_spawn_command(command: &str) -> Cow<'_, str> {
     #[cfg(windows)]
     if let Some(resolved) = resolve_windows_ssh_family_spawn_command(command) {
         tracing::info!(
@@ -10296,10 +10409,9 @@ fn shell_budget_error(
         Some(error_codes::ACTION_BUDGET_EXPIRED.to_owned()),
         Some(format!(
             "caller timeout_ms budget expired after {timeout_ms} ms; the process tree was terminated. \
-             Inline MCP calls are guarded by a {} ms client-call budget so long-running commands keep \
+             Inline MCP calls are guarded by a {DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS} ms client-call budget so long-running commands keep \
              a durable status handle instead of disappearing behind a client timeout. To allow more \
-             time: {remediation}.",
-            DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS
+             time: {remediation}."
         )),
     )
 }
@@ -10361,7 +10473,7 @@ impl OwnedProcessJob {
             SetInformationJobObject(
                 self.handle,
                 JobObjectExtendedLimitInformation,
-                &raw const limits as *const _,
+                (&raw const limits).cast(),
                 limit_size,
             )
         }
@@ -10445,7 +10557,7 @@ pub(crate) fn assign_owned_process_job(
         SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
-            &raw const limits as *const _,
+            (&raw const limits).cast(),
             limit_size,
         )
     }
@@ -10772,6 +10884,165 @@ fn detect_shell_global_input(command_line: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|marker| haystack.contains(marker))
+}
+
+/// PowerShell automatic/read-only variables (case-insensitive names). Assigning
+/// to any of these silently fails or throws, and the name then keeps its
+/// built-in value — the `$home`/`$HOME` collision behind #1507. Assignment to
+/// one of these is almost never intended and is refused fail-closed.
+const SHELL_RESERVED_PS_VARIABLES: &[&str] = &[
+    "home",
+    "pwd",
+    "pid",
+    "profile",
+    "pshome",
+    "psscriptroot",
+    "pscommandpath",
+    "psversiontable",
+    "host",
+    "true",
+    "false",
+    "null",
+    "input",
+    "matches",
+    "myinvocation",
+    "executioncontext",
+    "shellid",
+    "lastexitcode",
+    "consolefilename",
+];
+
+/// PowerShell/cmd path variables that can resolve outside a shell job's
+/// workspace (user home, profile, tooling roots). A recursive delete/move that
+/// targets one of these cannot be proven contained. Lowercase for matching.
+const SHELL_UNCONTAINED_PATH_REFERENCES: &[&str] = &[
+    "$home",
+    "${home}",
+    "$env:userprofile",
+    "$env:homepath",
+    "$env:homedrive",
+    "$env:appdata",
+    "$env:localappdata",
+    "$env:systemroot",
+    "$env:windir",
+    "$env:programfiles",
+    "$env:programdata",
+    "$profile",
+    "$pshome",
+];
+
+/// Recursive/whole-tree destructive verb+flag pairs. Each entry is
+/// `(verb_markers, recursive_flag_markers)`; a hazard requires one marker from
+/// each set in the same command. Lowercase for matching.
+const SHELL_RECURSIVE_DELETE_VERBS: &[&str] = &[
+    "remove-item",
+    "remove-itemproperty",
+    "[system.io.directory]::delete",
+    " ri ",
+    " rm ",
+    " rmdir",
+    " rd ",
+    " del ",
+    " erase ",
+    "move-item",
+    " mv ",
+    " move ",
+];
+
+const SHELL_RECURSIVE_FLAGS: &[&str] = &[
+    "-recurse",
+    "-r ",
+    "-r\"",
+    " /s",
+    "-force -recurse",
+    ", $true",
+];
+
+/// Detects assignment to a PowerShell automatic/read-only variable (the
+/// `$home = ...` collision from #1507). Returns the offending variable name.
+///
+/// Only assignment is a hazard: read-only *use* (`Join-Path $HOME x`) and
+/// `$env:` namespace variables are left alone. `==`, `-eq`, and comparison
+/// contexts are not assignments and do not match.
+fn detect_shell_reserved_variable_assignment(command_line: &str) -> Option<&'static str> {
+    let haystack = command_line.to_ascii_lowercase();
+    for reserved in SHELL_RESERVED_PS_VARIABLES {
+        let needle = format!("${reserved}");
+        let mut search_from = 0;
+        while let Some(rel) = haystack[search_from..].find(&needle) {
+            let start = search_from + rel;
+            let after = start + needle.len();
+            // The next non-name byte must not continue the identifier — otherwise
+            // `$home` matched inside `$homedir`. PowerShell identifiers allow
+            // ASCII alphanumerics and `_`.
+            let boundary_ok = haystack.as_bytes().get(after).is_none_or(|byte| {
+                !(byte.is_ascii_alphanumeric() || *byte == b'_' || *byte == b':')
+            });
+            if boundary_ok {
+                // Skip whitespace, then require a single `=` that is not `==`,
+                // `-eq`, `+=` is still a write to a read-only var so it counts.
+                let rest = haystack[after..].trim_start();
+                let is_assignment = rest
+                    .strip_prefix("+=")
+                    .or_else(|| rest.strip_prefix('='))
+                    .is_some_and(|tail| !tail.starts_with('='));
+                if is_assignment {
+                    return Some(reserved);
+                }
+            }
+            search_from = after;
+        }
+    }
+    None
+}
+
+/// Detects a recursive delete/move whose target references a path variable that
+/// can resolve outside the workspace (the `Remove-Item $home -Recurse` shape).
+/// Returns the offending path reference marker.
+fn detect_uncontained_recursive_delete(command_line: &str) -> Option<&'static str> {
+    // Pad with spaces so ` rm `/` del ` style word-boundary markers match at the
+    // command-line edges too.
+    let haystack = format!(" {} ", command_line.to_ascii_lowercase());
+    let has_recursive_verb = SHELL_RECURSIVE_DELETE_VERBS
+        .iter()
+        .any(|verb| haystack.contains(verb));
+    if !has_recursive_verb {
+        return None;
+    }
+    let has_recursive_flag = SHELL_RECURSIVE_FLAGS
+        .iter()
+        .any(|flag| haystack.contains(flag));
+    if !has_recursive_flag {
+        return None;
+    }
+    SHELL_UNCONTAINED_PATH_REFERENCES
+        .iter()
+        .copied()
+        .find(|reference| haystack.contains(reference))
+}
+
+/// Resolves an uncontained path reference marker to the absolute path it would
+/// evaluate to on this host, so the refusal can surface the real target.
+#[cfg(windows)]
+fn resolve_uncontained_path_reference(reference: &str) -> Option<String> {
+    let key = match reference {
+        "$home" | "${home}" | "$env:userprofile" => "USERPROFILE",
+        "$env:homepath" => "HOMEPATH",
+        "$env:homedrive" => "HOMEDRIVE",
+        "$env:appdata" => "APPDATA",
+        "$env:localappdata" => "LOCALAPPDATA",
+        "$env:systemroot" | "$env:windir" => "SystemRoot",
+        "$env:programfiles" => "ProgramFiles",
+        "$env:programdata" => "ProgramData",
+        "$profile" | "$pshome" => "USERPROFILE",
+        _ => return None,
+    };
+    std::env::var(key).ok()
+}
+
+#[cfg(not(windows))]
+fn resolve_uncontained_path_reference(_reference: &str) -> Option<String> {
+    None
 }
 
 fn shell_command_line_from_parts(command: &str, args: &[String]) -> String {
@@ -11346,6 +11617,198 @@ fn contains_any_character_class_repetition(pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_search_tool_readback_resolves_windows_builtins() {
+        // The readback resolves against the same child-process environment shell
+        // jobs receive. `findstr` and `powershell` are Windows built-ins that
+        // `ensure_windows_path_entries` always merges into the child PATH, so
+        // they must resolve to real files — otherwise the readback (and the
+        // shell env it describes) is broken. This is the FSV anchor: a missing
+        // findstr here means the child PATH is not actually usable.
+        let readback = shell_search_tool_readback();
+        assert!(
+            readback.starts_with("shell_search_tools "),
+            "unexpected readback shape: {readback}"
+        );
+        assert!(
+            readback.contains("documented_fallback=powershell_select_string"),
+            "readback must name the documented fallback primitive: {readback}"
+        );
+        assert!(
+            !readback.contains("findstr=absent"),
+            "findstr is a Windows built-in on the child PATH and must resolve: {readback}"
+        );
+        assert!(
+            !readback.contains("powershell=absent"),
+            "powershell must resolve on the child PATH: {readback}"
+        );
+        // `primary` must never claim a tool the readback reports as absent.
+        let primary = readback
+            .split_whitespace()
+            .find_map(|token| token.strip_prefix("primary="))
+            .expect("readback must include a primary= token");
+        assert!(
+            matches!(primary, "rg" | "findstr" | "powershell_select_string"),
+            "unexpected primary tool {primary}: {readback}"
+        );
+        if primary == "rg" {
+            assert!(
+                !readback.contains("rg=absent"),
+                "primary=rg contradicts rg=absent: {readback}"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_variable_assignment_detection() {
+        // Collisions that must be refused.
+        assert_eq!(
+            detect_shell_reserved_variable_assignment("$home = \"C:\\temp\\calyx\""),
+            Some("home")
+        );
+        assert_eq!(
+            detect_shell_reserved_variable_assignment("$HOME=$scratch"),
+            Some("home")
+        );
+        assert_eq!(
+            detect_shell_reserved_variable_assignment("$Profile = 'x'"),
+            Some("profile")
+        );
+        assert_eq!(
+            detect_shell_reserved_variable_assignment("$PWD += 'x'"),
+            Some("pwd")
+        );
+        // Safe: read-only use, env namespace, different identifier, RHS use.
+        assert_eq!(
+            detect_shell_reserved_variable_assignment("Join-Path $HOME 'sub'"),
+            None
+        );
+        assert_eq!(
+            detect_shell_reserved_variable_assignment("$env:HOME = 'x'"),
+            None
+        );
+        assert_eq!(
+            detect_shell_reserved_variable_assignment("$homedir = 'x'"),
+            None
+        );
+        assert_eq!(
+            detect_shell_reserved_variable_assignment("$scratch = $HOME"),
+            None
+        );
+        assert_eq!(
+            detect_shell_reserved_variable_assignment("if ($host -eq 'x') { 1 }"),
+            None
+        );
+    }
+
+    #[test]
+    fn uncontained_recursive_delete_detection() {
+        // The exact #1507 shape and variants must be refused.
+        assert_eq!(
+            detect_uncontained_recursive_delete("Remove-Item $home -Recurse -Force"),
+            Some("$home")
+        );
+        assert_eq!(
+            detect_uncontained_recursive_delete("rm -r $env:USERPROFILE\\scratch"),
+            Some("$env:userprofile")
+        );
+        assert_eq!(
+            detect_uncontained_recursive_delete("[System.IO.Directory]::Delete($profile, $true)"),
+            Some("$profile")
+        );
+        // Safe: recursive delete of an explicit workspace path (no home ref).
+        assert_eq!(
+            detect_uncontained_recursive_delete(
+                "Remove-Item C:\\code\\Synapse\\target\\fsv -Recurse -Force"
+            ),
+            None
+        );
+        // Safe: reference present but NOT recursive.
+        assert_eq!(detect_uncontained_recursive_delete("Get-Item $home"), None);
+        assert_eq!(
+            detect_uncontained_recursive_delete("Remove-Item $home"),
+            None
+        );
+    }
+
+    #[test]
+    fn validate_run_shell_params_refuses_reserved_variable_and_recursive_home_delete() {
+        let collision = shell_params(
+            "powershell.exe",
+            vec!["-NoProfile", "-Command", "$home = 'C:\\temp\\x'"],
+            1000,
+        );
+        let err = validate_run_shell_params(&collision)
+            .expect_err("reserved variable assignment must be refused");
+        assert_eq!(
+            err.data
+                .as_ref()
+                .and_then(|d| d.get("code"))
+                .and_then(serde_json::Value::as_str),
+            Some(error_codes::SAFETY_SHELL_RESERVED_VARIABLE_COLLISION)
+        );
+
+        let uncontained = shell_params(
+            "powershell.exe",
+            vec![
+                "-NoProfile",
+                "-Command",
+                "Remove-Item $home -Recurse -Force",
+            ],
+            1000,
+        );
+        let err = validate_run_shell_params(&uncontained)
+            .expect_err("recursive home delete must be refused");
+        let data = err.data.as_ref().expect("structured error data");
+        assert_eq!(
+            data.get("code").and_then(serde_json::Value::as_str),
+            Some(error_codes::SAFETY_SHELL_RECURSIVE_DELETE_UNCONTAINED)
+        );
+        // The refusal must surface the resolved absolute target, not just the ref.
+        #[cfg(windows)]
+        assert!(
+            data.get("resolved_target")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|target| !target.is_empty()),
+            "refusal must surface the resolved home path"
+        );
+    }
+
+    #[test]
+    fn validate_run_shell_params_allows_workspace_recursive_delete() {
+        let ok = shell_params(
+            "powershell.exe",
+            vec![
+                "-NoProfile",
+                "-Command",
+                "Remove-Item C:\\code\\Synapse\\target\\fsv -Recurse -Force",
+            ],
+            1000,
+        );
+        validate_run_shell_params(&ok)
+            .expect("recursive delete of an explicit workspace path must be allowed");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_program_on_path_finds_and_misses() {
+        let system32 = format!(
+            "{}\\System32",
+            std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_owned())
+        );
+        let pathext = WINDOWS_DEFAULT_PATHEXT;
+        assert!(
+            resolve_program_on_path("findstr", &system32, pathext).is_some(),
+            "findstr.exe must resolve under System32"
+        );
+        assert!(
+            resolve_program_on_path("synapse_definitely_not_a_real_tool_xyz", &system32, pathext)
+                .is_none(),
+            "a nonexistent tool must resolve to None, not a false positive"
+        );
+    }
 
     fn shell_config_for(params: &ActRunShellParams) -> M4ServiceConfig {
         match M4ServiceConfig::from_cli_parts(
@@ -15298,10 +15761,7 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         }))
         .expect_err("invalid concrete timeout type must fail");
 
-        println!(
-            "readback=act_run_shell_params edge=invalid_timeout_type after=error:{}",
-            error
-        );
+        println!("readback=act_run_shell_params edge=invalid_timeout_type after=error:{error}");
         assert!(error.to_string().contains("invalid type"));
     }
 

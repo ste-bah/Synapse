@@ -607,7 +607,7 @@ impl SynapseService {
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("write agent mailbox row {}: {error}", row_key),
+                    format!("write agent mailbox row {row_key}: {error}"),
                 )
             })?;
         let storage_readback = readback_exact_mailbox_row(&db, &row_key)?;
@@ -639,7 +639,7 @@ impl SynapseService {
                     "agent_send",
                     "steer",
                     Some(from_session.to_owned()),
-                    Some(message.to_session.clone()),
+                    Some(message.to_session),
                     command_payload,
                     command_before,
                     json!({

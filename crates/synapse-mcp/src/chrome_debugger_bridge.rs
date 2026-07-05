@@ -118,13 +118,13 @@ const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
 
 #[derive(Clone, Debug)]
-pub(crate) struct NativeHostInvocation {
+pub struct NativeHostInvocation {
     pub origin: String,
     pub parent_window: Option<String>,
 }
 
 #[must_use]
-pub(crate) fn native_host_invocation_from_args<I>(args: I) -> Option<NativeHostInvocation>
+pub fn native_host_invocation_from_args<I>(args: I) -> Option<NativeHostInvocation>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -145,7 +145,7 @@ where
 }
 
 #[derive(Debug)]
-pub(crate) struct ChromeDebuggerBridgeError {
+pub struct ChromeDebuggerBridgeError {
     code: &'static str,
     detail: String,
 }
@@ -268,8 +268,10 @@ impl ChromeDebuggerBridgeError {
         let expected_worker_path = profile_install_state
             .active_profile_extension_path
             .as_ref()
-            .map(|path| quote_detail_value(&path.join("service_worker.js").to_string_lossy()))
-            .unwrap_or_else(|| "<none>".to_owned());
+            .map_or_else(
+                || "<none>".to_owned(),
+                |path| quote_detail_value(&path.join("service_worker.js").to_string_lossy()),
+            );
         Self {
             code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
             detail: format!(
@@ -277,8 +279,7 @@ impl ChromeDebuggerBridgeError {
                 host.extension_id.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_version.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_protocol_version
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "not_seen_yet".to_owned()),
+                    .map_or_else(|| "not_seen_yet".to_owned(), |value| value.to_string()),
                 host.extension_build_id.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_declared_build_sha256
                     .as_deref()
@@ -692,13 +693,9 @@ fn scan_chrome_profiles_uncached() -> ChromeProfileScan {
                             manifest_permissions.join(","),
                             granted_hazards.join(","),
                             runtime_state
-                                .state
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| "<absent>".to_owned()),
+                                .state.map_or_else(|| "<absent>".to_owned(), |value| value.to_string()),
                             runtime_state
-                                .active_bit
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| "<absent>".to_owned()),
+                                .active_bit.map_or_else(|| "<absent>".to_owned(), |value| value.to_string()),
                             format_disable_reasons(&runtime_state.disable_reasons)
                         ));
                     }
@@ -770,13 +767,9 @@ fn scan_chrome_profiles_uncached() -> ChromeProfileScan {
                     manifest_permissions.join(","),
                     granted_hazards.join(","),
                     runtime_state
-                        .state
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "<absent>".to_owned()),
+                        .state.map_or_else(|| "<absent>".to_owned(), |value| value.to_string()),
                     runtime_state
-                        .active_bit
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "<absent>".to_owned()),
+                        .active_bit.map_or_else(|| "<absent>".to_owned(), |value| value.to_string()),
                     format_disable_reasons(&runtime_state.disable_reasons)
                 ));
             }
@@ -835,11 +828,9 @@ fn scan_chrome_profiles_uncached() -> ChromeProfileScan {
     };
     let active_profile_detail = active_profile
         .as_deref()
-        .map(quote_detail_value)
-        .unwrap_or_else(|| "<unknown>".to_owned());
-    let active_profile_installed_detail = active_profile_installed
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "unknown".to_owned());
+        .map_or_else(|| "<unknown>".to_owned(), quote_detail_value);
+    let active_profile_installed_detail =
+        active_profile_installed.map_or_else(|| "unknown".to_owned(), |value| value.to_string());
     let installed_profile_detail = if installed_profiles.is_empty() {
         "<none>".to_owned()
     } else {
@@ -849,10 +840,10 @@ fn scan_chrome_profiles_uncached() -> ChromeProfileScan {
             .collect::<Vec<_>>()
             .join(",")
     };
-    let active_profile_extension_path_detail = active_profile_extension_path
-        .as_ref()
-        .map(|path| quote_detail_value(&path.to_string_lossy()))
-        .unwrap_or_else(|| "<none>".to_owned());
+    let active_profile_extension_path_detail = active_profile_extension_path.as_ref().map_or_else(
+        || "<none>".to_owned(),
+        |path| quote_detail_value(&path.to_string_lossy()),
+    );
     let active_profile_service_worker_sha256_detail = active_profile_service_worker_sha256
         .as_deref()
         .unwrap_or("not_available");
@@ -1036,7 +1027,7 @@ fn chrome_policy_set_value_access_status(subkey: &str) -> String {
             PCWSTR(subkey_wide.as_ptr()),
             None,
             KEY_SET_VALUE,
-            &mut key,
+            &raw mut key,
         )
     };
     if status != windows::Win32::Foundation::ERROR_SUCCESS {
@@ -1223,8 +1214,10 @@ fn active_host_popup_risk_suppression_summary() -> String {
         .active_host_id
         .as_ref()
         .and_then(|host_id| inner.hosts.get(host_id))
-        .map(|host| popup_risk_suppression_summary(&host.extension_popup_risk_suppression))
-        .unwrap_or_else(|| "not_reported".to_owned())
+        .map_or_else(
+            || "not_reported".to_owned(),
+            |host| popup_risk_suppression_summary(&host.extension_popup_risk_suppression),
+        )
 }
 
 fn ensure_normal_bridge_external_popup_suppressed(
@@ -1668,15 +1661,11 @@ fn external_chrome_layout_infobar_processes() -> Vec<String> {
             }
 
             let parent_pid = process
-                .parent()
-                .map(|parent| parent.as_u32().to_string())
-                .unwrap_or_else(|| "<unknown>".to_owned());
+                .parent().map_or_else(|| "<unknown>".to_owned(), |parent| parent.as_u32().to_string());
             let user_data_dir = process_switch_arg_value(&command_args, "--user-data-dir");
             let user_data_dir_state = chrome_user_data_dir_state_label(user_data_dir.as_deref());
             let user_data_dir_display = user_data_dir
-                .as_deref()
-                .map(quote_detail_value)
-                .unwrap_or_else(|| "<missing>".to_owned());
+                .as_deref().map_or_else(|| "<missing>".to_owned(), quote_detail_value);
             let parent_chain = chrome_process_parent_chain(&system, process.parent());
             let owner_hint = chrome_layout_infobar_owner_hint(
                 &command_line,
@@ -1873,7 +1862,7 @@ fn sha256_file_hex_lower(path: &Path) -> Result<String, String> {
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ChromeDebuggerMouseButton {
+pub enum ChromeDebuggerMouseButton {
     Left,
     Right,
     Middle,
@@ -1890,21 +1879,21 @@ impl ChromeDebuggerMouseButton {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerClickPoint {
+pub struct ChromeDebuggerClickPoint {
     pub x: f64,
     pub y: f64,
     pub target_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerTypeResult {
+pub struct ChromeDebuggerTypeResult {
     pub x: f64,
     pub y: f64,
     pub target_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerTypeActiveElementResult {
+pub struct ChromeDebuggerTypeActiveElementResult {
     pub target_id: String,
     pub tab_id: u32,
     pub chars_typed: u32,
@@ -1925,7 +1914,7 @@ pub(crate) struct ChromeDebuggerTypeActiveElementResult {
 /// raw in-page field values returned to the daemon for an exact Source-of-Truth
 /// comparison; they are hashed before leaving the daemon and never logged raw.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerSetFieldValueResult {
+pub struct ChromeDebuggerSetFieldValueResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -1958,7 +1947,7 @@ pub(crate) struct ChromeDebuggerSetFieldValueResult {
 /// `document.documentElement.outerHTML` from a normal Chrome tab without
 /// debugger attach.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageContentResult {
+pub struct ChromeDebuggerPageContentResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -1995,7 +1984,7 @@ pub(crate) struct ChromeDebuggerPageContentResult {
 /// Result of the typed `setContent` bridge command: document replacement via
 /// `document.open/write/close` plus same-tab readback, without debugger attach.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerSetContentResult {
+pub struct ChromeDebuggerSetContentResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2038,7 +2027,7 @@ pub(crate) struct ChromeDebuggerSetContentResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerAriaSnapshotNode {
+pub struct ChromeDebuggerAriaSnapshotNode {
     pub element_id: String,
     #[serde(default)]
     pub parent_element_id: Option<String>,
@@ -2059,7 +2048,7 @@ pub(crate) struct ChromeDebuggerAriaSnapshotNode {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerAriaSnapshotResult {
+pub struct ChromeDebuggerAriaSnapshotResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2109,7 +2098,7 @@ pub(crate) struct ChromeDebuggerAriaSnapshotResult {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerAssertElementState {
+pub struct ChromeDebuggerAssertElementState {
     #[serde(default)]
     pub tag_name: String,
     #[serde(default)]
@@ -2127,7 +2116,7 @@ pub(crate) struct ChromeDebuggerAssertElementState {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerAssertPollResult {
+pub struct ChromeDebuggerAssertPollResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2157,7 +2146,7 @@ pub(crate) struct ChromeDebuggerAssertPollResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerLocateElementsResult {
+pub struct ChromeDebuggerLocateElementsResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2197,7 +2186,7 @@ pub(crate) struct ChromeDebuggerLocateElementsResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerWaitForTextResult {
+pub struct ChromeDebuggerWaitForTextResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2239,7 +2228,7 @@ pub(crate) struct ChromeDebuggerWaitForTextResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerWaitForFunctionResult {
+pub struct ChromeDebuggerWaitForFunctionResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2287,7 +2276,7 @@ pub(crate) struct ChromeDebuggerWaitForFunctionResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerWaitForLoadStateResult {
+pub struct ChromeDebuggerWaitForLoadStateResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2337,7 +2326,7 @@ pub(crate) struct ChromeDebuggerWaitForLoadStateResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerWaitForUrlResult {
+pub struct ChromeDebuggerWaitForUrlResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2379,7 +2368,7 @@ pub(crate) struct ChromeDebuggerWaitForUrlResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerNetworkWaitEntry {
+pub struct ChromeDebuggerNetworkWaitEntry {
     #[serde(default)]
     pub seq: u64,
     #[serde(default)]
@@ -2421,7 +2410,7 @@ pub(crate) struct ChromeDebuggerNetworkWaitEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerWaitForNetworkResult {
+pub struct ChromeDebuggerWaitForNetworkResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2471,7 +2460,7 @@ pub(crate) struct ChromeDebuggerWaitForNetworkResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerWaitForSelectorResult {
+pub struct ChromeDebuggerWaitForSelectorResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2527,7 +2516,7 @@ pub(crate) struct ChromeDebuggerWaitForSelectorResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerInspectElementResult {
+pub struct ChromeDebuggerInspectElementResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2561,7 +2550,7 @@ pub(crate) struct ChromeDebuggerInspectElementResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerScrollIntoViewResult {
+pub struct ChromeDebuggerScrollIntoViewResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2596,7 +2585,7 @@ pub(crate) struct ChromeDebuggerScrollIntoViewResult {
 
 /// Readback from the typed normal-bridge `clock` command.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerClockReadback {
+pub struct ChromeDebuggerClockReadback {
     #[serde(default)]
     pub installed: bool,
     #[serde(default)]
@@ -2620,7 +2609,7 @@ pub(crate) struct ChromeDebuggerClockReadback {
 /// Result of the typed `clock` bridge command: Playwright-style page clock
 /// control in the current normal Chrome document without debugger attach.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerClockResult {
+pub struct ChromeDebuggerClockResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2657,7 +2646,7 @@ pub(crate) struct ChromeDebuggerClockResult {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageEventEntry {
+pub struct ChromeDebuggerPageEventEntry {
     #[serde(default)]
     pub seq: u64,
     #[serde(default)]
@@ -2707,7 +2696,7 @@ pub(crate) struct ChromeDebuggerPageEventEntry {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageTargetSnapshot {
+pub struct ChromeDebuggerPageTargetSnapshot {
     #[serde(default)]
     pub target_id: String,
     #[serde(default)]
@@ -2741,7 +2730,7 @@ pub(crate) struct ChromeDebuggerPageTargetSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerWorkerSnapshot {
+pub struct ChromeDebuggerWorkerSnapshot {
     #[serde(default)]
     pub worker_id: String,
     #[serde(default)]
@@ -2765,7 +2754,7 @@ pub(crate) struct ChromeDebuggerWorkerSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageEventsFilters {
+pub struct ChromeDebuggerPageEventsFilters {
     #[serde(default)]
     pub since_seq: Option<u64>,
     #[serde(default)]
@@ -2777,7 +2766,7 @@ pub(crate) struct ChromeDebuggerPageEventsFilters {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageEventsResult {
+pub struct ChromeDebuggerPageEventsResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2823,13 +2812,13 @@ pub(crate) struct ChromeDebuggerPageEventsResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerNodeValue {
+pub struct ChromeDebuggerNodeValue {
     pub value: String,
     pub target_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerOpenTabResult {
+pub struct ChromeDebuggerOpenTabResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2858,7 +2847,7 @@ pub(crate) struct ChromeDebuggerOpenTabResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerCloseTabResult {
+pub struct ChromeDebuggerCloseTabResult {
     pub target_id: String,
     pub tab_id: u32,
     pub target_count_before: u32,
@@ -2867,7 +2856,7 @@ pub(crate) struct ChromeDebuggerCloseTabResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerTabTarget {
+pub struct ChromeDebuggerTabTarget {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2890,7 +2879,7 @@ pub(crate) struct ChromeDebuggerTabTarget {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerListTabsResult {
+pub struct ChromeDebuggerListTabsResult {
     pub extension_id: Option<String>,
     #[serde(default)]
     pub chrome_window_id: Option<i64>,
@@ -2910,7 +2899,7 @@ pub(crate) struct ChromeDebuggerListTabsResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerTargetInfo {
+pub struct ChromeDebuggerTargetInfo {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -2940,7 +2929,7 @@ pub(crate) struct ChromeDebuggerTargetInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerViewportOverride {
+pub struct ChromeDebuggerViewportOverride {
     pub width: u32,
     pub height: u32,
     pub device_scale_factor: f64,
@@ -2948,7 +2937,7 @@ pub(crate) struct ChromeDebuggerViewportOverride {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerViewportReadback {
+pub struct ChromeDebuggerViewportReadback {
     pub inner_width: i64,
     pub inner_height: i64,
     pub device_pixel_ratio: f64,
@@ -2967,7 +2956,7 @@ pub(crate) struct ChromeDebuggerViewportReadback {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerViewportEmulationResult {
+pub struct ChromeDebuggerViewportEmulationResult {
     pub extension_id: Option<String>,
     pub target_id: String,
     pub tab_id: u32,
@@ -2997,7 +2986,7 @@ pub(crate) struct ChromeDebuggerViewportEmulationResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerDeviceDescriptor {
+pub struct ChromeDebuggerDeviceDescriptor {
     pub user_agent: String,
     pub width: u32,
     pub height: u32,
@@ -3008,7 +2997,7 @@ pub(crate) struct ChromeDebuggerDeviceDescriptor {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerDeviceReadback {
+pub struct ChromeDebuggerDeviceReadback {
     pub viewport: ChromeDebuggerViewportReadback,
     pub user_agent: String,
     pub max_touch_points: i64,
@@ -3020,7 +3009,7 @@ pub(crate) struct ChromeDebuggerDeviceReadback {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerDeviceEmulationResult {
+pub struct ChromeDebuggerDeviceEmulationResult {
     pub extension_id: Option<String>,
     pub target_id: String,
     pub tab_id: u32,
@@ -3052,7 +3041,7 @@ pub(crate) struct ChromeDebuggerDeviceEmulationResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerGeolocationOverride {
+pub struct ChromeDebuggerGeolocationOverride {
     pub latitude: f64,
     pub longitude: f64,
     pub accuracy: f64,
@@ -3067,7 +3056,7 @@ pub(crate) struct ChromeDebuggerGeolocationOverride {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerGeolocationCoordinatesReadback {
+pub struct ChromeDebuggerGeolocationCoordinatesReadback {
     pub latitude: f64,
     pub longitude: f64,
     pub accuracy: f64,
@@ -3083,13 +3072,13 @@ pub(crate) struct ChromeDebuggerGeolocationCoordinatesReadback {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerGeolocationErrorReadback {
+pub struct ChromeDebuggerGeolocationErrorReadback {
     pub code: i64,
     pub message: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerGeolocationReadback {
+pub struct ChromeDebuggerGeolocationReadback {
     pub permission_state: String,
     #[serde(default)]
     pub position: Option<ChromeDebuggerGeolocationCoordinatesReadback>,
@@ -3098,7 +3087,7 @@ pub(crate) struct ChromeDebuggerGeolocationReadback {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerGeolocationEmulationResult {
+pub struct ChromeDebuggerGeolocationEmulationResult {
     pub extension_id: Option<String>,
     pub target_id: String,
     pub tab_id: u32,
@@ -3130,7 +3119,7 @@ pub(crate) struct ChromeDebuggerGeolocationEmulationResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerLocaleTimezoneOverride {
+pub struct ChromeDebuggerLocaleTimezoneOverride {
     #[serde(default)]
     pub locale: Option<String>,
     #[serde(default)]
@@ -3138,7 +3127,7 @@ pub(crate) struct ChromeDebuggerLocaleTimezoneOverride {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerLocaleTimezoneReadback {
+pub struct ChromeDebuggerLocaleTimezoneReadback {
     pub locale: String,
     pub calendar: String,
     pub numbering_system: String,
@@ -3150,7 +3139,7 @@ pub(crate) struct ChromeDebuggerLocaleTimezoneReadback {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerLocaleEmulationResult {
+pub struct ChromeDebuggerLocaleEmulationResult {
     pub extension_id: Option<String>,
     pub target_id: String,
     pub tab_id: u32,
@@ -3180,7 +3169,7 @@ pub(crate) struct ChromeDebuggerLocaleEmulationResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerMediaOverride {
+pub struct ChromeDebuggerMediaOverride {
     #[serde(default)]
     pub media: Option<String>,
     #[serde(default)]
@@ -3190,7 +3179,7 @@ pub(crate) struct ChromeDebuggerMediaOverride {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerMediaReadback {
+pub struct ChromeDebuggerMediaReadback {
     pub media_screen: bool,
     pub media_print: bool,
     pub color_scheme_dark: bool,
@@ -3201,7 +3190,7 @@ pub(crate) struct ChromeDebuggerMediaReadback {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerMediaEmulationResult {
+pub struct ChromeDebuggerMediaEmulationResult {
     pub extension_id: Option<String>,
     pub target_id: String,
     pub tab_id: u32,
@@ -3231,7 +3220,7 @@ pub(crate) struct ChromeDebuggerMediaEmulationResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerNetworkConditionsOverride {
+pub struct ChromeDebuggerNetworkConditionsOverride {
     pub offline: bool,
     pub latency_ms: f64,
     pub download_throughput_bytes_per_sec: f64,
@@ -3241,7 +3230,7 @@ pub(crate) struct ChromeDebuggerNetworkConditionsOverride {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerNetworkConditionsReadback {
+pub struct ChromeDebuggerNetworkConditionsReadback {
     pub online: bool,
     #[serde(default)]
     pub connection_type: Option<String>,
@@ -3256,7 +3245,7 @@ pub(crate) struct ChromeDebuggerNetworkConditionsReadback {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerNetworkConditionsResult {
+pub struct ChromeDebuggerNetworkConditionsResult {
     pub extension_id: Option<String>,
     pub target_id: String,
     pub tab_id: u32,
@@ -3286,7 +3275,7 @@ pub(crate) struct ChromeDebuggerNetworkConditionsResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerFrameEntry {
+pub struct ChromeDebuggerFrameEntry {
     #[serde(default)]
     pub frame_id: String,
     #[serde(default)]
@@ -3326,7 +3315,7 @@ pub(crate) struct ChromeDebuggerFrameEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerLocatedFrame {
+pub struct ChromeDebuggerLocatedFrame {
     #[serde(default)]
     pub resolved: bool,
     #[serde(default)]
@@ -3354,7 +3343,7 @@ pub(crate) struct ChromeDebuggerLocatedFrame {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerFramesResult {
+pub struct ChromeDebuggerFramesResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -3392,7 +3381,7 @@ pub(crate) struct ChromeDebuggerFramesResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerCaptureVisibleTabResult {
+pub struct ChromeDebuggerCaptureVisibleTabResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -3436,7 +3425,7 @@ pub(crate) struct ChromeDebuggerCaptureVisibleTabResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageScreenshotResult {
+pub struct ChromeDebuggerPageScreenshotResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -3503,7 +3492,7 @@ pub(crate) struct ChromeDebuggerPageScreenshotResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPagePdfResult {
+pub struct ChromeDebuggerPagePdfResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -3556,7 +3545,7 @@ pub(crate) struct ChromeDebuggerPagePdfResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerDownloadsResult {
+pub struct ChromeDebuggerDownloadsResult {
     #[serde(default)]
     pub extension_id: Option<String>,
     #[serde(default)]
@@ -3590,7 +3579,7 @@ pub(crate) struct ChromeDebuggerDownloadsResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerDownloadEntry {
+pub struct ChromeDebuggerDownloadEntry {
     #[serde(default)]
     pub id: i64,
     #[serde(default)]
@@ -3634,7 +3623,7 @@ pub(crate) struct ChromeDebuggerDownloadEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerDownloadEvent {
+pub struct ChromeDebuggerDownloadEvent {
     #[serde(default)]
     pub seq: u64,
     #[serde(default)]
@@ -3668,7 +3657,7 @@ pub(crate) struct ChromeDebuggerDownloadEvent {
 }
 
 #[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageScreenshotRect {
+pub struct ChromeDebuggerPageScreenshotRect {
     #[serde(default)]
     pub x: f64,
     #[serde(default)]
@@ -3680,7 +3669,7 @@ pub(crate) struct ChromeDebuggerPageScreenshotRect {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageScreenshotTile {
+pub struct ChromeDebuggerPageScreenshotTile {
     #[serde(default)]
     pub scroll_x_css: f64,
     #[serde(default)]
@@ -3695,7 +3684,7 @@ pub(crate) struct ChromeDebuggerPageScreenshotTile {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerCaptureAttempt {
+pub struct ChromeDebuggerCaptureAttempt {
     #[serde(default)]
     pub attempt: u32,
     #[serde(default)]
@@ -3716,7 +3705,7 @@ where
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerLargestContentfulPaint {
+pub struct ChromeDebuggerLargestContentfulPaint {
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -3746,7 +3735,7 @@ pub(crate) struct ChromeDebuggerLargestContentfulPaint {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageVitals {
+pub struct ChromeDebuggerPageVitals {
     #[serde(default)]
     pub available: bool,
     #[serde(default)]
@@ -3770,7 +3759,7 @@ pub(crate) struct ChromeDebuggerPageVitals {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageVitalsResult {
+pub struct ChromeDebuggerPageVitalsResult {
     pub extension_id: Option<String>,
     pub target_id: String,
     pub tab_id: u32,
@@ -3792,7 +3781,7 @@ pub(crate) struct ChromeDebuggerPageVitalsResult {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerPageText {
+pub struct ChromeDebuggerPageText {
     #[serde(default)]
     pub available: bool,
     #[serde(default)]
@@ -3822,7 +3811,7 @@ pub(crate) struct ChromeDebuggerPageText {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerFrameReadback {
+pub struct ChromeDebuggerFrameReadback {
     #[serde(default)]
     pub index: Option<usize>,
     #[serde(default)]
@@ -3860,7 +3849,7 @@ pub(crate) struct ChromeDebuggerFrameReadback {
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerActiveElement {
+pub struct ChromeDebuggerActiveElement {
     #[serde(default)]
     pub available: bool,
     #[serde(default)]
@@ -3894,7 +3883,7 @@ pub(crate) struct ChromeDebuggerActiveElement {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerNavigateResult {
+pub struct ChromeDebuggerNavigateResult {
     pub target_id: String,
     pub tab_id: u32,
     pub action: String,
@@ -3932,7 +3921,7 @@ pub(crate) struct ChromeDebuggerNavigateResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerActivateTabResult {
+pub struct ChromeDebuggerActivateTabResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -3954,7 +3943,7 @@ pub(crate) struct ChromeDebuggerActivateTabResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerEvaluateScriptResult {
+pub struct ChromeDebuggerEvaluateScriptResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -3986,7 +3975,7 @@ pub(crate) struct ChromeDebuggerEvaluateScriptResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerInitScriptResult {
+pub struct ChromeDebuggerInitScriptResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -4006,7 +3995,7 @@ pub(crate) struct ChromeDebuggerInitScriptResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerBindingCall {
+pub struct ChromeDebuggerBindingCall {
     pub seq: u64,
     pub name: String,
     pub payload: String,
@@ -4019,7 +4008,7 @@ pub(crate) struct ChromeDebuggerBindingCall {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerExposeBindingResult {
+pub struct ChromeDebuggerExposeBindingResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -4067,7 +4056,7 @@ pub(crate) struct ChromeDebuggerExposeBindingResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerDialogEntry {
+pub struct ChromeDebuggerDialogEntry {
     pub seq: u64,
     pub url: String,
     pub frame_id: String,
@@ -4103,7 +4092,7 @@ pub(crate) struct ChromeDebuggerDialogEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerHandleDialogResult {
+pub struct ChromeDebuggerHandleDialogResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -4159,7 +4148,7 @@ pub(crate) struct ChromeDebuggerHandleDialogResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerFileUploadFile {
+pub struct ChromeDebuggerFileUploadFile {
     pub name: String,
     #[serde(default)]
     pub size: u64,
@@ -4170,7 +4159,7 @@ pub(crate) struct ChromeDebuggerFileUploadFile {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerFileUploadInput {
+pub struct ChromeDebuggerFileUploadInput {
     #[serde(default)]
     pub resolved_by: String,
     #[serde(default)]
@@ -4206,7 +4195,7 @@ pub(crate) struct ChromeDebuggerFileUploadInput {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerFileChooserEntry {
+pub struct ChromeDebuggerFileChooserEntry {
     pub seq: u64,
     #[serde(default)]
     pub frame_id: String,
@@ -4232,7 +4221,7 @@ pub(crate) struct ChromeDebuggerFileChooserEntry {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeDebuggerFileUploadResult {
+pub struct ChromeDebuggerFileUploadResult {
     pub target_id: String,
     pub tab_id: u32,
     #[serde(default)]
@@ -4293,7 +4282,7 @@ pub(crate) struct ChromeDebuggerFileUploadResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeBridgeReloadCommandAck {
+pub struct ChromeBridgeReloadCommandAck {
     pub ok: bool,
     #[serde(rename = "extensionId")]
     pub extension_id: String,
@@ -4326,7 +4315,7 @@ pub(crate) struct ChromeBridgeReloadCommandAck {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeBridgeHostSnapshot {
+pub struct ChromeBridgeHostSnapshot {
     pub host_id: String,
     pub origin: String,
     pub extension_id: Option<String>,
@@ -4358,7 +4347,7 @@ pub(crate) struct ChromeBridgeHostSnapshot {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeBridgeReloadResult {
+pub struct ChromeBridgeReloadResult {
     pub before: ChromeBridgeHostSnapshot,
     pub command_ack: ChromeBridgeReloadCommandAck,
     pub after: ChromeBridgeHostSnapshot,
@@ -4367,7 +4356,7 @@ pub(crate) struct ChromeBridgeReloadResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeBridgeMaintenancePauseAck {
+pub struct ChromeBridgeMaintenancePauseAck {
     pub ok: bool,
     pub host_id: Option<String>,
     pub pause_ms: u64,
@@ -4385,7 +4374,7 @@ pub(crate) struct ChromeBridgeMaintenancePauseAck {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub(crate) struct ChromeBridgeWebSocketCloseAck {
+pub struct ChromeBridgeWebSocketCloseAck {
     pub had_socket: bool,
     pub ready_state_before: Option<u16>,
     pub close_requested: bool,
@@ -4405,7 +4394,7 @@ struct NativeRegisterResponse {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct NativeRegisterRequest {
+pub struct NativeRegisterRequest {
     origin: String,
     pid: u32,
     parent_window: Option<String>,
@@ -4414,25 +4403,25 @@ pub(crate) struct NativeRegisterRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) struct NativeMessageRequest {
+pub struct NativeMessageRequest {
     host_id: String,
     message: Value,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct NativeMaintenancePauseRequest {
+pub struct NativeMaintenancePauseRequest {
     pause_ms: Option<u64>,
     reason: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct NativeNextQuery {
+pub struct NativeNextQuery {
     host_id: String,
     timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct NativeWsQuery {
+pub struct NativeWsQuery {
     host_id: String,
     bridge_token: String,
 }
@@ -4489,7 +4478,7 @@ struct ExtensionTabNavigationEvent {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ChromeDebuggerBrowserNavigationEvent {
+pub struct ChromeDebuggerBrowserNavigationEvent {
     pub source: String,
     pub event: String,
     pub url: String,
@@ -4596,7 +4585,7 @@ fn browser_navigation_sink_slot() -> &'static Mutex<Option<Arc<BrowserNavigation
     SINK.get_or_init(|| Mutex::new(None))
 }
 
-pub(crate) fn set_browser_navigation_sink(sink: Arc<BrowserNavigationSink>) {
+pub fn set_browser_navigation_sink(sink: Arc<BrowserNavigationSink>) {
     match browser_navigation_sink_slot().lock() {
         Ok(mut guard) => *guard = Some(sink),
         Err(poisoned) => *poisoned.into_inner() = Some(sink),
@@ -4725,8 +4714,7 @@ fn bridge_command_stale_reason_with_profile_state(
         return Some(format!(
             "debugger_api_available={} expected=true",
             host.extension_debugger_api_available
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "not_seen_yet".to_owned())
+                .map_or_else(|| "not_seen_yet".to_owned(), |value| value.to_string())
         ));
     }
     if host.extension_capabilities.is_empty() {
@@ -4752,9 +4740,8 @@ fn service_worker_integrity_stale_reason(
     expected_worker_path: Option<&str>,
     expected_error: Option<&str>,
 ) -> Option<String> {
-    let expected_worker_path = expected_worker_path
-        .map(quote_detail_value)
-        .unwrap_or_else(|| "<none>".to_owned());
+    let expected_worker_path =
+        expected_worker_path.map_or_else(|| "<none>".to_owned(), quote_detail_value);
     let actual_status = actual_status.unwrap_or("not_seen_yet");
     let actual_error = actual_error.unwrap_or("none");
     match (actual_sha256, expected_sha256) {
@@ -4816,8 +4803,7 @@ fn bridge_identity_stale_reasons(host: &ChromeBridgeHealthRecord) -> Vec<String>
         reasons.push(format!(
             "debugger_api_available={} expected=true",
             host.extension_debugger_api_available
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "not_seen_yet".to_owned())
+                .map_or_else(|| "not_seen_yet".to_owned(), |value| value.to_string())
         ));
     }
     let missing = bridge_missing_required_capabilities(&host.extension_capabilities);
@@ -5475,7 +5461,7 @@ impl ChromeDebuggerBridge {
     /// Long-running in-extension operations (e.g. `downloads` operation=wait with
     /// a caller `waitTimeoutMs` greater than the default 30s) must give the daemon
     /// a budget that outlives the in-page wait, otherwise the daemon kills the
-    /// command first and surfaces a transport-looking A11Y_CDP_EXTENSION_TIMEOUT
+    /// command first and surfaces a transport-looking `A11Y_CDP_EXTENSION_TIMEOUT`
     /// instead of the extension's clean no-match result (#1342).
     async fn send_command_with_timeout(
         &self,
@@ -5717,7 +5703,7 @@ fn bridge() -> &'static ChromeDebuggerBridge {
     })
 }
 
-pub(crate) fn health_subsystem() -> SubsystemHealth {
+pub fn health_subsystem() -> SubsystemHealth {
     let profile_scan = chrome_profile_scan();
     let mut popup_risks = profile_scan.scan.external_profile_surfaces.clone();
     popup_risks.extend(external_chrome_native_messaging_processes());
@@ -5843,8 +5829,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     let extension_version = host.extension_version.as_deref().unwrap_or("not_seen_yet");
     let extension_protocol_version = host
         .extension_protocol_version
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "not_seen_yet".to_owned());
+        .map_or_else(|| "not_seen_yet".to_owned(), |value| value.to_string());
     let extension_build_id = host.extension_build_id.as_deref().unwrap_or("not_seen_yet");
     let extension_declared_build_sha256 = host
         .extension_declared_build_sha256
@@ -5864,8 +5849,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
         .unwrap_or("not_seen_yet");
     let extension_service_worker_byte_length = host
         .extension_service_worker_byte_length
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "not_seen_yet".to_owned());
+        .map_or_else(|| "not_seen_yet".to_owned(), |value| value.to_string());
     let extension_service_worker_sha256_error = host
         .extension_service_worker_sha256_error
         .as_deref()
@@ -5877,14 +5861,12 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     let expected_service_worker_path = host
         .expected_service_worker_path
         .as_deref()
-        .map(quote_detail_value)
-        .unwrap_or_else(|| "<none>".to_owned());
+        .map_or_else(|| "<none>".to_owned(), quote_detail_value);
     let extension_capabilities = format_capabilities(&host.extension_capabilities);
     let extension_user_agent = host.extension_user_agent.as_deref().unwrap_or("");
     let extension_debugger_api_available = host
         .extension_debugger_api_available
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "not_seen_yet".to_owned());
+        .map_or_else(|| "not_seen_yet".to_owned(), |value| value.to_string());
     let popup_risk_suppression =
         popup_risk_suppression_summary(&host.extension_popup_risk_suppression);
     let popup_risk_suppression_ok = popup_risk_suppression_covers_profile_risks(
@@ -5990,7 +5972,7 @@ async fn send_attach_command(
     Err(error)
 }
 
-pub(crate) async fn click_node(
+pub async fn click_node(
     hwnd: i64,
     foreground_title: &str,
     target_id_hint: Option<&str>,
@@ -6018,7 +6000,7 @@ pub(crate) async fn click_node(
     })
 }
 
-pub(crate) async fn type_node(
+pub async fn type_node(
     hwnd: i64,
     foreground_title: &str,
     target_id_hint: Option<&str>,
@@ -6044,7 +6026,7 @@ pub(crate) async fn type_node(
     })
 }
 
-pub(crate) async fn node_value(
+pub async fn node_value(
     hwnd: i64,
     foreground_title: &str,
     target_id_hint: Option<&str>,
@@ -6068,7 +6050,7 @@ pub(crate) async fn node_value(
     })
 }
 
-pub(crate) async fn open_tab(
+pub async fn open_tab(
     hwnd: i64,
     url: &str,
     agent_session_id: Option<&str>,
@@ -6102,7 +6084,7 @@ pub(crate) async fn open_tab(
     })
 }
 
-pub(crate) async fn list_tabs(
+pub async fn list_tabs(
     hwnd: i64,
     expected_chrome_window_id: Option<i64>,
     expected_window_bounds: Option<Rect>,
@@ -6132,7 +6114,7 @@ pub(crate) async fn list_tabs(
     })
 }
 
-pub(crate) async fn close_tab(
+pub async fn close_tab(
     hwnd: i64,
     target_id: &str,
 ) -> Result<ChromeDebuggerCloseTabResult, ChromeDebuggerBridgeError> {
@@ -6153,7 +6135,7 @@ pub(crate) async fn close_tab(
     })
 }
 
-pub(crate) async fn target_info(
+pub async fn target_info(
     hwnd: i64,
     target_id: &str,
     expected_chrome_window_id: Option<i64>,
@@ -6185,7 +6167,7 @@ pub(crate) async fn target_info(
     })
 }
 
-pub(crate) struct ChromeDebuggerViewportEmulationRequest<'a> {
+pub struct ChromeDebuggerViewportEmulationRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
     pub operation: &'a str,
@@ -6196,7 +6178,7 @@ pub(crate) struct ChromeDebuggerViewportEmulationRequest<'a> {
     pub wait_timeout_ms: u64,
 }
 
-pub(crate) async fn viewport_emulation(
+pub async fn viewport_emulation(
     request: ChromeDebuggerViewportEmulationRequest<'_>,
 ) -> Result<ChromeDebuggerViewportEmulationResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "viewportEmulation")?;
@@ -6222,7 +6204,7 @@ pub(crate) async fn viewport_emulation(
     })
 }
 
-pub(crate) struct ChromeDebuggerDeviceEmulationRequest<'a> {
+pub struct ChromeDebuggerDeviceEmulationRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
     pub operation: &'a str,
@@ -6236,7 +6218,7 @@ pub(crate) struct ChromeDebuggerDeviceEmulationRequest<'a> {
     pub wait_timeout_ms: u64,
 }
 
-pub(crate) async fn device_emulation(
+pub async fn device_emulation(
     request: ChromeDebuggerDeviceEmulationRequest<'_>,
 ) -> Result<ChromeDebuggerDeviceEmulationResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "deviceEmulation")?;
@@ -6265,7 +6247,7 @@ pub(crate) async fn device_emulation(
     })
 }
 
-pub(crate) struct ChromeDebuggerGeolocationEmulationRequest {
+pub struct ChromeDebuggerGeolocationEmulationRequest {
     pub hwnd: i64,
     pub target_id: String,
     pub operation: String,
@@ -6280,7 +6262,7 @@ pub(crate) struct ChromeDebuggerGeolocationEmulationRequest {
     pub wait_timeout_ms: u64,
 }
 
-pub(crate) async fn geolocation_emulation(
+pub async fn geolocation_emulation(
     request: ChromeDebuggerGeolocationEmulationRequest,
 ) -> Result<ChromeDebuggerGeolocationEmulationResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "geolocationEmulation")?;
@@ -6310,7 +6292,7 @@ pub(crate) async fn geolocation_emulation(
     })
 }
 
-pub(crate) struct ChromeDebuggerLocaleEmulationRequest<'a> {
+pub struct ChromeDebuggerLocaleEmulationRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
     pub operation: &'a str,
@@ -6319,7 +6301,7 @@ pub(crate) struct ChromeDebuggerLocaleEmulationRequest<'a> {
     pub wait_timeout_ms: u64,
 }
 
-pub(crate) async fn locale_emulation(
+pub async fn locale_emulation(
     request: ChromeDebuggerLocaleEmulationRequest<'_>,
 ) -> Result<ChromeDebuggerLocaleEmulationResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "localeEmulation")?;
@@ -6343,7 +6325,7 @@ pub(crate) async fn locale_emulation(
     })
 }
 
-pub(crate) struct ChromeDebuggerMediaEmulationRequest<'a> {
+pub struct ChromeDebuggerMediaEmulationRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
     pub operation: &'a str,
@@ -6353,7 +6335,7 @@ pub(crate) struct ChromeDebuggerMediaEmulationRequest<'a> {
     pub wait_timeout_ms: u64,
 }
 
-pub(crate) async fn media_emulation(
+pub async fn media_emulation(
     request: ChromeDebuggerMediaEmulationRequest<'_>,
 ) -> Result<ChromeDebuggerMediaEmulationResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "mediaEmulation")?;
@@ -6378,7 +6360,7 @@ pub(crate) async fn media_emulation(
     })
 }
 
-pub(crate) async fn page_vitals(
+pub async fn page_vitals(
     hwnd: i64,
     target_id: &str,
 ) -> Result<ChromeDebuggerPageVitalsResult, ChromeDebuggerBridgeError> {
@@ -6399,7 +6381,7 @@ pub(crate) async fn page_vitals(
     })
 }
 
-pub(crate) struct ChromeDebuggerNetworkConditionsRequest<'a> {
+pub struct ChromeDebuggerNetworkConditionsRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
     pub operation: &'a str,
@@ -6411,7 +6393,7 @@ pub(crate) struct ChromeDebuggerNetworkConditionsRequest<'a> {
     pub wait_timeout_ms: u64,
 }
 
-pub(crate) async fn network_conditions(
+pub async fn network_conditions(
     request: ChromeDebuggerNetworkConditionsRequest<'_>,
 ) -> Result<ChromeDebuggerNetworkConditionsResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "networkConditions")?;
@@ -6438,7 +6420,7 @@ pub(crate) async fn network_conditions(
     })
 }
 
-pub(crate) async fn frames(
+pub async fn frames(
     hwnd: i64,
     target_id: &str,
 ) -> Result<ChromeDebuggerFramesResult, ChromeDebuggerBridgeError> {
@@ -6459,7 +6441,7 @@ pub(crate) async fn frames(
     })
 }
 
-pub(crate) async fn capture_visible_tab(
+pub async fn capture_visible_tab(
     hwnd: i64,
     _target_id: &str,
     _expected_chrome_window_id: Option<i64>,
@@ -6470,7 +6452,7 @@ pub(crate) async fn capture_visible_tab(
     ))
 }
 
-pub(crate) async fn page_screenshot(
+pub async fn page_screenshot(
     hwnd: i64,
     target_id: &str,
     params: Value,
@@ -6491,7 +6473,7 @@ pub(crate) async fn page_screenshot(
     })
 }
 
-pub(crate) async fn page_pdf(
+pub async fn page_pdf(
     hwnd: i64,
     target_id: &str,
     params: Value,
@@ -6512,7 +6494,7 @@ pub(crate) async fn page_pdf(
     })
 }
 
-pub(crate) async fn downloads(
+pub async fn downloads(
     hwnd: i64,
     params: Value,
 ) -> Result<ChromeDebuggerDownloadsResult, ChromeDebuggerBridgeError> {
@@ -6560,7 +6542,7 @@ fn downloads_command_timeout(payload: &Value) -> Duration {
     budget.max(COMMAND_TIMEOUT)
 }
 
-pub(crate) async fn type_active_element(
+pub async fn type_active_element(
     hwnd: i64,
     target_id: &str,
     text: &str,
@@ -6592,7 +6574,7 @@ pub(crate) async fn type_active_element(
 /// (React-safe), and returns the raw before/after values for the daemon's
 /// Source-of-Truth check. No foreground, no debugger attach; works on
 /// inactive/occluded tabs UIA cannot perceive.
-pub(crate) async fn set_field_value(
+pub async fn set_field_value(
     hwnd: i64,
     target_id: &str,
     expected_chrome_window_id: Option<i64>,
@@ -6623,7 +6605,7 @@ pub(crate) async fn set_field_value(
     })
 }
 
-pub(crate) async fn page_content(
+pub async fn page_content(
     hwnd: i64,
     target_id: &str,
     max_bytes: usize,
@@ -6646,7 +6628,7 @@ pub(crate) async fn page_content(
     })
 }
 
-pub(crate) async fn cookies(
+pub async fn cookies(
     hwnd: i64,
     target_id: &str,
     mut params: Value,
@@ -6660,7 +6642,7 @@ pub(crate) async fn cookies(
     bridge().send_command("cookies", params).await
 }
 
-pub(crate) async fn storage_state(
+pub async fn storage_state(
     hwnd: i64,
     target_id: &str,
     mut params: Value,
@@ -6674,7 +6656,7 @@ pub(crate) async fn storage_state(
     bridge().send_command("storageState", params).await
 }
 
-pub(crate) async fn set_content(
+pub async fn set_content(
     hwnd: i64,
     target_id: &str,
     html: &str,
@@ -6701,7 +6683,7 @@ pub(crate) async fn set_content(
     })
 }
 
-pub(crate) async fn aria_snapshot(
+pub async fn aria_snapshot(
     hwnd: i64,
     target_id: &str,
     root_element_id: Option<&str>,
@@ -6728,7 +6710,7 @@ pub(crate) async fn aria_snapshot(
     })
 }
 
-pub(crate) async fn assert_poll(
+pub async fn assert_poll(
     hwnd: i64,
     target_id: &str,
     locator: Value,
@@ -6753,7 +6735,7 @@ pub(crate) async fn assert_poll(
     })
 }
 
-pub(crate) async fn locate_elements(
+pub async fn locate_elements(
     hwnd: i64,
     target_id: &str,
     locator: Value,
@@ -6778,7 +6760,7 @@ pub(crate) async fn locate_elements(
     })
 }
 
-pub(crate) async fn inspect_element(
+pub async fn inspect_element(
     hwnd: i64,
     target_id: &str,
     element_id: &str,
@@ -6803,7 +6785,7 @@ pub(crate) async fn inspect_element(
     })
 }
 
-pub(crate) async fn scroll_into_view(
+pub async fn scroll_into_view(
     hwnd: i64,
     target_id: &str,
     element_id: &str,
@@ -6826,7 +6808,7 @@ pub(crate) async fn scroll_into_view(
     })
 }
 
-pub(crate) async fn wait_for_text(
+pub async fn wait_for_text(
     hwnd: i64,
     target_id: &str,
     state: &str,
@@ -6855,7 +6837,7 @@ pub(crate) async fn wait_for_text(
     })
 }
 
-pub(crate) async fn wait_for_function(
+pub async fn wait_for_function(
     hwnd: i64,
     target_id: &str,
     expression: &str,
@@ -6884,7 +6866,7 @@ pub(crate) async fn wait_for_function(
     })
 }
 
-pub(crate) async fn wait_for_load_state(
+pub async fn wait_for_load_state(
     hwnd: i64,
     target_id: &str,
     state: &str,
@@ -6910,7 +6892,7 @@ pub(crate) async fn wait_for_load_state(
     })
 }
 
-pub(crate) async fn wait_for_url(
+pub async fn wait_for_url(
     hwnd: i64,
     target_id: &str,
     url: &str,
@@ -6944,7 +6926,7 @@ pub(crate) async fn wait_for_url(
 // scalars captured at the call site; bundling them into a params struct would only
 // relocate the same fields.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn wait_for_request(
+pub async fn wait_for_request(
     hwnd: i64,
     target_id: &str,
     url: Option<&str>,
@@ -6970,7 +6952,7 @@ pub(crate) async fn wait_for_request(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn wait_for_response(
+pub async fn wait_for_response(
     hwnd: i64,
     target_id: &str,
     url: Option<&str>,
@@ -7033,7 +7015,7 @@ async fn wait_for_network(
     })
 }
 
-pub(crate) async fn wait_for_selector(
+pub async fn wait_for_selector(
     hwnd: i64,
     target_id: &str,
     locator: Value,
@@ -7064,7 +7046,7 @@ pub(crate) async fn wait_for_selector(
     })
 }
 
-pub(crate) async fn clock(
+pub async fn clock(
     hwnd: i64,
     target_id: &str,
     operation: &str,
@@ -7091,7 +7073,7 @@ pub(crate) async fn clock(
     })
 }
 
-pub(crate) async fn page_events(
+pub async fn page_events(
     hwnd: i64,
     target_id: &str,
     since_seq: Option<u64>,
@@ -7120,7 +7102,7 @@ pub(crate) async fn page_events(
     })
 }
 
-pub(crate) async fn navigate_tab(
+pub async fn navigate_tab(
     hwnd: i64,
     target_id: &str,
     action: &str,
@@ -7157,7 +7139,7 @@ pub(crate) async fn navigate_tab(
 /// foreground before/after and fail closed if Chrome becomes foreground.
 /// External debugger/nativeMessaging risks must be suppressed by policy or the
 /// bridge management fallback before this queues.
-pub(crate) async fn activate_tab(
+pub async fn activate_tab(
     hwnd: i64,
     target_id: &str,
     wait_timeout_ms: u64,
@@ -7180,7 +7162,7 @@ pub(crate) async fn activate_tab(
     })
 }
 
-pub(crate) async fn evaluate_script(
+pub async fn evaluate_script(
     hwnd: i64,
     target_id: &str,
     expression: &str,
@@ -7213,7 +7195,7 @@ pub(crate) async fn evaluate_script(
     clippy::too_many_arguments,
     reason = "mirrors the MCP init-script parameters sent to the bridge"
 )]
-pub(crate) async fn init_script(
+pub async fn init_script(
     hwnd: i64,
     target_id: &str,
     operation: &str,
@@ -7250,7 +7232,7 @@ pub(crate) async fn init_script(
     clippy::too_many_arguments,
     reason = "mirrors the MCP binding parameters sent to the bridge"
 )]
-pub(crate) async fn expose_binding(
+pub async fn expose_binding(
     hwnd: i64,
     target_id: &str,
     operation: &str,
@@ -7285,7 +7267,7 @@ pub(crate) async fn expose_binding(
     clippy::too_many_arguments,
     reason = "mirrors the MCP dialog parameters sent to the bridge"
 )]
-pub(crate) async fn handle_dialog(
+pub async fn handle_dialog(
     hwnd: i64,
     target_id: &str,
     operation: &str,
@@ -7316,7 +7298,7 @@ pub(crate) async fn handle_dialog(
     })
 }
 
-pub(crate) struct ChromeDebuggerFileUploadRequest<'a> {
+pub struct ChromeDebuggerFileUploadRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
     pub operation: &'a str,
@@ -7328,7 +7310,7 @@ pub(crate) struct ChromeDebuggerFileUploadRequest<'a> {
     pub limit: usize,
 }
 
-pub(crate) async fn file_upload(
+pub async fn file_upload(
     request: ChromeDebuggerFileUploadRequest<'_>,
 ) -> Result<ChromeDebuggerFileUploadResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "fileUpload")?;
@@ -7355,7 +7337,7 @@ pub(crate) async fn file_upload(
     })
 }
 
-pub(crate) struct ChromeDebuggerDomActionRequest<'a> {
+pub struct ChromeDebuggerDomActionRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
     pub action: &'a str,
@@ -7381,7 +7363,7 @@ pub(crate) struct ChromeDebuggerDomActionRequest<'a> {
     pub suppress_page_text: bool,
 }
 
-pub(crate) async fn dom_action(
+pub async fn dom_action(
     request: ChromeDebuggerDomActionRequest<'_>,
 ) -> Result<Value, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "domAction")?;
@@ -7417,7 +7399,7 @@ pub(crate) async fn dom_action(
         .await
 }
 
-pub(crate) struct ChromeDebuggerCdpInputRequest<'a> {
+pub struct ChromeDebuggerCdpInputRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
     pub action: &'a str,
@@ -7450,7 +7432,7 @@ pub(crate) struct ChromeDebuggerCdpInputRequest<'a> {
     pub suppress_page_text: bool,
 }
 
-pub(crate) async fn cdp_input(
+pub async fn cdp_input(
     request: ChromeDebuggerCdpInputRequest<'_>,
 ) -> Result<Value, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "cdpInput")?;
@@ -7489,7 +7471,7 @@ pub(crate) async fn cdp_input(
         .await
 }
 
-pub(crate) struct ChromeDebuggerCoordinateClickRequest<'a> {
+pub struct ChromeDebuggerCoordinateClickRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
     pub x: i32,
@@ -7502,7 +7484,7 @@ pub(crate) struct ChromeDebuggerCoordinateClickRequest<'a> {
     pub suppress_page_text: bool,
 }
 
-pub(crate) async fn coordinate_click(
+pub async fn coordinate_click(
     request: ChromeDebuggerCoordinateClickRequest<'_>,
 ) -> Result<Value, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(request.hwnd, "coordinateClick")?;
@@ -7525,9 +7507,7 @@ pub(crate) async fn coordinate_click(
         .await
 }
 
-pub(crate) fn validate_reload_wait_timeout(
-    value: Option<u64>,
-) -> Result<u64, ChromeDebuggerBridgeError> {
+pub fn validate_reload_wait_timeout(value: Option<u64>) -> Result<u64, ChromeDebuggerBridgeError> {
     let value = value.unwrap_or(DEFAULT_RELOAD_WAIT_TIMEOUT_MS);
     if value == 0 || value > MAX_RELOAD_WAIT_TIMEOUT_MS {
         return Err(ChromeDebuggerBridgeError::params_invalid(format!(
@@ -7562,13 +7542,13 @@ fn validate_maintenance_reconnect_pause_reason(
     Ok(value.to_owned())
 }
 
-pub(crate) async fn reload_bridge(
+pub async fn reload_bridge(
     wait_timeout_ms: u64,
 ) -> Result<ChromeBridgeReloadResult, ChromeDebuggerBridgeError> {
     bridge().reload_self(wait_timeout_ms).await
 }
 
-pub(crate) async fn maintenance_pause_reconnect(
+pub async fn maintenance_pause_reconnect(
     reason: &str,
     pause_ms: Option<u64>,
 ) -> Result<ChromeBridgeMaintenancePauseAck, ChromeDebuggerBridgeError> {
@@ -7577,7 +7557,7 @@ pub(crate) async fn maintenance_pause_reconnect(
     bridge().maintenance_pause_reconnect(reason, pause_ms).await
 }
 
-pub(crate) fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: &Uri) -> bool {
+pub fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: &Uri) -> bool {
     let path = uri.path();
     if !path.starts_with("/chrome-debugger/native/") {
         return false;
@@ -7612,7 +7592,7 @@ pub(crate) fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: 
         .is_some_and(|token| bridge().direct_http_bridge_token_matches(token))
 }
 
-pub(crate) async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Response {
+pub async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Response {
     if request.transport.as_deref() == Some("direct_http") {
         note_normal_bridge_registration_external_popup_risk();
     }
@@ -7630,7 +7610,7 @@ pub(crate) async fn http_register(Json(request): Json<NativeRegisterRequest>) ->
     }
 }
 
-pub(crate) async fn http_message(Json(request): Json<NativeMessageRequest>) -> Response {
+pub async fn http_message(Json(request): Json<NativeMessageRequest>) -> Response {
     match bridge().post_message(request) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(detail) => (
@@ -7645,7 +7625,7 @@ pub(crate) async fn http_message(Json(request): Json<NativeMessageRequest>) -> R
     }
 }
 
-pub(crate) async fn http_maintenance_pause(
+pub async fn http_maintenance_pause(
     Json(request): Json<NativeMaintenancePauseRequest>,
 ) -> Response {
     match maintenance_pause_reconnect(&request.reason, request.pause_ms).await {
@@ -7673,7 +7653,7 @@ pub(crate) async fn http_maintenance_pause(
     }
 }
 
-pub(crate) async fn http_next(Query(query): Query<NativeNextQuery>) -> Response {
+pub async fn http_next(Query(query): Query<NativeNextQuery>) -> Response {
     let timeout_ms = query
         .timeout_ms
         .unwrap_or_else(|| u64::try_from(NATIVE_POLL_TIMEOUT.as_millis()).unwrap_or(15_000))
@@ -7695,7 +7675,7 @@ pub(crate) async fn http_next(Query(query): Query<NativeNextQuery>) -> Response 
     }
 }
 
-pub(crate) async fn http_ws(Query(query): Query<NativeWsQuery>, ws: WebSocketUpgrade) -> Response {
+pub async fn http_ws(Query(query): Query<NativeWsQuery>, ws: WebSocketUpgrade) -> Response {
     if !bridge().direct_http_bridge_token_matches_host(&query.host_id, &query.bridge_token) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -7723,7 +7703,7 @@ async fn direct_http_ws_loop(socket: WebSocket, host_id: String) {
         tokio::select! {
             incoming = receiver.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(_))) | Some(Ok(Message::Binary(_))) | Some(Ok(Message::Pong(_))) => {
+                    Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Pong(_))) => {
                         if !bridge().touch_host(&host_id) {
                             disconnect_detail = "registered direct HTTP host disappeared while processing WebSocket keepalive".to_owned();
                             break;
@@ -7781,7 +7761,7 @@ async fn direct_http_ws_loop(socket: WebSocket, host_id: String) {
     bridge().disconnect_direct_http_host(&host_id, &disconnect_detail);
 }
 
-pub(crate) async fn run_native_host(
+pub async fn run_native_host(
     bind: &str,
     invocation: NativeHostInvocation,
 ) -> anyhow::Result<ExitCode> {
@@ -9059,12 +9039,12 @@ mod tests {
         // A long wait extends the budget past the 30s default (+5s margin).
         assert_eq!(
             downloads_command_timeout(&json!({"operation": "wait", "waitTimeoutMs": 300_000})),
-            Duration::from_millis(300_000) + Duration::from_secs(5)
+            Duration::from_mins(5) + Duration::from_secs(5)
         );
         // save/move also wait for a completed match.
         assert_eq!(
             downloads_command_timeout(&json!({"operation": "save", "waitTimeoutMs": 120_000})),
-            Duration::from_millis(120_000) + Duration::from_secs(5)
+            Duration::from_mins(2) + Duration::from_secs(5)
         );
         // A short wait budget never drops below the default floor.
         assert_eq!(

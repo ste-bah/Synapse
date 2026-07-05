@@ -192,7 +192,7 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                 cause: "process_missing_on_startup".to_owned(),
                 detail: json!({
                     "new_pid": std::process::id(),
-                    "new_run_id": run.run_id.clone(),
+                    "new_run_id": run.run_id,
                     "reason": "daemon-run-current had no ended_at_unix_ms when this daemon acquired the DB lock",
                 }),
                 recorded_at_unix_ms: now_unix_ms(),

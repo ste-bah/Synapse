@@ -8,6 +8,13 @@ macro_rules! assert_literal {
 
 #[test]
 fn error_codes_match_literal_names() {
+    assert_perception_error_codes();
+    assert_action_error_codes();
+    assert_reflex_profile_session_storage_error_codes();
+    assert_model_and_safety_error_codes();
+}
+
+fn assert_perception_error_codes() {
     assert_literal!(OBSERVE_NO_PERCEPTION_AVAILABLE);
     assert_literal!(OBSERVE_INTERNAL);
     assert_literal!(CAPTURE_GRAPHICS_API_UNSUPPORTED);
@@ -41,7 +48,9 @@ fn error_codes_match_literal_names() {
     assert_literal!(AUDIO_DEVICE_LOST);
     assert_literal!(AUDIO_LOOPBACK_INIT_FAILED);
     assert_literal!(AUDIO_STT_MODEL_NOT_LOADED);
+}
 
+fn assert_action_error_codes() {
     assert_literal!(ACTION_QUEUE_FULL);
     assert_literal!(ACTION_RATE_LIMITED);
     assert_literal!(ACTION_BACKEND_UNAVAILABLE);
@@ -69,7 +78,9 @@ fn error_codes_match_literal_names() {
     assert_literal!(ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED);
     assert_literal!(FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED);
     assert_literal!(ACTION_ELEMENT_VALUE_READ_ONLY);
+}
 
+fn assert_reflex_profile_session_storage_error_codes() {
     assert_literal!(REFLEX_CAP_REACHED);
     assert_literal!(REFLEX_KIND_INVALID);
     assert_literal!(REFLEX_PARAMS_INVALID);
@@ -119,7 +130,9 @@ fn error_codes_match_literal_names() {
     assert_literal!(STORAGE_CF_HARD_CAP_REACHED);
 
     assert_literal!(EPISODE_NOT_FOUND);
+}
 
+fn assert_model_and_safety_error_codes() {
     assert_literal!(MODEL_DOWNLOAD_FAILED);
     assert_literal!(MODEL_HASH_MISMATCH);
     assert_literal!(MODEL_LOAD_FAILED);
@@ -137,6 +150,8 @@ fn error_codes_match_literal_names() {
     assert_literal!(SAFETY_PROCESS_DENYLISTED);
     assert_literal!(SAFETY_SHELL_DENIED_BY_POLICY);
     assert_literal!(SAFETY_SHELL_GLOBAL_INPUT_DENIED);
+    assert_literal!(SAFETY_SHELL_RESERVED_VARIABLE_COLLISION);
+    assert_literal!(SAFETY_SHELL_RECURSIVE_DELETE_UNCONTAINED);
     assert_literal!(SAFETY_LAUNCH_DENIED_BY_POLICY);
     assert_literal!(SAFETY_SECRET_REDACTED);
     assert_literal!(SAFETY_PERMISSION_DENIED);

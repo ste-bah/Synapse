@@ -458,9 +458,9 @@ impl SynapseService {
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_config_with_shutdown_reason(
                 m2_config,
-                shutdown_cancel.clone(),
+                shutdown_cancel,
                 shutdown_reason,
-                Some(connection_closed_cancel.clone()),
+                Some(connection_closed_cancel),
             )?,
             m3_state,
             m4_config,
@@ -499,9 +499,9 @@ impl SynapseService {
             m1_state: SharedM1State::default(),
             m2_state: shared_m2_state_from_config_with_shutdown_reason(
                 m2_config,
-                shutdown_cancel.clone(),
+                shutdown_cancel,
                 shutdown_reason,
-                Some(connection_closed_cancel.clone()),
+                Some(connection_closed_cancel),
             )?,
             m3_state,
             m4_config,

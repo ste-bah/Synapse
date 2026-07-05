@@ -147,7 +147,7 @@ pub struct BrowserEmulateGeolocation {
     pub grant_permission: Option<bool>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserEmulateLocale {
     #[serde(default)]
@@ -156,7 +156,7 @@ pub struct BrowserEmulateLocale {
     pub timezone_id: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserEmulateMedia {
     #[serde(default)]

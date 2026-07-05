@@ -1,8 +1,8 @@
 //! `episode_segment` tool integration regression (#846): real daemon, real
-//! RocksDB, real MCP calls. Seeds a synthetic day of timeline rows whose
+//! `RocksDB`, real MCP calls. Seeds a synthetic day of timeline rows whose
 //! expected episodes are known, segments it, re-segments it (idempotency),
 //! exercises dry-run, disk-pressure refusal, and validation errors, then
-//! reopens the database after shutdown and decodes the physical CF_EPISODES
+//! reopens the database after shutdown and decodes the physical `CF_EPISODES`
 //! rows.
 
 use anyhow::Context;

@@ -104,7 +104,7 @@ pub struct CdpNetworkEntry {
 }
 
 impl CdpNetworkEntry {
-    fn new(seq: u64, request_id: String) -> Self {
+    const fn new(seq: u64, request_id: String) -> Self {
         Self {
             seq,
             first_seq: seq,
@@ -227,7 +227,7 @@ pub struct CdpWebSocketEntry {
 }
 
 impl CdpWebSocketEntry {
-    fn new(seq: u64, request_id: String) -> Self {
+    const fn new(seq: u64, request_id: String) -> Self {
         Self {
             seq,
             first_seq: seq,
@@ -281,7 +281,7 @@ pub struct CdpWebSocketReadResult {
 }
 
 /// Response body returned by `Network.getResponseBody` for a captured request.
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct CdpNetworkResponseBody {
     pub request_id: String,
     pub body: String,
@@ -289,7 +289,7 @@ pub struct CdpNetworkResponseBody {
 }
 
 /// Request body returned by `Network.getRequestPostData` for a captured request.
-#[derive(Clone, Debug, Serialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct CdpNetworkRequestPostData {
     pub request_id: String,
     pub post_data: String,
@@ -425,11 +425,11 @@ impl RingBuffer {
         }
     }
 
-    fn cursor(&self) -> u64 {
+    const fn cursor(&self) -> u64 {
         self.next_seq
     }
 
-    fn reserve_seq(&mut self) -> u64 {
+    const fn reserve_seq(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq += 1;
         seq
@@ -550,11 +550,11 @@ impl WebSocketRingBuffer {
         }
     }
 
-    fn cursor(&self) -> u64 {
+    const fn cursor(&self) -> u64 {
         self.next_seq
     }
 
-    fn reserve_seq(&mut self) -> u64 {
+    const fn reserve_seq(&mut self) -> u64 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         seq
@@ -1014,6 +1014,7 @@ pub async fn cdp_network_capture_start(
 }
 
 /// Reads a filtered, cursor-delimited slice of a target's network buffer.
+#[must_use]
 pub fn network_capture_read(
     target_id: &str,
     filter: &CdpNetworkReadFilter<'_>,
@@ -1081,6 +1082,7 @@ pub fn network_capture_read(
 }
 
 /// Reads a filtered, cursor-delimited slice of captured WebSocket entries.
+#[must_use]
 pub fn network_web_socket_read(
     target_id: &str,
     filter: &CdpWebSocketReadFilter<'_>,
@@ -1231,7 +1233,7 @@ pub async fn network_overrides_apply(
         detail: "network override state lock is poisoned".to_owned(),
     })?;
     status.newly_armed = newly_armed;
-    status.applied_at_unix_ms = now_unix_ms() as u64;
+    status.applied_at_unix_ms = now_unix_ms_u64();
     status.header_count = config.headers.len();
     status.headers = config.headers;
     status.user_agent = config.user_agent;
@@ -1283,7 +1285,7 @@ pub async fn network_overrides_clear(
         detail: "network override state lock is poisoned".to_owned(),
     })?;
     status.newly_armed = false;
-    status.applied_at_unix_ms = now_unix_ms() as u64;
+    status.applied_at_unix_ms = now_unix_ms_u64();
     status.header_count = 0;
     status.headers.clear();
     status.user_agent = None;
@@ -1369,75 +1371,70 @@ pub async fn fetch_interception_ensure(
                 .lock()
                 .ok()
                 .and_then(|rules| fetch_route_match(event, &rules));
-            match matched_rule {
-                Some(rule) => {
-                    let route_id = rule.id.clone();
-                    match fetch_apply_route(&listener_page, event, &rule).await {
-                        Ok(applied) => {
-                            if let Ok(mut counters) = pump_counters.lock() {
-                                counters.last_route_id = Some(route_id);
-                                match applied {
-                                    FetchRouteApplied::Fulfilled => {
-                                        counters.fulfilled_count =
-                                            counters.fulfilled_count.saturating_add(1);
-                                    }
-                                    FetchRouteApplied::Failed => {
-                                        counters.failed_count =
-                                            counters.failed_count.saturating_add(1);
-                                    }
-                                    FetchRouteApplied::Continued => {
-                                        counters.continued_count =
-                                            counters.continued_count.saturating_add(1);
-                                    }
+            if let Some(rule) = matched_rule {
+                let route_id = rule.id.clone();
+                match fetch_apply_route(&listener_page, event, &rule).await {
+                    Ok(applied) => {
+                        if let Ok(mut counters) = pump_counters.lock() {
+                            counters.last_route_id = Some(route_id);
+                            match applied {
+                                FetchRouteApplied::Fulfilled => {
+                                    counters.fulfilled_count =
+                                        counters.fulfilled_count.saturating_add(1);
                                 }
-                            }
-                        }
-                        Err(error) => {
-                            let mut last_error = format!(
-                                "Fetch route {route_id} failed request_id={request_id}: {error}"
-                            );
-                            let continued = listener_page
-                                .execute(FetchContinueRequestParams::new(event.request_id.clone()))
-                                .await;
-                            if let Ok(mut counters) = pump_counters.lock() {
-                                counters.last_route_id = Some(route_id);
-                                counters.continue_error_count =
-                                    counters.continue_error_count.saturating_add(1);
-                                match continued {
-                                    Ok(_) => {
-                                        counters.continued_count =
-                                            counters.continued_count.saturating_add(1);
-                                    }
-                                    Err(continue_error) => {
-                                        counters.continue_error_count =
-                                            counters.continue_error_count.saturating_add(1);
-                                        last_error.push_str(&format!(
-                                            "; fallback Fetch.continueRequest failed: {continue_error}"
-                                        ));
-                                    }
+                                FetchRouteApplied::Failed => {
+                                    counters.failed_count = counters.failed_count.saturating_add(1);
                                 }
-                                counters.last_error = Some(last_error);
+                                FetchRouteApplied::Continued => {
+                                    counters.continued_count =
+                                        counters.continued_count.saturating_add(1);
+                                }
                             }
                         }
                     }
+                    Err(error) => {
+                        let mut last_error = format!(
+                            "Fetch route {route_id} failed request_id={request_id}: {error}"
+                        );
+                        let continued = listener_page
+                            .execute(FetchContinueRequestParams::new(event.request_id.clone()))
+                            .await;
+                        if let Ok(mut counters) = pump_counters.lock() {
+                            counters.last_route_id = Some(route_id);
+                            counters.continue_error_count =
+                                counters.continue_error_count.saturating_add(1);
+                            match continued {
+                                Ok(_) => {
+                                    counters.continued_count =
+                                        counters.continued_count.saturating_add(1);
+                                }
+                                Err(continue_error) => {
+                                    counters.continue_error_count =
+                                        counters.continue_error_count.saturating_add(1);
+                                    last_error.push_str(&format!(
+                                        "; fallback Fetch.continueRequest failed: {continue_error}"
+                                    ));
+                                }
+                            }
+                            counters.last_error = Some(last_error);
+                        }
+                    }
                 }
-                None => {
-                    let continued = listener_page
-                        .execute(FetchContinueRequestParams::new(event.request_id.clone()))
-                        .await;
-                    if let Ok(mut counters) = pump_counters.lock() {
-                        match continued {
-                            Ok(_) => {
-                                counters.continued_count =
-                                    counters.continued_count.saturating_add(1);
-                            }
-                            Err(error) => {
-                                counters.continue_error_count =
-                                    counters.continue_error_count.saturating_add(1);
-                                counters.last_error = Some(format!(
-                                    "Fetch.continueRequest request_id={request_id}: {error}"
-                                ));
-                            }
+            } else {
+                let continued = listener_page
+                    .execute(FetchContinueRequestParams::new(event.request_id.clone()))
+                    .await;
+                if let Ok(mut counters) = pump_counters.lock() {
+                    match continued {
+                        Ok(_) => {
+                            counters.continued_count = counters.continued_count.saturating_add(1);
+                        }
+                        Err(error) => {
+                            counters.continue_error_count =
+                                counters.continue_error_count.saturating_add(1);
+                            counters.last_error = Some(format!(
+                                "Fetch.continueRequest request_id={request_id}: {error}"
+                            ));
                         }
                     }
                 }
@@ -1445,7 +1442,7 @@ pub async fn fetch_interception_ensure(
         }
     });
 
-    let armed_at_unix_ms = now_unix_ms() as u64;
+    let armed_at_unix_ms = now_unix_ms_u64();
     let slot = Arc::new(FetchInterceptionSlot {
         endpoint: endpoint.to_owned(),
         target_id: target_id.to_owned(),
@@ -1558,10 +1555,11 @@ pub async fn fetch_interception_stop(target_id: &str) -> A11yResult<bool> {
 /// Number of targets with an active Fetch interception scaffold.
 #[must_use]
 pub fn fetch_interception_active_count() -> usize {
-    fetch_registry().slots.lock().map(|s| s.len()).unwrap_or(0)
+    fetch_registry().slots.lock().map_or(0, |s| s.len())
 }
 
 /// Tears down network capture for a target. Idempotent.
+#[must_use]
 pub fn network_capture_stop(target_id: &str) -> bool {
     registry()
         .slots
@@ -1572,6 +1570,7 @@ pub fn network_capture_stop(target_id: &str) -> bool {
 }
 
 /// Clears buffered network records for a target while keeping capture armed.
+#[must_use]
 pub fn network_capture_clear(target_id: &str) -> bool {
     let slot = {
         let slots = match registry().slots.lock() {
@@ -1598,7 +1597,7 @@ pub fn network_capture_clear(target_id: &str) -> bool {
 /// Number of targets with a registered network capture slot.
 #[must_use]
 pub fn network_capture_active_count() -> usize {
-    registry().slots.lock().map(|s| s.len()).unwrap_or(0)
+    registry().slots.lock().map_or(0, |s| s.len())
 }
 
 fn lookup_live(target_id: &str) -> Option<Arc<NetworkCaptureSlot>> {
@@ -1667,7 +1666,7 @@ async fn network_override_ensure(
             return Err(err);
         }
     };
-    let armed_at_unix_ms = now_unix_ms() as u64;
+    let armed_at_unix_ms = now_unix_ms_u64();
     let status = CdpNetworkOverrideStatus {
         newly_armed: true,
         endpoint: endpoint.to_owned(),
@@ -1872,9 +1871,9 @@ fn fetch_route_rule_matches(event: &FetchEventRequestPaused, rule: &CdpFetchRout
 fn fetch_route_url_matches(url: &str, rule: &CdpFetchRouteRule) -> bool {
     match rule.match_kind {
         CdpFetchRouteMatchKind::Glob => glob_matches(&rule.url, url),
-        CdpFetchRouteMatchKind::Regex => Regex::new(&rule.url)
-            .map(|regex| regex.is_match(url))
-            .unwrap_or(false),
+        CdpFetchRouteMatchKind::Regex => {
+            Regex::new(&rule.url).is_ok_and(|regex| regex.is_match(url))
+        }
     }
 }
 
@@ -2361,7 +2360,7 @@ fn websocket_frame_snapshot(
     timestamp_s: Option<f64>,
     frame: &WebSocketFrame,
 ) -> CdpWebSocketFrame {
-    let payload_base64_encoded = frame.opcode != 1.0;
+    let payload_base64_encoded = !finite_f64_eq(frame.opcode, 1.0);
     let (close_code, close_reason) = websocket_close_info(frame);
     CdpWebSocketFrame {
         seq,
@@ -2379,7 +2378,7 @@ fn websocket_frame_snapshot(
 }
 
 fn websocket_close_info(frame: &WebSocketFrame) -> (Option<u16>, Option<String>) {
-    if frame.opcode != 8.0 {
+    if !finite_f64_eq(frame.opcode, 8.0) {
         return (None, None);
     }
     let Ok(bytes) = BASE64_STANDARD.decode(&frame.payload_data) else {
@@ -2436,8 +2435,18 @@ fn headers_value(headers: &Headers) -> Value {
 fn now_unix_ms() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .unwrap_or(0.0)
+        .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+}
+
+fn now_unix_ms_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+fn finite_f64_eq(left: f64, right: f64) -> bool {
+    left.partial_cmp(&right)
+        .is_some_and(std::cmp::Ordering::is_eq)
 }
 
 #[cfg(test)]

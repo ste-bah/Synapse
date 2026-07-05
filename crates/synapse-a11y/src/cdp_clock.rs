@@ -28,7 +28,7 @@ pub enum CdpClockOperation {
 }
 
 impl CdpClockOperation {
-    fn wire(self) -> &'static str {
+    const fn wire(self) -> &'static str {
         match self {
             Self::Status => "status",
             Self::Install => "install",
@@ -78,8 +78,7 @@ fn registry() -> &'static Mutex<HashMap<String, ClockSlot>> {
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Runs one browser-clock operation against `target_id`.
@@ -263,7 +262,7 @@ async fn run_clock_js(
     })
 }
 
-fn clock_init_script() -> &'static str {
+const fn clock_init_script() -> &'static str {
     CLOCK_INIT_SCRIPT
 }
 

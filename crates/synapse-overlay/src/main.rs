@@ -157,7 +157,7 @@ mod tray {
             spawn_poll_thread(hwnd, Arc::clone(&app));
             message_loop();
             let data = notify_data(hwnd, "Synapse");
-            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+            let _ = Shell_NotifyIconW(NIM_DELETE, &raw const data);
         }
         Ok(())
     }
@@ -183,7 +183,7 @@ mod tray {
             lpszClassName: PCWSTR(class_name.as_ptr()),
             ..Default::default()
         };
-        if RegisterClassW(&wc) == 0 {
+        if RegisterClassW(&raw const wc) == 0 {
             bail!("RegisterClassW failed: {:?}", GetLastError());
         }
         let raw = Arc::into_raw(app);
@@ -230,8 +230,8 @@ mod tray {
                 LRESULT(0)
             }
             WM_TRAY => {
-                let event = lparam.0 as u32;
-                if (event == WM_RBUTTONUP || event == WM_LBUTTONUP)
+                let event = u32::try_from(lparam.0).ok();
+                if event.is_some_and(|event| event == WM_RBUTTONUP || event == WM_LBUTTONUP)
                     && let Some(app) = app_from_window(hwnd)
                 {
                     let _ = show_menu(hwnd, app);
@@ -320,9 +320,9 @@ mod tray {
 
     unsafe fn message_loop() {
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        while GetMessageW(&raw mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&raw const msg);
+            DispatchMessageW(&raw const msg);
         }
     }
 
@@ -332,7 +332,7 @@ mod tray {
         action: NOTIFY_ICON_MESSAGE,
     ) -> Result<()> {
         let data = notify_data(hwnd, &state.tip());
-        if !Shell_NotifyIconW(action, &data).as_bool() {
+        if !Shell_NotifyIconW(action, &raw const data).as_bool() {
             bail!("Shell_NotifyIconW failed: {:?}", GetLastError());
         }
         Ok(())
@@ -366,7 +366,7 @@ mod tray {
             .clone();
         populate_menu(menu, &state)?;
         let mut point = POINT::default();
-        if let Err(error) = GetCursorPos(&mut point) {
+        if let Err(error) = GetCursorPos(&raw mut point) {
             let _ = DestroyMenu(menu);
             bail!("GetCursorPos failed: {error}");
         }
@@ -545,7 +545,7 @@ mod tray {
                 bail!("daemon health returned ok=false");
             }
             let state = fetch_dashboard_state(&client, base, &app.token).await?;
-            Ok(parse_snapshot(health, state))
+            Ok(parse_snapshot(&health, &state))
         })
     }
 
@@ -613,7 +613,7 @@ mod tray {
         })
     }
 
-    fn parse_snapshot(health: HealthResponse, state: DashboardState) -> TraySnapshot {
+    fn parse_snapshot(health: &HealthResponse, state: &DashboardState) -> TraySnapshot {
         let recorder_paused = state
             .timeline
             .data
@@ -758,11 +758,11 @@ mod tray {
                 },
             };
             let snapshot = parse_snapshot(
-                HealthResponse {
+                &HealthResponse {
                     ok: true,
                     pid: Some(12),
                 },
-                state,
+                &state,
             );
             assert!(snapshot.recorder_paused);
             assert!(snapshot.demo_armed);

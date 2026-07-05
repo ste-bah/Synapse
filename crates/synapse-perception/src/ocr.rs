@@ -466,8 +466,7 @@ mod platform {
         max_dimension: u32,
     ) -> Option<Vec<TextRegion>> {
         validate_bgra_len(width, height, bytes).ok()?;
-        let mut best = None;
-        if let Some(bounds) = content_bounds_for_bgra(width, height, bytes)
+        let mut best = if let Some(bounds) = content_bounds_for_bgra(width, height, bytes)
             && let Some(candidate) = recognize_bgra_subregion(
                 engine,
                 region,
@@ -476,10 +475,11 @@ mod platform {
                 bytes,
                 bounds,
                 max_dimension,
-            )
-        {
-            best = Some(candidate);
-        }
+            ) {
+            Some(candidate)
+        } else {
+            None
+        };
         if should_try_sparse_tiling(width, height, max_dimension) {
             let mut tiled = Vec::new();
             for tile in sparse_ocr_tiles(width, height, max_dimension) {
@@ -698,7 +698,7 @@ mod platform {
             || should_try_sparse_tiling(width, height, max_dimension)
     }
 
-    fn content_candidate_possible(width: u32, height: u32) -> bool {
+    const fn content_candidate_possible(width: u32, height: u32) -> bool {
         width >= OCR_SPARSE_TILE_MIN_WIDTH_PX || height < OCR_MIN_RECOGNITION_HEIGHT_PX
     }
 
@@ -900,12 +900,22 @@ mod platform {
     }
 
     fn rect_overlap_ratio(left: Rect, right: Rect) -> f64 {
-        let left_x2 = left.x.saturating_add(left.w.max(0));
-        let left_y2 = left.y.saturating_add(left.h.max(0));
-        let right_x2 = right.x.saturating_add(right.w.max(0));
-        let right_y2 = right.y.saturating_add(right.h.max(0));
-        let overlap_w = left_x2.min(right_x2).saturating_sub(left.x.max(right.x));
-        let overlap_h = left_y2.min(right_y2).saturating_sub(left.y.max(right.y));
+        let left_end = (
+            left.x.saturating_add(left.w.max(0)),
+            left.y.saturating_add(left.h.max(0)),
+        );
+        let right_end = (
+            right.x.saturating_add(right.w.max(0)),
+            right.y.saturating_add(right.h.max(0)),
+        );
+        let overlap_w = left_end
+            .0
+            .min(right_end.0)
+            .saturating_sub(left.x.max(right.x));
+        let overlap_h = left_end
+            .1
+            .min(right_end.1)
+            .saturating_sub(left.y.max(right.y));
         if overlap_w <= 0 || overlap_h <= 0 {
             return 0.0;
         }
@@ -1028,8 +1038,12 @@ mod platform {
                     bytes[offset + 3] = 255;
                 }
             }
-            let bounds = content_bounds_for_bgra(width as u32, height as u32, &bytes)
-                .expect("content bounds");
+            let width_u32 =
+                u32::try_from(width).unwrap_or_else(|_| panic!("test width too large: {width}"));
+            let height_u32 =
+                u32::try_from(height).unwrap_or_else(|_| panic!("test height too large: {height}"));
+            let bounds =
+                content_bounds_for_bgra(width_u32, height_u32, &bytes).expect("content bounds");
             assert_eq!(
                 bounds,
                 BitmapRect {

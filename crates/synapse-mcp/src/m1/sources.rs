@@ -1789,7 +1789,7 @@ fn bgra_contrast_score(bytes: &[u8]) -> f32 {
         let luma = 0.0722_f32.mul_add(b, 0.7152_f32.mul_add(g, 0.2126_f32 * r));
         count += 1.0;
         sum += luma;
-        sum_sq += luma * luma;
+        sum_sq = luma.mul_add(luma, sum_sq);
     }
     if count <= 0.0 {
         return 0.0;

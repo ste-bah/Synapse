@@ -422,14 +422,12 @@ fn assert_exposure_overlay_matches_policy(
             );
             ensure!(
                 row.break_glass_only == "no",
-                "{} visible in normal_agent cannot be break-glass-only",
-                tool
+                "{tool} visible in normal_agent cannot be break-glass-only"
             );
         } else if tool.starts_with("action_diagnostic_") {
             ensure!(
                 row.default_exposure == "debug_only" && row.hidden_internal == "yes",
-                "{} diagnostic tool must be debug_only hidden/internal",
-                tool
+                "{tool} diagnostic tool must be debug_only hidden/internal"
             );
         } else if browser_debugger_only.contains(tool) {
             ensure!(
@@ -440,8 +438,7 @@ fn assert_exposure_overlay_matches_policy(
             );
             ensure!(
                 row.break_glass_only == "no",
-                "{} browser_debugger tool must not be classified break-glass-only",
-                tool
+                "{tool} browser_debugger tool must not be classified break-glass-only"
             );
         } else if public_tools.contains(tool) {
             ensure!(
@@ -452,8 +449,7 @@ fn assert_exposure_overlay_matches_policy(
             );
             ensure!(
                 row.break_glass_only == "no",
-                "{} public profile-gated tool must not be classified break-glass-only",
-                tool
+                "{tool} public profile-gated tool must not be classified break-glass-only"
             );
         } else if break_glass_hazards.contains(tool) {
             ensure!(
@@ -464,8 +460,7 @@ fn assert_exposure_overlay_matches_policy(
             );
             ensure!(
                 row.break_glass_only == "yes",
-                "{} break-glass hazard must be break-glass-only",
-                tool
+                "{tool} break-glass hazard must be break-glass-only"
             );
         } else {
             ensure!(
@@ -477,24 +472,20 @@ fn assert_exposure_overlay_matches_policy(
             if row.default_exposure == "facade_only" {
                 ensure!(
                     row.break_glass_only == "no",
-                    "{} facade-routed implementation tool must not be break-glass-only",
-                    tool
+                    "{tool} facade-routed implementation tool must not be break-glass-only"
                 );
                 ensure!(
                     row.hidden_internal == "yes",
-                    "{} facade-routed implementation tool must mark the raw name hidden/internal",
-                    tool
+                    "{tool} facade-routed implementation tool must mark the raw name hidden/internal"
                 );
                 ensure!(
                     !row.safe_replacement_tool.starts_with("none"),
-                    "{} facade-routed implementation tool must name the public facade route",
-                    tool
+                    "{tool} facade-routed implementation tool must name the public facade route"
                 );
             } else {
                 ensure!(
                     row.break_glass_only == "yes",
-                    "{} break-glass hidden implementation tool must be break-glass-only",
-                    tool
+                    "{tool} break-glass hidden implementation tool must be break-glass-only"
                 );
             }
         }

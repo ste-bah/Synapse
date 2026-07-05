@@ -405,7 +405,7 @@ fn validate_exclusion_entry(raw: &str) -> Result<String> {
     Ok(trimmed.to_lowercase())
 }
 
-fn lock_unpoisoned<'a, T>(mutex: &'a Mutex<T>) -> std::sync::MutexGuard<'a, T> {
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),

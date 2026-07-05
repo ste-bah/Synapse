@@ -25,7 +25,7 @@ pub struct ClipboardRestoreReport {
 
 impl ClipboardSnapshot {
     #[must_use]
-    pub fn format_count(&self) -> usize {
+    pub const fn format_count(&self) -> usize {
         self.formats.len()
     }
 
@@ -35,7 +35,7 @@ impl ClipboardSnapshot {
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.formats.is_empty()
     }
 }

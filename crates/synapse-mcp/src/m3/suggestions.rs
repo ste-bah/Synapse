@@ -164,7 +164,7 @@ pub enum AssistMitigationStrategy {
     InSessionCorrection,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssistMitigation {
     pub strategy: AssistMitigationStrategy,
@@ -883,10 +883,7 @@ fn write_suggestion(db: &Arc<Db>, record: &SuggestionRecord) -> Result<(), Error
     db.mutate_batch_pressure_bypass(
         cf::CF_KV,
         Vec::<Vec<u8>>::new(),
-        [
-            (key.clone(), value.clone()),
-            (index_key.clone(), index_value.clone()),
-        ],
+        [(key.clone(), value), (index_key.clone(), index_value)],
     )
     .map_err(|error| {
         mcp_error(

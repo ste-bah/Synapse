@@ -3239,8 +3239,7 @@ impl SynapseService {
                 error.code(),
                 "before_value_read_failed",
                 format!(
-                    "act_set_field_text before-value UIA readback failed for element {}: {error}",
-                    element_id
+                    "act_set_field_text before-value UIA readback failed for element {element_id}: {error}"
                 ),
             )
         })?;
@@ -3261,8 +3260,7 @@ impl SynapseService {
                     error.code(),
                     "scroll_into_view_failed",
                     format!(
-                        "act_set_field_text ScrollItemPattern scroll-into-view failed for element {}: {error}",
-                        element_id
+                        "act_set_field_text ScrollItemPattern scroll-into-view failed for element {element_id}: {error}"
                     ),
                 )
             })?;
@@ -3273,8 +3271,7 @@ impl SynapseService {
                         error.code(),
                         "post_scroll_bbox_read_failed",
                         format!(
-                            "act_set_field_text post-scroll bounding-rect readback failed for element {}: {error}",
-                            element_id
+                            "act_set_field_text post-scroll bounding-rect readback failed for element {element_id}: {error}"
                         ),
                     )
                 },
@@ -3403,8 +3400,7 @@ impl SynapseService {
                 error.code(),
                 "after_value_read_failed",
                 format!(
-                    "act_set_field_text after-value UIA readback failed for element {}: {error}",
-                    element_id
+                    "act_set_field_text after-value UIA readback failed for element {element_id}: {error}"
                 ),
             )
         })?;
@@ -4310,8 +4306,8 @@ fn verify_captured_action_delta(
     foreground_change_policy: ForegroundChangePolicy,
 ) -> Result<ActPostcondition, ErrorData> {
     if point_region.is_some() {
-        let before_point = before.point_pixel.clone();
-        let after_point = after.point_pixel.clone();
+        let before_point = before.point_pixel;
+        let after_point = after.point_pixel;
         let before_hash = verify_hash_json(&before_point)?;
         let after_hash = verify_hash_json(&after_point)?;
         if before_point == after_point {

@@ -199,14 +199,17 @@ fn a11y_error_to_action(
         synapse_a11y::A11yError::ElementStale { .. } => {
             resolver::transient_element_expired(element_id, detail)
         }
-        synapse_a11y::A11yError::ElementPatternUnsupported { .. } => {
-            resolver::element_pattern_unsupported(element_id, detail)
-        }
-        synapse_a11y::A11yError::ElementValueUnsupported { .. } => {
+        synapse_a11y::A11yError::ElementPatternUnsupported { .. }
+        | synapse_a11y::A11yError::ElementValueUnsupported { .. } => {
             resolver::element_pattern_unsupported(element_id, detail)
         }
         synapse_a11y::A11yError::ElementValueReadOnly { .. }
-        | synapse_a11y::A11yError::ElementNotEnabled { .. } => resolver::target_invalid(detail),
+        | synapse_a11y::A11yError::ElementNotEnabled { .. }
+        | synapse_a11y::A11yError::CdpUnreachable { .. }
+        | synapse_a11y::A11yError::CdpAttachFailed { .. }
+        | synapse_a11y::A11yError::CdpAxtreeFailed { .. }
+        | synapse_a11y::A11yError::BrowserWaitTimeout { .. }
+        | synapse_a11y::A11yError::Internal { .. } => resolver::target_invalid(detail),
         synapse_a11y::A11yError::InvalidElementId { .. }
         | synapse_a11y::A11yError::NoForeground { .. } => resolver::element_not_resolved(detail),
         synapse_a11y::A11yError::NotAvailable { detail } => {
@@ -218,11 +221,6 @@ fn a11y_error_to_action(
         synapse_a11y::A11yError::ForegroundActivationRefused { .. } => {
             crate::ActionError::ForegroundActivationRefused { detail }
         }
-        synapse_a11y::A11yError::CdpUnreachable { .. }
-        | synapse_a11y::A11yError::CdpAttachFailed { .. }
-        | synapse_a11y::A11yError::CdpAxtreeFailed { .. }
-        | synapse_a11y::A11yError::BrowserWaitTimeout { .. }
-        | synapse_a11y::A11yError::Internal { .. } => resolver::target_invalid(detail),
     }
 }
 

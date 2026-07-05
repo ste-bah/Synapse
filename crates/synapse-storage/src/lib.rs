@@ -42,7 +42,7 @@ const ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
 pub type RawRow = (Vec<u8>, Vec<u8>);
 /// A bounded scan window plus whether more rows remain past it.
 pub type ScanWindow = (Vec<RawRow>, bool);
-/// Per-CF integer storage metrics plus CFs whose RocksDB property was absent.
+/// Per-CF integer storage metrics plus CFs whose `RocksDB` property was absent.
 pub type CfEstimateMap = (BTreeMap<String, u64>, Vec<String>);
 
 /// Opened storage handle.
@@ -449,7 +449,7 @@ impl Db {
         Ok(sizes)
     }
 
-    /// Returns RocksDB's live-data-size estimate for each Synapse column family.
+    /// Returns `RocksDB`'s live-data-size estimate for each Synapse column family.
     ///
     /// This is metadata-backed and intentionally cheaper than [`Self::cf_sizes`],
     /// which scans every key/value byte to compute exact logical sizes.
@@ -477,7 +477,7 @@ impl Db {
         Ok(counts)
     }
 
-    /// Returns RocksDB's estimated row count for each Synapse column family.
+    /// Returns `RocksDB`'s estimated row count for each Synapse column family.
     ///
     /// This is metadata-backed and intentionally cheaper than [`Self::cf_row_counts`],
     /// which scans every key in every column family.
@@ -722,20 +722,18 @@ impl Db {
         let mut missing = Vec::new();
         for cf_name in cf::ALL_COLUMN_FAMILIES {
             let handle = self.cf_handle(cf_name)?;
-            match self
+            if let Some(value) = self
                 .inner
                 .property_int_value_cf(&handle, property)
                 .map_err(|source| StorageError::ReadFailed {
                     cf_name: cf_name.to_owned(),
                     detail: source.to_string(),
-                })? {
-                Some(value) => {
-                    values.insert(cf_name.to_owned(), value);
-                }
-                None => {
-                    values.insert(cf_name.to_owned(), 0);
-                    missing.push(cf_name.to_owned());
-                }
+                })?
+            {
+                values.insert(cf_name.to_owned(), value);
+            } else {
+                values.insert(cf_name.to_owned(), 0);
+                missing.push(cf_name.to_owned());
             }
         }
         Ok((values, missing))

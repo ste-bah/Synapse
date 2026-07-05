@@ -170,7 +170,7 @@ async fn http_shutdown_exits_with_open_keep_alive_client() -> anyhow::Result<()>
     let mut one = [0_u8; 1];
     let closed = tokio::time::timeout(Duration::from_secs(1), keep_alive.read(&mut one)).await;
     assert!(
-        matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+        matches!(closed, Ok(Ok(0) | Err(_))),
         "keep-alive client still readable/open after daemon exit: {closed:?}"
     );
     Ok(())
@@ -207,7 +207,7 @@ async fn http_shutdown_closes_active_mcp_sse_session() -> anyhow::Result<()> {
     let closed =
         tokio::time::timeout(Duration::from_secs(2), sse.read_to_end(&mut remaining)).await;
     assert!(
-        matches!(closed, Ok(Ok(_)) | Ok(Err(_))),
+        matches!(closed, Ok(Ok(_) | Err(_))),
         "MCP SSE client still open after daemon exit: {closed:?}"
     );
 

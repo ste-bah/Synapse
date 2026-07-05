@@ -59,18 +59,15 @@ fn captured_frame_drop_loop_queries_d3d_texture() -> Result<(), CaptureError> {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     let mut idle_slices = 0_u32;
     while queried < 1_000 && std::time::Instant::now() < deadline {
-        let frame = match rx.recv_timeout(Duration::from_millis(250)) {
-            Ok(frame) => frame,
-            Err(_) => {
-                idle_slices = idle_slices.saturating_add(1);
-                // Once capture is proven (>=1 frame), a static desktop simply
-                // stops producing frames; stop after ~1s of quiet rather than
-                // burning the whole budget.
-                if queried >= 1 && idle_slices >= 4 {
-                    break;
-                }
-                continue;
+        let Ok(frame) = rx.recv_timeout(Duration::from_millis(250)) else {
+            idle_slices = idle_slices.saturating_add(1);
+            // Once capture is proven (>=1 frame), a static desktop simply
+            // stops producing frames; stop after ~1s of quiet rather than
+            // burning the whole budget.
+            if queried >= 1 && idle_slices >= 4 {
+                break;
             }
+            continue;
         };
         idle_slices = 0;
         let mut desc = D3D11_TEXTURE2D_DESC::default();

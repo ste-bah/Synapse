@@ -258,8 +258,20 @@ impl SynapseService {
         mcp_session_id: Option<&str>,
     ) -> Result<Json<synapse_core::Observation>, ErrorData> {
         let explicit_hwnd = params.0.window_hwnd;
-        let target_hwnd = perception_window_hwnd("observe", &target, explicit_hwnd)?;
-        let cdp_target_id_hint = if explicit_hwnd.is_some() {
+        // A subtree_root drill-down is element/window perception even when the
+        // include set looks global, so it always takes the window path.
+        let needs_window = include.requires_window_perception() || params.0.subtree_root.is_some();
+        // Global-only observes (fs/clipboard/audio) read host-wide state and
+        // never need a window; do not resolve or refuse a target window for
+        // them, so a filesystem-only readback succeeds even when the session's
+        // active target is a Chrome CDP tab the window path refuses to
+        // downgrade (#1508).
+        let target_hwnd = if needs_window {
+            perception_window_hwnd("observe", &target, explicit_hwnd)?
+        } else {
+            None
+        };
+        let cdp_target_id_hint = if !needs_window || explicit_hwnd.is_some() {
             None
         } else {
             target_cdp_id(&target)
@@ -268,24 +280,28 @@ impl SynapseService {
         // Scope the (non-Send) state guard so it is released before any await.
         let mut input = {
             let state = self.m1_state()?;
-            let mut input = match observe_input(&state, &params.0, target_hwnd) {
-                Ok(input) => input,
-                Err(error) if params.0.subtree_root.is_none() => {
-                    let Some(hwnd) = target_hwnd else {
-                        return Err(error);
-                    };
-                    let Some(session_id) = mcp_session_id else {
-                        return Err(error);
-                    };
-                    self.hidden_desktop_observe_input(
-                        session_id,
-                        hwnd,
-                        crate::m1::observe_gather_depth(&params.0),
-                        state.perception_mode,
-                        error,
-                    )?
+            let mut input = if needs_window {
+                match observe_input(&state, &params.0, target_hwnd) {
+                    Ok(input) => input,
+                    Err(error) if params.0.subtree_root.is_none() => {
+                        let Some(hwnd) = target_hwnd else {
+                            return Err(error);
+                        };
+                        let Some(session_id) = mcp_session_id else {
+                            return Err(error);
+                        };
+                        self.hidden_desktop_observe_input(
+                            session_id,
+                            hwnd,
+                            crate::m1::observe_gather_depth(&params.0),
+                            state.perception_mode,
+                            error,
+                        )?
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
+            } else {
+                crate::m1::global_only_input(&state)
             };
             if include.fs && input.fs_recent.is_empty() {
                 fs_timeline_events = populate_fs_recent(&mut input, &state.fs_recent_tracker);
@@ -5458,8 +5474,7 @@ impl SynapseService {
             return Err(mcp_error(
                 error_codes::ACTION_POSTCONDITION_FAILED,
                 format!(
-                    "cdp_open_tab refused target {cdp_target_id:?}: Chrome bridge changed the human OS foreground from {:?} to requested HWND {window_hwnd:#x} while required_foreground=false",
-                    human_os_foreground_before_hwnd
+                    "cdp_open_tab refused target {cdp_target_id:?}: Chrome bridge changed the human OS foreground from {human_os_foreground_before_hwnd:?} to requested HWND {window_hwnd:#x} while required_foreground=false"
                 ),
             ));
         }
@@ -5470,8 +5485,7 @@ impl SynapseService {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
                 format!(
-                    "cdp_open_tab refused target {cdp_target_id:?}: Chrome bridge created an active/highlighted tab in focused Chrome window {:?}",
-                    chrome_window_id
+                    "cdp_open_tab refused target {cdp_target_id:?}: Chrome bridge created an active/highlighted tab in focused Chrome window {chrome_window_id:?}"
                 ),
             ));
         }
@@ -9817,8 +9831,7 @@ impl SynapseService {
             return Err(mcp_error(
                 error_codes::ACTION_POSTCONDITION_FAILED,
                 format!(
-                    "cdp_activate_tab refused target {cdp_target_id:?}: Chrome bridge changed the human OS foreground from {:?} to requested HWND {window_hwnd:#x} while required_foreground=false",
-                    human_os_foreground_before_hwnd
+                    "cdp_activate_tab refused target {cdp_target_id:?}: Chrome bridge changed the human OS foreground from {human_os_foreground_before_hwnd:?} to requested HWND {window_hwnd:#x} while required_foreground=false"
                 ),
             ));
         }
@@ -9998,7 +10011,7 @@ fn select_cdp_owner_for_session(
             window_hwnd,
             cdp_target_id,
         }) if cdp_target_ids_equal(cdp_target_id, target_id) => Some(*window_hwnd),
-        Some(SessionTarget::Window { .. }) | Some(SessionTarget::Cdp { .. }) | None => None,
+        Some(SessionTarget::Window { .. } | SessionTarget::Cdp { .. }) | None => None,
     };
     if let Some(active_window) = active_window {
         let active_matches = owners
@@ -10049,7 +10062,7 @@ fn select_persisted_cdp_owner_for_authorized_session(
             window_hwnd,
             cdp_target_id,
         }) if cdp_target_ids_equal(cdp_target_id, target_id) => Some(*window_hwnd),
-        Some(SessionTarget::Window { .. }) | Some(SessionTarget::Cdp { .. }) | None => None,
+        Some(SessionTarget::Window { .. } | SessionTarget::Cdp { .. }) | None => None,
     };
     if let Some(active_window) = active_window {
         let active_matches = owners
@@ -11127,7 +11140,7 @@ fn browser_wait_facade_error(
     let message = message.into();
     ErrorData::new(
         ErrorCode(-32099),
-        message.clone(),
+        message,
         Some(json!({
             "code": error_codes::TOOL_PARAMS_INVALID,
             "operation": operation.as_str(),
@@ -11598,7 +11611,7 @@ fn validate_browser_wait_for_params(
     let state = match (params.state, text.as_ref()) {
         (Some(BrowserWaitForState::TextAppears), Some(_)) => BrowserWaitForState::TextAppears,
         (Some(BrowserWaitForState::TextGone), Some(_)) => BrowserWaitForState::TextGone,
-        (Some(BrowserWaitForState::Timeout), None) | (None, None) => BrowserWaitForState::Timeout,
+        (Some(BrowserWaitForState::Timeout) | None, None) => BrowserWaitForState::Timeout,
         (None, Some(_)) => BrowserWaitForState::TextAppears,
         (Some(BrowserWaitForState::Timeout), Some(_)) => {
             return Err(mcp_error(
@@ -13171,7 +13184,7 @@ async fn browser_wait_for_selector_backend_visible(
             ));
         }
     };
-    let state: BrowserWaitForSelectorElementState = serde_json::from_value(evaluated.value.clone())
+    let state: BrowserWaitForSelectorElementState = serde_json::from_value(evaluated.value)
         .map_err(|error| {
             mcp_error(
                 error_codes::OBSERVE_INTERNAL,
@@ -13432,7 +13445,7 @@ fn browser_nav_facade_error(
     let message = message.into();
     ErrorData::new(
         ErrorCode(-32099),
-        message.clone(),
+        message,
         Some(json!({
             "code": error_codes::TOOL_PARAMS_INVALID,
             "operation": operation.as_str(),
@@ -15796,13 +15809,13 @@ fn screenshot_downscale_scale(
     max_pixels: Option<u64>,
     max_long_edge: Option<u32>,
 ) -> Result<f64, ErrorData> {
-    if let Some(0) = max_pixels {
+    if max_pixels == Some(0) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "capture_screenshot max_pixels must be greater than zero",
         ));
     }
-    if let Some(0) = max_long_edge {
+    if max_long_edge == Some(0) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "capture_screenshot max_long_edge must be greater than zero",
@@ -17050,7 +17063,7 @@ fn elapsed_ms_u64(start: Instant) -> u64 {
 }
 
 const CDP_TARGET_INFO_PAGE_TEXT_MAX_CHARS: usize = 4096;
-const CDP_TARGET_INFO_PAGE_VITALS_SCRIPT: &str = r###"
+const CDP_TARGET_INFO_PAGE_VITALS_SCRIPT: &str = r##"
 (() => {
   function stringValue(value) {
     return value === null || value === undefined ? "" : String(value);
@@ -17153,7 +17166,7 @@ const CDP_TARGET_INFO_PAGE_VITALS_SCRIPT: &str = r###"
     };
   }
 })()
-"###;
+"##;
 
 #[cfg(windows)]
 async fn raw_cdp_page_text_info(endpoint: &str, target_id: &str) -> Option<CdpPageTextInfo> {
@@ -20000,10 +20013,8 @@ mod tests {
                 .is_some_and(|path| path.ends_with("synapse-tag.css"))
         );
 
-        let error = validate_browser_add_script_tag_params(&BrowserAddScriptTagParams {
-            ..Default::default()
-        })
-        .expect_err("missing source must be rejected");
+        let error = validate_browser_add_script_tag_params(&Default::default())
+            .expect_err("missing source must be rejected");
         let code = error
             .data
             .as_ref()
@@ -22257,7 +22268,7 @@ fn gray_luma_stddev_0_1(region_image: &GrayImage) -> f32 {
         let luma = f32::from(pixel.0[0]);
         count += 1.0;
         sum += luma;
-        sum_sq += luma * luma;
+        sum_sq = luma.mul_add(luma, sum_sq);
     }
     if count <= 0.0 {
         return 0.0;

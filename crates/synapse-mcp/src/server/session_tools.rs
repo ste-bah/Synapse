@@ -865,7 +865,7 @@ impl SynapseService {
             target_session_count: targets.len(),
             returned_count,
             input_lease_held: lease_status.held,
-            input_lease_owner_session_id: lease_status.owner_session_id.clone(),
+            input_lease_owner_session_id: lease_status.owner_session_id,
             compact_sessions,
             sessions: full_sessions,
             attached_agent_registry,
@@ -1964,6 +1964,22 @@ fn terminal_dead_agent_state(agent_state: Option<&AgentStateRead>) -> bool {
         && agent_state.attention_class.is_terminal_history()
 }
 
+fn cleanup_verified_dead_agent_state(agent_state: Option<&AgentStateRead>) -> bool {
+    if !terminal_dead_agent_state(agent_state) {
+        return false;
+    }
+    let Some(reason_code) = agent_state.and_then(|read| read.reason_code.as_deref()) else {
+        return false;
+    };
+    matches!(
+        reason_code,
+        "process_gone_without_exit_event"
+            | "http_stale"
+            | "http_session_store_deleted"
+            | "spawned_agent_process_exited"
+    )
+}
+
 fn quiet_orphan_local_model_resource_session(summary: &SessionSummary) -> bool {
     let owns_cleanup_resource =
         summary.active_target.is_some() || !summary.persisted_cdp_target_owners.is_empty();
@@ -2004,9 +2020,8 @@ fn dead_live_cleanup_candidate_parts(
     let owns_cleanup_resource = active_target.is_some() || has_persisted_cdp_owner;
     registry.lifecycle == "live"
         && registry.last_seen_ms_ago >= DEAD_LIVE_SESSION_CLEANUP_MIN_QUIET_MS
-        && registry.last_action.is_none()
         && owns_cleanup_resource
-        && terminal_dead_agent_state(agent_state)
+        && cleanup_verified_dead_agent_state(agent_state)
         && target_claims.is_empty()
         && !lease.is_owner
         && !active_target_claimed_by_other(session_id, active_target, all_target_claims)
@@ -2017,9 +2032,8 @@ fn dead_live_cleanup_candidate_summary(summary: &SessionSummary) -> bool {
         summary.active_target.is_some() || !summary.persisted_cdp_target_owners.is_empty();
     summary.registry.lifecycle == "live"
         && summary.registry.last_seen_ms_ago >= DEAD_LIVE_SESSION_CLEANUP_MIN_QUIET_MS
-        && summary.registry.last_action.is_none()
         && owns_cleanup_resource
-        && terminal_dead_agent_state(summary.agent_state.as_ref())
+        && cleanup_verified_dead_agent_state(summary.agent_state.as_ref())
         && summary.target_claims.is_empty()
         && !summary.lease.is_owner
         && summary.foreground_lane.status != "conflicting_owner"
@@ -3005,6 +3019,73 @@ mod tests {
             )
             .is_ok()
         );
+
+        let stale_action_summary = dead_live_target_summary(
+            "dead-live-target-with-stale-action",
+            Some(SessionTarget::Window { hwnd: 0x5678 }),
+            Vec::new(),
+            &[],
+            &lease_status,
+            DEAD_LIVE_SESSION_CLEANUP_MIN_QUIET_MS + 1,
+            Some("tools/call:act"),
+            false,
+        );
+
+        assert_eq!(stale_action_summary.registry.lifecycle, "live");
+        assert_eq!(
+            stale_action_summary.agent_state.as_ref().unwrap().state,
+            AgentLifecycleState::Dead
+        );
+        assert_eq!(
+            stale_action_summary.registry.last_action.as_deref(),
+            Some("tools/call:act")
+        );
+        assert_eq!(
+            stale_action_summary.attention_class,
+            AgentAttentionClass::CleanupRequired
+        );
+        assert!(
+            ensure_cross_session_cleanup_allowed(
+                "caller",
+                "dead-live-target-with-stale-action",
+                &status_response(Some(stale_action_summary))
+            )
+            .is_ok()
+        );
+
+        let ambiguous_unprobeable_summary = dead_live_target_summary_with_reason(
+            "dead-live-target-unprobeable",
+            Some(SessionTarget::Window { hwnd: 0x9abc }),
+            Vec::new(),
+            &[],
+            &lease_status,
+            DEAD_LIVE_SESSION_CLEANUP_MIN_QUIET_MS + 1,
+            Some("tools/call:target"),
+            false,
+            Some("unprobeable_silent_ended"),
+        );
+
+        assert_eq!(
+            ambiguous_unprobeable_summary
+                .agent_state
+                .as_ref()
+                .unwrap()
+                .reason_code
+                .as_deref(),
+            Some("unprobeable_silent_ended")
+        );
+        assert_eq!(
+            ambiguous_unprobeable_summary.attention_class,
+            AgentAttentionClass::TerminalRuntimeFailure
+        );
+        assert!(
+            ensure_cross_session_cleanup_allowed(
+                "caller",
+                "dead-live-target-unprobeable",
+                &status_response(Some(ambiguous_unprobeable_summary))
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3689,6 +3770,30 @@ mod tests {
         last_action: Option<&str>,
         has_persisted_cdp_owner: bool,
     ) -> SessionSummary {
+        dead_live_target_summary_with_reason(
+            session_id,
+            active_target,
+            target_claims,
+            all_target_claims,
+            lease_status,
+            last_seen_ms_ago,
+            last_action,
+            has_persisted_cdp_owner,
+            Some("process_gone_without_exit_event"),
+        )
+    }
+
+    fn dead_live_target_summary_with_reason(
+        session_id: &str,
+        active_target: Option<SessionTarget>,
+        target_claims: Vec<TargetClaimRead>,
+        all_target_claims: &[TargetClaimRead],
+        lease_status: &synapse_action::LeaseStatus,
+        last_seen_ms_ago: u64,
+        last_action: Option<&str>,
+        has_persisted_cdp_owner: bool,
+        death_reason_code: Option<&str>,
+    ) -> SessionSummary {
         let now_unix_ms = 1_000_000;
         let mut registry = synthetic_registry_read(session_id, now_unix_ms, 500);
         registry.lifecycle = "live".to_owned();
@@ -3708,11 +3813,7 @@ mod tests {
             has_persisted_cdp_owner,
         )
         .expect("dead live summary");
-        let mut agent_state = agent_read(
-            session_id,
-            AgentLifecycleState::Dead,
-            Some("unprobeable_silent_ended"),
-        );
+        let mut agent_state = agent_read(session_id, AgentLifecycleState::Dead, death_reason_code);
         agent_state.session_id = Some(session_id.to_owned());
         agent_state.spawn_id = None;
         summary.agent_state = Some(agent_state);

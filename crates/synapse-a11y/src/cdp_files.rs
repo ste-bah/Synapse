@@ -82,6 +82,7 @@ pub async fn cdp_set_intercept_file_chooser(
     Ok(())
 }
 
+#[must_use]
 pub fn cdp_file_chooser_entry_from_event(
     event: &EventFileChooserOpened,
     seq: u64,

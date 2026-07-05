@@ -140,8 +140,7 @@ fn slot_key(endpoint: &str, target_id: &str) -> String {
 fn now_unix_ms() -> f64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs_f64() * 1000.0)
-        .unwrap_or(0.0)
+        .map_or(0.0, |d| d.as_secs_f64() * 1000.0)
 }
 
 fn lookup_live(endpoint: &str, target_id: &str) -> Option<Arc<BindingSlot>> {
@@ -257,6 +256,7 @@ pub async fn binding_capture_add(
     status_from_slot(&slot, name, true, binding_newly_added, false)
 }
 
+#[must_use]
 pub fn binding_capture_read(
     endpoint: &str,
     target_id: &str,
@@ -485,15 +485,20 @@ mod tests {
         assert!(truncated);
     }
 
-    fn call(name: &str, payload: &str, context: i64) -> CdpBindingCall {
+    fn call(name: &str, payload: &str, context: u64) -> CdpBindingCall {
+        let seq = context
+            .checked_sub(1)
+            .unwrap_or_else(|| panic!("test binding context must be positive, got {context}"));
+        let execution_context_id = i64::try_from(context)
+            .unwrap_or_else(|_| panic!("test binding context must fit in i64, got {context}"));
         CdpBindingCall {
-            seq: context as u64 - 1,
+            seq,
             name: name.to_owned(),
             payload: payload.to_owned(),
             payload_len: payload.len(),
             payload_truncated: false,
             payload_json: None,
-            execution_context_id: *ExecutionContextId::new(context).inner(),
+            execution_context_id: *ExecutionContextId::new(execution_context_id).inner(),
             timestamp_ms: 0.0,
         }
     }

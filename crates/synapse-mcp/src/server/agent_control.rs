@@ -1713,12 +1713,12 @@ impl SynapseService {
             // Report current physical state without mutating suspend counts.
             crate::m4::OwnedProcessSuspendReadback {
                 process_ids: process.process_tree_ids.clone(),
-                live_process_ids: process.live_process_ids.clone(),
+                live_process_ids: process.live_process_ids,
                 applied_process_ids: Vec::new(),
                 failed: Vec::new(),
                 all_suspended: was_suspended_before,
                 all_running: !any_suspended_before,
-                states_after: states_before.clone(),
+                states_after: states_before,
             }
         } else if pause {
             crate::m4::suspend_owned_process_ids(&process.process_tree_ids)
@@ -2018,7 +2018,7 @@ impl SynapseService {
             carried_context,
             effective_prompt_chars: effective_prompt.chars().count(),
             new_session_id: spawned.session_id.clone(),
-            new_spawn_id: spawned.spawn_id.clone(),
+            new_spawn_id: spawned.spawn_id,
             lineage_journal_event,
         };
 
@@ -2389,10 +2389,10 @@ impl SynapseService {
         let mut process_after = process_readback_for_target(&target);
         let mut orphan_process_ids =
             merged_live_process_ids(&process_before.process_tree_ids, &process_after);
-        let post_teardown_force_termination = if !orphan_process_ids.is_empty() {
-            Some(crate::m4::terminate_owned_process_ids(&orphan_process_ids))
-        } else {
+        let post_teardown_force_termination = if orphan_process_ids.is_empty() {
             None
+        } else {
+            Some(crate::m4::terminate_owned_process_ids(&orphan_process_ids))
         };
         if post_teardown_force_termination.is_some() {
             process_after = process_readback_for_target(&target);

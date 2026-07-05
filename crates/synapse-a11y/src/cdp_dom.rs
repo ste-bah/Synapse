@@ -19,7 +19,7 @@
 //! instead of UIA re-resolution. The target id and backendNodeId round-trip out
 //! of the id with no side registry. Legacy backend-only ids still parse, but
 //! new observations carry the target id so duplicate tab titles cannot steer
-//! follow-up actions/read_text to the wrong document.
+//! follow-up `actions/read_text` to the wrong document.
 //!
 //! ## bbox semantics
 //!
@@ -108,7 +108,7 @@ pub fn cdp_backend_from_element_id(id: &ElementId) -> Option<i64> {
     Some(i64::from_ne_bytes(unsigned.to_ne_bytes()))
 }
 
-/// If `id` is a target-aware CDP web-node id, returns the CDP TargetID encoded
+/// If `id` is a target-aware CDP web-node id, returns the CDP `TargetID` encoded
 /// in it. Legacy backend-only ids return `None`.
 #[must_use]
 pub fn cdp_target_from_element_id(id: &ElementId) -> Option<String> {
@@ -137,7 +137,7 @@ pub fn build_accessible_nodes(
 }
 
 /// Pure mapping variant that embeds the selected page target in every web node
-/// id so later CDP actions/read_text resolve the same tab the observation read.
+/// id so later CDP `actions/read_text` resolve the same tab the observation read.
 #[must_use]
 pub fn build_accessible_nodes_for_target(
     hwnd: i64,
@@ -273,7 +273,7 @@ pub struct CdpDomSnapshot {
     pub total_ax_nodes: u32,
     /// Page URL the snapshot came from (diagnostics).
     pub page_url: String,
-    /// CDP TargetID selected for this snapshot.
+    /// CDP `TargetID` selected for this snapshot.
     pub target_id: String,
     /// CDP flat-session id attached to the selected target.
     pub session_id: String,
@@ -324,7 +324,7 @@ pub struct CdpFrameTreeEntry {
     pub is_out_of_process: bool,
     /// Synapse element id for the owning iframe/frame element, when CDP exposes it.
     pub frame_element_id: Option<String>,
-    /// BackendNodeId for the owning iframe/frame element, when CDP exposes it.
+    /// `BackendNodeId` for the owning iframe/frame element, when CDP exposes it.
     pub frame_element_backend_node_id: Option<i64>,
     /// CDP target that owns the iframe/frame element id.
     pub frame_element_cdp_target_id: Option<String>,
@@ -762,9 +762,7 @@ struct CdpFrameDescriptor {
 /// resolve an out-of-process iframe child target the same way `observe`
 /// enumerated it, instead of failing once the element id names a child target.
 #[cfg(windows)]
-pub(crate) async fn enable_flat_iframe_auto_attach(
-    page: &chromiumoxide::Page,
-) -> Result<(), String> {
+pub async fn enable_flat_iframe_auto_attach(page: &chromiumoxide::Page) -> Result<(), String> {
     use chromiumoxide::cdp::browser_protocol::target::{
         FilterEntry, SetAutoAttachParams, TargetFilter,
     };

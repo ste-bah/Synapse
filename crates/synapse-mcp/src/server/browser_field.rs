@@ -1036,7 +1036,7 @@ fn browser_form_facade_error(
     let message = message.into();
     ErrorData::new(
         ErrorCode(-32099),
-        message.clone(),
+        message,
         Some(json!({
             "code": error_codes::TOOL_PARAMS_INVALID,
             "operation": operation.as_str(),

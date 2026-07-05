@@ -1,10 +1,10 @@
 //! Full State Verification for the durable agent task queue (#910).
 //!
-//! Source of truth: the daemon's RocksDB `CF_KV` column family. We drive the
+//! Source of truth: the daemon's `RocksDB` `CF_KV` column family. We drive the
 //! real MCP daemon over stdio and verify every outcome two ways — through a
 //! read tool (`task_get`, which does NOT reconcile, so it reflects raw stored
 //! state), and by shutting the daemon down and scanning the physical
-//! `agent-task/v1/task/...` rows directly from RocksDB.
+//! `agent-task/v1/task/...` rows directly from `RocksDB`.
 //!
 //! Note on reconcile: the session registry is only populated in HTTP mode, so
 //! under the stdio harness the live-session set is empty. That makes the
@@ -264,8 +264,7 @@ async fn agent_tasks_lifecycle_round_trips_against_physical_cf_rows() -> anyhow:
             by_id
                 .values()
                 .last()
-                .map(|t| t["state"].clone())
-                .unwrap_or(Value::Null)
+                .map_or(Value::Null, |t| t["state"].clone())
         );
     }
     ensure!(

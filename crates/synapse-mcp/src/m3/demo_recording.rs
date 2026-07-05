@@ -875,7 +875,7 @@ fn now_ts_ns() -> u64 {
     u64::try_from(nanos).unwrap_or(0)
 }
 
-fn lock_unpoisoned<'a, T>(mutex: &'a Mutex<T>) -> MutexGuard<'a, T> {
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     match mutex.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),

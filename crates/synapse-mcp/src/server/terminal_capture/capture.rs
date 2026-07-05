@@ -529,7 +529,7 @@ pub(crate) fn spawn_capture_to_asciicast(
     let reader_thread = spawn_reader_thread(reader, reader_input, file, header, cols, rows);
     let waiter_artifacts = artifacts.clone();
     let mut spawn_failure_killer = child.clone_killer();
-    let live_key_for_spawn_failure = spec.live_key.clone();
+    let live_key_for_spawn_failure = spec.live_key;
     std::thread::Builder::new()
         .name(format!("synapse-pty-wait-{process_id}"))
         .spawn(move || {
@@ -767,7 +767,7 @@ fn spawn_reader_thread(
                     bytes_captured += n as u64;
                     output_events += 1;
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -801,8 +801,8 @@ impl ReaderInput {
         chunk: &[u8],
     ) -> std::io::Result<()> {
         match self {
-            ReaderInput::Direct(pty_input) => responder.respond(chunk, pty_input.as_mut()),
-            ReaderInput::Live(session) => session.respond_terminal_query(responder, chunk),
+            Self::Direct(pty_input) => responder.respond(chunk, pty_input.as_mut()),
+            Self::Live(session) => session.respond_terminal_query(responder, chunk),
         }
     }
 }

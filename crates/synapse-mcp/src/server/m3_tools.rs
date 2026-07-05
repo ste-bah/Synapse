@@ -210,7 +210,7 @@ impl SynapseService {
             let event_bus = self.sse_state()?.event_bus();
             if let Err(error) = install_file_jsonl_tail_watcher(&m3_state, request, event_bus) {
                 let rollback = ReflexCancelParams {
-                    reflex_id: response.reflex_id.clone(),
+                    reflex_id: response.reflex_id,
                 };
                 let _rollback_result = cancel_reflex(&runtime, &rollback);
                 return Err(error);
@@ -728,7 +728,7 @@ impl SynapseService {
                     "demo_record_start",
                     "demo_record_start",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -743,7 +743,7 @@ impl SynapseService {
                     "demo_record_start",
                     "demo_record_start",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -802,7 +802,7 @@ impl SynapseService {
                     "demo_record_stop",
                     "demo_record_stop",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -817,7 +817,7 @@ impl SynapseService {
                     "demo_record_stop",
                     "demo_record_stop",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -1670,7 +1670,7 @@ impl SynapseService {
                     "timeline_pause",
                     "pause",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -1685,7 +1685,7 @@ impl SynapseService {
                     "timeline_pause",
                     "pause",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -1740,7 +1740,7 @@ impl SynapseService {
                     "timeline_resume",
                     "resume",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -1755,7 +1755,7 @@ impl SynapseService {
                     "timeline_resume",
                     "resume",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -1816,7 +1816,7 @@ impl SynapseService {
                     "timeline_exclusions",
                     "timeline_exclusions",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -1831,7 +1831,7 @@ impl SynapseService {
                     "timeline_exclusions",
                     "timeline_exclusions",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -1901,7 +1901,7 @@ impl SynapseService {
                     "timeline_purge",
                     "purge",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({
@@ -1916,7 +1916,7 @@ impl SynapseService {
                     "timeline_purge",
                     "purge",
                     Some(by_session.clone()),
-                    Some(by_session.clone()),
+                    Some(by_session),
                     command_payload,
                     command_before,
                     json!({

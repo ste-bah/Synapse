@@ -277,6 +277,13 @@ fn validate_target(target: &CaptureTarget) -> Result<(), CaptureError> {
     }
 }
 
+/// Validates a raw window handle before capture starts.
+///
+/// # Errors
+///
+/// Returns [`CaptureError::TargetInvalid`] when the handle is not positive, or
+/// the platform-specific validation error when the handle does not identify a
+/// capturable window.
 pub fn validate_hwnd(hwnd: i64) -> Result<(), CaptureError> {
     if hwnd <= 0 {
         return Err(CaptureError::TargetInvalid {
@@ -287,6 +294,12 @@ pub fn validate_hwnd(hwnd: i64) -> Result<(), CaptureError> {
     platform::validate_hwnd_impl(hwnd)
 }
 
+/// Validates a monitor index before capture starts.
+///
+/// # Errors
+///
+/// Returns the platform-specific validation error when the monitor index does
+/// not identify a capturable display.
 pub fn validate_monitor(monitor_index: u32) -> Result<(), CaptureError> {
     platform::validate_monitor_impl(monitor_index)
 }

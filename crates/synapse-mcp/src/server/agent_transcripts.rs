@@ -2005,8 +2005,7 @@ fn required_local_normalized_arguments(object: &Map<String, Value>) -> Result<&V
         }
     }
     Err(format!(
-        "one of required object fields {:?} is missing",
-        FIELDS
+        "one of required object fields {FIELDS:?} is missing"
     ))
 }
 

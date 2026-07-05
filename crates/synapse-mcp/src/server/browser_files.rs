@@ -703,8 +703,7 @@ mod tests {
             assert!(
                 matches!(
                     code,
-                    Some(error_codes::TOOL_PARAMS_INVALID)
-                        | Some(error_codes::ACTION_TARGET_INVALID)
+                    Some(error_codes::TOOL_PARAMS_INVALID | error_codes::ACTION_TARGET_INVALID)
                 ),
                 "unexpected error code: {code:?}"
             );

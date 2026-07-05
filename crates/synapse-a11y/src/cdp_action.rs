@@ -175,7 +175,7 @@ pub struct CdpScrollIntoViewResult {
 }
 
 /// Active-element Source-of-Truth read from a CDP page target.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpActiveElementState {
     pub target_id: String,
     pub has_active_element: bool,
@@ -207,7 +207,7 @@ impl CdpPageNavigationAction {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpPageState {
     pub url: String,
     pub title: String,
@@ -234,7 +234,7 @@ impl CdpLoadState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CdpLoadStateWaitResult {
     pub target_id: String,
     pub requested_state: String,
@@ -269,7 +269,7 @@ impl CdpUrlMatchKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CdpUrlWaitResult {
     pub target_id: String,
     pub pattern: String,
@@ -283,7 +283,7 @@ pub struct CdpUrlWaitResult {
     pub ready_state: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpPageTextState {
     pub target_id: String,
     pub url: String,
@@ -298,7 +298,7 @@ pub struct CdpPageTextState {
 /// Result of evaluating a JavaScript expression in a CDP page target via
 /// `Runtime.evaluate` (#1065/#1067). Background-safe: this never activates the
 /// tab or uses OS foreground input — it attaches CDP to the owned target only.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpEvaluateResult {
     pub target_id: String,
     pub url: String,
@@ -324,7 +324,7 @@ pub struct CdpEvaluateResult {
     pub unserializable_value: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CdpInitScriptResult {
     pub target_id: String,
     pub identifier: String,
@@ -332,14 +332,14 @@ pub struct CdpInitScriptResult {
 }
 
 /// Selector resolution engine for [`cdp_locate`] (#1110–#1119), giving Synapse
-/// the full Playwright locator surface (CSS / XPath / text / role / label /
+/// the full Playwright locator surface (CSS / `XPath` / text / role / label /
 /// placeholder / altText / title / testid / layout).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CdpLocateEngine {
     /// `DOM.querySelectorAll` semantics, shadow-piercing (`getBy`-free CSS).
     #[default]
     Css,
-    /// `document.evaluate` XPath (Playwright `xpath=`).
+    /// `document.evaluate` `XPath` (Playwright `xpath=`).
     Xpath,
     /// Visible text (`getByText`): normalized whitespace, substring/exact/regex.
     Text,
@@ -463,7 +463,7 @@ pub struct CdpLocateRequest {
 /// Result of resolving a selector to live DOM nodes in a CDP page target
 /// (#1110). `backend_node_ids` are the matched nodes (capped at the caller's
 /// limit); `match_count` is the total number of matches before the cap.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpLocateResult {
     pub target_id: String,
     pub url: String,
@@ -477,7 +477,7 @@ pub struct CdpLocateResult {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CdpPageNavigationResult {
     pub target_id: String,
     pub action: String,
@@ -488,7 +488,7 @@ pub struct CdpPageNavigationResult {
     pub is_download: Option<bool>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CdpSetDocumentContentResult {
     pub target_id: String,
     pub frame_id: String,
@@ -706,7 +706,7 @@ pub struct CdpSetNodeTextReadback {
 
 /// DOM primitive result for Playwright-style `clear`, `focus`, `blur`, and
 /// `selectText` actions on an observed CDP backend node.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpDomPrimitiveResult {
     pub action: String,
     pub before_element: Value,
@@ -1082,7 +1082,7 @@ pub async fn cdp_dom_primitive_node(
 /// Mirrors the Playwright `fill` strategy: value controls use `select()`, a
 /// contenteditable host gets a DOM range over its contents. Returns a wire
 /// string so a non-editable target fails loud instead of appending.
-const CDP_SELECT_ALL_FUNCTION: &str = r#"function() {
+const CDP_SELECT_ALL_FUNCTION: &str = r"function() {
     if (this === null || this === undefined || !this.isConnected) { return 'detached'; }
     if (typeof this.select === 'function' && ('value' in this) && !this.disabled && !this.readOnly) {
         this.focus();
@@ -1100,7 +1100,7 @@ const CDP_SELECT_ALL_FUNCTION: &str = r#"function() {
     }
     if (('value' in this) && (this.disabled || this.readOnly)) { return 'not_editable_disabled_or_readonly'; }
     return 'not_editable';
-}"#;
+}";
 
 /// Replaces a web editable node's full text content (#882): real click to
 /// place focus/caret, best-effort `DOM.focus`, select-all on the exact
@@ -1297,9 +1297,7 @@ pub async fn cdp_mouse_stroke_target(
         .last()
         .map_or(start, |point| cdp_stroke_action_point(*point));
     let duration_ms = points.last().map_or(0.0, |point| point.elapsed_ms.max(0.0));
-    let button = button
-        .map(CdpMouseButton::to_cdp)
-        .unwrap_or(MouseButton::None);
+    let button = button.map_or(MouseButton::None, CdpMouseButton::to_cdp);
     let dispatched_target_id = with_target_page(endpoint, target_id, |page| async move {
         let dispatched_target_id = page.target_id().inner().clone();
         Ok(dispatched_target_id)
@@ -2493,7 +2491,7 @@ fn remote_object_type_str(
 }
 
 /// Formats a `Runtime.ExceptionDetails` into a single, fully-detailed line so
-/// the failure is actionable: the thrown class+message (from the RemoteObject
+/// the failure is actionable: the thrown class+message (from the `RemoteObject`
 /// description when present, which includes the stack), and the source location.
 fn format_evaluate_exception(
     exception: &chromiumoxide::cdp::js_protocol::runtime::ExceptionDetails,
@@ -2702,7 +2700,7 @@ pub async fn cdp_wait_for_load_state(
                     last_network_activity = Instant::now();
                     in_flight.remove(&event.request_id);
                 }
-                _ = tokio::time::sleep(sleep_for) => {}
+                () = tokio::time::sleep(sleep_for) => {}
             }
         }
     }
@@ -2868,14 +2866,12 @@ pub async fn cdp_wait_for_url(
 
             if started.elapsed() >= deadline {
                 let state_detail = last_state
-                    .as_ref()
-                    .map(|state| {
+                    .as_ref().map_or_else(|| "no page-state readback".to_owned(), |state| {
                         format!(
                             "last url={:?} title={:?} readyState={:?}",
                             state.url, state.title, state.ready_state
                         )
-                    })
-                    .unwrap_or_else(|| "no page-state readback".to_owned());
+                    });
                 let error_detail = last_error
                     .as_deref()
                     .map(|error| format!("; last readback error={error}"))
@@ -2898,7 +2894,7 @@ pub async fn cdp_wait_for_url(
                 Some(_) = same_document_navigated.next() => {
                     navigation_event_count = navigation_event_count.saturating_add(1);
                 }
-                _ = tokio::time::sleep(sleep_for) => {}
+                () = tokio::time::sleep(sleep_for) => {}
             }
         }
     }
@@ -3244,7 +3240,7 @@ pub async fn cdp_scroll_node(
     .await
 }
 
-const SCROLL_INTO_VIEW_STATE_JS: &str = r#"function() {
+const SCROLL_INTO_VIEW_STATE_JS: &str = r"function() {
     const node = this;
     const doc = (node && node.ownerDocument) || document;
     const win = doc.defaultView || window;
@@ -3309,7 +3305,7 @@ const SCROLL_INTO_VIEW_STATE_JS: &str = r#"function() {
         box_model_content: null,
         box_model_error: null
     };
-}"#;
+}";
 
 async fn read_scroll_into_view_snapshot(
     page: &chromiumoxide::Page,
@@ -3354,7 +3350,7 @@ async fn read_scroll_into_view_snapshot(
                 y: f64::from(rect.y),
                 width: f64::from(rect.w),
                 height: f64::from(rect.h),
-            })
+            });
         }
         Err(error) => snapshot.box_model_error = Some(error.to_string()),
     }
@@ -3918,7 +3914,7 @@ fn raw_mouse_event_message(
     })
 }
 
-fn mouse_button_wire(button: &MouseButton) -> &'static str {
+const fn mouse_button_wire(button: &MouseButton) -> &'static str {
     match button {
         MouseButton::Left => "left",
         MouseButton::Right => "right",
@@ -3934,7 +3930,7 @@ async fn sleep_until_sample(previous_elapsed_ms: f64, next_elapsed_ms: f64) {
     }
 }
 
-fn cdp_stroke_action_point(point: CdpMouseStrokePoint) -> CdpActionPoint {
+const fn cdp_stroke_action_point(point: CdpMouseStrokePoint) -> CdpActionPoint {
     CdpActionPoint {
         x: point.x,
         y: point.y,
@@ -4204,7 +4200,7 @@ async fn read_touch_input_state(page: &chromiumoxide::Page) -> A11yResult<CdpTou
     })
 }
 
-fn mouse_button_bit(button: &MouseButton) -> i64 {
+const fn mouse_button_bit(button: &MouseButton) -> i64 {
     match button {
         MouseButton::Left => 1,
         MouseButton::Right => 2,
@@ -4491,7 +4487,7 @@ async fn get_page_with_discovery(
         })
 }
 
-pub(crate) async fn get_target_page_with_discovery(
+pub async fn get_target_page_with_discovery(
     browser: &chromiumoxide::Browser,
     target_id: &str,
 ) -> A11yResult<chromiumoxide::Page> {
@@ -4733,7 +4729,7 @@ where
             detail: format!("Runtime.callFunctionOn {label} exception: {exception:?}"),
         });
     }
-    let remote = returns.result.result.clone();
+    let remote = returns.result.result;
     let value = remote.value.ok_or_else(|| A11yError::CdpAxtreeFailed {
         detail: format!(
             "Runtime.callFunctionOn {label} returned no by-value payload (type={:?} subtype={:?} description={:?})",

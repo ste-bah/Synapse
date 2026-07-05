@@ -702,20 +702,20 @@ pub enum BrowserRouteErrorReason {
 impl BrowserRouteErrorReason {
     fn as_cdp_str(self) -> &'static str {
         match self {
-            BrowserRouteErrorReason::Failed => "Failed",
-            BrowserRouteErrorReason::Aborted => "Aborted",
-            BrowserRouteErrorReason::TimedOut => "TimedOut",
-            BrowserRouteErrorReason::AccessDenied => "AccessDenied",
-            BrowserRouteErrorReason::ConnectionClosed => "ConnectionClosed",
-            BrowserRouteErrorReason::ConnectionReset => "ConnectionReset",
-            BrowserRouteErrorReason::ConnectionRefused => "ConnectionRefused",
-            BrowserRouteErrorReason::ConnectionAborted => "ConnectionAborted",
-            BrowserRouteErrorReason::ConnectionFailed => "ConnectionFailed",
-            BrowserRouteErrorReason::NameNotResolved => "NameNotResolved",
-            BrowserRouteErrorReason::InternetDisconnected => "InternetDisconnected",
-            BrowserRouteErrorReason::AddressUnreachable => "AddressUnreachable",
-            BrowserRouteErrorReason::BlockedByClient => "BlockedByClient",
-            BrowserRouteErrorReason::BlockedByResponse => "BlockedByResponse",
+            Self::Failed => "Failed",
+            Self::Aborted => "Aborted",
+            Self::TimedOut => "TimedOut",
+            Self::AccessDenied => "AccessDenied",
+            Self::ConnectionClosed => "ConnectionClosed",
+            Self::ConnectionReset => "ConnectionReset",
+            Self::ConnectionRefused => "ConnectionRefused",
+            Self::ConnectionAborted => "ConnectionAborted",
+            Self::ConnectionFailed => "ConnectionFailed",
+            Self::NameNotResolved => "NameNotResolved",
+            Self::InternetDisconnected => "InternetDisconnected",
+            Self::AddressUnreachable => "AddressUnreachable",
+            Self::BlockedByClient => "BlockedByClient",
+            Self::BlockedByResponse => "BlockedByResponse",
         }
     }
 }
@@ -3700,7 +3700,7 @@ fn har_route_id(index: usize, method: &str, url: &str) -> String {
 fn har_datetime(unix_ms: Option<f64>) -> String {
     let unix_ms = unix_ms.unwrap_or_else(current_unix_ms);
     let secs = (unix_ms / 1000.0).floor() as i64;
-    let nanos = ((unix_ms - (secs as f64 * 1000.0)) * 1_000_000.0)
+    let nanos = ((secs as f64).mul_add(-1000.0, unix_ms) * 1_000_000.0)
         .round()
         .clamp(0.0, 999_999_999.0) as u32;
     DateTime::<Utc>::from_timestamp(secs, nanos)

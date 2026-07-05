@@ -53,7 +53,7 @@ impl SynapseService {
                     .command_query
                     .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), AUDIT_SOT))?;
                 let response = self
-                    .command_audit_query(spec.clone().into())
+                    .command_audit_query(spec.into())
                     .map_err(|error| delegate_error(AUDIT_TOOL, operation.as_str(), "CF_ACTION_LOG", AUDIT_SOT, error, "tighten the audit filters or repair CF_ACTION_LOG before retrying command_query"))?;
                 let sanitized = summarize_command_query(response)?;
                 Ok(Json(audit_response(
@@ -298,7 +298,7 @@ impl SynapseService {
                             REPLAY_TOOL,
                             "demo_start",
                             Some(by_session.clone()),
-                            Some(by_session.clone()),
+                            Some(by_session),
                             command_payload,
                             command_before,
                             json!({
@@ -317,7 +317,7 @@ impl SynapseService {
                                 REPLAY_TOOL,
                                 "demo_start",
                                 Some(by_session.clone()),
-                                Some(by_session.clone()),
+                                Some(by_session),
                                 command_payload,
                                 command_before,
                                 json!({
@@ -385,7 +385,7 @@ impl SynapseService {
                             REPLAY_TOOL,
                             "demo_stop",
                             Some(by_session.clone()),
-                            Some(by_session.clone()),
+                            Some(by_session),
                             command_payload,
                             command_before,
                             json!({
@@ -404,7 +404,7 @@ impl SynapseService {
                                 REPLAY_TOOL,
                                 "demo_stop",
                                 Some(by_session.clone()),
-                                Some(by_session.clone()),
+                                Some(by_session),
                                 command_payload,
                                 command_before,
                                 json!({

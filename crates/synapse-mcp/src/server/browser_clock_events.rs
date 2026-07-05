@@ -43,11 +43,11 @@ pub enum BrowserClockOperation {
 impl BrowserClockOperation {
     fn wire(self) -> &'static str {
         match self {
-            BrowserClockOperation::Status => "status",
-            BrowserClockOperation::Install => "install",
-            BrowserClockOperation::SetFixedTime => "setFixedTime",
-            BrowserClockOperation::FastForward => "fastForward",
-            BrowserClockOperation::PauseAt => "pauseAt",
+            Self::Status => "status",
+            Self::Install => "install",
+            Self::SetFixedTime => "setFixedTime",
+            Self::FastForward => "fastForward",
+            Self::PauseAt => "pauseAt",
         }
     }
 }

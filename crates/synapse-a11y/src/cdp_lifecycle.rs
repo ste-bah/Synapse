@@ -153,7 +153,7 @@ impl RingBuffer {
         }
     }
 
-    fn cursor(&self) -> u64 {
+    const fn cursor(&self) -> u64 {
         self.next_seq
     }
 
@@ -307,8 +307,7 @@ fn registry() -> &'static CaptureRegistry {
 fn now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 pub async fn lifecycle_capture_ensure(
@@ -600,6 +599,7 @@ pub async fn lifecycle_capture_ensure(
     })
 }
 
+#[must_use]
 pub fn lifecycle_capture_read(
     target_id: &str,
     filter: &CdpPageEventsReadFilter<'_>,

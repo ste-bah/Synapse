@@ -327,7 +327,7 @@ fn main() {
             "read after stop returns None (not armed)",
             console_capture_read(&target_id, &ConsoleReadFilter::default()).is_none()
         );
-        console_capture_stop(&target_b);
+        let _ = console_capture_stop(&target_b);
 
         println!("\nSMOKE RESULT: {pass} passed, {fail} failed");
         if fail > 0 {

@@ -19,6 +19,11 @@ pub const CDP_TIMEZONE_MAX_CHARS: usize = 128;
 pub const CDP_NETWORK_MAX_LATENCY_MS: f64 = 3_600_000.0;
 pub const CDP_NETWORK_MAX_THROUGHPUT_BYTES_PER_SEC: f64 = 10_000_000_000.0;
 
+fn finite_f64_eq(left: f64, right: f64) -> bool {
+    left.partial_cmp(&right)
+        .is_some_and(std::cmp::Ordering::is_eq)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct CdpViewportOverride {
     pub width: u32,
@@ -111,7 +116,7 @@ pub struct CdpGeolocationCoordinatesReadback {
     pub timestamp: f64,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpGeolocationErrorReadback {
     pub code: i64,
     pub message: String,
@@ -138,13 +143,13 @@ pub struct CdpGeolocationResult {
     pub readback: CdpGeolocationReadback,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CdpLocaleTimezoneOverride {
     pub locale: Option<String>,
     pub timezone_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpLocaleTimezoneReadback {
     pub locale: String,
     pub calendar: String,
@@ -156,7 +161,7 @@ pub struct CdpLocaleTimezoneReadback {
     pub timezone_offset_minutes: i64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CdpLocaleTimezoneResult {
     pub endpoint: String,
     pub cdp_target_id: String,
@@ -168,14 +173,14 @@ pub struct CdpLocaleTimezoneResult {
     pub readback: CdpLocaleTimezoneReadback,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CdpMediaOverride {
     pub media: Option<String>,
     pub color_scheme: Option<String>,
     pub reduced_motion: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct CdpMediaReadback {
     pub media_screen: bool,
     pub media_print: bool,
@@ -186,7 +191,7 @@ pub struct CdpMediaReadback {
     pub reduced_motion_no_preference: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CdpMediaResult {
     pub endpoint: String,
     pub cdp_target_id: String,
@@ -273,7 +278,7 @@ enum GeolocationPermissionSetting {
 }
 
 impl GeolocationPermissionSetting {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Granted => "granted",
             Self::Denied => "denied",
@@ -913,9 +918,9 @@ fn validate_network_conditions_override(
         validate_network_connection_type(connection_type)?;
     }
     if !requested.offline
-        && requested.latency_ms == 0.0
-        && requested.download_throughput_bytes_per_sec == -1.0
-        && requested.upload_throughput_bytes_per_sec == -1.0
+        && finite_f64_eq(requested.latency_ms, 0.0)
+        && finite_f64_eq(requested.download_throughput_bytes_per_sec, -1.0)
+        && finite_f64_eq(requested.upload_throughput_bytes_per_sec, -1.0)
         && requested.connection_type.is_none()
     {
         return Err(A11yError::CdpAxtreeFailed {
@@ -939,7 +944,8 @@ fn validate_network_latency(value: f64) -> A11yResult<()> {
 
 fn validate_network_throughput(field: &str, value: f64) -> A11yResult<()> {
     if value.is_finite()
-        && (value == -1.0 || (0.0..=CDP_NETWORK_MAX_THROUGHPUT_BYTES_PER_SEC).contains(&value))
+        && (finite_f64_eq(value, -1.0)
+            || (0.0..=CDP_NETWORK_MAX_THROUGHPUT_BYTES_PER_SEC).contains(&value))
     {
         Ok(())
     } else {
@@ -1687,7 +1693,7 @@ async fn network_conditions_readback(
     })
 }
 
-const VIEWPORT_READBACK_JS: &str = r#"(() => {
+const VIEWPORT_READBACK_JS: &str = r"(() => {
   const viewport = globalThis.visualViewport || null;
   return {
     inner_width: Math.round(globalThis.innerWidth || 0),
@@ -1700,7 +1706,7 @@ const VIEWPORT_READBACK_JS: &str = r#"(() => {
     visual_viewport_width: viewport ? Number(viewport.width) : null,
     visual_viewport_height: viewport ? Number(viewport.height) : null
   };
-})()"#;
+})()";
 
 const DEVICE_READBACK_JS: &str = r#"(() => {
   const viewport = globalThis.visualViewport || null;
@@ -1893,7 +1899,7 @@ mod tests {
         bad_ua.user_agent = " bad ".to_owned();
         assert!(validate_device_descriptor(&bad_ua).is_err());
 
-        let mut no_touch_points = mobile.clone();
+        let mut no_touch_points = mobile;
         no_touch_points.max_touch_points = 0;
         assert!(validate_device_descriptor(&no_touch_points).is_err());
 

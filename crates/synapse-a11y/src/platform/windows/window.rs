@@ -483,9 +483,9 @@ fn visible_top_level_hwnds() -> A11yResult<Vec<HWND>> {
     Ok(search.hwnds)
 }
 
-fn is_invalid_window_handle_error(error: &windows::core::Error) -> bool {
+const fn is_invalid_window_handle_error(error: &windows::core::Error) -> bool {
     // ERROR_INVALID_WINDOW_HANDLE (1400) surfaced through HRESULT_FROM_WIN32.
-    error.code().0 as u32 == 0x8007_0578
+    u32::from_ne_bytes(error.code().0.to_ne_bytes()) == 0x8007_0578
 }
 
 fn valid_hwnd(hwnd: i64) -> A11yResult<HWND> {

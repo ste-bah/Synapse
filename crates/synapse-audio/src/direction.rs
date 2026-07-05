@@ -95,9 +95,9 @@ fn normalized_correlation(left: &[f32], right: &[f32], lag: i32) -> f32 {
     for idx in 0..len {
         let l = left[left_start + idx];
         let r = right[right_start + idx];
-        dot += l * r;
-        left_energy += l * l;
-        right_energy += r * r;
+        dot = l.mul_add(r, dot);
+        left_energy = l.mul_add(l, left_energy);
+        right_energy = r.mul_add(r, right_energy);
     }
     let denom = (left_energy * right_energy).sqrt();
     if denom <= f32::EPSILON {

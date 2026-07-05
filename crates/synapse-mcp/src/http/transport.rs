@@ -4324,7 +4324,7 @@ fn dashboard_agent_recording_readback(
             scan_limit: Some(request.event_scan_limit.unwrap_or(50_000).clamp(1, 50_000)),
             start_ts_ns: None,
             end_ts_ns: None,
-            spawn_id: Some(spawn_id.clone()),
+            spawn_id: Some(spawn_id),
             session_id: None,
             kind: None,
         },
@@ -4378,7 +4378,7 @@ fn dashboard_agent_recording_seed(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &code,
                 "agent recording failed to read session registry",
-                error.data.clone(),
+                error.data,
             )
         })?;
     for summary in &sessions.sessions {
@@ -5292,7 +5292,7 @@ async fn dashboard_context_inject(
     let payload_sha256 = dashboard_payload_sha256(&payload);
     let result = match channel.as_str() {
         "steer" => state.health_service.dashboard_agent_steer(
-            session_id.clone(),
+            session_id,
             packet.to_owned(),
             request.request_receipt,
         ),
@@ -5305,9 +5305,9 @@ async fn dashboard_context_inject(
                 .unwrap_or("context_packet")
                 .to_owned();
             state.health_service.dashboard_agent_send(
-                session_id.clone(),
+                session_id,
                 kind,
-                payload.clone(),
+                payload,
                 request.request_receipt,
             )
         }
@@ -5321,7 +5321,7 @@ async fn dashboard_context_inject(
                 .unwrap_or_else(|| format!("context/{session_id}/{now_unix_ms}"));
             state
                 .health_service
-                .dashboard_workspace_put(key, None, payload.clone())
+                .dashboard_workspace_put(key, None, payload)
         }
         other => {
             return with_dashboard_security_headers(dashboard_error_response(

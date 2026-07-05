@@ -1,6 +1,6 @@
 //! Offline column-family dump for manual Full-State-Verification.
 //!
-//! Opens a Synapse RocksDB strictly READ-ONLY and prints every row of one
+//! Opens a Synapse `RocksDB` strictly READ-ONLY and prints every row of one
 //! column family so physical storage state can be verified independently of
 //! the MCP tool surface. Read-only open never creates databases or column
 //! families (a source-of-truth reader must not be able to mutate the source
@@ -16,6 +16,16 @@ use std::{
 
 use rocksdb::{DB, Options};
 use synapse_storage::{cf, timeline};
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
@@ -53,7 +63,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
     for (index, (key, value)) in rows.iter().enumerate() {
-        let key_hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+        let key_hex = hex_encode(key);
         let decoded_key = if cf_name == cf::CF_TIMELINE {
             match timeline::decode_timeline_key(key) {
                 Ok((ts_ns, seq)) => format!(" ts_ns={ts_ns} seq={seq}"),

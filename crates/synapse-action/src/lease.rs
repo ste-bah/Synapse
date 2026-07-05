@@ -200,10 +200,12 @@ fn remember_expired_cleanup(status: &LeaseStatus) {
     if owner_session_id == OPERATOR_LEASE_OWNER_SESSION_ID {
         return;
     }
-    let mut pending = lock_expired_cleanup();
-    pending
-        .entry(owner_session_id.clone())
-        .or_insert_with(|| status.clone());
+    {
+        let mut pending = lock_expired_cleanup();
+        pending
+            .entry(owner_session_id.clone())
+            .or_insert_with(|| status.clone());
+    }
     tracing::warn!(
         code = error_codes::ACTION_FOREGROUND_LEASE_BUSY,
         owner_session_id,
@@ -350,7 +352,7 @@ pub fn handoff(
     match guard.as_mut() {
         Some(lease) if lease.owner_session_id == from_session_id => {
             let prior = lease.status(now);
-            lease.owner_session_id = to_session_id.to_owned();
+            to_session_id.clone_into(&mut lease.owner_session_id);
             lease.acquired_at = now;
             lease.renewed_at = now;
             lease.ttl = ttl;
@@ -414,6 +416,9 @@ pub fn force_clear(reason: &str) -> Option<LeaseStatus> {
     let now = Instant::now();
     let mut guard = lock();
     let prior = guard.as_ref().map(|lease| lease.status(now));
+    *guard = None;
+    drop(guard);
+    lock_expired_cleanup().clear();
     if let Some(prior) = &prior {
         tracing::info!(
             reason,
@@ -421,8 +426,6 @@ pub fn force_clear(reason: &str) -> Option<LeaseStatus> {
             "input lease force-cleared"
         );
     }
-    *guard = None;
-    lock_expired_cleanup().clear();
     prior
 }
 
@@ -438,13 +441,16 @@ pub fn force_clear_if_owner(session_id: &str, reason: &str) -> Option<LeaseStatu
         .as_ref()
         .filter(|lease| lease.owner_session_id == session_id)
         .map(|lease| lease.status(now));
+    if prior.is_some() {
+        *guard = None;
+    }
+    drop(guard);
     if let Some(prior) = &prior {
         tracing::warn!(
             reason,
             prior_owner = ?prior.owner_session_id,
             "input lease force-cleared by owner-guarded operator override"
         );
-        *guard = None;
         lock_expired_cleanup().clear();
     }
     prior

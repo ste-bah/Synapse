@@ -1107,11 +1107,13 @@ fn error_data_code(error: &ErrorData) -> Option<String> {
 fn is_refusal_code(code: Option<&str>) -> bool {
     matches!(
         code,
-        Some(error_codes::SAFETY_PERMISSION_DENIED)
-            | Some(error_codes::SAFETY_PROFILE_ACTION_DENIED)
-            | Some(error_codes::SAFETY_LAUNCH_DENIED_BY_POLICY)
-            | Some(error_codes::HTTP_SESSION_INVALID)
-            | Some(error_codes::TOOL_PARAMS_INVALID)
+        Some(
+            error_codes::SAFETY_PERMISSION_DENIED
+                | error_codes::SAFETY_PROFILE_ACTION_DENIED
+                | error_codes::SAFETY_LAUNCH_DENIED_BY_POLICY
+                | error_codes::HTTP_SESSION_INVALID
+                | error_codes::TOOL_PARAMS_INVALID
+        )
     )
 }
 

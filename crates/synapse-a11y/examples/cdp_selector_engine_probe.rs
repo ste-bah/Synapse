@@ -6,25 +6,142 @@
 //! GitHub issue comments.
 //!
 //! Usage (a Chromium must be listening with --remote-debugging-port):
-//!   cargo run -p synapse-a11y --example cdp_selector_engine_probe -- http://127.0.0.1:9222
+//!   cargo run -p synapse-a11y --example `cdp_selector_engine_probe` -- <http://127.0.0.1:9222>
 #![allow(clippy::expect_used, clippy::too_many_lines, clippy::print_stdout)]
+
+#[cfg(windows)]
+use chromiumoxide::cdp::browser_protocol::dom::{
+    BackendNodeId, GetDocumentParams, ResolveNodeParams,
+};
+#[cfg(windows)]
+use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
+#[cfg(windows)]
+use chromiumoxide::{Browser, Page};
+#[cfg(windows)]
+use futures_util::StreamExt as _;
+#[cfg(windows)]
+use synapse_a11y::{
+    CdpLayoutRelation, CdpLocateEngine, CdpLocateRequest, CdpLocateResult, CdpMouseButton,
+    cdp_click_node, cdp_locate,
+};
 
 #[cfg(not(windows))]
 fn main() {}
 
 #[cfg(windows)]
-fn main() {
-    use chromiumoxide::Browser;
-    use chromiumoxide::cdp::browser_protocol::dom::{
-        BackendNodeId, GetDocumentParams, ResolveNodeParams,
-    };
-    use chromiumoxide::cdp::js_protocol::runtime::CallFunctionOnParams;
-    use futures_util::StreamExt as _;
-    use synapse_a11y::{
-        CdpLayoutRelation, CdpLocateEngine, CdpLocateRequest, CdpMouseButton, cdp_click_node,
-        cdp_locate,
-    };
+fn req(engine: CdpLocateEngine, query: &str) -> CdpLocateRequest {
+    CdpLocateRequest {
+        engine,
+        query: query.to_owned(),
+        limit: 50,
+        ..Default::default()
+    }
+}
 
+#[cfg(windows)]
+async fn resolved_id(page: &Page, backend: i64) -> String {
+    let resolved = page
+        .execute(
+            ResolveNodeParams::builder()
+                .backend_node_id(BackendNodeId::new(backend))
+                .build(),
+        )
+        .await
+        .expect("resolveNode");
+    let object_id = resolved.object.object_id.clone().expect("objectId");
+    let call = CallFunctionOnParams::builder()
+        .function_declaration(
+            "function(){ return this.id || this.tagName.toLowerCase(); }".to_owned(),
+        )
+        .object_id(object_id)
+        .return_by_value(true)
+        .build()
+        .expect("call build");
+    page.execute(call)
+        .await
+        .expect("read id")
+        .result
+        .result
+        .value
+        .and_then(|v| v.as_str().map(ToOwned::to_owned))
+        .unwrap_or_default()
+}
+
+#[cfg(windows)]
+struct ProbeCase {
+    label: &'static str,
+    request: CdpLocateRequest,
+    expected_ids: Vec<&'static str>,
+    expected_count: usize,
+}
+
+#[cfg(windows)]
+const fn case(
+    label: &'static str,
+    request: CdpLocateRequest,
+    expected_ids: Vec<&'static str>,
+    expected_count: usize,
+) -> ProbeCase {
+    ProbeCase {
+        label,
+        request,
+        expected_ids,
+        expected_count,
+    }
+}
+
+#[cfg(windows)]
+struct ProbeContext<'a> {
+    endpoint: &'a str,
+    target_id: &'a str,
+    page: &'a Page,
+    pass: u32,
+}
+
+#[cfg(windows)]
+impl ProbeContext<'_> {
+    async fn check(
+        &mut self,
+        label: &str,
+        request: CdpLocateRequest,
+        expected_ids: &[&str],
+        expected_count: usize,
+    ) -> CdpLocateResult {
+        let result = cdp_locate(self.endpoint, self.target_id, request)
+            .await
+            .unwrap_or_else(|e| panic!("[{label}] cdp_locate FAILED: {e}"));
+        let mut got = Vec::new();
+        for backend in &result.backend_node_ids {
+            got.push(resolved_id(self.page, *backend).await);
+        }
+        let expected: Vec<String> = expected_ids.iter().map(|id| (*id).to_owned()).collect();
+        println!(
+            "readback=probe check='{label}' match_count={} expected_count={} got_ids={got:?} expected_ids={expected:?}",
+            result.match_count, expected_count
+        );
+        assert_eq!(result.match_count, expected_count, "[{label}] match_count");
+        assert_eq!(got, expected, "[{label}] resolved ids (order-sensitive)");
+        self.pass += 1;
+        result
+    }
+}
+
+#[cfg(windows)]
+async fn run_cases(context: &mut ProbeContext<'_>, cases: Vec<ProbeCase>) {
+    for case in cases {
+        context
+            .check(
+                case.label,
+                case.request,
+                &case.expected_ids,
+                case.expected_count,
+            )
+            .await;
+    }
+}
+
+#[cfg(windows)]
+fn main() {
     // A page that exercises every engine and edge case. Every assertable node
     // carries a stable `id` so we can read the resolution back independently.
     const PAGE_HTML: &str = r"
@@ -58,7 +175,7 @@ fn main() {
         .build()
         .expect("rt");
 
-    rt.block_on(async move {
+    rt.block_on(Box::pin(async move {
         let (browser, mut handler) = Browser::connect(&endpoint).await.expect("connect to Chrome");
         let _drive = tokio::spawn(async move { while handler.next().await.is_some() {} });
 
@@ -75,134 +192,181 @@ fn main() {
             .await;
         println!("readback=probe stage=setup target={target_id} url=about:blank title='Synapse Selector Probe'");
 
-        // Independent probe readback: backendNodeId -> element.id.
-        let id_of = |backend: i64| {
-            let page = page.clone();
-            async move {
-                let resolved = page
-                    .execute(
-                        ResolveNodeParams::builder()
-                            .backend_node_id(BackendNodeId::new(backend))
-                            .build(),
-                    )
-                    .await
-                    .expect("resolveNode");
-                let object_id = resolved.object.object_id.clone().expect("objectId");
-                let call = CallFunctionOnParams::builder()
-                    .function_declaration("function(){ return this.id || this.tagName.toLowerCase(); }".to_owned())
-                    .object_id(object_id)
-                    .return_by_value(true)
-                    .build()
-                    .expect("call build");
-                page.execute(call)
-                    .await
-                    .expect("read id")
-                    .result
-                    .result
-                    .value
-                    .and_then(|v| v.as_str().map(ToOwned::to_owned))
-                    .unwrap_or_default()
-            }
-        };
-
-        let req = |engine: CdpLocateEngine, query: &str| CdpLocateRequest {
-            engine,
-            query: query.to_owned(),
-            limit: 50,
-            ..Default::default()
-        };
-
-        // Runs a request, reads back the resolved ids, and asserts the set + count.
-        let mut pass = 0u32;
-        macro_rules! check {
-            ($label:expr, $request:expr, $expected_ids:expr, $expected_count:expr) => {{
-                let request: CdpLocateRequest = $request;
-                let result = cdp_locate(&endpoint, &target_id, request)
-                    .await
-                    .unwrap_or_else(|e| panic!("[{}] cdp_locate FAILED: {e}", $label));
-                let mut got = Vec::new();
-                for b in &result.backend_node_ids {
-                    got.push(id_of(*b).await);
-                }
-                let expected: Vec<String> = $expected_ids.iter().map(|s: &&str| (*s).to_owned()).collect();
-                println!(
-                    "readback=probe check='{}' match_count={} expected_count={} got_ids={:?} expected_ids={:?}",
-                    $label, result.match_count, $expected_count, got, expected
-                );
-                assert_eq!(result.match_count, $expected_count, "[{}] match_count", $label);
-                assert_eq!(got, expected, "[{}] resolved ids (order-sensitive)", $label);
-                pass += 1;
-                result
-            }};
-        }
-
-        // ---- #1111 CSS ----
-        check!("css.unique", req(CdpLocateEngine::Css, "#btn-apply"), ["btn-apply"], 1);
-        check!("css.multiple", req(CdpLocateEngine::Css, "a.lnk"), ["lnk-1", "lnk-2"], 2);
-        check!("css.nomatch", req(CdpLocateEngine::Css, "#does-not-exist"), [] as [&str; 0], 0);
-
-        // ---- #1112 XPath ----
-        check!("xpath.attr", req(CdpLocateEngine::Xpath, "//button[@id='btn-submit']"), ["btn-submit"], 1);
-        check!("xpath.text", req(CdpLocateEngine::Xpath, "//a[contains(.,'Read more')]"), ["lnk-1", "lnk-2"], 2);
-        check!("xpath.nomatch", req(CdpLocateEngine::Xpath, "//table"), [] as [&str; 0], 0);
-
-        // ---- #1113 Text (substring / exact / regex) ----
-        // substring "apply" (case-insensitive) -> deepest matches: btn-apply + apply-span.
-        check!("text.substring", req(CdpLocateEngine::Text, "apply"), ["btn-apply", "apply-span"], 2);
-        check!(
-            "text.exact",
-            CdpLocateRequest { exact: true, ..req(CdpLocateEngine::Text, "Submit Order") },
-            ["btn-submit"], 1
-        );
-        check!(
-            "text.regex",
-            CdpLocateRequest { regex: true, ..req(CdpLocateEngine::Text, "^Read more$") },
-            ["lnk-1", "lnk-2"], 2
-        );
-
-        // ---- #1114 Role + name + state ----
-        check!(
-            "role.name",
-            CdpLocateRequest { name: Some("Submit Order".to_owned()), name_exact: true, ..req(CdpLocateEngine::Role, "button") },
-            ["btn-submit"], 1
-        );
-        check!(
-            "role.checked",
-            CdpLocateRequest { checked: Some(true), ..req(CdpLocateEngine::Role, "checkbox") },
-            ["cb-on"], 1
-        );
-        check!(
-            "role.heading.level",
-            CdpLocateRequest { level: Some(2), ..req(CdpLocateEngine::Role, "heading") },
-            ["heading2"], 1
-        );
-
-        // ---- #1115 Label / placeholder / altText / title ----
-        check!("label.for", req(CdpLocateEngine::Label, "Full Name"), ["inp-name"], 1);
-        check!("label.aria", req(CdpLocateEngine::Label, "Search query"), ["inp-aria"], 1);
-        check!("placeholder", req(CdpLocateEngine::Placeholder, "Email address"), ["inp-email"], 1);
-        check!("alttext", req(CdpLocateEngine::AltText, "Company Logo"), ["img-logo"], 1);
-        check!("title", req(CdpLocateEngine::Title, "Tooltip Here"), ["sp-title"], 1);
-
-        // ---- #1116 TestId (default + configurable attribute) ----
-        check!("testid.default", req(CdpLocateEngine::TestId, "submit-btn"), ["btn-submit"], 1);
-        check!(
-            "testid.custom-attr",
-            CdpLocateRequest { testid_attribute: Some("data-test".to_owned()), ..req(CdpLocateEngine::TestId, "alt-attr") },
-            ["ti-custom"], 1
-        );
-
-        // ---- #1117 Layout / relational ----
-        check!(
-            "layout.right-of",
-            CdpLocateRequest { relation: Some(CdpLayoutRelation::RightOf), anchor: Some("#anchor-box".to_owned()), ..req(CdpLocateEngine::Layout, "button.lay") },
-            ["right-btn"], 1
-        );
-        check!(
-            "layout.left-of",
-            CdpLocateRequest { relation: Some(CdpLayoutRelation::LeftOf), anchor: Some("#anchor-box".to_owned()), ..req(CdpLocateEngine::Layout, "button.lay") },
-            ["left-btn"], 1
-        );
+        let checks = {
+            // Runs each request, reads back the resolved ids, and asserts the set + count.
+            let mut probe = ProbeContext {
+                endpoint: &endpoint,
+                target_id: &target_id,
+                page: &page,
+                pass: 0,
+            };
+            run_cases(
+                &mut probe,
+                vec![
+                // ---- #1111 CSS ----
+                case(
+                    "css.unique",
+                    req(CdpLocateEngine::Css, "#btn-apply"),
+                    vec!["btn-apply"],
+                    1,
+                ),
+                case(
+                    "css.multiple",
+                    req(CdpLocateEngine::Css, "a.lnk"),
+                    vec!["lnk-1", "lnk-2"],
+                    2,
+                ),
+                case(
+                    "css.nomatch",
+                    req(CdpLocateEngine::Css, "#does-not-exist"),
+                    vec![],
+                    0,
+                ),
+                // ---- #1112 XPath ----
+                case(
+                    "xpath.attr",
+                    req(CdpLocateEngine::Xpath, "//button[@id='btn-submit']"),
+                    vec!["btn-submit"],
+                    1,
+                ),
+                case(
+                    "xpath.text",
+                    req(CdpLocateEngine::Xpath, "//a[contains(.,'Read more')]"),
+                    vec!["lnk-1", "lnk-2"],
+                    2,
+                ),
+                case(
+                    "xpath.nomatch",
+                    req(CdpLocateEngine::Xpath, "//table"),
+                    vec![],
+                    0,
+                ),
+                // ---- #1113 Text (substring / exact / regex) ----
+                // substring "apply" (case-insensitive) -> deepest matches: btn-apply + apply-span.
+                case(
+                    "text.substring",
+                    req(CdpLocateEngine::Text, "apply"),
+                    vec!["btn-apply", "apply-span"],
+                    2,
+                ),
+                case(
+                    "text.exact",
+                    CdpLocateRequest {
+                        exact: true,
+                        ..req(CdpLocateEngine::Text, "Submit Order")
+                    },
+                    vec!["btn-submit"],
+                    1,
+                ),
+                case(
+                    "text.regex",
+                    CdpLocateRequest {
+                        regex: true,
+                        ..req(CdpLocateEngine::Text, "^Read more$")
+                    },
+                    vec!["lnk-1", "lnk-2"],
+                    2,
+                ),
+                // ---- #1114 Role + name + state ----
+                case(
+                    "role.name",
+                    CdpLocateRequest {
+                        name: Some("Submit Order".to_owned()),
+                        name_exact: true,
+                        ..req(CdpLocateEngine::Role, "button")
+                    },
+                    vec!["btn-submit"],
+                    1,
+                ),
+                case(
+                    "role.checked",
+                    CdpLocateRequest {
+                        checked: Some(true),
+                        ..req(CdpLocateEngine::Role, "checkbox")
+                    },
+                    vec!["cb-on"],
+                    1,
+                ),
+                case(
+                    "role.heading.level",
+                    CdpLocateRequest {
+                        level: Some(2),
+                        ..req(CdpLocateEngine::Role, "heading")
+                    },
+                    vec!["heading2"],
+                    1,
+                ),
+                // ---- #1115 Label / placeholder / altText / title ----
+                case(
+                    "label.for",
+                    req(CdpLocateEngine::Label, "Full Name"),
+                    vec!["inp-name"],
+                    1,
+                ),
+                case(
+                    "label.aria",
+                    req(CdpLocateEngine::Label, "Search query"),
+                    vec!["inp-aria"],
+                    1,
+                ),
+                case(
+                    "placeholder",
+                    req(CdpLocateEngine::Placeholder, "Email address"),
+                    vec!["inp-email"],
+                    1,
+                ),
+                case(
+                    "alttext",
+                    req(CdpLocateEngine::AltText, "Company Logo"),
+                    vec!["img-logo"],
+                    1,
+                ),
+                case(
+                    "title",
+                    req(CdpLocateEngine::Title, "Tooltip Here"),
+                    vec!["sp-title"],
+                    1,
+                ),
+                // ---- #1116 TestId (default + configurable attribute) ----
+                case(
+                    "testid.default",
+                    req(CdpLocateEngine::TestId, "submit-btn"),
+                    vec!["btn-submit"],
+                    1,
+                ),
+                case(
+                    "testid.custom-attr",
+                    CdpLocateRequest {
+                        testid_attribute: Some("data-test".to_owned()),
+                        ..req(CdpLocateEngine::TestId, "alt-attr")
+                    },
+                    vec!["ti-custom"],
+                    1,
+                ),
+                // ---- #1117 Layout / relational ----
+                case(
+                    "layout.right-of",
+                    CdpLocateRequest {
+                        relation: Some(CdpLayoutRelation::RightOf),
+                        anchor: Some("#anchor-box".to_owned()),
+                        ..req(CdpLocateEngine::Layout, "button.lay")
+                    },
+                    vec!["right-btn"],
+                    1,
+                ),
+                case(
+                    "layout.left-of",
+                    CdpLocateRequest {
+                        relation: Some(CdpLayoutRelation::LeftOf),
+                        anchor: Some("#anchor-box".to_owned()),
+                        ..req(CdpLocateEngine::Layout, "button.lay")
+                    },
+                    vec!["left-btn"],
+                    1,
+                ),
+                ],
+            )
+            .await;
 
         // ---- #1118 chaining / filter / nth / strict ----
         // root scoping: only the button inside #card.
@@ -210,31 +374,57 @@ fn main() {
             .await
             .expect("locate card");
         let card_backend = card.backend_node_ids[0];
-        check!(
-            "chain.root",
-            CdpLocateRequest { root_backend_node_id: Some(card_backend), ..req(CdpLocateEngine::Css, "button") },
-            ["incard"], 1
-        );
-        check!(
-            "nth.first",
-            CdpLocateRequest { nth: Some(0), ..req(CdpLocateEngine::Css, "a.lnk") },
-            ["lnk-1"], 2
-        );
-        check!(
-            "nth.last",
-            CdpLocateRequest { nth: Some(-1), ..req(CdpLocateEngine::Css, "a.lnk") },
-            ["lnk-2"], 2
-        );
-        check!(
-            "filter.hasText",
-            CdpLocateRequest { has_text: Some("Read more".to_owned()), ..req(CdpLocateEngine::Css, "a") },
-            ["lnk-1", "lnk-2"], 2
-        );
-        check!(
-            "filter.hasText.none",
-            CdpLocateRequest { has_text: Some("zzz-nope".to_owned()), ..req(CdpLocateEngine::Css, "a") },
-            [] as [&str; 0], 0
-        );
+        run_cases(
+            &mut probe,
+            vec![
+                case(
+                    "chain.root",
+                    CdpLocateRequest {
+                        root_backend_node_id: Some(card_backend),
+                        ..req(CdpLocateEngine::Css, "button")
+                    },
+                    vec!["incard"],
+                    1,
+                ),
+                case(
+                    "nth.first",
+                    CdpLocateRequest {
+                        nth: Some(0),
+                        ..req(CdpLocateEngine::Css, "a.lnk")
+                    },
+                    vec!["lnk-1"],
+                    2,
+                ),
+                case(
+                    "nth.last",
+                    CdpLocateRequest {
+                        nth: Some(-1),
+                        ..req(CdpLocateEngine::Css, "a.lnk")
+                    },
+                    vec!["lnk-2"],
+                    2,
+                ),
+                case(
+                    "filter.hasText",
+                    CdpLocateRequest {
+                        has_text: Some("Read more".to_owned()),
+                        ..req(CdpLocateEngine::Css, "a")
+                    },
+                    vec!["lnk-1", "lnk-2"],
+                    2,
+                ),
+                case(
+                    "filter.hasText.none",
+                    CdpLocateRequest {
+                        has_text: Some("zzz-nope".to_owned()),
+                        ..req(CdpLocateEngine::Css, "a")
+                    },
+                    vec![],
+                    0,
+                ),
+            ],
+        )
+        .await;
 
         // strict: >1 match must error; ==1 must pass.
         let strict_err = cdp_locate(
@@ -245,12 +435,18 @@ fn main() {
         .await;
         println!("readback=probe check='strict.multiple' result={strict_err:?}");
         assert!(strict_err.is_err(), "strict mode must error on >1 match");
-        pass += 1;
-        check!(
-            "strict.unique",
-            CdpLocateRequest { strict: true, ..req(CdpLocateEngine::Css, "#btn-apply") },
-            ["btn-apply"], 1
-        );
+        probe.pass += 1;
+        probe
+            .check(
+                "strict.unique",
+                CdpLocateRequest {
+                    strict: true,
+                    ..req(CdpLocateEngine::Css, "#btn-apply")
+                },
+                &["btn-apply"],
+                1,
+            )
+            .await;
 
         // ---- #1120 the resolved id drives a REAL action ----
         let submit = cdp_locate(&endpoint, &target_id, req(CdpLocateEngine::TestId, "submit-btn"))
@@ -288,9 +484,11 @@ fn main() {
         );
         assert_eq!(clicks_before, "0", "counter should start at 0");
         assert_eq!(clicks_after, "1", "resolved testid id must drive a real click → counter 0->1");
-        pass += 1;
+            probe.pass += 1;
+            probe.pass
+        };
 
         let _ = page.close().await;
-        println!("readback=probe VERDICT PASS checks={pass}");
-    });
+        println!("readback=probe VERDICT PASS checks={checks}");
+    }));
 }

@@ -195,7 +195,7 @@ fn optional_bool(
     object_path: &str,
 ) -> Result<(), ErrorData> {
     match fields.get(field) {
-        None | Some(Value::Null) | Some(Value::Bool(_)) => Ok(()),
+        None | Some(Value::Null | Value::Bool(_)) => Ok(()),
         Some(_) => Err(invalid(
             format!("{object_path}.{field}"),
             format!("{field} must be a boolean when present"),
@@ -210,7 +210,7 @@ fn optional_number(
     object_path: &str,
 ) -> Result<(), ErrorData> {
     match fields.get(field) {
-        None | Some(Value::Null) | Some(Value::Number(_)) => Ok(()),
+        None | Some(Value::Null | Value::Number(_)) => Ok(()),
         Some(_) => Err(invalid(
             format!("{object_path}.{field}"),
             format!("{field} must be a number when present"),

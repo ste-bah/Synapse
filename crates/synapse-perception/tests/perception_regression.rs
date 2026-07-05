@@ -6,8 +6,9 @@ use std::{
 
 use chrono::Utc;
 use synapse_core::{
-    AccessibleNode, AudioContext, DetectedEntity, FocusedElement, ForegroundContext, HudReadings,
-    PerceptionMode, Rect, SensorStatus, UiaPattern, element_id, entity_id, error_codes,
+    AccessibleNode, AudioContext, DetectedEntity, FocusedElement, ForegroundContext, FsEvent,
+    FsEventKind, HudReadings, PerceptionMode, Rect, SensorStatus, UiaPattern, element_id,
+    entity_id, error_codes,
 };
 use synapse_perception::{
     A11yTreeSummary, ObservationAssembler, ObservationInput, ObserveInclude, OcrProvider,
@@ -337,6 +338,79 @@ fn assembler_all_sensors_unavailable_fails_closed() -> TestResult {
         after.err().map(|err| err.code()),
         Some(error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE)
     );
+    Ok(())
+}
+
+/// #1508: a filesystem-only observe reads host-wide state and must succeed even
+/// when every window/screen/audio sensor is unavailable (the exact state a
+/// no-window global-only readback produces). It must not fail closed the way a
+/// window-perception observe does, and it must carry the requested fs data.
+#[test]
+fn assembler_global_only_fs_succeeds_without_window_sensors() -> TestResult {
+    let fs_only = ObserveInclude {
+        focused: false,
+        elements: false,
+        entities: false,
+        hud: false,
+        audio: false,
+        events: false,
+        clipboard: false,
+        fs: true,
+        diagnostics: false,
+        ..ObserveInclude::default()
+    };
+    assert!(
+        !fs_only.requires_window_perception(),
+        "fs-only observe must not require window perception"
+    );
+
+    // No window was observed: empty foreground, every sensor Unavailable/Disabled.
+    let mut input = ObservationInput::new(ForegroundContext {
+        hwnd: 0,
+        pid: 0,
+        process_name: String::new(),
+        process_path: String::new(),
+        window_title: String::new(),
+        window_bounds: Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        },
+        monitor_index: 0,
+        dpi_scale: 1.0,
+        profile_id: None,
+        steam_appid: None,
+        is_fullscreen: false,
+        is_dwm_composed: false,
+    });
+    input.fs_recent = vec![FsEvent {
+        at: Utc::now(),
+        path: "C:\\code\\GameEditor\\target\\fsv\\readback.json".to_owned(),
+        kind: FsEventKind::Modified,
+        size_bytes: Some(2048),
+    }];
+
+    regression_log(format_args!(
+        "regression_check=observation edge=global_only_fs before=a11y:{:?} capture:{:?} fs_events:{}",
+        input.a11y_status,
+        input.capture_status,
+        input.fs_recent.len()
+    ))?;
+    let observation = ObservationAssembler::new().assemble(fs_only, input)?;
+    regression_log(format_args!(
+        "regression_check=observation edge=global_only_fs after=fs_recent:{} focused:{} elements:{}",
+        observation.fs_recent.len(),
+        observation.focused.is_some(),
+        observation.elements.len()
+    ))?;
+    assert_eq!(observation.fs_recent.len(), 1);
+    assert_eq!(
+        observation.fs_recent[0].path,
+        "C:\\code\\GameEditor\\target\\fsv\\readback.json"
+    );
+    assert!(observation.focused.is_none());
+    assert!(observation.elements.is_empty());
     Ok(())
 }
 
@@ -798,8 +872,8 @@ fn interactable_only_keeps_form_controls_and_ignores_depth() -> TestResult {
     Ok(())
 }
 
-/// #882: diagnostics payloads (input_backends, cdp evidence, capture blocks)
-/// are emitted only when the include set requests diagnostics; web_path always
+/// #882: diagnostics payloads (`input_backends`, cdp evidence, capture blocks)
+/// are emitted only when the include set requests diagnostics; `web_path` always
 /// survives as the fidelity signal.
 #[test]
 fn diagnostics_blocks_are_suppressed_when_not_requested() -> TestResult {

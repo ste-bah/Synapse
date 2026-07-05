@@ -66,6 +66,28 @@ impl Default for ObserveInclude {
 }
 
 impl ObserveInclude {
+    /// True when any requested slot needs window/foreground perception — the
+    /// a11y/screen gather bound to a specific `HWND`.
+    ///
+    /// The global slots (`fs`, `clipboard`, `audio`) read host-wide state and
+    /// never need a window. An observe requesting only those must not be
+    /// refused when the session's active target is a Chrome CDP tab (#1508),
+    /// nor silently downgraded into reading the human foreground window: it has
+    /// nothing to read from a window at all. Everything else — focused,
+    /// elements, entities, interactable filtering, hud, events, diagnostics —
+    /// is derived from (or scoped to) the target window and keeps the
+    /// fail-closed CDP-target refusal.
+    #[must_use]
+    pub const fn requires_window_perception(&self) -> bool {
+        self.focused
+            || self.elements
+            || self.entities
+            || self.interactable_only
+            || self.hud
+            || self.events
+            || self.diagnostics
+    }
+
     #[must_use]
     pub const fn focused_only() -> Self {
         Self {
@@ -290,7 +312,7 @@ impl ObservationAssembler {
         input: ObservationInput,
     ) -> PerceptionResult<Observation> {
         let started = Instant::now();
-        ensure_any_sensor_available(&input)?;
+        ensure_any_sensor_available(include, &input)?;
         let summary = A11yTreeSummary::from_nodes(&input.elements);
         let mode = input
             .mode_override
@@ -510,7 +532,18 @@ fn filter_entities(
     (entities, truncated)
 }
 
-fn ensure_any_sensor_available(input: &ObservationInput) -> PerceptionResult<()> {
+fn ensure_any_sensor_available(
+    include: ObserveInclude,
+    input: &ObservationInput,
+) -> PerceptionResult<()> {
+    // Global-only observes (fs/clipboard/audio) read host-wide state that is
+    // structurally available; an empty result is valid data, not a perception
+    // failure. Only window/foreground perception can be genuinely unavailable
+    // (no reachable a11y/capture/detection sensor), so gate the failure on
+    // requests that actually need a window (#1508).
+    if !include.requires_window_perception() {
+        return Ok(());
+    }
     let statuses = [
         &input.a11y_status,
         &input.capture_status,
