@@ -775,6 +775,14 @@ pub struct ShellSessionCleanupReadback {
     #[serde(default)]
     #[schemars(!default)]
     pub reaped_phantom_jobs: usize,
+    /// Job directories that vanished (or whose status file vanished) between
+    /// enumeration and read because a concurrent session, the reaper, or a
+    /// parallel test mutated the shared job root. This is an expected outcome of
+    /// operating on a shared store and is tracked separately from `failed` so a
+    /// benign race never inflates the error signal operators watch (#1509).
+    #[serde(default)]
+    #[schemars(!default)]
+    pub skipped_concurrently_mutated: usize,
     pub termination_attempted: usize,
     pub termination_succeeded: usize,
     pub failed: usize,
@@ -2611,6 +2619,7 @@ pub fn cleanup_shell_jobs_for_session(
             live_jobs_before: 0,
             retained_live_jobs: 0,
             reaped_phantom_jobs: 0,
+            skipped_concurrently_mutated: 0,
             termination_attempted: 0,
             termination_succeeded: 0,
             failed: 0,
@@ -2630,6 +2639,7 @@ pub fn cleanup_shell_jobs_for_session(
         live_jobs_before: 0,
         retained_live_jobs: 0,
         reaped_phantom_jobs: 0,
+        skipped_concurrently_mutated: 0,
         termination_attempted: 0,
         termination_succeeded: 0,
         failed: 0,
@@ -2651,6 +2661,22 @@ pub fn cleanup_shell_jobs_for_session(
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A sibling job directory was removed by a concurrent session,
+                // the reaper, or a parallel test between opening the directory
+                // stream and yielding this entry. That is an expected outcome of
+                // scanning a shared store, not a failure of this cleanup pass.
+                readback.skipped_concurrently_mutated =
+                    readback.skipped_concurrently_mutated.saturating_add(1);
+                tracing::debug!(
+                    code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_DIR_ENTRY_VANISHED",
+                    session_id,
+                    reason,
+                    error = %error,
+                    "act_run_shell session cleanup skipped a job directory entry that vanished mid-scan"
+                );
+                continue;
+            }
             Err(error) => {
                 readback.failed = readback.failed.saturating_add(1);
                 tracing::error!(
@@ -2770,6 +2796,7 @@ pub fn cleanup_shell_jobs_for_session(
         skipped_invalid_job_dirs = readback.skipped_invalid_job_dirs,
         skipped_unreadable_status_files = readback.skipped_unreadable_status_files,
         skipped_foreign_jobs = readback.skipped_foreign_jobs,
+        skipped_concurrently_mutated = readback.skipped_concurrently_mutated,
         live_jobs_before = readback.live_jobs_before,
         retained_live_jobs = readback.retained_live_jobs,
         termination_attempted = readback.termination_attempted,
@@ -7008,7 +7035,87 @@ fn shell_job_paths_from_root(root: &Path, job_id: &str) -> ShellJobPaths {
     }
 }
 
+// Per-thread override of the durable shell-job store root. Set only by
+// `ShellJobRootGuard` in tests so each test gets a hermetic root instead of
+// sharing the process-wide `%LOCALAPPDATA%\Synapse\shell-jobs` directory
+// (#1509). All durable-job path resolution funnels through
+// `shell_job_root_dir`, and every root read happens synchronously on the
+// caller's thread (the background monitor uses the absolute `ShellJobPaths`
+// resolved at start time), so a thread-local override fully isolates a test
+// without touching the production code path.
+#[cfg(test)]
+thread_local! {
+    static SHELL_JOB_ROOT_OVERRIDE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn shell_job_root_override() -> Option<PathBuf> {
+    SHELL_JOB_ROOT_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(not(test))]
+#[inline]
+fn shell_job_root_override() -> Option<PathBuf> {
+    None
+}
+
+/// RAII guard that redirects the durable shell-job store to a unique temporary
+/// directory for the lifetime of a single test, then restores the previous
+/// override and drops the temp dir. Install it at the top of any test that
+/// starts durable jobs, scans the job root, or asserts cleanup counts so the
+/// test never observes — or is perturbed by — jobs written by other tests
+/// running in parallel (#1509).
+#[cfg(test)]
+struct ShellJobRootGuard {
+    previous: Option<PathBuf>,
+    _temp: tempfile::TempDir,
+}
+
+#[cfg(test)]
+impl ShellJobRootGuard {
+    fn new() -> Self {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create hermetic shell-jobs root: {error}"));
+        let previous = SHELL_JOB_ROOT_OVERRIDE
+            .with(|cell| cell.borrow_mut().replace(temp.path().to_path_buf()));
+        Self {
+            previous,
+            _temp: temp,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ShellJobRootGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        SHELL_JOB_ROOT_OVERRIDE.with(|cell| *cell.borrow_mut() = previous);
+    }
+}
+
 fn shell_job_root_dir() -> Result<PathBuf, ErrorData> {
+    if let Some(override_root) = shell_job_root_override() {
+        return Ok(override_root);
+    }
+    // Operator/deployment seam: relocate the durable shell-job store off the
+    // default per-user path (e.g. onto a faster or per-instance volume). A set
+    // but empty value is a misconfiguration and must fail loudly rather than
+    // silently falling back to the default root.
+    if let Some(env_root) = std::env::var_os("SYNAPSE_SHELL_JOB_ROOT") {
+        if env_root.is_empty() {
+            return Err(shell_tool_error(
+                error_codes::STORAGE_OPEN_FAILED,
+                "act_run_shell SYNAPSE_SHELL_JOB_ROOT is set but empty; unset it or point it at a directory",
+                json!({
+                    "code": error_codes::STORAGE_OPEN_FAILED,
+                    "reason": "shell_job_root_env_empty",
+                }),
+            ));
+        }
+        return Ok(PathBuf::from(env_root));
+    }
+
     #[cfg(windows)]
     {
         let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
@@ -7439,8 +7546,69 @@ fn commit_shell_job_status_file(tmp_path: &Path, path: &Path, _job_id: &str) -> 
     fs::rename(tmp_path, path)
 }
 
+/// Read a durable status file, tolerating the brief window in which a
+/// concurrent [`write_shell_job_status`] is swapping the file in.
+///
+/// On Windows `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` is not observably atomic
+/// when the destination is being read concurrently: a reader can transiently
+/// see `ERROR_FILE_NOT_FOUND` (2) — the destination momentarily does not exist
+/// mid-replace — as well as `ERROR_SHARING_VIOLATION` (32) or
+/// `ERROR_ACCESS_DENIED` (5). A status poll, cleanup scan, or dashboard read
+/// racing the monitor's frequent status updates must not fail spuriously, so we
+/// retry within a bounded window (mirroring the writer's own move retry).
+///
+/// `NOT_FOUND` is overloaded: it is also the legitimate signal that a job never
+/// existed. We disambiguate without penalising the genuine-missing path by
+/// checking for the writer's staging `*.json.tmp` sibling: if it is present a
+/// replace is in flight and we retry; if neither the target nor the staging
+/// file exists the job is truly absent and we return immediately.
+#[cfg(windows)]
+fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    // ERROR_ACCESS_DENIED = 5, ERROR_SHARING_VIOLATION = 32.
+    const TRANSIENT_OPEN_CODES: [i32; 2] = [5, 32];
+    let staging_path = shell_status_staging_path(path);
+    let started = Instant::now();
+    loop {
+        match fs::read(path) {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) => {
+                let within_window = started.elapsed() < Duration::from_millis(500);
+                let transient_open = error
+                    .raw_os_error()
+                    .is_some_and(|code| TRANSIENT_OPEN_CODES.contains(&code));
+                // A NOT_FOUND only counts as a transient replace window while the
+                // writer's staging file is still on disk; otherwise the job is
+                // genuinely absent and the error is returned as-is.
+                let mid_replace =
+                    error.kind() == io::ErrorKind::NotFound && staging_path.exists();
+                if within_window && (transient_open || mid_replace) {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    // POSIX `rename(2)` is atomic: a reader always sees either the old or the
+    // new inode, never a sharing violation or a missing-file window, so no
+    // retry is required.
+    fs::read(path)
+}
+
+/// Deterministic path of the staging file `write_shell_job_status` renames into
+/// place; must stay in lockstep with the `with_extension("json.tmp")` call
+/// there so [`read_shell_status_bytes`] can detect an in-flight replace.
+#[cfg(windows)]
+fn shell_status_staging_path(path: &Path) -> PathBuf {
+    path.with_extension("json.tmp")
+}
+
 fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStatus, ErrorData> {
-    let bytes = fs::read(path).map_err(|error| {
+    let bytes = read_shell_status_bytes(path).map_err(|error| {
         let code = if error.kind() == io::ErrorKind::NotFound {
             error_codes::TOOL_PARAMS_INVALID
         } else {
@@ -12960,6 +13128,78 @@ mod tests {
         assert_eq!(final_readback.job_id, "issue1012-status-race");
     }
 
+    // #1509: the status reader tolerates the Windows atomic-replace window
+    // (destination transiently reports NOT_FOUND while the writer's staging file
+    // is renamed in) WITHOUT slowing down the genuinely-missing path. Both arms
+    // are asserted against real filesystem state so a future change that either
+    // drops the mid-replace tolerance or blanket-retries every NOT_FOUND is
+    // caught.
+    #[cfg(windows)]
+    #[test]
+    fn shell_status_read_notfound_gate_distinguishes_replace_from_missing() {
+        let temp = tempfile::TempDir::new()
+            .unwrap_or_else(|error| panic!("create temp status dir: {error}"));
+        let status_path = temp.path().join("status.json");
+        let staging_path = shell_status_staging_path(&status_path);
+
+        // Arm 1 — genuinely missing: neither the target nor the staging file
+        // exists, so the read must fail immediately rather than burning the
+        // 500 ms replace-tolerance window.
+        assert!(!status_path.exists());
+        assert!(!staging_path.exists());
+        let started = Instant::now();
+        let missing = read_shell_status_bytes(&status_path);
+        let missing_elapsed = started.elapsed();
+        println!(
+            "readback=read_shell_status_bytes edge=genuine_missing after=err:{} elapsed_ms:{}",
+            missing.is_err(),
+            missing_elapsed.as_millis()
+        );
+        assert!(missing.is_err(), "absent status file must error");
+        assert_eq!(
+            missing.err().and_then(|error| error.raw_os_error()),
+            Some(2),
+            "missing file must surface ERROR_FILE_NOT_FOUND"
+        );
+        assert!(
+            missing_elapsed < Duration::from_millis(200),
+            "genuine missing read must return promptly, took {missing_elapsed:?}"
+        );
+
+        // Arm 2 — mid-replace window: target absent but the writer's staging file
+        // is present, so the reader retries. A concurrent thread lands the real
+        // file partway through the tolerance window; the read must then succeed
+        // with the delivered bytes instead of erroring.
+        std::fs::write(&staging_path, b"pending-replace")
+            .unwrap_or_else(|error| panic!("seed staging file: {error}"));
+        let writer_status_path = status_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(60));
+            std::fs::write(&writer_status_path, b"{\"delivered\":true}")
+                .unwrap_or_else(|error| panic!("land replacement status: {error}"));
+        });
+        let started = Instant::now();
+        let recovered = read_shell_status_bytes(&status_path);
+        let recovered_elapsed = started.elapsed();
+        writer
+            .join()
+            .unwrap_or_else(|error| panic!("writer thread should join: {error:?}"));
+        println!(
+            "readback=read_shell_status_bytes edge=mid_replace after=ok:{} elapsed_ms:{}",
+            recovered.is_ok(),
+            recovered_elapsed.as_millis()
+        );
+        assert_eq!(
+            recovered.expect("mid-replace read must recover once the file lands"),
+            b"{\"delivered\":true}".to_vec(),
+            "reader must return the freshly delivered bytes"
+        );
+        assert!(
+            recovered_elapsed >= Duration::from_millis(40),
+            "reader must have waited through the replace window, waited {recovered_elapsed:?}"
+        );
+    }
+
     #[test]
     fn shell_job_reconciliation_preserves_monitor_terminal_status() {
         let temp = tempfile::TempDir::new()
@@ -16159,6 +16399,9 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
     #[cfg(windows)]
     #[tokio::test]
     async fn shell_durable_timeout_persists_budget_expired_code() {
+        // Hermetic durable-job root so this test neither scans nor is perturbed
+        // by jobs written by other tests running in parallel (#1509).
+        let _root_guard = ShellJobRootGuard::new();
         let timeout_ms = 200;
         let args = vec![
             "-NoProfile".to_owned(),
@@ -16224,6 +16467,11 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
     #[cfg(windows)]
     #[tokio::test]
     async fn shell_session_cleanup_retains_live_durable_jobs() {
+        // Hermetic durable-job root: the cleanup scan now enumerates only this
+        // test's own jobs instead of every job in the process-wide shared root,
+        // so a parallel test mutating that root can never flip this test's
+        // exact-count assertions (#1509).
+        let _root_guard = ShellJobRootGuard::new();
         let args = vec![
             "-NoProfile".to_owned(),
             "-Command".to_owned(),
@@ -16284,10 +16532,20 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         println!("readback=act_run_shell_session_cleanup edge=retain after={cleanup:?}");
         assert_eq!(cleanup.live_jobs_before, 1);
         assert_eq!(cleanup.retained_live_jobs, 1);
-        assert!(
-            cleanup.skipped_foreign_jobs >= 1,
-            "cleanup should count the synthetic foreign job: {cleanup:?}"
+        // The hermetic root (#1509) means the scan sees exactly this test's two
+        // jobs — the retained live one and the synthetic foreign one — and never
+        // the process-wide pile of jobs left by other tests or prior runs.
+        assert_eq!(
+            cleanup.status_files_read, 2,
+            "hermetic scan must read only this test's two jobs: {cleanup:?}"
         );
+        assert_eq!(
+            cleanup.skipped_foreign_jobs, 1,
+            "cleanup should count exactly the synthetic foreign job: {cleanup:?}"
+        );
+        // No sibling directory should be mutating this test's private root, so
+        // the concurrent-mutation reconciliation counter must stay at zero.
+        assert_eq!(cleanup.skipped_concurrently_mutated, 0);
         // The only durable job under this unique session is genuinely alive, so
         // nothing should be reaped as a phantom (#1334).
         assert_eq!(cleanup.reaped_phantom_jobs, 0);
