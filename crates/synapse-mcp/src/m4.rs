@@ -2606,6 +2606,21 @@ pub fn cleanup_shell_jobs_for_session(
     reason: &str,
 ) -> Result<ShellSessionCleanupReadback, ErrorData> {
     validate_shell_session_id(session_id)?;
+    // #1510: opportunistically reap stale terminal jobs on every session teardown
+    // so a long-lived daemon's durable store stays bounded even when the process
+    // never restarts. This runs before the live-job scan below, so once the
+    // backlog is drained every subsequent enumeration is cheap again. Best-effort:
+    // a reaper error must never abort this session's own cleanup — it is logged and
+    // the next teardown (or a daemon restart) retries.
+    if let Err(error) = reap_stale_shell_jobs() {
+        tracing::warn!(
+            code = "M4_ACT_RUN_SHELL_SESSION_CLEANUP_REAP_FAILED",
+            session_id,
+            reason,
+            detail = %error.message,
+            "act_run_shell session cleanup could not run the stale-job reaper; continuing with live-job cleanup"
+        );
+    }
     let root = shell_durable_job_root_dir()?;
     if !root.exists() {
         return Ok(ShellSessionCleanupReadback {
@@ -2806,6 +2821,299 @@ pub fn cleanup_shell_jobs_for_session(
         "readback=act_run_shell_session_cleanup after=status_files_and_process_table"
     );
     Ok(readback)
+}
+
+/// Default retention for settled durable shell-job directories: 7 days. A job
+/// whose backing process is no longer live (any status other than `running` or
+/// `cancel_requested`) and whose completion is older than this is eligible for
+/// reaping. Live jobs and recently-settled jobs are always retained so an
+/// operator can still read a job they just finished. Override with the
+/// `SYNAPSE_SHELL_JOB_TTL_SECS` environment variable.
+const DEFAULT_SHELL_JOB_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Cap on how many reaped job ids are echoed in the reap readback so draining a
+/// huge backlog (the 856-dir accumulation in #1510) cannot emit an unbounded log
+/// line. The `reaped_stale_jobs` count is always exact; only the id sample is
+/// capped.
+const SHELL_JOB_REAP_ID_SAMPLE_CAP: usize = 64;
+
+/// Structured evidence of one durable shell-job retention pass. Every scanned
+/// directory lands in exactly one bucket so the numbers are auditable:
+/// `scanned_job_dirs == reaped_stale_jobs + retained_live_jobs
+///   + retained_recent_terminal_jobs + skipped_unreadable_status_files
+///   + reap_failures (+ any concurrently-vanished dirs)`.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ShellJobReapReadback {
+    pub job_root: Option<String>,
+    pub retention_secs: u64,
+    pub scanned_job_dirs: usize,
+    pub reaped_stale_jobs: usize,
+    pub retained_live_jobs: usize,
+    pub retained_recent_terminal_jobs: usize,
+    pub skipped_invalid_job_dirs: usize,
+    pub skipped_unreadable_status_files: usize,
+    pub skipped_concurrently_mutated: usize,
+    pub reap_failures: usize,
+    pub bytes_reclaimed: u64,
+    pub reaped_job_ids_sample: Vec<String>,
+}
+
+/// Resolve the terminal-job retention TTL. Unset uses the 7-day default; a set
+/// value is parsed as a positive integer number of seconds. A set-but-invalid
+/// value (non-UTF-8, unparseable, or zero) is a misconfiguration and fails loudly
+/// rather than silently disabling retention — mirroring `SYNAPSE_SHELL_JOB_ROOT`.
+fn shell_job_retention_ttl() -> Result<Duration, ErrorData> {
+    let Some(raw) = std::env::var_os("SYNAPSE_SHELL_JOB_TTL_SECS") else {
+        return Ok(Duration::from_secs(DEFAULT_SHELL_JOB_RETENTION_SECS));
+    };
+    let text = raw.to_str().ok_or_else(|| {
+        shell_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "SYNAPSE_SHELL_JOB_TTL_SECS must be valid UTF-8 (a positive integer number of seconds)",
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "reason": "shell_job_ttl_not_utf8",
+            }),
+        )
+    })?;
+    let secs: u64 = text.trim().parse().map_err(|error| {
+        shell_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "SYNAPSE_SHELL_JOB_TTL_SECS must be a positive integer number of seconds: {error}"
+            ),
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "value": text,
+                "reason": "shell_job_ttl_unparseable",
+            }),
+        )
+    })?;
+    if secs == 0 {
+        return Err(shell_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "SYNAPSE_SHELL_JOB_TTL_SECS must be greater than zero; unset it for the 7-day default",
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "reason": "shell_job_ttl_zero",
+            }),
+        ));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
+/// Age in milliseconds of a settled job, measured from its completion timestamp
+/// (falling back to `started_at` if a record lacks `completed_at`). An
+/// unparseable or future timestamp yields `None`, which the reaper treats as
+/// age 0 (retain), so a clock skew can never cause a premature deletion.
+fn shell_job_terminal_age_ms(job: &ActRunShellJobStatus) -> Option<u64> {
+    let stamp = job
+        .completed_at
+        .as_deref()
+        .unwrap_or(job.started_at.as_str());
+    elapsed_ms_since_rfc3339(stamp)
+}
+
+/// Best-effort byte accounting for a job directory's known artifacts, summed
+/// before removal so the readback can report reclaimed disk. Missing files
+/// contribute zero rather than failing the pass.
+fn shell_job_dir_bytes(paths: &ShellJobPaths) -> u64 {
+    [
+        &paths.status_path,
+        &paths.stdout_path,
+        &paths.stderr_path,
+        &paths.request_path,
+        &paths.remote_cleanup_path,
+    ]
+    .into_iter()
+    .filter_map(|path| fs::metadata(path).ok())
+    .map(|metadata| metadata.len())
+    .fold(0u64, |acc, len| acc.saturating_add(len))
+}
+
+/// Reap stale settled durable shell-job directories using the configured TTL
+/// (#1510). Returns structured evidence of every scanned directory's disposition.
+/// Only jobs whose backing process is no longer live AND older than the TTL are
+/// removed; anything whose status cannot be read, still claims a live process
+/// (`running`/`cancel_requested`), or settled recently is retained. This is the
+/// source-of-truth mutation for the retention policy and is invoked at daemon
+/// startup and opportunistically during session cleanup.
+pub fn reap_stale_shell_jobs() -> Result<ShellJobReapReadback, ErrorData> {
+    let ttl = shell_job_retention_ttl()?;
+    reap_stale_shell_jobs_with_ttl(ttl)
+}
+
+fn reap_stale_shell_jobs_with_ttl(ttl: Duration) -> Result<ShellJobReapReadback, ErrorData> {
+    let root = shell_durable_job_root_dir()?;
+    let ttl_ms = u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX);
+    let mut readback = ShellJobReapReadback {
+        job_root: Some(path_string(&root)),
+        retention_secs: ttl.as_secs(),
+        scanned_job_dirs: 0,
+        reaped_stale_jobs: 0,
+        retained_live_jobs: 0,
+        retained_recent_terminal_jobs: 0,
+        skipped_invalid_job_dirs: 0,
+        skipped_unreadable_status_files: 0,
+        skipped_concurrently_mutated: 0,
+        reap_failures: 0,
+        bytes_reclaimed: 0,
+        reaped_job_ids_sample: Vec::new(),
+    };
+    if !root.exists() {
+        return Ok(readback);
+    }
+    let entries = fs::read_dir(&root).map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("shell job reaper failed to read shell job root: {error}"),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "path": root,
+                "reason": "reap_job_root_read_failed",
+            }),
+        )
+    })?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A sibling job directory vanished mid-scan (concurrent session,
+                // parallel test, or a prior reap). Expected on a shared store.
+                readback.skipped_concurrently_mutated =
+                    readback.skipped_concurrently_mutated.saturating_add(1);
+                continue;
+            }
+            Err(error) => {
+                readback.reap_failures = readback.reap_failures.saturating_add(1);
+                tracing::error!(
+                    code = "M4_SHELL_JOB_REAP_DIR_ENTRY_FAILED",
+                    error = %error,
+                    "shell job reaper could not read one job directory entry"
+                );
+                continue;
+            }
+        };
+        let job_dir = entry.path();
+        if !job_dir.is_dir() {
+            continue;
+        }
+        let Some(job_id) = job_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+        else {
+            readback.skipped_invalid_job_dirs = readback.skipped_invalid_job_dirs.saturating_add(1);
+            continue;
+        };
+        if validate_shell_job_id(&job_id).is_err() {
+            readback.skipped_invalid_job_dirs = readback.skipped_invalid_job_dirs.saturating_add(1);
+            continue;
+        }
+        readback.scanned_job_dirs = readback.scanned_job_dirs.saturating_add(1);
+        let paths = shell_job_paths_from_root(&root, &job_id);
+        let job = match read_shell_job_status(&paths.status_path, &job_id) {
+            Ok(job) => job,
+            Err(_error) => {
+                // Unreadable status = possibly a job mid-write or a corrupt record.
+                // NEVER reap a job we cannot prove is terminal; a live job whose
+                // status file is momentarily unreadable must survive.
+                readback.skipped_unreadable_status_files =
+                    readback.skipped_unreadable_status_files.saturating_add(1);
+                continue;
+            }
+        };
+        // Safety invariant: a job whose status still claims a live backing
+        // process (`running`/`cancel_requested`) is retained unconditionally,
+        // regardless of age — reaping it could orphan a running child's on-disk
+        // record. Dead-PID phantoms in these states are reconciled to a terminal
+        // status by session cleanup (#1334); a later reap then removes them once
+        // aged. Everything else — terminal statuses AND a `finalizing` job that
+        // has been stuck far past the millisecond-scale finalize window (observed
+        // in the real store, #1510) — is a settled job eligible for age-based
+        // reaping.
+        if shell_job_live_status(&job.status) {
+            readback.retained_live_jobs = readback.retained_live_jobs.saturating_add(1);
+            continue;
+        }
+        let age_ms = shell_job_terminal_age_ms(&job).unwrap_or(0);
+        if age_ms < ttl_ms {
+            readback.retained_recent_terminal_jobs =
+                readback.retained_recent_terminal_jobs.saturating_add(1);
+            continue;
+        }
+        let bytes = shell_job_dir_bytes(&paths);
+        match fs::remove_dir_all(&job_dir) {
+            Ok(()) => {
+                readback.reaped_stale_jobs = readback.reaped_stale_jobs.saturating_add(1);
+                readback.bytes_reclaimed = readback.bytes_reclaimed.saturating_add(bytes);
+                if readback.reaped_job_ids_sample.len() < SHELL_JOB_REAP_ID_SAMPLE_CAP {
+                    readback.reaped_job_ids_sample.push(job_id.clone());
+                }
+                tracing::debug!(
+                    code = "M4_SHELL_JOB_REAPED",
+                    job_id,
+                    status = %job.status,
+                    age_ms,
+                    bytes,
+                    "reaped stale terminal durable shell job"
+                );
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                readback.skipped_concurrently_mutated =
+                    readback.skipped_concurrently_mutated.saturating_add(1);
+            }
+            Err(error) => {
+                readback.reap_failures = readback.reap_failures.saturating_add(1);
+                tracing::error!(
+                    code = "M4_SHELL_JOB_REAP_REMOVE_FAILED",
+                    job_id,
+                    path = %path_string(&job_dir),
+                    error = %error,
+                    "shell job reaper could not remove a stale terminal job directory"
+                );
+            }
+        }
+    }
+    tracing::info!(
+        code = "M4_SHELL_JOB_REAP",
+        job_root = ?readback.job_root,
+        retention_secs = readback.retention_secs,
+        scanned_job_dirs = readback.scanned_job_dirs,
+        reaped_stale_jobs = readback.reaped_stale_jobs,
+        retained_live_jobs = readback.retained_live_jobs,
+        retained_recent_terminal_jobs = readback.retained_recent_terminal_jobs,
+        skipped_invalid_job_dirs = readback.skipped_invalid_job_dirs,
+        skipped_unreadable_status_files = readback.skipped_unreadable_status_files,
+        skipped_concurrently_mutated = readback.skipped_concurrently_mutated,
+        reap_failures = readback.reap_failures,
+        bytes_reclaimed = readback.bytes_reclaimed,
+        "readback=shell_job_reap after=durable_job_root_scan"
+    );
+    Ok(readback)
+}
+
+/// Best-effort durable shell-job retention pass for daemon startup. Housekeeping
+/// must never block or fail daemon boot, so a reaper error is logged and
+/// swallowed; the next session teardown reaper retries. Called once from each
+/// daemon entry point (stdio and HTTP) after the single-instance lock is held.
+pub fn reap_stale_shell_jobs_on_startup() {
+    match reap_stale_shell_jobs() {
+        Ok(readback) => tracing::info!(
+            code = "M4_SHELL_JOB_REAP_STARTUP",
+            reaped_stale_jobs = readback.reaped_stale_jobs,
+            scanned_job_dirs = readback.scanned_job_dirs,
+            retained_live_jobs = readback.retained_live_jobs,
+            retained_recent_terminal_jobs = readback.retained_recent_terminal_jobs,
+            bytes_reclaimed = readback.bytes_reclaimed,
+            "daemon startup reaped stale durable shell jobs"
+        ),
+        Err(error) => tracing::error!(
+            code = "M4_SHELL_JOB_REAP_STARTUP_FAILED",
+            detail = %error.message,
+            "daemon startup shell-job reaper failed; will retry on next session cleanup"
+        ),
+    }
 }
 
 pub fn shell_jobs_dashboard_snapshot(
@@ -16256,6 +16564,240 @@ SYNAPSE_REMOTE_EXIT_V1 job_id=issue1274-exit-nonzero pid=2266815 pgid=2266815 ex
         assert!(
             message.contains("MCP client-call budget"),
             "names the client-call guard: {message}"
+        );
+    }
+
+    /// Seed a synthetic durable shell job on disk with a fully-formed status
+    /// record so the reaper's real `read_shell_job_status` path exercises it.
+    /// `completed_at` is the retention clock; `None` models a still-live job.
+    #[cfg(test)]
+    fn seed_synthetic_shell_job(
+        root: &Path,
+        job_id: &str,
+        status: &str,
+        started_at: &str,
+        completed_at: Option<&str>,
+    ) -> ShellJobPaths {
+        let paths = shell_job_paths_from_root(root, job_id);
+        fs::create_dir_all(&paths.job_dir)
+            .unwrap_or_else(|error| panic!("seed job dir {job_id} should create: {error}"));
+        let params = ActRunShellStartParams {
+            command: "powershell.exe".to_owned(),
+            args: vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                "Write-Output reap-seed".to_owned(),
+            ],
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: Some(30_000),
+            job_id: Some(job_id.to_owned()),
+        };
+        let authorization = RunShellAuthorization {
+            command_line: shell_command_line_from_parts(&params.command, &params.args),
+            matched_pattern: "__any_permitted__".to_owned(),
+        };
+        let request_sha = run_shell_start_request_sha256(&params)
+            .unwrap_or_else(|error| panic!("seed request should hash: {error}"));
+        let mut record = shell_job_status_record(
+            job_id,
+            status,
+            &params,
+            &paths,
+            &request_sha,
+            &authorization,
+            started_at.to_owned(),
+            Some(4242),
+            None,
+        );
+        record.completed_at = completed_at.map(ToOwned::to_owned);
+        if completed_at.is_some() {
+            record.exit_code = Some(0);
+            record.duration_ms = Some(10);
+        }
+        // Give each job a little stdout so bytes_reclaimed is provably non-zero.
+        fs::write(&paths.stdout_path, b"reap-seed-stdout\n")
+            .unwrap_or_else(|error| panic!("seed stdout {job_id} should write: {error}"));
+        write_shell_job_status(&paths.status_path, &record)
+            .unwrap_or_else(|error| panic!("seed status {job_id} should write: {error}"));
+        paths
+    }
+
+    // #1510 full-state verification: seed synthetic jobs with backdated
+    // completion timestamps and prove — by reading the filesystem, the source of
+    // truth — that only aged *terminal* jobs are removed while live, finalizing,
+    // recently-terminal, and unreadable jobs survive.
+    #[test]
+    fn reap_stale_shell_jobs_removes_only_aged_terminal_jobs() {
+        let _root_guard = ShellJobRootGuard::new();
+        let root = shell_durable_job_root_dir()
+            .unwrap_or_else(|error| panic!("durable root should resolve: {error}"));
+        fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("durable root should create: {error}"));
+
+        let old = (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339();
+        let recent = chrono::Utc::now().to_rfc3339();
+
+        // Reap candidates: two distinct terminal statuses, both aged out.
+        let old_ok = seed_synthetic_shell_job(&root, "reap-old-ok", "ok", &old, Some(&old));
+        let old_exited = seed_synthetic_shell_job(
+            &root,
+            "reap-old-exited",
+            "exited_unobserved",
+            &old,
+            Some(&old),
+        );
+        // Reap candidate: a `finalizing` job stuck far past the millisecond-scale
+        // finalize window is abandoned and must be reaped like any settled job
+        // (the exact leak observed in the real store, #1510).
+        let old_finalizing =
+            seed_synthetic_shell_job(&root, "reap-old-finalizing", "finalizing", &old, Some(&old));
+        // Retain: recently completed terminal job (age below TTL).
+        let recent_ok =
+            seed_synthetic_shell_job(&root, "reap-recent-ok", "ok", &recent, Some(&recent));
+        // Retain: a genuinely in-flight `finalizing` job (just now) — the age
+        // guard protects the millisecond window while the monitor writes final
+        // output.
+        let recent_finalizing = seed_synthetic_shell_job(
+            &root,
+            "reap-recent-finalizing",
+            "finalizing",
+            &recent,
+            Some(&recent),
+        );
+        // Retain: live job (running) — never reaped regardless of age.
+        let running = seed_synthetic_shell_job(&root, "reap-running", "running", &old, None);
+        // Retain: unreadable status file — cannot prove it is settled, never reaped.
+        let corrupt_paths = shell_job_paths_from_root(&root, "reap-corrupt");
+        fs::create_dir_all(&corrupt_paths.job_dir)
+            .unwrap_or_else(|error| panic!("corrupt job dir should create: {error}"));
+        fs::write(&corrupt_paths.status_path, b"{ this is not valid json")
+            .unwrap_or_else(|error| panic!("corrupt status should write: {error}"));
+
+        // Precondition (source of truth = filesystem): all seven dirs exist.
+        for dir in [
+            &old_ok.job_dir,
+            &old_exited.job_dir,
+            &old_finalizing.job_dir,
+            &recent_ok.job_dir,
+            &recent_finalizing.job_dir,
+            &running.job_dir,
+            &corrupt_paths.job_dir,
+        ] {
+            assert!(dir.exists(), "precondition: {} should exist", dir.display());
+        }
+
+        // Exercise the real public entry point (default 7-day TTL); the aged
+        // jobs are 30 days old so they exceed it, the recent one does not.
+        let readback = reap_stale_shell_jobs()
+            .unwrap_or_else(|error| panic!("reap should succeed: {error}"));
+        println!("readback=shell_job_reap edge=mixed_store after={readback:?}");
+
+        // Full-state verification against the filesystem itself.
+        assert!(
+            !old_ok.job_dir.exists(),
+            "aged terminal ok job must be gone from disk"
+        );
+        assert!(
+            !old_exited.job_dir.exists(),
+            "aged terminal exited job must be gone from disk"
+        );
+        assert!(
+            !old_finalizing.job_dir.exists(),
+            "aged abandoned finalizing job must be gone from disk"
+        );
+        assert!(
+            recent_ok.job_dir.exists(),
+            "recently-terminal job must be retained on disk"
+        );
+        assert!(
+            recent_finalizing.job_dir.exists(),
+            "in-flight finalizing job must be retained on disk"
+        );
+        assert!(
+            running.job_dir.exists(),
+            "live running job must be retained on disk"
+        );
+        assert!(
+            corrupt_paths.job_dir.exists(),
+            "unreadable job must be retained on disk"
+        );
+
+        // Readback accounting must exactly partition the seven scanned dirs.
+        assert_eq!(readback.scanned_job_dirs, 7, "readback: {readback:?}");
+        assert_eq!(readback.reaped_stale_jobs, 3, "readback: {readback:?}");
+        assert_eq!(readback.retained_live_jobs, 1, "readback: {readback:?}");
+        assert_eq!(
+            readback.retained_recent_terminal_jobs, 2,
+            "readback: {readback:?}"
+        );
+        assert_eq!(
+            readback.skipped_unreadable_status_files, 1,
+            "readback: {readback:?}"
+        );
+        assert_eq!(readback.reap_failures, 0, "readback: {readback:?}");
+        assert!(
+            readback.bytes_reclaimed > 0,
+            "reaped jobs had on-disk artifacts: {readback:?}"
+        );
+        let mut sample = readback.reaped_job_ids_sample.clone();
+        sample.sort();
+        assert_eq!(
+            sample,
+            vec!["reap-old-exited", "reap-old-finalizing", "reap-old-ok"]
+        );
+
+        // Idempotence: a second pass finds nothing new to reap.
+        let second = reap_stale_shell_jobs()
+            .unwrap_or_else(|error| panic!("second reap should succeed: {error}"));
+        assert_eq!(second.reaped_stale_jobs, 0, "second pass: {second:?}");
+        assert_eq!(second.scanned_job_dirs, 4, "second pass: {second:?}");
+    }
+
+    // #1510 boundary audit: the TTL is honored, not hardcoded. The same
+    // ~2-hour-old terminal job is reaped under a 1-hour TTL and retained under a
+    // 1-day TTL.
+    #[test]
+    fn reap_stale_shell_jobs_honors_ttl_boundary() {
+        let _root_guard = ShellJobRootGuard::new();
+        let root = shell_durable_job_root_dir()
+            .unwrap_or_else(|error| panic!("durable root should resolve: {error}"));
+        fs::create_dir_all(&root)
+            .unwrap_or_else(|error| panic!("durable root should create: {error}"));
+        let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+
+        let under_short_ttl = seed_synthetic_shell_job(
+            &root,
+            "reap-ttl-short",
+            "ok",
+            &two_hours_ago,
+            Some(&two_hours_ago),
+        );
+        let short = reap_stale_shell_jobs_with_ttl(Duration::from_secs(60 * 60))
+            .unwrap_or_else(|error| panic!("short-ttl reap should succeed: {error}"));
+        assert!(
+            !under_short_ttl.job_dir.exists(),
+            "2h-old job must be reaped under a 1h TTL: {short:?}"
+        );
+        assert_eq!(short.reaped_stale_jobs, 1, "short-ttl readback: {short:?}");
+
+        let under_long_ttl = seed_synthetic_shell_job(
+            &root,
+            "reap-ttl-long",
+            "ok",
+            &two_hours_ago,
+            Some(&two_hours_ago),
+        );
+        let long = reap_stale_shell_jobs_with_ttl(Duration::from_secs(24 * 60 * 60))
+            .unwrap_or_else(|error| panic!("long-ttl reap should succeed: {error}"));
+        assert!(
+            under_long_ttl.job_dir.exists(),
+            "2h-old job must be retained under a 1d TTL: {long:?}"
+        );
+        assert_eq!(long.reaped_stale_jobs, 0, "long-ttl readback: {long:?}");
+        assert_eq!(
+            long.retained_recent_terminal_jobs, 1,
+            "long-ttl readback: {long:?}"
         );
     }
 

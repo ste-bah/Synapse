@@ -46,7 +46,12 @@ pub(super) fn summarize_command_query(
                 "limit": response.limit,
                 "scan_limit": response.scan_limit,
                 "has_next_page": response.next_start_key_hex.is_some(),
-                "remediation": "narrow the time/tool/status filters or rerun with a larger complete page; partial command_query pages intentionally return no row-count proof",
+                // Surface the continuation cursor so a partial page is pageable from the
+                // public surface (#1515). This is a resume key, NOT a row-count proof, so it
+                // does not weaken the fail-closed "partial pages carry no success counts"
+                // contract enforced below (matched_rows/returned_count stay absent).
+                "next_start_key_hex": response.next_start_key_hex.clone(),
+                "remediation": "scope the read with start_ts_ns (it seeks CF_ACTION_LOG by ascending timestamp, so recent-activity queries complete in one page), or page forward by passing this next_start_key_hex back as start_key_hex until page_complete is true; a partial page intentionally omits matched/returned row counts",
             })),
         ));
     }
@@ -151,7 +156,12 @@ mod tests {
         );
         assert!(data.get("matched_rows").is_none());
         assert!(data.get("returned_count").is_none());
-        assert!(data.get("next_start_key_hex").is_none());
+        // The continuation cursor IS surfaced so the partial page is pageable (#1515);
+        // it is a resume key, not a success/row-count proof.
+        assert_eq!(
+            data.get("next_start_key_hex").and_then(|value| value.as_str()),
+            Some("18be7a763bd0462c0000005500")
+        );
     }
 
     #[test]

@@ -5000,9 +5000,17 @@ mod tests {
         assert_eq!(wire.id, "rewrite-api");
         assert_eq!(wire.action, "continue");
         assert_eq!(wire.status, None);
+        // Public route readbacks redact URL paths/queries so rewrite targets cannot
+        // leak secrets to the client (see url_redaction + commit 93983a2d). The
+        // origin is preserved but the `/mock` path is replaced with `/redacted`.
         assert_eq!(
             wire.continue_url.as_deref(),
-            Some("https://example.test/mock")
+            Some("https://example.test/redacted")
+        );
+        assert!(
+            !wire.continue_url.as_deref().unwrap().contains("mock"),
+            "continue_url path must be redacted, got: {:?}",
+            wire.continue_url
         );
         assert_eq!(wire.continue_method.as_deref(), Some("POST"));
         assert_eq!(wire.headers[0].name, "x-test");

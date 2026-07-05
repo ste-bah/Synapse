@@ -27,6 +27,24 @@ const EPISODE_SOURCE_OF_TRUTH: &str = "CF_EPISODES rows + CF_TIMELINE evidence r
 const PRIVACY_SOURCE_OF_TRUTH: &str =
     "CF_KV timeline/control/v1 + CF_TIMELINE rows/audit rows + hygiene flag/taint rows";
 
+/// #1516: default recent window (7 days, in ns) applied to a `timeline stats`
+/// call that supplies no time bounds. An unwindowed scan starts at the OLDEST
+/// row and is budget-capped, so on a large timeline it silently returns stale
+/// stats for the oldest slice; scoping the default to recent activity serves the
+/// common intent and lets the scan complete within budget. Callers wanting
+/// lifetime stats pass an explicit `start_ts_ns` (e.g. 0).
+const TIMELINE_STATS_DEFAULT_WINDOW_NS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
+
+/// Lower bound `now - window_ns`, saturating at 0. Uses the wall clock; a clock
+/// at or before the epoch yields 0 (full range) rather than erroring.
+fn recent_window_start_ns(window_ns: u64) -> u64 {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
+    now_ns.saturating_sub(window_ns)
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TimelineOperation {
@@ -241,10 +259,22 @@ impl SynapseService {
                 )))
             }
             TimelineOperation::Stats => {
-                let spec = params
+                let mut spec = params
                     .0
                     .stats
                     .ok_or_else(|| missing_timeline_spec("stats"))?;
+                // #1516: when no time bounds are supplied, seek to a recent window
+                // instead of scanning from the oldest row, so the default serves
+                // "recent activity" and completes within the scan budget. The applied
+                // default is reported in the readback so it is never silent.
+                let applied_default_window_start_ns =
+                    if spec.start_ts_ns.is_none() && spec.end_ts_ns.is_none() {
+                        let start = recent_window_start_ns(TIMELINE_STATS_DEFAULT_WINDOW_NS);
+                        spec.start_ts_ns = Some(start);
+                        Some(start)
+                    } else {
+                        None
+                    };
                 let source_id = timeline_range_source_id(spec.start_ts_ns, spec.end_ts_ns);
                 let response = self
                     .timeline_stats(Parameters(spec))
@@ -258,15 +288,22 @@ impl SynapseService {
                         )
                     })?
                     .0;
+                let default_window_note = match applied_default_window_start_ns {
+                    Some(start) => format!(
+                        " applied_default_recent_window_start_ns={start} (no start_ts_ns/end_ts_ns supplied; pass start_ts_ns=0 for lifetime stats)"
+                    ),
+                    None => String::new(),
+                };
                 Ok(Json(timeline_response(
                     operation,
                     format!(
-                        "CF_TIMELINE stats total_rows={} scanned={} invalid={} scan_complete={} recorder_paused={}",
+                        "CF_TIMELINE stats total_rows={} scanned={} invalid={} scan_complete={} recorder_paused={}{}",
                         response.total_rows,
                         response.scanned_rows,
                         response.invalid_rows,
                         response.scan_complete,
-                        response.recorder.paused
+                        response.recorder.paused,
+                        default_window_note,
                     ),
                     |out| out.stats = Some(response),
                 )))

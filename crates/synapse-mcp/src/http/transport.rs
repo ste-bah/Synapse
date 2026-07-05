@@ -633,6 +633,13 @@ pub(super) async fn serve(
         );
     }
 
+    // #1510: drain the durable shell-job store's terminal-job backlog once at
+    // boot. This daemon already holds the single-instance lock (acquired before
+    // binding the port), so it is the authoritative owner of the store. The pass
+    // is best-effort and never fails startup; ongoing retention is handled
+    // opportunistically on every session teardown.
+    crate::m4::reap_stale_shell_jobs_on_startup();
+
     // Periodic routine miner (#848): keeps CF_ROUTINES tracking the episode
     // store without manual routine_mine calls. A misconfigured schedule is a
     // startup failure, not a silently substituted default.

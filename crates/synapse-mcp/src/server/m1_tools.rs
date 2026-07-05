@@ -21416,8 +21416,21 @@ mod tests {
         );
 
         let error = result.expect_err("target owned by another session should be denied");
-        assert!(error.message.contains("cdp_activate_tab refused target"));
-        assert!(!error.message.contains("cdp_navigate_tab refused target"));
+        // The cross-session denial is produced by the durable owner-recovery layer
+        // (added in #1210), which refuses to restore owner authority for a session
+        // that holds no target_claim / active target / explicit set_target request.
+        // The message must still name the *actual* tool (cdp_activate_tab) and must
+        // never leak a different tool name (the point of #1208's audit fix).
+        assert!(
+            error.message.contains("cdp_activate_tab refused"),
+            "denial must name the actual tool, got: {:?}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("cdp_navigate_tab"),
+            "denial must not name a different tool, got: {:?}",
+            error.message
+        );
         let rows = action_log_tail(&service, 1)?;
         let stored: serde_json::Value = serde_json::from_slice(&rows[0].1)?;
         assert_eq!(action_log_count(&service)?, before + 1);

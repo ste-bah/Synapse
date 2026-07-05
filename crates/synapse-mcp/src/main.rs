@@ -569,6 +569,11 @@ async fn run_stdio(
         "daemon lifecycle ledger ready"
     );
 
+    // #1510: drain the durable shell-job store's terminal-job backlog once at
+    // boot, now that this process holds the single-instance lock and is the
+    // authoritative owner of the store. Best-effort — never blocks or fails boot.
+    m4::reap_stale_shell_jobs_on_startup();
+
     let rmcp_token = CancellationToken::new();
     let emitter_shutdown_token = CancellationToken::new();
     let emitter_connection_closed_token = CancellationToken::new();
