@@ -5398,6 +5398,37 @@ impl ChromeDebuggerBridge {
         Ok(ack)
     }
 
+    async fn wait_for_active_host(
+        &self,
+        wait_timeout: Duration,
+    ) -> Result<ChromeBridgeHostSnapshot, ChromeDebuggerBridgeError> {
+        let started = Instant::now();
+        loop {
+            if let Ok(snapshot) = self.active_host_snapshot()
+                && snapshot.extension_id.as_deref() == Some(EXTENSION_ID)
+                && snapshot.last_disconnect_detail.is_none()
+            {
+                if snapshot.extension_stale {
+                    return Err(ChromeDebuggerBridgeError {
+                        code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
+                        detail: format!(
+                            "Chrome bridge active host is stale after reconnect wait; host_id={} stale_reasons={}",
+                            snapshot.host_id,
+                            snapshot.extension_stale_reasons.join("|")
+                        ),
+                    });
+                }
+                return Ok(snapshot);
+            }
+            if started.elapsed() >= wait_timeout {
+                return Err(ChromeDebuggerBridgeError::timeout(
+                    "waitActiveChromeBridgeHost",
+                ));
+            }
+            sleep(RELOAD_RECONNECT_POLL_INTERVAL).await;
+        }
+    }
+
     async fn next_command(
         &self,
         host_id: &str,
@@ -7546,6 +7577,14 @@ pub async fn reload_bridge(
     wait_timeout_ms: u64,
 ) -> Result<ChromeBridgeReloadResult, ChromeDebuggerBridgeError> {
     bridge().reload_self(wait_timeout_ms).await
+}
+
+pub async fn wait_for_active_bridge_host(
+    wait_timeout_ms: u64,
+) -> Result<ChromeBridgeHostSnapshot, ChromeDebuggerBridgeError> {
+    bridge()
+        .wait_for_active_host(Duration::from_millis(wait_timeout_ms))
+        .await
 }
 
 pub async fn maintenance_pause_reconnect(

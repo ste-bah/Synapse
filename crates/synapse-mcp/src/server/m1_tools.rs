@@ -38,8 +38,9 @@ use super::{
     set_target_input_schema, tool, tool_router,
 };
 use crate::m1::{
-    BrowserTabsMutation, BrowserTabsOperation, CaptureRetryEvidence, ClipboardTimelineSample,
-    FsTimelineEvent, effective_ocr_backend, hidden_desktop_input_from_worker_snapshot,
+    BrowserTabsActivationVisualReadback, BrowserTabsMutation, BrowserTabsOperation,
+    CaptureRetryEvidence, ClipboardTimelineSample, FsTimelineEvent, effective_ocr_backend,
+    hidden_desktop_input_from_worker_snapshot,
 };
 use crate::m3::activity_recorder::BrowserNavigationEvent;
 use crate::server::session_continuity::PersistedCdpTargetOwner;
@@ -106,8 +107,24 @@ const BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH: &str =
     "target-scoped browser wait predicate readback from DOM/URL/load/network/function state";
 const BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH: &str =
     "browser_wait_for condition response plus daemon-tool-events.jsonl";
-const BROWSER_SCREENSHOT_PASSIVE_WINDOW_FALLBACK_CODE: &str =
-    "BROWSER_SCREENSHOT_BRIDGE_DISCONNECTED_PASSIVE_WINDOW_FALLBACK";
+const BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS: u64 = 3_000;
+
+#[derive(Clone, Debug)]
+struct BrowserTabsWindowResolution {
+    context: ForegroundContext,
+    used_human_os_foreground_window: bool,
+    discovery_source: &'static str,
+    chromium_window_candidate_count: u32,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct BrowserTabsActivationVisualProbe {
+    window_title: String,
+    bitmap_sha256: String,
+    width: u32,
+    height: u32,
+}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -911,12 +928,14 @@ impl SynapseService {
         );
         let session_id = require_target_session_id(&request_context)?;
         let validation = validate_browser_downloads_params(params.0)?;
-        let (window_context, used_human_os_foreground_window) = self
-            .resolve_browser_tabs_window_context(
-                TOOL,
-                &session_id,
-                validation.params.window_hwnd,
-            )?;
+        let window_resolution = self.resolve_browser_tabs_window_context(
+            TOOL,
+            &session_id,
+            validation.params.window_hwnd,
+            true,
+        )?;
+        let window_context = window_resolution.context;
+        let used_human_os_foreground_window = window_resolution.used_human_os_foreground_window;
         let request_details = json!({
             "session_id": &session_id,
             "operation": validation.params.operation,
@@ -924,6 +943,8 @@ impl SynapseService {
             "window_title": &window_context.window_title,
             "process_name": &window_context.process_name,
             "used_human_os_foreground_window": used_human_os_foreground_window,
+            "window_discovery_source": &window_resolution.discovery_source,
+            "chromium_window_candidate_count": window_resolution.chromium_window_candidate_count,
             "download_id": validation.params.download_id,
             "url_contains": validation.params.url_contains.as_deref(),
             "filename_contains": validation.params.filename_contains.as_deref(),
@@ -1723,36 +1744,6 @@ impl SynapseService {
         }
         ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
         let bridge_payload = browser_screenshot_bridge_payload(params, validation.format)?;
-        let owner_metadata = match self.cdp_target_owner_for_readback(
-            "browser_screenshot",
-            session_id,
-            cdp_target_id,
-        ) {
-            Ok(owner) => owner,
-            Err(error) => {
-                let error_code = error
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("code"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("UNKNOWN");
-                tracing::warn!(
-                    code = "BROWSER_SCREENSHOT_FALLBACK_OWNER_METADATA_UNAVAILABLE",
-                    hwnd = window_hwnd,
-                    cdp_target_id = %cdp_target_id,
-                    error_code = %error_code,
-                    error = %error.message,
-                    "browser_screenshot could not read durable owner metadata before capture; fallback metadata will rely on live Chrome readback"
-                );
-                None
-            }
-        };
-        let fallback_metadata = browser_screenshot_fallback_metadata_snapshot(
-            owner_metadata.as_ref(),
-            window_hwnd,
-            cdp_target_id,
-        )
-        .await;
         // #1359: serialize the brief foreground-capture critical section so
         // concurrent browser_screenshot captures (multi-agent / batched) cannot
         // interleave their Chrome-window activation and corrupt each other's
@@ -1764,10 +1755,10 @@ impl SynapseService {
         // makes concurrent agent captures queue.
         let _foreground_serialization = BROWSER_SCREENSHOT_FOREGROUND_LOCK.lock().await;
         let foreground_guard = prepare_browser_screenshot_foreground(window_hwnd)?;
-        let captured_result = crate::chrome_debugger_bridge::page_screenshot(
+        let mut captured_result = crate::chrome_debugger_bridge::page_screenshot(
             window_hwnd,
             cdp_target_id,
-            bridge_payload,
+            bridge_payload.clone(),
         )
         .await
         .map_err(|error| {
@@ -1779,6 +1770,17 @@ impl SynapseService {
                 ),
             )
         });
+        if let Err(error) = &captured_result
+            && browser_screenshot_bridge_disconnected(error)
+        {
+            captured_result = browser_screenshot_retry_after_bridge_disconnect(
+                window_hwnd,
+                cdp_target_id,
+                bridge_payload.clone(),
+                error,
+            )
+            .await;
+        }
         let foreground_readback = finish_browser_screenshot_foreground(
             window_hwnd,
             foreground_guard,
@@ -1786,25 +1788,6 @@ impl SynapseService {
         )?;
         let captured = match captured_result {
             Ok(captured) => captured,
-            Err(error) if browser_screenshot_bridge_disconnected(&error) => {
-                // #1341/#1343: the normal Chrome bridge captureVisibleTab lane
-                // disconnected mid-capture (the MV3 service worker drops its
-                // WebSocket on some GPU/WebGL-heavy pages). Rather than fail with
-                // an opaque A11Y_CDP_EXTENSION_UNAVAILABLE, fall back to a passive
-                // WGC capture of the owning Chrome window — WGC captures occluded
-                // windows and never depends on the bridge worker — so browser
-                // FSV still gets a real bitmap, flagged as a whole-window fallback.
-                return browser_screenshot_passive_window_fallback(
-                    params,
-                    validation,
-                    window_hwnd,
-                    cdp_target_id,
-                    &foreground_readback,
-                    &error,
-                    fallback_metadata,
-                )
-                .await;
-            }
             Err(error) => return Err(error),
         };
         if !cdp_target_ids_equal(&captured.target_id, cdp_target_id) {
@@ -1818,6 +1801,7 @@ impl SynapseService {
         }
         tracing::info!(
             code = "BROWSER_SCREENSHOT_BRIDGE_CAPTURED",
+            session_id = %session_id,
             hwnd = window_hwnd,
             cdp_target_id = %captured.target_id,
             tab_id = captured.tab_id,
@@ -2523,9 +2507,14 @@ impl SynapseService {
                 ),
             ));
         }
-        let (window_context, used_human_os_foreground_window) =
-            self.resolve_browser_tabs_window_context(TOOL, &session_id, params.window_hwnd)?;
-        if !allow_human_foreground_discovery && used_human_os_foreground_window {
+        let window_resolution = self.resolve_browser_tabs_window_context(
+            TOOL,
+            &session_id,
+            params.window_hwnd,
+            allow_human_foreground_discovery,
+        )?;
+        let window_context = window_resolution.context.clone();
+        if !allow_human_foreground_discovery && window_resolution.used_human_os_foreground_window {
             return Err(mcp_error(
                 error_codes::TARGET_NOT_SET,
                 format!(
@@ -2540,7 +2529,9 @@ impl SynapseService {
             "window_hwnd": window_context.hwnd,
             "window_title": &window_context.window_title,
             "process_name": &window_context.process_name,
-            "used_human_os_foreground_window": used_human_os_foreground_window,
+            "used_human_os_foreground_window": window_resolution.used_human_os_foreground_window,
+            "window_discovery_source": window_resolution.discovery_source,
+            "chromium_window_candidate_count": window_resolution.chromium_window_candidate_count,
             "required_foreground": false,
             "no_debugger_attach": true,
             "requested_cdp_target": cdp_target_id_audit_ref(params.cdp_target_id.as_deref()),
@@ -2551,7 +2542,7 @@ impl SynapseService {
             .browser_tabs_dispatch(
                 &session_id,
                 window_context,
-                used_human_os_foreground_window,
+                window_resolution.used_human_os_foreground_window,
                 &params,
             )
             .await;
@@ -2651,14 +2642,22 @@ impl SynapseService {
             "tool.invocation kind=browser_adopt_active_tab"
         );
         let session_id = require_target_session_id(&request_context)?;
-        let (window_context, used_human_os_foreground_window) =
-            self.resolve_browser_tabs_window_context(TOOL, &session_id, params.0.window_hwnd)?;
+        let window_resolution = self.resolve_browser_tabs_window_context(
+            TOOL,
+            &session_id,
+            params.0.window_hwnd,
+            false,
+        )?;
+        let window_context = window_resolution.context;
+        let used_human_os_foreground_window = window_resolution.used_human_os_foreground_window;
         let request_details = json!({
             "session_id": &session_id,
             "window_hwnd": window_context.hwnd,
             "window_title": &window_context.window_title,
             "process_name": &window_context.process_name,
             "used_human_os_foreground_window": used_human_os_foreground_window,
+            "window_discovery_source": &window_resolution.discovery_source,
+            "chromium_window_candidate_count": window_resolution.chromium_window_candidate_count,
             "required_foreground": false,
             "no_debugger_attach": true,
             "mutation": "session_target_bind_only",
@@ -5745,26 +5744,79 @@ impl SynapseService {
         tool: &str,
         session_id: &str,
         window_hwnd: Option<i64>,
-    ) -> Result<(ForegroundContext, bool), ErrorData> {
-        let (context, used_human_os_foreground_window) = if let Some(hwnd) = window_hwnd {
-            (validate_target_window_context(hwnd)?, false)
+        allow_passive_chromium_discovery: bool,
+    ) -> Result<BrowserTabsWindowResolution, ErrorData> {
+        let explicit_or_session_resolution = if let Some(hwnd) = window_hwnd {
+            Some((
+                validate_target_window_context(hwnd)?,
+                false,
+                "explicit_window_hwnd",
+                1,
+            ))
         } else if let Some(target) = self.session_target(Some(session_id))? {
             let hwnd = match target {
                 SessionTarget::Window { hwnd } => hwnd,
                 SessionTarget::Cdp { window_hwnd, .. } => window_hwnd,
             };
-            (validate_target_window_context(hwnd)?, false)
+            Some((
+                validate_target_window_context(hwnd)?,
+                false,
+                "session_target",
+                1,
+            ))
         } else {
-            let context = synapse_a11y::current_foreground_context().map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "{tool} could not read the current human OS foreground window: {error}"
-                    ),
-                )
-            })?;
-            (context, true)
+            None
         };
+        let (context, used_human_os_foreground_window, discovery_source, candidate_count) =
+            if let Some(resolution) = explicit_or_session_resolution {
+                resolution
+            } else {
+                let context = synapse_a11y::current_foreground_context().map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "{tool} could not read the current human OS foreground window: {error}"
+                        ),
+                    )
+                })?;
+                if synapse_a11y::is_chromium_family(&context.process_name) {
+                    (context, true, "human_os_foreground_chromium", 1)
+                } else if allow_passive_chromium_discovery {
+                    let candidates = passive_chromium_window_candidates(tool, Some(&context))?;
+                    match candidates.as_slice() {
+                        [candidate] => (
+                            candidate.clone(),
+                            false,
+                            "passive_single_chromium_window",
+                            1,
+                        ),
+                        [] => {
+                            return Err(mcp_error(
+                                error_codes::ACTION_TARGET_INVALID,
+                                format!(
+                                    "{tool} resolved non-Chromium human foreground hwnd={:#x} process_name={:?} title={:?}; passive discovery found no visible Chromium windows. remediation=use target operation=list to inspect windows, open or reuse an existing Chrome/Chromium/Edge/Brave/Vivaldi/Opera window, or pass window_hwnd explicitly.",
+                                    context.hwnd, context.process_name, context.window_title
+                                ),
+                            ));
+                        }
+                        _ => {
+                            return Err(mcp_error(
+                                error_codes::ACTION_TARGET_INVALID,
+                                format!(
+                                    "{tool} resolved non-Chromium human foreground hwnd={:#x} process_name={:?} title={:?}; passive discovery found {} Chromium windows and refused to guess. candidates=[{}] remediation=pass window_hwnd from target operation=list or bind a session target first.",
+                                    context.hwnd,
+                                    context.process_name,
+                                    context.window_title,
+                                    candidates.len(),
+                                    format_chromium_window_candidates(&candidates)
+                                ),
+                            ));
+                        }
+                    }
+                } else {
+                    (context, true, "human_os_foreground_non_chromium", 0)
+                }
+            };
         if !synapse_a11y::is_chromium_family(&context.process_name) {
             return Err(mcp_error(
                 error_codes::ACTION_TARGET_INVALID,
@@ -5774,7 +5826,12 @@ impl SynapseService {
                 ),
             ));
         }
-        Ok((context, used_human_os_foreground_window))
+        Ok(BrowserTabsWindowResolution {
+            context,
+            used_human_os_foreground_window,
+            discovery_source,
+            chromium_window_candidate_count: candidate_count,
+        })
     }
 
     #[cfg(not(windows))]
@@ -5783,7 +5840,8 @@ impl SynapseService {
         tool: &str,
         _session_id: &str,
         _window_hwnd: Option<i64>,
-    ) -> Result<(ForegroundContext, bool), ErrorData> {
+        _allow_passive_chromium_discovery: bool,
+    ) -> Result<BrowserTabsWindowResolution, ErrorData> {
         Err(mcp_error(
             error_codes::A11Y_NOT_AVAILABLE,
             format!("{tool} is only available on Windows in this build"),
@@ -5863,6 +5921,7 @@ impl SynapseService {
                     before_active: None,
                     active: None,
                     highlighted: None,
+                    activation_visual_readback: None,
                     opened_cdp_target_id: None,
                     closed_cdp_target_id: None,
                     closed: false,
@@ -5909,6 +5968,14 @@ impl SynapseService {
                             ),
                         )
                     })?;
+                let visual_before = if before_tab.active {
+                    None
+                } else {
+                    Some(browser_tabs_activation_visual_probe(
+                        window_context.hwnd,
+                        "before_activation",
+                    )?)
+                };
                 let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
                 let activated = crate::chrome_debugger_bridge::activate_tab(
                     window_context.hwnd,
@@ -5972,7 +6039,7 @@ impl SynapseService {
                 let mut response = self
                     .browser_tabs_impl(
                         session_id,
-                        window_context,
+                        window_context.clone(),
                         used_human_os_foreground_window,
                         BrowserTabsOperation::Activate,
                         None,
@@ -6000,6 +6067,19 @@ impl SynapseService {
                         ),
                     ));
                 }
+                let activation_visual_readback = if before_tab.active {
+                    None
+                } else {
+                    Some(
+                        browser_tabs_verify_activation_visualized(
+                            window_context.hwnd,
+                            &before_tab,
+                            &activated_tab,
+                            visual_before.as_ref(),
+                        )
+                        .await?,
+                    )
+                };
                 response.mutation = Some(BrowserTabsMutation {
                     operation: BrowserTabsOperation::Activate,
                     requested_cdp_target_id: Some(requested.to_owned()),
@@ -6012,6 +6092,7 @@ impl SynapseService {
                     before_active: activated.before_active,
                     active: Some(activated.active),
                     highlighted: activated.highlighted,
+                    activation_visual_readback,
                     opened_cdp_target_id: None,
                     closed_cdp_target_id: None,
                     closed: false,
@@ -6060,6 +6141,7 @@ impl SynapseService {
                         before_active: None,
                         active: None,
                         highlighted: None,
+                        activation_visual_readback: None,
                         opened_cdp_target_id: Some(opened.cdp_target_id),
                         closed_cdp_target_id: None,
                         closed: false,
@@ -6122,6 +6204,7 @@ impl SynapseService {
                         before_active: None,
                         active: None,
                         highlighted: None,
+                        activation_visual_readback: None,
                         opened_cdp_target_id: None,
                         closed_cdp_target_id: Some(target_id),
                         closed: closed.closed,
@@ -13627,6 +13710,243 @@ fn background_tab_activation_foregrounded_requested_window(
         && after_hwnd != before_hwnd
 }
 
+#[cfg(windows)]
+fn passive_chromium_window_candidates(
+    tool: &str,
+    foreground: Option<&ForegroundContext>,
+) -> Result<Vec<ForegroundContext>, ErrorData> {
+    let contexts = synapse_a11y::visible_top_level_window_contexts().map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("{tool} could not enumerate visible Chromium windows: {error}"),
+        )
+    })?;
+    let mut candidates = contexts
+        .into_iter()
+        .filter(|context| synapse_a11y::is_chromium_family(&context.process_name))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|context| {
+        (
+            foreground.is_some_and(|fg| fg.hwnd == context.hwnd),
+            context.process_name.to_ascii_lowercase(),
+            context.window_title.to_ascii_lowercase(),
+            context.hwnd,
+        )
+    });
+    Ok(candidates)
+}
+
+#[cfg(windows)]
+fn format_chromium_window_candidates(candidates: &[ForegroundContext]) -> String {
+    candidates
+        .iter()
+        .take(8)
+        .map(|context| {
+            format!(
+                "hwnd={:#x} pid={} process={:?} title={:?} bounds={}x{}+{},{}",
+                context.hwnd,
+                context.pid,
+                context.process_name,
+                context.window_title,
+                context.window_bounds.w,
+                context.window_bounds.h,
+                context.window_bounds.x,
+                context.window_bounds.y
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(windows)]
+fn browser_tabs_activation_visual_probe(
+    window_hwnd: i64,
+    phase: &str,
+) -> Result<BrowserTabsActivationVisualProbe, ErrorData> {
+    let minimized = synapse_a11y::is_window_minimized(window_hwnd).map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "browser_tabs operation=activate could not read minimized state for Chrome HWND {window_hwnd:#x} before visual postcondition: {error}"
+            ),
+        )
+    })?;
+    if minimized {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_tabs operation=activate cannot prove visible HWND pixels for minimized Chrome HWND {window_hwnd:#x}; restore the window or use target-scoped browser_capture instead of HWND capture"
+            ),
+        ));
+    }
+    let context = validate_target_window_context(window_hwnd)?;
+    let captured =
+        synapse_capture::window_full_frame_to_bgra_bitmap(window_hwnd, WINDOW_SCREENSHOT_TIMEOUT_MS)
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "browser_tabs operation=activate passive HWND visual readback failed during {phase} for Chrome HWND {window_hwnd:#x}: {error}"
+                    ),
+                )
+            })?;
+    let bitmap = captured.bitmap;
+    let bitmap_sha256 = sha256_hex(&bitmap.bytes);
+    tracing::info!(
+        code = "BROWSER_TABS_ACTIVATE_VISUAL_PROBE",
+        hwnd = window_hwnd,
+        phase,
+        window_title = %context.window_title,
+        width = bitmap.width,
+        height = bitmap.height,
+        bitmap_sha256 = %bitmap_sha256,
+        "readback=passive_wgc_window_bgra outcome=activation_visual_probe"
+    );
+    Ok(BrowserTabsActivationVisualProbe {
+        window_title: context.window_title,
+        bitmap_sha256,
+        width: bitmap.width,
+        height: bitmap.height,
+    })
+}
+
+#[cfg(windows)]
+async fn browser_tabs_verify_activation_visualized(
+    window_hwnd: i64,
+    before_tab: &BrowserTabEntry,
+    activated_tab: &BrowserTabEntry,
+    visual_before: Option<&BrowserTabsActivationVisualProbe>,
+) -> Result<BrowserTabsActivationVisualReadback, ErrorData> {
+    let before = visual_before.ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "browser_tabs operation=activate missing pre-activation visual readback for inactive tab"
+                .to_owned(),
+        )
+    })?;
+    let started = Instant::now();
+    let mut attempts = 0_u32;
+    loop {
+        attempts = attempts.saturating_add(1);
+        let after = browser_tabs_activation_visual_probe(window_hwnd, "after_activation")?;
+        let visual_changed = before.bitmap_sha256 != after.bitmap_sha256;
+        let title_match =
+            browser_tab_window_title_matches_target(&after.window_title, activated_tab);
+        if visual_changed && title_match.unwrap_or(true) {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            tracing::info!(
+                code = "BROWSER_TABS_ACTIVATE_VISUAL_VERIFIED",
+                hwnd = window_hwnd,
+                requested_cdp_target_id = %activated_tab.cdp_target_id,
+                before_cdp_target_id = %before_tab.cdp_target_id,
+                attempts,
+                elapsed_ms,
+                before_bitmap_sha256 = %before.bitmap_sha256,
+                after_bitmap_sha256 = %after.bitmap_sha256,
+                target_title_matched_window_title = title_match.unwrap_or(true),
+                "readback=passive_wgc_window_bgra outcome=activation_visual_postcondition_verified"
+            );
+            return Ok(browser_tabs_activation_visual_readback(
+                "verified_hwnd_pixels_changed",
+                before,
+                &after,
+                true,
+                title_match,
+                attempts,
+                elapsed_ms,
+            ));
+        }
+        if attempts >= 8 {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            tracing::error!(
+                code = error_codes::ACTION_POSTCONDITION_FAILED,
+                hwnd = window_hwnd,
+                requested_cdp_target_id = %activated_tab.cdp_target_id,
+                before_cdp_target_id = %before_tab.cdp_target_id,
+                attempts,
+                elapsed_ms,
+                before_window_title = %before.window_title,
+                after_window_title = %after.window_title,
+                before_bitmap_sha256 = %before.bitmap_sha256,
+                after_bitmap_sha256 = %after.bitmap_sha256,
+                visual_changed = before.bitmap_sha256 != after.bitmap_sha256,
+                target_title_matched_window_title = title_match.unwrap_or(true),
+                "browser_tabs operation=activate Chrome tab state changed but passive HWND visual postcondition did not verify"
+            );
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "browser_tabs operation=activate postcondition failed: Chrome reported target {:?} active, but passive HWND pixels for Chrome HWND {window_hwnd:#x} did not prove the visual tab switch after {attempts} attempts over {elapsed_ms} ms. before_target={:?} before_title={:?} after_title={:?} before_sha256={} after_sha256={} visual_changed={} title_matches_target={:?}. remediation=use target-scoped browser_capture for tab content or retry after Chrome repaints; HWND capture was not accepted as current.",
+                    activated_tab.cdp_target_id,
+                    before_tab.cdp_target_id,
+                    before.window_title,
+                    after.window_title,
+                    before.bitmap_sha256,
+                    after.bitmap_sha256,
+                    before.bitmap_sha256 != after.bitmap_sha256,
+                    title_match
+                ),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(125)).await;
+    }
+}
+
+#[cfg(windows)]
+fn browser_tabs_activation_visual_readback(
+    status: &str,
+    before: &BrowserTabsActivationVisualProbe,
+    after: &BrowserTabsActivationVisualProbe,
+    visual_changed: bool,
+    title_match: Option<bool>,
+    attempts: u32,
+    elapsed_ms: u64,
+) -> BrowserTabsActivationVisualReadback {
+    BrowserTabsActivationVisualReadback {
+        status: status.to_owned(),
+        source_of_truth:
+            "passive per-window WGC BGRA capture of the owning Chrome HWND before and after chrome.tabs.update(active=true)"
+                .to_owned(),
+        before_window_title: Some(before.window_title.clone()),
+        after_window_title: Some(after.window_title.clone()),
+        before_bitmap_sha256: Some(before.bitmap_sha256.clone()),
+        after_bitmap_sha256: Some(after.bitmap_sha256.clone()),
+        before_bitmap_width: before.width,
+        before_bitmap_height: before.height,
+        after_bitmap_width: after.width,
+        after_bitmap_height: after.height,
+        visual_changed,
+        target_title_matched_window_title: title_match,
+        attempts,
+        elapsed_ms,
+    }
+}
+
+#[cfg(windows)]
+fn browser_tab_window_title_matches_target(
+    window_title: &str,
+    activated_tab: &BrowserTabEntry,
+) -> Option<bool> {
+    let tab_title = activated_tab.title.trim();
+    if tab_title.is_empty() || tab_title.eq_ignore_ascii_case("redacted") {
+        return None;
+    }
+    let window = window_title.trim().to_ascii_lowercase();
+    if window.is_empty() {
+        return Some(false);
+    }
+    let tab = tab_title.to_ascii_lowercase();
+    let window_without_suffix = window
+        .strip_suffix(" - google chrome")
+        .unwrap_or(&window)
+        .trim();
+    Some(
+        window.contains(&tab)
+            || tab.contains(window_without_suffix)
+            || window_without_suffix.contains(&tab),
+    )
+}
+
 #[derive(Clone, Debug, Default)]
 struct BrowserScreenshotForegroundReadback {
     required_foreground: bool,
@@ -14558,10 +14878,10 @@ fn capture_context_looks_like_transient_startup_hwnd(context: &ForegroundContext
         || context.window_bounds.h <= TRANSIENT_HWND_MAX_EDGE_PX
 }
 
-/// #1341/#1343: true when a browser_screenshot bridge capture failed because the
-/// normal Chrome bridge direct-HTTP host disconnected mid-command (the MV3
-/// service worker drops its WebSocket on some GPU/WebGL-heavy pages). This is the
-/// recoverable case where a passive WGC window capture is a valid substitute.
+/// #1341/#1343/#1517: true when a browser_screenshot bridge capture failed
+/// because the normal Chrome bridge direct-HTTP host disconnected mid-command.
+/// The only accepted recovery is a primary-lane retry after the bridge host
+/// reconnects; passive HWND capture is not an equivalent substitute.
 fn browser_screenshot_bridge_disconnected(error: &ErrorData) -> bool {
     error
         .message
@@ -14571,355 +14891,58 @@ fn browser_screenshot_bridge_disconnected(error: &ErrorData) -> bool {
             .contains("client closed direct HTTP WebSocket")
 }
 
-#[derive(Clone, Debug)]
-struct BrowserScreenshotFallbackMetadata {
-    cdp_target_id: String,
-    tab_id: Option<u32>,
-    chrome_window_id: Option<i64>,
-    url: String,
-    title: String,
-    device_pixel_ratio: Option<f64>,
-    viewport_width_css: Option<f64>,
-    viewport_height_css: Option<f64>,
-    scroll_width_css: Option<f64>,
-    scroll_height_css: Option<f64>,
-    sources: Vec<String>,
-}
-
-impl BrowserScreenshotFallbackMetadata {
-    fn new(cdp_target_id: &str) -> Self {
-        Self {
-            cdp_target_id: cdp_target_id.to_owned(),
-            tab_id: None,
-            chrome_window_id: None,
-            url: String::new(),
-            title: String::new(),
-            device_pixel_ratio: None,
-            viewport_width_css: None,
-            viewport_height_css: None,
-            scroll_width_css: None,
-            scroll_height_css: None,
-            sources: Vec::new(),
-        }
-    }
-
-    fn note_source(&mut self, source: &str) {
-        if !self.sources.iter().any(|existing| existing == source) {
-            self.sources.push(source.to_owned());
-        }
-    }
-
-    fn apply_owner(&mut self, owner: &CdpTargetOwner) {
-        self.chrome_window_id = self.chrome_window_id.or(owner.chrome_window_id);
-        if !owner.target_url.trim().is_empty() {
-            self.url.clone_from(&owner.target_url);
-        } else if !owner.requested_url.trim().is_empty() {
-            self.url.clone_from(&owner.requested_url);
-        }
-        self.note_source("session_cdp_target_owner");
-    }
-
-    fn apply_tab_target(
-        &mut self,
-        tab: &crate::chrome_debugger_bridge::ChromeDebuggerTabTarget,
-        source: &str,
-    ) {
-        if !cdp_target_ids_equal(&tab.target_id, &self.cdp_target_id) {
-            return;
-        }
-        self.tab_id = Some(tab.tab_id);
-        self.chrome_window_id = tab.chrome_window_id.or(self.chrome_window_id);
-        if !tab.url.trim().is_empty() {
-            self.url.clone_from(&tab.url);
-        }
-        if !tab.title.trim().is_empty() {
-            self.title.clone_from(&tab.title);
-        }
-        self.note_source(source);
-    }
-
-    fn apply_activate_result(
-        &mut self,
-        activated: &crate::chrome_debugger_bridge::ChromeDebuggerActivateTabResult,
-    ) {
-        if !cdp_target_ids_equal(&activated.target_id, &self.cdp_target_id) {
-            return;
-        }
-        self.tab_id = Some(activated.tab_id);
-        self.chrome_window_id = activated.chrome_window_id.or(self.chrome_window_id);
-        if !activated.url.trim().is_empty() {
-            self.url.clone_from(&activated.url);
-        }
-        if !activated.title.trim().is_empty() {
-            self.title.clone_from(&activated.title);
-        }
-        self.note_source("chrome.tabs.update_activateTab_fallback_readback");
-    }
-
-    fn apply_page_vitals(
-        &mut self,
-        vitals: &crate::chrome_debugger_bridge::ChromeDebuggerPageVitalsResult,
-    ) {
-        if !cdp_target_ids_equal(&vitals.target_id, &self.cdp_target_id) {
-            return;
-        }
-        self.tab_id = Some(vitals.tab_id);
-        self.chrome_window_id = vitals.chrome_window_id.or(self.chrome_window_id);
-        if !vitals.url.trim().is_empty() {
-            self.url.clone_from(&vitals.url);
-        }
-        if !vitals.title.trim().is_empty() {
-            self.title.clone_from(&vitals.title);
-        }
-        if let Some(viewport) = vitals.viewport.as_ref() {
-            if let Some(value) = positive_finite_f64(viewport.device_pixel_ratio) {
-                self.device_pixel_ratio = Some(value);
-            }
-            if let Some(value) = positive_i64_as_f64(viewport.inner_width) {
-                self.viewport_width_css = Some(value);
-            }
-            if let Some(value) = positive_i64_as_f64(viewport.inner_height) {
-                self.viewport_height_css = Some(value);
-            }
-            if let Some(value) = positive_i64_as_f64(viewport.scroll_width) {
-                self.scroll_width_css = Some(value);
-            }
-            if let Some(value) = positive_i64_as_f64(viewport.scroll_height) {
-                self.scroll_height_css = Some(value);
-            }
-        }
-        self.note_source("chrome.tabs.get_pageVitals_pre_capture");
-    }
-
-    fn source(&self) -> Option<String> {
-        if self.sources.is_empty() {
-            None
-        } else {
-            Some(self.sources.join("+"))
-        }
-    }
-}
-
-fn positive_i64_as_f64(value: i64) -> Option<f64> {
-    let value = u32::try_from(value).ok()?;
-    (value > 0).then_some(f64::from(value))
-}
-
-fn positive_finite_f64(value: f64) -> Option<f64> {
-    (value.is_finite() && value > 0.0).then_some(value)
-}
-
-async fn browser_screenshot_fallback_metadata_snapshot(
-    owner: Option<&CdpTargetOwner>,
+async fn browser_screenshot_retry_after_bridge_disconnect(
     window_hwnd: i64,
     cdp_target_id: &str,
-) -> BrowserScreenshotFallbackMetadata {
-    let mut metadata = BrowserScreenshotFallbackMetadata::new(cdp_target_id);
-    if let Some(owner) = owner {
-        metadata.apply_owner(owner);
-    }
-
-    let expected_context = validate_target_window_context(window_hwnd).ok();
-    let expected_chrome_window_id = owner.and_then(|owner| owner.chrome_window_id);
-    match crate::chrome_debugger_bridge::list_tabs(
-        window_hwnd,
-        expected_chrome_window_id,
-        expected_context
-            .as_ref()
-            .map(|context| context.window_bounds),
-        expected_context
-            .as_ref()
-            .map(|context| context.window_title.as_str()),
-    )
-    .await
-    {
-        Ok(listed) => {
-            if let Some(tab) = listed
-                .tabs
-                .iter()
-                .find(|tab| cdp_target_ids_equal(&tab.target_id, cdp_target_id))
-            {
-                metadata.apply_tab_target(tab, "chrome.tabs.query_pre_capture");
-            } else {
-                tracing::warn!(
-                    code = "BROWSER_SCREENSHOT_FALLBACK_METADATA_TARGET_MISSING",
-                    hwnd = window_hwnd,
-                    cdp_target_id = %cdp_target_id,
-                    tab_count = listed.tabs.len(),
-                    "browser_screenshot pre-capture metadata readback did not contain requested target"
-                );
-            }
-        }
-        Err(error) => {
-            tracing::warn!(
-                code = "BROWSER_SCREENSHOT_FALLBACK_METADATA_LIST_TABS_FAILED",
-                hwnd = window_hwnd,
-                cdp_target_id = %cdp_target_id,
-                detail = %error.detail(),
-                "browser_screenshot pre-capture chrome.tabs.query metadata readback failed"
-            );
-        }
-    }
-
-    match crate::chrome_debugger_bridge::page_vitals(window_hwnd, cdp_target_id).await {
-        Ok(vitals) => metadata.apply_page_vitals(&vitals),
-        Err(error) => {
-            tracing::warn!(
-                code = "BROWSER_SCREENSHOT_FALLBACK_METADATA_PAGE_VITALS_FAILED",
-                hwnd = window_hwnd,
-                cdp_target_id = %cdp_target_id,
-                detail = %error.detail(),
-                "browser_screenshot pre-capture pageVitals viewport metadata readback failed"
-            );
-        }
-    }
-
-    metadata
-}
-
-/// #1341/#1343: produce a browser_screenshot result from a passive per-window WGC
-/// capture of the owning Chrome window when the bridge captureVisibleTab lane
-/// disconnected mid-capture. WGC captures occluded/background windows and never
-/// depends on the bridge service worker, so browser FSV still gets a real bitmap.
-/// The result is flagged via `fallback_reason` + backend_tier_used so callers know
-/// it is a whole-window capture, not a viewport/clip/element capture.
-async fn browser_screenshot_passive_window_fallback(
-    params: &BrowserScreenshotParams,
-    validation: &BrowserScreenshotValidation,
-    window_hwnd: i64,
-    cdp_target_id: &str,
-    foreground: &BrowserScreenshotForegroundReadback,
-    bridge_error: &ErrorData,
-    mut fallback_metadata: BrowserScreenshotFallbackMetadata,
-) -> Result<BrowserScreenshotResponse, ErrorData> {
-    // Best-effort activate the target tab in its window so the passive WGC frame
-    // shows the intended page, not whichever tab was previously active. activateTab
-    // is a lightweight chrome.tabs.update — it does NOT run the captureVisibleTab
-    // path that drops the bridge worker. The capture failure typically disconnected
-    // the MV3 worker, which re-registers ~1s later via chrome.alarms, so retry the
-    // activate across that gap. A persistent failure is non-fatal: we still capture
-    // the window (its current tab), flagged via fallback_reason.
-    let mut activated = false;
-    for attempt in 0..5u32 {
-        match crate::chrome_debugger_bridge::activate_tab(window_hwnd, cdp_target_id, 2_000).await {
-            Ok(activated_tab) => {
-                fallback_metadata.apply_activate_result(&activated_tab);
-                activated = true;
-                // Let the activated (possibly background) tab paint before WGC.
-                tokio::time::sleep(std::time::Duration::from_millis(450)).await;
-                break;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    code = "BROWSER_SCREENSHOT_FALLBACK_ACTIVATE_RETRY",
-                    hwnd = window_hwnd,
-                    cdp_target_id = %cdp_target_id,
-                    attempt,
-                    detail = %error.detail(),
-                    "passive WGC fallback activate attempt failed; the bridge worker may still be re-registering"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(700)).await;
-            }
-        }
-    }
-    if !activated {
-        tracing::warn!(
-            code = "BROWSER_SCREENSHOT_FALLBACK_ACTIVATE_GAVE_UP",
-            hwnd = window_hwnd,
-            cdp_target_id = %cdp_target_id,
-            "passive WGC fallback could not activate the target tab after retries; capturing current window state"
-        );
-    }
-    let captured =
-        synapse_capture::window_full_frame_to_bgra_bitmap(window_hwnd, WINDOW_SCREENSHOT_TIMEOUT_MS)
-            .map_err(|error| {
-                mcp_error(
-                    error.code(),
-                    format!(
-                        "browser_screenshot passive WGC window fallback failed for Chrome HWND {window_hwnd:#x} after the bridge captureVisibleTab lane disconnected ({}): {error}",
-                        bridge_error.message
-                    ),
-                )
-            })?;
-    let capture_backend = captured.capture_backend;
-    let bitmap = captured.bitmap;
-    let page_region = full_bitmap_region(&bitmap)?;
-    let bitmap_sha256 = sha256_hex(&bitmap.bytes);
-    let write_params = CaptureScreenshotParams {
-        path: params.path.clone(),
-        region: Some(page_region),
-        window_hwnd: None,
-        overwrite: params.overwrite,
-        max_pixels: params.max_pixels,
-        max_long_edge: params.max_long_edge,
-    };
-    let screenshot = write_screenshot_bitmap_with_quality(
-        &write_params,
-        validation.output_path.clone(),
-        validation.format,
-        bitmap,
-        capture_backend,
-        bitmap_sha256,
-        None,
-        params.quality,
-        None,
-    )?;
+    bridge_payload: Value,
+    first_error: &ErrorData,
+) -> Result<crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult, ErrorData> {
     tracing::warn!(
-        code = "BROWSER_SCREENSHOT_PASSIVE_WINDOW_FALLBACK",
-        degradation_code = BROWSER_SCREENSHOT_PASSIVE_WINDOW_FALLBACK_CODE,
+        code = "BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY",
         hwnd = window_hwnd,
         cdp_target_id = %cdp_target_id,
-        bridge_error = %bridge_error.message,
-        fallback_metadata_source = %fallback_metadata.source().unwrap_or_else(|| "unavailable".to_owned()),
-        fallback_url_present = !fallback_metadata.url.trim().is_empty(),
-        fallback_title_present = !fallback_metadata.title.trim().is_empty(),
-        fallback_viewport_present = fallback_metadata.viewport_width_css.is_some()
-            && fallback_metadata.viewport_height_css.is_some(),
-        output_path = %validation.output_path.display(),
-        native_width = screenshot.native_width,
-        native_height = screenshot.native_height,
-        "readback=passive_wgc_window outcome=bridge_disconnect_fallback"
+        wait_timeout_ms = BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS,
+        first_error = %first_error.message,
+        "browser_screenshot primary Chrome bridge disconnected mid-capture; waiting for bridge reconnect before one primary-lane retry"
     );
-    let fallback_metadata_source = fallback_metadata.source();
-    Ok(BrowserScreenshotResponse {
-        path: screenshot.path,
-        format: screenshot.format,
-        capture_backend: screenshot.capture_backend,
-        scope: params.scope,
-        page_region,
-        width: screenshot.width,
-        height: screenshot.height,
-        native_width: screenshot.native_width,
-        native_height: screenshot.native_height,
-        scale: screenshot.scale,
-        bytes_written: screenshot.bytes_written,
-        bitmap_sha256: screenshot.bitmap_sha256,
-        cdp_target_id: cdp_target_id.to_owned(),
-        tab_id: fallback_metadata.tab_id.unwrap_or(0),
-        chrome_window_id: fallback_metadata.chrome_window_id,
-        url: redact_url_for_public_readback(&fallback_metadata.url),
-        title: fallback_metadata.title,
-        device_pixel_ratio: fallback_metadata.device_pixel_ratio.unwrap_or(0.0),
-        viewport_width_css: fallback_metadata.viewport_width_css.unwrap_or(0.0),
-        viewport_height_css: fallback_metadata.viewport_height_css.unwrap_or(0.0),
-        scroll_width_css: fallback_metadata.scroll_width_css.unwrap_or(0.0),
-        scroll_height_css: fallback_metadata.scroll_height_css.unwrap_or(0.0),
-        tile_count: 0,
-        mask_count: 0,
-        omit_background: params.omit_background,
-        required_foreground: foreground.required_foreground,
-        human_os_foreground_before_hwnd: foreground.before_hwnd,
-        human_os_foreground_capture_hwnd: foreground.capture_hwnd,
-        human_os_foreground_after_restore_hwnd: foreground.after_restore_hwnd,
-        restored_human_os_foreground: foreground.restored_human_os_foreground,
-        backend_tier_used: "passive_window_wgc_fallback".to_owned(),
-        source_of_truth:
-            "passive per-window WGC capture of the owning Chrome window (normal bridge captureVisibleTab lane disconnected mid-capture)"
-                .to_owned(),
-        degradation_code: Some(BROWSER_SCREENSHOT_PASSIVE_WINDOW_FALLBACK_CODE.to_owned()),
-        fallback_metadata_source,
-        fallback_reason: Some(bridge_error.message.to_string()),
-    })
+    let reconnect = crate::chrome_debugger_bridge::wait_for_active_bridge_host(
+        BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS,
+    )
+    .await
+    .map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "browser_screenshot Chrome bridge disconnected during capture and did not expose a usable reconnected host within {BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS} ms; first_error={}; reconnect_error={}. remediation=check health chrome_bridge last_disconnect_detail, reload the installed Synapse Chrome Bridge, then retry the same target-scoped browser_capture. No passive WGC fallback was used.",
+                first_error.message,
+                error.detail()
+            ),
+        )
+    })?;
+    tracing::info!(
+        code = "BROWSER_SCREENSHOT_BRIDGE_RECONNECTED_FOR_RETRY",
+        hwnd = window_hwnd,
+        cdp_target_id = %cdp_target_id,
+        host_id = %reconnect.host_id,
+        registered_unix_ms = reconnect.registered_unix_ms,
+        last_seen_unix_ms = reconnect.last_seen_unix_ms,
+        "readback=chrome_bridge_active_host_snapshot outcome=reconnected_before_screenshot_retry"
+    );
+    crate::chrome_debugger_bridge::page_screenshot(window_hwnd, cdp_target_id, bridge_payload)
+        .await
+        .map_err(|retry_error| {
+            let retry_detail = retry_error.detail().to_owned();
+            let retry_code = retry_error.code().to_owned();
+            let code = retry_error.code();
+            mcp_error(
+                code,
+                format!(
+                    "browser_screenshot Chrome bridge capture failed after reconnect retry; first_error={}; retry_code={retry_code}; retry_error={retry_detail}; host_id={}. No passive WGC fallback was used; the screenshot artifact was not written from a substitute capture lane.",
+                    first_error.message,
+                    reconnect.host_id
+                ),
+            )
+        })
 }
 
 #[cfg(windows)]
@@ -18152,38 +18175,38 @@ mod tests {
     use super::{
         BROWSER_EVALUATE_MAX_EXPRESSION_BYTES, BROWSER_INIT_SCRIPT_MAX_SOURCE_BYTES,
         BROWSER_NAV_READBACK_SOURCE_OF_TRUTH, BROWSER_NAV_SOURCE_OF_TRUTH,
-        BROWSER_TAG_MAX_CONTENT_BYTES, BROWSER_WAIT_MAX_TEXT_BYTES,
-        BrowserScreenshotFallbackMetadata, BrowserScreenshotParams, BrowserScreenshotScope,
-        BrowserTagSourceKind, BrowserWaitForSelectorObservation, CdpTargetOwner,
-        DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS, DEFAULT_BROWSER_WAIT_TIMEOUT_MS, ErrorData,
-        MAX_BROWSER_SET_CONTENT_HTML_BYTES, MAX_BROWSER_WAIT_POLLING_INTERVAL_MS,
+        BROWSER_TAG_MAX_CONTENT_BYTES, BROWSER_WAIT_MAX_TEXT_BYTES, BrowserScreenshotParams,
+        BrowserScreenshotScope, BrowserTagSourceKind, BrowserWaitForSelectorObservation,
+        CdpTargetOwner, DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS, DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
+        ErrorData, MAX_BROWSER_SET_CONTENT_HTML_BYTES, MAX_BROWSER_WAIT_POLLING_INTERVAL_MS,
         MAX_BROWSER_WAIT_TIMEOUT_MS, MAX_CDP_NAVIGATE_WAIT_TIMEOUT_MS,
         MIN_BROWSER_WAIT_POLLING_INTERVAL_MS, SessionTarget, SetTargetParam, SynapseService,
         TargetClaimTargetParam, TargetOperation, TargetParams, TargetWire,
         attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
         background_tab_activation_foregrounded_requested_window, browser_nav_delegate_error,
-        browser_tab_entry, browser_wait_for_selector_condition,
+        browser_screenshot_bridge_disconnected, browser_tab_entry,
+        browser_tab_window_title_matches_target, browser_wait_for_selector_condition,
         capture_target_window_transient_candidate_diagnostic_from_contexts,
         cdp_activate_resolution_request_details, cdp_navigation_error_code,
         cdp_target_info_resolution_request_details, chrome_capture_visible_tab_data_url_to_bgra,
-        chrome_page_vitals_info, downscale_captured_bitmap, hidden_desktop_pip_ended_response,
-        hidden_worker_target_miss, mcp_error, ocr_cache_key, page_text_info_from_parts,
-        perception_window_hwnd, resolve_browser_tag_source, resolve_capture_target_window_context,
-        screenshot_downscale_scale, select_single_active_browser_tab, sha256_hex,
-        target_claim_param_from_set, target_wire, template_value, unavailable_page_vitals_info,
-        validate_browser_add_init_script_params, validate_browser_add_script_tag_params,
-        validate_browser_add_style_tag_params, validate_browser_downloads_params,
-        validate_browser_evaluate_params, validate_browser_expose_binding_params,
-        validate_browser_frame_locator, validate_browser_nav_params,
-        validate_browser_screenshot_params, validate_browser_set_content_params,
-        validate_browser_tabs_params, validate_browser_wait_for_function_params,
-        validate_browser_wait_for_load_state_params, validate_browser_wait_for_params,
-        validate_browser_wait_for_request_params, validate_browser_wait_for_response_params,
-        validate_browser_wait_for_selector_params, validate_browser_wait_for_url_params,
-        validate_cdp_navigation_url, validate_screenshot_capture_facade_params,
-        validate_screenshot_gif_facade_params, validate_target_adopt_params,
-        validate_target_get_params, validate_target_set_params, validate_target_status_params,
-        validate_target_window,
+        chrome_page_vitals_info, downscale_captured_bitmap, format_chromium_window_candidates,
+        hidden_desktop_pip_ended_response, hidden_worker_target_miss, mcp_error, ocr_cache_key,
+        page_text_info_from_parts, perception_window_hwnd, resolve_browser_tag_source,
+        resolve_capture_target_window_context, screenshot_downscale_scale,
+        select_single_active_browser_tab, sha256_hex, target_claim_param_from_set, target_wire,
+        template_value, unavailable_page_vitals_info, validate_browser_add_init_script_params,
+        validate_browser_add_script_tag_params, validate_browser_add_style_tag_params,
+        validate_browser_downloads_params, validate_browser_evaluate_params,
+        validate_browser_expose_binding_params, validate_browser_frame_locator,
+        validate_browser_nav_params, validate_browser_screenshot_params,
+        validate_browser_set_content_params, validate_browser_tabs_params,
+        validate_browser_wait_for_function_params, validate_browser_wait_for_load_state_params,
+        validate_browser_wait_for_params, validate_browser_wait_for_request_params,
+        validate_browser_wait_for_response_params, validate_browser_wait_for_selector_params,
+        validate_browser_wait_for_url_params, validate_cdp_navigation_url,
+        validate_screenshot_capture_facade_params, validate_screenshot_gif_facade_params,
+        validate_target_adopt_params, validate_target_get_params, validate_target_set_params,
+        validate_target_status_params, validate_target_window,
     };
     use crate::m1::{
         BrowserAddInitScriptParams, BrowserAddScriptTagParams, BrowserAddStyleTagParams,
@@ -18384,174 +18407,6 @@ mod tests {
                 .contains("browser_screenshot max_long_edge must be greater than zero"),
             "unexpected max_long_edge error: {}",
             max_long_edge_err.message
-        );
-    }
-
-    #[test]
-    fn browser_screenshot_fallback_metadata_preserves_best_readbacks() {
-        let mut metadata = BrowserScreenshotFallbackMetadata::new("chrome-tab:222");
-        let owner = CdpTargetOwner {
-            session_id: "session-1".to_owned(),
-            window_hwnd: 0x1234,
-            endpoint: "chrome-extension://synapse/chrome.tabs".to_owned(),
-            chrome_window_id: Some(10),
-            capture_window_hwnd: Some(0x1234),
-            cdp_target_id: "chrome-tab:222".to_owned(),
-            requested_url: "http://example.test/requested".to_owned(),
-            target_url: "http://example.test/owner".to_owned(),
-            created_at_unix_ms: 1,
-        };
-        metadata.apply_owner(&owner);
-        assert_eq!(metadata.url, "http://example.test/owner");
-        assert_eq!(metadata.chrome_window_id, Some(10));
-
-        metadata.apply_tab_target(
-            &crate::chrome_debugger_bridge::ChromeDebuggerTabTarget {
-                target_id: "chrome-tab:999".to_owned(),
-                tab_id: 999,
-                chrome_window_id: Some(99),
-                index: 0,
-                target_type: "page".to_owned(),
-                url: "http://example.test/wrong".to_owned(),
-                title: "Wrong Target".to_owned(),
-                ready_state: "complete".to_owned(),
-                active: false,
-                highlighted: false,
-                pinned: false,
-                target_attached: false,
-            },
-            "wrong_target",
-        );
-        assert_eq!(metadata.url, "http://example.test/owner");
-        assert_eq!(
-            metadata.source().as_deref(),
-            Some("session_cdp_target_owner")
-        );
-
-        metadata.apply_tab_target(
-            &crate::chrome_debugger_bridge::ChromeDebuggerTabTarget {
-                target_id: "chrome-tab:222".to_owned(),
-                tab_id: 222,
-                chrome_window_id: Some(20),
-                index: 1,
-                target_type: "page".to_owned(),
-                url: "http://example.test/list-tabs".to_owned(),
-                title: "List Tabs Title".to_owned(),
-                ready_state: "complete".to_owned(),
-                active: false,
-                highlighted: false,
-                pinned: false,
-                target_attached: false,
-            },
-            "chrome.tabs.query_pre_capture",
-        );
-        assert_eq!(metadata.tab_id, Some(222));
-        assert_eq!(metadata.chrome_window_id, Some(20));
-        assert_eq!(metadata.url, "http://example.test/list-tabs");
-        assert_eq!(metadata.title, "List Tabs Title");
-
-        metadata.apply_page_vitals(
-            &crate::chrome_debugger_bridge::ChromeDebuggerPageVitalsResult {
-                extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-                target_id: "chrome-tab:222".to_owned(),
-                tab_id: 222,
-                chrome_window_id: Some(30),
-                url: "http://example.test/page-vitals".to_owned(),
-                title: "Page Vitals Title".to_owned(),
-                ready_state: "complete".to_owned(),
-                viewport: Some(
-                    crate::chrome_debugger_bridge::ChromeDebuggerViewportReadback {
-                        inner_width: 1200,
-                        inner_height: 800,
-                        device_pixel_ratio: 1.5,
-                        screen_width: 2560,
-                        screen_height: 1440,
-                        outer_width: 1300,
-                        outer_height: 900,
-                        scroll_width: 1210,
-                        scroll_height: 4000,
-                        visual_viewport_width: None,
-                        visual_viewport_height: None,
-                    },
-                ),
-                viewport_error_detail: None,
-                page_vitals: crate::chrome_debugger_bridge::ChromeDebuggerPageVitals::default(),
-                readback_backend: "pageVitals".to_owned(),
-                target_candidate_count: 1,
-                target_selection_reason: "target_id".to_owned(),
-            },
-        );
-        assert_eq!(metadata.chrome_window_id, Some(30));
-        assert_eq!(metadata.url, "http://example.test/page-vitals");
-        assert_eq!(metadata.title, "Page Vitals Title");
-        assert_eq!(metadata.device_pixel_ratio, Some(1.5));
-        assert_eq!(metadata.viewport_width_css, Some(1200.0));
-        assert_eq!(metadata.viewport_height_css, Some(800.0));
-        assert_eq!(metadata.scroll_width_css, Some(1210.0));
-        assert_eq!(metadata.scroll_height_css, Some(4000.0));
-
-        metadata.apply_page_vitals(
-            &crate::chrome_debugger_bridge::ChromeDebuggerPageVitalsResult {
-                extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-                target_id: "chrome-tab:222".to_owned(),
-                tab_id: 222,
-                chrome_window_id: Some(31),
-                url: String::new(),
-                title: String::new(),
-                ready_state: "complete".to_owned(),
-                viewport: Some(
-                    crate::chrome_debugger_bridge::ChromeDebuggerViewportReadback {
-                        inner_width: 0,
-                        inner_height: -1,
-                        device_pixel_ratio: f64::NAN,
-                        screen_width: 2560,
-                        screen_height: 1440,
-                        outer_width: 1300,
-                        outer_height: 900,
-                        scroll_width: i64::from(u32::MAX) + 1,
-                        scroll_height: 0,
-                        visual_viewport_width: None,
-                        visual_viewport_height: None,
-                    },
-                ),
-                viewport_error_detail: Some("synthetic invalid viewport".to_owned()),
-                page_vitals: crate::chrome_debugger_bridge::ChromeDebuggerPageVitals::default(),
-                readback_backend: "pageVitals".to_owned(),
-                target_candidate_count: 1,
-                target_selection_reason: "target_id".to_owned(),
-            },
-        );
-        assert_eq!(metadata.device_pixel_ratio, Some(1.5));
-        assert_eq!(metadata.viewport_width_css, Some(1200.0));
-        assert_eq!(metadata.viewport_height_css, Some(800.0));
-        assert_eq!(metadata.scroll_width_css, Some(1210.0));
-        assert_eq!(metadata.scroll_height_css, Some(4000.0));
-
-        metadata.apply_activate_result(
-            &crate::chrome_debugger_bridge::ChromeDebuggerActivateTabResult {
-                target_id: "chrome-tab:222".to_owned(),
-                tab_id: 222,
-                chrome_window_id: Some(40),
-                before_active: Some(false),
-                active: true,
-                highlighted: Some(true),
-                url: "http://example.test/activated".to_owned(),
-                title: "Activated Title".to_owned(),
-                ready_state: "complete".to_owned(),
-                readback_backend: "activateTab".to_owned(),
-                target_candidate_count: 1,
-                target_selection_reason: "target_id".to_owned(),
-                extension_id: Some("leoocgnkjnplbfdbklajepahofecgfbk".to_owned()),
-            },
-        );
-        assert_eq!(metadata.chrome_window_id, Some(40));
-        assert_eq!(metadata.url, "http://example.test/activated");
-        assert_eq!(metadata.title, "Activated Title");
-        assert_eq!(
-            metadata.source().as_deref(),
-            Some(
-                "session_cdp_target_owner+chrome.tabs.query_pre_capture+chrome.tabs.get_pageVitals_pre_capture+chrome.tabs.update_activateTab_fallback_readback"
-            )
         );
     }
 
@@ -19665,6 +19520,116 @@ mod tests {
             pinned: false,
             target_attached: false,
         }
+    }
+
+    fn foreground_context_for_test(
+        hwnd: i64,
+        pid: u32,
+        process_name: &str,
+        window_title: &str,
+        window_bounds: Rect,
+    ) -> ForegroundContext {
+        ForegroundContext {
+            hwnd,
+            pid,
+            process_name: process_name.to_owned(),
+            process_path: format!(r"C:\Program Files\{}\{}.exe", process_name, process_name),
+            window_title: window_title.to_owned(),
+            window_bounds,
+            monitor_index: 0,
+            dpi_scale: 1.0,
+            profile_id: None,
+            steam_appid: None,
+            is_fullscreen: false,
+            is_dwm_composed: true,
+        }
+    }
+
+    #[test]
+    fn browser_tab_window_title_matches_target_accepts_chrome_suffix() {
+        let mut target = browser_tab_for_test("chrome-tab:1518", true);
+        target.title = "Synapse Activate Target 1518".to_owned();
+
+        assert_eq!(
+            browser_tab_window_title_matches_target(
+                "Synapse Activate Target 1518 - Google Chrome",
+                &target,
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            browser_tab_window_title_matches_target("Synapse Activate Target 1518 report", &target,),
+            Some(true)
+        );
+        assert_eq!(
+            browser_tab_window_title_matches_target("Previous Job Page - Google Chrome", &target),
+            Some(false)
+        );
+
+        target.title.clear();
+        assert_eq!(
+            browser_tab_window_title_matches_target(
+                "Synapse Activate Target 1518 - Google Chrome",
+                &target,
+            ),
+            None
+        );
+
+        target.title = "redacted".to_owned();
+        assert_eq!(
+            browser_tab_window_title_matches_target(
+                "Synapse Activate Target 1518 - Google Chrome",
+                &target,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn browser_screenshot_bridge_disconnected_only_matches_direct_http_disconnects() {
+        let disconnected = mcp_error(
+            error_codes::ACTION_BACKEND_UNAVAILABLE,
+            "Chrome bridge host disconnected before command response; close frame 3001 synapse bridge reconnect cleanup",
+        );
+        let client_closed = mcp_error(
+            error_codes::ACTION_BACKEND_UNAVAILABLE,
+            "client closed direct HTTP WebSocket while waiting for pageScreenshot",
+        );
+        let ordinary_timeout = mcp_error(
+            error_codes::ACTION_BACKEND_UNAVAILABLE,
+            "captureVisibleTab timed out while waiting for Chrome",
+        );
+
+        assert!(browser_screenshot_bridge_disconnected(&disconnected));
+        assert!(browser_screenshot_bridge_disconnected(&client_closed));
+        assert!(!browser_screenshot_bridge_disconnected(&ordinary_timeout));
+    }
+
+    #[test]
+    fn format_chromium_window_candidates_includes_human_actionable_context() {
+        let candidates = vec![foreground_context_for_test(
+            0x1519,
+            4242,
+            "chrome.exe",
+            "Synapse Existing Chromium Window",
+            Rect {
+                x: 10,
+                y: 20,
+                w: 1280,
+                h: 720,
+            },
+        )];
+
+        let summary = format_chromium_window_candidates(&candidates);
+
+        assert!(summary.contains("hwnd=0x1519"), "{summary}");
+        assert!(summary.contains("pid=4242"), "{summary}");
+        assert!(summary.contains("process=\"chrome.exe\""), "{summary}");
+        assert!(
+            summary.contains("title=\"Synapse Existing Chromium Window\""),
+            "{summary}"
+        );
+        assert!(summary.contains("bounds=1280x720+10,20"), "{summary}");
     }
 
     #[test]

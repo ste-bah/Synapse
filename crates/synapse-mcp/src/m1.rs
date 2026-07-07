@@ -1255,6 +1255,30 @@ pub struct BrowserTabEntry {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct BrowserTabsActivationVisualReadback {
+    pub status: String,
+    pub source_of_truth: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_bitmap_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_bitmap_sha256: Option<String>,
+    pub before_bitmap_width: u32,
+    pub before_bitmap_height: u32,
+    pub after_bitmap_width: u32,
+    pub after_bitmap_height: u32,
+    pub visual_changed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_title_matched_window_title: Option<bool>,
+    pub attempts: u32,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BrowserTabsMutation {
     pub operation: BrowserTabsOperation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1277,6 +1301,8 @@ pub struct BrowserTabsMutation {
     pub active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub highlighted: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_visual_readback: Option<BrowserTabsActivationVisualReadback>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opened_cdp_target_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
