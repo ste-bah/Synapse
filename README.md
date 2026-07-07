@@ -110,7 +110,8 @@ person's time. What if something chased all of them for you?"* Install is light 
 runtime + Synapse, then you just prompt it), and you're in the door.
 
 > 🎓 Want to learn how to pitch and deploy Synapse for real businesses? Follow along on
-> **[YouTube @Leapableai](https://www.youtube.com/@Leapableai)** and join the community.
+> **[YouTube @Leapableai](https://www.youtube.com/@Leapableai)** and join the
+> **[Skool community](https://www.skool.com/calyx-5392)**.
 
 <br clear="all">
 
