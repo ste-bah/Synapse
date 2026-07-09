@@ -11,7 +11,10 @@
 //! availability. Tier-1-focused tests pre-mark `tier0_fired` to isolate the
 //! off-machine path.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use serde_json::{Value, json};
 use synapse_storage::{Db, cf, decode_json};
@@ -164,18 +167,31 @@ async fn spawn_webhook_listener() -> (
     String,
     tokio::sync::mpsc::UnboundedReceiver<ReceivedRequest>,
 ) {
+    spawn_webhook_listener_with_statuses(vec![200]).await
+}
+
+async fn spawn_webhook_listener_with_statuses(
+    statuses: Vec<u16>,
+) -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<ReceivedRequest>,
+) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
     let addr = listener.local_addr().expect("local addr");
     let url = format!("http://{addr}/hook");
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let statuses = Arc::new(statuses);
+    let request_index = Arc::new(AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _peer)) = listener.accept().await else {
                 break;
             };
             let tx = tx.clone();
+            let statuses = Arc::clone(&statuses);
+            let request_index = Arc::clone(&request_index);
             tokio::spawn(async move {
                 let mut buf = Vec::new();
                 let mut tmp = [0u8; 4096];
@@ -199,9 +215,27 @@ async fn spawn_webhook_listener() -> (
                         let body =
                             buf[body_start..(body_start + content_length).min(buf.len())].to_vec();
                         let _ = tx.send(ReceivedRequest { headers, body });
-                        let _ = socket
-                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-                            .await;
+                        let index = request_index.fetch_add(1, Ordering::SeqCst);
+                        let status = statuses
+                            .get(index)
+                            .or_else(|| statuses.last())
+                            .copied()
+                            .unwrap_or(200);
+                        let reason = if (200..300).contains(&status) {
+                            "OK"
+                        } else {
+                            "FAIL"
+                        };
+                        let body = if (200..300).contains(&status) {
+                            "ok"
+                        } else {
+                            "err"
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
                         return;
                     }
                 }
@@ -783,8 +817,125 @@ async fn tier1_webhook_delivers_signed_packet() {
     assert_eq!(item.ladder_index, 1);
     assert_eq!(item.channel_attempts.len(), 1);
     assert!(item.channel_attempts[0].ok);
+    assert_eq!(item.channel_attempts[0].ladder_index, 0);
+    assert_eq!(item.channel_attempts[0].attempt_number, 1);
     assert_eq!(item.channel_attempts[0].http_status, Some(200));
     assert!(item.channel_attempts[0].signed);
+}
+
+#[tokio::test]
+async fn tier1_webhook_failure_retries_same_rung_before_advancing() {
+    let db = db();
+    let (url, mut rx) = spawn_webhook_listener_with_statuses(vec![500, 200]).await;
+    let window = 1_000;
+    let policy = EscalationPolicy {
+        webhooks: vec![WebhookChannel {
+            name: "ntfy".to_owned(),
+            url: url.clone(),
+            secret: None,
+        }],
+        min_tier1_severity: Severity::Medium,
+        ack_window_ms: window,
+        updated_at_unix_ms: 1,
+        ..EscalationPolicy::default()
+    };
+    store_policy(&db, &policy).expect("store policy");
+
+    let t0 = 1_000_000;
+    note_transition(
+        &db,
+        &transition("agent-r", AgentLifecycleState::NeedsInput),
+        t0,
+    );
+    let id = only_open(&db, "agent-r").escalation_id;
+    mark_tier0_fired(&db, &id, t0);
+
+    let report = process_pending(&db, t0).await.expect("sweep failure");
+    assert_eq!(report.tier1_failed, 1);
+    let first = recv_request(&mut rx).await;
+    let first_payload: Value = serde_json::from_slice(&first.body).expect("json body");
+    assert_eq!(first_payload["ladder_index"], json!(0));
+    let item = read_item(&db, &id).unwrap().unwrap();
+    assert_eq!(item.ladder_index, 0, "failed rung must not advance");
+    assert_eq!(item.next_escalate_at_unix_ms, Some(t0 + window));
+    assert_eq!(item.channel_attempts.len(), 1);
+    assert!(!item.channel_attempts[0].ok);
+    assert_eq!(item.channel_attempts[0].http_status, Some(500));
+    assert_eq!(item.channel_attempts[0].ladder_index, 0);
+    assert_eq!(item.channel_attempts[0].attempt_number, 1);
+
+    let report = process_pending(&db, t0 + window)
+        .await
+        .expect("sweep retry");
+    assert_eq!(report.tier1_fired, 1);
+    let second = recv_request(&mut rx).await;
+    let second_payload: Value = serde_json::from_slice(&second.body).expect("json body");
+    assert_eq!(
+        second_payload["ladder_index"],
+        json!(0),
+        "retry must post the same rung"
+    );
+    let item = read_item(&db, &id).unwrap().unwrap();
+    assert_eq!(item.ladder_index, 1, "successful retry advances");
+    assert_eq!(item.next_escalate_at_unix_ms, None);
+    assert_eq!(item.channel_attempts.len(), 2);
+    assert!(item.channel_attempts[1].ok);
+    assert_eq!(item.channel_attempts[1].http_status, Some(200));
+    assert_eq!(item.channel_attempts[1].ladder_index, 0);
+    assert_eq!(item.channel_attempts[1].attempt_number, 2);
+}
+
+#[tokio::test]
+async fn tier1_webhook_failure_exhausts_bounded_retries() {
+    let db = db();
+    let (url, mut rx) = spawn_webhook_listener_with_statuses(vec![500]).await;
+    let window = 1_000;
+    let policy = EscalationPolicy {
+        webhooks: vec![WebhookChannel {
+            name: "ntfy".to_owned(),
+            url: url.clone(),
+            secret: None,
+        }],
+        min_tier1_severity: Severity::Medium,
+        ack_window_ms: window,
+        updated_at_unix_ms: 1,
+        ..EscalationPolicy::default()
+    };
+    store_policy(&db, &policy).expect("store policy");
+
+    let t0 = 2_000_000;
+    note_transition(
+        &db,
+        &transition("agent-s", AgentLifecycleState::NeedsInput),
+        t0,
+    );
+    let id = only_open(&db, "agent-s").escalation_id;
+    mark_tier0_fired(&db, &id, t0);
+
+    for attempt_number in 1..=WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL {
+        let now = t0 + u64::from(attempt_number - 1) * window;
+        let report = process_pending(&db, now)
+            .await
+            .unwrap_or_else(|error| panic!("sweep attempt {attempt_number}: {error}"));
+        assert_eq!(report.tier1_failed, 1);
+        let _request = recv_request(&mut rx).await;
+        let item = read_item(&db, &id).unwrap().unwrap();
+        assert_eq!(item.channel_attempts.len(), attempt_number as usize);
+        assert_eq!(
+            item.channel_attempts
+                .last()
+                .expect("attempt")
+                .attempt_number,
+            attempt_number
+        );
+        if attempt_number < WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL {
+            assert_eq!(item.ladder_index, 0);
+            assert_eq!(item.next_escalate_at_unix_ms, Some(now + window));
+        } else {
+            assert_eq!(item.ladder_index, 1);
+            assert_eq!(item.next_escalate_at_unix_ms, None);
+        }
+    }
 }
 
 #[tokio::test]

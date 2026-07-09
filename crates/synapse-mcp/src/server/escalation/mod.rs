@@ -89,6 +89,9 @@ const MAX_URL_CHARS: usize = 2_048;
 const MAX_NAME_CHARS: usize = 64;
 const MAX_SECRET_CHARS: usize = 512;
 const WEBHOOK_TIMEOUT_MS: u64 = 15_000;
+const WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL: u32 = 3;
+const WEBHOOK_RETRY_BASE_BACKOFF_MS: u64 = 30_000;
+const WEBHOOK_RETRY_MAX_BACKOFF_MS: u64 = DEFAULT_ACK_WINDOW_MS;
 const WORKER_TICK_MS: u64 = 1_000;
 const AMBIENT_SILENT_TIMEOUT_SUPPRESSED: &str = "ambient_unprobeable_silent_timeout";
 
@@ -313,6 +316,10 @@ pub(crate) struct EscalationContext {
 pub(crate) struct ChannelAttempt {
     pub channel_name: String,
     pub url_host: String,
+    #[serde(default)]
+    pub ladder_index: u32,
+    #[serde(default)]
+    pub attempt_number: u32,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
@@ -1513,28 +1520,47 @@ pub(crate) async fn process_pending(
             let policy = load_policy(db)?;
             let index = item.ladder_index as usize;
             if let Some(channel) = policy.webhooks.get(index).cloned() {
-                let attempt = deliver_webhook(&channel, &item, now_unix_ms).await;
+                let ladder_index = item.ladder_index;
+                let attempt_number = next_channel_attempt_number(&item, ladder_index);
+                let attempt =
+                    deliver_webhook(&channel, &item, ladder_index, attempt_number, now_unix_ms)
+                        .await;
                 if attempt.ok {
                     report.tier1_fired += 1;
                 } else {
                     report.tier1_failed += 1;
                 }
+                let policy_window_ms = policy.window_for(item.severity);
+                let retry_backoff_ms = (!attempt.ok
+                    && attempt_number < WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL)
+                    .then(|| webhook_retry_backoff_ms(attempt_number, policy_window_ms));
+                let retry_exhausted = !attempt.ok && retry_backoff_ms.is_none();
                 let event_detail = json!({
                     "channel_name": attempt.channel_name,
+                    "ladder_index": ladder_index,
+                    "attempt_number": attempt_number,
+                    "max_attempts_per_channel": WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL,
                     "ok": attempt.ok,
                     "http_status": attempt.http_status,
                     "error": attempt.error,
+                    "retry_backoff_ms": retry_backoff_ms,
+                    "retry_exhausted": retry_exhausted,
                 });
                 item.channel_attempts.push(attempt);
-                item.ladder_index += 1;
+                if item
+                    .channel_attempts
+                    .last()
+                    .is_some_and(|attempt| attempt.ok || retry_exhausted)
+                {
+                    item.ladder_index += 1;
+                }
                 item.updated_at_unix_ms = now_unix_ms;
-                // Schedule the next ladder channel only if one remains.
-                item.next_escalate_at_unix_ms =
-                    if (item.ladder_index as usize) < policy.webhooks.len() {
-                        Some(now_unix_ms.saturating_add(policy.window_for(item.severity)))
-                    } else {
-                        None
-                    };
+                item.next_escalate_at_unix_ms = retry_backoff_ms
+                    .map(|backoff| now_unix_ms.saturating_add(backoff))
+                    .or_else(|| {
+                        ((item.ladder_index as usize) < policy.webhooks.len())
+                            .then_some(now_unix_ms.saturating_add(policy_window_ms))
+                    });
                 write_item_and_audit(db, &item, "tier1_channel_attempt", event_detail)?;
                 dirty = false;
             } else {
@@ -1656,6 +1682,8 @@ fn escalation_toast_tag(escalation_id: &str) -> String {
 async fn deliver_webhook(
     channel: &WebhookChannel,
     item: &EscalationItem,
+    ladder_index: u32,
+    attempt_number: u32,
     now_unix_ms: u64,
 ) -> ChannelAttempt {
     let url_host = reqwest::Url::parse(&channel.url)
@@ -1665,6 +1693,8 @@ async fn deliver_webhook(
     let mut attempt = ChannelAttempt {
         channel_name: channel.name.clone(),
         url_host,
+        ladder_index,
+        attempt_number,
         ok: false,
         http_status: None,
         error: None,
@@ -1711,6 +1741,28 @@ async fn deliver_webhook(
         }
     }
     attempt
+}
+
+fn next_channel_attempt_number(item: &EscalationItem, ladder_index: u32) -> u32 {
+    let previous = item
+        .channel_attempts
+        .iter()
+        .filter(|attempt| attempt.ladder_index == ladder_index)
+        .count();
+    u32::try_from(previous)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
+}
+
+fn webhook_retry_backoff_ms(attempt_number: u32, policy_window_ms: u64) -> u64 {
+    let capped_exponent = attempt_number.saturating_sub(1).min(4);
+    let multiplier = 1_u64 << capped_exponent;
+    let base = WEBHOOK_RETRY_BASE_BACKOFF_MS
+        .min(policy_window_ms)
+        .max(WORKER_TICK_MS);
+    base.saturating_mul(multiplier)
+        .min(WEBHOOK_RETRY_MAX_BACKOFF_MS)
+        .min(policy_window_ms)
 }
 
 fn webhook_payload(channel: &WebhookChannel, item: &EscalationItem) -> Value {
