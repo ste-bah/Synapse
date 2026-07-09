@@ -231,7 +231,7 @@ Thresholds (`PressureThresholds`, defaults; `GB = 1e9`, `MB = 1e6`):
 | Level3 | all **except** the rebuildable/cache set: `CF_OBSERVATIONS`, `CF_OCR_CACHE`, `CF_TELEMETRY`, `CF_MODEL_CACHE`, `CF_PROCESS_HISTORY`, `CF_TIMELINE`, `CF_EPISODES`, `CF_ROUTINES`, `CF_AGENT_TRANSCRIPTS` |
 | Level4 | **only** `CF_REFLEX_AUDIT` and `CF_SESSIONS` |
 
-`CF_AGENT_EVENTS` stays writable even at Level3 (control-plane audit journal). When a write is shed, `put_batch` increments `storage_writes_shed_total` (label `cf`), logs `STORAGE_WRITE_FAILED`, and returns `Ok(())` (shedding is policy, not error). Deletes are always allowed under pressure.
+`CF_AGENT_EVENTS` stays writable even at Level3 (control-plane audit journal). When a write is shed, `put_batch` increments `storage_writes_shed_total` (label `cf`), logs `STORAGE_WRITE_FAILED`, and returns `StorageError::WriteShed`. Deletes are always allowed under pressure.
 
 `PressureState`: `level: AtomicU8`, `emitted_codes: Mutex<Vec<&str>>`. API on `Db`: `pressure_level()`, `pressure_permits_write(cf)`, `pressure_transition_codes()`, `run_pressure_check_once()`, `run_pressure_check_with_free_bytes_sample(free_bytes)` (test), `spawn_pressure_task()`. `PressureReport` fields: `free_bytes`, `previous_level`, `current_level`, `emitted_code`, `compacted_cfs`, `gc_advised`. Disk probing is abstracted behind the `DiskProbe` trait (`Fs2DiskProbe` in production, `SequenceDiskProbe` for tests). `PressureTask` aborts on drop.
 
@@ -291,7 +291,7 @@ Record: `EpisodeRecord` (`crates/synapse-core/src/types/episode.rs`), `EPISODE_R
 
 ### 6.3 Agent events — `CF_AGENT_EVENTS`
 
-Key codec: `crates/synapse-storage/src/agent_events.rs`. `AGENT_EVENT_KEY_LEN = 12`. Key = `ts_ns (8 BE) ‖ seq (4 BE)`; `seq` is a process-wide monotonic counter (ordering authority within a tick). `agent_event_key`, `agent_event_scan_start`, `decode_agent_event_key` (`AGENT_EVENT_KEY_INVALID`). Append-only; rides the batcher (flushed every 100 ms / 64 KiB); terminal-state writers call `Db::flush()`.
+Key codec: `crates/synapse-storage/src/agent_events.rs`. `AGENT_EVENT_KEY_LEN = 12`. Key = `ts_ns (8 BE) ‖ seq (4 BE)`; `seq` is a process-wide monotonic counter (ordering authority within a tick). `agent_event_key`, `agent_event_scan_start`, `decode_agent_event_key` (`AGENT_EVENT_KEY_INVALID`). Append-only; `Db::put_batch` returns after a synced WAL write; terminal-state writers call `Db::flush()`.
 
 Record: `AgentEventRecord` (`crates/synapse-core/src/types/agent_event.rs`), `AGENT_EVENT_RECORD_VERSION = 1`. Bounds: `AGENT_EVENT_MAX_ID_CHARS = 512`, `AGENT_EVENT_MAX_REASON_CHARS = 128`.
 
@@ -414,15 +414,15 @@ Writes are aggregated through a single background `Batcher` thread (spawned in `
 
 | Method | Path | Pressure gate | Behavior |
 |---|---|---|---|
-| `put_batch(cf, kvs)` | batcher | yes (sheds per §5.3) | enqueues to batcher; empty input is a no-op |
+| `put_batch(cf, kvs)` | batcher | yes (returns `WriteShed` per §5.3) | writes the submitted batch with synced WAL before returning; empty input is a no-op |
 | `put_batch_pressure_bypass(cf, kvs)` | direct | **no** | synchronous `WriteBatch` + `flush_cf`; reserved for maintenance rewrites |
 | `mutate_batch_pressure_bypass(cf, deletes, puts)` | direct | no | atomic deletes-then-puts + `flush_cf`; for coordination state with no release gap |
 | `delete_batch(cf, keys)` | direct | n/a (always allowed) | `WriteBatch` deletes + `flush_cf` |
-| `flush()` | batcher | — | synchronous flush of pending batch |
+| `flush()` | batcher | - | synchronous WAL flush |
 
-All paths first resolve the CF handle and return `StorageError::WriteFailed` if it is missing.
+All paths first resolve the CF handle and return `StorageError::WriteFailed` if it is missing. Pressure-gated `put_batch` returns `StorageError::WriteShed` when policy rejects rows, so callers can surface or retry recording gaps.
 
-Batcher mechanics: constants `FLUSH_INTERVAL = 100 ms`, `FLUSH_BYTES = 64 * 1024` (64 KiB). The worker holds a `PendingBatch { writes, bytes, first_write_at }`. On a `Write` command it enqueues, and flushes (async, `sync=false`) when `pending.bytes >= FLUSH_BYTES`. Otherwise `receive_next` waits up to `FLUSH_INTERVAL - elapsed` since the first pending write; a `RecvTimeoutError::Timeout` triggers a non-sync flush. `Flush` and `Shutdown` commands flush with `sync=true`. `flush_pending` builds a `WriteBatch` of `put_cf` ops, calls `write_opt` with `WriteOptions::set_sync(sync)`, and on `sync` also `flush_wal(true)`. On `Drop`, the batcher sends `Shutdown`, waits up to `2 * FLUSH_INTERVAL`, and joins the worker. Commands are `Write`/`Flush`/`Shutdown`, each replying over a `sync_channel(1)`.
+Batcher mechanics: the worker accepts `Write`/`Flush`/`Shutdown` commands over a `sync_channel(1)`. A `Write` command builds one `WriteBatch`, calls `write_opt` with `WriteOptions::set_sync(true)`, calls `flush_wal(true)`, and only then replies to the caller. `Flush` and `Shutdown` call `flush_wal(true)`. On `Drop`, the batcher sends `Shutdown`, waits up to `2 * FLUSH_INTERVAL`, and joins the worker.
 
 ---
 
@@ -436,6 +436,7 @@ Batcher mechanics: constants `FLUSH_INTERVAL = 100 ms`, `FLUSH_BYTES = 64 * 1024
 | `EncodeJson` | `type_name: &'static str`, `source: serde_json::Error` | `STORAGE_WRITE_FAILED` |
 | `DecodeJson` | `type_name: &'static str`, `source: serde_json::Error` | `STORAGE_READ_FAILED` |
 | `WriteFailed` | `cf_name: String`, `detail: String` | `STORAGE_WRITE_FAILED` |
+| `WriteShed` | `cf_name: String`, `pressure_level: String`, `rows: usize` | `STORAGE_WRITE_FAILED` |
 | `ReadFailed` | `cf_name: String`, `detail: String` | `STORAGE_READ_FAILED` |
 | `SchemaMismatch` | `expected: u32`, `actual: u32` | `STORAGE_SCHEMA_MISMATCH` |
 

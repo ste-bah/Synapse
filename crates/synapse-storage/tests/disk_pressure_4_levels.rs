@@ -1,11 +1,12 @@
 use std::error::Error;
 
 use synapse_core::error_codes;
-use synapse_storage::{Db, DiskPressureLevel, cf};
+use synapse_storage::{Db, DiskPressureLevel, StorageError, StorageResult, cf};
 
 const TEST_SCHEMA_VERSION: u32 = 7;
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn disk_pressure_transitions_writes_and_restart() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let path = temp.path().join("db");
@@ -53,7 +54,12 @@ fn disk_pressure_transitions_writes_and_restart() -> Result<(), Box<dyn Error>> 
         assert_eq!(report.emitted_code, expected_code);
     }
 
-    db.put_batch(cf::CF_OBSERVATIONS, row("obs-l3"))?;
+    assert_write_shed(
+        db.put_batch(cf::CF_OBSERVATIONS, row("obs-l3")),
+        cf::CF_OBSERVATIONS,
+        DiskPressureLevel::Level3,
+        1,
+    );
     db.put_batch(cf::CF_EVENTS, row("event-l3"))?;
     db.flush()?;
     let l3_observations = db.scan_cf(cf::CF_OBSERVATIONS)?;
@@ -68,8 +74,18 @@ fn disk_pressure_transitions_writes_and_restart() -> Result<(), Box<dyn Error>> 
     assert_eq!(l3_events.len(), 1);
 
     db.run_pressure_check_with_free_bytes_sample(100_000_000)?;
-    db.put_batch(cf::CF_OBSERVATIONS, row("obs-l4"))?;
-    db.put_batch(cf::CF_EVENTS, row("event-l4"))?;
+    assert_write_shed(
+        db.put_batch(cf::CF_OBSERVATIONS, row("obs-l4")),
+        cf::CF_OBSERVATIONS,
+        DiskPressureLevel::Level4,
+        1,
+    );
+    assert_write_shed(
+        db.put_batch(cf::CF_EVENTS, row("event-l4")),
+        cf::CF_EVENTS,
+        DiskPressureLevel::Level4,
+        1,
+    );
     db.put_batch(cf::CF_REFLEX_AUDIT, row("audit-l4"))?;
     db.put_batch(cf::CF_SESSIONS, row("session-l4"))?;
     db.flush()?;
@@ -111,6 +127,26 @@ fn row(label: &'static str) -> Vec<(Vec<u8>, Vec<u8>)> {
         label.as_bytes().to_vec(),
         format!(r#"{{"label":"{label}"}}"#).into_bytes(),
     )]
+}
+
+fn assert_write_shed(
+    result: StorageResult<()>,
+    expected_cf: &str,
+    expected_level: DiskPressureLevel,
+    expected_rows: usize,
+) {
+    match result {
+        Err(StorageError::WriteShed {
+            cf_name,
+            pressure_level,
+            rows,
+        }) => {
+            assert_eq!(cf_name, expected_cf);
+            assert_eq!(pressure_level, format!("{expected_level:?}"));
+            assert_eq!(rows, expected_rows);
+        }
+        other => panic!("expected WriteShed for {expected_cf}, got {other:?}"),
+    }
 }
 
 fn printable_keys(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<String> {

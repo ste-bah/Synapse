@@ -41,7 +41,7 @@ fn batch_explicit_flush_round_trips_bytes() -> Result<(), Box<dyn Error>> {
 }
 
 #[test]
-fn batch_timer_flushes_after_interval() -> Result<(), Box<dyn Error>> {
+fn batch_put_is_readable_before_explicit_flush() -> Result<(), Box<dyn Error>> {
     let temp = tempfile::tempdir()?;
     let db = Db::open(&temp.path().join("db"), TEST_SCHEMA_VERSION)?;
     let expected = vec![(b"timer-01".to_vec(), b"x".to_vec())];
@@ -49,18 +49,20 @@ fn batch_timer_flushes_after_interval() -> Result<(), Box<dyn Error>> {
     db.put_batch(cf::CF_ACTION_LOG, expected.clone())?;
     let before = db.scan_cf(cf::CF_ACTION_LOG)?;
     println!(
-        "regression_state=cf_scan case=timer before_count={} before_bytes={}",
+        "regression_state=cf_scan case=durable_put before_flush_count={} before_flush_bytes={} observed={:?}",
         before.len(),
-        total_value_bytes(&before)
+        total_value_bytes(&before),
+        printable_rows(&before)
     );
-    std::thread::sleep(batch::FLUSH_INTERVAL.saturating_mul(2));
+    db.flush()?;
     let after = db.scan_cf(cf::CF_ACTION_LOG)?;
     println!(
-        "regression_state=cf_scan case=timer after_count={} after_bytes={} observed={:?}",
+        "regression_state=cf_scan case=durable_put after_flush_count={} after_flush_bytes={} observed={:?}",
         after.len(),
         total_value_bytes(&after),
         printable_rows(&after)
     );
+    assert_eq!(sorted_rows(before), sorted_rows(expected.clone()));
     assert_eq!(sorted_rows(after), sorted_rows(expected));
     Ok(())
 }

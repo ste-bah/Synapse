@@ -147,6 +147,8 @@ impl Db {
     ///
     /// Returns [`StorageError::WriteFailed`] when the column family is missing,
     /// the background batcher is unavailable, or `RocksDB` rejects the batch.
+    /// Returns [`StorageError::WriteShed`] when disk-pressure policy rejects
+    /// the write before it reaches `RocksDB`.
     #[tracing::instrument(skip_all, fields(cf_name))]
     pub fn put_batch<I, K, V>(&self, cf_name: &str, kvs: I) -> StorageResult<()>
     where
@@ -168,9 +170,11 @@ impl Db {
             return Ok(());
         }
         if !self.pressure.permits_write(cf_name) {
-            // Shedding is policy, not failure, but it must stay observable:
-            // consumers like the activity timeline mine continuity and need
-            // to detect recording gaps (ADR 2026-06-11-timeline-data-model).
+            // Consumers like the activity timeline mine continuity and need
+            // a returned failure to detect recording gaps (ADR
+            // 2026-06-11-timeline-data-model). Logs/metrics are only
+            // supporting signals.
+            let pressure_level = format!("{:?}", self.pressure.level());
             synapse_telemetry::metrics::counter!(
                 STORAGE_WRITES_SHED_TOTAL,
                 "cf" => cf_name.to_owned()
@@ -184,7 +188,11 @@ impl Db {
                 metric_name = STORAGE_WRITES_SHED_TOTAL,
                 "storage write dropped under disk pressure"
             );
-            return Ok(());
+            return Err(StorageError::WriteShed {
+                cf_name: cf_name.to_owned(),
+                pressure_level,
+                rows: kvs.len(),
+            });
         }
         self.batcher.put_batch(cf_name, kvs)
     }
@@ -344,7 +352,8 @@ impl Db {
             })
     }
 
-    /// Flushes pending batched writes with synchronous `RocksDB` write options.
+    /// Syncs the batcher WAL. `put_batch` already waits for each submitted
+    /// batch to reach `RocksDB` with a synced WAL before returning.
     ///
     /// # Errors
     ///

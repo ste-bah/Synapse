@@ -24,6 +24,12 @@ pub enum StorageError {
     },
     #[error("storage write failed in {cf_name}: {detail}")]
     WriteFailed { cf_name: String, detail: String },
+    #[error("storage write shed in {cf_name} under disk pressure {pressure_level}: {rows} rows")]
+    WriteShed {
+        cf_name: String,
+        pressure_level: String,
+        rows: usize,
+    },
     #[error("storage read failed in {cf_name}: {detail}")]
     ReadFailed { cf_name: String, detail: String },
     #[error("storage schema mismatch: expected {expected}, actual {actual}")]
@@ -36,7 +42,9 @@ impl StorageError {
     pub fn code(&self) -> &'static str {
         match self {
             Self::OpenFailed { .. } => error_codes::STORAGE_OPEN_FAILED,
-            Self::EncodeJson { .. } | Self::WriteFailed { .. } => error_codes::STORAGE_WRITE_FAILED,
+            Self::EncodeJson { .. } | Self::WriteFailed { .. } | Self::WriteShed { .. } => {
+                error_codes::STORAGE_WRITE_FAILED
+            }
             Self::DecodeJson { .. } | Self::ReadFailed { .. } => error_codes::STORAGE_READ_FAILED,
             Self::SchemaMismatch { .. } => error_codes::STORAGE_SCHEMA_MISMATCH,
         }

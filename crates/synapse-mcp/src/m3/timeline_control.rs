@@ -347,9 +347,8 @@ fn load_persisted(db: &Db) -> Result<PersistedControlState> {
 }
 
 /// Durable write of the control row: pressure bypass (pause/exclusion must
-/// work under disk pressure — they reduce retained state) plus an explicit
-/// flush, because the batcher acks `put_batch` on enqueue and a control row
-/// that evaporates on crash would silently resume recording.
+/// work under disk pressure because they reduce retained state) plus an
+/// explicit WAL sync at the coordination boundary.
 fn persist(db: &Db, state: &PersistedControlState) -> Result<()> {
     let encoded = serde_json::to_vec(state).context("encode timeline control row")?;
     db.put_batch_pressure_bypass(cf::CF_KV, [(TIMELINE_CONTROL_KEY.to_vec(), encoded)])

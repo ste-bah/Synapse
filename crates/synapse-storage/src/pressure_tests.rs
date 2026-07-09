@@ -99,9 +99,19 @@ fn disk_pressure_write_gating() -> Result<(), Box<dyn Error>> {
 
     pressure::run_once_with_free_bytes(&db.inner, &db.pressure, &config, 150)?;
     let before_observations = db.scan_cf(cf::CF_OBSERVATIONS)?;
-    db.put_batch(cf::CF_OBSERVATIONS, row("obs-l3"))?;
+    assert_write_shed(
+        db.put_batch(cf::CF_OBSERVATIONS, row("obs-l3")),
+        cf::CF_OBSERVATIONS,
+        DiskPressureLevel::Level3,
+        1,
+    );
     db.put_batch(cf::CF_EVENTS, row("event-l3"))?;
-    db.put_batch(cf::CF_TIMELINE, row("timeline-l3"))?;
+    assert_write_shed(
+        db.put_batch(cf::CF_TIMELINE, row("timeline-l3")),
+        cf::CF_TIMELINE,
+        DiskPressureLevel::Level3,
+        1,
+    );
     db.flush()?;
     let after_l3_observations = db.scan_cf(cf::CF_OBSERVATIONS)?;
     let after_l3_events = db.scan_cf(cf::CF_EVENTS)?;
@@ -125,11 +135,26 @@ fn disk_pressure_write_gating() -> Result<(), Box<dyn Error>> {
     );
 
     pressure::run_once_with_free_bytes(&db.inner, &db.pressure, &config, 50)?;
-    db.put_batch(cf::CF_OBSERVATIONS, row("obs-l4"))?;
-    db.put_batch(cf::CF_EVENTS, row("event-l4"))?;
+    assert_write_shed(
+        db.put_batch(cf::CF_OBSERVATIONS, row("obs-l4")),
+        cf::CF_OBSERVATIONS,
+        DiskPressureLevel::Level4,
+        1,
+    );
+    assert_write_shed(
+        db.put_batch(cf::CF_EVENTS, row("event-l4")),
+        cf::CF_EVENTS,
+        DiskPressureLevel::Level4,
+        1,
+    );
     db.put_batch(cf::CF_REFLEX_AUDIT, row("audit-l4"))?;
     db.put_batch(cf::CF_SESSIONS, row("session-l4"))?;
-    db.put_batch(cf::CF_TIMELINE, row("timeline-l4"))?;
+    assert_write_shed(
+        db.put_batch(cf::CF_TIMELINE, row("timeline-l4")),
+        cf::CF_TIMELINE,
+        DiskPressureLevel::Level4,
+        1,
+    );
     db.flush()?;
     let after_l4_observations = db.scan_cf(cf::CF_OBSERVATIONS)?;
     let after_l4_events = db.scan_cf(cf::CF_EVENTS)?;
@@ -195,6 +220,26 @@ fn row(label: &'static str) -> Vec<(Vec<u8>, Vec<u8>)> {
         label.as_bytes().to_vec(),
         format!(r#"{{"label":"{label}"}}"#).into_bytes(),
     )]
+}
+
+fn assert_write_shed(
+    result: StorageResult<()>,
+    expected_cf: &str,
+    expected_level: DiskPressureLevel,
+    expected_rows: usize,
+) {
+    match result {
+        Err(StorageError::WriteShed {
+            cf_name,
+            pressure_level,
+            rows,
+        }) => {
+            assert_eq!(cf_name, expected_cf);
+            assert_eq!(pressure_level, format!("{expected_level:?}"));
+            assert_eq!(rows, expected_rows);
+        }
+        other => panic!("expected WriteShed for {expected_cf}, got {other:?}"),
+    }
 }
 
 fn printable_keys(rows: &[(Vec<u8>, Vec<u8>)]) -> Vec<String> {

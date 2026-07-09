@@ -10,11 +10,10 @@
 //!
 //! # Durability contract (#897 acceptance)
 //!
-//! [`record_agent_event`] rides the storage batcher (`Db::put_batch`,
-//! flushed every 100 ms / 64 KiB): a daemon crash loses at most the
-//! in-flight batch. [`record_agent_event_durable`] additionally calls
-//! `Db::flush()` so terminal lifecycle facts (exited, spawn failure,
-//! session deleted) survive an immediate crash.
+//! [`record_agent_event`] uses `Db::put_batch`, which returns only after
+//! the row reaches RocksDB with a synced WAL. [`record_agent_event_durable`]
+//! additionally calls `Db::flush()` at terminal lifecycle boundaries
+//! (exited, spawn failure, session deleted).
 //!
 //! # Failure contract
 //!

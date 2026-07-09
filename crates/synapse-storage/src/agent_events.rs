@@ -9,11 +9,10 @@
 //! and decode keys through this module so a malformed key is a structured
 //! error, never a silent skip.
 //!
-//! Durability contract (#897 acceptance): journal rows ride the storage
-//! batcher (`Db::put_batch`, flushed every 100 ms / 64 KiB), so a daemon
-//! crash loses at most the in-flight batch. Writers of terminal lifecycle
-//! events (exited/killed/spawn failure) call `Db::flush()` afterwards so end
-//! states survive an immediate crash.
+//! Durability contract (#897 acceptance): journal rows use `Db::put_batch`,
+//! which returns only after the row reaches `RocksDB` with a synced WAL.
+//! Writers of terminal lifecycle events (exited/killed/spawn failure) also
+//! call `Db::flush()` at the lifecycle boundary.
 
 use crate::{StorageError, StorageResult, cf};
 

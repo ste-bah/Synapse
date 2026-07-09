@@ -20,7 +20,7 @@ fn open_all_cfs_and_restart_durability() -> Result<(), Box<dyn Error>> {
         let before = db.scan_cf(cf_name)?;
         db.put_batch(cf_name, row(cf_name))?;
         println!(
-            "regression_state=open_all_cfs cf={cf_name} before={} after=enqueued observed=key:{}",
+            "regression_state=open_all_cfs cf={cf_name} before={} after=written observed=key:{}",
             before.len(),
             key(cf_name)
         );

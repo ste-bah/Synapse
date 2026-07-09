@@ -16,7 +16,7 @@
 //! number, and parser state. Each cycle reads only bytes past the offset,
 //! consumes complete lines (a trailing partial line waits for the next
 //! cycle unless the source is being finalized), and advances the cursor
-//! only after the transcript rows are enqueued. Re-ingesting a line is
+//! only after the transcript rows are durable. Re-ingesting a line is
 //! idempotent: the same line always lands on the same key. A source file
 //! that shrinks below the cursor offset is a `TRANSCRIPT_SOURCE_TRUNCATED`
 //! sticky error — surfaced loudly, never silently re-read.

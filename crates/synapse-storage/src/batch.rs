@@ -1,11 +1,8 @@
 use std::{
-    sync::{
-        Arc, mpsc,
-        mpsc::{RecvTimeoutError, Sender},
-    },
+    sync::{Arc, mpsc, mpsc::Sender},
     thread,
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use rocksdb::{DB, WriteBatch, WriteOptions};
@@ -13,6 +10,7 @@ use rocksdb::{DB, WriteBatch, WriteOptions};
 use crate::{StorageError, StorageResult};
 
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+#[cfg(test)]
 pub const FLUSH_BYTES: usize = 64 * 1024;
 const STORAGE_WRITE_BATCH_FLUSHES_TOTAL: &str = "storage_write_batch_flushes_total";
 
@@ -86,36 +84,32 @@ struct Worker {
 
 impl Worker {
     fn run(self) {
-        let mut pending = PendingBatch::default();
         loop {
-            match receive_next(&self.receiver, &pending) {
+            match self.receiver.recv() {
                 Ok(Command::Write {
                     cf_name,
                     kvs,
                     reply,
                 }) => {
-                    enqueue(&mut pending, &cf_name, kvs);
-                    let result = if pending.bytes >= FLUSH_BYTES {
-                        flush_pending(&self.db, &mut pending, false, "bytes")
-                    } else {
-                        Ok(())
-                    };
+                    let result = write_batch(&self.db, &cf_name, kvs, "write");
                     let _ = reply.send(result);
                 }
                 Ok(Command::Flush { reply }) => {
-                    let result = flush_pending(&self.db, &mut pending, true, "explicit");
+                    let result = sync_wal(&self.db, "explicit");
                     let _ = reply.send(result);
                 }
                 Ok(Command::Shutdown { reply }) => {
-                    let result = flush_pending(&self.db, &mut pending, true, "shutdown");
+                    let result = sync_wal(&self.db, "shutdown");
                     let _ = reply.send(result);
                     break;
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    let _ = flush_pending(&self.db, &mut pending, false, "interval");
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    let _ = flush_pending(&self.db, &mut pending, true, "disconnected");
+                Err(_disconnected) => {
+                    if let Err(error) = sync_wal(&self.db, "disconnected") {
+                        tracing::warn!(
+                            error = %error,
+                            "storage batcher final WAL sync failed after command channel disconnected"
+                        );
+                    }
                     break;
                 }
             }
@@ -123,96 +117,41 @@ impl Worker {
     }
 }
 
-#[derive(Default)]
-struct PendingBatch {
-    writes: Vec<PendingWrite>,
-    bytes: usize,
-    first_write_at: Option<Instant>,
-}
-
-struct PendingWrite {
-    cf_name: String,
-    key: Vec<u8>,
-    value: Vec<u8>,
-}
-
-fn receive_next(
-    receiver: &mpsc::Receiver<Command>,
-    pending: &PendingBatch,
-) -> Result<Command, RecvTimeoutError> {
-    pending.first_write_at.map_or_else(
-        || {
-            receiver
-                .recv()
-                .map_err(|_error| RecvTimeoutError::Disconnected)
-        },
-        |first_write_at| {
-            receiver.recv_timeout(
-                FLUSH_INTERVAL
-                    .checked_sub(first_write_at.elapsed())
-                    .unwrap_or(Duration::ZERO),
-            )
-        },
-    )
-}
-
-fn enqueue(pending: &mut PendingBatch, cf_name: &str, kvs: Vec<(Vec<u8>, Vec<u8>)>) {
-    if kvs.is_empty() {
-        return;
-    }
-    if pending.first_write_at.is_none() {
-        pending.first_write_at = Some(Instant::now());
-    }
-    for (key, value) in kvs {
-        pending.bytes = pending
-            .bytes
-            .saturating_add(key.len())
-            .saturating_add(value.len());
-        pending.writes.push(PendingWrite {
-            cf_name: cf_name.to_owned(),
-            key,
-            value,
-        });
-    }
-}
-
-fn flush_pending(
+fn write_batch(
     db: &DB,
-    pending: &mut PendingBatch,
-    sync: bool,
+    cf_name: &str,
+    kvs: Vec<(Vec<u8>, Vec<u8>)>,
     trigger: &'static str,
 ) -> StorageResult<()> {
-    if pending.writes.is_empty() {
-        if sync {
-            db.flush_wal(true)
-                .map_err(|error| write_failed("batcher", error.to_string()))?;
-        }
-        return Ok(());
+    if kvs.is_empty() {
+        return sync_wal(db, trigger);
     }
 
+    let cf = db.cf_handle(cf_name).ok_or_else(|| {
+        write_failed(
+            cf_name,
+            "column family handle missing while writing batch".to_owned(),
+        )
+    })?;
     let mut batch = WriteBatch::default();
-    for write in &pending.writes {
-        let cf = db.cf_handle(&write.cf_name).ok_or_else(|| {
-            write_failed(
-                &write.cf_name,
-                "column family handle missing while flushing batch".to_owned(),
-            )
-        })?;
-        batch.put_cf(&cf, &write.key, &write.value);
+    for (key, value) in kvs {
+        batch.put_cf(&cf, key, value);
     }
 
     let mut options = WriteOptions::default();
-    options.set_sync(sync);
+    options.set_sync(true);
     db.write_opt(batch, &options)
-        .map_err(|error| write_failed("batcher", error.to_string()))?;
-    if sync {
-        db.flush_wal(true)
-            .map_err(|error| write_failed("batcher", error.to_string()))?;
-    }
+        .map_err(|error| write_failed(cf_name, error.to_string()))?;
+    db.flush_wal(true)
+        .map_err(|error| write_failed(cf_name, error.to_string()))?;
+    synapse_telemetry::metrics::counter!(STORAGE_WRITE_BATCH_FLUSHES_TOTAL, "trigger" => trigger)
+        .increment(1);
+    Ok(())
+}
 
-    pending.writes.clear();
-    pending.bytes = 0;
-    pending.first_write_at = None;
+fn sync_wal(db: &DB, trigger: &'static str) -> StorageResult<()> {
+    db.flush_wal(true)
+        .map_err(|error| write_failed("batcher", error.to_string()))?;
     synapse_telemetry::metrics::counter!(STORAGE_WRITE_BATCH_FLUSHES_TOTAL, "trigger" => trigger)
         .increment(1);
     Ok(())

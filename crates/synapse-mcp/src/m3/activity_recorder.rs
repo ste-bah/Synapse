@@ -190,10 +190,9 @@ impl TimelineWriter {
         Ok(())
     }
 
-    /// Forces pending batched writes to disk. The batcher acks `put_batch`
-    /// on enqueue and flushes on a 100 ms cadence, so anything that must be
-    /// durable *now* (session boundaries at shutdown) needs an explicit
-    /// flush — a return value alone does not prove the row is on disk.
+    /// Syncs the storage WAL. `put_batch` already returns only after the
+    /// row reaches RocksDB with a synced WAL; shutdown still performs an
+    /// explicit sync at session boundaries.
     fn flush_logged(&self) {
         if let Err(error) = self.db.flush() {
             tracing::error!(
@@ -1930,8 +1929,8 @@ impl ActivityRecorder {
                     }),
                 )
                 .context("write CF_TIMELINE session_start row at recorder startup")?;
-            // The batcher acks on enqueue; flush so a broken write path fails
-            // the daemon at startup instead of surfacing 100 ms later in a log.
+            // Keep startup fail-loud by forcing an explicit WAL sync after
+            // the initial session row is written.
             writer
                 .db
                 .flush()
