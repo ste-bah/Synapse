@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use synapse_core::{Action, ComboInput, Point};
 
 use crate::{ActionBackend, ActionError, EmitState, recovery};
@@ -104,7 +106,9 @@ impl ActionBackend for SoftwareBackend {
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_combo"))]
 fn combo(steps: &[synapse_core::ComboStep], state: &mut EmitState) -> Result<(), ActionError> {
+    let start = Instant::now();
     for step in steps {
+        sleep_until_combo_step(start, step.at_ms)?;
         match &step.input {
             ComboInput::KeyDown { key } => keyboard::key_down(key, state)?,
             ComboInput::KeyUp { key } => keyboard::key_up(key, state)?,
@@ -125,6 +129,25 @@ fn combo(steps: &[synapse_core::ComboStep], state: &mut EmitState) -> Result<(),
     Ok(())
 }
 
+fn sleep_until_combo_step(start: Instant, at_ms: u32) -> Result<(), ActionError> {
+    let elapsed_ms = elapsed_millis_u32(start.elapsed());
+    let delay_ms = combo_step_delay_ms(elapsed_ms, at_ms);
+    if utils::sleep_ms(delay_ms) {
+        return Err(ActionError::SafetyOperatorHotkeyFired {
+            detail: format!("operator release requested before combo step at_ms={at_ms}"),
+        });
+    }
+    Ok(())
+}
+
+const fn combo_step_delay_ms(elapsed_ms: u32, at_ms: u32) -> u32 {
+    at_ms.saturating_sub(elapsed_ms)
+}
+
+fn elapsed_millis_u32(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
 #[tracing::instrument(skip_all, fields(action_kind = "software_release_all"))]
 fn release_all(state: &mut EmitState) -> Result<(), ActionError> {
     let snapshot = state.snapshot();
@@ -139,4 +162,17 @@ fn release_all(state: &mut EmitState) -> Result<(), ActionError> {
     }
     state.release_all();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn combo_step_delay_honors_absolute_offsets() {
+        assert_eq!(combo_step_delay_ms(0, 150), 150);
+        assert_eq!(combo_step_delay_ms(40, 150), 110);
+        assert_eq!(combo_step_delay_ms(150, 150), 0);
+        assert_eq!(combo_step_delay_ms(200, 150), 0);
+    }
 }

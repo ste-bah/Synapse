@@ -7,7 +7,10 @@ use crate::{ActionBackend, ActionError, EmitState};
 
 #[cfg(all(unix, not(target_os = "macos")))]
 mod linux {
-    use std::{thread, time::Duration};
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
 
     use enigo::{
         Axis, Button as EnigoButton, Coordinate, Direction, Enigo, Key as EnigoKey, Keyboard,
@@ -292,7 +295,9 @@ mod linux {
     }
 
     fn combo(steps: &[synapse_core::ComboStep], state: &mut EmitState) -> Result<(), ActionError> {
+        let start = Instant::now();
         for step in steps {
+            sleep_until_combo_step(start, step.at_ms);
             match &step.input {
                 ComboInput::KeyDown { key } => key_down(key, state)?,
                 ComboInput::KeyUp { key } => key_up(key, state)?,
@@ -312,6 +317,12 @@ mod linux {
             }
         }
         Ok(())
+    }
+
+    fn sleep_until_combo_step(start: Instant, at_ms: u32) {
+        let elapsed_ms = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+        let delay_ms = at_ms.saturating_sub(elapsed_ms);
+        sleep_ms(delay_ms);
     }
 
     fn release_all(state: &mut EmitState) -> Result<(), ActionError> {

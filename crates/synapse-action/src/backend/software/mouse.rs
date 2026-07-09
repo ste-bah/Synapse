@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, sync::Once};
+use std::{fmt::Write as _, sync::Once, time::Instant};
 
 use enigo::Enigo;
 use serde_json::json;
@@ -140,8 +140,17 @@ pub(super) fn mouse_drag(
 ) -> Result<(), ActionError> {
     send_absolute_mouse_move(from, "drag origin absolute mouse move")?;
     mouse_button(button, ButtonAction::Down, 0, state)?;
-    mouse_move_curve(from, to, curve, duration_ms)?;
-    mouse_button(button, ButtonAction::Up, 0, state)
+    let drag_result = mouse_move_curve(from, to, curve, duration_ms)
+        .and_then(|()| verify_cursor_position(to, "drag target cursor readback"));
+    let release_result = mouse_button(button, ButtonAction::Up, 0, state);
+    match (drag_result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(original), Err(release_error)) => Err(annotate_drag_cleanup_release_error(
+            release_error,
+            &original,
+        )),
+    }
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_stroke"))]
@@ -291,13 +300,47 @@ fn mouse_move_curve(
     curve: &AimCurve,
     duration_ms: u32,
 ) -> Result<(), ActionError> {
+    if matches!(curve, AimCurve::Instant) {
+        return send_absolute_mouse_move(to, "curve instant absolute mouse move");
+    }
     let samples = sample_curve(curve, from, to, duration_ms, None);
     let desktop = virtual_desktop()?;
-    let mut inputs = Vec::with_capacity(samples.len().saturating_sub(1));
-    for point in samples.into_iter().skip(1) {
-        inputs.push(absolute_mouse_input_for_desktop(point, desktop));
+    let last_index = samples.len().saturating_sub(1);
+    if last_index == 0 {
+        return Ok(());
     }
-    send_input_batch(&inputs, "drag curve absolute mouse move")
+    let start = Instant::now();
+    for (index, point) in samples.into_iter().enumerate().skip(1) {
+        let target_elapsed_ms = curve_sample_elapsed_ms(duration_ms, index, last_index);
+        let elapsed_ms = elapsed_millis_u32(start.elapsed());
+        let delay_ms = target_elapsed_ms.saturating_sub(elapsed_ms);
+        if sleep_ms(delay_ms) {
+            return Err(ActionError::SafetyOperatorHotkeyFired {
+                detail: format!(
+                    "operator release requested during mouse_move_curve at sample_index={index}"
+                ),
+            });
+        }
+        send_input_batch(
+            &[absolute_mouse_input_for_desktop(point, desktop)],
+            "curve absolute mouse move",
+        )?;
+    }
+    Ok(())
+}
+
+fn curve_sample_elapsed_ms(duration_ms: u32, sample_index: usize, last_index: usize) -> u32 {
+    if duration_ms == 0 || last_index == 0 {
+        return 0;
+    }
+    let numerator = u128::from(duration_ms) * sample_index as u128;
+    let denominator = last_index as u128;
+    let rounded = (numerator + denominator / 2) / denominator;
+    u32::try_from(rounded).unwrap_or(u32::MAX)
+}
+
+fn elapsed_millis_u32(duration: std::time::Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
 }
 
 #[allow(
@@ -594,6 +637,33 @@ fn stroke_error(error: &StrokeError) -> ActionError {
     ActionError::TargetInvalid {
         detail: format!("mouse_stroke planning failed: {error}"),
     }
+}
+
+fn verify_cursor_position(point: Point, detail: &'static str) -> Result<(), ActionError> {
+    let actual = read_physical_cursor_position(detail)?;
+    if cursor_readback_matches(point, actual) {
+        Ok(())
+    } else {
+        Err(ActionError::BackendUnavailable {
+            detail: format!(
+                "{detail} mismatch: requested={point:?} actual=({},{}) tolerance_px={CURSOR_READBACK_TOLERANCE_PX}",
+                actual.x, actual.y
+            ),
+        })
+    }
+}
+
+fn annotate_drag_cleanup_release_error(
+    release_error: ActionError,
+    original_error: &ActionError,
+) -> ActionError {
+    let detail = format!(
+        "mouse_drag button_cleanup_after_move_error: original_code={} original_detail={}; cleanup_detail={}",
+        original_error.code(),
+        original_error.detail(),
+        release_error.detail()
+    );
+    release_error.with_detail(detail)
 }
 
 #[derive(Clone, Debug)]
@@ -1147,6 +1217,32 @@ mod tests {
         );
         assert!(cursor_readback_matches(requested, within));
         assert!(!cursor_readback_matches(requested, outside));
+    }
+
+    #[test]
+    fn curve_sample_elapsed_ms_reaches_duration_without_drift() {
+        let last_index = 7;
+        let elapsed = (0..=last_index)
+            .map(|index| curve_sample_elapsed_ms(120, index, last_index))
+            .collect::<Vec<_>>();
+        let delays = elapsed
+            .windows(2)
+            .map(|pair| pair[1].saturating_sub(pair[0]))
+            .collect::<Vec<_>>();
+
+        println!(
+            "readback=curve_sample_elapsed before=duration_ms:120 last_index:{last_index} after_elapsed={elapsed:?} after_delays={delays:?}"
+        );
+        assert_eq!(elapsed[0], 0);
+        assert_eq!(elapsed[last_index], 120);
+        assert!(elapsed.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(delays.iter().sum::<u32>(), 120);
+    }
+
+    #[test]
+    fn curve_sample_elapsed_ms_zero_duration_has_no_delay() {
+        assert_eq!(curve_sample_elapsed_ms(0, 3, 7), 0);
+        assert_eq!(curve_sample_elapsed_ms(120, 0, 0), 0);
     }
 
     #[test]
