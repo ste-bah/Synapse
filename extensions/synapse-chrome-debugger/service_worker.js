@@ -13285,6 +13285,49 @@ function runLoadStateProbeInPage(request) {
     } catch (_error) {}
     return [];
   };
+  const requestUrl = (input) => {
+    if (input === undefined || input === null) {
+      return "";
+    }
+    try {
+      if (typeof Request !== "undefined" && input instanceof Request) {
+        return input.url;
+      }
+    } catch (_error) {}
+    try {
+      return new URL(String(input), String(globalThis.location?.href || "about:blank")).href;
+    } catch (_error) {
+      return String(input || "");
+    }
+  };
+  const shouldShortCircuitBrowserInternalFetch = (url) => {
+    const value = String(url || "");
+    if (!value) {
+      return false;
+    }
+    try {
+      const parsed = new URL(value, String(globalThis.location?.href || "about:blank"));
+      const protocol = String(parsed.protocol || "").toLowerCase();
+      if (protocol === "chrome-extension:") {
+        const host = String(parsed.hostname || "").toLowerCase();
+        return host === "invalid" || !/^[a-p]{32}$/.test(host);
+      }
+      return protocol === "chrome:" ||
+        protocol === "chrome-untrusted:" ||
+        protocol === "devtools:" ||
+        protocol === "edge:";
+    } catch (_error) {
+      return /^chrome-extension:\/\/invalid(?:[/#?]|$)/i.test(value);
+    }
+  };
+  const browserInternalFetchError = (url) => {
+    const error = new TypeError("Failed to fetch");
+    try {
+      Object.defineProperty(error, "__synapseSuppressedBrowserInternalFetch", { value: true });
+      Object.defineProperty(error, "__synapseSuppressedUrl", { value: String(url || "") });
+    } catch (_error) {}
+    return error;
+  };
   const navigationTiming = () => {
     const entries = performanceEntries("navigation");
     return entries.length > 0 && entries[0] ? entries[0] : null;
@@ -13304,12 +13347,12 @@ function runLoadStateProbeInPage(request) {
   };
   const ensureState = () => {
     const existing = globalThis[stateKey];
-    if (existing && existing.version === 1) {
+    if (existing && existing.version === 2) {
       return existing;
     }
     const installedAtMs = nowMs();
     const state = {
-      version: 1,
+      version: 2,
       installedAtMs,
       lastActivityAtMs: installedAtMs,
       domcontentloadedAtMs: 0,
@@ -13319,6 +13362,9 @@ function runLoadStateProbeInPage(request) {
       networkEventCount: 0,
       totalStarted: 0,
       totalFinished: 0,
+      suppressedBrowserInternalFetches: 0,
+      lastSuppressedBrowserInternalFetchUrl: "",
+      lastSuppressedBrowserInternalFetchAtMs: 0,
       fetchWrapped: false,
       xhrWrapped: false,
       lifecycleListenersInstalled: false,
@@ -13346,13 +13392,24 @@ function runLoadStateProbeInPage(request) {
     }
     markActivity();
   };
+  const markBrowserInternalFetchSuppressed = (url) => {
+    state.suppressedBrowserInternalFetches = Number(state.suppressedBrowserInternalFetches || 0) + 1;
+    state.lastSuppressedBrowserInternalFetchUrl = String(url || "");
+    state.lastSuppressedBrowserInternalFetchAtMs = nowMs();
+  };
   const installFetchProbe = () => {
     if (state.fetchWrapped || typeof globalThis.fetch !== "function") {
       return;
     }
     const originalFetch = globalThis.fetch;
     const wrappedFetch = function synapseLoadStateFetchWrapper(...args) {
+      const url = requestUrl(args[0]);
       markRequestStarted();
+      if (shouldShortCircuitBrowserInternalFetch(url)) {
+        markBrowserInternalFetchSuppressed(url);
+        markRequestFinished();
+        return Promise.reject(browserInternalFetchError(url));
+      }
       let result;
       try {
         result = originalFetch.apply(this, args);
@@ -13472,6 +13529,9 @@ function runLoadStateProbeInPage(request) {
     resource_entry_count: resourceEntries.length,
     total_started: state.totalStarted,
     total_finished: state.totalFinished,
+    suppressed_browser_internal_fetches: Number(state.suppressedBrowserInternalFetches || 0),
+    last_suppressed_browser_internal_fetch_url: state.lastSuppressedBrowserInternalFetchUrl || "",
+    last_suppressed_browser_internal_fetch_at_ms: Math.floor(state.lastSuppressedBrowserInternalFetchAtMs || 0),
     network_idle_quiet_ms: quietElapsedMs,
     quiet_window_ms: quietMs,
     latest_resource_activity_ms: Math.floor(latestResourceMs)
@@ -20457,7 +20517,7 @@ function mergeInPageNetworkEntry(buffer, raw) {
 
 function installSynapseNetworkRecorderInPage() {
   const global = globalThis;
-  if (global.__synapseBridgeNetworkRecorder?.installed) {
+  if (global.__synapseBridgeNetworkRecorder?.installed && global.__synapseBridgeNetworkRecorder.version === 2) {
     return {
       ok: true,
       reason: "already_installed",
@@ -20466,6 +20526,7 @@ function installSynapseNetworkRecorderInPage() {
   }
   const recorder = {
     installed: true,
+    version: 2,
     nextId: 0,
     nextSeq: 0,
     maxEntries: 1000,
@@ -20507,12 +20568,41 @@ function installSynapseNetworkRecorderInPage() {
     const method = init?.method || (typeof Request !== "undefined" && input instanceof Request ? input.method : null) || "GET";
     return String(method).toUpperCase();
   };
+  const shouldShortCircuitBrowserInternalFetch = (url) => {
+    const value = String(url || "");
+    if (!value) {
+      return false;
+    }
+    try {
+      const parsed = new URL(value, String(global.location?.href || "about:blank"));
+      const protocol = String(parsed.protocol || "").toLowerCase();
+      if (protocol === "chrome-extension:") {
+        const host = String(parsed.hostname || "").toLowerCase();
+        return host === "invalid" || !/^[a-p]{32}$/.test(host);
+      }
+      return protocol === "chrome:" ||
+        protocol === "chrome-untrusted:" ||
+        protocol === "devtools:" ||
+        protocol === "edge:";
+    } catch (_) {
+      return /^chrome-extension:\/\/invalid(?:[/#?]|$)/i.test(value);
+    }
+  };
+  const browserInternalFetchError = (url) => {
+    const error = new TypeError("Failed to fetch");
+    try {
+      Object.defineProperty(error, "__synapseSuppressedBrowserInternalFetch", { value: true });
+      Object.defineProperty(error, "__synapseSuppressedUrl", { value: String(url || "") });
+    } catch (_) {}
+    return error;
+  };
   if (typeof global.fetch === "function") {
     const originalFetch = global.fetch;
     global.fetch = function synapseRecordedFetch(input, init) {
+      const url = requestUrl(input);
       const entry = remember({
         request_id: `fetch-${++recorder.nextId}`,
-        url: requestUrl(input),
+        url,
         method: requestMethod(input, init),
         resource_type: "Fetch",
         response_received: false,
@@ -20523,7 +20613,24 @@ function installSynapseNetworkRecorderInPage() {
         loading_failed: false,
         failure_error_text: null
       });
-      const promise = Reflect.apply(originalFetch, this, arguments);
+      if (shouldShortCircuitBrowserInternalFetch(url)) {
+        recorder.suppressedBrowserInternalFetches = Number(recorder.suppressedBrowserInternalFetches || 0) + 1;
+        entry.loading_finished = false;
+        entry.loading_failed = true;
+        entry.failure_error_text = "Synapse suppressed browser-internal fetch before Chrome network request";
+        touch(entry);
+        return Promise.reject(browserInternalFetchError(url));
+      }
+      let promise;
+      try {
+        promise = Reflect.apply(originalFetch, this, arguments);
+      } catch (error) {
+        entry.loading_finished = false;
+        entry.loading_failed = true;
+        entry.failure_error_text = String(error?.message || error);
+        touch(entry);
+        throw error;
+      }
       return Promise.resolve(promise).then(
         (response) => {
           entry.response_received = true;
