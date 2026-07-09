@@ -1177,6 +1177,143 @@ fn respawn_plan_unknown_session_errors_structurally() {
     );
 }
 
+#[test]
+fn respawn_manifest_reads_working_dir_from_physical_manifest() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let spawn = "agent-spawn-regression-respawn-manifest";
+    let working_dir = temp.path().join("prior-cwd");
+    let log_dir = temp.path().join("respawn-log");
+    std::fs::create_dir_all(&working_dir).expect("mkdir working dir");
+    std::fs::create_dir_all(&log_dir).expect("mkdir log dir");
+    std::fs::write(
+        log_dir.join("spawn-manifest.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "spawn_id": spawn,
+            "cli": "local-model",
+            "kind": "local-model",
+            "model": "gemma3",
+            "model_ref": "gemma-local",
+            "working_dir": working_dir.display().to_string(),
+        }))
+        .expect("encode manifest"),
+    )
+    .expect("write manifest");
+    let target = ResolvedAgent {
+        session_id: "session-regression-respawn-manifest".to_owned(),
+        spawn_id: Some(spawn.to_owned()),
+        agent_kind: "local-model".to_owned(),
+        lifecycle: "test".to_owned(),
+        resolution_source: "test".to_owned(),
+        dead: true,
+        launcher_process_id: 0,
+        agent_process_id: None,
+        log_dir: log_dir.display().to_string(),
+        control: None,
+    };
+
+    let manifest = service
+        .read_respawn_manifest(&target)
+        .expect("manifest must read the durable cwd");
+    let expected_working_dir = std::fs::canonicalize(&working_dir)
+        .expect("canonical working dir")
+        .display()
+        .to_string();
+    assert_eq!(manifest.agent_kind, "local-model");
+    assert_eq!(manifest.model.as_deref(), Some("gemma3"));
+    assert_eq!(manifest.model_ref.as_deref(), Some("gemma-local"));
+    assert_eq!(
+        manifest.working_dir.as_deref(),
+        Some(expected_working_dir.as_str())
+    );
+}
+
+#[test]
+fn respawn_manifest_missing_working_dir_errors_loudly() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let spawn = "agent-spawn-regression-respawn-missing-cwd";
+    let log_dir = temp.path().join("respawn-log");
+    std::fs::create_dir_all(&log_dir).expect("mkdir log dir");
+    std::fs::write(
+        log_dir.join("spawn-manifest.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "spawn_id": spawn,
+            "cli": "local-model",
+            "kind": "local-model",
+            "model": "gemma3",
+        }))
+        .expect("encode manifest"),
+    )
+    .expect("write manifest");
+    let target = ResolvedAgent {
+        session_id: "session-regression-respawn-missing-cwd".to_owned(),
+        spawn_id: Some(spawn.to_owned()),
+        agent_kind: "local-model".to_owned(),
+        lifecycle: "test".to_owned(),
+        resolution_source: "test".to_owned(),
+        dead: true,
+        launcher_process_id: 0,
+        agent_process_id: None,
+        log_dir: log_dir.display().to_string(),
+        control: None,
+    };
+
+    let error = service
+        .read_respawn_manifest(&target)
+        .expect_err("missing cwd must fail before respawn can kill");
+    assert!(
+        error.message.contains("AGENT_RESPAWN_WORKING_DIR_MISSING"),
+        "unexpected error: {}",
+        error.message
+    );
+}
+
+#[test]
+fn respawn_manifest_invalid_working_dir_errors_before_spawn() {
+    let temp = TempDir::new().expect("temp dir");
+    let service = regression_service(temp.path());
+    let spawn = "agent-spawn-regression-respawn-invalid-cwd";
+    let missing_working_dir = temp.path().join("missing-cwd");
+    let log_dir = temp.path().join("respawn-log");
+    std::fs::create_dir_all(&log_dir).expect("mkdir log dir");
+    std::fs::write(
+        log_dir.join("spawn-manifest.json"),
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "spawn_id": spawn,
+            "cli": "local-model",
+            "kind": "local-model",
+            "working_dir": missing_working_dir.display().to_string(),
+        }))
+        .expect("encode manifest"),
+    )
+    .expect("write manifest");
+    let target = ResolvedAgent {
+        session_id: "session-regression-respawn-invalid-cwd".to_owned(),
+        spawn_id: Some(spawn.to_owned()),
+        agent_kind: "local-model".to_owned(),
+        lifecycle: "test".to_owned(),
+        resolution_source: "test".to_owned(),
+        dead: true,
+        launcher_process_id: 0,
+        agent_process_id: None,
+        log_dir: log_dir.display().to_string(),
+        control: None,
+    };
+
+    let error = service
+        .read_respawn_manifest(&target)
+        .expect_err("invalid cwd must fail before respawn can kill");
+    assert!(
+        error.message.contains("AGENT_RESPAWN_WORKING_DIR_INVALID"),
+        "unexpected error: {}",
+        error.message
+    );
+}
+
 #[tokio::test]
 #[ignore = "real-process FSV: registers a real spawned victim to exercise manifest reconstruction; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn respawn_plan_reconstructs_identity_from_physical_manifest() {
@@ -1199,6 +1336,7 @@ async fn respawn_plan_reconstructs_identity_from_physical_manifest() {
             "kind": "local-model",
             "model": "gemma3",
             "model_ref": "gemma-local",
+            "working_dir": temp.path().display().to_string(),
         }))
         .expect("encode manifest"),
     )
@@ -1221,6 +1359,14 @@ async fn respawn_plan_reconstructs_identity_from_physical_manifest() {
     assert_eq!(plan.manifest.agent_kind, "local-model");
     assert_eq!(plan.manifest.model.as_deref(), Some("gemma3"));
     assert_eq!(plan.manifest.model_ref.as_deref(), Some("gemma-local"));
+    let expected_working_dir = std::fs::canonicalize(temp.path())
+        .expect("canonical temp dir")
+        .display()
+        .to_string();
+    assert_eq!(
+        plan.manifest.working_dir.as_deref(),
+        Some(expected_working_dir.as_str())
+    );
     assert_eq!(plan.request_value["cli"], json!("local_model"));
     assert_eq!(plan.request_value["model"], json!("gemma3"));
     assert_eq!(plan.request_value["model_ref"], json!("gemma-local"));

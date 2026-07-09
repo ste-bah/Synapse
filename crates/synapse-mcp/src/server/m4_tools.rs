@@ -425,11 +425,16 @@ pub struct ProcessHistoryRow {
     pub command_line: Option<String>,
 }
 
-/// Builds the per-spawn manifest JSON. Records the CLI and, when the operator
-/// pinned one, the model — the authoritative model source the transcript
-/// ingester reads (indispensable for Codex, whose stream omits it, #949).
-fn build_spawn_manifest(spawn_id: &str, params: &ActSpawnAgentParams) -> Result<Value, ErrorData> {
+/// Builds the per-spawn manifest JSON. Records the CLI, resolved working
+/// directory, and, when the operator pinned one, the model. This is the
+/// authoritative run identity the transcript ingester and respawn path read.
+fn build_spawn_manifest(
+    spawn_id: &str,
+    params: &ActSpawnAgentParams,
+    working_dir: &Path,
+) -> Result<Value, ErrorData> {
     let agent_kind = params.effective_cli()?;
+    let effective_working_dir = working_dir.display().to_string();
     Ok(json!({
         "version": AGENT_SPAWN_MANIFEST_VERSION,
         "spawn_id": spawn_id,
@@ -437,6 +442,9 @@ fn build_spawn_manifest(spawn_id: &str, params: &ActSpawnAgentParams) -> Result<
         "kind": agent_kind.as_str(),
         "model": params.model_for_spawn_manifest(agent_kind),
         "model_ref": params.local_model_ref(),
+        "working_dir": effective_working_dir,
+        "effective_working_dir": effective_working_dir,
+        "requested_working_dir": params.working_dir.as_deref(),
         "require_approval_gate": params.require_approval_gate,
         "approval_gate_effective": params.require_approval_gate && agent_kind.uses_approval_gate(),
         "local_model_autonomous_tool_calls": agent_kind.is_local_model(),
@@ -5419,7 +5427,7 @@ fn prepare_agent_spawn_files(
     // transcript ingester reads it to attribute cost — indispensable for Codex,
     // whose `exec --json` stream carries no model id (#949).
     let manifest_path = log_dir.join(AGENT_SPAWN_MANIFEST_FILENAME);
-    let manifest = build_spawn_manifest(spawn_id, params)?;
+    let manifest = build_spawn_manifest(spawn_id, params, working_dir)?;
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
@@ -8805,14 +8813,20 @@ mod tests {
     #[test]
     fn spawn_manifest_records_cli_and_model() {
         // The manifest is the transcript ingester's authoritative model source.
+        let dir = tempfile::TempDir::new().expect("create temp dir");
         let mut params = test_spawn_params();
         params.model = Some("gpt-5-codex".to_owned());
-        let manifest = build_spawn_manifest("agent-spawn-manifest-regression", &params)
+        let manifest = build_spawn_manifest("agent-spawn-manifest-regression", &params, dir.path())
             .expect("build spawn manifest");
         assert_eq!(manifest["version"], AGENT_SPAWN_MANIFEST_VERSION);
         assert_eq!(manifest["spawn_id"], "agent-spawn-manifest-regression");
         assert_eq!(manifest["cli"], "codex");
         assert_eq!(manifest["model"], "gpt-5-codex");
+        assert_eq!(manifest["working_dir"], dir.path().display().to_string());
+        assert_eq!(
+            manifest["effective_working_dir"],
+            dir.path().display().to_string()
+        );
         assert_eq!(manifest["require_approval_gate"], true);
         assert_eq!(manifest["approval_gate_effective"], true);
         assert_eq!(manifest["assigned_prompt_present"], true);
@@ -8820,7 +8834,7 @@ mod tests {
 
         // No pinned model -> manifest carries an explicit null, never a guess.
         params.model = None;
-        let manifest = build_spawn_manifest("agent-spawn-manifest-regression", &params)
+        let manifest = build_spawn_manifest("agent-spawn-manifest-regression", &params, dir.path())
             .expect("build spawn manifest");
         assert!(manifest["model"].is_null());
     }
@@ -8879,12 +8893,13 @@ mod tests {
         assert!(!script.contains("& codex"));
         assert!(!script.contains("& claude"));
 
-        let manifest =
-            build_spawn_manifest("agent-spawn-manifest-local", &params).expect("manifest");
+        let manifest = build_spawn_manifest("agent-spawn-manifest-local", &params, dir.path())
+            .expect("manifest");
         assert_eq!(manifest["cli"], "local-model");
         assert_eq!(manifest["kind"], "local-model");
         assert_eq!(manifest["model"], "ollama-gemma4-e4b");
         assert_eq!(manifest["model_ref"], "ollama-gemma4-e4b");
+        assert_eq!(manifest["working_dir"], dir.path().display().to_string());
         assert_eq!(manifest["require_approval_gate"], true);
         assert_eq!(manifest["approval_gate_effective"], false);
         assert_eq!(manifest["local_model_autonomous_tool_calls"], true);
@@ -8899,7 +8914,8 @@ mod tests {
             agent_spawn_powershell_script(&params, &files, dir.path()).expect("trusted script");
         assert!(trusted_script.contains("--local-agent-trusted-unattended-exact-contract"));
         let trusted_manifest =
-            build_spawn_manifest("agent-spawn-manifest-local", &params).expect("manifest");
+            build_spawn_manifest("agent-spawn-manifest-local", &params, dir.path())
+                .expect("manifest");
         assert_eq!(trusted_manifest["require_approval_gate"], false);
         assert_eq!(trusted_manifest["approval_gate_effective"], false);
         assert_eq!(trusted_manifest["local_model_autonomous_tool_calls"], true);

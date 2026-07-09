@@ -453,7 +453,7 @@ pub struct AgentRespawnParams {
     /// The work prompt for the new instance. Required: the original prompt is
     /// not persisted (only its size is journaled), so respawn never fabricates
     /// it — supply the continued task. The new agent's kind/model/model_ref and
-    /// (when journaled) working_dir/target are reused from the prior spawn.
+    /// manifest-recorded working_dir are reused from the prior spawn.
     pub prompt: String,
     /// When true (default), a continuity packet naming the prior spawn/session
     /// and, if present, its final message is prepended to the prompt so the new
@@ -666,7 +666,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Respawn ONE spawned agent (#906): kill the prior instance (if live) and launch a fresh one that reuses the prior spawn's kind/model/model_ref and journaled working_dir/target, with a continuity packet (prior spawn/session id + final message) prepended so it resumes. prompt is REQUIRED — the original prompt is not persisted, so respawn supplies the continued task rather than fabricate it. Writes a StateChanged lineage row (respawned_into) on the prior agent and returns both ids. Errors loudly if the prior spawn manifest cannot be read."
+        description = "Respawn ONE spawned agent (#906): kill the prior instance (if live) and launch a fresh one that reuses the prior spawn's kind/model/model_ref and manifest-recorded working_dir, with a continuity packet (prior spawn/session id + final message) prepended so it resumes. prompt is REQUIRED — the original prompt is not persisted, so respawn supplies the continued task rather than fabricate it. Writes a StateChanged lineage row (respawned_into) on the prior agent and returns both ids. Errors loudly if the prior spawn manifest or working_dir cannot be read."
     )]
     pub async fn agent_respawn(
         &self,
@@ -1970,17 +1970,83 @@ impl SynapseService {
         let prior_killed = if prior_already_dead {
             false
         } else {
-            self.agent_kill_impl(
-                AgentKillParams {
-                    session_id: target.session_id.clone(),
-                    grace_ms: params.grace_ms,
-                    interrupt_first: true,
-                },
-                caller.as_deref(),
-            )
-            .await
-            .map(|kill| kill.killed)
-            .unwrap_or(false)
+            match self
+                .agent_kill_impl(
+                    AgentKillParams {
+                        session_id: target.session_id.clone(),
+                        grace_ms: params.grace_ms,
+                        interrupt_first: true,
+                    },
+                    caller.as_deref(),
+                )
+                .await
+            {
+                Ok(kill) if kill.killed => true,
+                Ok(kill) => {
+                    let error = mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "AGENT_RESPAWN_PRIOR_KILL_FAILED: agent {} (session {}) was still live and agent_kill returned killed=false; no replacement was launched",
+                            lookup, target.session_id
+                        ),
+                    );
+                    let after = json!({
+                        "spawn_attempted": false,
+                        "prior_kill_failed": true,
+                        "prior_kill": kill,
+                        "error": error.message.to_string(),
+                    });
+                    self.command_audit_final(
+                        CommandAuditInput::mcp(
+                            TOOL_AGENT_RESPAWN,
+                            "respawn",
+                            caller.clone(),
+                            Some(target.session_id.clone()),
+                            payload.clone(),
+                            before.clone(),
+                            after,
+                            "error",
+                        )
+                        .with_target(json!({
+                            "spawn_id": prior_spawn_id.clone(),
+                            "agent_kind": target.agent_kind.clone()
+                        })),
+                    )?;
+                    return Err(error);
+                }
+                Err(source) => {
+                    let source_message = source.message.to_string();
+                    let error = mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "AGENT_RESPAWN_PRIOR_KILL_FAILED: prior agent kill failed before replacement spawn; no replacement was launched: {source_message}"
+                        ),
+                    );
+                    let after = json!({
+                        "spawn_attempted": false,
+                        "prior_kill_failed": true,
+                        "source_error": source_message,
+                        "error": error.message.to_string(),
+                    });
+                    self.command_audit_final(
+                        CommandAuditInput::mcp(
+                            TOOL_AGENT_RESPAWN,
+                            "respawn",
+                            caller.clone(),
+                            Some(target.session_id.clone()),
+                            payload.clone(),
+                            before.clone(),
+                            after,
+                            "error",
+                        )
+                        .with_target(json!({
+                            "spawn_id": prior_spawn_id.clone(),
+                            "agent_kind": target.agent_kind.clone()
+                        })),
+                    )?;
+                    return Err(error);
+                }
+            }
         };
 
         let request: crate::m4::ActSpawnAgentRequest = serde_json::from_value(request_value)
@@ -2058,8 +2124,8 @@ impl SynapseService {
     }
 
     /// Reads the prior spawn's reusable identity from its `spawn-manifest.json`
-    /// (kind/model/model_ref) and folds in the journaled working_dir. Errors if
-    /// no manifest exists — respawn never fabricates a spawn identity.
+    /// (kind/model/model_ref/working_dir). Errors if no manifest or working
+    /// directory exists — respawn never fabricates a spawn identity or cwd.
     fn read_respawn_manifest(&self, target: &ResolvedAgent) -> Result<RespawnManifest, ErrorData> {
         let manifest_path =
             PathBuf::from(&target.log_dir).join(super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME);
@@ -2095,43 +2161,43 @@ impl SynapseService {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
         };
+        let working_dir = string_field("working_dir")
+            .or_else(|| string_field("effective_working_dir"))
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "AGENT_RESPAWN_WORKING_DIR_MISSING: prior spawn manifest {} has no working_dir/effective_working_dir; refusing to respawn into the daemon default cwd",
+                        manifest_path.display()
+                    ),
+                )
+            })?;
+        let working_dir_path = PathBuf::from(&working_dir);
+        let canonical_working_dir = fs::canonicalize(&working_dir_path).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_RESPAWN_WORKING_DIR_INVALID: prior spawn working_dir {working_dir_path:?} from {} could not be resolved: {error}",
+                    manifest_path.display()
+                ),
+            )
+        })?;
+        if !canonical_working_dir.is_dir() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "AGENT_RESPAWN_WORKING_DIR_INVALID: prior spawn working_dir {canonical_working_dir:?} from {} is not a directory",
+                    manifest_path.display()
+                ),
+            ));
+        }
         Ok(RespawnManifest {
             agent_kind,
             model: string_field("model"),
             model_ref: string_field("model_ref"),
-            working_dir: self.prior_spawn_working_dir(target.spawn_id.as_deref()),
+            working_dir: Some(canonical_working_dir.display().to_string()),
             source: super::m4_tools::AGENT_SPAWN_MANIFEST_FILENAME.to_owned(),
         })
-    }
-
-    /// Recovers the prior spawn's working_dir from its `SpawnRequested` journal
-    /// row (the manifest does not record it). Best-effort: `None` lets the new
-    /// spawn fall back to the daemon default.
-    fn prior_spawn_working_dir(&self, spawn_id: Option<&str>) -> Option<String> {
-        let spawn_id = spawn_id?;
-        let db = self.agent_control_db().ok()?;
-        let (rows, _more) = db
-            .scan_cf_from(synapse_storage::cf::CF_AGENT_EVENTS, &[], 1_000_000)
-            .ok()?;
-        for (_key, value) in rows {
-            let Ok(record) = serde_json::from_slice::<AgentEventRecord>(&value) else {
-                continue;
-            };
-            if record.kind == AgentEventKind::SpawnRequested
-                && record.spawn_id.as_deref() == Some(spawn_id)
-            {
-                if let Some(working_dir) = record
-                    .payload
-                    .get("working_dir")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    return Some(working_dir.to_owned());
-                }
-            }
-        }
-        None
     }
 
     // ------------------------------------------------------------------
