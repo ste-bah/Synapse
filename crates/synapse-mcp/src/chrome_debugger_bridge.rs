@@ -40,9 +40,9 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-06-30-window-id-v2";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-07-09-register-token-v1";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "a3e3013060a20b95af67da6f5be3cdd45b36f85b9ea64ebf304577b389225fea";
+    "25af9fe2d52245ee4d52ab89e580914ca65a0a8564c9696ff6c7b964d9cb165c";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -7601,14 +7601,6 @@ pub fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: &Uri) -
     if !path.starts_with("/chrome-debugger/native/") {
         return false;
     }
-    if headers
-        .get(header::ORIGIN)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .is_some_and(|origin| origin == EXTENSION_ORIGIN)
-    {
-        return true;
-    }
     if !matches!(
         path,
         "/chrome-debugger/native/next"
@@ -7625,10 +7617,30 @@ pub fn is_direct_http_extension_bridge_request(headers: &HeaderMap, uri: &Uri) -
     {
         return true;
     }
+    bridge_token_from_headers(headers)
+        .is_some_and(|token| bridge().direct_http_bridge_token_matches(token))
+}
+
+pub fn is_direct_http_extension_bridge_register_request(headers: &HeaderMap, uri: &Uri) -> bool {
+    uri.path() == "/chrome-debugger/native/register"
+        && headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .is_some_and(|origin| origin == EXTENSION_ORIGIN)
+}
+
+fn direct_http_bridge_token_header_matches_host(headers: &HeaderMap, host_id: &str) -> bool {
+    bridge_token_from_headers(headers)
+        .is_some_and(|token| bridge().direct_http_bridge_token_matches_host(host_id, token))
+}
+
+fn bridge_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(BRIDGE_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
-        .is_some_and(|token| bridge().direct_http_bridge_token_matches(token))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
 }
 
 pub async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Response {
@@ -7649,7 +7661,15 @@ pub async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Respon
     }
 }
 
-pub async fn http_message(Json(request): Json<NativeMessageRequest>) -> Response {
+pub async fn http_message(
+    headers: HeaderMap,
+    Json(request): Json<NativeMessageRequest>,
+) -> Response {
+    if bridge_token_from_headers(&headers).is_some()
+        && !direct_http_bridge_token_header_matches_host(&headers, &request.host_id)
+    {
+        return direct_http_bridge_token_rejected(&request.host_id);
+    }
     match bridge().post_message(request) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
         Err(detail) => (
@@ -7692,7 +7712,12 @@ pub async fn http_maintenance_pause(
     }
 }
 
-pub async fn http_next(Query(query): Query<NativeNextQuery>) -> Response {
+pub async fn http_next(headers: HeaderMap, Query(query): Query<NativeNextQuery>) -> Response {
+    if bridge_token_from_headers(&headers).is_some()
+        && !direct_http_bridge_token_header_matches_host(&headers, &query.host_id)
+    {
+        return direct_http_bridge_token_rejected(&query.host_id);
+    }
     let timeout_ms = query
         .timeout_ms
         .unwrap_or_else(|| u64::try_from(NATIVE_POLL_TIMEOUT.as_millis()).unwrap_or(15_000))
@@ -7712,6 +7737,18 @@ pub async fn http_next(Query(query): Query<NativeNextQuery>) -> Response {
         )
             .into_response(),
     }
+}
+
+fn direct_http_bridge_token_rejected(host_id: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "ok": false,
+            "code": error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE,
+            "detail": format!("direct Chrome debugger bridge token did not match host_id {host_id:?}"),
+        })),
+    )
+        .into_response()
 }
 
 pub async fn http_ws(Query(query): Query<NativeWsQuery>, ws: WebSocketUpgrade) -> Response {
@@ -9187,6 +9224,42 @@ mod tests {
         assert!(!is_direct_http_extension_bridge_request(
             &headers,
             &Uri::from_static("/mcp"),
+        ));
+    }
+
+    #[test]
+    fn direct_http_bridge_token_header_is_host_scoped_after_register() {
+        let first = bridge()
+            .register(NativeRegisterRequest {
+                origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
+                pid: 1,
+                parent_window: None,
+                bridge_protocol_version: BRIDGE_PROTOCOL_VERSION,
+                transport: Some("direct_http".to_owned()),
+            })
+            .expect("first direct bridge register should issue a host token");
+        let second = bridge()
+            .register(NativeRegisterRequest {
+                origin: "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk/".to_owned(),
+                pid: 2,
+                parent_window: None,
+                bridge_protocol_version: BRIDGE_PROTOCOL_VERSION,
+                transport: Some("direct_http".to_owned()),
+            })
+            .expect("second direct bridge register should issue a host token");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            BRIDGE_TOKEN_HEADER,
+            HeaderValue::from_str(&first.bridge_token).expect("bridge token header-safe"),
+        );
+
+        assert!(direct_http_bridge_token_header_matches_host(
+            &headers,
+            &first.host_id
+        ));
+        assert!(!direct_http_bridge_token_header_matches_host(
+            &headers,
+            &second.host_id
         ));
     }
 

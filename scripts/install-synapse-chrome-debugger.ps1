@@ -1,6 +1,7 @@
 param(
     [string]$SynapseNativeHostExe = "$env:USERPROFILE\.cargo\bin\synapse-chrome-native-host.exe",
     [string]$ExtensionId = "leoocgnkjnplbfdbklajepahofecgfbk",
+    [string]$TokenPath = "$env:APPDATA\synapse\token.txt",
     # Maintenance/self-heal entry point: run ONLY the one-way removal of any
     # debugger/nativeMessaging blockers Synapse wrote into the Chrome
     # ExtensionSettings policy, print the result, and exit.
@@ -60,6 +61,62 @@ function Get-SynapseFileSha256 {
     } catch {
         throw "SYNAPSE_CHROME_FILE_HASH_FAILED path=$Path error=$($_.Exception.Message) remediation=verify the extension artifact is readable and retry the Chrome bridge install"
     }
+}
+
+function Get-SynapseSha256HexLower {
+    param([Parameter(Mandatory = $true)][byte[]]$Bytes)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($Bytes)
+        return (($hash | ForEach-Object { $_.ToString('x2') }) -join '')
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-SynapseChromeBridgeRegisterToken {
+    param([Parameter(Mandatory = $true)][string]$BearerToken)
+    $domainBytes = [System.Text.Encoding]::UTF8.GetBytes('synapse.chrome_bridge.register.v1')
+    $tokenBytes = [System.Text.Encoding]::UTF8.GetBytes($BearerToken)
+    $bytes = New-Object byte[] ($domainBytes.Length + 1 + $tokenBytes.Length)
+    [System.Buffer]::BlockCopy($domainBytes, 0, $bytes, 0, $domainBytes.Length)
+    $bytes[$domainBytes.Length] = 0
+    [System.Buffer]::BlockCopy($tokenBytes, 0, $bytes, ($domainBytes.Length + 1), $tokenBytes.Length)
+    Get-SynapseSha256HexLower -Bytes $bytes
+}
+
+function Get-SynapseChromeBridgeBearerToken {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_SOURCE_MISSING path=$Path remediation=run scripts\synapse-setup.ps1 so the daemon bearer token exists before deploying the Chrome bridge"
+    }
+    $raw = Get-Content -Raw -LiteralPath $Path
+    $token = if ($null -eq $raw) { '' } else { $raw.Trim() }
+    if ($token.Length -lt 16) {
+        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_SOURCE_INVALID path=$Path length=$($token.Length) remediation=delete the invalid daemon bearer token and rerun scripts\synapse-setup.ps1"
+    }
+    return $token
+}
+
+function Set-SynapseChromeBridgeRegisterToken {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ServiceWorkerPath,
+        [Parameter(Mandatory = $true)]
+        [string]$RegisterToken
+    )
+    if ($RegisterToken -notmatch '^[0-9a-f]{64}$') {
+        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_INVALID remediation=derived register token must be 64 lowercase hex chars"
+    }
+    $text = Get-Content -Raw -LiteralPath $ServiceWorkerPath
+    $pattern = 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"[^"]*";'
+    if ($text -notmatch $pattern) {
+        throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_PLACEHOLDER_MISSING path=$ServiceWorkerPath remediation=service_worker.js must declare BRIDGE_REGISTER_TOKEN so setup can inject the derived daemon registration credential"
+    }
+    $replacement = 'const BRIDGE_REGISTER_TOKEN = "' + $RegisterToken + '";'
+    $updated = [System.Text.RegularExpressions.Regex]::Replace($text, $pattern, $replacement, 1)
+    $encoding = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($ServiceWorkerPath, $updated, $encoding)
 }
 
 function Get-RegistryAclDiagnostic {
@@ -564,6 +621,9 @@ if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_DECLARED_BUILD_SHA256\s*=\s*"
     throw "SYNAPSE_CHROME_EXTENSION_BUILD_SHA_MISSING path=$sourceServiceWorkerPath remediation=service_worker.js must expose BRIDGE_DECLARED_BUILD_SHA256 for declared build metadata; physical integrity comes from service_worker_sha256"
 }
 $bridgeDeclaredBuildSha256 = [string]$Matches[1]
+if ($serviceWorkerSource -notmatch 'const\s+BRIDGE_REGISTER_TOKEN\s*=\s*"";') {
+    throw "SYNAPSE_CHROME_BRIDGE_REGISTER_TOKEN_SOURCE_NOT_EMPTY path=$sourceServiceWorkerPath remediation=repo service_worker.js must keep BRIDGE_REGISTER_TOKEN empty; setup injects the host-local derived credential only into the deployed copy"
+}
 if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_ROOT_UNAVAILABLE remediation=LOCALAPPDATA is required to deploy the unpacked Chrome bridge to a checkout-independent stable directory"
 }
@@ -581,6 +641,14 @@ $manifestPath = Join-Path $extensionDir 'manifest.json'
 if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
     throw "SYNAPSE_CHROME_EXTENSION_STABLE_MANIFEST_MISSING source=$sourceManifestPath deployed=$manifestPath"
 }
+$deployedServiceWorkerPath = Join-Path $extensionDir 'service_worker.js'
+if (-not (Test-Path -LiteralPath $deployedServiceWorkerPath -PathType Leaf)) {
+    throw "SYNAPSE_CHROME_EXTENSION_STABLE_SERVICE_WORKER_MISSING source=$sourceServiceWorkerPath deployed=$deployedServiceWorkerPath"
+}
+$bridgeBearerToken = Get-SynapseChromeBridgeBearerToken -Path $TokenPath
+$bridgeRegisterToken = Get-SynapseChromeBridgeRegisterToken -BearerToken $bridgeBearerToken
+Set-SynapseChromeBridgeRegisterToken -ServiceWorkerPath $deployedServiceWorkerPath -RegisterToken $bridgeRegisterToken
+$bridgeRegisterTokenSha256 = Get-SynapseSha256HexLower -Bytes ([System.Text.Encoding]::UTF8.GetBytes($bridgeRegisterToken))
 $extensionManifest = Get-Content -Raw -LiteralPath $manifestPath | ConvertFrom-Json
 $extensionDeploy = [pscustomobject]@{
     source_dir = $extensionSourceDir
@@ -590,7 +658,9 @@ $extensionDeploy = [pscustomobject]@{
     declared_build_sha256 = $bridgeDeclaredBuildSha256
     build_sha256 = $bridgeDeclaredBuildSha256
     manifest_sha256 = Get-SynapseFileSha256 -Path $manifestPath
-    service_worker_sha256 = Get-SynapseFileSha256 -Path (Join-Path $extensionDir 'service_worker.js')
+    service_worker_sha256 = Get-SynapseFileSha256 -Path $deployedServiceWorkerPath
+    bridge_register_token_injected = $true
+    bridge_register_token_sha256 = $bridgeRegisterTokenSha256
 }
 $requiredPermissions = @($extensionManifest.permissions)
 $optionalPermissions = @($extensionManifest.optional_permissions)
@@ -1499,45 +1569,14 @@ function Invoke-SynapseChromeBridgeAutoInstall {
     }
 
     # Same extension ID already loaded, enabled, and fully permissioned, but registered
-    # from a directory other than the current stable dir (e.g. a pre-#1307 repo-checkout
-    # install). The bridge extension ID is derived from the manifest key and is therefore
-    # path-independent: a working same-ID host IS the Synapse bridge no matter which
-    # directory Chrome loaded it from. Chrome cannot relocate an already-loaded unpacked
-    # extension in place — the only ways to change its load directory are re-running
-    # "Load unpacked" (the fragile chrome://extensions UI-Automation path) or a Chrome
-    # relaunch, and there is no supported in-place mechanism for an off-Web-Store
-    # extension. Driving UI Automation to "re-install" a bridge that is already loaded and
-    # healthy is precisely the failure mode that broke the daemon handoff (see #1313), so
-    # we refuse to do it. The stable directory has already been deployed for future
-    # first-time installs; the live daemon reconverges the extension's code in place via
-    # the public browser_debugger.reload_bridge facade after handoff, and the
-    # post-handoff /health check is the live
-    # source of truth that fails loud if the bridge is not actually serving. We surface
-    # the pending path migration in the readback so health and operators can see that the
-    # bridge is still loaded from a non-stable directory.
+    # from a directory other than the current stable dir (e.g. a repo-checkout install).
+    # Registration is now credentialed with a host-local token injected only into the
+    # deployed stable copy. Reloading a non-stable source copy would keep an
+    # uncredentialed worker alive, so normal setup must migrate the loaded unpacked
+    # extension to the stable directory through Chrome's Load unpacked flow.
     if ($before.installed -and $before.enabled_and_permissioned -and $before.manifest_dir_exists) {
-        if ($ReloadExistingExtensionViaUi) {
-            return Invoke-SynapseChromeBridgeExistingUiReload `
-                -ChromeUserDataRoot $ChromeUserDataRoot `
-                -ExtensionId $ExtensionId `
-                -ExtensionDir $ExtensionDir `
-                -ActiveProfile $activeProfile `
-                -Before $before `
-                -TimeoutSeconds $TimeoutSeconds
-        }
-        return [pscustomobject]@{
-            attempted = $true
-            changed = $false
-            reason = 'existing_ready_extension_nonstable_path_code_reload_deferred_to_daemon'
-            active_profile = $activeProfile
-            required_foreground = $false
-            bridge_self_reload_command = 'browser_debugger.reload_bridge'
-            path_migration_pending = $true
-            loaded_manifest_path = $before.manifest_path
-            expected_stable_path = $ExtensionDir
-            before = $before
-            after = $before
-        }
+        Write-Warning ("SYNAPSE_CHROME_BRIDGE_NONSTABLE_PATH_REQUIRES_STABLE_RELOAD active_profile={0} loaded_manifest_path={1} expected_stable_path={2} reason=credentialed_register_token_only_injected_into_stable_extension" -f `
+            $activeProfile, $before.manifest_path, $ExtensionDir)
     }
 
     Initialize-SynapseChromeBridgeAutoInstallInterop
@@ -1653,10 +1692,15 @@ function Invoke-SynapseChromeBridgeAutoInstall {
                 -ExtensionDir $ExtensionDir
             throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_PROFILE_ROW_MISSING active_profile=$activeProfile timeout_s=$TimeoutSeconds installed=$($latest.installed) manifest_path=$($latest.manifest_path) expected_path=$ExtensionDir remediation=Chrome did not persist the Synapse unpacked extension row after Select Folder"
         }
+        $installReason = if ($before.installed -and -not $before.manifest_path_matches) {
+            'migrated_existing_extension_to_credentialed_stable_path'
+        } else {
+            'installed_unpacked_extension_in_active_profile'
+        }
         return [pscustomobject]@{
             attempted = $true
             changed = $true
-            reason = 'installed_unpacked_extension_in_active_profile'
+            reason = $installReason
             active_profile = $activeProfile
             chrome_window_hwnd = $chromeWindow.hwnd
             chrome_window_pid = $chromeWindow.pid

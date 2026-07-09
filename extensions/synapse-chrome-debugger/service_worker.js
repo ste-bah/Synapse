@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-06-30-window-id-v2";
-const BRIDGE_DECLARED_BUILD_SHA256 = "a3e3013060a20b95af67da6f5be3cdd45b36f85b9ea64ebf304577b389225fea";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-09-register-token-v1";
+const BRIDGE_DECLARED_BUILD_SHA256 = "25af9fe2d52245ee4d52ab89e580914ca65a0a8564c9696ff6c7b964d9cb165c";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
@@ -84,6 +84,8 @@ const BRIDGE_TOKEN_HEADER = "X-Synapse-Bridge-Token";
 const DAEMON_WS_BASE_URL = "ws://127.0.0.1:7700";
 const WINDOW_BOUNDS_SCALE_CANDIDATES = Object.freeze([1, 1.1, 1.25, 1.5, 1.75, 2, 2.5, 3]);
 const WEBSOCKET_KEEPALIVE_MS = 20000;
+const BRIDGE_REGISTER_TOKEN_HEADER = "X-Synapse-Bridge-Register-Token";
+const BRIDGE_REGISTER_TOKEN = "";
 const RECONNECT_INITIAL_MS = 1000;
 const RECONNECT_MAX_MS = 30000;
 const DISCONNECTED_KEEPALIVE_MS = 20000;
@@ -21856,6 +21858,14 @@ async function daemonFetchJson(path, options = {}) {
   };
   if (bridgeToken) {
     init.headers[BRIDGE_TOKEN_HEADER] = bridgeToken;
+  } else if (path === "/chrome-debugger/native/register") {
+    if (!BRIDGE_REGISTER_TOKEN) {
+      throw bridgeError(
+        ERROR_DAEMON_UNAVAILABLE,
+        "Synapse Chrome bridge register token missing from deployed service worker; rerun scripts\\synapse-setup.ps1 so the unpacked extension is credentialed before registration"
+      );
+    }
+    init.headers[BRIDGE_REGISTER_TOKEN_HEADER] = BRIDGE_REGISTER_TOKEN;
   }
   if (Object.prototype.hasOwnProperty.call(options, "body")) {
     init.headers["Content-Type"] = "application/json";
