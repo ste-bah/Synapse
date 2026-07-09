@@ -28,6 +28,7 @@ pub const PLAN_EXECUTION_SOURCE_OF_TRUTH: &str =
 pub enum PlanExecutionStatus {
     Succeeded,
     Failed,
+    Skipped,
     DryRun,
 }
 
@@ -37,6 +38,7 @@ impl PlanExecutionStatus {
         match self {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
+            Self::Skipped => "skipped",
             Self::DryRun => "dry_run",
         }
     }
@@ -148,12 +150,18 @@ pub fn build_plan_execution_record(
     steps: Vec<PlanStepExecutionReport>,
 ) -> PlanExecutionRecord {
     let failed = steps.iter().any(|step| step.status.is_terminal_failure());
+    let all_succeeded = !steps.is_empty()
+        && steps
+            .iter()
+            .all(|step| step.status == PlanStepExecutionStatus::Succeeded);
     let status = if dry_run {
         PlanExecutionStatus::DryRun
     } else if failed {
         PlanExecutionStatus::Failed
-    } else {
+    } else if all_succeeded {
         PlanExecutionStatus::Succeeded
+    } else {
+        PlanExecutionStatus::Skipped
     };
     PlanExecutionRecord {
         record_version: PLAN_EXECUTION_RECORD_VERSION,
@@ -324,5 +332,38 @@ mod tests {
             .expect("execution exists");
         assert_eq!(readback, record);
         assert_eq!(readback.status, PlanExecutionStatus::Succeeded);
+    }
+
+    #[test]
+    fn skipped_only_execution_does_not_roll_up_as_succeeded() {
+        let started = 200;
+        let completed = 225;
+        let record = build_plan_execution_record(
+            plan_execution_id("sg1-skipped-assist", started),
+            "sg1-skipped-assist".to_owned(),
+            Some("session-1".to_owned()),
+            190,
+            started,
+            completed,
+            false,
+            plan(),
+            vec![PlanStepExecutionReport {
+                index: 0,
+                backend: PlanBackend::ActLaunch,
+                action: "report-only assist readback".to_owned(),
+                postcondition: Postcondition::WindowForProcessExists {
+                    process: "notepad.exe".to_owned(),
+                },
+                status: PlanStepExecutionStatus::Skipped,
+                started_ts_ns: started,
+                completed_ts_ns: completed,
+                duration_ns: completed - started,
+                evidence: json!({"mutation": "not_attempted_without_verifiable_desired_state"}),
+                error_code: Some("ASSIST_CORRECTION_REPORT_ONLY".to_owned()),
+                error: Some("assist produced a scoped readback report only".to_owned()),
+            }],
+        );
+
+        assert_eq!(record.status, PlanExecutionStatus::Skipped);
     }
 }

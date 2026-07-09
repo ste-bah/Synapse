@@ -215,7 +215,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Accept one live suggestion and execute its compiled setup plan (#860). Loads or compiles the routine plan, marks the durable suggestion/v1 row accepted, runs supported steps through background-first routes (act_launch for apps, cdp_open_tab for browser hosts), refuses unsupported/ambiguous steps loudly, verifies each step's postcondition, persists a plan_execution/v1 report, and records routine feedback with the execution outcome. dry_run returns the same routing report without mutating storage or launching/opening anything."
+        description = "Accept one live suggestion and execute its compiled setup plan (#860). Loads or compiles the routine plan, marks the durable suggestion/v1 row accepted, runs supported steps through background-first routes (act_launch for apps, cdp_open_tab for browser hosts), refuses unsupported/ambiguous steps loudly, verifies each mutating step's postcondition, persists a plan_execution/v1 report, and records routine feedback with the execution outcome. Assist report-only mitigations are recorded as skipped unless a scoped correction is actually attempted and verified. dry_run returns the same routing report without mutating storage or launching/opening anything."
     )]
     pub async fn suggestion_accept(
         &self,
@@ -521,9 +521,9 @@ impl SynapseService {
 
         let status = match execution.status {
             PlanExecutionStatus::Succeeded => ArmedRoutineRunStatus::Succeeded,
-            PlanExecutionStatus::Failed | PlanExecutionStatus::DryRun => {
-                ArmedRoutineRunStatus::Failed
-            }
+            PlanExecutionStatus::Failed
+            | PlanExecutionStatus::Skipped
+            | PlanExecutionStatus::DryRun => ArmedRoutineRunStatus::Failed,
         };
         let (error_code, error) = if status == ArmedRoutineRunStatus::Failed {
             (
@@ -671,7 +671,8 @@ impl SynapseService {
                     "correction_attempt": {
                         "mode": "in_session_report",
                         "mutation": "not_attempted_without_verifiable_desired_state",
-                        "honesty": "privacy-safe detector evidence does not include raw user content; success means the scoped assist report and fresh target readback were produced"
+                        "status": "report_only",
+                        "honesty": "privacy-safe detector evidence does not include raw user content; the assist acceptance produced a scoped report and fresh target readback without claiming a correction was applied"
                     },
                     "postcondition": mitigation.postcondition,
                 });
@@ -679,10 +680,13 @@ impl SynapseService {
                     step_report(
                         started,
                         step,
-                        PlanStepExecutionStatus::Succeeded,
+                        PlanStepExecutionStatus::Skipped,
                         evidence,
-                        None,
-                        None,
+                        Some("ASSIST_CORRECTION_REPORT_ONLY"),
+                        Some(
+                            "assist produced a scoped target readback report only; no correction was attempted because no verifiable desired state was available"
+                                .to_owned(),
+                        ),
                     )
                 } else {
                     step_report(

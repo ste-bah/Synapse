@@ -507,12 +507,12 @@ fn detector_offer(detector: &str, process_name: Option<&str>) -> String {
     match process_name {
         Some(process) if !process.trim().is_empty() => {
             format!(
-                "Stuck in {article} {label} in {process}? I can inspect the target and try a scoped correction."
+                "Stuck in {article} {label} in {process}? I can inspect the target and report what can be verified."
             )
         }
         _ => {
             format!(
-                "Stuck in {article} {label}? I can inspect the target and try a scoped correction."
+                "Stuck in {article} {label}? I can inspect the target and report what can be verified."
             )
         }
     }
@@ -597,7 +597,7 @@ fn assist_candidate_from_event(
     let label = format!("Assist: {}", detector_label(detector));
     let offer = detector_offer(detector, process_name.as_deref());
     let instruction = format!(
-        "Inspect the current target for assist opportunity {source_event_id} ({detector}); use the privacy-safe event evidence and fresh observation only, then apply a scoped correction when the postcondition is verifiable. If no safe correction can be inferred, report the precise blocker instead of mutating the app."
+        "Inspect the current target for assist opportunity {source_event_id} ({detector}); use the privacy-safe event evidence and fresh observation only. Report a scoped readback and precise blocker; do not claim a correction unless a desired state is known, mutation is attempted, and the postcondition is verified."
     );
     let mitigation = AssistMitigation {
         strategy: AssistMitigationStrategy::InSessionCorrection,
@@ -608,7 +608,7 @@ fn assist_candidate_from_event(
         process_name,
         input_origin,
         instruction,
-        postcondition: "fresh target readback exists and the in-session assist attempt reports success evidence or a precise failure".to_owned(),
+        postcondition: "fresh target readback exists and the in-session assist report records whether a correction was verified, skipped as report-only, or failed".to_owned(),
         evidence: json!({
             "event_id": &event.event_id,
             "opportunity_id": &source_event_id,
@@ -1401,7 +1401,7 @@ pub fn assist_plan_for_suggestion(
         .clone()
         .unwrap_or_else(|| "assist-opportunity".to_owned());
     let action = format!(
-        "in-session assist correction for {} from {}",
+        "in-session assist report for {} from {}",
         mitigation.detector, mitigation.source_event_id
     );
     Ok(PlanDocument {
