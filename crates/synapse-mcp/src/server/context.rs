@@ -91,15 +91,15 @@ impl SynapseService {
         });
         match (recording_enabled, m3_scaffold_ready) {
             (true, true) => {
-                "Synapse M1 perception MCP server with M2 action scaffold and M3 scaffold (recording enabled)"
+                "Synapse MCP server with M1 perception, M2 action, M3 autonomy, and 40-tool facade surface (recording enabled)"
             }
             (false, true) => {
-                "Synapse M1 perception MCP server with M2 action scaffold and M3 scaffold"
+                "Synapse MCP server with M1 perception, M2 action, M3 autonomy, and 40-tool facade surface"
             }
             (true, false) => {
-                "Synapse M1 perception MCP server with M2 action scaffold (recording enabled)"
+                "Synapse MCP server with M1 perception and M2 action (recording enabled)"
             }
-            (false, false) => "Synapse M1 perception MCP server with M2 action scaffold",
+            (false, false) => "Synapse MCP server with M1 perception and M2 action",
         }
     }
 
@@ -1631,7 +1631,7 @@ mod scope_gate_tests {
 
         assert!(!m3_tools.is_empty());
         assert_eq!(unique_tool_names.len(), m3_tools.len());
-        assert!(service.instructions().contains("M3 scaffold"));
+        assert!(service.instructions().contains("M3 autonomy"));
 
         Ok(())
     }

@@ -8,7 +8,7 @@ See [01_system_overview.md](01_system_overview.md) for the architectural narrati
 
 ## 1. Workspace Layout
 
-Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `rust-version = "1.95"`, `version = "0.1.0"`, license `MIT OR Apache-2.0`.
+Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `rust-version = "1.95"`, `version = "0.1.0"`, `license-file = "LICENSE.md"`.
 
 **`[workspace] members`** (14 crates):
 `synapse-mcp`, `synapse-core`, `synapse-capture`, `synapse-a11y`, `synapse-perception`, `synapse-audio`, `synapse-action`, `synapse-reflex`, `synapse-storage`, `synapse-profiles`, `synapse-models`, `synapse-telemetry`, `synapse-test-utils`, `synapse-overlay`.
@@ -609,7 +609,7 @@ React 19 + Vite + TypeScript SPA (`@synapse/command-center-dashboard`, private).
 Chrome MV3 extension "Synapse Chrome Bridge" (v0.1.1, min Chrome 125). Controls normal-profile Chrome tabs via a direct `127.0.0.1:7700` WebSocket bridge to the daemon. Permissions: `debugger`, `tabs`, `scripting`, `cookies`, `webRequest`, `webNavigation`, `alarms`, `management`; host perms `<all_urls>` + loopback. Files: `manifest.json`, `service_worker.js` (module background), `README.md`.
 
 ### `firmware/`
-`README.md` only at top level. Points to `firmware/pico-hid/` — a **separate** Cargo workspace (excluded from root; targets `thumbv6m-none-eabi`, `no_std`) for a Raspberry Pi Pico (RP2040) HID device. Exposes a composite USB device (VID `0x2E8A` / PID `0x1F50`): CDC ACM framed command channel + HID boot mouse/keyboard. Build feature flags: `loopback` (PONG debug), `force-first-nak` (ACK/NAK retry), `fake-fw-major-mismatch` (version-mismatch test). Release UF2 built via `scripts/release/firmware/build_pico_hid.ps1`.
+`README.md` only at top level. Documents the retired physical Pico HID path and states that current Synapse action uses the software backend. No `firmware/pico-hid/` workspace, release firmware script, or UF2 artifact path is present on current `main`.
 
 ### `scripts/` — operational PowerShell / shell / Python
 ```

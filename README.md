@@ -136,7 +136,8 @@ isolated session, while you keep working.
 
 Everything runs **on your machine**. No screen-scraping cloud service, no remote agent,
 no data leaving your PC. Synapse is Windows-native to the metal: Win32 `SendInput`, UI
-Automation, Windows Graphics Capture / DXGI, WASAPI audio, and local process control.
+Automation, Windows Graphics Capture / DXGI, optional debug-gated WASAPI audio capture,
+and local process control.
 
 ---
 
@@ -630,14 +631,18 @@ window via `target operation=claim`, gated by `approval` — and your cursor nev
 Durable jobs (`shell operation=start/status`), screenshot + OCR perception, and the audit
 trail give you a *provable* record of what happened while you slept.
 
-**🎧 Perceive three channels at once**
+**🎧 Debug-only audio prototype**
 
-> *"Join the meeting, transcribe the system audio live, and while it runs, fill in the CRM
-> form in the background window from yesterday's notes. When someone says my name in the
-> transcript, ping me."*
+> *"In a lab profile with debug tools and audio enabled, join the meeting, transcribe the
+> system audio live, and while it runs, fill in the CRM form in the background window from
+> yesterday's notes. When someone says my name in the transcript, ping me."*
 
-WASAPI audio capture + Whisper transcription, background form-fill through `browser_form` /
-`act` value patterns, and event subscriptions — three sensory channels, one agent.
+Audio transcription is not on the default 40-tool production surface. The lower-level
+`audio_tail` and `audio_transcribe` tools are debug-surface tools, require
+`SYNAPSE_DEBUG_TOOLS=1` and `--enable-audio`, and Whisper transcription requires a
+verified local model side-loaded into the configured model path; Synapse does not download
+that model automatically. Background form-fill through `browser_form` / `act` and event
+subscriptions remain part of the production surface.
 
 **🖥️ A self-driving install**
 
@@ -726,7 +731,7 @@ always backed by evidence. Full mapping and migration notes:
 | Action | Win32 `SendInput` (`enigo`), UIA control patterns, CDP input, verified readback |
 | Multi-agent | Per-session targets & clipboards, target-claim ownership, task queue, RocksDB mailboxes + workspace blackboard, approvals & escalation |
 | Learning | Routine mining, intent/assist, activity timeline & episodes, profile quality from audit |
-| Audio | WASAPI loopback + Whisper-tiny STT |
+| Audio | Debug-gated WASAPI loopback; Whisper STT requires `--enable-audio` plus a side-loaded verified model |
 | Storage | **RocksDB** (LZ4 + ZSTD), durable audit trail |
 | Models | ONNX Runtime (`ort`) for optional detection |
 
