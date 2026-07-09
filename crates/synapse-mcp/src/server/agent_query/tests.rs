@@ -324,17 +324,73 @@ async fn working_agent_snapshot_reconstructs_state_tool_events_and_tokens() {
         Some("Reading the config file to find the port. Then I'll run the build.")
     );
 
-    // task is null (not fabricated) and its source documents #910.
+    // No durable task row was planted, so task stays null rather than guessed.
     assert!(response.task.is_none());
-    assert!(
-        response
-            .sources
-            .get("task")
-            .expect("task source")
-            .contains("#910")
-    );
+    let task_source = response.sources.get("task").expect("task source");
+    assert!(task_source.contains("CF_KV"));
+    assert!(!task_source.contains("NOT YET IMPLEMENTED"));
     assert!(response.cooperative.is_none());
     assert_eq!(response.scan.events_matched, 6);
+}
+
+#[tokio::test]
+async fn task_link_reads_pending_attempt_from_durable_task_queue() {
+    let temp = TempDir::new().expect("tempdir");
+    let service = service_with_db(temp.path());
+    let db = db_of(&service);
+
+    let base = recent_base_ns();
+    write_event(
+        &db,
+        base + 1,
+        0,
+        AgentEventKind::SpawnReady,
+        Some(SPAWN),
+        Some(SESSION),
+        |_| {},
+    );
+    service
+        .task_create_for_test("task-query-join", "template-query")
+        .expect("create real task row");
+    service
+        .task_claim_with_spawn_for_test("task-query-join", SESSION, SPAWN, 7)
+        .expect("claim real task row with spawn binding");
+
+    let response = service
+        .agent_query_impl(params(SESSION), None)
+        .await
+        .expect("agent_query succeeds");
+    let task = response.task.expect("task link must be populated");
+    assert_eq!(task["task_id"], json!("task-query-join"));
+    assert_eq!(task["state"], json!("in_progress"));
+    assert_eq!(task["title"], json!("task-query-join"));
+    assert_eq!(task["template_id"], json!("template-query"));
+    assert_eq!(task["attempt"]["attempt_id"], json!(1));
+    assert_eq!(task["attempt"]["session_id"], json!(SESSION));
+    assert_eq!(task["attempt"]["spawn_id"], json!(SPAWN));
+    assert_eq!(task["attempt"]["template_version"], json!(7));
+    assert_eq!(task["attempt"]["outcome"], json!("pending"));
+    assert_eq!(
+        task["source"],
+        json!("CF_KV agent-task/v1/task/task-query-join")
+    );
+    let matched_by = task["matched_by"]
+        .as_array()
+        .expect("matched_by array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(matched_by.contains(&"session_id"));
+    assert!(matched_by.contains(&"spawn_id"));
+
+    let by_spawn = service
+        .agent_query_impl(params(SPAWN), None)
+        .await
+        .expect("spawn lookup succeeds");
+    assert_eq!(
+        by_spawn.task.expect("spawn lookup task link")["task_id"],
+        json!("task-query-join")
+    );
 }
 
 #[tokio::test]

@@ -42,6 +42,7 @@ use synapse_storage::{
 use rmcp::{RoleServer, service::RequestContext};
 
 use super::agent_state::{AgentAttentionClass, AgentLifecycleState, AgentStateRead};
+use super::agent_tasks::AttemptOutcome;
 use super::{
     ErrorData, Json, Parameters, SynapseService, agent_events::unix_time_ns_now, mcp_error, tool,
     tool_router,
@@ -281,8 +282,8 @@ pub struct AgentQueryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activity_summary: Option<String>,
 
-    /// Durable task/attempt link. Always null until #910 (durable agent task
-    /// queue) lands; reported null rather than fabricated.
+    /// Durable task/attempt link from the #910 task queue. Null only when no
+    /// task attempt binds this agent's session_id/spawn_id.
     pub task: Option<Value>,
 
     /// Cooperative answer, present only when `deep: true` was requested.
@@ -429,6 +430,7 @@ impl SynapseService {
             });
         let attention_class =
             agent_query_attention_class(lifecycle.as_ref(), session_summary.as_ref());
+        let task = read_task_snapshot_for_agent(&db, spawn_id.as_deref(), session_id.as_deref())?;
 
         // ---- Optional cooperative answer (deep mode). ----
         let cooperative = if params.deep {
@@ -467,7 +469,7 @@ impl SynapseService {
             turn,
             context_window_estimate_tokens,
             activity_summary,
-            task: None,
+            task,
             cooperative,
             scan: ScanReadback {
                 lookback_ms: params.lookback_ms,
@@ -1120,8 +1122,7 @@ fn sources_map() -> BTreeMap<String, String> {
     }
     map.insert(
         "task".to_owned(),
-        "#910 durable agent task queue — NOT YET IMPLEMENTED; reported null, never fabricated"
-            .to_owned(),
+        "CF_KV durable agent task rows (#910); joins TaskAttempt by session_id/spawn_id".to_owned(),
     );
     map.insert(
         "cooperative".to_owned(),
@@ -1139,6 +1140,56 @@ fn key_after(key: &[u8]) -> Vec<u8> {
 
 fn unix_time_ms_now() -> u64 {
     unix_time_ns_now() / 1_000_000
+}
+
+fn read_task_snapshot_for_agent(
+    db: &Db,
+    spawn_id: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Option<Value>, ErrorData> {
+    if spawn_id.is_none() && session_id.is_none() {
+        return Ok(None);
+    }
+
+    let tasks = SynapseService::read_all_tasks(db)?;
+    let mut best: Option<((u8, u64, u32), Value)> = None;
+    for task in tasks {
+        for attempt in &task.attempts {
+            let mut matched_by = Vec::new();
+            if spawn_id.is_some_and(|id| attempt.spawn_id.as_deref() == Some(id)) {
+                matched_by.push("spawn_id");
+            }
+            if session_id.is_some_and(|id| attempt.session_id == id) {
+                matched_by.push("session_id");
+            }
+            if matched_by.is_empty() {
+                continue;
+            }
+
+            let score = (
+                u8::from(attempt.outcome == AttemptOutcome::Pending),
+                attempt.started_unix_ms,
+                attempt.attempt_id,
+            );
+            let value = json!({
+                "task_id": task.task_id.clone(),
+                "state": task.state,
+                "title": task.title.clone(),
+                "priority": task.priority,
+                "template_id": task.template_id.clone(),
+                "attempt": attempt,
+                "matched_by": matched_by,
+                "source": format!("CF_KV agent-task/v1/task/{}", task.task_id),
+            });
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _value)| score > *best_score)
+            {
+                best = Some((score, value));
+            }
+        }
+    }
+    Ok(best.map(|(_score, value)| value))
 }
 
 fn agent_query_attention_class(
