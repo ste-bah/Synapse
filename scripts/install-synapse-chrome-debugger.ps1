@@ -947,6 +947,118 @@ function ConvertTo-SynapseComparablePath {
     return $full.TrimEnd($trimChars)
 }
 
+function Get-SynapseChromeBridgeReferencedManifestPaths {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ChromeUserDataRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$ExtensionId
+    )
+
+    $paths = @()
+    if (-not (Test-Path -LiteralPath $ChromeUserDataRoot -PathType Container)) {
+        return @()
+    }
+    foreach ($profileDir in @(Get-ChildItem -LiteralPath $ChromeUserDataRoot -Directory -ErrorAction SilentlyContinue)) {
+        if ([string]$profileDir.Name -eq 'Snapshots') {
+            continue
+        }
+        foreach ($prefFileName in @('Preferences', 'Secure Preferences')) {
+            $prefPath = Join-Path $profileDir.FullName $prefFileName
+            if (-not (Test-Path -LiteralPath $prefPath -PathType Leaf)) {
+                continue
+            }
+            try {
+                $pref = Get-Content -Raw -LiteralPath $prefPath | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                continue
+            }
+            if (-not $pref.extensions -or -not $pref.extensions.settings) {
+                continue
+            }
+            $property = $pref.extensions.settings.PSObject.Properties[$ExtensionId]
+            if (-not $property) {
+                continue
+            }
+            $setting = $property.Value
+            if ($setting.PSObject.Properties.Name -notcontains 'path') {
+                continue
+            }
+            $manifestPath = ConvertTo-SynapseComparablePath -Path ([string]$setting.path)
+            if (-not [string]::IsNullOrWhiteSpace($manifestPath)) {
+                $paths += $manifestPath
+            }
+        }
+    }
+    @($paths | Sort-Object -Unique)
+}
+
+function Remove-SynapseStaleChromeBridgeBuildDirs {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$StableRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentExtensionDir,
+        [Parameter(Mandatory = $true)]
+        [string]$ChromeUserDataRoot,
+        [Parameter(Mandatory = $true)]
+        [string]$ExtensionId
+    )
+
+    if (-not (Test-Path -LiteralPath $StableRoot -PathType Container)) {
+        return [pscustomobject]@{
+            attempted = $false
+            reason = 'stable_root_missing'
+            stable_root = $StableRoot
+            current_extension_dir = $CurrentExtensionDir
+            referenced_paths = @()
+            preserved_dirs = @()
+            removed_dirs = @()
+            failed_dirs = @()
+        }
+    }
+
+    $current = ConvertTo-SynapseComparablePath -Path $CurrentExtensionDir
+    $referencedPaths = @(Get-SynapseChromeBridgeReferencedManifestPaths `
+        -ChromeUserDataRoot $ChromeUserDataRoot `
+        -ExtensionId $ExtensionId)
+    $preserved = @()
+    $removed = @()
+    $failed = @()
+
+    foreach ($dir in @(Get-ChildItem -LiteralPath $StableRoot -Directory -ErrorAction SilentlyContinue)) {
+        if ([string]$dir.Name -notlike 'synapse-chrome-bridge-*') {
+            continue
+        }
+        $dirPath = ConvertTo-SynapseComparablePath -Path $dir.FullName
+        if ($dirPath -ieq $current) {
+            $preserved += [pscustomobject]@{ path = $dir.FullName; reason = 'current_build' }
+            continue
+        }
+        if (@($referencedPaths | Where-Object { $_ -ieq $dirPath }).Count -gt 0) {
+            $preserved += [pscustomobject]@{ path = $dir.FullName; reason = 'referenced_by_chrome_profile' }
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction Stop
+            $removed += $dir.FullName
+        } catch {
+            $failed += [pscustomobject]@{ path = $dir.FullName; error = $_.Exception.Message }
+        }
+    }
+
+    [pscustomobject]@{
+        attempted = $true
+        reason = 'removed_unreferenced_stale_build_dirs'
+        stable_root = $StableRoot
+        current_extension_dir = $CurrentExtensionDir
+        referenced_paths = @($referencedPaths)
+        preserved_dirs = @($preserved)
+        removed_dirs = @($removed)
+        failed_dirs = @($failed)
+    }
+}
+
 function Get-SynapseCommandLineSwitchValue {
     param(
         [AllowNull()]
@@ -2015,6 +2127,11 @@ $synapseChromeProfileInstallState = [pscustomobject]@{
     cdp_bridge_reload_can_install_absent_extension = $false
     remediation = 'run scripts\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop with the target Chrome profile already open; the installer deploys the bundled bridge into %LOCALAPPDATA%\synapse\chrome-extension\<build-id> and auto-loads that stable unpacked directory in the active profile. browser_debugger.reload_bridge can only reload an already-registered bridge host and cannot install an absent Chrome extension'
 }
+$staleBridgeBuildCleanup = Remove-SynapseStaleChromeBridgeBuildDirs `
+    -StableRoot $stableRootFull `
+    -CurrentExtensionDir $extensionDir `
+    -ChromeUserDataRoot $chromeUserDataRoot `
+    -ExtensionId $ExtensionId
 $externalNativeMessagingProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
         $_.CommandLine -match 'chrome\.nativeMessaging' -and
@@ -2194,6 +2311,7 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
     external_popup_risk_bridge_management_permission_present = ($requiredPermissions -contains 'management')
     synapse_chrome_auto_install = $chromeBridgeAutoInstall
     synapse_chrome_profile_install_state = $synapseChromeProfileInstallState
+    stale_bridge_build_cleanup = $staleBridgeBuildCleanup
     synapse_chrome_profile_readback = $synapseChromeProfileReadback
     synapse_stale_granted_permission_warning = [pscustomobject]@{
         warning = ($staleSynapseGrantedPermissions.Count -gt 0)

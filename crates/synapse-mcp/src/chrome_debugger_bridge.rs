@@ -114,6 +114,7 @@ const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
 const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension with scripts\\install-synapse-chrome-debugger.ps1; the installer deploys the bridge to %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> and auto-loads that stable unpacked directory into the already-open active Chrome profile while refusing to launch a second Chrome profile; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.downloads/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus chrome.alarms MV3 reconnect wake, exposes debugger-free pageScreenshot capture through chrome.tabs.captureVisibleTab stitching, exposes chrome.downloads list/wait/event capture for browser_downloads save/move, exposes browser_file_upload with target-scoped DOM.setFileInputFiles/Page.fileChooserOpened for session-owned Chrome bridge tabs, and has explicit browser_debugger-profile chrome.debugger lanes for target-scoped hover/tap/active-tab drag, Page.printToPDF PDF rendering, Runtime.evaluate page evaluation, Page.addScriptToEvaluateOnNewDocument init scripts, Runtime.addBinding/Runtime.bindingCalled binding capture, Page.handleJavaScriptDialog dialog handling, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; browser_debugger facade operations require profile operation=set profile=browser_debugger with confirm_break_glass=true and a reason; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
 const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=use the already-open authenticated Chrome profile only; do not launch a second Chrome process/profile; wait for the installed bridge worker alarmReconnect registration and re-read health; if an active stale host appears call browser_debugger.reload_bridge through the public facade after setting profile=browser_debugger; if no host registers, run scripts\\install-synapse-chrome-debugger.ps1 from the interactive Windows desktop so it auto-loads the bundled unpacked extension into the existing active Chrome profile; if health reports installed=false, browser_debugger.reload_bridge cannot repair because Chrome has no loaded extension host to receive reloadSelf";
+const SETUP_REPAIR_MCP_GUIDANCE: &str = "mcp_setup_repair=call public MCP tool setup with operation=repair from profile=maintenance and repair.reason=chrome_bridge_build_skew";
 const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
 
@@ -275,7 +276,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
             detail: format!(
-                "Chrome bridge extension is stale for command {command_kind:?}; host_id={host_id} reason={reason} extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} extension_declared_build_sha256={} extension_service_worker_sha256={} extension_service_worker_sha256_status={} extension_service_worker_sha256_error={} expected_build_id={} expected_service_worker_sha256={} expected_service_worker_path={} capabilities={} required_capabilities={} remediation=run scripts\\install-synapse-chrome-debugger.ps1 to deploy the bundled bridge into the stable %LOCALAPPDATA%\\synapse\\chrome-extension\\<build-id> directory, then call browser_debugger.reload_bridge through the public facade from a bridge that advertises reloadSelf; if the loaded worker predates reloadSelf, fail closed and wait for a Chrome restart/reload rather than using foreground chrome://extensions automation",
+                "Chrome bridge extension is stale for command {command_kind:?}; host_id={host_id} reason={reason} extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} extension_declared_build_sha256={} extension_service_worker_sha256={} extension_service_worker_sha256_status={} extension_service_worker_sha256_error={} expected_build_id={} expected_service_worker_sha256={} expected_service_worker_path={} capabilities={} required_capabilities={} setup_repair_guidance={} remediation=run the concrete setup repair command reported by setup status/doctor or call setup operation=repair, then call browser_debugger.reload_bridge through the public facade from a bridge that advertises reloadSelf; if the loaded worker predates reloadSelf, fail closed and wait for a Chrome restart/reload rather than using foreground chrome://extensions automation",
                 host.extension_id.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_version.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_protocol_version
@@ -297,7 +298,8 @@ impl ChromeDebuggerBridgeError {
                 expected_worker_sha256,
                 expected_worker_path,
                 format_capabilities(&host.extension_capabilities),
-                REQUIRED_DIRECT_HTTP_CAPABILITIES.join(",")
+                REQUIRED_DIRECT_HTTP_CAPABILITIES.join(","),
+                setup_repair_guidance()
             ),
         }
     }
@@ -4670,11 +4672,16 @@ fn bridge_command_stale_reason_with_profile_state(
         ));
     }
     let mut identity_reasons = Vec::new();
-    if host.extension_build_id.as_deref() != Some(EXPECTED_EXTENSION_BUILD_ID) {
-        identity_reasons.push(format!(
-            "build_id={} expected={EXPECTED_EXTENSION_BUILD_ID}",
-            host.extension_build_id.as_deref().unwrap_or("not_seen_yet")
-        ));
+    if let Some(reason) = bridge_build_id_stale_reason(
+        host.extension_build_id.as_deref(),
+        EXPECTED_EXTENSION_BUILD_ID,
+        host.extension_service_worker_sha256.as_deref(),
+        profile_install_state
+            .active_profile_service_worker_sha256
+            .as_deref(),
+        host.extension_service_worker_sha256_status.as_deref(),
+    ) {
+        identity_reasons.push(reason);
     }
     if let Some(reason) = service_worker_integrity_stale_reason(
         host.extension_service_worker_sha256.as_deref(),
@@ -4775,6 +4782,62 @@ fn service_worker_integrity_stale_reason(
     }
 }
 
+fn bridge_build_id_stale_reason(
+    actual_build_id: Option<&str>,
+    expected_build_id: &str,
+    actual_service_worker_sha256: Option<&str>,
+    expected_service_worker_sha256: Option<&str>,
+    actual_service_worker_status: Option<&str>,
+) -> Option<String> {
+    if actual_build_id == Some(expected_build_id) {
+        return None;
+    }
+    let actual_build_id = actual_build_id.unwrap_or("not_seen_yet");
+    let worker_sha256_matches = actual_service_worker_sha256
+        .zip(expected_service_worker_sha256)
+        .is_some_and(|(actual, expected)| actual.trim().eq_ignore_ascii_case(expected.trim()))
+        && actual_service_worker_status.unwrap_or("not_seen_yet") == "ok";
+    if worker_sha256_matches {
+        return Some(format!(
+            "build_id_skew=daemon_expected_build_mismatch loaded_build_id={} expected_build_id={} service_worker_sha256_matches_expected=true repair=restart_or_reinstall_repo_built_daemon",
+            actual_build_id, expected_build_id
+        ));
+    }
+    Some(format!(
+        "build_id={} expected={}",
+        actual_build_id, expected_build_id
+    ))
+}
+
+fn setup_repair_guidance() -> String {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source_dir = manifest_dir.parent().and_then(Path::parent);
+    if let Some(source_dir) = source_dir {
+        let setup_script = source_dir.join("scripts").join("synapse-setup.ps1");
+        if setup_script.is_file() {
+            return format!(
+                "{SETUP_REPAIR_MCP_GUIDANCE}; setup_script_path={} source_dir={} powershell_command={}",
+                quote_detail_value(&setup_script.to_string_lossy()),
+                quote_detail_value(&source_dir.to_string_lossy()),
+                quote_detail_value(&format!(
+                    "pwsh -NoProfile -ExecutionPolicy Bypass -File \"{}\" -SourceDir \"{}\" -ForceRestart",
+                    setup_script.display(),
+                    source_dir.display()
+                ))
+            );
+        }
+        return format!(
+            "{SETUP_REPAIR_MCP_GUIDANCE}; setup_script_missing_at={} source_dir={}",
+            quote_detail_value(&setup_script.to_string_lossy()),
+            quote_detail_value(&source_dir.to_string_lossy())
+        );
+    }
+    format!(
+        "{SETUP_REPAIR_MCP_GUIDANCE}; source_dir_unresolved_from_cargo_manifest_dir={}",
+        quote_detail_value(env!("CARGO_MANIFEST_DIR"))
+    )
+}
+
 fn bridge_identity_stale_reasons(host: &ChromeBridgeHealthRecord) -> Vec<String> {
     let mut reasons = Vec::new();
     if host.extension_id.as_deref() != Some(EXTENSION_ID) {
@@ -4783,11 +4846,14 @@ fn bridge_identity_stale_reasons(host: &ChromeBridgeHealthRecord) -> Vec<String>
             host.extension_id.as_deref().unwrap_or("not_seen_yet")
         ));
     }
-    if host.extension_build_id.as_deref() != Some(EXPECTED_EXTENSION_BUILD_ID) {
-        reasons.push(format!(
-            "build_id={} expected={EXPECTED_EXTENSION_BUILD_ID}",
-            host.extension_build_id.as_deref().unwrap_or("not_seen_yet")
-        ));
+    if let Some(reason) = bridge_build_id_stale_reason(
+        host.extension_build_id.as_deref(),
+        EXPECTED_EXTENSION_BUILD_ID,
+        host.extension_service_worker_sha256.as_deref(),
+        host.expected_service_worker_sha256.as_deref(),
+        host.extension_service_worker_sha256_status.as_deref(),
+    ) {
+        reasons.push(reason);
     }
     if let Some(reason) = service_worker_integrity_stale_reason(
         host.extension_service_worker_sha256.as_deref(),
@@ -9781,6 +9847,65 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn build_id_skew_reason_distinguishes_matching_worker_bytes() {
+        let reason = bridge_build_id_stale_reason(
+            Some("synapse-chrome-bridge-future"),
+            EXPECTED_EXTENSION_BUILD_ID,
+            Some(TEST_SERVICE_WORKER_SHA256),
+            Some(TEST_SERVICE_WORKER_SHA256),
+            Some("ok"),
+        )
+        .expect("build id mismatch");
+
+        assert!(reason.contains("build_id_skew=daemon_expected_build_mismatch"));
+        assert!(reason.contains("loaded_build_id=synapse-chrome-bridge-future"));
+        assert!(reason.contains("service_worker_sha256_matches_expected=true"));
+        assert!(reason.contains("repair=restart_or_reinstall_repo_built_daemon"));
+
+        let stale_worker_reason = bridge_build_id_stale_reason(
+            Some("synapse-chrome-bridge-future"),
+            EXPECTED_EXTENSION_BUILD_ID,
+            Some("different-worker-sha"),
+            Some(TEST_SERVICE_WORKER_SHA256),
+            Some("mismatch"),
+        )
+        .expect("build id mismatch");
+        assert!(stale_worker_reason.contains("build_id=synapse-chrome-bridge-future"));
+        assert!(!stale_worker_reason.contains("build_id_skew="));
+    }
+
+    #[test]
+    fn stale_bridge_error_names_setup_repair_surface() {
+        let profile_install_state = SynapseChromeProfileInstallState::test_installed();
+        let mut host = test_host_record();
+        host.extension_build_id = Some("synapse-chrome-bridge-future".to_owned());
+        host.extension_service_worker_sha256 = Some(TEST_SERVICE_WORKER_SHA256.to_owned());
+        host.extension_service_worker_sha256_status = Some("ok".to_owned());
+        let reason = bridge_command_stale_reason_with_profile_state(
+            &host,
+            "openTab",
+            &profile_install_state,
+        )
+        .expect("stale reason");
+
+        let error = ChromeDebuggerBridgeError::stale("openTab", "host-test", &host, &reason);
+
+        assert_eq!(error.code(), error_codes::CHROME_BRIDGE_EXTENSION_STALE);
+        assert!(
+            error
+                .detail()
+                .contains("build_id_skew=daemon_expected_build_mismatch")
+        );
+        assert!(
+            error
+                .detail()
+                .contains("mcp_setup_repair=call public MCP tool setup")
+        );
+        assert!(error.detail().contains("setup_script_path="));
+        assert!(error.detail().contains("synapse-setup.ps1"));
     }
 
     #[test]

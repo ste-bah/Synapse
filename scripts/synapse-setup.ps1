@@ -346,7 +346,11 @@ function Format-SynapseChromeBridgeProfileInstallState {
     $autoInstallAttempted = if ($autoInstall) { [string]$autoInstall.attempted } else { 'missing' }
     $autoInstallReason = if ($autoInstall) { [string]$autoInstall.reason } else { 'missing' }
     $extensionDir = if ($Readback.extension_dir) { [string]$Readback.extension_dir } else { 'missing' }
-    return ("profile_install_state=installed:{0},profile_count:{1},installed_profile_count:{2},active_profile:{3},active_profile_installed:{4},reason:{5},auto_install_attempted:{6},auto_install_reason:{7},extension_dir:{8}" -f `
+    $cleanup = $Readback.stale_bridge_build_cleanup
+    $cleanupRemoved = if ($cleanup) { @($cleanup.removed_dirs).Count } else { 'missing' }
+    $cleanupPreserved = if ($cleanup) { @($cleanup.preserved_dirs).Count } else { 'missing' }
+    $cleanupFailed = if ($cleanup) { @($cleanup.failed_dirs).Count } else { 'missing' }
+    return ("profile_install_state=installed:{0},profile_count:{1},installed_profile_count:{2},active_profile:{3},active_profile_installed:{4},reason:{5},auto_install_attempted:{6},auto_install_reason:{7},extension_dir:{8},stale_build_dirs_removed:{9},stale_build_dirs_preserved:{10},stale_build_dirs_failed:{11}" -f `
         $state.installed, `
         $state.profile_count, `
         $state.installed_profile_count, `
@@ -355,7 +359,10 @@ function Format-SynapseChromeBridgeProfileInstallState {
         $state.reason, `
         $autoInstallAttempted, `
         $autoInstallReason, `
-        $extensionDir)
+        $extensionDir, `
+        $cleanupRemoved, `
+        $cleanupPreserved, `
+        $cleanupFailed)
 }
 
 function Invoke-SynapseChromeBridgeUiRepair {

@@ -508,6 +508,9 @@ fn setup_repair_error(
 
 pub(super) fn setup_status(service: &SynapseService) -> Result<SetupStatusResponse, ErrorData> {
     let bind = service.m3_bind_addr()?;
+    let source_dir = setup_source_dir()?;
+    let setup_script = setup_script_path(&source_dir)?;
+    let setup_repair_command_args = setup_repair_command_args(&setup_script, &source_dir, &bind);
     let token_file = file_readback(appdata_path(["synapse", "token.txt"]));
     let daemon_run_file = active_daemon_run_file()?;
     let shared_daemon_run_file = file_readback(shared_daemon_run_file_path());
@@ -518,6 +521,11 @@ pub(super) fn setup_status(service: &SynapseService) -> Result<SetupStatusRespon
         source_of_truth: SETUP_SOT,
         pid: std::process::id(),
         bind,
+        source_dir: source_dir.display().to_string(),
+        setup_script_file: file_readback(setup_script),
+        setup_repair_command_args,
+        setup_repair_mcp_tool: "setup operation=repair repair.reason=<reason> profile=maintenance"
+            .to_owned(),
         token_file,
         daemon_run_file,
         shared_daemon_run_file,
