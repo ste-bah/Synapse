@@ -9,6 +9,19 @@ pub struct TextRegion {
     pub text: String,
     pub bbox: Rect,
     pub confidence: f32,
+    #[serde(default)]
+    pub confidence_source: TextRegionConfidenceSource,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextRegionConfidenceSource {
+    Engine,
+    Uia,
+    Synthetic,
+    Heuristic,
+    #[default]
+    Unsupported,
 }
 
 pub trait OcrProvider {
@@ -113,7 +126,7 @@ mod platform {
     use serde::Deserialize;
     use synapse_core::Rect;
 
-    use super::{PerceptionError, PerceptionResult, TextRegion};
+    use super::{PerceptionError, PerceptionResult, TextRegion, TextRegionConfidenceSource};
 
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -124,6 +137,8 @@ mod platform {
         w: i32,
         h: i32,
         confidence: f32,
+        #[serde(default)]
+        confidence_source: TextRegionConfidenceSource,
     }
 
     #[derive(Debug, Deserialize)]
@@ -184,6 +199,7 @@ mod platform {
                     h: word.h,
                 },
                 confidence: word.confidence,
+                confidence_source: word.confidence_source,
             })
             .collect::<Vec<_>>();
         if regions.is_empty() {
@@ -267,7 +283,8 @@ try {
                 y = [int][Math]::Round($rect.Y)
                 w = [int][Math]::Round($rect.Width)
                 h = [int][Math]::Round($rect.Height)
-                confidence = 1.0
+                confidence = 0.0
+                confidence_source = 'unsupported'
             }
         }
     }
@@ -288,7 +305,7 @@ try {
 mod platform {
     use synapse_core::Rect;
 
-    use super::{PerceptionError, PerceptionResult, TextRegion};
+    use super::{PerceptionError, PerceptionResult, TextRegion, TextRegionConfidenceSource};
 
     pub fn read_text(_region: Rect) -> PerceptionResult<Vec<TextRegion>> {
         Err(PerceptionError::OcrBackendUnavailable {
@@ -311,7 +328,7 @@ mod platform {
         Storage::Streams::DataWriter,
     };
 
-    use super::{PerceptionError, PerceptionResult, TextRegion};
+    use super::{PerceptionError, PerceptionResult, TextRegion, TextRegionConfidenceSource};
 
     const OCR_MIN_RECOGNITION_HEIGHT_PX: u32 = 64;
     const OCR_MAX_UPSCALE: u32 = 6;
@@ -413,7 +430,8 @@ mod platform {
                         w: round_scaled_to_i32(bbox.Width, scale).max(1),
                         h: round_scaled_to_i32(bbox.Height, scale).max(1),
                     },
-                    confidence: 1.0,
+                    confidence: 0.0,
+                    confidence_source: TextRegionConfidenceSource::Unsupported,
                 });
             }
         }

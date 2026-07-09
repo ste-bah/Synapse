@@ -29,6 +29,9 @@ expression: shape
       "confidence": {
         "type": "number"
       },
+      "confidence_source": {
+        "type": "string"
+      },
       "latency_ms": {
         "minimum": 0,
         "type": "integer"
@@ -43,6 +46,7 @@ expression: shape
     "required": [
       "text",
       "confidence",
+      "confidence_source",
       "latency_ms",
       "model_id"
     ],

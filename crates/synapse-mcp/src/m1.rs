@@ -5269,6 +5269,7 @@ mod tests {
                         h: 24,
                     },
                     confidence: 0.95,
+                    confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
                 },
                 TextRegion {
                     text: "now".to_owned(),
@@ -5279,6 +5280,7 @@ mod tests {
                         h: 24,
                     },
                     confidence: 0.93,
+                    confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
                 },
             ],
             8,
@@ -5332,6 +5334,7 @@ mod tests {
                         h: 12,
                     },
                     confidence: 0.5,
+                    confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
                 },
                 TextRegion {
                     text: "Hidden".to_owned(),
@@ -5342,6 +5345,7 @@ mod tests {
                         h: 12,
                     },
                     confidence: 0.5,
+                    confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
                 },
             ],
             8,
@@ -5885,6 +5889,7 @@ mod tests {
             text: text.to_owned(),
             bbox: Rect { x, y, w, h },
             confidence: 0.95,
+            confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
         }
     }
 

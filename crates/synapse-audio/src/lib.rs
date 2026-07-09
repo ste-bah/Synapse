@@ -15,7 +15,7 @@ use synapse_core::Event;
 pub use error::{AudioError, AudioResult};
 pub use loopback::LoopbackStatus;
 pub use ring::{AudioFormat, AudioRing, AudioWindow};
-pub use stt::{Transcription, WhisperTinyStt};
+pub use stt::{Transcription, TranscriptionConfidenceSource, WhisperTinyStt};
 pub use synapse_core::DirectionEstimate;
 
 pub const DEFAULT_RING_SECONDS: u32 = 30;

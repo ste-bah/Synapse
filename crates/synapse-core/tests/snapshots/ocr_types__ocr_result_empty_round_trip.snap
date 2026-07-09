@@ -6,6 +6,7 @@ expression: "round_trip(\"OcrResult\", \"snapshot_empty\", empty_ocr_result())?"
   "full_text": "",
   "words": [],
   "confidence": 0.0,
+  "confidence_source": "unsupported",
   "region": {
     "x": 0,
     "y": 0,

@@ -1,6 +1,9 @@
 use rmcp::ErrorData;
-use synapse_core::{OcrBackend, OcrResult, OcrWord, Rect, error_codes};
-use synapse_perception::{TextRegion, read_text as platform_read_text, read_text_with_provider};
+use synapse_core::{OcrBackend, OcrConfidenceSource, OcrResult, OcrWord, Rect, error_codes};
+use synapse_perception::{
+    TextRegion, TextRegionConfidenceSource, read_text as platform_read_text,
+    read_text_with_provider,
+};
 
 use crate::m1::{M1State, ReadTextParams, current_input, mcp_error};
 
@@ -359,17 +362,24 @@ fn ocr_result_from_text_regions(
         .collect::<Vec<_>>()
         .join(" ");
     let confidence = aggregate_confidence(&regions);
+    let confidence_source = aggregate_confidence_source(&regions);
     OcrResult {
         full_text,
         words: regions
             .into_iter()
             .map(|word| OcrWord {
-                confidence: identifier_aware_confidence(&word.text, word.confidence),
+                confidence: word_confidence(&word.text, word.confidence, word.confidence_source),
+                confidence_source: word_confidence_source(
+                    &word.text,
+                    word.confidence,
+                    word.confidence_source,
+                ),
                 text: word.text,
                 bbox: word.bbox,
             })
             .collect(),
         confidence,
+        confidence_source,
         region: request.region,
         lang: request.lang(),
         perceived_text_notice: None,
@@ -383,10 +393,78 @@ fn aggregate_confidence(regions: &[TextRegion]) -> f32 {
     }
     let sum = regions
         .iter()
-        .map(|word| identifier_aware_confidence(&word.text, word.confidence))
+        .map(|word| word_confidence(&word.text, word.confidence, word.confidence_source))
         .sum::<f32>();
     let count = u16::try_from(regions.len()).unwrap_or(u16::MAX);
     sum / f32::from(count)
+}
+
+fn aggregate_confidence_source(regions: &[TextRegion]) -> OcrConfidenceSource {
+    regions
+        .iter()
+        .map(|word| word_confidence_source(&word.text, word.confidence, word.confidence_source))
+        .fold(None, |current, source| {
+            Some(match current {
+                None => source,
+                Some(existing) => merge_confidence_sources(existing, source),
+            })
+        })
+        .unwrap_or(OcrConfidenceSource::Unsupported)
+}
+
+fn word_confidence(text: &str, confidence: f32, source: TextRegionConfidenceSource) -> f32 {
+    if matches!(source, TextRegionConfidenceSource::Unsupported) {
+        return 0.0;
+    }
+    identifier_aware_confidence(text, confidence)
+}
+
+fn word_confidence_source(
+    text: &str,
+    confidence: f32,
+    source: TextRegionConfidenceSource,
+) -> OcrConfidenceSource {
+    let source = ocr_confidence_source(source);
+    if source == OcrConfidenceSource::Unsupported {
+        return source;
+    }
+    if is_ambiguous_identifier_token(text)
+        && normalize_confidence(confidence) > AMBIGUOUS_IDENTIFIER_CONFIDENCE_CAP
+    {
+        OcrConfidenceSource::Heuristic
+    } else {
+        source
+    }
+}
+
+fn ocr_confidence_source(source: TextRegionConfidenceSource) -> OcrConfidenceSource {
+    match source {
+        TextRegionConfidenceSource::Engine => OcrConfidenceSource::Engine,
+        TextRegionConfidenceSource::Uia => OcrConfidenceSource::Uia,
+        TextRegionConfidenceSource::Synthetic => OcrConfidenceSource::Synthetic,
+        TextRegionConfidenceSource::Heuristic => OcrConfidenceSource::Heuristic,
+        TextRegionConfidenceSource::Unsupported => OcrConfidenceSource::Unsupported,
+    }
+}
+
+fn merge_confidence_sources(
+    left: OcrConfidenceSource,
+    right: OcrConfidenceSource,
+) -> OcrConfidenceSource {
+    use OcrConfidenceSource::{Engine, Heuristic, Synthetic, Uia, Unsupported};
+    if left == right {
+        left
+    } else if matches!(left, Heuristic) || matches!(right, Heuristic) {
+        Heuristic
+    } else if matches!(left, Unsupported) || matches!(right, Unsupported) {
+        Unsupported
+    } else if matches!(left, Uia) || matches!(right, Uia) {
+        Uia
+    } else if matches!(left, Synthetic) || matches!(right, Synthetic) {
+        Synthetic
+    } else {
+        Engine
+    }
 }
 
 fn identifier_aware_confidence(text: &str, confidence: f32) -> f32 {
@@ -472,6 +550,7 @@ impl synapse_perception::OcrProvider for SyntheticOcrProvider {
                 h: 18,
             },
             confidence: 0.99,
+            confidence_source: TextRegionConfidenceSource::Synthetic,
         }])
     }
 }
@@ -480,9 +559,10 @@ impl synapse_perception::OcrProvider for SyntheticOcrProvider {
 mod tests {
     use super::{
         AMBIGUOUS_IDENTIFIER_CONFIDENCE_CAP, ReadTextCaptureSource, ResolvedReadTextRequest,
-        identifier_aware_confidence, is_ambiguous_identifier_token,
+        identifier_aware_confidence, is_ambiguous_identifier_token, ocr_result_from_text_regions,
     };
-    use synapse_core::{OcrBackend, Rect};
+    use synapse_core::{OcrBackend, OcrConfidenceSource, Rect};
+    use synapse_perception::TextRegionConfidenceSource;
 
     #[test]
     fn caps_short_tokens_collapsed_to_only_ambiguous_glyphs() {
@@ -502,6 +582,40 @@ mod tests {
     fn does_not_cap_ordinary_words_containing_some_ambiguous_letters() {
         assert!(!is_ambiguous_identifier_token("look"));
         assert_eq!(identifier_aware_confidence("look", 0.96), 0.96);
+    }
+
+    #[test]
+    fn unsupported_ocr_confidence_is_not_reported_as_measured() {
+        let request = ResolvedReadTextRequest {
+            region: Rect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 40,
+            },
+            capture_source: ReadTextCaptureSource::Screen,
+            requested_backend: OcrBackend::Auto,
+            effective_backend: OcrBackend::Winrt,
+            lang_hint: None,
+            synthetic: false,
+        };
+        let result = ocr_result_from_text_regions(
+            vec![synapse_perception::TextRegion {
+                text: "Synapse".to_owned(),
+                bbox: request.region,
+                confidence: 1.0,
+                confidence_source: TextRegionConfidenceSource::Unsupported,
+            }],
+            &request,
+        );
+
+        assert_eq!(result.confidence, 0.0);
+        assert_eq!(result.confidence_source, OcrConfidenceSource::Unsupported);
+        assert_eq!(result.words[0].confidence, 0.0);
+        assert_eq!(
+            result.words[0].confidence_source,
+            OcrConfidenceSource::Unsupported
+        );
     }
 
     #[cfg(windows)]

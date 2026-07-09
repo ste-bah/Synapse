@@ -33,6 +33,7 @@ async fn audio_transcribe_schema_defaults_silence_and_edges() -> anyhow::Result<
     )?;
     assert_eq!(silence["text"], "");
     assert_eq!(silence["confidence"], 0.0);
+    assert_eq!(silence["confidence_source"], "not_applicable");
     assert_eq!(silence["latency_ms"], 0);
     assert_eq!(silence["model_id"], "whisper_tiny_int8");
 
@@ -43,6 +44,7 @@ async fn audio_transcribe_schema_defaults_silence_and_edges() -> anyhow::Result<
     )?;
     assert_eq!(short_silence["text"], "");
     assert_eq!(short_silence["confidence"], 0.0);
+    assert_eq!(short_silence["confidence_source"], "not_applicable");
 
     let bad_language = client
         .tools_call_error("audio_transcribe", json!({"language": "xx"}))
@@ -92,7 +94,13 @@ fn assert_audio_transcribe_schema(tool: &Value) {
     );
     assert_eq!(
         shape["outputSchema"]["required"],
-        json!(["text", "confidence", "latency_ms", "model_id"])
+        json!([
+            "text",
+            "confidence",
+            "confidence_source",
+            "latency_ms",
+            "model_id"
+        ])
     );
     insta::assert_json_snapshot!("m3_audio_transcribe_tool", shape);
 }

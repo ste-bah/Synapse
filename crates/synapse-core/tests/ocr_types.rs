@@ -7,7 +7,7 @@ use proptest::{
     test_runner::{Config, TestRng, TestRunner},
 };
 use serde::{Serialize, de::DeserializeOwned};
-use synapse_core::{OcrResult, OcrWord, Rect};
+use synapse_core::{OcrConfidenceSource, OcrResult, OcrWord, Rect};
 
 #[test]
 fn ocr_type_edge_round_trips_with_readback() -> Result<(), Box<dyn std::error::Error>> {
@@ -120,6 +120,7 @@ fn empty_ocr_result() -> OcrResult {
         full_text: String::new(),
         words: Vec::new(),
         confidence: 0.0,
+        confidence_source: OcrConfidenceSource::Unsupported,
         region: rect(0, 0, 0, 0),
         lang: "und".to_owned(),
         perceived_text_notice: None,
@@ -132,6 +133,7 @@ fn single_word_ocr_result() -> OcrResult {
         full_text: "Synapse".to_owned(),
         words: vec![full_ocr_word("Synapse", 12, 4)],
         confidence: 0.99,
+        confidence_source: OcrConfidenceSource::Engine,
         region: rect(5, 7, 256, 64),
         lang: "en".to_owned(),
         perceived_text_notice: None,
@@ -147,6 +149,7 @@ fn full_ocr_result() -> OcrResult {
             full_ocr_word("Ready", 92, 4),
         ],
         confidence: 0.935,
+        confidence_source: OcrConfidenceSource::Engine,
         region: rect(5, 7, 256, 64),
         lang: "en-US".to_owned(),
         perceived_text_notice: None,
@@ -159,6 +162,7 @@ fn empty_ocr_word() -> OcrWord {
         text: String::new(),
         bbox: rect(0, 0, 0, 0),
         confidence: 0.0,
+        confidence_source: OcrConfidenceSource::Unsupported,
     }
 }
 
@@ -167,6 +171,7 @@ fn required_ocr_word() -> OcrWord {
         text: "A".to_owned(),
         bbox: rect(1, 2, 3, 4),
         confidence: 1.0,
+        confidence_source: OcrConfidenceSource::Engine,
     }
 }
 
@@ -175,6 +180,7 @@ fn full_ocr_word(text: &str, x: i32, y: i32) -> OcrWord {
         text: text.to_owned(),
         bbox: rect(x, y, 72, 18),
         confidence: if text == "Ready" { 0.88 } else { 0.99 },
+        confidence_source: OcrConfidenceSource::Engine,
     }
 }
 
@@ -194,6 +200,7 @@ fn ocr_result_strategy() -> impl Strategy<Value = OcrResult> {
             full_text,
             words,
             confidence,
+            confidence_source: OcrConfidenceSource::Engine,
             region,
             lang,
             perceived_text_notice: None,
@@ -207,6 +214,7 @@ fn ocr_word_strategy() -> impl Strategy<Value = OcrWord> {
             text,
             bbox,
             confidence,
+            confidence_source: OcrConfidenceSource::Engine,
         },
     )
 }

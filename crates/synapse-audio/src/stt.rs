@@ -32,12 +32,35 @@ const EN_DECODER_PROMPT: [i32; 4] = [50_258, 50_259, 50_359, 50_363];
 pub struct Transcription {
     pub text: String,
     pub confidence: f32,
+    pub confidence_source: TranscriptionConfidenceSource,
     pub language: String,
     pub audio_seconds: f32,
     pub elapsed_ms: u128,
     pub model_path: PathBuf,
     pub backend: Option<ModelBackend>,
     pub session_id: Option<u64>,
+}
+
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionConfidenceSource {
+    NotApplicable,
+    Model,
+    Heuristic,
+    #[default]
+    Unsupported,
+}
+
+impl TranscriptionConfidenceSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotApplicable => "not_applicable",
+            Self::Model => "model",
+            Self::Heuristic => "heuristic",
+            Self::Unsupported => "unsupported",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -134,7 +157,8 @@ impl WhisperTinyStt {
         };
 
         Ok(Transcription {
-            confidence: estimate_confidence(&text, language),
+            confidence: 0.0,
+            confidence_source: TranscriptionConfidenceSource::Unsupported,
             text,
             language: language.to_owned(),
             audio_seconds,
@@ -248,6 +272,7 @@ impl WhisperTinyStt {
         Transcription {
             text: String::new(),
             confidence: 0.0,
+            confidence_source: TranscriptionConfidenceSource::NotApplicable,
             language: language.as_ref().trim().to_owned(),
             audio_seconds,
             elapsed_ms: 0,
@@ -283,21 +308,5 @@ fn normalize_language(language: &str) -> AudioResult<&str> {
         Err(AudioError::LoopbackInitFailed {
             detail: format!("unsupported STT language `{language}`; only `en` is wired in M3"),
         })
-    }
-}
-
-#[must_use]
-fn estimate_confidence(text: &str, language: &str) -> f32 {
-    let normalized = format!(" {} ", text.to_ascii_lowercase());
-    if text.trim().is_empty() {
-        0.0
-    } else if language == DEFAULT_LANGUAGE
-        && ![" hello ", " world ", " this ", " is ", " the ", " synapse "]
-            .iter()
-            .any(|hint| normalized.contains(hint))
-    {
-        0.48
-    } else {
-        0.86
     }
 }

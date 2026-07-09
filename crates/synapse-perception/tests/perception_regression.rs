@@ -558,6 +558,7 @@ fn ocr_provider_happy_path_and_empty_result_are_observable() -> TestResult {
                 h: 18,
             },
             confidence: 0.99,
+            confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
         }],
     };
     regression_log(format_args!(

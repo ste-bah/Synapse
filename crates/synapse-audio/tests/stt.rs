@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use synapse_audio::{
-    AudioConfig, AudioFormat, AudioRuntime, AudioWindow, WhisperTinyStt,
-    stt::WHISPER_TINY_INT8_SHA256,
+    AudioConfig, AudioFormat, AudioRuntime, AudioWindow, TranscriptionConfidenceSource,
+    WhisperTinyStt, stt::WHISPER_TINY_INT8_SHA256,
 };
 use synapse_core::error_codes;
 
@@ -55,8 +55,16 @@ fn empty_and_silence_windows_return_blank_without_model_load() -> TestResult {
 
     assert_eq!(empty.text, "");
     assert!(empty.confidence.abs() <= f32::EPSILON);
+    assert_eq!(
+        empty.confidence_source,
+        TranscriptionConfidenceSource::NotApplicable
+    );
     assert_eq!(silence.text, "");
     assert!(silence.confidence.abs() <= f32::EPSILON);
+    assert_eq!(
+        silence.confidence_source,
+        TranscriptionConfidenceSource::NotApplicable
+    );
     assert!(!stt.is_loaded());
     Ok(())
 }

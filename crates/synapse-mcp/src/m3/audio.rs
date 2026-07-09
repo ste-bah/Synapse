@@ -94,6 +94,7 @@ pub struct AudioTranscribeParams {
 pub struct AudioTranscribeResponse {
     pub text: String,
     pub confidence: f32,
+    pub confidence_source: String,
     pub latency_ms: u64,
     pub model_id: String,
 }
@@ -314,6 +315,7 @@ fn response_from_transcription(transcription: Transcription) -> AudioTranscribeR
     AudioTranscribeResponse {
         text: transcription.text,
         confidence: transcription.confidence,
+        confidence_source: transcription.confidence_source.as_str().to_owned(),
         latency_ms: u64::try_from(transcription.elapsed_ms).unwrap_or(u64::MAX),
         model_id: WHISPER_TINY_MODEL_ID.to_owned(),
     }
@@ -443,6 +445,7 @@ mod tests {
             .map_err(|error| anyhow::anyhow!("transcribe silence failed: {error:?}"))?;
         assert_eq!(blank.text, "");
         assert_eq!(blank.confidence, 0.0);
+        assert_eq!(blank.confidence_source, "not_applicable");
         assert_eq!(blank.latency_ms, 0);
         assert_eq!(blank.model_id, WHISPER_TINY_MODEL_ID);
 

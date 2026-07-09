@@ -10,5 +10,6 @@ expression: "round_trip(\"OcrWord\", \"snapshot\", full_ocr_word(\"Synapse\", 12
     "w": 72,
     "h": 18
   },
-  "confidence": 0.99
+  "confidence": 0.99,
+  "confidence_source": "engine"
 }

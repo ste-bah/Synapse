@@ -473,6 +473,8 @@ pub struct OcrResult {
     pub full_text: String,
     pub words: Vec<OcrWord>,
     pub confidence: f32,
+    #[serde(default)]
+    pub confidence_source: OcrConfidenceSource,
     pub region: Rect,
     pub lang: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -481,10 +483,23 @@ pub struct OcrResult {
     pub suspected_injection: Vec<SuspectedInjectionAnnotation>,
 }
 
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum OcrConfidenceSource {
+    Engine,
+    Uia,
+    Synthetic,
+    Heuristic,
+    #[default]
+    Unsupported,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct OcrWord {
     pub text: String,
     pub bbox: Rect,
     pub confidence: f32,
+    #[serde(default)]
+    pub confidence_source: OcrConfidenceSource,
 }

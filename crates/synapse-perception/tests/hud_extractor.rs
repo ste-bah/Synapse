@@ -443,6 +443,7 @@ fn word(text: &str, confidence: f32) -> TextRegion {
         text: text.to_owned(),
         bbox: screen_region(),
         confidence,
+        confidence_source: synapse_perception::TextRegionConfidenceSource::Engine,
     }
 }
 

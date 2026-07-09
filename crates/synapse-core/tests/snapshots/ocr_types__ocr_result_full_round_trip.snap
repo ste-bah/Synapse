@@ -13,7 +13,8 @@ expression: "round_trip(\"OcrResult\", \"snapshot_full\", full_ocr_result())?"
         "w": 72,
         "h": 18
       },
-      "confidence": 0.99
+      "confidence": 0.99,
+      "confidence_source": "engine"
     },
     {
       "text": "Ready",
@@ -23,10 +24,12 @@ expression: "round_trip(\"OcrResult\", \"snapshot_full\", full_ocr_result())?"
         "w": 72,
         "h": 18
       },
-      "confidence": 0.88
+      "confidence": 0.88,
+      "confidence_source": "engine"
     }
   ],
   "confidence": 0.935,
+  "confidence_source": "engine",
   "region": {
     "x": 5,
     "y": 7,

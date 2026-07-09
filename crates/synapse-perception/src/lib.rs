@@ -20,7 +20,8 @@ pub use observe::{
     is_interactable_node, is_known_game_process, parse_perception_mode,
 };
 pub use ocr::{
-    OcrProvider, SystemOcrProvider, TextRegion, is_empty_region, read_text, read_text_with_provider,
+    OcrProvider, SystemOcrProvider, TextRegion, TextRegionConfidenceSource, is_empty_region,
+    read_text, read_text_with_provider,
 };
 pub use template_match::{
     HudTemplate, TemplateCounterConfig, TemplateCounterReading, TemplateSlotReading,

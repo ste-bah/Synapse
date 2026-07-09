@@ -17794,6 +17794,7 @@ fn bounded_uia_text_region(region: Rect) -> Option<TextRegion> {
         text: name.to_owned(),
         bbox,
         confidence: 1.0,
+        confidence_source: synapse_perception::TextRegionConfidenceSource::Uia,
     })
 }
 
@@ -21111,8 +21112,10 @@ mod tests {
                     h: 4,
                 },
                 confidence: 1.0,
+                confidence_source: synapse_core::OcrConfidenceSource::Engine,
             }],
             confidence: 1.0,
+            confidence_source: synapse_core::OcrConfidenceSource::Engine,
             region: Rect {
                 x: 0,
                 y: 0,
@@ -21143,6 +21146,7 @@ mod tests {
             full_text: "Quarterly planning notes are visible".to_owned(),
             words: Vec::new(),
             confidence: 1.0,
+            confidence_source: synapse_core::OcrConfidenceSource::Engine,
             region: Rect {
                 x: 0,
                 y: 0,
