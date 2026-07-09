@@ -24,9 +24,7 @@ static CAPTURE_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(windows)]
 #[test]
-fn captured_frame_drop_loop_queries_d3d_texture() -> Result<(), CaptureError> {
-    use windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC;
-
+fn captured_frame_drop_loop_produces_owned_cpu_buffer() -> Result<(), CaptureError> {
     let _guard = CAPTURE_LOCK
         .lock()
         // Recover from poison instead of panicking: these serialization guards
@@ -50,9 +48,9 @@ fn captured_frame_drop_loop_queries_d3d_texture() -> Result<(), CaptureError> {
     // desktop. A fixed `for _ in 0..1000 { recv_timeout }` therefore hangs and
     // fails on any static desktop (e.g. an unattended automated run) even though
     // capture is healthy — it captured the first frame fine. Bound the loop by a
-    // wall-clock budget instead, and exercise the actual invariant under test —
-    // that each captured frame's D3D texture descriptor matches the reported
-    // width/height — on every frame that DOES arrive. The first
+    // wall-clock budget instead, and exercise the actual invariant under test:
+    // each captured frame has an owned, tightly packed CPU buffer matching the
+    // reported width/height. The first
     // `acquire_next_frame` after duplication start always returns the current
     // desktop, so at least one frame is guaranteed; on an active desktop the loop
     // still exercises the drop path across up to 1000 frames.
@@ -70,24 +68,34 @@ fn captured_frame_drop_loop_queries_d3d_texture() -> Result<(), CaptureError> {
             continue;
         };
         idle_slices = 0;
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe {
-            frame.texture.get().GetDesc(std::ptr::addr_of_mut!(desc));
-        }
         if queried == 0 {
             println!(
-                "d3d_query frame_seq={} desc_width={} desc_height={} frame_width={} frame_height={}",
-                frame.frame_seq, desc.Width, desc.Height, frame.width, frame.height
+                "owned_frame frame_seq={} width={} height={} row_stride={} bytes_per_pixel={} byte_len={}",
+                frame.frame_seq,
+                frame.width,
+                frame.height,
+                frame.pixels.row_stride_bytes,
+                frame.pixels.bytes_per_pixel,
+                frame.pixels.bytes.len()
             );
         }
-        assert_eq!(desc.Width, frame.width);
-        assert_eq!(desc.Height, frame.height);
+        let bytes_per_pixel = usize::from(frame.pixels.bytes_per_pixel);
+        assert!(bytes_per_pixel > 0);
+        let row_len = usize::try_from(frame.width)
+            .ok()
+            .and_then(|width| width.checked_mul(bytes_per_pixel))
+            .expect("frame row length should fit usize");
+        assert_eq!(frame.pixels.row_stride_bytes, row_len);
+        let expected_len = row_len
+            .checked_mul(usize::try_from(frame.height).expect("height should fit usize"))
+            .expect("frame byte length should fit usize");
+        assert_eq!(frame.pixels.bytes.len(), expected_len);
         queried = queried.saturating_add(1);
     }
 
     let stats = handle.stats();
     println!(
-        "after d3d_drop_loop queried={} captured={} dropped={} priority={:?}",
+        "after owned_frame_loop queried={} captured={} dropped={} priority={:?}",
         queried,
         stats.frames_captured(),
         stats.frames_dropped(),

@@ -11,10 +11,6 @@ use windows::{
     Graphics::Imaging::{BitmapAlphaMode, BitmapPixelFormat, SoftwareBitmap},
     Storage::Streams::DataWriter,
     Win32::Graphics::{
-        Direct3D11::{
-            D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
-            D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, ID3D11Resource, ID3D11Texture2D,
-        },
         Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
         Gdi::{
             BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC, CreateDIBSection,
@@ -29,7 +25,6 @@ use windows::{
         GetWindowRect, IsIconic, PW_RENDERFULLCONTENT, WINDOW_EX_STYLE, WINDOW_STYLE,
         WINDOWPLACEMENT,
     },
-    core::Interface as _,
 };
 
 use crate::{
@@ -619,144 +614,94 @@ fn copy_region_bgra(frame: &CapturedFrame, region: Rect) -> Result<Vec<u8>, Capt
             });
         }
     };
-
-    let width = u32::try_from(region.w).map_err(|err| CaptureError::TargetInvalid {
-        detail: err.to_string(),
-    })?;
-    let height = u32::try_from(region.h).map_err(|err| CaptureError::TargetInvalid {
-        detail: err.to_string(),
-    })?;
-    let texture = frame.texture.get();
-    let texture_desc = texture_desc(texture);
-    validate_region_inside_texture(region, texture_desc.Width, texture_desc.Height)?;
-    let staging = create_staging_texture(texture, width, height)?;
-    let context = unsafe { texture.GetDevice() }
-        .and_then(|device| unsafe { device.GetImmediateContext() })
-        .map_err(capture_unsupported)?;
-    let source: ID3D11Resource = texture.cast().map_err(capture_unsupported)?;
-    let target: ID3D11Resource = staging.cast().map_err(capture_unsupported)?;
-    let source_left = u32::try_from(region.x).map_err(|err| CaptureError::TargetInvalid {
-        detail: format!("invalid source region x {}: {err}", region.x),
-    })?;
-    let source_top = u32::try_from(region.y).map_err(|err| CaptureError::TargetInvalid {
-        detail: format!("invalid source region y {}: {err}", region.y),
-    })?;
-    let source_right = u32::try_from(region.x.saturating_add(region.w)).map_err(|err| {
-        CaptureError::TargetInvalid {
-            detail: format!("invalid source region right edge for {region:?}: {err}"),
-        }
-    })?;
-    let source_bottom = u32::try_from(region.y.saturating_add(region.h)).map_err(|err| {
-        CaptureError::TargetInvalid {
-            detail: format!("invalid source region bottom edge for {region:?}: {err}"),
-        }
-    })?;
-    let source_box = D3D11_BOX {
-        left: source_left,
-        top: source_top,
-        front: 0,
-        right: source_right,
-        bottom: source_bottom,
-        back: 1,
-    };
-    unsafe {
-        context.CopySubresourceRegion(&target, 0, 0, 0, 0, &source, 0, Some(&raw const source_box));
-    }
-
-    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe { context.Map(&target, 0, D3D11_MAP_READ, 0, Some(&raw mut mapped)) }
-        .map_err(capture_unsupported)?;
-    let bytes = copy_mapped_rows(&mapped, width, height, convert_rgba_to_bgra);
-    unsafe {
-        context.Unmap(&target, 0);
-    }
-    bytes
-}
-
-fn texture_desc(texture: &ID3D11Texture2D) -> D3D11_TEXTURE2D_DESC {
-    let mut desc = D3D11_TEXTURE2D_DESC::default();
-    unsafe {
-        texture.GetDesc(&raw mut desc);
-    }
-    desc
-}
-
-fn create_staging_texture(
-    texture: &ID3D11Texture2D,
-    width: u32,
-    height: u32,
-) -> Result<ID3D11Texture2D, CaptureError> {
-    let mut desc = texture_desc(texture);
-    desc.Width = width;
-    desc.Height = height;
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Usage = D3D11_USAGE_STAGING;
-    desc.BindFlags = 0;
-    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0.cast_unsigned();
-    desc.MiscFlags = 0;
-    desc.SampleDesc.Count = 1;
-    desc.SampleDesc.Quality = 0;
-
-    let device = unsafe { texture.GetDevice() }.map_err(capture_unsupported)?;
-    let mut staging = None;
-    unsafe { device.CreateTexture2D(&raw const desc, None, Some(&raw mut staging)) }
-        .map_err(capture_unsupported)?;
-    staging.ok_or_else(|| CaptureError::GraphicsApiUnsupported {
-        detail: "CreateTexture2D returned no staging texture".to_owned(),
-    })
-}
-
-fn copy_mapped_rows(
-    mapped: &D3D11_MAPPED_SUBRESOURCE,
-    width: u32,
-    height: u32,
-    convert_rgba_to_bgra: bool,
-) -> Result<Vec<u8>, CaptureError> {
-    let row_len = usize::try_from(width)
-        .ok()
-        .and_then(|value| value.checked_mul(4))
-        .ok_or_else(|| CaptureError::TargetInvalid {
-            detail: format!("invalid OCR bitmap width {width}"),
-        })?;
-    let height = usize::try_from(height).map_err(|err| CaptureError::TargetInvalid {
-        detail: err.to_string(),
-    })?;
-    let byte_len = row_len
-        .checked_mul(height)
-        .ok_or_else(|| CaptureError::TargetInvalid {
-            detail: format!("invalid OCR bitmap dimensions {width}x{height}"),
-        })?;
-    let row_pitch =
-        usize::try_from(mapped.RowPitch).map_err(|err| CaptureError::GraphicsApiUnsupported {
-            detail: err.to_string(),
-        })?;
-    if mapped.pData.is_null() {
-        return Err(CaptureError::GraphicsApiUnsupported {
-            detail: "D3D11 Map returned null pData for BGRA readback".to_owned(),
-        });
-    }
-    if row_pitch < row_len {
+    if frame.pixels.bytes_per_pixel != 4 {
         return Err(CaptureError::GraphicsApiUnsupported {
             detail: format!(
-                "D3D11 Map returned row pitch {row_pitch} smaller than row byte length {row_len}"
+                "OCR bitmap copy requires 4-byte pixels, frame has {} bytes per pixel",
+                frame.pixels.bytes_per_pixel
             ),
         });
     }
-    let mut output = vec![0_u8; byte_len];
-    let base = mapped.pData.cast::<u8>();
+    validate_region_inside_texture(region, frame.width, frame.height)?;
+    copy_owned_frame_region_bgra(frame, region, convert_rgba_to_bgra)
+}
+
+fn copy_owned_frame_region_bgra(
+    frame: &CapturedFrame,
+    region: Rect,
+    convert_rgba_to_bgra: bool,
+) -> Result<Vec<u8>, CaptureError> {
+    validate_owned_frame_buffer(frame)?;
+    let source_x = usize::try_from(region.x).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid source region x {}: {err}", region.x),
+    })?;
+    let source_y = usize::try_from(region.y).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid source region y {}: {err}", region.y),
+    })?;
+    let width = usize::try_from(region.w).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid source region width {}: {err}", region.w),
+    })?;
+    let height = usize::try_from(region.h).map_err(|err| CaptureError::TargetInvalid {
+        detail: format!("invalid source region height {}: {err}", region.h),
+    })?;
+    let bytes_per_pixel = usize::from(frame.pixels.bytes_per_pixel);
+    let row_len =
+        width
+            .checked_mul(bytes_per_pixel)
+            .ok_or_else(|| CaptureError::TargetInvalid {
+                detail: format!("invalid OCR bitmap width {}", region.w),
+            })?;
+    let byte_len = row_len
+        .checked_mul(height)
+        .ok_or_else(|| CaptureError::TargetInvalid {
+            detail: format!("invalid OCR bitmap dimensions {}x{}", region.w, region.h),
+        })?;
+    let mut output = Vec::with_capacity(byte_len);
     for row in 0..height {
-        let source_offset =
-            row.checked_mul(row_pitch)
-                .ok_or_else(|| CaptureError::GraphicsApiUnsupported {
+        let source_row = source_y
+            .checked_add(row)
+            .ok_or_else(|| CaptureError::TargetInvalid {
+                detail: format!("invalid OCR bitmap source row y={} row={row}", region.y),
+            })?;
+        let row_offset = source_row
+            .checked_mul(frame.pixels.row_stride_bytes)
+            .ok_or_else(|| CaptureError::TargetInvalid {
+                detail: format!(
+                    "invalid OCR bitmap row offset row={source_row} stride={}",
+                    frame.pixels.row_stride_bytes
+                ),
+            })?;
+        let col_offset =
+            source_x
+                .checked_mul(bytes_per_pixel)
+                .ok_or_else(|| CaptureError::TargetInvalid {
+                    detail: format!("invalid OCR bitmap source column x={}", region.x),
+                })?;
+        let start =
+            row_offset
+                .checked_add(col_offset)
+                .ok_or_else(|| CaptureError::TargetInvalid {
                     detail: format!(
-                        "D3D11 mapped row offset overflow for row {row}, pitch {row_pitch}"
+                        "invalid OCR bitmap source offset row={source_row} x={source_x}"
                     ),
                 })?;
+        let end = start
+            .checked_add(row_len)
+            .ok_or_else(|| CaptureError::TargetInvalid {
+                detail: format!("invalid OCR bitmap source range start={start} len={row_len}"),
+            })?;
         let source =
-            unsafe { slice::from_raw_parts(base.add(source_offset).cast_const(), row_len) };
-        let start = row.saturating_mul(row_len);
-        output[start..start + row_len].copy_from_slice(source);
+            frame
+                .pixels
+                .bytes
+                .get(start..end)
+                .ok_or_else(|| CaptureError::GraphicsApiUnsupported {
+                    detail: format!(
+                        "owned capture frame buffer too short for region {region:?}: need byte range {start}..{end}, have {}",
+                        frame.pixels.bytes.len()
+                    ),
+                })?;
+        output.extend_from_slice(source);
     }
     if convert_rgba_to_bgra {
         for pixel in output.chunks_exact_mut(4) {
@@ -766,6 +711,51 @@ fn copy_mapped_rows(
     Ok(output)
 }
 
+fn validate_owned_frame_buffer(frame: &CapturedFrame) -> Result<(), CaptureError> {
+    let bytes_per_pixel = usize::from(frame.pixels.bytes_per_pixel);
+    if bytes_per_pixel == 0 {
+        return Err(CaptureError::GraphicsApiUnsupported {
+            detail: "owned capture frame has zero bytes per pixel".to_owned(),
+        });
+    }
+    let min_row_len = usize::try_from(frame.width)
+        .ok()
+        .and_then(|value| value.checked_mul(bytes_per_pixel))
+        .ok_or_else(|| CaptureError::TargetInvalid {
+            detail: format!("invalid capture frame width {}", frame.width),
+        })?;
+    if frame.pixels.row_stride_bytes < min_row_len {
+        return Err(CaptureError::GraphicsApiUnsupported {
+            detail: format!(
+                "owned capture frame row stride {} is smaller than row length {min_row_len}",
+                frame.pixels.row_stride_bytes
+            ),
+        });
+    }
+    let min_len = frame
+        .pixels
+        .row_stride_bytes
+        .checked_mul(
+            usize::try_from(frame.height).map_err(|err| CaptureError::TargetInvalid {
+                detail: err.to_string(),
+            })?,
+        )
+        .ok_or_else(|| CaptureError::TargetInvalid {
+            detail: format!(
+                "invalid capture frame dimensions {}x{}",
+                frame.width, frame.height
+            ),
+        })?;
+    if frame.pixels.bytes.len() < min_len {
+        return Err(CaptureError::GraphicsApiUnsupported {
+            detail: format!(
+                "owned capture frame buffer too short: need {min_len} bytes, have {}",
+                frame.pixels.bytes.len()
+            ),
+        });
+    }
+    Ok(())
+}
 fn validate_region_inside_texture(
     region: Rect,
     texture_width: u32,
@@ -790,7 +780,7 @@ fn validate_region_inside_texture(
     if right > texture_width || bottom > texture_height {
         return Err(CaptureError::TargetInvalid {
             detail: format!(
-                "source region {region:?} exceeds D3D texture bounds {texture_width}x{texture_height}"
+                "source region {region:?} exceeds captured frame bounds {texture_width}x{texture_height}"
             ),
         });
     }
@@ -1155,62 +1145,83 @@ fn clamp_region_to_frame(frame: &CapturedFrame, region: Rect) -> Result<Rect, Ca
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::c_void;
-
-    use windows::Win32::Graphics::Direct3D11::D3D11_MAPPED_SUBRESOURCE;
+    use std::time::Instant;
 
     use super::{
-        client_region_to_frame_region, copy_bgra_region_from_bytes, copy_mapped_rows,
+        client_region_to_frame_region, copy_bgra_region_from_bytes, copy_region_bgra,
         validate_region_inside_texture,
     };
-    use crate::CaptureError;
+    use crate::{CaptureError, CapturedFrame, CapturedFrameBuffer, DxgiFormat};
     use synapse_core::Rect;
 
     #[test]
-    fn mapped_row_copy_rejects_null_pointer() {
-        let mapped = D3D11_MAPPED_SUBRESOURCE {
-            pData: std::ptr::null_mut(),
-            RowPitch: 16,
-            DepthPitch: 16,
-        };
+    fn owned_frame_copy_rejects_short_buffer() {
+        let frame = owned_frame(DxgiFormat::Bgra8, 2, 1, 8, 4, vec![1, 2, 3, 4]);
 
-        let error = copy_mapped_rows(&mapped, 4, 1, false).unwrap_err();
-
-        assert!(matches!(error, CaptureError::GraphicsApiUnsupported { .. }));
-        assert!(error.to_string().contains("null pData"));
-    }
-
-    #[test]
-    fn mapped_row_copy_rejects_short_pitch() {
-        let mut bytes = [0_u8; 8];
-        let mapped = D3D11_MAPPED_SUBRESOURCE {
-            pData: bytes.as_mut_ptr().cast::<c_void>(),
-            RowPitch: 3,
-            DepthPitch: 8,
-        };
-
-        let error = copy_mapped_rows(&mapped, 1, 1, false).unwrap_err();
+        let error = copy_region_bgra(
+            &frame,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 1,
+            },
+        )
+        .unwrap_err();
 
         assert!(matches!(error, CaptureError::GraphicsApiUnsupported { .. }));
-        assert!(error.to_string().contains("row pitch 3"));
+        assert!(error.to_string().contains("too short"));
     }
 
     #[test]
-    fn mapped_row_copy_honors_pitch_padding_and_bgra_order() {
-        let mut bytes = [1_u8, 2, 3, 4, 99, 99, 5, 6, 7, 8, 88, 88];
-        let mapped = D3D11_MAPPED_SUBRESOURCE {
-            pData: bytes.as_mut_ptr().cast::<c_void>(),
-            RowPitch: 6,
-            DepthPitch: 12,
-        };
+    fn owned_frame_copy_rejects_short_stride() {
+        let frame = owned_frame(DxgiFormat::Bgra8, 2, 1, 4, 4, vec![0; 8]);
 
-        let output = copy_mapped_rows(&mapped, 1, 2, false).unwrap();
+        let error = copy_region_bgra(
+            &frame,
+            Rect {
+                x: 0,
+                y: 0,
+                w: 2,
+                h: 1,
+            },
+        )
+        .unwrap_err();
 
-        assert_eq!(output, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert!(matches!(error, CaptureError::GraphicsApiUnsupported { .. }));
+        assert!(error.to_string().contains("row stride 4"));
     }
 
     #[test]
-    fn texture_region_validation_rejects_source_box_overflow() {
+    fn owned_frame_copy_honors_stride_padding_and_rgba_conversion() {
+        let frame = owned_frame(
+            DxgiFormat::Rgba8,
+            2,
+            2,
+            10,
+            4,
+            vec![
+                1, 2, 3, 4, 5, 6, 7, 8, 99, 99, //
+                9, 10, 11, 12, 13, 14, 15, 16, 88, 88,
+            ],
+        );
+
+        let output = copy_region_bgra(
+            &frame,
+            Rect {
+                x: 1,
+                y: 0,
+                w: 1,
+                h: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(output, vec![7, 6, 5, 8, 15, 14, 13, 16]);
+    }
+
+    #[test]
+    fn frame_region_validation_rejects_source_box_overflow() {
         let error = validate_region_inside_texture(
             Rect {
                 x: 8,
@@ -1224,7 +1235,7 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, CaptureError::TargetInvalid { .. }));
-        assert!(error.to_string().contains("exceeds D3D texture bounds"));
+        assert!(error.to_string().contains("exceeds captured frame bounds"));
     }
 
     #[test]
@@ -1253,6 +1264,29 @@ mod tests {
                 17, 18, 19, 20, 21, 22, 23, 24,
             ]
         );
+    }
+
+    fn owned_frame(
+        format: DxgiFormat,
+        width: u32,
+        height: u32,
+        row_stride_bytes: usize,
+        bytes_per_pixel: u8,
+        bytes: Vec<u8>,
+    ) -> CapturedFrame {
+        CapturedFrame {
+            pixels: CapturedFrameBuffer {
+                bytes,
+                row_stride_bytes,
+                bytes_per_pixel,
+            },
+            width,
+            height,
+            format,
+            captured_at: Instant::now(),
+            frame_seq: 7,
+            dirty_region: None,
+        }
     }
 
     #[test]
