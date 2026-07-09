@@ -249,22 +249,13 @@ fn parse_grants(raw: &str) -> Result<RequiredPermissions> {
 }
 
 fn default_grants(audio_enabled: bool) -> RequiredPermissions {
-    // Permissive by default: every non-audio permission is granted so a stock
-    // daemon can fully drive the Windows desktop. READ_AUDIO is a real
-    // capability dependency (requires --enable-audio / SYNAPSE_ENABLE_AUDIO),
-    // not a guardrail, so it stays conditional.
+    // Fail closed by default: a stock daemon may read state, but write and
+    // synthetic-input capabilities require explicit operator opt-in.
     let mut granted = required([
         Permission::ReadEvents,
-        Permission::WriteReflex,
         Permission::ReadReflex,
         Permission::ReadProfile,
-        Permission::WriteProfileActive,
-        Permission::WriteReplay,
         Permission::ReadStorage,
-        Permission::WriteStorage,
-        Permission::InputKeyboard,
-        Permission::InputMouse,
-        Permission::InputPad,
     ]);
     if audio_enabled {
         granted.insert(Permission::ReadAudio);
@@ -380,6 +371,75 @@ mod tests {
     }
 
     #[test]
+    fn default_grants_are_read_only_without_audio() {
+        let grants =
+            PermissionGrants::from_config(None, false).expect("default grants should parse");
+
+        assert_eq!(
+            grants.names(),
+            vec!["READ_EVENTS", "READ_REFLEX", "READ_PROFILE", "READ_STORAGE"]
+        );
+        assert_granted(&grants, Permission::ReadEvents);
+        assert_granted(&grants, Permission::ReadReflex);
+        assert_granted(&grants, Permission::ReadProfile);
+        assert_granted(&grants, Permission::ReadStorage);
+
+        for denied in [
+            Permission::WriteReflex,
+            Permission::WriteProfileActive,
+            Permission::WriteReplay,
+            Permission::ReadAudio,
+            Permission::WriteStorage,
+            Permission::InputKeyboard,
+            Permission::InputMouse,
+            Permission::InputPad,
+        ] {
+            assert_missing(&grants, denied);
+        }
+    }
+
+    #[test]
+    fn default_grants_include_read_audio_only_when_audio_enabled() {
+        let grants =
+            PermissionGrants::from_config(None, true).expect("audio-enabled defaults should parse");
+
+        assert_granted(&grants, Permission::ReadAudio);
+        assert_missing(&grants, Permission::WriteStorage);
+        assert_missing(&grants, Permission::InputKeyboard);
+        assert_missing(&grants, Permission::InputMouse);
+        assert_missing(&grants, Permission::InputPad);
+    }
+
+    #[test]
+    fn explicit_grants_can_opt_into_write_and_input() {
+        let grants = PermissionGrants::from_config(
+            Some("READ_STORAGE WRITE_STORAGE INPUT_KEYBOARD INPUT_MOUSE INPUT_PAD"),
+            false,
+        )
+        .expect("explicit write/input grants should parse");
+
+        assert_granted(&grants, Permission::ReadStorage);
+        assert_granted(&grants, Permission::WriteStorage);
+        assert_granted(&grants, Permission::InputKeyboard);
+        assert_granted(&grants, Permission::InputMouse);
+        assert_granted(&grants, Permission::InputPad);
+        assert_missing(&grants, Permission::ReadEvents);
+    }
+
+    #[test]
+    fn explicit_empty_config_denies_all() {
+        for raw in ["", "none", "DENY_ALL"] {
+            let grants = PermissionGrants::from_config(Some(raw), true)
+                .expect("empty/none grants should parse");
+            assert_eq!(grants.names(), Vec::<&'static str>::new());
+            assert_missing(&grants, Permission::ReadEvents);
+            assert_missing(&grants, Permission::ReadAudio);
+            assert_missing(&grants, Permission::WriteStorage);
+            assert_missing(&grants, Permission::InputKeyboard);
+        }
+    }
+
+    #[test]
     fn replay_path_must_stay_under_root_after_parent_components() {
         let root = PathBuf::from(r"C:\Users\hotra\AppData\Local\synapse\replays");
         let inside = normalize_replay_path(&root, Some("ok\\demo.jsonl"))
@@ -391,6 +451,17 @@ mod tests {
         assert_eq!(
             outside.data.as_ref().and_then(|data| data.get("code")),
             Some(&json!(error_codes::SAFETY_PERMISSION_DENIED))
+        );
+    }
+
+    fn assert_granted(grants: &PermissionGrants, permission: Permission) {
+        assert_eq!(grants.first_missing(&required([permission])), None);
+    }
+
+    fn assert_missing(grants: &PermissionGrants, permission: Permission) {
+        assert_eq!(
+            grants.first_missing(&required([permission])),
+            Some(permission)
         );
     }
 }

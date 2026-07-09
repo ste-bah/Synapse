@@ -137,6 +137,7 @@ struct Cli {
     /// apps are actionable out of the box. Set to fail closed on unknown scope.
     #[arg(long, env = "SYNAPSE_RESTRICT_UNKNOWN_PROFILE")]
     restrict_unknown_profile: bool,
+    /// Explicit M3 permission grant allowlist. Unset defaults to read-only.
     #[arg(long, env = "SYNAPSE_MCP_ALLOWED_PERMISSIONS", value_name = "LIST")]
     allowed_permissions: Option<String>,
     #[arg(long, env = "SYNAPSE_REFLEX_FORCE_DEGRADED")]

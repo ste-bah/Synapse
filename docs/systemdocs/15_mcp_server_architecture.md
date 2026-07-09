@@ -77,7 +77,7 @@ The `Mode` enum (`main.rs`) selects behavior. There are no clap subcommands; mod
 | `--kill-stray` | — | false | (doctor) kill matching strays once a live holder is found |
 | `--enable-audio` | `SYNAPSE_ENABLE_AUDIO` | false | Enable audio capture / `ReadAudio` permission |
 | `--restrict-unknown-profile` | `SYNAPSE_RESTRICT_UNKNOWN_PROFILE` | false | Fail-closed on unprofiled apps (default: actionable) |
-| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | — | Permission grant allowlist (section 6) |
+| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | read-only | Explicit M3 permission grant allowlist; write/input permissions require opt-in (section 6) |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | SSE subscription cap |
 | `--allow-shell` (repeatable) | `SYNAPSE_ALLOW_SHELL` (comma) | — | `act_run_shell` allow regex |
 | `--allow-launch` (repeatable) | `SYNAPSE_ALLOW_LAUNCH` (comma) | — | `act_launch` allow regex |
@@ -256,7 +256,7 @@ Provides the bundled MV3 extension's native-messaging host and the CDP bridge ba
 
 ### 6.1 M3 permission grants (`m3/permissions.rs`)
 
-`Permission` enum (12 variants): `ReadEvents`, `WriteReflex`, `ReadReflex`, `ReadProfile`, `WriteProfileActive`, `WriteReplay`, `ReadAudio`, `ReadStorage`, `WriteStorage`, `InputKeyboard`, `InputMouse`, `InputPad`. `RequiredPermissions = BTreeSet<Permission>`. `PermissionGrants::from_config(allowed_permissions, audio_enabled)` parses `--allowed-permissions` or uses `default_grants` (all but `ReadAudio` unless audio is enabled). A tool whose `required(...)` set is not satisfied fails with an authorization error naming the first missing permission. `ReadAudio` additionally requires `--enable-audio`.
+`Permission` enum (12 variants): `ReadEvents`, `WriteReflex`, `ReadReflex`, `ReadProfile`, `WriteProfileActive`, `WriteReplay`, `ReadAudio`, `ReadStorage`, `WriteStorage`, `InputKeyboard`, `InputMouse`, `InputPad`. `RequiredPermissions = BTreeSet<Permission>`. `PermissionGrants::from_config(allowed_permissions, audio_enabled)` parses `--allowed-permissions` or uses the stock read-only default: `ReadEvents`, `ReadReflex`, `ReadProfile`, `ReadStorage`, and `ReadAudio` only when audio is enabled. Write permissions and synthetic input permissions require explicit operator opt-in. A tool whose `required(...)` set is not satisfied fails with an authorization error naming the first missing permission. `ReadAudio` additionally requires `--enable-audio`.
 
 ### 6.2 Permission gate (`server/permission_gate.rs`) + classifier (`server/permission_policy.rs`)
 

@@ -13,6 +13,16 @@ use tokio::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const TEST_M3_PERMISSIONS_NON_AUDIO: &str = concat!(
+    "READ_EVENTS,WRITE_REFLEX,READ_REFLEX,READ_PROFILE,",
+    "WRITE_PROFILE_ACTIVE,WRITE_REPLAY,READ_STORAGE,WRITE_STORAGE,",
+    "INPUT_KEYBOARD,INPUT_MOUSE,INPUT_PAD"
+);
+const TEST_M3_PERMISSIONS_WITH_AUDIO: &str = concat!(
+    "READ_EVENTS,WRITE_REFLEX,READ_REFLEX,READ_PROFILE,",
+    "WRITE_PROFILE_ACTIVE,WRITE_REPLAY,READ_AUDIO,READ_STORAGE,WRITE_STORAGE,",
+    "INPUT_KEYBOARD,INPUT_MOUSE,INPUT_PAD"
+);
 
 /// Minimal raw JSON-RPC stdio client for local MCP regression checks.
 pub struct StdioMcpClient {
@@ -117,6 +127,12 @@ impl StdioMcpClient {
             .env("SYNAPSE_LOG_LEVEL", "debug");
         if !caller_controls_perception {
             command.env("SYNAPSE_MCP_SYNTHETIC_FIXTURE", "notepad");
+        }
+        let caller_supplied_permissions = envs
+            .iter()
+            .any(|(key, _value)| key.eq_ignore_ascii_case("SYNAPSE_MCP_ALLOWED_PERMISSIONS"));
+        if !caller_supplied_permissions {
+            command.env("SYNAPSE_MCP_ALLOWED_PERMISSIONS", test_m3_permissions(envs));
         }
         if let Some(temp_db_dir) = temp_db_dir.as_ref() {
             command.env("SYNAPSE_DB", temp_db_dir.path().join("db"));
@@ -331,6 +347,20 @@ impl Drop for StdioMcpClient {
                 std::thread::sleep(Duration::from_millis(25));
             }
         }
+    }
+}
+
+fn test_m3_permissions(envs: &[(&str, &str)]) -> &'static str {
+    let audio_enabled = envs.iter().rev().find_map(|(key, value)| {
+        key.eq_ignore_ascii_case("SYNAPSE_ENABLE_AUDIO")
+            .then_some(value.trim())
+    });
+    if matches!(audio_enabled, Some("1"))
+        || audio_enabled.is_some_and(|value| value.eq_ignore_ascii_case("true"))
+    {
+        TEST_M3_PERMISSIONS_WITH_AUDIO
+    } else {
+        TEST_M3_PERMISSIONS_NON_AUDIO
     }
 }
 

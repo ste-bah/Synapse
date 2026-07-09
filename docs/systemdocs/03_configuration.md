@@ -61,7 +61,7 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--kill-stray` | — | bool | `false` | In `--mode doctor`, kill stray `synapse-mcp` processes. |
 | `--enable-audio` | `SYNAPSE_ENABLE_AUDIO` | bool | `false` | Enable audio capture runtime. |
 | `--restrict-unknown-profile` | `SYNAPSE_RESTRICT_UNKNOWN_PROFILE` | bool | `false` | Fail closed on unprofiled foreground apps. Default off = unknown apps actionable. |
-| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | string (LIST) | none | Restrict granted permission set. |
+| `--allowed-permissions` | `SYNAPSE_MCP_ALLOWED_PERMISSIONS` | string (LIST) | read-only (`READ_EVENTS`, `READ_REFLEX`, `READ_PROFILE`, `READ_STORAGE`; plus `READ_AUDIO` only when audio is enabled) | Explicit M3 permission grant allowlist; write/input permissions require opt-in. |
 | `--reflex-force-degraded` | `SYNAPSE_REFLEX_FORCE_DEGRADED` | bool | `false` | Force reflex into degraded mode (testing/diagnostic). |
 | `--storage-pressure-free-bytes-sample` | `SYNAPSE_STORAGE_PRESSURE_FREE_BYTES_SAMPLE` | u64 (BYTES) | none | Inject a synthetic free-bytes value for disk-pressure logic. |
 | `--max-subscriptions` | `SYNAPSE_MAX_SUBSCRIPTIONS` | NonZeroUsize | `synapse_reflex::DEFAULT_MAX_SUBSCRIPTIONS_NONZERO` | Cap on event-bus subscriptions. |
