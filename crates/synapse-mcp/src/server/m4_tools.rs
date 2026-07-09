@@ -1727,7 +1727,8 @@ impl SynapseService {
             }),
             &session_id,
         )?;
-        let result = shell_job_status(&params, Some(&session_id));
+        let result =
+            shell_job_status_blocking(params, session_id.clone(), "act_run_shell_status").await;
         self.audit_action_result_for_session("act_run_shell_status", &result, &session_id)?;
         result.map(Json)
     }
@@ -1752,13 +1753,15 @@ impl SynapseService {
         }
         let params = params.0;
         let session_id = require_shell_session_id(&request_context)?;
-        let before_status = shell_job_status(
-            &ActRunShellStatusParams {
+        let before_status = shell_job_status_blocking(
+            ActRunShellStatusParams {
                 job_id: params.job_id.clone(),
                 tail_bytes: 1024,
             },
-            Some(&session_id),
-        );
+            session_id.clone(),
+            "act_run_shell_cancel.before_status",
+        )
+        .await;
         let command_payload = json!({
             "job_id": &params.job_id,
             "session_id": &session_id,
@@ -1786,14 +1789,16 @@ impl SynapseService {
             &command_payload,
             &session_id,
         )?;
-        let result = cancel_shell_job(&params, Some(&session_id));
-        let after_status = shell_job_status(
-            &ActRunShellStatusParams {
-                job_id: params.job_id,
+        let result = cancel_shell_job_blocking(params.clone(), session_id.clone()).await;
+        let after_status = shell_job_status_blocking(
+            ActRunShellStatusParams {
+                job_id: params.job_id.clone(),
                 tail_bytes: 1024,
             },
-            Some(&session_id),
-        );
+            session_id.clone(),
+            "act_run_shell_cancel.after_status",
+        )
+        .await;
         match &result {
             Ok(response) => self.command_audit_final(
                 super::command_audit::CommandAuditInput::mcp(
@@ -2282,6 +2287,32 @@ fn require_shell_session_id(
             "act_run_shell tools require an MCP session id (run the daemon in HTTP mode so each agent has its own Mcp-Session-Id)",
         )
     })
+}
+
+async fn shell_job_status_blocking(
+    params: ActRunShellStatusParams,
+    session_id: String,
+    tool: &'static str,
+) -> Result<ActRunShellStatusResponse, ErrorData> {
+    tokio::task::spawn_blocking(move || shell_job_status(&params, Some(&session_id)))
+        .await
+        .map_err(|error| blocking_worker_join_error(tool, error))?
+}
+
+async fn cancel_shell_job_blocking(
+    params: ActRunShellJobIdParams,
+    session_id: String,
+) -> Result<ActRunShellCancelResponse, ErrorData> {
+    tokio::task::spawn_blocking(move || cancel_shell_job(&params, Some(&session_id)))
+        .await
+        .map_err(|error| blocking_worker_join_error("act_run_shell_cancel", error))?
+}
+
+fn blocking_worker_join_error(tool: &str, error: tokio::task::JoinError) -> ErrorData {
+    mcp_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        format!("{tool}: blocking worker join failed: {error}"),
+    )
 }
 
 impl SynapseService {

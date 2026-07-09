@@ -562,8 +562,13 @@ impl SynapseService {
             "tool.invocation kind=agent_interrupt"
         );
         let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
-        self.agent_interrupt_impl(params.0, caller.as_deref())
-            .map(Json)
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || {
+            service.agent_interrupt_impl(params.0, caller.as_deref())
+        })
+        .await
+        .map_err(|error| blocking_worker_join_error(TOOL_AGENT_INTERRUPT, error))?
+        .map(Json)
     }
 
     #[tool(
@@ -618,7 +623,11 @@ impl SynapseService {
             "tool.invocation kind=agent_steer"
         );
         let caller = super::context::mcp_session_id_from_request_context(&request_context)?;
-        self.agent_steer_impl(params.0, caller.as_deref()).map(Json)
+        let service = self.clone();
+        tokio::task::spawn_blocking(move || service.agent_steer_impl(params.0, caller.as_deref()))
+            .await
+            .map_err(|error| blocking_worker_join_error(TOOL_AGENT_STEER, error))?
+            .map(Json)
     }
 
     #[tool(
@@ -2632,13 +2641,21 @@ impl SynapseService {
                 },
             }
         } else {
-            match self.agent_interrupt_impl(
-                AgentInterruptParams {
-                    session_id: session_id.to_owned(),
-                },
-                caller_session,
-            ) {
-                Ok(interrupt) => FleetStopAgentOutcome {
+            let service = self.clone();
+            let worker_session_id = session_id.to_owned();
+            let outcome_session_id = worker_session_id.clone();
+            let caller_session = caller_session.map(ToOwned::to_owned);
+            match tokio::task::spawn_blocking(move || {
+                service.agent_interrupt_impl(
+                    AgentInterruptParams {
+                        session_id: worker_session_id,
+                    },
+                    caller_session.as_deref(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(interrupt)) => FleetStopAgentOutcome {
                     session_id: interrupt.session_id,
                     spawn_id: interrupt.spawn_id,
                     agent_kind: interrupt.agent_kind,
@@ -2648,12 +2665,22 @@ impl SynapseService {
                         .unwrap_or_else(|| "no_channel_delivered".to_owned()),
                     surviving_process_ids: Vec::new(),
                 },
-                Err(error) => FleetStopAgentOutcome {
-                    session_id: session_id.to_owned(),
+                Ok(Err(error)) => FleetStopAgentOutcome {
+                    session_id: outcome_session_id,
                     spawn_id: None,
                     agent_kind: "unknown".to_owned(),
                     ok: false,
                     reason: error.message.to_string(),
+                    surviving_process_ids: Vec::new(),
+                },
+                Err(error) => FleetStopAgentOutcome {
+                    session_id: outcome_session_id,
+                    spawn_id: None,
+                    agent_kind: "unknown".to_owned(),
+                    ok: false,
+                    reason: blocking_worker_join_error(TOOL_FLEET_STOP, error)
+                        .message
+                        .to_string(),
                     surviving_process_ids: Vec::new(),
                 },
             }
@@ -3556,6 +3583,13 @@ fn dashboard_json_readback(value: impl Serialize) -> Result<Value, ErrorData> {
             format!("serialize dashboard agent-control readback: {error}"),
         )
     })
+}
+
+fn blocking_worker_join_error(tool: &str, error: tokio::task::JoinError) -> ErrorData {
+    mcp_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        format!("{tool}: blocking worker join failed: {error}"),
+    )
 }
 
 fn validate_lookup_id(session_id: &str, tool: &str) -> Result<String, ErrorData> {
