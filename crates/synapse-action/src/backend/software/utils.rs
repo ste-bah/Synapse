@@ -30,10 +30,13 @@ pub(super) fn enigo_error(context: &'static str) -> impl FnOnce(enigo::InputErro
 }
 
 pub(super) fn sleep_ms(milliseconds: u32) -> bool {
+    sleep_ms_since(milliseconds, crate::hotkey::operator_release_epoch())
+}
+
+pub(super) fn sleep_ms_since(milliseconds: u32, epoch: u64) -> bool {
     if milliseconds == 0 {
-        return false;
+        return crate::hotkey::operator_release_requested_since(epoch);
     }
-    let epoch = crate::hotkey::operator_release_epoch();
     let deadline = Instant::now() + Duration::from_millis(u64::from(milliseconds));
     loop {
         if crate::hotkey::operator_release_requested_since(epoch) {

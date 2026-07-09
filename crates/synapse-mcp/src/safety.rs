@@ -13,13 +13,14 @@ use crate::server::SynapseService;
 
 pub const DISABLE_OPERATOR_HOTKEY_ENV: &str = "SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY";
 /// When set truthy, a failure to register the operator panic hotkey aborts
-/// startup instead of degrading. Off by default so a leaked/duplicate instance
-/// holding the global hotkey cannot brick the MCP server (the failure surfaced
-/// as JSON-RPC `-32000` to clients and broke the editor-wired stdio child).
+/// startup instead of degrading. Defaults to true because the MCP daemon exposes
+/// input-emitting tools; set this false only with an explicit operator decision
+/// to run degraded, or set `SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY=1` to skip
+/// registration intentionally.
 pub const REQUIRE_OPERATOR_HOTKEY_ENV: &str = "SYNAPSE_MCP_REQUIRE_OPERATOR_HOTKEY";
 
 /// Operator-facing remediation for an unavailable panic hotkey.
-const OPERATOR_HOTKEY_REMEDIATION: &str = "the daemon-owned operator hotkey could not be armed; stop duplicate synapse-mcp instances or conflicting hook owners, set SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY=1 to run intentionally without it, set SYNAPSE_MCP_REQUIRE_OPERATOR_HOTKEY=1 to make this a hard startup failure, or set SYNAPSE_OPERATOR_HOTKEY / SYNAPSE_MCP_OPERATOR_HOTKEY to another Ctrl+Alt+Shift+<A-Z|0-9> chord";
+const OPERATOR_HOTKEY_REMEDIATION: &str = "the daemon-owned operator hotkey could not be armed; stop duplicate synapse-mcp instances or conflicting hook owners, set SYNAPSE_OPERATOR_HOTKEY / SYNAPSE_MCP_OPERATOR_HOTKEY to another Ctrl+Alt+Shift+<A-Z|0-9> chord, set SYNAPSE_MCP_DISABLE_OPERATOR_HOTKEY=1 to run intentionally without it, or set SYNAPSE_MCP_REQUIRE_OPERATOR_HOTKEY=0 only for an explicit degraded run";
 const OPERATOR_RELEASE_ALL_TIMEOUT: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug, Serialize)]
@@ -76,14 +77,14 @@ pub fn install_operator_hotkey(
         Err(error) => {
             set_operator_hotkey_status(OperatorHotkeyStatus::Unavailable);
             if operator_hotkey_required_by_env()? {
-                // Strict mode: caller propagates and startup fails closed.
-                return Err(error);
+                // Default strict mode: caller propagates and startup fails closed.
+                let detail = format!("{}; {OPERATOR_HOTKEY_REMEDIATION}", error.detail());
+                return Err(error.with_detail(detail));
             }
-            // Default: do NOT abort the whole MCP server because the global
-            // kill-switch could not bind. Log loudly with exact cause and
-            // remediation, record degraded status for /health, and continue so
-            // the (mostly read-only) tool surface stays usable. Input-emitting
-            // tools remain guarded by their own preflight/consent paths.
+            // Explicit degraded mode: do NOT abort the whole MCP server because
+            // the operator chose to run without a bound global kill-switch.
+            // Log loudly with exact cause/remediation and record status for
+            // /health so the risk is visible.
             tracing::error!(
                 code = error_codes::ACTION_BACKEND_UNAVAILABLE,
                 component = "operator_hotkey",
@@ -93,7 +94,7 @@ pub fn install_operator_hotkey(
                 remediation = OPERATOR_HOTKEY_REMEDIATION,
                 require_env = REQUIRE_OPERATOR_HOTKEY_ENV,
                 disable_env = DISABLE_OPERATOR_HOTKEY_ENV,
-                "operator panic hotkey unavailable; continuing in degraded safety mode without the kill-switch"
+                "operator panic hotkey unavailable; continuing only because degraded hotkey mode was explicitly allowed"
             );
             Ok(None)
         }
@@ -101,24 +102,69 @@ pub fn install_operator_hotkey(
 }
 
 fn operator_hotkey_required_by_env() -> synapse_action::ActionResult<bool> {
-    parse_bool_env(REQUIRE_OPERATOR_HOTKEY_ENV)
+    parse_bool_env(REQUIRE_OPERATOR_HOTKEY_ENV, true)
 }
 
 fn operator_hotkey_disabled_by_env() -> synapse_action::ActionResult<bool> {
-    parse_bool_env(DISABLE_OPERATOR_HOTKEY_ENV)
+    parse_bool_env(DISABLE_OPERATOR_HOTKEY_ENV, false)
 }
 
-fn parse_bool_env(name: &str) -> synapse_action::ActionResult<bool> {
-    let Some(raw) = std::env::var_os(name) else {
-        return Ok(false);
+fn parse_bool_env(name: &str, default: bool) -> synapse_action::ActionResult<bool> {
+    let raw = std::env::var_os(name);
+    parse_bool_value(
+        name,
+        raw.as_ref().map(|value| value.to_string_lossy()),
+        default,
+    )
+}
+
+fn parse_bool_value(
+    name: &str,
+    value: Option<std::borrow::Cow<'_, str>>,
+    default: bool,
+) -> synapse_action::ActionResult<bool> {
+    let Some(value) = value else {
+        return Ok(default);
     };
-    let value = raw.to_string_lossy();
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
         "" | "0" | "false" | "no" | "off" => Ok(false),
         _ => Err(ActionError::BackendUnavailable {
             detail: format!("{name} must be one of 1/true/yes/on or 0/false/no/off"),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn operator_hotkey_required_defaults_to_fail_closed() {
+        let required = parse_bool_value(REQUIRE_OPERATOR_HOTKEY_ENV, None, true)
+            .expect("missing require env should parse");
+
+        assert!(required);
+    }
+
+    #[test]
+    fn operator_hotkey_required_can_be_explicitly_relaxed() {
+        let required = parse_bool_value(
+            REQUIRE_OPERATOR_HOTKEY_ENV,
+            Some(std::borrow::Cow::Borrowed("0")),
+            true,
+        )
+        .expect("false require env should parse");
+
+        assert!(!required);
+    }
+
+    #[test]
+    fn operator_hotkey_disabled_defaults_to_false() {
+        let disabled = parse_bool_value(DISABLE_OPERATOR_HOTKEY_ENV, None, false)
+            .expect("missing disable env should parse");
+
+        assert!(!disabled);
     }
 }
 
