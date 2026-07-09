@@ -1531,7 +1531,7 @@ async fn target_act_cleanup_notepad_tabs(
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
     let result = target_act_cleanup_notepad_tabs_impl(service, params, request_context).await;
-    let _ = service.audit_action_result_for_request("target_act", &result, request_context);
+    service.audit_action_result_for_request("target_act", &result, request_context)?;
     match result {
         Ok(response) => Ok((
             "target_window_notepad_tab_cleanup",
@@ -2486,7 +2486,7 @@ async fn target_act_save(
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
     let result = target_act_save_impl(service, params, request_context).await;
-    let _ = service.audit_action_result_for_request("target_act", &result, request_context);
+    service.audit_action_result_for_request("target_act", &result, request_context)?;
     match result {
         Ok(response) => Ok((
             "target_window_save",
