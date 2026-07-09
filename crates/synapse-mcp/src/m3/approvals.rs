@@ -694,7 +694,7 @@ pub fn prepare_activation_links(
         schema_version: SCHEMA_VERSION,
         activation_id: activation_id.clone(),
         approval_id: approval_id.to_owned(),
-        token_sha256: sha256_hex(token.as_bytes()),
+        token_sha256: activation_token_sha256(&token),
         created_at_unix_ms: now_unix_ms(),
         used_at_unix_ms: None,
         used_by_session: None,
@@ -783,7 +783,7 @@ pub fn decide_approval_from_activation(
             params.activation_id
         )));
     }
-    let expected_hash = sha256_hex(params.token.as_bytes());
+    let expected_hash = activation_token_sha256(&params.token);
     if activation.token_sha256 != expected_hash {
         return Err(invalid(
             "activation token did not match the stored token hash",
@@ -1727,6 +1727,10 @@ fn hex_value(byte: u8) -> Option<u8> {
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     format!("sha256:{}", hex_encode(&digest))
+}
+
+pub(crate) fn activation_token_sha256(token: &str) -> String {
+    sha256_hex(token.as_bytes())
 }
 
 #[cfg(test)]

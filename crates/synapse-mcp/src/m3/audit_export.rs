@@ -29,6 +29,64 @@ const DEFAULT_MAX_ROW_BYTES: u64 = 64 * 1024;
 const MAX_ROW_BYTES: u64 = 512 * 1024;
 const STRICT_POLICY: &str = "strict";
 const BUNDLE_KIND: &str = "audit_export_bundle";
+const RETAINED_FIELD_PATHS: &[&str] = &[
+    "schema_version",
+    "row_kind",
+    "profile_id",
+    "profile_version",
+    "profile_schema_version",
+    "active_profile_id",
+    "active_profile_schema_version",
+    "tool",
+    "verb",
+    "phase",
+    "channel",
+    "status",
+    "outcome",
+    "error_code",
+    "redacted",
+    "audit_context/profile_id",
+    "audit_context/profile_version",
+    "audit_context/profile_schema_version",
+    "actor/channel",
+    "actor/tool",
+    "actor/profile_id",
+    "actor/profile_version",
+    "actor/profile_schema_version",
+    "foreground/profile_id",
+    "foreground/profile_schema_version",
+    "foreground/process_name",
+    "human_os_foreground/profile_id",
+    "human_os_foreground/profile_schema_version",
+    "human_os_foreground/process_name",
+    "foreground_tier/required_foreground",
+    "foreground_tier/backend_tier",
+    "foreground_tier/session_foreground_policy",
+    "foreground_tier/policy_allows_foreground",
+    "foreground_tier/foreground_policy_violation",
+    "foreground_tier/allowed",
+    "source_of_truth/cf_name",
+    "source_of_truth/row_kind",
+    "source_of_truth/retention",
+    "details/response/backend",
+];
+const TRAVERSABLE_CONTAINER_PATHS: &[&str] = &[
+    "actor",
+    "audit_context",
+    "audit_context/app_context",
+    "audit_context/backend_policy",
+    "before",
+    "after",
+    "details",
+    "details/response",
+    "error",
+    "foreground",
+    "foreground_tier",
+    "human_os_foreground",
+    "payload_bounded",
+    "source_of_truth",
+    "target",
+];
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -478,15 +536,54 @@ fn redact_object(object: Map<String, Value>, stats: &mut RedactionStats, path: &
         if let Some(class) = sensitive_field_class(&key) {
             redact_leaf(stats, class);
             redacted.insert(key, json!(format!("[redacted:{class}]")));
-        } else {
+        } else if retained_field_path(&child_path) {
+            redacted.insert(key, redact_retained_value(value, stats));
+        } else if traversable_container_path(&child_path) {
             redacted.insert(key, redact_value(value, stats, &child_path));
+        } else {
+            redact_leaf(stats, "unknown_field");
+            redacted.insert(key, json!("[redacted:unknown_field]"));
         }
     }
     Value::Object(redacted)
 }
 
+fn retained_field_path(path: &str) -> bool {
+    RETAINED_FIELD_PATHS.contains(&path)
+}
+
+fn traversable_container_path(path: &str) -> bool {
+    TRAVERSABLE_CONTAINER_PATHS.contains(&path)
+}
+
+fn redact_retained_value(value: Value, stats: &mut RedactionStats) -> Value {
+    match value {
+        Value::String(text) if path_like_string(&text) => {
+            redact_leaf(stats, "path_like_string");
+            json!("[redacted:path_like_string]")
+        }
+        Value::Object(_) | Value::Array(_) => {
+            redact_leaf(stats, "unknown_field");
+            json!("[redacted:unknown_field]")
+        }
+        other => other,
+    }
+}
+
 fn sensitive_field_class(key: &str) -> Option<&'static str> {
     let lower = key.to_ascii_lowercase();
+    if lower.contains("token")
+        || lower.contains("secret")
+        || lower.contains("password")
+        || lower.contains("passwd")
+        || lower.contains("api_key")
+        || lower.contains("apikey")
+        || lower.contains("cookie")
+        || lower.contains("credential")
+        || lower.contains("authorization")
+    {
+        return Some("credential");
+    }
     if matches!(
         lower.as_str(),
         "audit_id"
@@ -658,24 +755,10 @@ fn consent_key(profile_id: &str) -> String {
 }
 
 fn retained_fields() -> Vec<String> {
-    [
-        "schema_version",
-        "profile_id",
-        "profile_version",
-        "profile_schema_version",
-        "active_profile_id",
-        "active_profile_schema_version",
-        "foreground.profile_id",
-        "foreground.profile_schema_version",
-        "foreground.process_name",
-        "tool",
-        "status",
-        "error_code",
-        "details.response.backend",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
+    RETAINED_FIELD_PATHS
+        .iter()
+        .map(|path| path.replace('/', "."))
+        .collect()
 }
 
 fn fail_closed_rules() -> Vec<String> {
@@ -685,6 +768,9 @@ fn fail_closed_rules() -> Vec<String> {
         "redaction policy must be selected and match explicit consent",
         "external sharing remains false in local bundles",
         "matching rows larger than max_row_bytes abort the export before files are written",
+        "only retained_fields are exported in plaintext; every unknown field redacts as unknown_field",
+        "credential-like keys redact before retained-field checks",
+        "path-like string values redact even when a retained key is unexpectedly path-shaped",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -941,6 +1027,66 @@ mod tests {
         assert_eq!(redacted["details"]["user_id"], "[redacted:user_identifier]");
         assert_eq!(redacted["details"]["command_line"], "[redacted:path]");
         assert!(stats.fields_redacted >= 8);
+    }
+
+    #[test]
+    fn strict_redaction_redacts_unknown_payload_field_names() {
+        let row = json!({
+            "schema_version": 1,
+            "profile_id": "luanti.minetest",
+            "actor": {
+                "channel": "mcp",
+                "tool": {
+                    "token": "SYNAPSE_SECRET_RETAINED_SHAPE_1540"
+                }
+            },
+            "tool": "approval_activate",
+            "status": "ok",
+            "details": {
+                "value": "SYNAPSE_SECRET_VALUE_1540",
+                "content": "SYNAPSE_SECRET_CONTENT_1540",
+                "args": ["SYNAPSE_SECRET_ARG_1540"],
+                "note": "SYNAPSE_SECRET_NOTE_1540",
+                "body": "SYNAPSE_SECRET_BODY_1540",
+                "message": "SYNAPSE_SECRET_MESSAGE_1540",
+                "token": "synapse-activation-v1-plaintext-token"
+            }
+        });
+        let mut stats = RedactionStats::default();
+
+        let redacted = redact_value(row, &mut stats, "");
+        let encoded = serde_json::to_string(&redacted).expect("encode redacted row");
+
+        assert_eq!(redacted["profile_id"], "luanti.minetest");
+        assert_eq!(redacted["actor"]["channel"], "mcp");
+        assert_eq!(redacted["actor"]["tool"], "[redacted:unknown_field]");
+        assert_eq!(redacted["tool"], "approval_activate");
+        assert_eq!(redacted["status"], "ok");
+        assert_eq!(redacted["details"]["value"], "[redacted:unknown_field]");
+        assert_eq!(redacted["details"]["content"], "[redacted:unknown_field]");
+        assert_eq!(redacted["details"]["args"], "[redacted:unknown_field]");
+        assert_eq!(redacted["details"]["note"], "[redacted:unknown_field]");
+        assert_eq!(redacted["details"]["body"], "[redacted:unknown_field]");
+        assert_eq!(redacted["details"]["message"], "[redacted:unknown_field]");
+        assert_eq!(redacted["details"]["token"], "[redacted:credential]");
+        assert!(!encoded.contains("SYNAPSE_SECRET_"));
+        assert!(!encoded.contains("synapse-activation-v1-plaintext-token"));
+        assert_eq!(
+            stats
+                .redacted_by_class
+                .get("unknown_field")
+                .copied()
+                .unwrap_or_default(),
+            7
+        );
+        assert_eq!(
+            stats
+                .redacted_by_class
+                .get("credential")
+                .copied()
+                .unwrap_or_default(),
+            1
+        );
     }
 
     #[test]

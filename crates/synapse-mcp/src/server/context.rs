@@ -530,14 +530,7 @@ impl SynapseService {
         by_session: &str,
     ) -> Result<crate::m3::approvals::ApprovalActivationDecisionResponse, ErrorData> {
         let db = self.m3_storage()?;
-        let command_payload = json!({
-            "bind": &params.bind,
-            "approval_id": &params.approval_id,
-            "activation_id": &params.activation_id,
-            "token": &params.token,
-            "decision": &params.decision,
-            "snooze_ms": params.snooze_ms,
-        });
+        let command_payload = approval_activation_command_payload(params);
         let command_before = json!({
             "source_of_truth": "CF_KV approval queue rows plus approval activation/audit rows",
             "approval_id": &params.approval_id,
@@ -1528,6 +1521,19 @@ fn m3_state_error(error: &anyhow::Error) -> ErrorData {
     )
 }
 
+fn approval_activation_command_payload(
+    params: &crate::m3::approvals::ApprovalActivationParams,
+) -> Value {
+    json!({
+        "bind": &params.bind,
+        "approval_id": &params.approval_id,
+        "activation_id": &params.activation_id,
+        "token_sha256": crate::m3::approvals::activation_token_sha256(&params.token),
+        "decision": &params.decision,
+        "snooze_ms": params.snooze_ms,
+    })
+}
+
 #[cfg(debug_assertions)]
 pub(super) fn maybe_force_panic_during_act(tool: &'static str) {
     if std::env::var("SYNAPSE_MCP_FORCE_PANIC_DURING_ACT").as_deref() == Ok("1") {
@@ -1617,6 +1623,28 @@ mod scope_gate_tests {
             Some(&json!(error_codes::HTTP_SESSION_INVALID))
         );
         Ok(())
+    }
+
+    #[test]
+    fn approval_activation_command_payload_uses_token_hash_only() {
+        let params = crate::m3::approvals::ApprovalActivationParams {
+            bind: "127.0.0.1:7700".to_owned(),
+            approval_id: "appr-issue1540".to_owned(),
+            activation_id: "actv1-issue1540".to_owned(),
+            token: "synapse-activation-v1-raw-token-issue1540".to_owned(),
+            decision: "accept".to_owned(),
+            snooze_ms: None,
+        };
+
+        let payload = approval_activation_command_payload(&params);
+        let encoded = payload.to_string();
+
+        assert!(payload.get("token").is_none());
+        assert_eq!(
+            payload["token_sha256"],
+            crate::m3::approvals::activation_token_sha256(&params.token)
+        );
+        assert!(!encoded.contains(&params.token));
     }
 
     #[test]
