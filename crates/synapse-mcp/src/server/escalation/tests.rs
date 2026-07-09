@@ -220,6 +220,110 @@ async fn recv_request(
         .expect("listener channel open")
 }
 
+fn retention_item(id: &str, status: EscalationStatus, updated_at: u64) -> EscalationItem {
+    EscalationItem {
+        schema_version: SCHEMA_VERSION,
+        escalation_id: id.to_owned(),
+        approval_id: format!("apr-{id}"),
+        anchor: "retention-agent".to_owned(),
+        spawn_id: None,
+        session_id: None,
+        severity: Severity::Medium,
+        attention_state: "needs_input".to_owned(),
+        reason_code: None,
+        context: EscalationContext {
+            action: "retention test".to_owned(),
+            reason: "synthetic queue cleanup coverage".to_owned(),
+            reversible: true,
+            alternatives: Vec::new(),
+            waiting_for: None,
+            agent_detail_deep_link: "/agents/retention-agent".to_owned(),
+            approval_deadline_unix_ms: updated_at.saturating_add(DEFAULT_ACK_WINDOW_MS),
+            evidence: Value::Null,
+        },
+        status,
+        created_at_unix_ms: updated_at,
+        updated_at_unix_ms: updated_at,
+        expires_at_unix_ms: updated_at.saturating_add(DEFAULT_TTL_ORDINARY_MS),
+        tier0_fired: false,
+        tier0_toast_removed: None,
+        tier0_quiet_digest: false,
+        tier0_suppressed_reason: None,
+        tier1_quiet_suppressed: false,
+        tier1_suppressed_reason: None,
+        approval_suppressed_reason: Some("retention_test".to_owned()),
+        tier1_eligible: false,
+        ladder_index: 0,
+        next_escalate_at_unix_ms: None,
+        channel_attempts: Vec::new(),
+        acked_at_unix_ms: None,
+        acked_via: None,
+        closed_reason: None,
+    }
+}
+
+#[test]
+fn escalation_retention_prunes_only_old_terminal_items() {
+    let db = db();
+    let now = TERMINAL_ITEM_RETENTION_MS + 10_000;
+    let old_terminal = retention_item("esc1-old-terminal", EscalationStatus::Resolved, 1);
+    let open_old = retention_item("esc1-open-old", EscalationStatus::Pending, 1);
+    let recent_terminal = retention_item(
+        "esc1-recent-terminal",
+        EscalationStatus::Expired,
+        now - TERMINAL_ITEM_RETENTION_MS + 1,
+    );
+    write_item_and_audit(&db, &old_terminal, "seed", json!({})).expect("old terminal write");
+    write_item_and_audit(&db, &open_old, "seed", json!({})).expect("open write");
+    write_item_and_audit(&db, &recent_terminal, "seed", json!({})).expect("recent terminal write");
+
+    let deleted = prune_terminal_items(&db, now).expect("prune terminal items");
+
+    assert_eq!(deleted, 1);
+    assert!(read_item(&db, "esc1-old-terminal").unwrap().is_none());
+    assert!(read_item(&db, "esc1-open-old").unwrap().is_some());
+    assert!(read_item(&db, "esc1-recent-terminal").unwrap().is_some());
+    let old_audit_prefix = format!("{AUDIT_PREFIX}{}", old_terminal.escalation_id);
+    assert!(
+        !db.scan_cf_prefix(cf::CF_KV, old_audit_prefix.as_bytes())
+            .unwrap()
+            .is_empty(),
+        "terminal item pruning must leave append-only audit evidence"
+    );
+}
+
+#[test]
+fn escalation_retention_caps_recent_terminal_items() {
+    let db = db();
+    let now = TERMINAL_ITEM_RETENTION_MS + 100_000;
+    let rows = (0..(TERMINAL_ITEM_RETAIN_ROWS + 2))
+        .map(|idx| {
+            let item = retention_item(
+                &format!("esc1-cap-{idx:05}"),
+                EscalationStatus::Resolved,
+                now - 1_000 + idx as u64,
+            );
+            (
+                item_key(&item.escalation_id),
+                encode_item(&item).expect("encode retention item"),
+            )
+        })
+        .collect::<Vec<_>>();
+    db.put_batch_pressure_bypass(cf::CF_KV, rows)
+        .expect("seed terminal rows");
+
+    let deleted = prune_terminal_items(&db, now).expect("cap terminal items");
+
+    assert_eq!(deleted, 2);
+    assert!(read_item(&db, "esc1-cap-00000").unwrap().is_none());
+    assert!(read_item(&db, "esc1-cap-00001").unwrap().is_none());
+    assert!(read_item(&db, "esc1-cap-00002").unwrap().is_some());
+    assert!(
+        scan_items(&db).unwrap().len() <= TERMINAL_ITEM_RETAIN_ROWS,
+        "terminal cap must keep the hot item queue below the historical failure threshold"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Decision + durability (no off-machine egress, no toast)
 // ---------------------------------------------------------------------------

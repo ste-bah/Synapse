@@ -80,6 +80,10 @@ const DEFAULT_CRITICAL_ACK_WINDOW_MS: u64 = 60 * 1_000;
 const DEFAULT_TTL_ORDINARY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 const DEFAULT_TTL_SENSITIVE_MS: u64 = 24 * 60 * 60 * 1_000;
 const MAX_SCAN_ROWS: usize = 20_000;
+const SCAN_CHUNK_ROWS: usize = 4_096;
+const TERMINAL_ITEM_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const TERMINAL_ITEM_RETAIN_ROWS: usize = 5_000;
+const DELETE_BATCH_ROWS: usize = 512;
 const MAX_WEBHOOKS: usize = 8;
 const MAX_URL_CHARS: usize = 2_048;
 const MAX_NAME_CHARS: usize = 64;
@@ -535,27 +539,133 @@ fn decode_item(escalation_id: &str, value: &[u8]) -> Result<EscalationItem, Erro
     })
 }
 
-/// All escalation items, newest scan order. Bounded by [`MAX_SCAN_ROWS`].
+#[derive(Clone, Debug)]
+struct EscalationItemRow {
+    key: Vec<u8>,
+    item: EscalationItem,
+}
+
+fn key_after(key: &[u8]) -> Vec<u8> {
+    let mut next = key.to_vec();
+    next.push(0);
+    next
+}
+
+fn scan_item_rows(db: &Db) -> Result<Vec<EscalationItemRow>, ErrorData> {
+    let mut start = ITEM_PREFIX.as_bytes().to_vec();
+    let mut out = Vec::new();
+    loop {
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
+            .map_err(storage_error)?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut stop = false;
+        let mut last_key = None;
+        for (key, value) in rows {
+            if !key.starts_with(ITEM_PREFIX.as_bytes()) {
+                stop = true;
+                break;
+            }
+            let id = String::from_utf8_lossy(&key);
+            let id = id.strip_prefix(ITEM_PREFIX).unwrap_or(&id);
+            out.push(EscalationItemRow {
+                key: key.clone(),
+                item: decode_item(id, &value)?,
+            });
+            last_key = Some(key);
+        }
+        if stop || !more {
+            break;
+        }
+        let Some(key) = last_key else {
+            break;
+        };
+        start = key_after(&key);
+    }
+    Ok(out)
+}
+
+fn delete_keys(db: &Db, mut keys: Vec<Vec<u8>>, context: &str) -> Result<usize, ErrorData> {
+    keys.sort();
+    keys.dedup();
+    let deleted = keys.len();
+    for chunk in keys.chunks(DELETE_BATCH_ROWS) {
+        db.delete_batch(cf::CF_KV, chunk.iter().cloned())
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("{context} failed to delete terminal rows: {error}"),
+                )
+            })?;
+    }
+    Ok(deleted)
+}
+
+fn prune_terminal_item_rows(
+    db: &Db,
+    now_unix_ms: u64,
+    rows: &[EscalationItemRow],
+) -> Result<usize, ErrorData> {
+    let mut terminal = rows
+        .iter()
+        .filter(|row| !row.item.status.is_open())
+        .map(|row| (row.item.updated_at_unix_ms, row.key.clone()))
+        .collect::<Vec<_>>();
+    terminal.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut delete = terminal
+        .iter()
+        .filter(|(updated_at, _key)| {
+            updated_at.saturating_add(TERMINAL_ITEM_RETENTION_MS) <= now_unix_ms
+        })
+        .map(|(_updated_at, key)| key.clone())
+        .collect::<Vec<_>>();
+
+    if terminal.len() > TERMINAL_ITEM_RETAIN_ROWS {
+        let over_cap = terminal.len() - TERMINAL_ITEM_RETAIN_ROWS;
+        delete.extend(
+            terminal
+                .iter()
+                .take(over_cap)
+                .map(|(_updated_at, key)| key.clone()),
+        );
+    }
+
+    let deleted = delete_keys(db, delete, "escalation terminal retention")?;
+    if deleted > 0 {
+        tracing::info!(
+            code = "ESCALATION_ITEM_RETENTION_PRUNED",
+            scanned_rows = rows.len(),
+            terminal_rows = terminal.len(),
+            deleted_rows = deleted,
+            retain_terminal_rows = TERMINAL_ITEM_RETAIN_ROWS,
+            retention_ms = TERMINAL_ITEM_RETENTION_MS,
+            "readback=CF_KV escalation terminal item rows pruned"
+        );
+    } else if rows.len() > MAX_SCAN_ROWS {
+        tracing::warn!(
+            code = "ESCALATION_ITEM_QUEUE_LARGE",
+            scanned_rows = rows.len(),
+            terminal_rows = terminal.len(),
+            retain_terminal_rows = TERMINAL_ITEM_RETAIN_ROWS,
+            "escalation item scan exceeded historical hard limit but continued"
+        );
+    }
+    Ok(deleted)
+}
+
+fn prune_terminal_items(db: &Db, now_unix_ms: u64) -> Result<usize, ErrorData> {
+    let rows = scan_item_rows(db)?;
+    prune_terminal_item_rows(db, now_unix_ms, &rows)
+}
+
+/// All escalation items. Large queues are scanned in bounded RocksDB windows;
+/// terminal item rows are compacted by the sweep/list paths instead of making
+/// the queue fail closed at the historical row limit.
 fn scan_items(db: &Db) -> Result<Vec<EscalationItem>, ErrorData> {
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, ITEM_PREFIX.as_bytes())
-        .map_err(storage_error)?;
-    if rows.len() > MAX_SCAN_ROWS {
-        return Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "escalation item scan exceeded {MAX_SCAN_ROWS} rows ({}); refusing partial result",
-                rows.len()
-            ),
-        ));
-    }
-    let mut items = Vec::with_capacity(rows.len());
-    for (key, value) in rows {
-        let id = String::from_utf8_lossy(&key);
-        let id = id.strip_prefix(ITEM_PREFIX).unwrap_or(&id);
-        items.push(decode_item(id, &value)?);
-    }
-    Ok(items)
+    scan_item_rows(db).map(|rows| rows.into_iter().map(|row| row.item).collect())
 }
 
 fn open_items_for_anchor(db: &Db, anchor: &str) -> Result<Vec<EscalationItem>, ErrorData> {
@@ -1226,7 +1336,13 @@ pub(crate) async fn process_pending(
     now_unix_ms: u64,
 ) -> Result<ProcessReport, ErrorData> {
     let mut report = ProcessReport::default();
-    let items = scan_items(db)?;
+    let rows = scan_item_rows(db)?;
+    let pruned = prune_terminal_item_rows(db, now_unix_ms, &rows)?;
+    let items = if pruned > 0 {
+        scan_items(db)?
+    } else {
+        rows.into_iter().map(|row| row.item).collect()
+    };
     let terminal_agent_reads: Vec<AgentStateRead> = super::agent_state::reads(now_unix_ms)
         .into_iter()
         .filter(|read| read.state == AgentLifecycleState::Dead)
@@ -2020,6 +2136,7 @@ impl SynapseService {
     ) -> Result<Json<EscalationListResponse>, ErrorData> {
         let params = params.0;
         let db = self.m3_storage()?;
+        prune_terminal_items(&db, unix_time_ms_now())?;
         let mut items = scan_items(&db)?;
         items.sort_by_key(|item| std::cmp::Reverse(item.created_at_unix_ms));
         let total_open = items.iter().filter(|item| item.status.is_open()).count();

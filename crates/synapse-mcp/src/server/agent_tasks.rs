@@ -55,6 +55,7 @@ use crate::m4::{
 /// clean re-key, never an in-place migration.
 const TASK_NAMESPACE: &str = "agent-task/v1";
 const TASK_SCHEMA_VERSION: u32 = 1;
+const TASK_SEQUENCE_KEY: &str = "agent-task/v1/meta/last_enqueue_seq";
 
 const MAX_TASK_ID_CHARS: usize = 200;
 const MAX_TITLE_CHARS: usize = 500;
@@ -63,6 +64,10 @@ const MAX_PARAM_VALUE_BYTES: usize = 16 * 1024;
 const MIN_PRIORITY: u8 = 1;
 const MAX_PRIORITY: u8 = 5;
 const MAX_LIST_TASKS: usize = 1000;
+const SCAN_CHUNK_ROWS: usize = 4_096;
+const TERMINAL_TASK_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+const TERMINAL_TASK_RETAIN_ROWS: usize = 5_000;
+const DELETE_BATCH_ROWS: usize = 512;
 /// Default global cap on concurrently in-flight (`in_progress`) tasks the
 /// dispatcher will allow. Operators override per call.
 const DEFAULT_CONCURRENCY_CAP: usize = 8;
@@ -449,6 +454,12 @@ fn task_prefix() -> String {
     format!("{TASK_NAMESPACE}/task/")
 }
 
+fn key_after(key: &[u8]) -> Vec<u8> {
+    let mut next = key.to_vec();
+    next.push(0);
+    next
+}
+
 fn params_error(message: impl Into<String>) -> ErrorData {
     mcp_error(error_codes::TOOL_PARAMS_INVALID, message.into())
 }
@@ -627,6 +638,12 @@ struct SpawnTerminalCompletion {
     error_message: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct AgentTaskRow {
+    key: Vec<u8>,
+    task: AgentTask,
+}
+
 impl SpawnTerminalCompletion {
     fn is_success(&self) -> bool {
         self.status == "ok"
@@ -724,21 +741,191 @@ impl SynapseService {
     }
 
     pub(crate) fn read_all_tasks(db: &Db) -> Result<Vec<AgentTask>, ErrorData> {
+        Self::scan_task_rows(db).map(|rows| rows.into_iter().map(|row| row.task).collect())
+    }
+
+    fn scan_task_rows(db: &Db) -> Result<Vec<AgentTaskRow>, ErrorData> {
         let prefix = task_prefix();
+        let mut start = prefix.as_bytes().to_vec();
+        let mut out = Vec::new();
+        loop {
+            let (rows, more) = db
+                .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("agent_task failed to scan tasks: {error}"),
+                    )
+                })?;
+            if rows.is_empty() {
+                break;
+            }
+            let mut stop = false;
+            let mut last_key = None;
+            for (raw_key, raw_value) in rows {
+                if !raw_key.starts_with(prefix.as_bytes()) {
+                    stop = true;
+                    break;
+                }
+                let key = String::from_utf8_lossy(&raw_key).into_owned();
+                out.push(AgentTaskRow {
+                    key: raw_key.clone(),
+                    task: decode_task(&key, &raw_value)?,
+                });
+                last_key = Some(raw_key);
+            }
+            if stop || !more {
+                break;
+            }
+            let Some(key) = last_key else {
+                break;
+            };
+            start = key_after(&key);
+        }
+        Ok(out)
+    }
+
+    fn read_enqueue_seq_watermark(db: &Db) -> Result<Option<u64>, ErrorData> {
         let rows = db
-            .scan_cf_prefix(cf::CF_KV, prefix.as_bytes())
+            .scan_cf_prefix(cf::CF_KV, TASK_SEQUENCE_KEY.as_bytes())
             .map_err(|error| {
                 mcp_error(
                     error.code(),
-                    format!("agent_task failed to scan tasks: {error}"),
+                    format!("agent_task failed to read sequence watermark: {error}"),
                 )
             })?;
-        rows.into_iter()
-            .map(|(raw_key, raw_value)| {
-                let key = String::from_utf8_lossy(&raw_key).into_owned();
-                decode_task(&key, &raw_value)
+        for (key, value) in rows {
+            if key == TASK_SEQUENCE_KEY.as_bytes() {
+                let text = std::str::from_utf8(&value).map_err(|error| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!("agent_task sequence watermark is not UTF-8: {error}"),
+                    )
+                })?;
+                let seq = text.parse::<u64>().map_err(|error| {
+                    mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!("agent_task sequence watermark is not a u64: {error}"),
+                    )
+                })?;
+                return Ok(Some(seq));
+            }
+        }
+        Ok(None)
+    }
+
+    fn write_enqueue_seq_watermark(db: &Db, seq: u64) -> Result<(), ErrorData> {
+        db.put_batch(
+            cf::CF_KV,
+            [(
+                TASK_SEQUENCE_KEY.as_bytes().to_vec(),
+                seq.to_string().into_bytes(),
+            )],
+        )
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("agent_task failed to persist sequence watermark: {error}"),
+            )
+        })?;
+        db.flush().map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("agent_task sequence watermark persisted but failed to flush: {error}"),
+            )
+        })
+    }
+
+    fn ensure_enqueue_seq_watermark(db: &Db) -> Result<u64, ErrorData> {
+        if let Some(seq) = Self::read_enqueue_seq_watermark(db)? {
+            return Ok(seq);
+        }
+        let max_seq = Self::scan_task_rows(db)?
+            .iter()
+            .map(|row| row.task.enqueue_seq)
+            .max()
+            .unwrap_or(0);
+        Self::write_enqueue_seq_watermark(db, max_seq)?;
+        Ok(max_seq)
+    }
+
+    fn next_enqueue_seq(db: &Db) -> Result<u64, ErrorData> {
+        let current = Self::ensure_enqueue_seq_watermark(db)?;
+        let next = current.checked_add(1).ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "agent_task enqueue sequence overflowed u64",
+            )
+        })?;
+        Self::write_enqueue_seq_watermark(db, next)?;
+        Ok(next)
+    }
+
+    fn delete_task_keys(db: &Db, mut keys: Vec<Vec<u8>>) -> Result<usize, ErrorData> {
+        keys.sort();
+        keys.dedup();
+        let deleted = keys.len();
+        for chunk in keys.chunks(DELETE_BATCH_ROWS) {
+            db.delete_batch(cf::CF_KV, chunk.iter().cloned())
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("agent_task failed to prune terminal rows: {error}"),
+                    )
+                })?;
+        }
+        Ok(deleted)
+    }
+
+    fn prune_terminal_task_rows(
+        db: &Db,
+        now: u64,
+        rows: &[AgentTaskRow],
+    ) -> Result<usize, ErrorData> {
+        let mut terminal = rows
+            .iter()
+            .filter(|row| row.task.state.is_terminal())
+            .map(|row| (row.task.updated_unix_ms, row.key.clone()))
+            .collect::<Vec<_>>();
+        terminal.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+        let mut delete = terminal
+            .iter()
+            .filter(|(updated_at, _key)| {
+                updated_at.saturating_add(TERMINAL_TASK_RETENTION_MS) <= now
             })
-            .collect()
+            .map(|(_updated_at, key)| key.clone())
+            .collect::<Vec<_>>();
+
+        if terminal.len() > TERMINAL_TASK_RETAIN_ROWS {
+            let over_cap = terminal.len() - TERMINAL_TASK_RETAIN_ROWS;
+            delete.extend(
+                terminal
+                    .iter()
+                    .take(over_cap)
+                    .map(|(_updated_at, key)| key.clone()),
+            );
+        }
+
+        let deleted = Self::delete_task_keys(db, delete)?;
+        if deleted > 0 {
+            tracing::info!(
+                code = "AGENT_TASK_RETENTION_PRUNED",
+                scanned_rows = rows.len(),
+                terminal_rows = terminal.len(),
+                deleted_rows = deleted,
+                retain_terminal_rows = TERMINAL_TASK_RETAIN_ROWS,
+                retention_ms = TERMINAL_TASK_RETENTION_MS,
+                "readback=CF_KV terminal agent task rows pruned"
+            );
+        }
+        Ok(deleted)
+    }
+
+    fn prune_terminal_tasks(db: &Db, now: u64) -> Result<usize, ErrorData> {
+        Self::ensure_enqueue_seq_watermark(db)?;
+        let rows = Self::scan_task_rows(db)?;
+        Self::prune_terminal_task_rows(db, now, &rows)
     }
 
     /// Persists a task row and flushes so it is durable + immediately visible on
@@ -923,6 +1110,8 @@ impl SynapseService {
         validate_template_params(&params.template_params)?;
 
         let db = self.agent_task_db()?;
+        let now = unix_time_ms_now();
+        Self::prune_terminal_tasks(&db, now)?;
         if Self::read_task(&db, &params.task_id)?.is_some() {
             return Err(mcp_error(
                 error_codes::TOOL_PARAMS_INVALID,
@@ -932,14 +1121,9 @@ impl SynapseService {
                 ),
             ));
         }
-        // Strict global FIFO: enqueue_seq is max(existing) + 1, stable across
-        // restarts (low task volume makes the scan negligible).
-        let next_seq = Self::read_all_tasks(&db)?
-            .iter()
-            .map(|task| task.enqueue_seq)
-            .max()
-            .map_or(1, |max| max + 1);
-        let now = unix_time_ms_now();
+        // Strict global FIFO survives terminal-row pruning via a durable
+        // namespace watermark instead of deriving from retained rows.
+        let next_seq = Self::next_enqueue_seq(&db)?;
         let task = AgentTask {
             schema_version: TASK_SCHEMA_VERSION,
             task_id: params.task_id,
@@ -1103,6 +1287,7 @@ impl SynapseService {
 
     fn task_list_impl(&self, params: TaskListParams) -> Result<TaskListResponse, ErrorData> {
         let db = self.agent_task_db()?;
+        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         // Lazy reconcile on read so orphaned in_progress tasks surface even
         // without an explicit reconcile or a daemon restart hook.
         let (_, flagged) = self.reconcile_tasks(&db)?;
@@ -1122,6 +1307,7 @@ impl SynapseService {
 
     fn task_next_impl(&self, params: TaskNextParams) -> Result<TaskNextResponse, ErrorData> {
         let db = self.agent_task_db()?;
+        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
         let tasks = Self::read_all_tasks(&db)?;
         let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
@@ -1147,6 +1333,7 @@ impl SynapseService {
 
     fn task_reconcile_impl(&self) -> Result<TaskReconcileResponse, ErrorData> {
         let db = self.agent_task_db()?;
+        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         let (scanned, flagged) = self.reconcile_tasks(&db)?;
         tracing::info!(
             code = "AGENT_TASK_RECONCILE",
@@ -1199,6 +1386,7 @@ impl SynapseService {
         request_context: &RequestContext<RoleServer>,
     ) -> Result<TaskDispatchOnceResponse, ErrorData> {
         let db = self.agent_task_db()?;
+        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
         let tasks = Self::read_all_tasks(&db)?;
         let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
@@ -1399,6 +1587,7 @@ impl SynapseService {
         params: TaskDispatchOnceParams,
     ) -> Result<TaskDispatchOnceResponse, ErrorData> {
         let db = self.agent_task_db()?;
+        Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
         let tasks = Self::read_all_tasks(&db)?;
         let in_flight = tasks.iter().filter(|task| task.is_in_flight()).count();
@@ -1796,6 +1985,69 @@ mod tests {
             dir.join("completion-status.json"),
             serde_json::to_vec(&value)?,
         )?;
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_task_retention_preserves_enqueue_watermark() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION)?;
+        let now = TERMINAL_TASK_RETENTION_MS + 10_000;
+        let mut old_terminal = task("old-terminal", TaskState::Done, 3, "reviewer", 99);
+        old_terminal.updated_unix_ms = 1;
+        old_terminal.created_unix_ms = 1;
+        let mut open_old = task("open-old", TaskState::Todo, 3, "reviewer", 5);
+        open_old.updated_unix_ms = 1;
+        open_old.created_unix_ms = 1;
+        task_result(SynapseService::write_task(&db, &old_terminal))?;
+        task_result(SynapseService::write_task(&db, &open_old))?;
+
+        let deleted = task_result(SynapseService::prune_terminal_tasks(&db, now))?;
+
+        assert_eq!(deleted, 1);
+        assert!(task_result(SynapseService::read_task(&db, "old-terminal"))?.is_none());
+        assert!(task_result(SynapseService::read_task(&db, "open-old"))?.is_some());
+        assert_eq!(
+            task_result(SynapseService::read_enqueue_seq_watermark(&db))?,
+            Some(99)
+        );
+        assert_eq!(task_result(SynapseService::next_enqueue_seq(&db))?, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_task_retention_caps_recent_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let db = Db::open(&temp.path().join("db"), SCHEMA_VERSION)?;
+        let now = TERMINAL_TASK_RETENTION_MS + 100_000;
+        let rows = (0..(TERMINAL_TASK_RETAIN_ROWS + 2))
+            .map(|idx| {
+                let mut row = task(
+                    &format!("cap-{idx:05}"),
+                    TaskState::Done,
+                    3,
+                    "reviewer",
+                    u64::try_from(idx + 1).expect("idx fits u64"),
+                );
+                row.updated_unix_ms = now - 1_000 + u64::try_from(idx).expect("idx fits u64");
+                row.created_unix_ms = row.updated_unix_ms;
+                Ok((
+                    task_key(&row.task_id).into_bytes(),
+                    task_result(encode_task(&row))?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        db.put_batch_pressure_bypass(cf::CF_KV, rows)?;
+
+        let deleted = task_result(SynapseService::prune_terminal_tasks(&db, now))?;
+
+        assert_eq!(deleted, 2);
+        assert!(task_result(SynapseService::read_task(&db, "cap-00000"))?.is_none());
+        assert!(task_result(SynapseService::read_task(&db, "cap-00001"))?.is_none());
+        assert!(task_result(SynapseService::read_task(&db, "cap-00002"))?.is_some());
+        assert!(
+            task_result(SynapseService::read_all_tasks(&db))?.len() <= TERMINAL_TASK_RETAIN_ROWS
+        );
         Ok(())
     }
 
