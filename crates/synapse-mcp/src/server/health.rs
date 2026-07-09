@@ -598,9 +598,10 @@ impl SynapseService {
         match self.m3_state.lock() {
             Ok(state) => {
                 if state.shutdown_reason == "http" {
+                    let diagnostics = crate::http::http_transport_diagnostics_detail();
                     SubsystemHealth {
                         status: "ok".to_owned(),
-                        detail: Some("HTTP transport initialized".to_owned()),
+                        detail: Some(format!("HTTP transport initialized; {diagnostics}")),
                         bind_addr: Some(state.bind.clone()),
                         active_sessions,
                         sse_subscribers: Some(state.sse_state.active_subscription_count()),

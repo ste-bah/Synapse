@@ -9,7 +9,7 @@ use std::{
     process::ExitCode,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -86,6 +86,138 @@ const DASHBOARD_SPAWN_FAN_OUT_MAX: u32 = 5;
 const DASHBOARD_AGENT_KILL_DEFAULT_GRACE_MS: u64 = 3_000;
 const DASHBOARD_ASCIICAST_DEFAULT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const DASHBOARD_ASCIICAST_HARD_MAX_BYTES: u64 = 64 * 1024 * 1024;
+static HTTP_ACCEPTED_SOCKETS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HTTP_ACCEPTED_SOCKETS_CURRENT: AtomicU64 = AtomicU64::new(0);
+static HTTP_MCP_REQUEST_STARTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HTTP_MCP_REQUEST_COMPLETED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HTTP_MCP_REQUEST_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static HTTP_MCP_REQUEST_ERROR_STATUS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static HTTP_MCP_LAST_EVENT: Mutex<Option<HttpMcpTransportEvent>> = Mutex::new(None);
+
+#[derive(Clone, Debug)]
+struct HttpMcpTransportEvent {
+    request_id: u64,
+    phase: &'static str,
+    method: String,
+    path: String,
+    status_code: Option<u16>,
+    elapsed_ms: Option<u128>,
+    unix_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct HttpTransportDiagnosticsSnapshot {
+    accepted_sockets_total: u64,
+    accepted_sockets_current: u64,
+    mcp_request_started_total: u64,
+    mcp_request_completed_total: u64,
+    mcp_request_in_flight: u64,
+    mcp_request_error_status_total: u64,
+    last_event: Option<HttpMcpTransportEvent>,
+}
+
+pub(crate) fn http_transport_diagnostics_detail() -> String {
+    http_transport_diagnostics_detail_from_snapshot(http_transport_diagnostics_snapshot())
+}
+
+fn http_transport_diagnostics_snapshot() -> HttpTransportDiagnosticsSnapshot {
+    HttpTransportDiagnosticsSnapshot {
+        accepted_sockets_total: HTTP_ACCEPTED_SOCKETS_TOTAL.load(Ordering::Relaxed),
+        accepted_sockets_current: HTTP_ACCEPTED_SOCKETS_CURRENT.load(Ordering::Relaxed),
+        mcp_request_started_total: HTTP_MCP_REQUEST_STARTED_TOTAL.load(Ordering::Relaxed),
+        mcp_request_completed_total: HTTP_MCP_REQUEST_COMPLETED_TOTAL.load(Ordering::Relaxed),
+        mcp_request_in_flight: HTTP_MCP_REQUEST_IN_FLIGHT.load(Ordering::Relaxed),
+        mcp_request_error_status_total: HTTP_MCP_REQUEST_ERROR_STATUS_TOTAL.load(Ordering::Relaxed),
+        last_event: HTTP_MCP_LAST_EVENT
+            .lock()
+            .ok()
+            .and_then(|event| event.clone()),
+    }
+}
+
+fn http_transport_diagnostics_detail_from_snapshot(
+    snapshot: HttpTransportDiagnosticsSnapshot,
+) -> String {
+    let last_event = snapshot.last_event.map_or_else(
+        || "none".to_owned(),
+        |event| {
+            format!(
+                "request_id:{} phase:{} method:{} path:{} status:{} elapsed_ms:{} unix_ms:{}",
+                event.request_id,
+                event.phase,
+                event.method,
+                event.path,
+                event
+                    .status_code
+                    .map_or_else(|| "none".to_owned(), |status| status.to_string()),
+                event
+                    .elapsed_ms
+                    .map_or_else(|| "none".to_owned(), |elapsed| elapsed.to_string()),
+                event.unix_ms
+            )
+        },
+    );
+    format!(
+        "mcp_transport_diagnostics=request_started_total:{} request_completed_total:{} request_in_flight:{} request_error_status_total:{} accepted_sockets_total:{} accepted_sockets_current:{} last_event=\"{}\" classification_hint=\"if client send errors occur while process/socket SoT is listening and request_started_total does not increase, the request did not reach the daemon HTTP middleware; if started increases without completed, inspect request_in_flight and daemon_lifecycle in-flight tools; if completed status is 5xx/4xx, inspect status and daemon-tool-events\"",
+        snapshot.mcp_request_started_total,
+        snapshot.mcp_request_completed_total,
+        snapshot.mcp_request_in_flight,
+        snapshot.mcp_request_error_status_total,
+        snapshot.accepted_sockets_total,
+        snapshot.accepted_sockets_current,
+        last_event.replace('"', "'")
+    )
+}
+
+fn store_http_mcp_last_event(event: HttpMcpTransportEvent) {
+    if let Ok(mut last_event) = HTTP_MCP_LAST_EVENT.lock() {
+        *last_event = Some(event);
+    }
+}
+
+fn saturating_decrement(counter: &AtomicU64) {
+    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+        Some(value.saturating_sub(1))
+    });
+}
+
+fn record_http_mcp_request_started(method: &str, path: &str) -> u64 {
+    let request_id = HTTP_MCP_REQUEST_STARTED_TOTAL.fetch_add(1, Ordering::Relaxed) + 1;
+    HTTP_MCP_REQUEST_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    store_http_mcp_last_event(HttpMcpTransportEvent {
+        request_id,
+        phase: "started",
+        method: method.to_owned(),
+        path: path.to_owned(),
+        status_code: None,
+        elapsed_ms: None,
+        unix_ms: dashboard_unix_time_ms(),
+    });
+    request_id
+}
+
+fn record_http_mcp_request_completed(
+    request_id: u64,
+    method: &str,
+    path: &str,
+    status: StatusCode,
+    elapsed: Duration,
+) {
+    HTTP_MCP_REQUEST_COMPLETED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    saturating_decrement(&HTTP_MCP_REQUEST_IN_FLIGHT);
+    if status.is_client_error() || status.is_server_error() {
+        HTTP_MCP_REQUEST_ERROR_STATUS_TOTAL.fetch_add(1, Ordering::Relaxed);
+    }
+    store_http_mcp_last_event(HttpMcpTransportEvent {
+        request_id,
+        phase: "completed",
+        method: method.to_owned(),
+        path: path.to_owned(),
+        status_code: Some(status.as_u16()),
+        elapsed_ms: Some(elapsed.as_millis()),
+        unix_ms: dashboard_unix_time_ms(),
+    });
+}
 
 #[derive(Clone)]
 struct HttpState {
@@ -210,6 +342,8 @@ impl ActiveHttpSockets {
 
     #[cfg(windows)]
     fn register(&self, raw_socket: usize, peer_addr: SocketAddr) {
+        HTTP_ACCEPTED_SOCKETS_TOTAL.fetch_add(1, Ordering::Relaxed);
+        HTTP_ACCEPTED_SOCKETS_CURRENT.fetch_add(1, Ordering::Relaxed);
         let info = ActiveHttpSocketInfo {
             raw_socket,
             peer_addr: peer_addr.to_string(),
@@ -240,6 +374,7 @@ impl ActiveHttpSockets {
 
     #[cfg(windows)]
     fn unregister(&self, raw_socket: usize) {
+        saturating_decrement(&HTTP_ACCEPTED_SOCKETS_CURRENT);
         match self.inner.lock() {
             Ok(mut sockets) => {
                 let removed = sockets.remove(&raw_socket).is_some();
@@ -1035,7 +1170,8 @@ fn router(
         .layer(middleware::from_fn_with_state(
             auth,
             auth::require_http_security,
-        ));
+        ))
+        .layer(middleware::from_fn(record_mcp_transport_diagnostics));
     let dashboard_routes = Router::new()
         .route("/dashboard", get(dashboard_index))
         .route("/dashboard/assets/{asset}", get(dashboard_asset))
@@ -7609,6 +7745,29 @@ fn dashboard_unix_time_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+async fn record_mcp_transport_diagnostics(
+    request: Request<Body>,
+    next: middleware::Next,
+) -> Response {
+    let path = request.uri().path().to_owned();
+    if !path.starts_with("/mcp") {
+        return next.run(request).await;
+    }
+
+    let method = request.method().to_string();
+    let request_id = record_http_mcp_request_started(&method, &path);
+    let started = Instant::now();
+    let response = next.run(request).await;
+    record_http_mcp_request_completed(
+        request_id,
+        &method,
+        &path,
+        response.status(),
+        started.elapsed(),
+    );
+    response
+}
+
 const DASHBOARD_CSS_FILE: &str = "dashboard-CicCCuUG.css";
 const DASHBOARD_JS_FILE: &str = "dashboard-D_jF422B.js";
 const DASHBOARD_HTML: &str = include_str!("../../../../dashboard/dist/index.html");
@@ -8061,6 +8220,37 @@ mod tests {
     use super::*;
 
     const TEST_RESET_REASON: &str = "http_transport_lease_test_reset";
+
+    #[test]
+    fn http_transport_diagnostics_detail_names_request_counters_and_hint() {
+        let detail =
+            http_transport_diagnostics_detail_from_snapshot(HttpTransportDiagnosticsSnapshot {
+                accepted_sockets_total: 7,
+                accepted_sockets_current: 2,
+                mcp_request_started_total: 11,
+                mcp_request_completed_total: 10,
+                mcp_request_in_flight: 1,
+                mcp_request_error_status_total: 3,
+                last_event: Some(HttpMcpTransportEvent {
+                    request_id: 11,
+                    phase: "completed",
+                    method: "POST".to_owned(),
+                    path: "/mcp".to_owned(),
+                    status_code: Some(500),
+                    elapsed_ms: Some(42),
+                    unix_ms: 1234,
+                }),
+            });
+
+        assert!(detail.contains("request_started_total:11"));
+        assert!(detail.contains("request_completed_total:10"));
+        assert!(detail.contains("request_in_flight:1"));
+        assert!(detail.contains("request_error_status_total:3"));
+        assert!(detail.contains("accepted_sockets_current:2"));
+        assert!(detail.contains("request_id:11 phase:completed"));
+        assert!(detail.contains("client send errors"));
+        assert!(detail.contains("daemon HTTP middleware"));
+    }
 
     #[test]
     fn dashboard_host_gate_accepts_loopback_only() {
