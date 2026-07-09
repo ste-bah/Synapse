@@ -222,7 +222,6 @@ These are written by setup/launcher scripts, not read by the daemon Rust code:
 | `SYNAPSE_TOOL_SURFACE_SNAPSHOT_AT_CODEX_START` | Codex launcher | Path to the start snapshot. |
 | `SYNAPSE_TOOL_SURFACE_OUT` | `server/tool_profiles.rs` | Output path for the tool-surface dump. |
 | `SYNAPSE_DEBUG_TOOLS` | `server.rs` | Truthy enables debug tools in the surface. |
-| `SYNAPSE_ENABLE_EVERQUEST` | `server.rs` | Truthy enables EverQuest domain tools. |
 
 ### 3.11 Test / benchmark only (not production config)
 

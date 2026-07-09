@@ -256,7 +256,6 @@ impl SynapseService {
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
         super::target_policy::ensure_supported_use_allows(&runtime, &foreground, tool)
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
-        let preflight = self.ensure_everquest_live_ui_context_for_action(tool, preflight)?;
         Ok(preflight)
     }
 
@@ -2738,7 +2737,6 @@ max_detections = 8
             active_profile_id_before: None,
             applied: false,
             status: "not_applicable",
-            target: None,
             before: proof.clone(),
             candidate_count: None,
             focus_attempted: false,
@@ -2746,7 +2744,6 @@ max_detections = 8
             focus_error: None,
             after: Some(proof),
             readback_error: None,
-            everquest_ui_context: None,
         }
     }
 

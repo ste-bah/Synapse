@@ -1,10 +1,9 @@
 ---
 source: crates/synapse-mcp/tests/m4_tools_list.rs
-assertion_line: 56
 expression: snapshot
 ---
 {
-  "count": 270,
+  "count": 245,
   "m4_defaults": [
     {
       "actual": 33,
@@ -167,46 +166,6 @@ expression: snapshot
       "actual": false,
       "path": "inputSchema.properties.suppress_popup.default",
       "tool": "notify_human"
-    },
-    {
-      "actual": "everquest.live",
-      "path": "inputSchema.properties.profile_id.default",
-      "tool": "everquest_world_summary"
-    },
-    {
-      "actual": "everquest/current_state/v1/everquest.live",
-      "path": "inputSchema.properties.state_row_key.default",
-      "tool": "everquest_world_summary"
-    },
-    {
-      "actual": 5,
-      "path": "inputSchema.properties.max_exits.default",
-      "tool": "everquest_world_summary"
-    },
-    {
-      "actual": 5,
-      "path": "inputSchema.properties.max_landmarks.default",
-      "tool": "everquest_world_summary"
-    },
-    {
-      "actual": 5,
-      "path": "inputSchema.properties.max_transitions.default",
-      "tool": "everquest_world_summary"
-    },
-    {
-      "actual": 5,
-      "path": "inputSchema.properties.max_hazards.default",
-      "tool": "everquest_world_summary"
-    },
-    {
-      "actual": 300,
-      "path": "inputSchema.properties.stale_after_seconds.default",
-      "tool": "everquest_world_summary"
-    },
-    {
-      "actual_contains": "summary_id",
-      "path": "inputSchema.required",
-      "tool": "everquest_world_summary"
     }
   ],
   "tools": [
@@ -335,31 +294,6 @@ expression: snapshot
     "escalation_config_get",
     "escalation_config_set",
     "escalation_list",
-    "everquest_action_prior_record",
-    "everquest_action_prior_scorecard",
-    "everquest_autocombat",
-    "everquest_chat_input_state",
-    "everquest_contextgraph_ingest",
-    "everquest_contextgraph_search",
-    "everquest_current_state",
-    "everquest_domain_normalize",
-    "everquest_episode_export",
-    "everquest_loc_probe",
-    "everquest_map_sensor",
-    "everquest_memory_consult",
-    "everquest_memory_record",
-    "everquest_outcome_ingest",
-    "everquest_planner_guard",
-    "everquest_predictive_model_fit",
-    "everquest_predictive_model_predict",
-    "everquest_route_plan",
-    "everquest_safe_command",
-    "everquest_surprise_detect",
-    "everquest_survival_readiness",
-    "everquest_trajectory_record",
-    "everquest_world_model_inspect",
-    "everquest_world_model_record",
-    "everquest_world_summary",
     "find",
     "fleet_stop",
     "get_target",

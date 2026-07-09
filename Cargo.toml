@@ -11,7 +11,6 @@ members = [
     "crates/synapse-reflex",
     "crates/synapse-storage",
     "crates/synapse-profiles",
-    "crates/synapse-everquest",
     "crates/synapse-models",
     "crates/synapse-telemetry",
     "crates/synapse-test-utils",

@@ -30,8 +30,8 @@ const KEY_LAUNCH_TARGET: &str = "launch.target";
 const KEY_LAUNCH_WORLD: &str = "launch.world";
 const KEY_LAUNCH_LOGFILE: &str = "launch.logfile";
 const KEY_BENCHMARK_GAMEID: &str = "benchmark_world_gameid";
-const KEY_RUNTIME_EVERQUEST_EXE: &str = "runtime.everquest.exe";
-const KEY_RUNTIME_EVERQUEST_SERVER: &str = "runtime.everquest.server";
+const KEY_RUNTIME_LIVE_SERVER_EXE: &str = "runtime.live_server.exe";
+const KEY_RUNTIME_LIVE_SERVER_NAME: &str = "runtime.live_server.name";
 
 /// Opt-in enforcement of the legacy game-target `supported_use` policy.
 ///
@@ -385,7 +385,8 @@ fn evaluate_operator_attended_live_server(
         ));
     }
 
-    if let Some(expected_exe) = optional_expanded_path(&profile.metadata, KEY_RUNTIME_EVERQUEST_EXE)
+    if let Some(expected_exe) =
+        optional_expanded_path(&profile.metadata, KEY_RUNTIME_LIVE_SERVER_EXE)
         && !same_path_text(&expected_exe, Path::new(&foreground.process_path))
     {
         return Err(denial(
@@ -400,12 +401,12 @@ fn evaluate_operator_attended_live_server(
             DenialEvidence::default(),
         ));
     }
-    if metadata_trimmed(&profile.metadata, KEY_RUNTIME_EVERQUEST_SERVER).is_none() {
+    if metadata_trimmed(&profile.metadata, KEY_RUNTIME_LIVE_SERVER_NAME).is_none() {
         return Err(denial(
             profile,
             foreground,
             "live_server_name_missing",
-            format!("{KEY_RUNTIME_EVERQUEST_SERVER} metadata is required"),
+            format!("{KEY_RUNTIME_LIVE_SERVER_NAME} metadata is required"),
             DenialEvidence::default(),
         ));
     }
@@ -1128,11 +1129,9 @@ mod tests {
 
     #[test]
     fn supported_use_allows_operator_attended_live_server() {
-        let exe_path = PathBuf::from(
-            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
-        );
-        let profile = everquest_profile(&exe_path, true);
-        let foreground = foreground_for("eqgame.exe", &exe_path, "EverQuest");
+        let exe_path = PathBuf::from(r"C:\Games\LiveServer\livegame.exe");
+        let profile = live_server_profile(&exe_path, true);
+        let foreground = foreground_for("livegame.exe", &exe_path, "Live Server");
 
         let state = require_allow(evaluate_supported_use_with_optional_process(
             &profile,
@@ -1140,7 +1139,7 @@ mod tests {
             None,
         ));
 
-        assert_eq!(state.profile_id, "everquest.live");
+        assert_eq!(state.profile_id, "live_server.test");
         assert_eq!(
             state.foreground_process_path,
             exe_path.display().to_string()
@@ -1150,11 +1149,9 @@ mod tests {
 
     #[test]
     fn supported_use_denies_live_server_without_operator_attended_metadata() {
-        let exe_path = PathBuf::from(
-            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
-        );
-        let profile = everquest_profile(&exe_path, false);
-        let foreground = foreground_for("eqgame.exe", &exe_path, "EverQuest");
+        let exe_path = PathBuf::from(r"C:\Games\LiveServer\livegame.exe");
+        let profile = live_server_profile(&exe_path, false);
+        let foreground = foreground_for("livegame.exe", &exe_path, "Live Server");
 
         let denial = require_denial(evaluate_supported_use_with_optional_process(
             &profile,
@@ -1167,12 +1164,10 @@ mod tests {
 
     #[test]
     fn supported_use_denies_live_server_process_path_mismatch() {
-        let profile_path = PathBuf::from(
-            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
-        );
-        let foreground_path = PathBuf::from(r"C:\Temp\eqgame.exe");
-        let profile = everquest_profile(&profile_path, true);
-        let foreground = foreground_for("eqgame.exe", &foreground_path, "EverQuest");
+        let profile_path = PathBuf::from(r"C:\Games\LiveServer\livegame.exe");
+        let foreground_path = PathBuf::from(r"C:\Temp\livegame.exe");
+        let profile = live_server_profile(&profile_path, true);
+        let foreground = foreground_for("livegame.exe", &foreground_path, "Live Server");
 
         let denial = require_denial(evaluate_supported_use_with_optional_process(
             &profile,
@@ -1185,11 +1180,9 @@ mod tests {
 
     #[test]
     fn supported_use_denies_live_server_text_clipboard_shell_launch_combo_and_reflex_tools() {
-        let exe_path = PathBuf::from(
-            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
-        );
-        let profile = everquest_profile(&exe_path, true);
-        let foreground = foreground_for("eqgame.exe", &exe_path, "EverQuest");
+        let exe_path = PathBuf::from(r"C:\Games\LiveServer\livegame.exe");
+        let profile = live_server_profile(&exe_path, true);
+        let foreground = foreground_for("livegame.exe", &exe_path, "Live Server");
 
         for tool in [
             "act_type",
@@ -1213,12 +1206,10 @@ mod tests {
 
     #[test]
     fn supported_use_denies_live_server_without_social_economy_boundary_metadata() {
-        let exe_path = PathBuf::from(
-            r"C:\Users\Public\Daybreak Game Company\Installed Games\EverQuest\eqgame.exe",
-        );
-        let mut profile = everquest_profile(&exe_path, true);
+        let exe_path = PathBuf::from(r"C:\Games\LiveServer\livegame.exe");
+        let mut profile = live_server_profile(&exe_path, true);
         profile.metadata.remove(KEY_NO_SOCIAL_OR_ECONOMY_AUTOMATION);
-        let foreground = foreground_for("eqgame.exe", &exe_path, "EverQuest");
+        let foreground = foreground_for("livegame.exe", &exe_path, "Live Server");
 
         let denial = require_denial(evaluate_supported_use_with_optional_process(
             &profile,
@@ -1284,7 +1275,7 @@ mod tests {
         }
     }
 
-    fn everquest_profile(exe_path: &Path, operator_attended: bool) -> Profile {
+    fn live_server_profile(exe_path: &Path, operator_attended: bool) -> Profile {
         let mut metadata = BTreeMap::new();
         metadata.insert(KEY_LIVE_SERVER_ALLOWED.to_owned(), "true".to_owned());
         metadata.insert(
@@ -1322,16 +1313,16 @@ mod tests {
             "true".to_owned(),
         );
         metadata.insert(
-            KEY_RUNTIME_EVERQUEST_EXE.to_owned(),
+            KEY_RUNTIME_LIVE_SERVER_EXE.to_owned(),
             exe_path.display().to_string(),
         );
         metadata.insert(
-            KEY_RUNTIME_EVERQUEST_SERVER.to_owned(),
-            "Frostreaver".to_owned(),
+            KEY_RUNTIME_LIVE_SERVER_NAME.to_owned(),
+            "Local Live Server".to_owned(),
         );
         Profile {
-            id: "everquest.live".to_owned(),
-            label: "EverQuest".to_owned(),
+            id: "live_server.test".to_owned(),
+            label: "Live Server Test".to_owned(),
             version: "1".to_owned(),
             use_scope: ProfileUseScope::OperatorOwnedTest,
             matches: Vec::new(),

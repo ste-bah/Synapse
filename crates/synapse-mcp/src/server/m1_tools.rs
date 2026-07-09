@@ -364,9 +364,6 @@ impl SynapseService {
             None
         };
         self.resolve_input_profile_and_hud(&mut input, include.hud);
-        if include.events {
-            self.populate_everquest_log_events(&mut input);
-        }
         {
             let mut state = self.m1_state()?;
             populate_detection_from_state(&mut state, &mut input);

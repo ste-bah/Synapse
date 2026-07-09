@@ -19,14 +19,8 @@ use synapse_test_utils::stdio_mcp_client::StdioMcpClient;
 async fn m4_tools_list_snapshot_defaults_and_closed_schemas() -> anyhow::Result<()> {
     // Run with debug tools enabled so the asserted surface + snapshot covers the
     // full tool set, including the SYNAPSE_DEBUG_TOOLS-gated storage probes.
-    let mut client = StdioMcpClient::launch_and_init_with_env(
-        None,
-        &[
-            ("SYNAPSE_DEBUG_TOOLS", "1"),
-            ("SYNAPSE_ENABLE_EVERQUEST", "1"),
-        ],
-    )
-    .await?;
+    let mut client =
+        StdioMcpClient::launch_and_init_with_env(None, &[("SYNAPSE_DEBUG_TOOLS", "1")]).await?;
     let response = client.tools_list().await?;
     let tools = response
         .get("tools")
@@ -381,61 +375,6 @@ fn m4_default_readbacks(tools: &[Value]) -> anyhow::Result<Vec<Value>> {
         "notify_human",
         "inputSchema.properties.suppress_popup.default",
         &json!(false),
-    )?;
-    read_default(
-        &mut readbacks,
-        tools,
-        "everquest_world_summary",
-        "inputSchema.properties.profile_id.default",
-        &json!("everquest.live"),
-    )?;
-    read_default(
-        &mut readbacks,
-        tools,
-        "everquest_world_summary",
-        "inputSchema.properties.state_row_key.default",
-        &json!("everquest/current_state/v1/everquest.live"),
-    )?;
-    read_default(
-        &mut readbacks,
-        tools,
-        "everquest_world_summary",
-        "inputSchema.properties.max_exits.default",
-        &json!(5),
-    )?;
-    read_default(
-        &mut readbacks,
-        tools,
-        "everquest_world_summary",
-        "inputSchema.properties.max_landmarks.default",
-        &json!(5),
-    )?;
-    read_default(
-        &mut readbacks,
-        tools,
-        "everquest_world_summary",
-        "inputSchema.properties.max_transitions.default",
-        &json!(5),
-    )?;
-    read_default(
-        &mut readbacks,
-        tools,
-        "everquest_world_summary",
-        "inputSchema.properties.max_hazards.default",
-        &json!(5),
-    )?;
-    read_default(
-        &mut readbacks,
-        tools,
-        "everquest_world_summary",
-        "inputSchema.properties.stale_after_seconds.default",
-        &json!(300),
-    )?;
-    read_required(
-        &mut readbacks,
-        tools,
-        "everquest_world_summary",
-        "summary_id",
     )?;
     Ok(readbacks)
 }

@@ -14,7 +14,6 @@ Every claim cites `file:line` under the repo root. This document is the analysis
 2. **`verb=press` with no key chord silently becomes a synthetic mouse click** (`background_router.rs:711-716` → DOM `"press"` → `performClick`).
 3. **`typeActiveElement` uses the plain `.value=` setter + synchronous readback** (`service_worker.js:15555`, `:15467`). Controlled React/Vue/Angular inputs revert this on next render; the sync readback passes before the async revert → false success. The correct native-setter path already exists in `setFieldValue` (`:16002`, comment `:15648`).
 4. **Test/FSV scaffolding shipped as live tools:** `storage_put_probe_rows` (`m3_tools.rs:2111`), `storage_pressure_sample` (`m3_tools.rs:2153`), `action_diagnostic_rate_limit_override` (`m2_tools.rs:1644`), `action_diagnostic_queue_full_setup` (`m2_tools.rs:1726`).
-5. **EverQuest pack (25 tools) is already correctly gated** behind `SYNAPSE_ENABLE_EVERQUEST` (`server.rs:652-657`) — 0 tools on the default surface. The model to emulate.
 
 ---
 
@@ -68,11 +67,6 @@ Read side (`browser_network_requests`/`_request`/`_websockets`) read one shared 
 ## 14. Misc
 `workspace_subscribe` ⊂ generic `subscribe` (workspace filter) → fold. Naming collision: session `tool_profile_*` vs learned `profile_*`/`profile_authoring_*` — rename one.
 
-## 15. EverQuest
-25 tools, gated, 0 on default surface — no action for the shrink goal; long-term extract to its own crate/feature.
-
----
-
 ## (a) Prioritized LOW-RISK first cuts (candidate child issues)
 1. Delete/hide FSV/test-harness tools from the live surface — `storage_put_probe_rows`, `storage_pressure_sample`, `action_diagnostic_rate_limit_override`, `action_diagnostic_queue_full_setup`. (-4, zero capability loss)
 2. Delete dead code — `act_click_with_handle` (`click.rs:103`), `applyTextToEditable`/`dispatchSyntheticInputEvent` (`service_worker.js`).
@@ -93,6 +87,4 @@ Net of items 1-7: roughly **-30 tools** with no real capability loss (245 → ~2
 3. Converge field-text tools into `act_set_field_text` tiers (large #882/#1000/#1299 refactor; keep per-tier fail-closed contract).
 4. Fix `typeActiveElement` plain-setter revert (native setter / `Input.insertText` + deferred re-read).
 5. Unify the two screenshot lanes / two click lanes behind one tool with a `lane` override.
-6. Extract the EverQuest crate.
-
 **Repo-wide invariant to enforce (issue principles 3/4):** no synthetic `dispatchEvent` may be the implementation of an input verb, and every mutating verb must assert a real-state postcondition. The codebase already does this for `clear`/`check`/`set_field`/`select`; these cuts bring `click`/`press`/`type` to the same bar.

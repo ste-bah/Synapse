@@ -1,6 +1,6 @@
 # 02. Source Code Map
 
-**Source files covered:** entire workspace tree (~586 `.rs` files across 15 crates plus top-level non-Rust components); key `lib.rs`/`main.rs`/`server.rs` and module-root files of each crate read in detail; one-line descriptions for remaining files derived from module names, doc-comments, and key declarations.
+**Source files covered:** entire workspace tree across 14 crates plus top-level non-Rust components; key `lib.rs`/`main.rs`/`server.rs` and module-root files of each crate read in detail; one-line descriptions for remaining files derived from module names, doc-comments, and key declarations.
 
 See [01_system_overview.md](01_system_overview.md) for the architectural narrative this map indexes.
 
@@ -10,8 +10,8 @@ See [01_system_overview.md](01_system_overview.md) for the architectural narrati
 
 Root: `C:\code\synapse\Cargo.toml` — `resolver = "2"`, `edition = "2024"`, `rust-version = "1.95"`, `version = "0.1.0"`, license `MIT OR Apache-2.0`.
 
-**`[workspace] members`** (15 crates):
-`synapse-mcp`, `synapse-core`, `synapse-capture`, `synapse-a11y`, `synapse-perception`, `synapse-audio`, `synapse-action`, `synapse-reflex`, `synapse-storage`, `synapse-profiles`, `synapse-everquest`, `synapse-models`, `synapse-telemetry`, `synapse-test-utils`, `synapse-overlay`.
+**`[workspace] members`** (14 crates):
+`synapse-mcp`, `synapse-core`, `synapse-capture`, `synapse-a11y`, `synapse-perception`, `synapse-audio`, `synapse-action`, `synapse-reflex`, `synapse-storage`, `synapse-profiles`, `synapse-models`, `synapse-telemetry`, `synapse-test-utils`, `synapse-overlay`.
 
 **`default-members`:** `synapse-mcp`, `synapse-overlay` (the two shipped binaries).
 
@@ -304,21 +304,6 @@ crates/synapse-models/src/error.rs      # model errors
 ```
 Test: model_loader.
 
-### crates/synapse-everquest
-EverQuest domain pack: log tailing, map file parsing, zone-graph building. No internal deps.
-
-```
-crates/synapse-everquest/src/lib.rs            # crate root; log/map/inventory/zone-graph exports
-crates/synapse-everquest/src/log.rs             # parse/tail EQ chat+combat logs, outcome parsing
-crates/synapse-everquest/src/map.rs             # parse EQ .map files (lines, points, labels)
-crates/synapse-everquest/src/map_inventory.rs   # inventory/dedup a map set, sha256
-crates/synapse-everquest/src/zone_graph.rs      # build zone adjacency graph + nearest landmark
-crates/synapse-everquest/src/bin/eq-map-inspect.rs    # CLI: inspect a map file
-crates/synapse-everquest/src/bin/eq-map-inventory.rs  # CLI: inventory a map set
-crates/synapse-everquest/src/bin/eq-zone-graph.rs     # CLI: dump zone graph
-```
-Test: map_inventory.
-
 ### crates/synapse-telemetry
 Tracing/log init (JSON file + console), log-dir GC, metrics registration, panic hook. Depends on `synapse-core`.
 
@@ -345,7 +330,7 @@ crates/synapse-overlay/src/main.rs   # Win32 system-tray icon + popup menu (daem
 ```
 
 ### crates/synapse-mcp
-The daemon: MCP server binding all subsystems, organized M1 (perception) → M2 (action) → M3 (background/agents) → M4 (orchestration/shell). Depends on **all** other crates except `test-utils`/`overlay`/`everquest-bins`. ~202 source files.
+The daemon: MCP server binding all subsystems, organized M1 (perception) → M2 (action) → M3 (background/agents) → M4 (orchestration/shell). Depends on the runtime crates except `test-utils`/`overlay`. ~202 source files.
 
 **Crate root / lifecycle / transports:**
 ```
@@ -466,7 +451,7 @@ crates/synapse-mcp/src/m3/storage.rs        # storage inspect tool
 crates/synapse-mcp/src/m3/config.rs (in m3.rs) # M3ServiceConfig (from CLI/env)
 ```
 
-**`src/m4.rs` + `src/server/` — orchestration, multi-agent, browser, EverQuest tools:**
+**`src/m4.rs` + `src/server/` — orchestration, multi-agent, and browser tools:**
 ```
 crates/synapse-mcp/src/m4.rs               # M4 service: act_run_shell / act_launch allow-list config
 crates/synapse-mcp/src/server.rs           # (see lifecycle) ServerHandler + tool_router aggregation
@@ -530,36 +515,6 @@ crates/synapse-mcp/src/server/agent_transcripts.rs   # agent transcript records
 crates/synapse-mcp/src/server/ambient_agents.rs      # ambient (always-on) agent management
 ```
 
-**`src/server/everquest_*` — EverQuest domain tool surface (world model, routing, combat, scoring):**
-```
-crates/synapse-mcp/src/server/everquest_tools.rs          # EverQuest tool registrations
-crates/synapse-mcp/src/server/everquest_domain.rs          # domain state/config
-crates/synapse-mcp/src/server/everquest_state.rs           # live game state
-crates/synapse-mcp/src/server/everquest_log.rs             # log-sensor integration
-crates/synapse-mcp/src/server/everquest_map_sensor.rs      # map-position sensor
-crates/synapse-mcp/src/server/everquest_route.rs           # zone routing
-crates/synapse-mcp/src/server/everquest_ui_context.rs      # UI context extraction
-crates/synapse-mcp/src/server/everquest_contextgraph.rs    # context graph
-crates/synapse-mcp/src/server/everquest_world_model.rs     # world-model root
-crates/synapse-mcp/src/server/everquest_world_model/model.rs      # world-model data
-crates/synapse-mcp/src/server/everquest_world_model/validation.rs # world-model validation
-crates/synapse-mcp/src/server/everquest_world_summary.rs   # world summary root
-crates/synapse-mcp/src/server/everquest_world_summary/model.rs      # summary model
-crates/synapse-mcp/src/server/everquest_world_summary/validation.rs # summary validation
-crates/synapse-mcp/src/server/everquest_predictive_model.rs # predictive model
-crates/synapse-mcp/src/server/everquest_surprise.rs         # surprise (prediction-error) root
-crates/synapse-mcp/src/server/everquest_surprise/model.rs        # surprise model
-crates/synapse-mcp/src/server/everquest_surprise/compare.rs      # surprise comparison
-crates/synapse-mcp/src/server/everquest_surprise/validation.rs   # surprise validation
-crates/synapse-mcp/src/server/everquest_trajectory.rs       # trajectory tracking
-crates/synapse-mcp/src/server/everquest_memory.rs           # episodic memory
-crates/synapse-mcp/src/server/everquest_episode_export.rs   # episode export
-crates/synapse-mcp/src/server/everquest_autocombat.rs       # auto-combat logic
-crates/synapse-mcp/src/server/everquest_guard.rs            # safety guard
-crates/synapse-mcp/src/server/everquest_outcome.rs          # outcome evaluation
-crates/synapse-mcp/src/server/everquest_scorecard.rs        # scorecard
-```
-
 **`src/server/browser_*` — Playwright-style browser tools (over CDP, see [synapse-a11y]):**
 ```
 crates/synapse-mcp/src/server/browser_assert.rs       # browser_assert
@@ -584,7 +539,7 @@ Edges from each crate's `Cargo.toml [dependencies]` (internal `synapse-*` only).
 
 ```
 synapse-mcp     -> synapse-action, synapse-a11y, synapse-audio, synapse-core,
-                   synapse-capture, synapse-everquest, synapse-models,
+                   synapse-capture, synapse-models,
                    synapse-perception, synapse-profiles, synapse-reflex,
                    synapse-storage, synapse-telemetry
 synapse-perception -> synapse-a11y, synapse-capture, synapse-core
@@ -599,7 +554,6 @@ synapse-models     -> synapse-core
 synapse-profiles   -> synapse-core
 synapse-telemetry  -> synapse-core
 synapse-test-utils -> synapse-core
-synapse-everquest  -> (none — leaf)
 synapse-core       -> (none — root)
 ```
 
@@ -613,7 +567,6 @@ synapse-core       -> (none — root)
 | synapse-action | core | input emission, leases, safety |
 | synapse-models | core | ONNX model registry/loading |
 | synapse-profiles | core | per-app profile parsing/matching |
-| synapse-everquest | — | EQ log/map/zone domain (leaf) |
 | synapse-perception | a11y, capture, core | observation assembly + OCR |
 | synapse-audio | core, models | loopback + STT |
 | synapse-reflex | action, core, storage | reactive automation engine |

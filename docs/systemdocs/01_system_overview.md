@@ -5,7 +5,7 @@
 - `README.md`
 - `crates/synapse-mcp/src/main.rs`, `server.rs`, `m1.rs`, `m2.rs`, `m3.rs`, `m4.rs`, `single_instance.rs`, `daemon_lifecycle.rs`
 - `crates/synapse-core/src/lib.rs`, `defaults.rs`, `error_codes.rs`
-- The 15 workspace crates' `lib.rs` / `main.rs` module declarations
+- The 14 workspace crates' `lib.rs` / `main.rs` module declarations
 - Synthesized from companion documents 02–17 in this series
 
 > Scope note: every claim below is derived from source in the `C:\code\synapse` workspace. Where a fact is documented in detail elsewhere in this series it is cross-referenced rather than repeated.
@@ -16,7 +16,7 @@
 
 Synapse is a local **Model Context Protocol (MCP) server**, written in Rust (edition 2024, `rust-version = 1.95`), that gives an LLM agent a structured interface to a **Windows** PC: it perceives the screen (capture + OCR + object detection + accessibility tree), emits human-like mouse/keyboard/gamepad input, runs sub-millisecond reflex loops, drives the browser over the Chrome DevTools Protocol, and orchestrates a fleet of agents that share one machine. It speaks MCP over stdio and over HTTP/SSE, and is designed to plug into Claude Code, Codex, and the Claude Desktop app (`README.md`).
 
-The system is structured as a Cargo workspace of **15 crates** (`Cargo.toml`). `synapse-mcp` is the server/daemon and the sink of the dependency graph; `synapse-core` is the shared-vocabulary root with no internal dependencies. See [02_source_code_map.md](02_source_code_map.md) for the full crate tree and dependency graph.
+The system is structured as a Cargo workspace of **14 crates** (`Cargo.toml`). `synapse-mcp` is the server/daemon and the sink of the dependency graph; `synapse-core` is the shared-vocabulary root with no internal dependencies. See [02_source_code_map.md](02_source_code_map.md) for the full crate tree and dependency graph.
 
 ---
 
@@ -96,7 +96,6 @@ The server registers MCP tools as `rmcp` `#[tool(...)]` functions on `SynapseSer
 | Intent / plans / routines | `intent_*`, `plan_*`, `armed_routine_*`, `suggestion_*` |
 | Reality / timeline | `reality_audit`/`baseline`, `timeline_get`/`search`/`digest`/`stats` |
 | Workspace blackboard | `workspace_get`/`put`/`list`/`subscribe` |
-| EverQuest pack | gated game-domain tools (`SYNAPSE_ENABLE_EVERQUEST`) |
 
 Total registered tool macros: **238** `#[tool(` occurrences (the reference doc enumerates **206** distinct client-exposed tools after accounting for feature-gated/debug tools; the README badge value of 81 is stale). See [18_verification_report.md](18_verification_report.md).
 
@@ -158,7 +157,6 @@ See [14_core_telemetry_overlay.md](14_core_telemetry_overlay.md) for the full co
 | **Action** (`synapse-action`) | Human-like input emission | Win32 `SendInput` + `SetPhysicalCursorPos`, ViGEm virtual gamepad; deterministic SplitMix64-seeded Bézier/min-jerk paths, Fitts'-law durations, WindMouse strokes, Gaussian inter-key timing with 0.75× bigram speedup; token-bucket rate limits, input lease, panic hotkey. | [09](09_action_subsystem.md) |
 | **Reflex** (`synapse-reflex`) | Sub-ms event-driven control loops | 7 kinds (aim_track, combo, hold_button, hold_move, on_event, path_follow, + hold_lifetime); 1 ms MMCSS waitable-timer scheduler thread (2 ms tokio fallback); aim_track EMA; starvation after 2 s. | [10](10_reflex_subsystem.md) |
 | **Profiles** (`synapse-profiles`) | Per-app/game profile matching | TOML profiles, `deny_unknown_fields`; foreground-window match ranked exe > title_regex > steam_appid > window_class, tie-break newest mtime; 200 ms debounced hot-reload, fail-open. | [11](11_profiles_subsystem.md) |
-| **EverQuest domain** (`synapse-everquest` + mcp `everquest_*`) | Game-specific log/map/world model | Regex log parsing; `.txt` map L/P records; static zone graph; Dijkstra routing (3D Euclidean); predictive model + surprise detection (divergence threshold 0.50); autocombat. | [12](12_everquest_domain.md) |
 | **Models** (`synapse-models`) | ONNX model registry/verify/session | 1 registered model (RT-DETRv2-S COCO); SHA-256 streaming verify (64 KiB chunks); EP order CUDA→DirectML→CPU; downloads disabled in M1 (manual side-load to `%LOCALAPPDATA%\synapse\models`). | [13](13_models_subsystem.md) |
 | **Core/Telemetry/Overlay** (`synapse-core`, `-telemetry`, `-overlay`) | Shared types, metrics, tray UI | ~120 error codes; 19 Prometheus metrics (12 counters/5 gauges/2 histograms); overlay = Win32 tray polling daemon every 2 s. | [14](14_core_telemetry_overlay.md) |
 | **MCP server** (`synapse-mcp`) | Daemon, transports, orchestration | stdio + HTTP/SSE (rmcp 1.7.0, axum); single-instance fs2 lock on port 7700; permission gate + target claims + approvals; `target_act` verb router; agent fleet lifecycle. | [15](15_mcp_server_architecture.md) |

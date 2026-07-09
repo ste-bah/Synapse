@@ -132,9 +132,8 @@ Allowlist gating: each `--allow-shell`/`--allow-launch` pattern is compiled to a
 
 ### Tool-router assembly notes (`server.rs`)
 
-`tool_router()` sums dozens of per-family sub-routers (M1/M2/M3/M4, agent control/cost/stats/query/templates/tasks, leases, target-claims, reality, intent, plan, suggestions, timeline, notify, hygiene, escalation, `target_act`, browser families, tool-profile). Two gating switches:
+`tool_router()` sums dozens of per-family sub-routers (M1/M2/M3/M4, agent control/cost/stats/query/templates/tasks, leases, target-claims, reality, intent, plan, suggestions, timeline, notify, hygiene, escalation, `target_act`, browser families, tool-profile). One gating switch:
 
-- The **EverQuest domain pack** (~25 tools) is only added when `SYNAPSE_ENABLE_EVERQUEST` is set.
 - Test-only storage probes (`storage_put_probe_rows`, `storage_pressure_sample`) are removed unless `SYNAPSE_DEBUG_TOOLS` is set.
 
 ---

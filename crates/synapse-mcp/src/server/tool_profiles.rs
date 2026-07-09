@@ -6817,7 +6817,6 @@ mod tests {
                 "produced_by": "server::tool_profiles::tests::emit_full_capability_tool_surface_artifact",
                 "env_gates": {
                     "SYNAPSE_DEBUG_TOOLS": std::env::var("SYNAPSE_DEBUG_TOOLS").ok(),
-                    "SYNAPSE_ENABLE_EVERQUEST": std::env::var("SYNAPSE_ENABLE_EVERQUEST").ok(),
                 },
             },
             "tool_count": tools.len(),

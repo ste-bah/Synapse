@@ -53,7 +53,6 @@ fn bundled_profiles_parse_and_keep_natural_defaults() -> Result<(), Box<dyn std:
             "calculator",
             "chrome",
             "cmd",
-            "everquest.live",
             "excel",
             "explorer",
             "firefox",
@@ -143,102 +142,6 @@ fn bundled_minecraft_profile_carries_first_game_contract() -> Result<(), Box<dyn
         profile.metadata["runtime.minecraft.configured_host_status"],
         "launcher_installed_sign_in_required_java_runtime_not_verified"
     );
-    Ok(())
-}
-
-#[test]
-fn bundled_everquest_profile_targets_inventory_panel() -> Result<(), Box<dyn std::error::Error>> {
-    let path = bundled_profiles_dir().join("everquest.live.toml");
-    let loaded = parse_profile_file(&path)?;
-    let profile = loaded.profile;
-
-    assert_eq!(profile.id, "everquest.live");
-    let level = profile
-        .hud
-        .iter()
-        .find(|field| field.name == "everquest.level_text")
-        .ok_or("everquest.level_text HUD field missing")?;
-    assert!(matches!(level.extractor, HudExtractor::WinrtOcr));
-    assert!(matches!(
-        level.parser,
-        HudParser::Regex { ref pattern, group }
-            if pattern.contains("[0-9]{1,3}") && pattern.contains("\\s+Wi(?:zard)?\\b") && group == 1
-    ));
-    assert!(matches!(
-        level.region,
-        HudRegion::AnchoredToEdge {
-            edge: WindowEdge::TopLeft,
-            x_offset: 80,
-            y_offset: 80,
-            w: 320,
-            h: 150,
-        }
-    ));
-
-    let next_level = profile
-        .hud
-        .iter()
-        .find(|field| field.name == "everquest.next_level_label")
-        .ok_or("everquest.next_level_label HUD field missing")?;
-    assert!(matches!(
-        next_level.region,
-        HudRegion::AnchoredToEdge {
-            edge: WindowEdge::TopLeft,
-            x_offset: 80,
-            y_offset: 180,
-            w: 320,
-            h: 260,
-        }
-    ));
-    let next_level_percent = profile
-        .hud
-        .iter()
-        .find(|field| field.name == "everquest.next_level_percent")
-        .ok_or("everquest.next_level_percent HUD field missing")?;
-    assert!(matches!(
-        next_level_percent.extractor,
-        HudExtractor::WinrtOcr
-    ));
-    assert!(matches!(
-        next_level_percent.parser,
-        HudParser::Regex { ref pattern, group }
-            if pattern.contains("NEXT") && pattern.contains('%') && group == 1
-    ));
-    assert!(matches!(
-        next_level_percent.region,
-        HudRegion::AnchoredToEdge {
-            edge: WindowEdge::TopLeft,
-            x_offset: 80,
-            y_offset: 180,
-            w: 320,
-            h: 260,
-        }
-    ));
-    let map_window = profile
-        .hud
-        .iter()
-        .find(|field| field.name == "everquest.map_window_text")
-        .ok_or("everquest.map_window_text HUD field missing")?;
-    assert!(matches!(map_window.extractor, HudExtractor::WinrtOcr));
-    assert!(matches!(
-        map_window.region,
-        HudRegion::FractionOfWindow { x, y, w, h }
-            if (x - 0.00).abs() < f32::EPSILON
-                && (y - 0.10).abs() < f32::EPSILON
-                && (w - 0.22).abs() < f32::EPSILON
-                && (h - 0.45).abs() < f32::EPSILON
-    ));
-    assert!(matches!(
-        map_window.parser,
-        HudParser::Regex { ref pattern, group }
-            if pattern.contains("nektulos") && pattern.contains("search") && group == 1
-    ));
-    assert!(
-        profile.metadata["capability.observe.hud"].contains("visible Inventory character panel")
-    );
-    assert!(profile.metadata["capability.observe.hud"].contains("everquest.map_window_text"));
-    assert!(profile.metadata["capability.observe.hud"].contains("everquest.next_level_percent"));
-    assert_eq!(profile.backends.mouse_default, Backend::Software);
     Ok(())
 }
 

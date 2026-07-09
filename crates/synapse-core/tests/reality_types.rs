@@ -39,7 +39,7 @@ fn sample_baseline() -> RealityBaseline {
         epoch_id: "epoch-20260529T200000Z".to_owned(),
         baseline_seq: 100,
         generated_at: fixed_time(),
-        profile_id: Some("everquest.live".to_owned()),
+        profile_id: Some("runtime.live".to_owned()),
         source_surfaces: vec![
             RealitySourceSurface::Window,
             RealitySourceSurface::GameLog,
@@ -47,7 +47,7 @@ fn sample_baseline() -> RealityBaseline {
         ],
         source_refs: vec![
             source_ref(RealitySourceSurface::Window, "hwnd:0x12ab"),
-            source_ref(RealitySourceSurface::GameLog, "eqlog/synthetic.log"),
+            source_ref(RealitySourceSurface::GameLog, "game-log/synthetic.log"),
         ],
         compact_state_hash: "sha256:baseline".to_owned(),
         redaction: redaction(),
@@ -298,7 +298,7 @@ fn reality_edge_states_are_representable() -> Result<(), Box<dyn std::error::Err
             severity: RealityDriftStatus::SourceUnavailable,
             source_refs: vec![source_ref(
                 RealitySourceSurface::GameLog,
-                "eqlog/missing.log",
+                "game-log/missing.log",
             )],
         }],
         rebase_required: true,

@@ -3,10 +3,7 @@ mod ocr;
 mod search;
 mod sources;
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use rmcp::{ErrorData, handler::server::common, model::JsonObject, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
@@ -65,8 +62,6 @@ pub struct M1State {
     /// on ambient host focus at run time.
     pub force_no_foreground: bool,
     pub last_observed_foreground: Option<ForegroundContext>,
-    pub everquest_log_cursor: Option<EverQuestLogCursorState>,
-    pub everquest_event_seq: u64,
     pub fs_recent_tracker: FsRecentTracker,
 }
 
@@ -97,8 +92,6 @@ impl M1State {
             force_observe_internal,
             force_no_foreground,
             last_observed_foreground: None,
-            everquest_log_cursor: None,
-            everquest_event_seq: 0,
             fs_recent_tracker: FsRecentTracker::from_env(),
         }
     }
@@ -164,12 +157,6 @@ impl M1State {
             stop_requested: handle.is_stop_requested(),
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EverQuestLogCursorState {
-    pub path: PathBuf,
-    pub offset: u64,
 }
 
 impl Default for M1State {

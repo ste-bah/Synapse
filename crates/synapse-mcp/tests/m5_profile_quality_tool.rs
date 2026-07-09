@@ -168,7 +168,7 @@ fn assert_first_snapshot(first: &Value) {
         2
     );
     assert_eq!(
-        first["snapshot"]["runtime_evidence"]["observed_log_event_kinds"]["everquest.log.cast_begins"],
+        first["snapshot"]["runtime_evidence"]["observed_log_event_kinds"]["runtime.log.cast_begins"],
         2
     );
 }
@@ -247,7 +247,7 @@ fn write_audit_rows(db_path: &Path) -> anyhow::Result<()> {
                     now - 1_600,
                     9,
                     "quality.synthetic",
-                    "everquest.log.cast_begins",
+                    "runtime.log.cast_begins",
                 )?,
                 event_row(now - 1_500, 10, "other.profile", "perception.observed")?,
             ],
@@ -312,7 +312,7 @@ fn observation_row(
         "recent_events": [
             {
                 "seq": 1,
-                "kind": "everquest.log.cast_begins",
+                "kind": "runtime.log.cast_begins",
                 "data_excerpt": {
                     "redacted": true,
                     "summary": "synthetic compact event"

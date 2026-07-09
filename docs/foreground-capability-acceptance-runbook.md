@@ -140,7 +140,7 @@ Compare these `tools/list` profiles via real spawned agents / the wired client:
 
 | Profile | How to get it | Expected surface |
 |---|---|---|
-| raw/full legacy | `SYNAPSE_DEBUG_TOOLS=1 SYNAPSE_ENABLE_EVERQUEST=1` | full implementation surface (~177) |
+| raw/full legacy | `SYNAPSE_DEBUG_TOOLS=1` | full implementation surface |
 | normal capability-preserving | default `normal_agent` | visible count from `tool_profile_status`; no raw `act_*` foreground primitives and no raw-CDP/`chrome.debugger` browser instrumentation tools; `target_act`, debugger-free `browser_*`, stable `browser_debugger` facade, `window_list`, `set_target`, legacy `cdp_*` tab-lifecycle wrappers, and route readbacks present |
 | browser-control task | `tool_profile_set browser_control` | narrower; debugger-free browser/perception + target tools only |
 | browser-debugger task | `tool_profile_set browser_debugger` with confirm + reason | browser-only raw-CDP/`chrome.debugger` instrumentation visible and stable `browser_debugger` facade operations admitted; raw OS foreground, shell, and spawn surfaces stay hidden |

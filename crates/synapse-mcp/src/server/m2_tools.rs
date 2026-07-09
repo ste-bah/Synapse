@@ -170,11 +170,6 @@ impl SynapseService {
             &action_preflight_details(&preflight),
             &request_context,
         )?;
-        if let Err(error) = ensure_everquest_click_backend(&params, &preflight) {
-            let result: Result<ActClickResponse, ErrorData> = Err(error);
-            self.audit_action_result_for_request("act_click", &result, &request_context)?;
-            return result.map(Json);
-        }
         if let Err(error) = self.ensure_target_claim_allows_action(
             "act_click",
             click_claim_target(&params),
@@ -7701,21 +7696,6 @@ fn clipboard_request_audit_details(params: &ActClipboardParams) -> Value {
         "required_foreground": false,
         "lease_required": false,
     })
-}
-
-fn ensure_everquest_click_backend(
-    params: &ActClickParams,
-    preflight: &ActionPreflightReadback,
-) -> Result<(), ErrorData> {
-    if preflight.target_profile_id.as_deref() == Some("everquest.live")
-        && params.backend == Backend::Software
-    {
-        return Err(mcp_error(
-            error_codes::ACTION_BACKEND_UNAVAILABLE,
-            "everquest.live software mouse clicks are not FSV-accepted; use backend=hardware through the configured HID path or a keyboard keymap equivalent",
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -1138,7 +1138,7 @@ fn bounded_label(value: &str) -> String {
 }
 
 fn is_log_event_kind(kind: &str) -> bool {
-    kind.starts_with("everquest.log.")
+    kind.starts_with("runtime.log.") || kind.contains(".log.")
 }
 
 #[cfg(test)]
@@ -1163,18 +1163,18 @@ mod tests {
                 events: Vec::new(),
                 reality: vec![
                     row(
-                        "reality/baseline/v1/everquest.live/epoch-a",
+                        "reality/baseline/v1/demo.profile/epoch-a",
                         json!({
                             "epoch_id": "epoch-a",
                             "source_surfaces": ["window", "process", "game_log"]
                         }),
                     ),
                     row(
-                        "reality/head/v1/everquest.live",
+                        "reality/head/v1/demo.profile",
                         json!({"epoch_id": "epoch-a", "head_seq": 2}),
                     ),
                     row(
-                        "reality/delta/v1/everquest.live/epoch-a/00000000000000000001",
+                        "reality/delta/v1/demo.profile/epoch-a/00000000000000000001",
                         json!({
                             "epoch_id": "epoch-a",
                             "seq": 1,
@@ -1184,7 +1184,7 @@ mod tests {
                         }),
                     ),
                     row(
-                        "reality/delta/v1/everquest.live/epoch-a/00000000000000000002",
+                        "reality/delta/v1/demo.profile/epoch-a/00000000000000000002",
                         json!({
                             "epoch_id": "epoch-a",
                             "seq": 2,
@@ -1194,7 +1194,7 @@ mod tests {
                         }),
                     ),
                     row(
-                        "reality/audit/v1/everquest.live/audit-a",
+                        "reality/audit/v1/demo.profile/audit-a",
                         json!({
                             "audit_id": "audit-a",
                             "epoch_id": "epoch-a",
@@ -1240,15 +1240,15 @@ mod tests {
                 events: Vec::new(),
                 reality: vec![
                     row(
-                        "reality/baseline/v1/everquest.live/epoch-b",
+                        "reality/baseline/v1/demo.profile/epoch-b",
                         json!({"epoch_id": "epoch-b"}),
                     ),
                     row(
-                        "reality/head/v1/everquest.live",
+                        "reality/head/v1/demo.profile",
                         json!({"epoch_id": "epoch-b", "head_seq": 1}),
                     ),
                     row(
-                        "reality/delta/v1/everquest.live/epoch-b/00000000000000000001",
+                        "reality/delta/v1/demo.profile/epoch-b/00000000000000000001",
                         json!({
                             "epoch_id": "epoch-b",
                             "seq": 1,
@@ -1280,7 +1280,7 @@ mod tests {
                 observations: Vec::new(),
                 events: Vec::new(),
                 reality: vec![row(
-                    "reality/audit/v1/everquest.live/audit-drift",
+                    "reality/audit/v1/demo.profile/audit-drift",
                     json!({
                         "audit_id": "audit-drift",
                         "epoch_id": "epoch-c",
@@ -1311,7 +1311,7 @@ mod tests {
     #[test]
     fn reality_parser_ignores_non_reality_keys() {
         assert!(
-            parse_reality_row(b"profile_quality/v1/everquest.live", br#"{}"#)
+            parse_reality_row(b"profile_quality/v1/demo.profile", br#"{}"#)
                 .unwrap()
                 .is_none()
         );
@@ -1319,7 +1319,7 @@ mod tests {
 
     fn params() -> ProfileQualityRefreshParams {
         ProfileQualityRefreshParams {
-            profile_id: "everquest.live".to_owned(),
+            profile_id: "demo.profile".to_owned(),
             max_audit_rows: 100,
             stale_after_ns: 86_400_000_000_000,
             manual_fsv_evidence_ref: Some("issue-543-test".to_owned()),
@@ -1330,15 +1330,15 @@ mod tests {
         let mut metadata = BTreeMap::new();
         metadata.insert(
             "registry.quality_signal".to_owned(),
-            "profile_quality.everquest.live".to_owned(),
+            "profile_quality.demo.profile".to_owned(),
         );
         metadata.insert(
             "registry.compatibility_target".to_owned(),
-            "everquest.live.level2".to_owned(),
+            "demo.profile.level2".to_owned(),
         );
         ProfileStatus {
-            id: "everquest.live".to_owned(),
-            label: "EverQuest Live".to_owned(),
+            id: "demo.profile".to_owned(),
+            label: "Demo Profile".to_owned(),
             use_scope: ProfileUseScope::OperatorOwnedTest,
             mode: PerceptionMode::A11yOnly,
             detection_model_id: None,
@@ -1356,7 +1356,7 @@ mod tests {
             schema_version: 2,
             matches: Vec::new(),
             metadata,
-            source_path: PathBuf::from("profiles/everquest.live.toml"),
+            source_path: PathBuf::from("profiles/demo.profile.toml"),
         }
     }
 

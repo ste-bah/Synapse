@@ -34,7 +34,7 @@ Counts below are `#[test]` + `#[tokio::test]` occurrences summed across each cra
 
 | Crate | ~`#[test]`/`#[tokio::test]` | Notable test files |
 |---|---|---|
-| `synapse-mcp` | ~860 | `src/local_agent.rs` (58), `src/m4.rs` (123), `src/chrome_debugger_bridge.rs` (31), `src/http/transport.rs` (29), `src/server/context.rs` (24), `src/m2/type_text.rs` (24), `src/m1.rs` (22), `src/server/agent_control/tests.rs` (35), `src/server/escalation/tests.rs` (21), `src/server/everquest_autocombat.rs` (20); plus ~50 `tests/*.rs` integration files (see §4) |
+| `synapse-mcp` | ~860 | `src/local_agent.rs` (58), `src/m4.rs` (123), `src/chrome_debugger_bridge.rs` (31), `src/http/transport.rs` (29), `src/server/context.rs` (24), `src/m2/type_text.rs` (24), `src/m1.rs` (22), `src/server/agent_control/tests.rs` (35), `src/server/escalation/tests.rs` (21); plus ~50 `tests/*.rs` integration files (see §4) |
 | `synapse-action` | ~155 | `tests/session_inputs.rs` (8), `tests/mouse_stroke.rs` (8), `tests/emitter_state.rs` (7), `src/rate_limit.rs` (8), `src/lease.rs` (13), `src/backend/vigem/tests.rs` (9), `src/backend/software/mouse.rs` (9), `src/invoke/tests.rs` (11) |
 | `synapse-core` | ~115 | `tests/action_serde_proptest.rs` (18), `tests/types.rs` (13), `tests/snapshots.rs` (7), `src/episodes.rs` (15), `src/types/agent_cost.rs` (13), `src/routines.rs` (12), `src/intent.rs` (10) |
 | `synapse-a11y` | ~120 | `src/tests.rs` (23), `src/cdp_action.rs` (19), `src/cdp_network.rs` (19), `src/cdp_dom.rs` (11), `tests/uwp_snapshot_regression.rs` (1, `#[ignore]`) |
@@ -45,7 +45,6 @@ Counts below are `#[test]` + `#[tokio::test]` occurrences summed across each cra
 | `synapse-models` | ~13 | `tests/model_loader.rs` (13) |
 | `synapse-audio` | ~22 | `tests/ring_detectors.rs` (5), `tests/direction.rs` (4), `tests/stt.rs` (3), `tests/runtime_scaffold.rs` (3) |
 | `synapse-capture` | ~22 | `src/tests.rs` (14), `src/platform/windows/bitmap.rs` (7) |
-| `synapse-everquest` | ~24 | `src/log.rs` (11), `src/map.rs` (6), `src/zone_graph.rs` (5), `tests/map_inventory.rs` (2) |
 | `synapse-telemetry` | ~7 | `src/metrics.rs` (3), `tests/file_sink.rs` (2), `tests/periodic_gc.rs` (1), `tests/periodic_gc_size_cap.rs` (1) |
 | `synapse-test-utils` | ~11 | `src/fixtures.rs` (10) — self-tests of the Notepad selection logic |
 | `synapse-overlay` | ~1 | `src/main.rs` (1) |

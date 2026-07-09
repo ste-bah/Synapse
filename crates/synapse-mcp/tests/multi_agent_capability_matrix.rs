@@ -66,14 +66,8 @@ async fn multi_agent_capability_matrix_covers_action_perception_surface() -> any
     // Source of truth: the real built tool surface. Launch the wired client with
     // the full surface enabled, then derive the matrix-scope set from it instead
     // of from a hand-maintained literal (#1062).
-    let mut client = StdioMcpClient::launch_and_init_with_env(
-        None,
-        &[
-            ("SYNAPSE_DEBUG_TOOLS", "1"),
-            ("SYNAPSE_ENABLE_EVERQUEST", "1"),
-        ],
-    )
-    .await?;
+    let mut client =
+        StdioMcpClient::launch_and_init_with_env(None, &[("SYNAPSE_DEBUG_TOOLS", "1")]).await?;
     let response = client.tools_list().await?;
     let tools = response
         .get("tools")

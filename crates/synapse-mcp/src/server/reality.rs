@@ -964,9 +964,6 @@ impl SynapseService {
             let _ = populate_clipboard_summary(&mut input);
         }
         self.resolve_input_profile_and_hud(&mut input, include.hud);
-        if include.events {
-            self.populate_everquest_log_events(&mut input);
-        }
         let observation = ObservationAssembler::new()
             .assemble(include, input)
             .map_err(|err| mcp_error(err.code(), err.to_string()))?;
@@ -1430,7 +1427,7 @@ fn compact_events(observation: &Observation) -> CompactEventCursor {
             .and_then(Value::as_str)
             .and_then(non_empty_hash)
             .or(log_path_sha256);
-        if !event.kind.starts_with("everquest.log_cursor") {
+        if !event.kind.ends_with(".log_cursor") {
             event_count = event_count.saturating_add(1);
             latest_non_cursor_kind = Some(event.kind.clone());
             latest_non_cursor_seq = Some(event.seq);

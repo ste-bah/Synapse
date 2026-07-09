@@ -16,7 +16,6 @@
 - `crates/synapse-mcp/src/server/intent_tools.rs`, `plan_tools.rs`, `reality.rs`, `suggestions.rs`, `routine_feedback.rs`, `routine_labeling.rs`
 - `crates/synapse-mcp/src/server/timeline_query.rs`, `timeline_digest.rs`, `data_cleaning.rs`
 - `crates/synapse-mcp/src/server/workspace_blackboard.rs`, `tool_profiles.rs`, `notify_tools.rs`, `hygiene_report.rs`, `permission_gate.rs`, `escalation/mod.rs`
-- `crates/synapse-mcp/src/server/everquest_*.rs` (17 files, opt-in domain pack)
 
 > See [15_mcp_server_architecture.md](15_mcp_server_architecture.md) for transport, session lifecycle, and routing internals. Subsystem cross-refs are noted per domain (docs 05–14).
 
@@ -28,10 +27,9 @@ Tools are registered through the **`rmcp`** crate's attribute macros. Each tool 
 
 The full surface is assembled in `SynapseService::tool_router()` (`server.rs:603`) by summing every module router with `+`. Tool **names** are the function names verbatim (e.g. `fn observe` -> tool `observe`). Over MCP they appear to clients as `mcp__synapse__<name>`.
 
-**Total tools documented: 207.**
+**Total tools documented: 182.**
 
 - **Core surface (always registered): ~182 tools.**
-- **EverQuest domain pack: 25 tools**, registered only when `SYNAPSE_ENABLE_EVERQUEST` is set (`server.rs:649`). rmcp builds the tool list once per service, so this is a startup opt-in.
 - **Debug-only:** `storage_put_probe_rows` and `storage_pressure_sample` are removed from the default surface and remain callable only when `SYNAPSE_DEBUG_TOOLS` is set (`server.rs:671`).
 
 Conventions seen throughout:
@@ -39,7 +37,7 @@ Conventions seen throughout:
 - Action tools take `verify_delta` / `verify_timeout_ms` and a `backend` (auto/software/hardware) selector.
 - Many tools persist to RocksDB column families (`CF_KV`, `CF_TIMELINE`, `CF_EPISODES`, `CF_ROUTINES`, `CF_AGENT_TRANSCRIPTS`, etc.) and return an exact row readback.
 
-> Detail note: where a param table below says "(summarized)" the field list is abbreviated to key/required params; full field sets exist in the named struct. EverQuest tool params are summarized (opt-in pack).
+> Detail note: where a param table below says "(summarized)" the field list is abbreviated to key/required params; full field sets exist in the named struct.
 
 ---
 
@@ -374,42 +372,8 @@ Run-scoped durable key/value blackboard for multi-agent coordination.
 | `tool_profile_set` | Set durable tool profile (normal_agent/browser_control/break_glass) | `profile` (req), `reason?`, `confirm_break_glass?` (break_glass requires reason + held foreground lease) | writes CF_SESSIONS policy |
 | `notify_human` | Raise a Windows toast (verified via Action Center; dedupe) | `title`, `body`, `kind` (req), `dedupe_key?`, `suppress_popup?` | OS toast; reads back Action Center |
 
-## 16.18 EverQuest domain pack — `everquest_*.rs` (opt-in)
+## 16.18 Notes & caveats
 
-25 tools, registered only when `SYNAPSE_ENABLE_EVERQUEST` is set. See [12_everquest_domain.md](12_everquest_domain.md). All persist typed redacted rows to CF_KV with exact readback; params summarized. Most take an id + optional `profile_id` + state/source-ref overrides.
-
-| Tool | File | Description |
-|------|------|-------------|
-| `everquest_chat_input_state` | everquest_tools.rs | Read chat-input pollution state (foreground/UI/OCR). No params. |
-| `everquest_loc_probe` | everquest_tools.rs | Send `/loc`, verify appended EQ log coordinate. No params. |
-| `everquest_safe_command` | everquest_tools.rs | Send one allowlisted non-social slash command (`command` req). |
-| `everquest_survival_readiness` | everquest_tools.rs | Read+persist survival readiness (no input sent). No params. |
-| `everquest_autocombat` | everquest_autocombat.rs | Bounded operator-attended combat loop. Params: `max_iterations?`, `max_duration_s?`, `hp_floor_percent?`, `mana_floor_percent?`, `target_level_max?`, `stop_at_level?`, `cast_mana_cost_percent?`, `engagement_timeout_s?`, `hotbar_alias?`, `max_roam_steps?`, `max_chase_s?`, `idempotency_key?`. Sends gameplay input. |
-| `everquest_current_state` | everquest_state.rs | Build/persist compact current-state record. No params. |
-| `everquest_route_plan` | everquest_route.rs | Plan+persist a bounded route (no movement). `plan_id` req + overrides. |
-| `everquest_map_sensor` | everquest_map_sensor.rs | Persist calibrated current-map sensor. `sensor_id` req + overrides. |
-| `everquest_planner_guard` | everquest_guard.rs | Evaluate+persist one planner guard decision. `decision_id`, `candidate_kind` req. |
-| `everquest_memory_record` | everquest_memory.rs | Persist hazard/safe-area memory row. `memory_id`, `memory_type`, `memory_kind`, `subject`, `confidence` req. |
-| `everquest_memory_consult` | everquest_memory.rs | Consult memories for a candidate action. `candidate_id`, `candidate_kind` req. |
-| `everquest_world_summary` | everquest_world_summary.rs | Persist compact world-state summary for context injection. |
-| `everquest_world_model_record` | everquest_world_model.rs | Persist a world-model row under approved prefix. |
-| `everquest_world_model_inspect` | everquest_world_model.rs | Inspect approved world-model prefixes/keys/samples. |
-| `everquest_domain_normalize` | everquest_domain.rs | Normalize one state/action/outcome transition. `transition_id`, `state`, `action`, `outcome`, `entity` req. |
-| `everquest_outcome_ingest` | everquest_outcome.rs | Parse EQ log bytes into redacted outcome rows. `start_offset?`, `max_bytes=64KB`, `max_events=64`, `log_path?`, `persist_unknown=true`. |
-| `everquest_trajectory_record` | everquest_trajectory.rs | Persist one ordered trajectory + JSONL provenance. `trajectory_id`, `intent`, `session_id`, `transitions` req. |
-| `everquest_surprise_detect` | everquest_surprise.rs | Compare predicted vs observed; persist surprise row. |
-| `everquest_predictive_model_fit` | everquest_predictive_model.rs | Fit transparent predictive baseline. `model_id` req; `min_confidence=0.60`, `max_trajectories=64`. |
-| `everquest_predictive_model_predict` | everquest_predictive_model.rs | Predict next outcome w/ calibrated abstention. `prediction_id`, `model_id`, `state_row_key`, `candidate_actions` req. |
-| `everquest_action_prior_record` | everquest_scorecard.rs | Persist action-prior prediction/outcome sample. `sample_id`, `prediction_id`, `prediction`, `actual` req. |
-| `everquest_action_prior_scorecard` | everquest_scorecard.rs | Aggregate samples into competence scorecard. `window_id` req; `min_samples=3`, floors/targets. |
-| `everquest_episode_export` | everquest_episode_export.rs | Export redacted trajectory rows to DynamicJEPA episode JSONL. `export_id`, `trajectory_row_keys` req; `output_path?`, `overwrite=false`. |
-| `everquest_contextgraph_ingest` | everquest_contextgraph.rs | Ingest episode JSONL into ContextGraph (external MCP stdio). `ingest_id`, `export_path`, `expected_export_sha256`, `contextgraph_storage_path` req. External call. |
-| `everquest_contextgraph_search` | everquest_contextgraph.rs | Query ContextGraph for memories (require provenance). `search_id`, `query`, `contextgraph_storage_path` req. External call. |
-
----
-
-## 16.19 Notes & caveats
-
-- **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), `browser_cookies`/`browser_storage` (verb-shaped), and all EverQuest tools. Authoritative field sets live in the named `*Params` structs in each source file.
+- **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), and `browser_cookies`/`browser_storage` (verb-shaped). Authoritative field sets live in the named `*Params` structs in each source file.
 - **Empty-schema tools** (`input_schema = empty_input_schema()`): `health`, `get_target`, `clear_target`, `control_lease_release`, `control_lease_status`, `tool_profile_status`, `escalation_config_get`.
-- Counts: enumerated by `#[tool(...)]` across `crates/synapse-mcp/src/server/`. The 25 EverQuest tools are the gated set in `server.rs:649-667`.
+- Counts: enumerated by `#[tool(...)]` across `crates/synapse-mcp/src/server/`.
