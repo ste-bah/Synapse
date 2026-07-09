@@ -208,6 +208,12 @@ fn record_http_mcp_request_completed(
     if status.is_client_error() || status.is_server_error() {
         HTTP_MCP_REQUEST_ERROR_STATUS_TOTAL.fetch_add(1, Ordering::Relaxed);
     }
+    synapse_telemetry::metrics::counter!(
+        synapse_telemetry::metrics::HTTP_REQUESTS_TOTAL,
+        "path" => normalized_http_metric_path(path),
+        "status" => http_status_metric_label(status)
+    )
+    .increment(1);
     store_http_mcp_last_event(HttpMcpTransportEvent {
         request_id,
         phase: "completed",
@@ -217,6 +223,37 @@ fn record_http_mcp_request_completed(
         elapsed_ms: Some(elapsed.as_millis()),
         unix_ms: dashboard_unix_time_ms(),
     });
+}
+
+fn emit_http_active_sessions(count: usize) {
+    synapse_telemetry::metrics::gauge!(synapse_telemetry::metrics::HTTP_ACTIVE_SESSIONS)
+        .set(usize_metric_value(count));
+}
+
+fn usize_metric_value(value: usize) -> f64 {
+    u32::try_from(value).map_or(f64::from(u32::MAX), f64::from)
+}
+
+fn normalized_http_metric_path(path: &str) -> String {
+    match path {
+        "/mcp" | "/health" | "/agent-events" | "/events" => path.to_owned(),
+        "" => "/".to_owned(),
+        _ => "__other__".to_owned(),
+    }
+}
+
+fn http_status_metric_label(status: StatusCode) -> &'static str {
+    if status.is_success() {
+        "2xx"
+    } else if status.is_redirection() {
+        "3xx"
+    } else if status.is_client_error() {
+        "4xx"
+    } else if status.is_server_error() {
+        "5xx"
+    } else {
+        "other"
+    }
 }
 
 #[derive(Clone)]
@@ -1667,13 +1704,15 @@ async fn cleanup_stale_session_cdp_targets_once(
 }
 
 async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTreeSet<String> {
-    session_manager
+    let sessions: BTreeSet<String> = session_manager
         .sessions
         .read()
         .await
         .keys()
         .map(|session_id| session_id.as_ref().to_owned())
-        .collect()
+        .collect();
+    emit_http_active_sessions(sessions.len());
+    sessions
 }
 
 async fn close_active_mcp_sessions_for_shutdown(
@@ -1689,6 +1728,7 @@ async fn close_active_mcp_sessions_for_shutdown(
             .collect::<Vec<_>>();
         (sessions_before, sessions)
     };
+    emit_http_active_sessions(0);
     let close_attempted = sessions.len();
     let session_ids = sessions
         .iter()
@@ -4040,6 +4080,7 @@ async fn dashboard_state(State(state): State<HttpState>, headers: HeaderMap) -> 
     let mut timing_segments = Vec::new();
     let active_sessions_started = Instant::now();
     let active_sessions = state.session_manager.sessions.read().await.len();
+    emit_http_active_sessions(active_sessions);
     dashboard_push_state_timing(
         &mut timing_segments,
         "active_sessions",
@@ -7793,6 +7834,7 @@ async fn health(State(state): State<HttpState>) -> Json<Health> {
         "tool.invocation kind=health transport=http"
     );
     let active_sessions = state.session_manager.sessions.read().await.len();
+    emit_http_active_sessions(active_sessions);
     Json(
         state
             .health_service
@@ -7802,6 +7844,7 @@ async fn health(State(state): State<HttpState>) -> Json<Health> {
 
 async fn shutdown(State(state): State<HttpState>, headers: HeaderMap) -> Response {
     let active_sessions = state.session_manager.sessions.read().await.len();
+    emit_http_active_sessions(active_sessions);
     let user_agent = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|value| value.to_str().ok())

@@ -26,6 +26,8 @@ pub const WHISPER_TINY_INT8_SHA256: &str =
 const SILENCE_RMS_DB: f32 = -70.0;
 const DEFAULT_LANGUAGE: &str = "en";
 const EN_DECODER_PROMPT: [i32; 4] = [50_258, 50_259, 50_359, 50_363];
+const AUDIO_STT_INFERENCES_TOTAL: &str = "audio_stt_inferences_total";
+const AUDIO_STT_LATENCY_MS: &str = "audio_stt_latency_ms";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -147,13 +149,26 @@ impl WhisperTinyStt {
         }
 
         let started = Instant::now();
-        let (backend, session_id, session) = self.load_session()?;
-        let text = {
-            let mut session = session.lock().map_err(|_| AudioError::ModelLoadFailed {
-                path: self.descriptor.path.clone(),
-                detail: "ORT session lock was poisoned".to_owned(),
-            })?;
-            self.run_session(&mut session, bytes)?
+        let result = (|| -> AudioResult<(String, ModelBackend, u64)> {
+            let (backend, session_id, session) = self.load_session()?;
+            let text = {
+                let mut session = session.lock().map_err(|_| AudioError::ModelLoadFailed {
+                    path: self.descriptor.path.clone(),
+                    detail: "ORT session lock was poisoned".to_owned(),
+                })?;
+                self.run_session(&mut session, bytes)?
+            };
+            Ok((text, backend, session_id))
+        })();
+        let (text, backend, session_id) = match result {
+            Ok(result) => {
+                record_stt_inference("success", started.elapsed());
+                result
+            }
+            Err(error) => {
+                record_stt_inference("error", started.elapsed());
+                return Err(error);
+            }
         };
 
         Ok(Transcription {
@@ -269,6 +284,7 @@ impl WhisperTinyStt {
     }
 
     fn blank(&self, language: impl AsRef<str>, audio_seconds: f32) -> Transcription {
+        metrics::counter!(AUDIO_STT_INFERENCES_TOTAL, "outcome" => "not_applicable").increment(1);
         Transcription {
             text: String::new(),
             confidence: 0.0,
@@ -288,6 +304,11 @@ impl WhisperTinyStt {
             detail,
         }
     }
+}
+
+fn record_stt_inference(outcome: &'static str, elapsed: std::time::Duration) {
+    metrics::counter!(AUDIO_STT_INFERENCES_TOTAL, "outcome" => outcome).increment(1);
+    metrics::histogram!(AUDIO_STT_LATENCY_MS).record(elapsed.as_secs_f64() * 1000.0);
 }
 
 #[must_use]

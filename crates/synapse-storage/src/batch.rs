@@ -14,6 +14,7 @@ use crate::{StorageError, StorageResult};
 
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 pub const FLUSH_BYTES: usize = 64 * 1024;
+const STORAGE_WRITE_BATCH_FLUSHES_TOTAL: &str = "storage_write_batch_flushes_total";
 
 pub struct Batcher {
     sender: Sender<Command>,
@@ -95,26 +96,26 @@ impl Worker {
                 }) => {
                     enqueue(&mut pending, &cf_name, kvs);
                     let result = if pending.bytes >= FLUSH_BYTES {
-                        flush_pending(&self.db, &mut pending, false)
+                        flush_pending(&self.db, &mut pending, false, "bytes")
                     } else {
                         Ok(())
                     };
                     let _ = reply.send(result);
                 }
                 Ok(Command::Flush { reply }) => {
-                    let result = flush_pending(&self.db, &mut pending, true);
+                    let result = flush_pending(&self.db, &mut pending, true, "explicit");
                     let _ = reply.send(result);
                 }
                 Ok(Command::Shutdown { reply }) => {
-                    let result = flush_pending(&self.db, &mut pending, true);
+                    let result = flush_pending(&self.db, &mut pending, true, "shutdown");
                     let _ = reply.send(result);
                     break;
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    let _ = flush_pending(&self.db, &mut pending, false);
+                    let _ = flush_pending(&self.db, &mut pending, false, "interval");
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    let _ = flush_pending(&self.db, &mut pending, true);
+                    let _ = flush_pending(&self.db, &mut pending, true, "disconnected");
                     break;
                 }
             }
@@ -175,7 +176,12 @@ fn enqueue(pending: &mut PendingBatch, cf_name: &str, kvs: Vec<(Vec<u8>, Vec<u8>
     }
 }
 
-fn flush_pending(db: &DB, pending: &mut PendingBatch, sync: bool) -> StorageResult<()> {
+fn flush_pending(
+    db: &DB,
+    pending: &mut PendingBatch,
+    sync: bool,
+    trigger: &'static str,
+) -> StorageResult<()> {
     if pending.writes.is_empty() {
         if sync {
             db.flush_wal(true)
@@ -207,6 +213,8 @@ fn flush_pending(db: &DB, pending: &mut PendingBatch, sync: bool) -> StorageResu
     pending.writes.clear();
     pending.bytes = 0;
     pending.first_write_at = None;
+    synapse_telemetry::metrics::counter!(STORAGE_WRITE_BATCH_FLUSHES_TOTAL, "trigger" => trigger)
+        .increment(1);
     Ok(())
 }
 

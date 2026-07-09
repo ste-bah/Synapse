@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 chrono.workspace = true
+metrics.workspace = true
 notify.workspace = true
 regex.workspace = true
 serde.workspace = true

@@ -20,6 +20,7 @@ pub const DEFAULT_MAX_SUBSCRIPTIONS_NONZERO: NonZeroUsize =
         None => NonZeroUsize::MIN,
     };
 pub const EVENTS_DROPPED_METRIC: &str = "events_dropped_for_subscriber";
+const EVENTS_PUBLISHED_METRIC: &str = "events_published_total";
 
 pub type EventBusResult<T> = Result<T, EventBusError>;
 
@@ -185,6 +186,12 @@ impl EventBus {
     #[must_use]
     #[tracing::instrument(skip_all, fields(event_kind = %event.kind, event_seq = event.seq))]
     pub fn publish(&self, event: Event) -> PublishReport {
+        metrics::counter!(
+            EVENTS_PUBLISHED_METRIC,
+            "source" => event_source_label(event.source),
+            "kind" => event.kind.clone()
+        )
+        .increment(1);
         let subscribers = self.inner.subscribers.load();
         let mut report = PublishReport::default();
         for subscriber in subscribers.iter() {
@@ -230,6 +237,24 @@ impl EventBus {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+const fn event_source_label(source: synapse_core::EventSource) -> &'static str {
+    match source {
+        synapse_core::EventSource::A11yUia => "a11y_uia",
+        synapse_core::EventSource::A11yWinEvent => "a11y_win_event",
+        synapse_core::EventSource::A11yCdp => "a11y_cdp",
+        synapse_core::EventSource::Perception => "perception",
+        synapse_core::EventSource::PerceptionDetection => "perception_detection",
+        synapse_core::EventSource::PerceptionHud => "perception_hud",
+        synapse_core::EventSource::PerceptionAudio => "perception_audio",
+        synapse_core::EventSource::Filesystem => "filesystem",
+        synapse_core::EventSource::Process => "process",
+        synapse_core::EventSource::Clipboard => "clipboard",
+        synapse_core::EventSource::ActionEmitter => "action_emitter",
+        synapse_core::EventSource::Reflex => "reflex",
+        synapse_core::EventSource::System => "system",
     }
 }
 

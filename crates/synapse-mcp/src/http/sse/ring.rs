@@ -71,6 +71,8 @@ impl Subscription {
         drop(ring);
         if ring_dropped > 0 {
             self.record_dropped(ring_dropped);
+            metrics::counter!(synapse_telemetry::metrics::SSE_BUFFER_OVERFLOWS_TOTAL)
+                .increment(ring_dropped);
             metrics::counter!(
                 EVENTS_DROPPED_METRIC,
                 "subscription_id" => self.id().to_owned()

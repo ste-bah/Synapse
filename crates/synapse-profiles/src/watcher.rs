@@ -22,6 +22,8 @@ use crate::{
 };
 
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(200);
+const PROFILES_ACTIVE_METRIC: &str = "profiles_active";
+const PROFILE_RELOADS_METRIC: &str = "profile_reloads_total";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProfileStatus {
@@ -170,8 +172,15 @@ impl ProfileRuntime {
                 profile_id: profile_id.to_owned(),
             });
         }
+        let previous_profile_id = state.active_profile_id.clone();
         state.active_profile_id = Some(profile_id.to_owned());
         drop(state);
+        if previous_profile_id.as_deref() != Some(profile_id)
+            && let Some(previous_profile_id) = previous_profile_id
+        {
+            metrics::gauge!(PROFILES_ACTIVE_METRIC, "profile_id" => previous_profile_id).set(0.0);
+        }
+        metrics::gauge!(PROFILES_ACTIVE_METRIC, "profile_id" => profile_id.to_owned()).set(1.0);
         tracing::info!(code = "PROFILE_ACTIVATED", profile_id, "profile activated");
         Ok(())
     }
@@ -269,6 +278,18 @@ impl ProfileRuntime {
 
         if changed {
             if let Some(active_profile_id) = &active_profile_id {
+                if let Some(previous_profile_id) = &previous_profile_id {
+                    metrics::gauge!(
+                        PROFILES_ACTIVE_METRIC,
+                        "profile_id" => previous_profile_id.clone()
+                    )
+                    .set(0.0);
+                }
+                metrics::gauge!(
+                    PROFILES_ACTIVE_METRIC,
+                    "profile_id" => active_profile_id.clone()
+                )
+                .set(1.0);
                 tracing::info!(
                     code = "PROFILE_FOREGROUND_ACTIVATED",
                     previous_profile_id = ?previous_profile_id,
@@ -277,6 +298,13 @@ impl ProfileRuntime {
                     "foreground profile activated"
                 );
             } else {
+                if let Some(previous_profile_id) = &previous_profile_id {
+                    metrics::gauge!(
+                        PROFILES_ACTIVE_METRIC,
+                        "profile_id" => previous_profile_id.clone()
+                    )
+                    .set(0.0);
+                }
                 tracing::info!(
                     code = "PROFILE_FOREGROUND_CLEARED",
                     previous_profile_id = ?previous_profile_id,
@@ -370,8 +398,39 @@ fn refresh_state(
     }
     guard.last_errors = errors;
     guard.last_reload_at = Some(SystemTime::now());
+    emit_profile_reload_metrics(&guard);
     drop(guard);
     Ok(())
+}
+
+fn emit_profile_reload_metrics(state: &ProfileState) {
+    for profile_id in state.profiles.keys() {
+        metrics::counter!(
+            PROFILE_RELOADS_METRIC,
+            "profile_id" => profile_id.clone(),
+            "outcome" => "loaded"
+        )
+        .increment(1);
+        let active = state
+            .active_profile_id
+            .as_ref()
+            .is_some_and(|active_id| active_id == profile_id);
+        metrics::gauge!(PROFILES_ACTIVE_METRIC, "profile_id" => profile_id.clone())
+            .set(if active { 1.0 } else { 0.0 });
+    }
+    for error in &state.last_errors {
+        let profile_id = error
+            .path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("__unknown__");
+        metrics::counter!(
+            PROFILE_RELOADS_METRIC,
+            "profile_id" => profile_id.to_owned(),
+            "outcome" => "error"
+        )
+        .increment(1);
+    }
 }
 
 fn system_time_epoch_ms(value: SystemTime) -> Option<String> {

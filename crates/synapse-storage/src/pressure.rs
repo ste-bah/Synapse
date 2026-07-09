@@ -23,6 +23,7 @@ const LEVEL_2_FREE_BYTES: u64 = GB;
 const LEVEL_3_FREE_BYTES: u64 = 500 * MB;
 const LEVEL_4_FREE_BYTES: u64 = 200 * MB;
 const PRESSURE_CF: &str = "storage_disk_pressure";
+const STORAGE_DISK_PRESSURE_LEVEL: &str = "storage_disk_pressure_level";
 
 /// Current DB-volume pressure level.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -286,6 +287,8 @@ fn apply_free_bytes(
     free_bytes: u64,
 ) -> StorageResult<PressureReport> {
     let current_level = config.thresholds.level_for(free_bytes);
+    synapse_telemetry::metrics::gauge!(STORAGE_DISK_PRESSURE_LEVEL)
+        .set(f64::from(current_level as u8));
     let (previous_level, emitted_code) = state.transition_to(current_level)?;
     let transitioned = previous_level != current_level;
     let gc_advised = transitioned && current_level >= DiskPressureLevel::Level1;

@@ -68,6 +68,8 @@ pub enum TelemetryError {
     LogDirNotWritable(PathBuf, String),
     #[error("TELEMETRY_SUBSCRIBER_INIT_FAILED: {0}")]
     SubscriberInit(String),
+    #[error("TELEMETRY_METRICS_RECORDER_FAILED: {0}")]
+    MetricsRecorder(String),
     #[error("TELEMETRY_GC_FAILED: {0}")]
     Gc(String),
 }
@@ -78,6 +80,7 @@ impl TelemetryError {
         match self {
             Self::LogDirNotWritable(_, _) => "TELEMETRY_LOG_DIR_NOT_WRITABLE",
             Self::SubscriberInit(_) => "TELEMETRY_SUBSCRIBER_INIT_FAILED",
+            Self::MetricsRecorder(_) => "TELEMETRY_METRICS_RECORDER_FAILED",
             Self::Gc(_) => "TELEMETRY_GC_FAILED",
         }
     }
@@ -230,6 +233,8 @@ pub fn init_tracing(cfg: TelemetryConfig) -> Result<TelemetryGuard, TelemetryErr
         .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     install_panic_hook();
+    let _metrics_handle = metrics::install_prometheus_recorder()
+        .map_err(|error| TelemetryError::MetricsRecorder(error.to_string()))?;
     metrics::register_m3_metrics();
 
     let gc_interval = effective_gc_interval(cfg.gc_interval);

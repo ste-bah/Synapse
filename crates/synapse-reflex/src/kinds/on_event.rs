@@ -15,6 +15,7 @@ pub const MAX_ON_EVENT_FIRINGS_PER_TICK: usize = 4;
 pub const REFLEX_DEBOUNCED_KIND: &str = "reflex_debounced";
 pub const REFLEX_FIRED_KIND: &str = "reflex_fired";
 pub const REFLEX_RECURSION_LIMIT_KIND: &str = "reflex_recursion_limit";
+const REFLEX_RECURSION_CLAMPS_METRIC: &str = "reflex_recursion_clamps_total";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OnEventState {
@@ -62,6 +63,7 @@ impl OnEventTickGuard {
             return;
         }
         self.limit_reported = true;
+        metrics::counter!(REFLEX_RECURSION_CLAMPS_METRIC).increment(1);
         publish_limit_event(event_bus, reflex_id, tick_index, trigger_event);
         let audit = recursion_limit_audit(reflex_id, tick_index, trigger_event, audit_context);
         write_audit_if_configured(audit_db, &audit);

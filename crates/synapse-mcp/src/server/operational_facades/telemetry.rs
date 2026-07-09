@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde_json::Value;
 
 use rmcp::{RoleServer, service::RequestContext};
@@ -55,6 +57,7 @@ pub(super) async fn handle(
     let cf_row_counts = storage_summary.cf_row_counts.clone();
     let status = TelemetryStatusResponse {
         source_of_truth: TELEMETRY_SOT,
+        metrics_recorder: metrics_recorder_telemetry(),
         tool_surface: tool_surface_telemetry(&snapshot),
         storage_summary,
         agent_event_ingress: ingress,
@@ -77,6 +80,55 @@ fn agent_ingress_stats() -> AgentEventIngressStats {
         rejected_malformed_total: stat_u64(&value, "rejected_malformed_total"),
         rejected_storage_total: stat_u64(&value, "rejected_storage_total"),
     }
+}
+
+fn metrics_recorder_telemetry() -> super::types::MetricsRecorderTelemetry {
+    let rendered = synapse_telemetry::metrics::render_prometheus();
+    let recorded_metric_names = rendered
+        .as_deref()
+        .map(recorded_metric_names)
+        .unwrap_or_default();
+    let recorded_metric_samples = rendered
+        .as_deref()
+        .map(recorded_metric_samples)
+        .unwrap_or_default();
+    super::types::MetricsRecorderTelemetry {
+        source_of_truth: synapse_telemetry::metrics::PROMETHEUS_RECORDER_SOURCE_OF_TRUTH,
+        installed: synapse_telemetry::metrics::prometheus_recorder_installed(),
+        recorder: "prometheus".to_owned(),
+        registry_metric_count: synapse_telemetry::metrics::m3_metric_specs().len(),
+        rendered_bytes: rendered.as_ref().map_or(0, String::len),
+        recorded_metric_names,
+        recorded_metric_samples,
+    }
+}
+
+fn recorded_metric_names(rendered: &str) -> Vec<String> {
+    rendered
+        .lines()
+        .filter(|line| !line.starts_with('#') && !line.trim().is_empty())
+        .filter_map(|line| {
+            line.split(['{', ' '])
+                .next()
+                .filter(|name| !name.is_empty())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(64)
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn recorded_metric_samples(rendered: &str) -> Vec<String> {
+    let mut samples = rendered
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty() && !trimmed.starts_with('#')).then(|| trimmed.to_owned())
+        })
+        .collect::<Vec<_>>();
+    samples.sort();
+    samples.into_iter().take(256).collect()
 }
 
 fn tool_surface_telemetry(snapshot: &ToolProfileSnapshot) -> ToolSurfaceTelemetry {

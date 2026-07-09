@@ -1,8 +1,10 @@
-use std::sync::Once;
+use std::sync::{Once, OnceLock};
 
 pub use ::metrics::{
     Unit, counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram,
 };
+use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+use thiserror::Error;
 
 pub const CARDINALITY_LIMIT: u16 = 1_000;
 
@@ -242,6 +244,59 @@ pub const M3_METRICS: &[MetricSpec] = &[
 ];
 
 static REGISTER_M3_METRICS: Once = Once::new();
+static PROMETHEUS_RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
+
+pub const PROMETHEUS_RECORDER_SOURCE_OF_TRUTH: &str =
+    "process-global metrics recorder + metrics_exporter_prometheus PrometheusHandle::render";
+
+#[derive(Debug, Error)]
+pub enum MetricsRecorderError {
+    #[error("METRICS_RECORDER_INSTALL_FAILED: {0}")]
+    Install(String),
+}
+
+#[must_use]
+pub fn prometheus_recorder_installed() -> bool {
+    PROMETHEUS_RECORDER.get().is_some()
+}
+
+/// Installs the process-global metrics recorder once and returns its render handle.
+///
+/// # Errors
+///
+/// Returns [`MetricsRecorderError`] when the exporter cannot build or when
+/// another global recorder has already been installed outside this module.
+pub fn install_prometheus_recorder() -> Result<PrometheusHandle, MetricsRecorderError> {
+    if let Some(handle) = PROMETHEUS_RECORDER.get() {
+        return Ok(handle.clone());
+    }
+
+    let handle = match PrometheusBuilder::new().install_recorder() {
+        Ok(handle) => handle,
+        Err(error) => {
+            if let Some(handle) = PROMETHEUS_RECORDER.get() {
+                return Ok(handle.clone());
+            }
+            return Err(MetricsRecorderError::Install(error.to_string()));
+        }
+    };
+    if PROMETHEUS_RECORDER.set(handle.clone()).is_ok() {
+        Ok(handle)
+    } else if let Some(handle) = PROMETHEUS_RECORDER.get() {
+        Ok(handle.clone())
+    } else {
+        Err(MetricsRecorderError::Install(
+            "prometheus recorder handle could not be published".to_owned(),
+        ))
+    }
+}
+
+#[must_use]
+pub fn render_prometheus() -> Option<String> {
+    PROMETHEUS_RECORDER
+        .get()
+        .map(metrics_exporter_prometheus::PrometheusHandle::render)
+}
 
 pub fn register_m3_metrics() {
     REGISTER_M3_METRICS.call_once(|| {
@@ -296,7 +351,8 @@ mod tests {
         PROFILE_RELOADS_TOTAL, PROFILES_ACTIVE, REFLEX_FIRES_TOTAL, REFLEX_RECURSION_CLAMPS_TOTAL,
         REFLEX_STARVED_TOTAL, REFLEX_TICK_JITTER_US, SSE_ACTIVE_SUBSCRIBERS,
         SSE_BUFFER_OVERFLOWS_TOTAL, STORAGE_CF_BYTES, STORAGE_DISK_PRESSURE_LEVEL,
-        STORAGE_WRITE_BATCH_FLUSHES_TOTAL, m3_metric_specs,
+        STORAGE_WRITE_BATCH_FLUSHES_TOTAL, counter, install_prometheus_recorder, m3_metric_specs,
+        register_m3_metrics, render_prometheus,
     };
 
     #[test]
@@ -351,6 +407,25 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn installed_prometheus_recorder_renders_counter_samples()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _handle = install_prometheus_recorder()?;
+        register_m3_metrics();
+        counter!(
+            EVENTS_PUBLISHED_TOTAL,
+            "source" => "telemetry_test",
+            "kind" => "smoke"
+        )
+        .increment(1);
+
+        let rendered = render_prometheus().ok_or("prometheus recorder render handle missing")?;
+        assert!(rendered.contains(EVENTS_PUBLISHED_TOTAL), "{rendered}");
+        assert!(rendered.contains("source=\"telemetry_test\""), "{rendered}");
+        assert!(rendered.contains("kind=\"smoke\""), "{rendered}");
+        Ok(())
     }
 
     #[test]

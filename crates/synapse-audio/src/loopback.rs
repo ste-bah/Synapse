@@ -17,6 +17,7 @@ use crate::{
 };
 
 pub const AUDIO_LOOPBACK_FRAMES_TOTAL: &str = "audio_loopback_frames_total";
+const AUDIO_LOOPBACK_UNDERRUNS_TOTAL: &str = "audio_loopback_underruns_total";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -284,6 +285,7 @@ impl WasapiLoopback {
             .map_err(device_lost)?
             .unwrap_or(0);
         if frames == 0 {
+            metrics::counter!(AUDIO_LOOPBACK_UNDERRUNS_TOTAL).increment(1);
             return Ok(None);
         }
         let bytes = usize::try_from(frames)
@@ -298,6 +300,7 @@ impl WasapiLoopback {
             .read_from_device(&mut raw)
             .map_err(device_lost)?;
         if read_frames == 0 {
+            metrics::counter!(AUDIO_LOOPBACK_UNDERRUNS_TOTAL).increment(1);
             return Ok(None);
         }
         Ok(Some(raw_f32_stereo(&raw, read_frames, &info)))

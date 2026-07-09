@@ -11,6 +11,7 @@ use metrics::{
 };
 use synapse_core::{Event, EventFilter, EventSource};
 use synapse_reflex::{EVENTS_DROPPED_METRIC, SUBSCRIBER_QUEUE_CAPACITY};
+use synapse_telemetry::metrics::{SSE_ACTIVE_SUBSCRIBERS, SSE_BUFFER_OVERFLOWS_TOTAL};
 
 use super::{
     EventsQuery, LAST_EVENT_ID, SUBSCRIPTION_ID_HEADER, SseState, replay,
@@ -191,6 +192,10 @@ fn ring_overflow_reports_drop_metric_and_lossy_frame() -> Result<(), Box<dyn Err
             recorder.counter_value(&metric_key_for(subscription.id()))?,
             EXPECTED_DROPPED
         );
+        assert_eq!(
+            recorder.counter_value(unlabeled_metric_key(SSE_BUFFER_OVERFLOWS_TOTAL))?,
+            EXPECTED_DROPPED
+        );
 
         let frames = replay::frames_after(&subscription, None);
         assert_eq!(frames.len(), SUBSCRIBER_QUEUE_CAPACITY + 1);
@@ -215,13 +220,70 @@ fn ring_overflow_reports_drop_metric_and_lossy_frame() -> Result<(), Box<dyn Err
     })
 }
 
+#[test]
+fn active_subscriber_gauge_tracks_subscribe_and_cancel() -> Result<(), Box<dyn Error>> {
+    let recorder = TestRecorder::default();
+    metrics::with_local_recorder(&recorder, || -> Result<(), Box<dyn Error>> {
+        let state = SseState::from_env();
+
+        assert_eq!(state.active_subscription_count(), 0);
+        assert_eq!(
+            recorder.gauge_value(unlabeled_metric_key(SSE_ACTIVE_SUBSCRIBERS))?,
+            0.0
+        );
+
+        let first = state
+            .create_subscription_with(EventFilter::All, Vec::new(), false, None)
+            .expect("first subscription should register")
+            .id()
+            .to_owned();
+        assert_eq!(
+            recorder.gauge_value(unlabeled_metric_key(SSE_ACTIVE_SUBSCRIBERS))?,
+            1.0
+        );
+
+        let second = state
+            .create_subscription_with(EventFilter::All, Vec::new(), false, None)
+            .expect("second subscription should register")
+            .id()
+            .to_owned();
+        assert_eq!(
+            recorder.gauge_value(unlabeled_metric_key(SSE_ACTIVE_SUBSCRIBERS))?,
+            2.0
+        );
+
+        state.cancel(&first).expect("first cancel should work");
+        assert_eq!(
+            recorder.gauge_value(unlabeled_metric_key(SSE_ACTIVE_SUBSCRIBERS))?,
+            1.0
+        );
+
+        state.cancel(&second).expect("second cancel should work");
+        assert_eq!(
+            recorder.gauge_value(unlabeled_metric_key(SSE_ACTIVE_SUBSCRIBERS))?,
+            0.0
+        );
+
+        Ok(())
+    })
+}
+
 fn metric_key_for(subscription_id: &str) -> String {
     format!("{EVENTS_DROPPED_METRIC}{{subscription_id={subscription_id}}}")
+}
+
+fn unlabeled_metric_key(name: &str) -> &str {
+    match name {
+        SSE_ACTIVE_SUBSCRIBERS => "sse_active_subscribers{}",
+        SSE_BUFFER_OVERFLOWS_TOTAL => "sse_buffer_overflows_total{}",
+        _ => panic!("unexpected unlabeled metric {name}"),
+    }
 }
 
 #[derive(Clone, Default)]
 struct TestRecorder {
     counters: Arc<Mutex<BTreeMap<String, u64>>>,
+    gauges: Arc<Mutex<BTreeMap<String, f64>>>,
 }
 
 impl TestRecorder {
@@ -231,6 +293,14 @@ impl TestRecorder {
             .lock()
             .map_err(|error| format!("metric recorder lock poisoned: {error}"))?;
         Ok(counters.get(key).copied().unwrap_or_default())
+    }
+
+    fn gauge_value(&self, key: &str) -> Result<f64, Box<dyn Error>> {
+        let gauges = self
+            .gauges
+            .lock()
+            .map_err(|error| format!("metric recorder lock poisoned: {error}"))?;
+        Ok(gauges.get(key).copied().unwrap_or_default())
     }
 }
 
@@ -248,8 +318,11 @@ impl Recorder for TestRecorder {
         }))
     }
 
-    fn register_gauge(&self, _key: &Key, _metadata: &Metadata<'_>) -> Gauge {
-        Gauge::from_arc(Arc::new(NoopGauge))
+    fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+        Gauge::from_arc(Arc::new(TestGauge {
+            key: metric_key(key),
+            gauges: Arc::clone(&self.gauges),
+        }))
     }
 
     fn register_histogram(&self, _key: &Key, _metadata: &Metadata<'_>) -> Histogram {
@@ -277,14 +350,31 @@ impl CounterFn for TestCounter {
     }
 }
 
-struct NoopGauge;
+struct TestGauge {
+    key: String,
+    gauges: Arc<Mutex<BTreeMap<String, f64>>>,
+}
 
-impl GaugeFn for NoopGauge {
-    fn increment(&self, _value: f64) {}
+impl GaugeFn for TestGauge {
+    fn increment(&self, value: f64) {
+        if let Ok(mut gauges) = self.gauges.lock() {
+            let gauge = gauges.entry(self.key.clone()).or_default();
+            *gauge += value;
+        }
+    }
 
-    fn decrement(&self, _value: f64) {}
+    fn decrement(&self, value: f64) {
+        if let Ok(mut gauges) = self.gauges.lock() {
+            let gauge = gauges.entry(self.key.clone()).or_default();
+            *gauge -= value;
+        }
+    }
 
-    fn set(&self, _value: f64) {}
+    fn set(&self, value: f64) {
+        if let Ok(mut gauges) = self.gauges.lock() {
+            gauges.insert(self.key.clone(), value);
+        }
+    }
 }
 
 struct NoopHistogram;

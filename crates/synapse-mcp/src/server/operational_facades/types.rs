@@ -322,6 +322,18 @@ pub struct AgentEventIngressStats {
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct MetricsRecorderTelemetry {
+    pub source_of_truth: &'static str,
+    pub installed: bool,
+    pub recorder: String,
+    pub registry_metric_count: usize,
+    pub rendered_bytes: usize,
+    pub recorded_metric_names: Vec<String>,
+    pub recorded_metric_samples: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ToolSurfaceTelemetry {
     pub source_of_truth: &'static str,
     pub profile: String,
@@ -353,6 +365,7 @@ pub struct ToolSurfaceTelemetry {
 #[serde(deny_unknown_fields)]
 pub struct TelemetryStatusResponse {
     pub source_of_truth: &'static str,
+    pub metrics_recorder: MetricsRecorderTelemetry,
     pub tool_surface: ToolSurfaceTelemetry,
     pub storage_summary: StorageSummaryResponse,
     pub agent_event_ingress: AgentEventIngressStats,

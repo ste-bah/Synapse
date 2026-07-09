@@ -36,6 +36,8 @@ use crate::{
     write_audit,
 };
 
+const REFLEX_FIRES_METRIC: &str = "reflex_fires_total";
+
 #[derive(Clone, Debug)]
 pub(super) struct RuntimeReflex {
     pub(super) registration_order: usize,
@@ -322,6 +324,14 @@ fn kind_summary(reflex: &ScheduledReflex) -> String {
 }
 
 pub(super) fn mark_reflex_fired(runtime: &RuntimeState, index: usize) {
+    if let Some(runtime_reflex) = runtime.reflexes.get(index) {
+        metrics::counter!(
+            REFLEX_FIRES_METRIC,
+            "kind" => kind_summary(&runtime_reflex.reflex),
+            "reflex_id" => format!("slot:{index}")
+        )
+        .increment(1);
+    }
     let expired = runtime
         .reflexes
         .get(index)

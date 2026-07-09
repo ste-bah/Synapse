@@ -35,6 +35,7 @@ const BLOCK_CACHE_BYTES: usize = 64 * MIB;
 const SCHEMA_VERSION_KEY: &[u8] = b"__schema_version";
 const TIMELINE_PERIODIC_COMPACTION_SECONDS: u64 = 86_400;
 const STORAGE_WRITES_SHED_TOTAL: &str = "storage_writes_shed_total";
+const STORAGE_CF_BYTES: &str = "storage_cf_bytes";
 const ESTIMATE_LIVE_DATA_SIZE: &str = "rocksdb.estimate-live-data-size";
 const ESTIMATE_NUM_KEYS: &str = "rocksdb.estimate-num-keys";
 
@@ -446,6 +447,7 @@ impl Db {
             }
             sizes.insert(cf_name.to_owned(), bytes);
         }
+        emit_storage_cf_bytes(&sizes);
         Ok(sizes)
     }
 
@@ -460,7 +462,9 @@ impl Db {
     /// be read.
     #[tracing::instrument(skip_all)]
     pub fn cf_live_data_size_estimates(&self) -> StorageResult<CfEstimateMap> {
-        self.cf_property_estimates(ESTIMATE_LIVE_DATA_SIZE)
+        let estimates = self.cf_property_estimates(ESTIMATE_LIVE_DATA_SIZE)?;
+        emit_storage_cf_bytes(&estimates.0);
+        Ok(estimates)
     }
 
     /// Returns exact row counts for each Synapse column family.
@@ -737,6 +741,14 @@ impl Db {
             }
         }
         Ok((values, missing))
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn emit_storage_cf_bytes(sizes: &BTreeMap<String, u64>) {
+    for (cf_name, bytes) in sizes {
+        synapse_telemetry::metrics::gauge!(STORAGE_CF_BYTES, "cf" => cf_name.clone())
+            .set(*bytes as f64);
     }
 }
 

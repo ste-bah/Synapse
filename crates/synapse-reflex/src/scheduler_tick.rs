@@ -28,6 +28,9 @@ use crate::{
     write_audit,
 };
 
+const REFLEX_TICK_JITTER_METRIC: &str = "reflex_tick_jitter_us";
+const REFLEX_STARVED_METRIC: &str = "reflex_starved_total";
+
 pub(super) fn tick(runtime: &mut RuntimeState, elapsed: Duration, degraded: bool) {
     let events = runtime.subscription.drain();
     expire_action_until_event_lifetimes(runtime, &events);
@@ -327,6 +330,11 @@ fn record_starvation(
     for loser in losers {
         losing_slots.insert(loser.loser_slot);
         if runtime.starvation_states[loser.loser_slot].record_loss(elapsed) {
+            metrics::counter!(
+                REFLEX_STARVED_METRIC,
+                "reflex_id" => format!("slot:{}", loser.loser_slot)
+            )
+            .increment(1);
             publish_starved(
                 &runtime.event_bus,
                 runtime.audit_db.as_deref(),
@@ -433,6 +441,8 @@ fn record_tick_sample(
     let elapsed_us = duration_us(elapsed);
     let target_us = duration_us(runtime.config.target_interval);
     let jitter_us = elapsed_us.abs_diff(target_us);
+    let jitter_metric = f64::from(u32::try_from(jitter_us).unwrap_or(u32::MAX));
+    metrics::histogram!(REFLEX_TICK_JITTER_METRIC).record(jitter_metric);
     let deadline_late = elapsed > runtime.config.late_after;
     let late = deadline_late || dispatch_blocked;
     if late {

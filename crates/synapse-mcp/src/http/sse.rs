@@ -127,21 +127,27 @@ impl SseState {
     }
 
     pub(crate) fn active_subscription_count(&self) -> usize {
-        self.inner
-            .subscriptions
-            .lock()
-            .map_or(0, |subscriptions| subscriptions.len())
+        match self.inner.subscriptions.lock() {
+            Ok(subscriptions) => {
+                let count = subscriptions.len();
+                emit_sse_active_subscribers(count);
+                count
+            }
+            Err(_poisoned) => 0,
+        }
     }
 
     pub(crate) fn cancel(&self, id: &str) -> Result<(), SseCancelError> {
-        let removed_from_map = {
+        let (removed_from_map, active_count) = {
             let mut subscriptions = self
                 .inner
                 .subscriptions
                 .lock()
                 .map_err(|_| SseCancelError::StateUnavailable)?;
-            subscriptions.remove(id).is_some()
+            let removed = subscriptions.remove(id).is_some();
+            (removed, subscriptions.len())
         };
+        emit_sse_active_subscribers(active_count);
         {
             let mut owners = self
                 .inner
@@ -289,6 +295,7 @@ impl SseState {
                 .lock()
                 .map_err(|_| SseSubscribeError::StateUnavailable)?;
             subscriptions.insert(id, Arc::clone(&subscription));
+            emit_sse_active_subscribers(subscriptions.len());
         }
         if let Some(owner_session_id) = owner_session_id {
             let mut owners = self
@@ -335,6 +342,15 @@ impl SseState {
         }
         subscription.push_events(events);
     }
+}
+
+fn emit_sse_active_subscribers(count: usize) {
+    synapse_telemetry::metrics::gauge!(synapse_telemetry::metrics::SSE_ACTIVE_SUBSCRIBERS)
+        .set(usize_metric_value(count));
+}
+
+fn usize_metric_value(value: usize) -> f64 {
+    u32::try_from(value).map_or(f64::from(u32::MAX), f64::from)
 }
 
 impl SseOpenError {
