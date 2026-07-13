@@ -400,7 +400,6 @@ mod tests {
         }
         assert!(backend.hold_started.load(Ordering::Acquire));
 
-        let started = Instant::now();
         let response = release_all_with_handles(
             handle.clone(),
             snapshot_handle.clone(),
@@ -409,7 +408,6 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("release_all should interrupt the in-flight hold: {error}"));
-        let elapsed = started.elapsed();
         press
             .await
             .unwrap_or_else(|error| panic!("press task should join: {error}"))
@@ -420,21 +418,12 @@ mod tests {
             .unwrap_or_else(|error| panic!("snapshot after interrupt should succeed: {error}"));
 
         println!(
-            "readback=action_emitter_state tool=release_all edge=in_flight_hold_interrupt elapsed_ms={} response={response:?} after={after:?}",
-            elapsed.as_millis()
+            "readback=action_emitter_state tool=release_all edge=in_flight_hold_interrupt release_observed={} response={response:?} after={after:?}",
+            backend.release_observed.load(Ordering::Acquire)
         );
-        // The contract is that release_all interrupts the in-flight 1_000 ms hold
-        // (see hold_ms above) rather than serializing behind it. The bound is
-        // derived from that signature: a non-interrupting regression waits the
-        // full ~1_000 ms, so any threshold well below 1_000 ms detects it. We use
-        // half the hold (500 ms) instead of 250 ms so a transient async-scheduler
-        // wakeup delay under full-suite parallel load (the #1616 flake class)
-        // cannot fail a correct interrupt, while still unambiguously proving the
-        // hold was not waited out.
-        assert!(
-            elapsed < Duration::from_millis(500),
-            "release_all waited behind the in-flight 1s hold instead of interrupting it: {elapsed:?}"
-        );
+        // `release_observed` is set only when the backend sees the operator
+        // release epoch change before its 1 s hold deadline. It directly proves
+        // interruption; a test-side stopwatch only measures scheduler load.
         assert!(backend.release_observed.load(Ordering::Acquire));
         assert!(after.held_keys.is_empty());
         assert!(after.held_buttons.is_empty());

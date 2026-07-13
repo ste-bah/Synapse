@@ -146,8 +146,8 @@ async fn operator_panic_empty_fleet_deletes_prior_lease_row_and_audits() -> anyh
     // With that override installed before the first lease touch below, every
     // `try_acquire`/`status`/`force_preempt` in this test operates on this
     // thread's hermetic lease cell, so a parallel test mutating the real
-    // process-global lease can no longer clear/overwrite this test's seeded
-    // owner between `try_acquire` and `force_preempt_input_lease` (issue #1600).
+    // process-global lease cannot clear/overwrite this test's seeded owner
+    // (issue #1600).
     //
     // This replaces the pre-#1585 `lease_serial` band-aid, which serialized only
     // against other `lease_serial` callers and, worse, force-cleared the GLOBAL
@@ -164,13 +164,28 @@ async fn operator_panic_empty_fleet_deletes_prior_lease_row_and_audits() -> anyh
         | synapse_action::LeaseOutcome::Renewed(status) => status,
         other => anyhow::bail!("owner lease acquire failed unexpectedly: {other:?}"),
     };
-    service
-        .persist_session_lease(owner, &acquired)
-        .map_err(|error| anyhow::anyhow!("persist lease failed: {}", error.message))?;
-
+    // Match the real hotkey's K1 ordering: snapshot and preempt the live lease
+    // immediately. The previous test performed a synchronous RocksDB write
+    // between acquire and this snapshot; under a saturated full suite that
+    // setup write could consume the entire 5 s synthetic TTL, so `status()`
+    // correctly expired the lease and `force_preempt` returned None (#1617).
     let lease_before = synapse_action::lease::status();
     let preempted_lease = synapse_action::force_preempt_input_lease("operator_panic_test");
     let lease_after_preempt = synapse_action::lease::status();
+    assert_eq!(lease_before.owner_session_id.as_deref(), Some(owner));
+    assert_eq!(
+        preempted_lease
+            .as_ref()
+            .and_then(|status| status.owner_session_id.as_deref()),
+        Some(owner)
+    );
+
+    // The K2 trigger below still reads and deletes a real CF_SESSIONS row. Its
+    // write occurs after the immutable K1 snapshot so storage contention cannot
+    // retroactively change which live owner the hotkey actually preempted.
+    service
+        .persist_session_lease(owner, &acquired)
+        .map_err(|error| anyhow::anyhow!("persist lease failed: {}", error.message))?;
     let immediate = OperatorHotkeyImmediateReport {
         hotkey: synapse_action::hotkey::DEFAULT_OPERATOR_HOTKEY,
         lease_before,
