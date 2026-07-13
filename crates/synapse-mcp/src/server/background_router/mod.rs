@@ -19,6 +19,7 @@ use super::m1_tools::{
 use super::{
     CdpTargetOwner, ErrorData, Json, Parameters, SessionTarget, SynapseService, tool, tool_router,
 };
+use crate::daemon_lifecycle::consume_panic_payload;
 use crate::m1::{
     CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction, CdpNavigateTabParams,
     CdpTargetInfoParams, ObserveParams, mcp_error,
@@ -28,20 +29,21 @@ use crate::m2::{
     ActSetFieldTextLocator, ActSetFieldTextParams, ActTypeParams, act_press_normalized_labels,
     default_auto_wait_timeout_ms, default_verify_timeout_ms,
 };
-use crate::m4::{ActRunShellExecutionMode, ActRunShellParams};
+use crate::m4::{ActRunShellJobIdParams, ActRunShellStartParams, ActRunShellStatusParams};
+use futures_util::FutureExt as _;
 use rmcp::schemars::{JsonSchema, schema_for};
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use synapse_core::{AccessibleNode, ElementId, Point, Rect, UiaPattern, error_codes};
+use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TARGET_ACT_SHELL_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TARGET_ACT_FOCUS_STABLE_MS: u32 = 75;
@@ -58,6 +60,11 @@ const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, ins
 const ACT_FACADE_SOURCE_OF_TRUTH: &str = "act facade CF_ACTION_LOG command audit row + target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
 const TARGET_ACT_SECRET_SAFE_REDACTION_POLICY: &str = "target_act_secret_safe_v1";
 const TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION: &str = "call act operation=foreground with the same action payload and a non-empty reason; the facade acquires the foreground input lease, temporarily sets break_glass, runs target_act, restores the prior profile, and releases the lease";
+const ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<session_id> row + synapse_action::lease and persisted MCP session lease row";
+const ACT_FOREGROUND_CLEANUP_FAILED_DETAIL_CODE: &str =
+    "ACT_FOREGROUND_CLEANUP_POSTCONDITION_FAILED";
+const ACT_FOREGROUND_PANIC_CLEANUP_ATTEMPTS: usize = 3;
+const ACT_COMMAND_AUDIT_FINAL_ATTEMPTS: usize = 3;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -566,6 +573,12 @@ pub struct ActForegroundEscalation {
     pub escalated_to: String,
     pub restored_profile: String,
     pub profile_restored: bool,
+    /// Independent post-cleanup lease readback. A newly acquired lease must no
+    /// longer be owned by this session; a lease the caller already held is not
+    /// released by this facade.
+    pub lease_cleanup_verified: bool,
+    pub session_holds_lease_after: bool,
+    pub cleanup_source_of_truth: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -574,6 +587,1127 @@ pub struct ActForegroundResponse {
     pub ok: bool,
     pub action: TargetActResponse,
     pub escalation: ActForegroundEscalation,
+}
+
+/// Durable final-phase owner for the public `act` command audit.
+///
+/// The complete command runs in a daemon-tracked transaction, so dropping the
+/// caller's join handle does not cancel the mutation, cleanup, or final audit.
+/// `Drop` is therefore only an invariant-failure circuit breaker: it performs
+/// no storage or schema work and drains the daemon fail-closed.
+struct ActCommandAuditGuard {
+    service: SynapseService,
+    operation_name: &'static str,
+    actor_session_id: Option<String>,
+    command_payload: Value,
+    command_before: Value,
+    pending_final: Option<super::command_audit::CommandAuditInput>,
+    armed: bool,
+}
+
+impl ActCommandAuditGuard {
+    fn begin(
+        service: &SynapseService,
+        operation_name: &'static str,
+        actor_session_id: Option<String>,
+        command_payload: Value,
+        command_before: Value,
+    ) -> Result<Self, ErrorData> {
+        service.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+            "act",
+            operation_name,
+            actor_session_id.clone(),
+            None,
+            command_payload.clone(),
+            command_before.clone(),
+            Value::Null,
+            "pending",
+        ))?;
+        Ok(Self {
+            service: service.clone(),
+            operation_name,
+            actor_session_id,
+            command_payload,
+            command_before,
+            pending_final: None,
+            armed: true,
+        })
+    }
+
+    fn completion_input(
+        &self,
+        after: Value,
+        outcome: &'static str,
+        error: Option<&ErrorData>,
+    ) -> super::command_audit::CommandAuditInput {
+        let input = super::command_audit::CommandAuditInput::mcp(
+            "act",
+            self.operation_name,
+            self.actor_session_id.clone(),
+            None,
+            self.command_payload.clone(),
+            self.command_before.clone(),
+            after,
+            outcome,
+        );
+        error.map_or(input.clone(), |error| {
+            input.with_error(super::command_audit::command_audit_error_from_error_data(
+                error,
+            ))
+        })
+    }
+
+    fn finalize(
+        &mut self,
+        after: Value,
+        outcome: &'static str,
+        error: Option<&ErrorData>,
+    ) -> Result<(), ErrorData> {
+        self.pending_final = Some(self.completion_input(after, outcome, error));
+        self.write_pending_final_with_retries("ordinary_completion")
+    }
+
+    fn write_pending_final_with_retries(&mut self, trigger: &'static str) -> Result<(), ErrorData> {
+        let input = self.pending_final.clone().ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "act command audit finalization was armed without a final row",
+            )
+        })?;
+        write_act_command_audit_final_with_retries(
+            &self.service,
+            &input,
+            self.operation_name,
+            trigger,
+        )?;
+        self.pending_final = None;
+        self.armed = false;
+        Ok(())
+    }
+}
+
+fn write_act_command_audit_final_with_retries(
+    service: &SynapseService,
+    input: &super::command_audit::CommandAuditInput,
+    operation_name: &'static str,
+    trigger: &'static str,
+) -> Result<(), ErrorData> {
+    let mut last_error = None;
+    for attempt in 1..=ACT_COMMAND_AUDIT_FINAL_ATTEMPTS {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            service.command_audit_final(input.clone())
+        })) {
+            Ok(Ok(_readback)) => return Ok(()),
+            Ok(Err(error)) => last_error = Some(error),
+            Err(panic) => {
+                let panic_description = consume_panic_payload(panic);
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    detail_code = "ACT_COMMAND_AUDIT_FINAL_PANICKED",
+                    operation = operation_name,
+                    attempt,
+                    trigger,
+                    panic = %panic_description,
+                    "act command final audit panicked inside its bounded retry loop"
+                );
+                last_error = Some(mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("act command audit finalization panicked: {panic_description}"),
+                ));
+            }
+        }
+        tracing::error!(
+            code = error_codes::TOOL_INTERNAL_ERROR,
+            detail_code = "ACT_COMMAND_AUDIT_FINAL_RETRY",
+            operation = operation_name,
+            attempt,
+            max_attempts = ACT_COMMAND_AUDIT_FINAL_ATTEMPTS,
+            trigger,
+            "act command final audit write/readback failed; retrying on the supervised finalizer worker"
+        );
+    }
+    Err(last_error.unwrap_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "act command final audit exhausted retries without an error detail",
+        )
+    }))
+}
+
+impl Drop for ActCommandAuditGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let drain = self
+            .service
+            .drain_state_handle()
+            .mark_draining("act_supervised_transaction_dropped");
+        let preempted =
+            synapse_action::force_preempt_input_lease("act_supervised_transaction_dropped");
+        tracing::error!(
+            code = error_codes::TOOL_INTERNAL_ERROR,
+            detail_code = "ACT_SUPERVISED_TRANSACTION_DROPPED",
+            operation = self.operation_name,
+            session_id = ?self.actor_session_id,
+            pending_final_selected = self.pending_final.is_some(),
+            drain = ?drain,
+            lease_preempted_from = ?preempted,
+            source_of_truth = ACT_FACADE_SOURCE_OF_TRUTH,
+            "armed act audit guard escaped the supervised transaction; daemon and lease fail-closed"
+        );
+    }
+}
+
+/// Authority rollback owner for `act operation=foreground`.
+///
+/// The daemon-tracked transaction catches unwind while this guard and the
+/// session authority lock are both live, then performs bounded physical
+/// rollback and readback before the public command audit is finalized. `Drop`
+/// is deliberately storage-free and is only an invariant-failure circuit
+/// breaker.
+struct ActForegroundAuthorityGuard {
+    service: SynapseService,
+    session_id: String,
+    prior_profile: super::tool_profiles::ToolProfileAssignment,
+    prior_profile_value_sha256: String,
+    prior_persisted_lease: super::session_continuity::PersistedSessionLeaseRowSnapshot,
+    expected_retained_persisted_lease: super::session_continuity::PersistedSessionLeaseRowSnapshot,
+    lease_owner_before: Option<String>,
+    operator_panic_epoch_at_arm: u64,
+    acquire_outcome_was_new: bool,
+    armed: bool,
+    #[cfg(test)]
+    cleanup_panics_remaining: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ActForegroundAuthorityCleanupReadback {
+    trigger: &'static str,
+    source_of_truth: &'static str,
+    profile_restore_attempt_ok: bool,
+    profile_readback_ok: bool,
+    expected_profile: String,
+    actual_profile: Option<String>,
+    profile_restored: bool,
+    lease_owner_before: Option<String>,
+    lease_owner_at_cleanup: Option<String>,
+    lease_owner_after: Option<String>,
+    newly_acquired_lease: bool,
+    lease_release_attempted: bool,
+    lease_release_call_released: bool,
+    lease_release_observed: bool,
+    persisted_lease_row_expected: bool,
+    persisted_lease_row_restored: bool,
+    profile_restore_error: Option<String>,
+    profile_readback_error: Option<String>,
+    persisted_lease_restore_error: Option<String>,
+    operator_panic_epoch_at_arm: u64,
+    operator_panic_epoch_after: u64,
+    operator_panic_observed: bool,
+    operator_epoch_stable_at_disarm: bool,
+    operator_owner_preserved: bool,
+    cleanup_ok: bool,
+}
+
+impl ActForegroundAuthorityGuard {
+    fn new(
+        service: &SynapseService,
+        session_id: &str,
+        profile_before: &super::tool_profiles::ToolProfileSnapshot,
+        lease_owner_before: Option<String>,
+        operator_panic_epoch_at_arm: u64,
+    ) -> Result<Self, ErrorData> {
+        let prior_profile_row = profile_before
+            .policy_row
+            .as_ref()
+            .ok_or_else(|| {
+                ErrorData::new(
+                    ErrorCode(-32099),
+                    "act operation=foreground could not snapshot the scoped profile row",
+                    Some(json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "detail_code": "ACT_FOREGROUND_PROFILE_SNAPSHOT_MISSING",
+                        "tool": "act",
+                        "operation": "foreground",
+                        "session_id": session_id,
+                        "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                        "remediation": "repair the CF_SESSIONS profile row before retrying the foreground action",
+                    })),
+                )
+            })?;
+        let prior_profile = prior_profile_row.record.clone();
+        let prior_profile_value_sha256 = prior_profile_row.value_sha256.clone();
+        let prior_persisted_lease =
+            super::session_continuity::snapshot_persisted_session_lease_row(
+                &service.m3_state_handle(),
+                session_id,
+            )
+            .map_err(|error| {
+                ErrorData::new(
+                    ErrorCode(-32099),
+                    format!(
+                        "act operation=foreground could not snapshot the persisted lease row: {error}"
+                    ),
+                    Some(json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "detail_code": "ACT_FOREGROUND_LEASE_SNAPSHOT_FAILED",
+                        "tool": "act",
+                        "operation": "foreground",
+                        "session_id": session_id,
+                        "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                        "error": error,
+                        "remediation": "repair CF_SESSIONS lease-row access before retrying the foreground action",
+                    })),
+                )
+            })?;
+        Ok(Self {
+            service: service.clone(),
+            session_id: session_id.to_owned(),
+            prior_profile,
+            prior_profile_value_sha256,
+            expected_retained_persisted_lease: prior_persisted_lease.clone(),
+            prior_persisted_lease,
+            lease_owner_before,
+            operator_panic_epoch_at_arm,
+            acquire_outcome_was_new: false,
+            armed: true,
+            #[cfg(test)]
+            cleanup_panics_remaining: 0,
+        })
+    }
+
+    fn note_acquire_response(
+        &mut self,
+        response: &super::lease_tools::ControlLeaseResponse,
+    ) -> Result<(), ErrorData> {
+        self.acquire_outcome_was_new = response.outcome == "acquired";
+        if response.outcome == "renewed" {
+            self.snapshot_expected_retained_persisted_lease_after_renewal()
+                .map_err(|error| {
+                    ErrorData::new(
+                        ErrorCode(-32099),
+                        "act operation=foreground could not snapshot the exact renewed lease row",
+                        Some(json!({
+                            "code": error_codes::ACTION_POSTCONDITION_FAILED,
+                            "detail_code": "ACT_FOREGROUND_RENEWED_LEASE_SNAPSHOT_FAILED",
+                            "tool": "act",
+                            "operation": "foreground",
+                            "session_id": self.session_id,
+                            "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                            "error": error,
+                            "remediation": "inspect the process-global lease and exact CF_SESSIONS lease row before retrying",
+                        })),
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
+    fn snapshot_expected_retained_persisted_lease_after_renewal(&mut self) -> Result<(), String> {
+        let mut failures = Vec::new();
+        for attempt in 1..=ACT_FOREGROUND_PANIC_CLEANUP_ATTEMPTS {
+            match super::session_continuity::snapshot_persisted_session_lease_row(
+                &self.service.m3_state_handle(),
+                &self.session_id,
+            ) {
+                Ok(renewed) if renewed.row_exists() => {
+                    self.expected_retained_persisted_lease = renewed;
+                    return Ok(());
+                }
+                Ok(_missing) => failures.push(format!(
+                    "attempt {attempt}: renewed input lease has no persisted continuity row"
+                )),
+                Err(error) => failures.push(format!("attempt {attempt}: {error}")),
+            }
+        }
+        Err(format!(
+            "could not snapshot renewed input lease row for {} after {} bounded attempts: {}",
+            self.session_id,
+            ACT_FOREGROUND_PANIC_CLEANUP_ATTEMPTS,
+            failures.join("; ")
+        ))
+    }
+
+    fn reconcile_expected_retained_lease_after_acquire_error(&mut self) -> Result<(), String> {
+        if self.operator_panic_observed() {
+            return Ok(());
+        }
+        let lease_after_error = synapse_action::lease::status();
+        if self.lease_owner_before.as_deref() == Some(self.session_id.as_str())
+            && lease_after_error.owner_session_id.as_deref() == Some(self.session_id.as_str())
+        {
+            self.snapshot_expected_retained_persisted_lease_after_renewal()?;
+        }
+        Ok(())
+    }
+
+    /// Linearize transaction completion before the final epoch read. A panic
+    /// published before disarm is necessarily observed by the following load;
+    /// a later panic belongs to the next authority transaction.
+    fn disarm_if_operator_epoch_stable(&mut self, expected_epoch: u64) -> Result<(), u64> {
+        self.armed = false;
+        let observed_epoch = synapse_action::operator_panic_epoch();
+        if observed_epoch == expected_epoch {
+            Ok(())
+        } else {
+            self.armed = true;
+            Err(observed_epoch)
+        }
+    }
+
+    fn operator_panic_observed(&self) -> bool {
+        let operator_panic = synapse_action::operator_panic_safety_readback();
+        operator_panic.pending || operator_panic.epoch != self.operator_panic_epoch_at_arm
+    }
+
+    fn restore_prior_profile_assignment(
+        &self,
+    ) -> Result<super::tool_profiles::ToolProfileRowReadback, ErrorData> {
+        self.service
+            .restore_tool_profile_assignment_exact(&self.prior_profile)
+    }
+
+    fn profile_row_matches_prior(
+        &self,
+        row: &super::tool_profiles::ToolProfileRowReadback,
+    ) -> bool {
+        row.record.profile == self.prior_profile.profile
+            && row.value_sha256 == self.prior_profile_value_sha256
+            && row.record.source == self.prior_profile.source
+            && row.record.reason == self.prior_profile.reason
+            && row.record.set_by_session_id == self.prior_profile.set_by_session_id
+    }
+
+    fn delete_operator_interrupted_lease_row(
+        &self,
+    ) -> Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String> {
+        super::session_continuity::delete_persisted_session_lease_row(
+            &self.service.m3_state_handle(),
+            &self.session_id,
+        )?;
+        let after = super::session_continuity::snapshot_persisted_session_lease_row(
+            &self.service.m3_state_handle(),
+            &self.session_id,
+        )?;
+        if after.row_exists() {
+            return Err(format!(
+                "operator-interrupted session lease row still exists for {}",
+                self.session_id
+            ));
+        }
+        Ok(after)
+    }
+
+    fn reconcile_persisted_lease_after_async_cleanup(
+        &self,
+    ) -> Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String> {
+        if self.operator_panic_observed() {
+            return self.delete_operator_interrupted_lease_row();
+        }
+        if self.acquire_outcome_was_new {
+            return super::session_continuity::restore_persisted_session_lease_row(
+                &self.service.m3_state_handle(),
+                &self.session_id,
+                &self.prior_persisted_lease,
+            );
+        }
+        self.read_expected_retained_persisted_lease()
+    }
+
+    fn read_expected_retained_persisted_lease(
+        &self,
+    ) -> Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String> {
+        let after = super::session_continuity::snapshot_persisted_session_lease_row(
+            &self.service.m3_state_handle(),
+            &self.session_id,
+        )?;
+        let lease_after = synapse_action::lease::status();
+        if lease_after.owner_session_id.as_deref() == Some(self.session_id.as_str())
+            && (!after.row_exists() || after != self.expected_retained_persisted_lease)
+        {
+            return Err(format!(
+                "retained input lease for {} does not match its exact persisted continuity row: expected_present={} actual_present={}",
+                self.session_id,
+                self.expected_retained_persisted_lease.row_exists(),
+                after.row_exists(),
+            ));
+        }
+        Ok(after)
+    }
+
+    fn cleanup_now(&mut self, trigger: &'static str) -> ActForegroundAuthorityCleanupReadback {
+        let profile_restore = self.restore_prior_profile_assignment();
+        #[cfg(test)]
+        if self.cleanup_panics_remaining > 0 {
+            self.cleanup_panics_remaining -= 1;
+            panic!("injected panic after exact profile restore");
+        }
+        // Emergency Drop cleanup intentionally avoids rebuilding/sanitizing the
+        // complete MCP schema. The byte-exact CF_SESSIONS row is the authority
+        // Source of Truth and this narrow read keeps unwind latency bounded.
+        let profile_readback = self.service.read_tool_profile_assignment(&self.session_id);
+        let actual_profile = profile_readback
+            .as_ref()
+            .ok()
+            .and_then(Option::as_ref)
+            .map(|row| row.record.profile.as_str().to_owned());
+        let profile_restored = profile_readback.as_ref().is_ok_and(|row| {
+            row.as_ref()
+                .is_some_and(|row| self.profile_row_matches_prior(row))
+        });
+
+        let lease_at_cleanup = synapse_action::lease::status();
+        let operator_interrupt_at_cleanup = self.operator_panic_observed();
+        let newly_owned_during_call = self.lease_owner_before.as_deref()
+            != Some(self.session_id.as_str())
+            && lease_at_cleanup.owner_session_id.as_deref() == Some(self.session_id.as_str());
+        let lease_release_attempted = if operator_interrupt_at_cleanup {
+            lease_at_cleanup.owner_session_id.as_deref() == Some(self.session_id.as_str())
+        } else {
+            self.acquire_outcome_was_new || newly_owned_during_call
+        };
+
+        // Operator panic supersedes every agent snapshot: delete the guarded
+        // row and never restore it. Otherwise restore a newly acquired lease's
+        // pre-call row before releasing process memory so status cannot
+        // resurrect the authority between the two operations.
+        let first_persisted_restore = if operator_interrupt_at_cleanup {
+            self.delete_operator_interrupted_lease_row().map(|_| ())
+        } else if lease_release_attempted {
+            super::session_continuity::restore_persisted_session_lease_row(
+                &self.service.m3_state_handle(),
+                &self.session_id,
+                &self.prior_persisted_lease,
+            )
+            .map(|_| ())
+        } else {
+            Ok(())
+        };
+        let released = if lease_release_attempted {
+            synapse_action::lease::release_if_owner(&self.session_id)
+        } else {
+            false
+        };
+        // Re-assert the operator deletion or exact pre-call row after release.
+        // A caller-owned renewed lease is intentionally kept with its renewed
+        // durable expiry instead of mixing old persistence with new memory.
+        let operator_interrupt_before_final = self.operator_panic_observed();
+        let mut final_persisted_restore = if operator_interrupt_before_final {
+            self.delete_operator_interrupted_lease_row()
+        } else if lease_release_attempted {
+            super::session_continuity::restore_persisted_session_lease_row(
+                &self.service.m3_state_handle(),
+                &self.session_id,
+                &self.prior_persisted_lease,
+            )
+        } else {
+            self.read_expected_retained_persisted_lease()
+        };
+        let mut operator_panic_epoch_after = synapse_action::operator_panic_epoch();
+        let mut operator_panic_observed =
+            operator_panic_epoch_after != self.operator_panic_epoch_at_arm;
+        if operator_panic_observed && !operator_interrupt_before_final {
+            final_persisted_restore = self.delete_operator_interrupted_lease_row();
+        }
+        let mut persisted_lease_row_restored =
+            final_persisted_restore.as_ref().is_ok_and(|after| {
+                if operator_panic_observed {
+                    !after.row_exists()
+                } else if lease_release_attempted {
+                    after == &self.prior_persisted_lease
+                } else {
+                    lease_at_cleanup.owner_session_id.as_deref() != Some(self.session_id.as_str())
+                        || (after.row_exists() && after == &self.expected_retained_persisted_lease)
+                }
+            });
+        let persisted_lease_restore_error = first_persisted_restore
+            .err()
+            .or_else(|| final_persisted_restore.as_ref().err().cloned());
+        let lease_after = synapse_action::lease::status();
+        let mut operator_owner_preserved = !operator_panic_observed
+            || if lease_at_cleanup.owner_session_id.as_deref()
+                == Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID)
+            {
+                lease_after.owner_session_id.as_deref()
+                    == Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID)
+            } else {
+                lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str())
+            };
+        let lease_owner_restored = if operator_panic_observed {
+            lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str())
+        } else if self.lease_owner_before.as_deref() == Some(self.session_id.as_str()) {
+            lease_after.owner_session_id.as_deref() == Some(self.session_id.as_str())
+        } else {
+            lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str())
+        };
+        let lease_release_observed = !lease_release_attempted
+            || lease_after.owner_session_id.as_deref() != Some(self.session_id.as_str());
+        let mut cleanup_ok = profile_restore.is_ok()
+            && profile_readback.is_ok()
+            && profile_restored
+            && persisted_lease_row_restored
+            && lease_owner_restored
+            && operator_owner_preserved
+            && lease_release_observed;
+        let mut operator_epoch_stable_at_disarm = false;
+        if cleanup_ok {
+            match self.disarm_if_operator_epoch_stable(operator_panic_epoch_after) {
+                Ok(()) => operator_epoch_stable_at_disarm = true,
+                Err(late_epoch) => {
+                    operator_panic_epoch_after = late_epoch;
+                    operator_panic_observed = true;
+                    persisted_lease_row_restored = false;
+                    operator_owner_preserved = false;
+                    cleanup_ok = false;
+                    tracing::warn!(
+                        code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                        detail_code = "ACT_FOREGROUND_OPERATOR_PANIC_DURING_GUARD_DISARM",
+                        session_id = self.session_id,
+                        trigger,
+                        operator_panic_epoch_at_arm = self.operator_panic_epoch_at_arm,
+                        operator_panic_epoch_after,
+                        source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                        "operator panic advanced at the cleanup linearization boundary; guard rearmed for another physical cleanup pass"
+                    );
+                }
+            }
+        }
+        let readback = ActForegroundAuthorityCleanupReadback {
+            trigger,
+            source_of_truth: ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            profile_restore_attempt_ok: profile_restore.is_ok(),
+            profile_readback_ok: profile_readback.is_ok(),
+            expected_profile: self.prior_profile.profile.as_str().to_owned(),
+            actual_profile,
+            profile_restored,
+            lease_owner_before: self.lease_owner_before.clone(),
+            lease_owner_at_cleanup: lease_at_cleanup.owner_session_id.clone(),
+            lease_owner_after: lease_after.owner_session_id,
+            newly_acquired_lease: self.acquire_outcome_was_new || newly_owned_during_call,
+            lease_release_attempted,
+            lease_release_call_released: released,
+            lease_release_observed,
+            persisted_lease_row_expected: if operator_panic_observed {
+                false
+            } else if lease_release_attempted {
+                self.prior_persisted_lease.row_exists()
+            } else {
+                lease_at_cleanup.owner_session_id.as_deref() == Some(self.session_id.as_str())
+                    || self.prior_persisted_lease.row_exists()
+            },
+            persisted_lease_row_restored,
+            profile_restore_error: profile_restore.err().map(|error| error.message.to_string()),
+            profile_readback_error: profile_readback
+                .err()
+                .map(|error| error.message.to_string()),
+            persisted_lease_restore_error,
+            operator_panic_epoch_at_arm: self.operator_panic_epoch_at_arm,
+            operator_panic_epoch_after,
+            operator_panic_observed,
+            operator_epoch_stable_at_disarm,
+            operator_owner_preserved,
+            cleanup_ok,
+        };
+        if cleanup_ok {
+            tracing::info!(
+                code = "ACT_FOREGROUND_AUTHORITY_GUARD_CLEANUP_OK",
+                session_id = self.session_id,
+                trigger,
+                profile_restored,
+                lease_release_attempted,
+                lease_release_observed,
+                persisted_lease_row_restored,
+                operator_panic_observed,
+                operator_epoch_stable_at_disarm,
+                operator_owner_preserved,
+                source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                "act_foreground authority guard restored and read back pre-call state"
+            );
+        } else {
+            tracing::error!(
+                code = error_codes::ACTION_POSTCONDITION_FAILED,
+                detail_code = "ACT_FOREGROUND_AUTHORITY_GUARD_CLEANUP_FAILED",
+                session_id = self.session_id,
+                trigger,
+                profile_restored,
+                lease_release_attempted,
+                lease_release_observed,
+                persisted_lease_row_restored,
+                operator_panic_observed,
+                operator_epoch_stable_at_disarm,
+                operator_owner_preserved,
+                source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                readback = ?readback,
+                "act_foreground authority guard failed to restore pre-call state"
+            );
+        }
+        readback
+    }
+
+    fn fail_closed_after_panic_cleanup_exhausted(
+        &self,
+        last_readback: Option<&ActForegroundAuthorityCleanupReadback>,
+        panic_count: usize,
+    ) {
+        // Cleanup could not prove revocation. Prevent every subsequent tool
+        // call and transfer the process-global lease away from agents before
+        // recording evidence. This is a safety terminal state, not a fallback
+        // success path: the daemon must be restarted/repaired.
+        let drain = self
+            .service
+            .drain_state_handle()
+            .mark_draining("act_foreground_authority_cleanup_failed");
+        let preempted =
+            synapse_action::force_preempt_input_lease("act_foreground_authority_cleanup_failed");
+        let persisted_row_delete = self.delete_operator_interrupted_lease_row();
+        let after = json!({
+            "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "session_id": self.session_id,
+            "cleanup_attempts": ACT_FOREGROUND_PANIC_CLEANUP_ATTEMPTS,
+            "cleanup_panic_count": panic_count,
+            "last_cleanup_readback": last_readback,
+            "fail_closed": {
+                "daemon_drain": drain,
+                "lease_preempted_from": preempted,
+                "persisted_session_lease_deleted": persisted_row_delete.is_ok(),
+                "persisted_session_lease_delete_error": persisted_row_delete.err(),
+            },
+        });
+        let audit = super::command_audit::CommandAuditInput::mcp(
+            "act",
+            "foreground_authority_cleanup",
+            Some(self.session_id.clone()),
+            Some(self.session_id.clone()),
+            json!({
+                "operation": "foreground",
+                "trigger": "caught_transaction_panic",
+            }),
+            json!({
+                "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                "authority_guard_armed": true,
+            }),
+            after,
+            "error",
+        )
+        .with_error(super::command_audit::CommandAuditError {
+            code: Some(error_codes::ACTION_POSTCONDITION_FAILED.to_owned()),
+            message: "act foreground authority cleanup exhausted bounded retries".to_owned(),
+            data: Some(json!({
+                "detail_code": "ACT_FOREGROUND_AUTHORITY_GUARD_CLEANUP_EXHAUSTED",
+                "session_id": self.session_id,
+            })),
+        });
+        let mut audit_recorded = false;
+        for attempt in 1..=ACT_COMMAND_AUDIT_FINAL_ATTEMPTS {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.service.command_audit_final(audit.clone())
+            })) {
+                Ok(Ok(_readback)) => {
+                    audit_recorded = true;
+                    break;
+                }
+                Ok(Err(_error)) => {}
+                Err(panic) => {
+                    let panic_description = consume_panic_payload(panic);
+                    tracing::error!(
+                        code = error_codes::TOOL_INTERNAL_ERROR,
+                        detail_code = "ACT_FOREGROUND_FAIL_CLOSED_AUDIT_PANICKED",
+                        session_id = self.session_id,
+                        attempt,
+                        panic = %panic_description,
+                        "foreground fail-closed audit panicked inside its bounded retry loop"
+                    );
+                }
+            }
+        }
+        tracing::error!(
+            code = error_codes::ACTION_POSTCONDITION_FAILED,
+            detail_code = "ACT_FOREGROUND_AUTHORITY_GUARD_CLEANUP_EXHAUSTED",
+            session_id = self.session_id,
+            cleanup_attempts = ACT_FOREGROUND_PANIC_CLEANUP_ATTEMPTS,
+            panic_count,
+            audit_recorded,
+            source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "act_foreground cleanup exhausted retries; daemon and lease are fail-closed"
+        );
+    }
+
+    /// Recover a foreground transaction panic while the tracked transaction
+    /// still owns the session authority gate. This is the only path allowed to
+    /// perform the exact RocksDB/profile rollback after an unwind; `Drop`
+    /// remains storage-free.
+    fn cleanup_with_bounded_retries(
+        &mut self,
+        trigger: &'static str,
+    ) -> Option<ActForegroundAuthorityCleanupReadback> {
+        let mut last_readback = None;
+        let mut panic_count = 0;
+        for attempt in 1..=ACT_FOREGROUND_PANIC_CLEANUP_ATTEMPTS {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.cleanup_now(trigger)
+            })) {
+                Ok(readback) => {
+                    let cleanup_ok = readback.cleanup_ok;
+                    last_readback = Some(readback);
+                    if cleanup_ok {
+                        return last_readback;
+                    }
+                }
+                Err(panic) => {
+                    panic_count += 1;
+                    let panic_description = consume_panic_payload(panic);
+                    tracing::error!(
+                        code = error_codes::ACTION_POSTCONDITION_FAILED,
+                        detail_code = "ACT_FOREGROUND_AUTHORITY_CLEANUP_PANICKED",
+                        session_id = self.session_id,
+                        attempt,
+                        trigger,
+                        panic = %panic_description,
+                        "foreground authority cleanup panicked inside its bounded retry loop"
+                    );
+                }
+            }
+            tracing::error!(
+                code = error_codes::ACTION_POSTCONDITION_FAILED,
+                detail_code = "ACT_FOREGROUND_AUTHORITY_GUARD_CLEANUP_RETRY",
+                session_id = self.session_id,
+                attempt,
+                max_attempts = ACT_FOREGROUND_PANIC_CLEANUP_ATTEMPTS,
+                trigger,
+                source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                "act_foreground panic cleanup failed; retrying inside the supervised transaction"
+            );
+        }
+        self.fail_closed_after_panic_cleanup_exhausted(last_readback.as_ref(), panic_count);
+        self.armed = false;
+        last_readback
+    }
+}
+
+impl Drop for ActForegroundAuthorityGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // An armed Drop means the tracked transaction failed to catch its own
+        // unwind. Do only bounded in-memory revocation here: no RocksDB, schema,
+        // audit, runtime lookup, or task spawn is legal from this destructor.
+        let lease_at_drop = synapse_action::lease::status();
+        let newly_owned_during_call = self.lease_owner_before.as_deref()
+            != Some(self.session_id.as_str())
+            && lease_at_drop.owner_session_id.as_deref() == Some(self.session_id.as_str());
+        let lease_revoked_immediately = if self.acquire_outcome_was_new || newly_owned_during_call {
+            synapse_action::lease::release_if_owner(&self.session_id)
+        } else {
+            false
+        };
+        self.armed = false;
+        let drain = self
+            .service
+            .drain_state_handle()
+            .mark_draining("act_foreground_guard_dropped_outside_supervised_cleanup");
+        let preempted = synapse_action::force_preempt_input_lease(
+            "act_foreground_guard_dropped_outside_supervised_cleanup",
+        );
+        tracing::error!(
+            code = error_codes::ACTION_POSTCONDITION_FAILED,
+            detail_code = "ACT_FOREGROUND_GUARD_DROPPED_OUTSIDE_SUPERVISED_CLEANUP",
+            session_id = self.session_id,
+            lease_revoked_immediately,
+            lease_preempted_from = ?preempted,
+            drain = ?drain,
+            source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "armed foreground authority guard escaped supervised panic cleanup; daemon and lease fail-closed"
+        );
+    }
+}
+
+fn act_foreground_authority_guard_error(
+    primary_error: &ErrorData,
+    cleanup: ActForegroundAuthorityCleanupReadback,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        "act operation=foreground failed and its synchronous authority cleanup did not reach the pre-call state",
+        Some(json!({
+            "code": error_codes::ACTION_POSTCONDITION_FAILED,
+            "detail_code": "ACT_FOREGROUND_AUTHORITY_GUARD_CLEANUP_FAILED",
+            "tool": "act",
+            "operation": "foreground",
+            "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "primary_error": act_foreground_error_diagnostics(primary_error),
+            "action_diagnostics": {
+                "status": "not_attempted",
+                "reason": "foreground lease acquisition did not complete",
+            },
+            "cleanup": cleanup,
+            "remediation": "inspect the profile and lease readbacks plus daemon ACT_FOREGROUND_AUTHORITY_GUARD_CLEANUP_FAILED logs; do not retry until the pre-call authority state is restored",
+        })),
+    )
+}
+
+fn ensure_act_operator_panic_not_observed(
+    operation: ActOperation,
+    session_id: &str,
+    operator_panic_epoch_at_arm: u64,
+    stage: &'static str,
+) -> Result<(), ErrorData> {
+    let operator_panic = synapse_action::operator_panic_safety_readback();
+    if operator_panic.pending || operator_panic.epoch != operator_panic_epoch_at_arm {
+        return Err(act_operator_panic_prearm_error(
+            operation,
+            session_id,
+            operator_panic_epoch_at_arm,
+            stage,
+        ));
+    }
+    Ok(())
+}
+
+fn act_operator_panic_authority_label(session_id: Option<&str>) -> &str {
+    session_id.unwrap_or("stdio:act:invoke")
+}
+
+fn target_act_verb_requires_operator_panic_gate(verb: &str) -> bool {
+    verb != "read"
+}
+
+#[derive(Clone, Debug)]
+struct TargetActOperatorPanicBoundary {
+    session_id: String,
+    operator_panic_epoch_at_arm: u64,
+}
+
+impl TargetActOperatorPanicBoundary {
+    fn ensure(&self, stage: &'static str) -> Result<(), ErrorData> {
+        ensure_act_operator_panic_not_observed(
+            ActOperation::Invoke,
+            &self.session_id,
+            self.operator_panic_epoch_at_arm,
+            stage,
+        )
+    }
+}
+
+tokio::task_local! {
+    static TARGET_ACT_OPERATOR_PANIC_BOUNDARY: Option<TargetActOperatorPanicBoundary>;
+}
+
+fn ensure_target_act_operator_panic_boundary(stage: &'static str) -> Result<(), ErrorData> {
+    crate::server::operator_panic_boundary::ensure_mcp_mutation(stage)?;
+    TARGET_ACT_OPERATOR_PANIC_BOUNDARY
+        .try_with(|boundary| match boundary {
+            Some(boundary) => boundary.ensure(stage),
+            None => Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "target_act mutation reached physical boundary {stage} without an operator-panic epoch"
+                ),
+            )),
+        })
+        .unwrap_or_else(|_| {
+            Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "target_act mutation reached physical boundary {stage} outside its request guard"
+                ),
+            ))
+        })
+}
+
+fn act_operator_panic_prearm_error(
+    operation: ActOperation,
+    session_id: &str,
+    operator_panic_epoch_at_arm: u64,
+    stage: &'static str,
+) -> ErrorData {
+    let operation_name = act_operation_name(operation);
+    let detail_code = match operation {
+        ActOperation::Invoke => "ACT_INVOKE_OPERATOR_PANIC_PREARMED",
+        ActOperation::Foreground => "ACT_FOREGROUND_OPERATOR_PANIC_PREARMED",
+        ActOperation::LeaseAcquire => "ACT_LEASE_ACQUIRE_OPERATOR_PANIC_PREARMED",
+        ActOperation::LeaseStatus => "ACT_LEASE_STATUS_OPERATOR_PANIC_PREARMED",
+        ActOperation::LeaseRelease => "ACT_LEASE_RELEASE_OPERATOR_PANIC_PREARMED",
+    };
+    let operator_panic = synapse_action::operator_panic_safety_readback();
+    let operator_panic_epoch_after = operator_panic.epoch;
+    let operator_panic_safety_pending = operator_panic.pending;
+    tracing::warn!(
+        code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+        detail_code,
+        operation = operation_name,
+        session_id,
+        stage,
+        operator_panic_epoch_at_arm,
+        operator_panic_epoch_after,
+        operator_panic_safety_pending,
+        "operator panic superseded an act mutation before the next authority transition"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!("act operation={operation_name} was superseded by the operator panic control"),
+        Some(json!({
+            "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            "detail_code": detail_code,
+            "tool": "act",
+            "operation": operation_name,
+            "session_id": session_id,
+            "stage": stage,
+            "operator_panic_epoch_at_arm": operator_panic_epoch_at_arm,
+            "operator_panic_epoch_after": operator_panic_epoch_after,
+            "operator_panic_safety_pending": operator_panic_safety_pending,
+            "source_of_truth": "synapse_action::operator_panic_safety_readback",
+            "remediation": "the physical operator panic control supersedes this request; inspect operator-panic audit and explicitly start a new foreground action only after the safety state is understood",
+        })),
+    )
+}
+
+fn act_foreground_operator_interrupted_error(
+    session_id: &str,
+    cleanup_error: Option<&ErrorData>,
+    action_result: Option<&Result<Json<TargetActResponse>, ErrorData>>,
+    cleanup: ActForegroundAuthorityCleanupReadback,
+) -> ErrorData {
+    let cleanup_error = cleanup_error.map(act_foreground_error_diagnostics);
+    if cleanup.cleanup_ok {
+        tracing::warn!(
+            code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            detail_code = "ACT_FOREGROUND_OPERATOR_INTERRUPTED",
+            session_id,
+            operator_panic_epoch_at_arm = cleanup.operator_panic_epoch_at_arm,
+            operator_panic_epoch_after = cleanup.operator_panic_epoch_after,
+            operator_owner_preserved = cleanup.operator_owner_preserved,
+            persisted_lease_row_restored = cleanup.persisted_lease_row_restored,
+            source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "operator interruption superseded act_foreground authority and cleanup snapshots"
+        );
+    } else {
+        tracing::error!(
+            code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            detail_code = "ACT_FOREGROUND_OPERATOR_INTERRUPTED_CLEANUP_FAILED",
+            session_id,
+            operator_panic_epoch_at_arm = cleanup.operator_panic_epoch_at_arm,
+            operator_panic_epoch_after = cleanup.operator_panic_epoch_after,
+            operator_owner_preserved = cleanup.operator_owner_preserved,
+            persisted_lease_row_restored = cleanup.persisted_lease_row_restored,
+            source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            cleanup = ?cleanup,
+            "operator interruption superseded act_foreground authority, but cleanup did not reach the safety postconditions"
+        );
+    }
+    ErrorData::new(
+        ErrorCode(-32099),
+        "act operation=foreground was interrupted by the operator safety release",
+        Some(json!({
+            "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            "detail_code": "ACT_FOREGROUND_OPERATOR_INTERRUPTED",
+            "tool": "act",
+            "operation": "foreground",
+            "session_id": session_id,
+            "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "cleanup_error": cleanup_error,
+            "action_diagnostics": act_foreground_action_diagnostics(action_result),
+            "cleanup": cleanup,
+            "remediation": "the operator safety release supersedes this request; inspect the operator-panic and act command-audit rows plus the profile, persisted lease-row, and process-global lease readbacks before explicitly starting a new foreground action",
+        })),
+    )
+}
+
+fn act_shutdown_cancelled_error(
+    operation: ActOperation,
+    session_id: Option<&str>,
+    stage: &'static str,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        "act authority transaction was cancelled for daemon shutdown",
+        Some(json!({
+            "code": error_codes::DAEMON_RESTARTING,
+            "detail_code": "ACT_AUTHORITY_TRANSACTION_SHUTDOWN_CANCELLED",
+            "tool": "act",
+            "operation": act_operation_name(operation),
+            "session_id": session_id,
+            "stage": stage,
+            "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
+            "remediation": "retry only after a fresh daemon has completed startup; inspect the terminal act command-audit row before assuming the cancelled operation took effect",
+        })),
+    )
+}
+
+fn cleanup_act_foreground_after_shutdown_cancellation(
+    authority_guard: &mut ActForegroundAuthorityGuard,
+    session_id: &str,
+    stage: &'static str,
+    action_result: Option<&Result<Json<TargetActResponse>, ErrorData>>,
+) -> ErrorData {
+    let cleanup = authority_guard.cleanup_with_bounded_retries("daemon_shutdown_cancellation");
+    let cleanup = match cleanup {
+        Some(readback) if readback.operator_panic_observed => {
+            return act_foreground_operator_interrupted_error(
+                session_id,
+                None,
+                action_result,
+                readback,
+            );
+        }
+        cleanup => cleanup,
+    };
+    let cleanup_ok = cleanup.as_ref().is_some_and(|readback| readback.cleanup_ok);
+    let code = if cleanup_ok {
+        error_codes::DAEMON_RESTARTING
+    } else {
+        error_codes::ACTION_POSTCONDITION_FAILED
+    };
+    if cleanup_ok {
+        tracing::info!(
+            code,
+            detail_code = "ACT_FOREGROUND_SHUTDOWN_CANCELLED_CLEAN",
+            session_id,
+            stage,
+            source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "foreground shutdown cancellation restored and read back the exact authority state"
+        );
+    } else {
+        tracing::error!(
+            code,
+            detail_code = "ACT_FOREGROUND_SHUTDOWN_CANCELLED_CLEANUP_FAILED",
+            session_id,
+            stage,
+            cleanup = ?cleanup,
+            source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "foreground shutdown cancellation failed to prove exact authority cleanup"
+        );
+    }
+    ErrorData::new(
+        ErrorCode(-32099),
+        if cleanup_ok {
+            "act operation=foreground was cancelled for daemon shutdown after exact authority cleanup"
+        } else {
+            "act operation=foreground was cancelled for daemon shutdown, but exact authority cleanup could not be proven"
+        },
+        Some(json!({
+            "code": code,
+            "detail_code": if cleanup_ok {
+                "ACT_FOREGROUND_SHUTDOWN_CANCELLED_CLEAN"
+            } else {
+                "ACT_FOREGROUND_SHUTDOWN_CANCELLED_CLEANUP_FAILED"
+            },
+            "tool": "act",
+            "operation": "foreground",
+            "session_id": session_id,
+            "stage": stage,
+            "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "action_diagnostics": act_foreground_action_diagnostics(action_result),
+            "cleanup": cleanup,
+            "remediation": if cleanup_ok {
+                "retry only after a fresh daemon has completed startup; the profile and lease readbacks are restored"
+            } else {
+                "keep daemon lifetime locks held and inspect the profile row, persisted lease row, process-global lease, and cleanup audit before repair/restart"
+            },
+        })),
+    )
 }
 
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
@@ -589,9 +1723,33 @@ impl SynapseService {
     ) -> Result<Json<ActResponse>, ErrorData> {
         let params = params.0;
         let operation = params.operation;
-        let operation_name = act_operation_name(operation);
         let actor_session_id =
             super::context::mcp_session_id_from_request_context(&request_context)?;
+        // Arm the operator-panic epoch before the tracked task can await its
+        // session gate. A physical panic signal during queueing must invalidate
+        // this request before it takes any authority snapshot.
+        let mutation_guarded_by_operator_panic = match operation {
+            ActOperation::Invoke => params.action.as_ref().is_some_and(|action| {
+                target_act_verb_requires_operator_panic_gate(action.verb.as_str())
+            }),
+            ActOperation::Foreground
+            | ActOperation::LeaseAcquire
+            | ActOperation::LeaseStatus
+            | ActOperation::LeaseRelease => true,
+        };
+        let operator_panic_epoch_at_entry = if mutation_guarded_by_operator_panic {
+            let epoch = synapse_action::operator_panic_epoch();
+            let authority_label = act_operator_panic_authority_label(actor_session_id.as_deref());
+            ensure_act_operator_panic_not_observed(
+                operation,
+                authority_label,
+                epoch,
+                "facade_entry_before_authority_spawn",
+            )?;
+            Some(epoch)
+        } else {
+            None
+        };
         let trace_verb = params
             .action
             .as_ref()
@@ -604,26 +1762,165 @@ impl SynapseService {
             verb = trace_verb,
             "tool.invocation kind=act"
         );
+        let mcp_boundary_snapshot = if mutation_guarded_by_operator_panic {
+            Some(
+                crate::server::operator_panic_boundary::reserve_and_snapshot_current_mcp_boundary(
+                    "act_before_authority_transaction_spawn",
+                )?,
+            )
+        } else {
+            None
+        };
+        let service = self.clone();
+        let handle =
+            self.spawn_cooperative_authority_transaction(move |cancellation| async move {
+                let transaction = service.run_act_supervised_transaction(
+                    params,
+                    request_context,
+                    actor_session_id,
+                    operator_panic_epoch_at_entry,
+                    cancellation,
+                );
+                crate::server::operator_panic_boundary::scope_mcp_boundary_snapshot(
+                    mcp_boundary_snapshot,
+                    transaction,
+                )
+                .await
+            })?;
+        match handle.await {
+            Ok(result) => result,
+            Err(join_error) => {
+                let drain = self
+                    .drain_state_handle()
+                    .mark_draining("act_authority_transaction_join_failed");
+                let preempted = synapse_action::force_preempt_input_lease(
+                    "act_authority_transaction_join_failed",
+                );
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    detail_code = "ACT_AUTHORITY_TRANSACTION_JOIN_FAILED",
+                    operation = act_operation_name(operation),
+                    join_cancelled = join_error.is_cancelled(),
+                    join_panicked = join_error.is_panic(),
+                    error = %join_error,
+                    drain = ?drain,
+                    lease_preempted_from = ?preempted,
+                    "tracked act authority transaction failed to join; daemon and lease fail-closed"
+                );
+                Err(ErrorData::new(
+                    ErrorCode(-32099),
+                    "tracked act authority transaction failed before durable completion",
+                    Some(json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "detail_code": "ACT_AUTHORITY_TRANSACTION_JOIN_FAILED",
+                        "tool": "act",
+                        "operation": act_operation_name(operation),
+                        "join_cancelled": join_error.is_cancelled(),
+                        "join_panicked": join_error.is_panic(),
+                        "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
+                        "remediation": "restart the drained daemon and inspect the act command-audit row plus ACT_SUPERVISED_TRANSACTION_DROPPED/ACT_FOREGROUND_GUARD_DROPPED_OUTSIDE_SUPERVISED_CLEANUP logs",
+                    })),
+                ))
+            }
+        }
+    }
+
+    async fn run_act_supervised_transaction(
+        &self,
+        params: ActParams,
+        request_context: RequestContext<RoleServer>,
+        actor_session_id: Option<String>,
+        operator_panic_epoch_at_entry: Option<u64>,
+        cancellation: CancellationToken,
+    ) -> Result<Json<ActResponse>, ErrorData> {
+        let operation = params.operation;
+        let operation_name = act_operation_name(operation);
+        let authority_session_id = actor_session_id.clone();
+        // Arm the durable intent before waiting for session authority so a
+        // shutdown-cancelled queued command still receives a terminal audit.
+        // Once acquired, the authority gate remains held across every snapshot,
+        // mutation, independent readback, and final audit.
         let command_payload = act_command_audit_payload(&params);
         let command_before = act_command_audit_before(operation);
-        self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
-            "act",
+        let mut command_audit_guard = ActCommandAuditGuard::begin(
+            self,
             operation_name,
             actor_session_id.clone(),
-            None,
             command_payload.clone(),
             command_before.clone(),
-            Value::Null,
-            "pending",
-        ))?;
+        )?;
+        let authority_gate = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => {
+                let cancellation_error = if let Some(operator_panic_epoch) =
+                    operator_panic_epoch_at_entry
+                {
+                    let authority_label =
+                        act_operator_panic_authority_label(authority_session_id.as_deref());
+                    match ensure_act_operator_panic_not_observed(
+                        operation,
+                        authority_label,
+                        operator_panic_epoch,
+                        "shutdown_while_waiting_for_authority_gate",
+                    ) {
+                        Ok(()) => act_shutdown_cancelled_error(
+                            operation,
+                            authority_session_id.as_deref(),
+                            "waiting_for_authority_gate",
+                        ),
+                        Err(operator_error) => operator_error,
+                    }
+                } else {
+                    act_shutdown_cancelled_error(
+                        operation,
+                        authority_session_id.as_deref(),
+                        "waiting_for_authority_gate",
+                    )
+                };
+                Err(cancellation_error)
+            }
+            gate = self.lock_act_authority(operation, authority_session_id.as_deref()) => gate,
+        };
+        let _authority_gate = match authority_gate {
+            Ok(gate) => gate,
+            Err(error) => {
+                command_audit_guard.finalize(
+                    act_command_audit_error_after(operation),
+                    "error",
+                    Some(&error),
+                )?;
+                return Err(error);
+            }
+        };
 
-        let result: Result<ActResponse, ErrorData> = async {
+        let transaction = std::panic::AssertUnwindSafe(async {
+            if let Some(operator_panic_epoch) = operator_panic_epoch_at_entry {
+                let authority_label =
+                    act_operator_panic_authority_label(authority_session_id.as_deref());
+                ensure_act_operator_panic_not_observed(
+                    operation,
+                    authority_label,
+                    operator_panic_epoch,
+                    "after_authority_gate_before_mutation",
+                )?;
+            }
             match operation {
                 ActOperation::Invoke => {
                     validate_act_invoke_params(&params)?;
                     let action_params = require_act_action(&params, ActOperation::Invoke)?;
                     let action = self
-                        .target_act(Parameters(action_params), request_context)
+                        .target_act_authority_locked(
+                            Parameters(action_params),
+                            request_context,
+                            operator_panic_epoch_at_entry,
+                            operator_panic_epoch_at_entry.map(|_| {
+                                authority_session_id
+                                    .clone()
+                                    .unwrap_or_else(|| {
+                                        act_operator_panic_authority_label(None).to_owned()
+                                    })
+                            }),
+                        )
                         .await?
                         .0;
                     Ok(ActResponse {
@@ -645,14 +1942,28 @@ impl SynapseService {
                             "reason",
                         )
                     })?;
+                    let session_id = authority_session_id.clone().ok_or_else(|| {
+                        mcp_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            "act foreground authority session disappeared inside its tracked transaction",
+                        )
+                    })?;
                     let response = self
-                        .act_foreground(
-                            Parameters(ActForegroundParams {
+                        .act_foreground_authority_locked(
+                            ActForegroundParams {
                                 reason,
                                 action: action_params,
                                 ttl_ms: params.ttl_ms,
-                            }),
+                            },
+                            session_id,
                             request_context,
+                            operator_panic_epoch_at_entry.ok_or_else(|| {
+                                mcp_error(
+                                    error_codes::TOOL_INTERNAL_ERROR,
+                                    "act foreground operator-panic epoch was not armed at facade entry",
+                                )
+                            })?,
+                            cancellation.clone(),
                         )
                         .await?
                         .0;
@@ -669,12 +1980,17 @@ impl SynapseService {
                     let ttl_ms = params
                         .ttl_ms
                         .unwrap_or(synapse_action::DEFAULT_LEASE_TTL_MS);
+                    super::lease_tools::validate_lease_ttl_ms("act", ttl_ms)?;
                     let lease = self
-                        .control_lease_acquire(
-                            Parameters(super::lease_tools::ControlLeaseAcquireParams { ttl_ms }),
-                            request_context,
-                        )
-                        .await?
+                        .control_lease_acquire_authority_locked(
+                            super::lease_tools::ControlLeaseAcquireParams { ttl_ms },
+                            authority_session_id.clone().ok_or_else(|| {
+                                mcp_error(
+                                    error_codes::TOOL_INTERNAL_ERROR,
+                                    "act lease authority session disappeared inside its tracked transaction",
+                                )
+                            })?,
+                        )?
                         .0;
                     Ok(ActResponse {
                         operation: ActOperation::LeaseAcquire,
@@ -686,7 +2002,16 @@ impl SynapseService {
                 }
                 ActOperation::LeaseStatus => {
                     validate_act_lease_read_params(&params, ActOperation::LeaseStatus)?;
-                    let lease = self.control_lease_status(request_context).await?.0;
+                    let lease = self
+                        .control_lease_status_authority_locked(
+                            authority_session_id.clone().ok_or_else(|| {
+                                mcp_error(
+                                    error_codes::TOOL_INTERNAL_ERROR,
+                                    "act lease authority session disappeared inside its tracked transaction",
+                                )
+                            })?,
+                        )?
+                        .0;
                     Ok(ActResponse {
                         operation: ActOperation::LeaseStatus,
                         source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
@@ -697,7 +2022,16 @@ impl SynapseService {
                 }
                 ActOperation::LeaseRelease => {
                     validate_act_lease_read_params(&params, ActOperation::LeaseRelease)?;
-                    let lease = self.control_lease_release(request_context).await?.0;
+                    let lease = self
+                        .control_lease_release_authority_locked(
+                            authority_session_id.clone().ok_or_else(|| {
+                                mcp_error(
+                                    error_codes::TOOL_INTERNAL_ERROR,
+                                    "act lease authority session disappeared inside its tracked transaction",
+                                )
+                            })?,
+                        )?
+                        .0;
                     Ok(ActResponse {
                         operation: ActOperation::LeaseRelease,
                         source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
@@ -707,48 +2041,233 @@ impl SynapseService {
                     })
                 }
             }
-        }
+        })
+        .catch_unwind()
         .await;
+        let result = match transaction {
+            Ok(result) => result,
+            Err(panic) => {
+                let panic_description = consume_panic_payload(panic);
+                Err(ErrorData::new(
+                    ErrorCode(-32099),
+                    "act authority transaction panicked; cleanup completed before this error was audited",
+                    Some(json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "detail_code": "ACT_AUTHORITY_TRANSACTION_PANICKED",
+                        "tool": "act",
+                        "operation": operation_name,
+                        "panic": panic_description,
+                        "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
+                        "remediation": "inspect the final act command-audit row and daemon logs; the daemon drains if any armed authority guard escaped supervised cleanup",
+                    })),
+                ))
+            }
+        };
+        let result = if cancellation.is_cancelled() && result.is_ok() {
+            Err(act_shutdown_cancelled_error(
+                operation,
+                authority_session_id.as_deref(),
+                "operation_reached_terminal_state_after_shutdown_signal",
+            ))
+        } else {
+            result
+        };
 
         match result {
             Ok(response) => {
-                self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
-                    "act",
-                    operation_name,
-                    actor_session_id.clone(),
-                    None,
-                    command_payload,
-                    command_before,
+                command_audit_guard.finalize(
                     act_command_audit_success_after(&response),
                     "ok",
-                ))?;
+                    None,
+                )?;
                 Ok(Json(response))
             }
             Err(error) => {
-                self.command_audit_final(
-                    super::command_audit::CommandAuditInput::mcp(
-                        "act",
-                        operation_name,
-                        actor_session_id,
-                        None,
-                        command_payload,
-                        command_before,
-                        act_command_audit_error_after(operation),
-                        "error",
-                    )
-                    .with_error(
-                        super::command_audit::command_audit_error_from_error_data(&error),
-                    ),
+                let outcome = if error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("detail_code"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|detail_code| {
+                        matches!(
+                            detail_code,
+                            "ACT_AUTHORITY_TRANSACTION_PANICKED"
+                                | "ACT_FOREGROUND_TRANSACTION_PANICKED"
+                        )
+                    }) {
+                    "panic"
+                } else {
+                    "error"
+                };
+                command_audit_guard.finalize(
+                    act_command_audit_error_after(operation),
+                    outcome,
+                    Some(&error),
                 )?;
                 Err(error)
             }
         }
     }
 
+    async fn lock_act_authority(
+        &self,
+        operation: ActOperation,
+        actor_session_id: Option<&str>,
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, ErrorData> {
+        self.lock_act_authority_after_resolve(operation, actor_session_id, || {})
+            .await
+    }
+
+    async fn lock_act_authority_after_resolve<F>(
+        &self,
+        operation: ActOperation,
+        actor_session_id: Option<&str>,
+        on_resolved: F,
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, ErrorData>
+    where
+        F: FnOnce(),
+    {
+        if let Some(session_id) = actor_session_id {
+            let gate = self
+                .lock_session_authority_for_tool_after_resolve("act", session_id, on_resolved)
+                .await?;
+            return Ok(Some(gate));
+        }
+        if operation == ActOperation::Invoke {
+            tracing::info!(
+                code = "ACT_AUTHORITY_UNSCOPED_STDIO",
+                operation = act_operation_name(operation),
+                source_of_truth = ACT_FACADE_SOURCE_OF_TRUTH,
+                "unscoped stdio act invocation has no HTTP session authority domain"
+            );
+            on_resolved();
+            return Ok(None);
+        }
+        let operation_name = act_operation_name(operation);
+        Err(act_facade_error(
+            operation,
+            format!("act operation={operation_name} requires an MCP session id"),
+            "run the daemon in HTTP mode so each agent has its own Mcp-Session-Id",
+            "Mcp-Session-Id",
+        ))
+    }
+
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd through raw CDP or the normal-profile Chrome bridge cdpInput lane, and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=check/uncheck set a native checkbox/radio to the requested checked state, no-op if already there, and verify checked-property readback; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed; verb=set_window_bounds moves/resizes the bound top-level window (native Window target, or the browser window behind a Cdp target) via background-safe SetWindowPos without activation, accepts x/y and/or width/height, and returns requested-vs-actual outer bounds (GetWindowRect readback) plus minimized state and size_satisfied so responsive-UI/layout FSV can drive a window through boundary sizes. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd through raw CDP or the normal-profile Chrome bridge cdpInput lane, and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=check/uncheck set a native checkbox/radio to the requested checked state, no-op if already there, and verify checked-property readback; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed; verb=set_window_bounds moves/resizes the bound top-level window (native Window target, or the browser window behind a Cdp target) via background-safe SetWindowPos without activation, accepts x/y and/or width/height, and returns requested-vs-actual outer bounds (GetWindowRect readback) plus minimized state and size_satisfied so manual responsive-UI/layout FSV can drive a window through boundary sizes. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
+        &self,
+        params: Parameters<TargetActParams>,
+        request_context: RequestContext<RoleServer>,
+    ) -> Result<Json<TargetActResponse>, ErrorData> {
+        let actor_session_id =
+            super::context::mcp_session_id_from_request_context(&request_context)?;
+        let Some(session_id) = actor_session_id.as_deref() else {
+            tracing::warn!(
+                code = error_codes::HTTP_SESSION_INVALID,
+                detail_code = "TARGET_ACT_UNSCOPED_STDIO_DENIED",
+                source_of_truth = ACT_FACADE_SOURCE_OF_TRUTH,
+                "raw target_act denied because stdio has no keyed session authority domain; use the act facade"
+            );
+            return Err(ErrorData::new(
+                ErrorCode(-32099),
+                "raw target_act requires an MCP session authority domain",
+                Some(json!({
+                    "code": error_codes::HTTP_SESSION_INVALID,
+                    "detail_code": "TARGET_ACT_UNSCOPED_STDIO_DENIED",
+                    "tool": "target_act",
+                    "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
+                    "remediation": "call public act operation=invoke; its deliberate unscoped stdio policy owns the complete delegated transaction",
+                })),
+            ));
+        };
+        let operator_panic_epoch_at_entry =
+            if target_act_verb_requires_operator_panic_gate(params.0.verb.as_str()) {
+                let epoch = synapse_action::operator_panic_epoch();
+                ensure_act_operator_panic_not_observed(
+                    ActOperation::Invoke,
+                    session_id,
+                    epoch,
+                    "raw_target_act_entry_before_authority_wait",
+                )?;
+                Some(epoch)
+            } else {
+                None
+            };
+        let _authority_gate = self
+            .lock_session_authority_for_tool("target_act", session_id)
+            .await?;
+        self.target_act_authority_locked(
+            params,
+            request_context,
+            operator_panic_epoch_at_entry,
+            operator_panic_epoch_at_entry.map(|_| session_id.to_owned()),
+        )
+        .await
+    }
+
+    async fn target_act_authority_locked(
+        &self,
+        params: Parameters<TargetActParams>,
+        request_context: RequestContext<RoleServer>,
+        operator_panic_epoch_at_entry: Option<u64>,
+        operator_panic_authority_label: Option<String>,
+    ) -> Result<Json<TargetActResponse>, ErrorData> {
+        let verb = params.0.verb.as_str().to_owned();
+        let session_and_epoch = if target_act_verb_requires_operator_panic_gate(&verb) {
+            let authority_label = operator_panic_authority_label.ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "target_act mutation {verb} reached its authority boundary without an operator-panic authority label"
+                    ),
+                )
+            })?;
+            let operator_panic_epoch = operator_panic_epoch_at_entry.ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "target_act mutation {verb} reached its authority boundary without a pre-wait operator-panic epoch"
+                    ),
+                )
+            })?;
+            ensure_act_operator_panic_not_observed(
+                ActOperation::Invoke,
+                &authority_label,
+                operator_panic_epoch,
+                "target_act_after_authority_wait_before_dispatch",
+            )?;
+            Some((authority_label, operator_panic_epoch))
+        } else {
+            None
+        };
+        let boundary =
+            session_and_epoch
+                .as_ref()
+                .map(
+                    |(session_id, operator_panic_epoch_at_arm)| TargetActOperatorPanicBoundary {
+                        session_id: session_id.clone(),
+                        operator_panic_epoch_at_arm: *operator_panic_epoch_at_arm,
+                    },
+                );
+        let result = TARGET_ACT_OPERATOR_PANIC_BOUNDARY
+            .scope(
+                boundary,
+                self.target_act_authority_locked_inner(params, request_context),
+            )
+            .await;
+        if let Some((session_id, operator_panic_epoch)) = session_and_epoch {
+            ensure_act_operator_panic_not_observed(
+                ActOperation::Invoke,
+                &session_id,
+                operator_panic_epoch,
+                "target_act_after_dispatch_before_response",
+            )?;
+        }
+        result
+    }
+
+    async fn target_act_authority_locked_inner(
         &self,
         params: Parameters<TargetActParams>,
         request_context: RequestContext<RoleServer>,
@@ -839,6 +2358,9 @@ impl SynapseService {
                         window_hwnd,
                         cdp_target_id,
                     }) => {
+                        ensure_target_act_operator_panic_boundary(
+                            "screenshot_before_cdp_tab_activation",
+                        )?;
                         let activated = self
                             .cdp_activate_tab(
                                 Parameters(CdpActivateTabParams {
@@ -849,6 +2371,9 @@ impl SynapseService {
                                 request_context.clone(),
                             )
                             .await?;
+                        ensure_target_act_operator_panic_boundary(
+                            "screenshot_after_activation_before_file_capture",
+                        )?;
                         let response = self
                             .capture_screenshot(
                                 Parameters(CaptureScreenshotParams {
@@ -875,21 +2400,26 @@ impl SynapseService {
                         }
                         ("capture_screenshot", true, TARGET_ACT_STATUS_OK, result)
                     }
-                    Some(SessionTarget::Window { .. }) => target_act_delegate_response(
-                        "capture_screenshot",
-                        self.capture_screenshot(
-                            Parameters(CaptureScreenshotParams {
-                                path,
-                                region: None,
-                                window_hwnd: None,
-                                overwrite: true,
-                                max_pixels: None,
-                                max_long_edge: None,
-                            }),
-                            request_context,
-                        )
-                        .await,
-                    )?,
+                    Some(SessionTarget::Window { .. }) => {
+                        ensure_target_act_operator_panic_boundary(
+                            "screenshot_before_window_file_capture",
+                        )?;
+                        target_act_delegate_response(
+                            "capture_screenshot",
+                            self.capture_screenshot(
+                                Parameters(CaptureScreenshotParams {
+                                    path,
+                                    region: None,
+                                    window_hwnd: None,
+                                    overwrite: true,
+                                    max_pixels: None,
+                                    max_long_edge: None,
+                                }),
+                                request_context,
+                            )
+                            .await,
+                        )?
+                    }
                     None => {
                         let error = mcp_error(
                             error_codes::TARGET_NOT_SET,
@@ -912,6 +2442,7 @@ impl SynapseService {
             }
             "navigate" => {
                 let url = require_param(params.url, "navigate", "url")?;
+                ensure_target_act_operator_panic_boundary("navigate_before_cdp_navigation")?;
                 let response = self
                     .cdp_navigate_tab(
                         Parameters(CdpNavigateTabParams {
@@ -947,6 +2478,9 @@ impl SynapseService {
                         // Background-safe web field replace in the user's normal Chrome
                         // via the safe bridge (no foreground, no DOM/action debugger attach,
                         // no UIA) — the #1000/#1005 path for forms perceived UIA-only.
+                        ensure_target_act_operator_panic_boundary(
+                            "set_field_before_browser_value_replace",
+                        )?;
                         let response = self
                             .browser_set_value(
                                 Parameters(BrowserSetValueParams {
@@ -966,6 +2500,9 @@ impl SynapseService {
                         element_id,
                         locator,
                     } => {
+                        ensure_target_act_operator_panic_boundary(
+                            "set_field_before_native_value_replace",
+                        )?;
                         let response = self
                             .act_set_field_text(
                                 Parameters(ActSetFieldTextParams {
@@ -1033,6 +2570,9 @@ impl SynapseService {
                             clicks,
                             params.button,
                             &params.modifiers,
+                        )?;
+                        ensure_target_act_operator_panic_boundary(
+                            "click_before_native_input_delivery",
                         )?;
                         let response = self
                             .act_click(Parameters(click_params), request_context)
@@ -1103,6 +2643,7 @@ impl SynapseService {
                     params.wait_timeout_ms,
                     verify_target_window_hwnd,
                 )?;
+                ensure_target_act_operator_panic_boundary("type_before_input_delivery")?;
                 let response = self
                     .act_type(Parameters(type_params), request_context)
                     .await;
@@ -1151,32 +2692,7 @@ impl SynapseService {
             "cleanup_notepad_tabs" => {
                 target_act_cleanup_notepad_tabs(self, &params, &request_context).await?
             }
-            "run_shell" => {
-                let command = require_param(params.command, "run_shell", "command")?;
-                let response = self
-                    .act_run_shell(
-                        Parameters(ActRunShellParams {
-                            command,
-                            args: params.args,
-                            working_dir: params.working_dir,
-                            env: BTreeMap::new(),
-                            timeout_ms: params
-                                .timeout_ms
-                                .unwrap_or(DEFAULT_TARGET_ACT_SHELL_TIMEOUT_MS),
-                            execution_mode: ActRunShellExecutionMode::Inline,
-                            durable_timeout_ms: None,
-                            idempotency_key: None,
-                        }),
-                        request_context,
-                    )
-                    .await?;
-                (
-                    "act_run_shell",
-                    true,
-                    TARGET_ACT_STATUS_OK,
-                    target_act_result(&response.0)?,
-                )
-            }
+            "run_shell" => target_act_run_shell(self, &params, &request_context).await?,
             "focus_window" => {
                 let session_id = target_act_session_id(&request_context, "focus_window")?;
                 let request_details = json!({
@@ -1188,51 +2704,11 @@ impl SynapseService {
                     "target_source": "session_target",
                     "no_human_os_foreground_fallback": true,
                 });
-                if let Err(error) =
-                    self.admit_tool_call_for_profile("act_focus_window", Some(&session_id))
-                {
-                    self.audit_action_denied_with_details_for_session(
-                        "target_act",
-                        &error,
-                        &request_details,
-                        &session_id,
-                    );
-                    (
-                        "act_focus_window",
-                        false,
-                        target_act_error_status(&error),
-                        target_act_error_result("act_focus_window", error),
-                    )
-                } else {
-                    let target = self.session_target(Some(&session_id))?;
-                    let target = match target {
-                        Some(target) => target,
-                        None => {
-                            let error = target_act_focus_window_missing_target_error();
-                            self.audit_action_denied_with_details_for_session(
-                                "target_act",
-                                &error,
-                                &request_details,
-                                &session_id,
-                            );
-                            return Ok(Json(TargetActResponse {
-                                verb: verb.as_str().to_owned(),
-                                ok: false,
-                                status: target_act_error_status(&error).to_owned(),
-                                delivery_state: target_act_delivery_state(
-                                    false,
-                                    target_act_error_status(&error),
-                                )
-                                .to_owned(),
-                                delegated_tool: "act_focus_window".to_owned(),
-                                routing: target_act_routing_description(),
-                                result: target_act_error_result("act_focus_window", error),
-                            }));
-                        }
-                    };
-                    if let Err(error) =
-                        target_act_focus_window_preflight(self, &session_id, &target)
-                    {
+                let target = self.session_target(Some(&session_id))?;
+                let target = match target {
+                    Some(target) => target,
+                    None => {
+                        let error = target_act_focus_window_missing_target_error();
                         self.audit_action_denied_with_details_for_session(
                             "target_act",
                             &error,
@@ -1253,35 +2729,57 @@ impl SynapseService {
                             result: target_act_error_result("act_focus_window", error),
                         }));
                     }
-                    let focus_params = match target_act_focus_window_params(Some(&target)) {
-                        Ok(params) => params,
-                        Err(error) => {
-                            self.audit_action_denied_with_details_for_session(
-                                "target_act",
-                                &error,
-                                &request_details,
-                                &session_id,
-                            );
-                            return Ok(Json(TargetActResponse {
-                                verb: verb.as_str().to_owned(),
-                                ok: false,
-                                status: target_act_error_status(&error).to_owned(),
-                                delivery_state: target_act_delivery_state(
-                                    false,
-                                    target_act_error_status(&error),
-                                )
-                                .to_owned(),
-                                delegated_tool: "act_focus_window".to_owned(),
-                                routing: target_act_routing_description(),
-                                result: target_act_error_result("act_focus_window", error),
-                            }));
-                        }
-                    };
-                    let response = self
-                        .act_focus_window(Parameters(focus_params), request_context)
-                        .await;
-                    target_act_delegate_response("act_focus_window", response)?
+                };
+                if let Err(error) = target_act_focus_window_preflight(self, &session_id, &target) {
+                    self.audit_action_denied_with_details_for_session(
+                        "target_act",
+                        &error,
+                        &request_details,
+                        &session_id,
+                    );
+                    return Ok(Json(TargetActResponse {
+                        verb: verb.as_str().to_owned(),
+                        ok: false,
+                        status: target_act_error_status(&error).to_owned(),
+                        delivery_state: target_act_delivery_state(
+                            false,
+                            target_act_error_status(&error),
+                        )
+                        .to_owned(),
+                        delegated_tool: "act_focus_window".to_owned(),
+                        routing: target_act_routing_description(),
+                        result: target_act_error_result("act_focus_window", error),
+                    }));
                 }
+                let focus_params = match target_act_focus_window_params(Some(&target)) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        self.audit_action_denied_with_details_for_session(
+                            "target_act",
+                            &error,
+                            &request_details,
+                            &session_id,
+                        );
+                        return Ok(Json(TargetActResponse {
+                            verb: verb.as_str().to_owned(),
+                            ok: false,
+                            status: target_act_error_status(&error).to_owned(),
+                            delivery_state: target_act_delivery_state(
+                                false,
+                                target_act_error_status(&error),
+                            )
+                            .to_owned(),
+                            delegated_tool: "act_focus_window".to_owned(),
+                            routing: target_act_routing_description(),
+                            result: target_act_error_result("act_focus_window", error),
+                        }));
+                    }
+                };
+                ensure_target_act_operator_panic_boundary("focus_window_before_activation")?;
+                let response = self
+                    .act_focus_window(Parameters(focus_params), request_context)
+                    .await;
+                target_act_delegate_response("act_focus_window", response)?
             }
             "scroll" => target_act_scroll(self, &params, &request_context).await?,
             "set_window_bounds" => target_act_set_window_bounds(self, &params, &request_context)?,
@@ -1300,14 +2798,122 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Run one target_act action under a single, fully-audited real-OS-foreground escalation (#1352). Given a non-empty `reason` and an `action` (a target_act params object incl. its `verb`), this atomically: acquires the foreground input lease (ttl_ms, default 30000), sets profile=break_glass, runs the action via target_act, then RESTORES the prior profile and releases the lease if it newly acquired it — so a session does not have to hand-stitch control_lease_acquire + tool_profile_set + the action + restore and guess the ordering. Returns the action result plus an escalation readback (acquired_lease, released_lease, prior/restored profile). The prior profile is restored even when the action fails. Use for actions that genuinely need the hardware foreground tier (e.g. Shift+selection, app accelerators); prefer plain target_act for background-capable work."
+        description = "Run one target_act action under a single, fully-audited real-OS-foreground escalation (#1352). Given a non-empty `reason` and an `action` (a target_act params object incl. its `verb`), this atomically: acquires the foreground input lease (ttl_ms, default 30000), sets profile=break_glass, runs the action via target_act, then RESTORES the prior profile and releases the lease if it newly acquired it — so a session does not have to hand-stitch control_lease_acquire + tool_profile_set + the action + restore and guess the ordering. It separately reads the CF_SESSIONS profile row and lease state after cleanup; any failed cleanup attempt or postcondition returns ACTION_POSTCONDITION_FAILED with the original action diagnostics. The prior profile is restored even when the action fails. Use for actions that genuinely need the hardware foreground tier (e.g. Shift+selection, app accelerators); prefer plain target_act for background-capable work."
     )]
     pub async fn act_foreground(
         &self,
         params: Parameters<ActForegroundParams>,
         request_context: RequestContext<RoleServer>,
     ) -> Result<Json<ActForegroundResponse>, ErrorData> {
-        let params = params.0;
+        // Arm the physical operator-panic generation before the first await or
+        // authority snapshot. A hotkey while waiting for this session's gate
+        // must be observed, never accepted as the new baseline.
+        let session_id = target_act_session_id(&request_context, "act_foreground")?;
+        let operator_panic_epoch_at_entry = synapse_action::operator_panic_epoch();
+        ensure_act_operator_panic_not_observed(
+            ActOperation::Foreground,
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "raw_entry_before_authority_spawn",
+        )?;
+        let mcp_boundary_snapshot =
+            crate::server::operator_panic_boundary::reserve_and_snapshot_current_mcp_boundary(
+                "raw_act_foreground_before_authority_transaction_spawn",
+            )?;
+        let service = self.clone();
+        let handle =
+            self.spawn_cooperative_authority_transaction(move |cancellation| async move {
+                let transaction = async move {
+                    let _authority_gate = tokio::select! {
+                        biased;
+                        _ = cancellation.cancelled() => {
+                            ensure_act_operator_panic_not_observed(
+                                ActOperation::Foreground,
+                                &session_id,
+                                operator_panic_epoch_at_entry,
+                                "shutdown_while_waiting_for_raw_authority_gate",
+                            )?;
+                            return Err(act_shutdown_cancelled_error(
+                                ActOperation::Foreground,
+                                Some(&session_id),
+                                "waiting_for_raw_authority_gate",
+                            ));
+                        }
+                        gate = service.lock_session_authority(&session_id) => gate?,
+                    };
+                    service.reject_terminated_session_tool_call("act_foreground", &session_id)?;
+                    service
+                        .act_foreground_authority_locked(
+                            params.0,
+                            session_id,
+                            request_context,
+                            operator_panic_epoch_at_entry,
+                            cancellation,
+                        )
+                        .await
+                };
+                crate::server::operator_panic_boundary::scope_mcp_boundary_snapshot(
+                    Some(mcp_boundary_snapshot),
+                    transaction,
+                )
+                .await
+            })?;
+        match handle.await {
+            Ok(result) => result,
+            Err(join_error) => {
+                let drain = self
+                    .drain_state_handle()
+                    .mark_draining("raw_act_foreground_transaction_join_failed");
+                let preempted = synapse_action::force_preempt_input_lease(
+                    "raw_act_foreground_transaction_join_failed",
+                );
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    detail_code = "RAW_ACT_FOREGROUND_TRANSACTION_JOIN_FAILED",
+                    join_cancelled = join_error.is_cancelled(),
+                    join_panicked = join_error.is_panic(),
+                    error = %join_error,
+                    drain = ?drain,
+                    lease_preempted_from = ?preempted,
+                    "tracked raw act_foreground transaction failed to join; daemon and lease fail-closed"
+                );
+                Err(ErrorData::new(
+                    ErrorCode(-32099),
+                    "tracked act_foreground authority transaction failed before durable completion",
+                    Some(json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "detail_code": "RAW_ACT_FOREGROUND_TRANSACTION_JOIN_FAILED",
+                        "tool": "act_foreground",
+                        "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                        "remediation": "restart the drained daemon and inspect foreground cleanup and command-audit logs",
+                    })),
+                ))
+            }
+        }
+    }
+
+    async fn act_foreground_authority_locked(
+        &self,
+        params: ActForegroundParams,
+        session_id: String,
+        request_context: RequestContext<RoleServer>,
+        operator_panic_epoch_at_entry: u64,
+        cancellation: CancellationToken,
+    ) -> Result<Json<ActForegroundResponse>, ErrorData> {
+        ensure_act_operator_panic_not_observed(
+            ActOperation::Foreground,
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "before_authority_snapshot",
+        )?;
+        if cancellation.is_cancelled() {
+            return Err(act_shutdown_cancelled_error(
+                ActOperation::Foreground,
+                Some(&session_id),
+                "before_authority_snapshot",
+            ));
+        }
+        self.reject_terminated_session_tool_call("act_foreground", &session_id)?;
         let reason = params.reason.trim().to_owned();
         if reason.is_empty() {
             return Err(mcp_error(
@@ -1317,7 +2923,6 @@ impl SynapseService {
         }
         let ttl_ms = params.ttl_ms.unwrap_or(30_000);
         super::lease_tools::validate_lease_ttl_ms("act_foreground", ttl_ms)?;
-        let session_id = target_act_session_id(&request_context, "act_foreground")?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "act_foreground",
@@ -1326,32 +2931,185 @@ impl SynapseService {
         );
         let before = self.tool_profile_snapshot(Some(&session_id))?;
         let prior_profile = before.profile;
-        let already_held = synapse_action::lease::status().owner_session_id.as_deref()
-            == Some(session_id.as_str());
+        // Reconcile continuity state before declaring the lease boundary. A
+        // raw process-global status read can miss a durable row that the lease
+        // tool is about to restore, and can race expiry.
+        let lease_before = self
+            .control_lease_status_authority_locked(session_id.clone())?
+            .0;
+        let mut authority_guard = ActForegroundAuthorityGuard::new(
+            self,
+            &session_id,
+            &before,
+            lease_before.owner_session_id.clone(),
+            operator_panic_epoch_at_entry,
+        )?;
 
-        // 1) acquire/renew the foreground input lease.
-        self.control_lease_acquire(
-            Parameters(super::lease_tools::ControlLeaseAcquireParams { ttl_ms }),
-            request_context.clone(),
-        )
-        .await?;
-        let acquired = !already_held;
+        let transaction = std::panic::AssertUnwindSafe(async {
+        if authority_guard.operator_panic_observed() {
+            let mut cleanup = authority_guard.cleanup_now("operator_panic_before_acquire");
+            if !cleanup.cleanup_ok {
+                if let Some(retry) = authority_guard.cleanup_with_bounded_retries(
+                    "operator_panic_before_acquire_retry",
+                ) {
+                    cleanup = retry;
+                }
+            }
+            return Err(act_foreground_operator_interrupted_error(
+                &session_id,
+                None,
+                None,
+                cleanup,
+            ));
+        }
+        if cancellation.is_cancelled() {
+            return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                &mut authority_guard,
+                &session_id,
+                "before_lease_acquire",
+                None,
+            ));
+        }
+
+        // 1) Acquire/renew the foreground input lease. Do not use `?` here:
+        // acquire can commit memory + persistence before a later audit error.
+        // The already-armed guard reconciles actual ownership on every exit.
+        let lease_acquire_result = self.control_lease_acquire_authority_locked(
+            super::lease_tools::ControlLeaseAcquireParams { ttl_ms },
+            session_id.clone(),
+        );
+        let lease_acquire = match lease_acquire_result {
+            Ok(response) => response.0,
+            Err(error) => {
+                let renewed_snapshot_reconciliation =
+                    authority_guard.reconcile_expected_retained_lease_after_acquire_error();
+                if let Err(snapshot_error) = renewed_snapshot_reconciliation.as_ref() {
+                    tracing::error!(
+                        code = error_codes::ACTION_POSTCONDITION_FAILED,
+                        detail_code = "ACT_FOREGROUND_ACQUIRE_ERROR_RENEWED_ROW_RECONCILE_FAILED",
+                        session_id,
+                        error = snapshot_error,
+                        "lease acquire returned an error after a possible renewal and its exact durable row could not be reconciled"
+                    );
+                }
+                let mut cleanup = authority_guard.cleanup_now("lease_acquire_error");
+                if cleanup.cleanup_ok {
+                    return Err(error);
+                }
+                if let Some(retry) = authority_guard
+                    .cleanup_with_bounded_retries("lease_acquire_error_retry")
+                {
+                    cleanup = retry;
+                }
+                if cleanup.cleanup_ok {
+                    return Err(error);
+                }
+                return Err(act_foreground_authority_guard_error(&error, cleanup));
+            }
+        };
+        if let Err(error) = authority_guard.note_acquire_response(&lease_acquire) {
+            let mut cleanup = authority_guard.cleanup_now("lease_acquire_readback_error");
+            if cleanup.cleanup_ok {
+                return Err(error);
+            }
+            if let Some(retry) = authority_guard
+                .cleanup_with_bounded_retries("lease_acquire_readback_error_retry")
+            {
+                cleanup = retry;
+            }
+            if cleanup.cleanup_ok {
+                return Err(error);
+            }
+            return Err(act_foreground_authority_guard_error(&error, cleanup));
+        }
+        let acquired = lease_acquire.outcome == "acquired";
+        if cancellation.is_cancelled() {
+            return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                &mut authority_guard,
+                &session_id,
+                "after_lease_acquire",
+                None,
+            ));
+        }
 
         // 2) escalate to break_glass (requires the lease we just took + confirm + reason).
-        self.tool_profile_set(
-            Parameters(super::tool_profiles::ToolProfileSetParams {
-                profile: super::tool_profiles::ToolProfileKind::BreakGlass,
-                reason: Some(reason.clone()),
-                confirm_break_glass: true,
-            }),
-            request_context.clone(),
-        )
-        .await?;
+        // Keep the error instead of returning early: a profile write can commit
+        // before a later audit/readback error, so cleanup must run either way.
+        let escalation_result = if authority_guard.operator_panic_observed() {
+            Err(act_operator_panic_prearm_error(
+                ActOperation::Foreground,
+                &session_id,
+                operator_panic_epoch_at_entry,
+                "before_profile_escalation",
+            ))
+        } else {
+            if cancellation.is_cancelled() {
+                return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                    &mut authority_guard,
+                    &session_id,
+                    "before_profile_escalation_boundary",
+                    None,
+                ));
+            }
+            self.tool_profile_set_response(
+                    super::tool_profiles::ToolProfileSetParams {
+                        profile: super::tool_profiles::ToolProfileKind::BreakGlass,
+                        reason: Some(reason.clone()),
+                        confirm_break_glass: true,
+                    },
+                    &request_context,
+                    "tool_profile_set",
+                    "profile_set",
+                    true,
+                )
+                .await
+                .map(Json)
+        };
+        // Once an authority boundary is in flight, its exact async owner must
+        // await it to terminal state. A cancellation select here would merely
+        // drop the mutation future and could let hidden work outlive cleanup.
+        if cancellation.is_cancelled() {
+            return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                &mut authority_guard,
+                &session_id,
+                "after_profile_escalation",
+                None,
+            ));
+        }
 
-        // 3) run the action — capture, do NOT early-return, so restore always runs.
-        let action_result = self
-            .target_act(Parameters(params.action), request_context.clone())
-            .await;
+        // 3) Run the action only after escalation was accepted. Capture the
+        // result instead of returning so both cleanup operations always run.
+        let action_result = if escalation_result.is_ok()
+            && !authority_guard.operator_panic_observed()
+        {
+            if cancellation.is_cancelled() {
+                return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                    &mut authority_guard,
+                    &session_id,
+                    "before_delegated_action_boundary",
+                    None,
+                ));
+            }
+            Some(
+                self.target_act_authority_locked(
+                    Parameters(params.action),
+                    request_context.clone(),
+                    Some(operator_panic_epoch_at_entry),
+                    Some(session_id.clone()),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if cancellation.is_cancelled() {
+            return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                &mut authority_guard,
+                &session_id,
+                "after_delegated_action",
+                action_result.as_ref(),
+            ));
+        }
 
         // 4) restore the prior profile (break_glass still requires the lease, which we
         //    still hold at this point).
@@ -1361,28 +3119,199 @@ impl SynapseService {
                 | super::tool_profiles::ToolProfileKind::FullCapability
                 | super::tool_profiles::ToolProfileKind::BrowserDebugger
         );
-        let profile_restored = self
-            .tool_profile_set(
-                Parameters(super::tool_profiles::ToolProfileSetParams {
+        if cancellation.is_cancelled() {
+            return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                &mut authority_guard,
+                &session_id,
+                "before_profile_restore_boundary",
+                action_result.as_ref(),
+            ));
+        }
+        let profile_restore_result = self
+            .tool_profile_set_response(
+                super::tool_profiles::ToolProfileSetParams {
                     profile: prior_profile,
                     reason: Some(format!("restore after act_foreground: {reason}")),
                     confirm_break_glass: prior_needs_confirm,
-                }),
-                request_context.clone(),
+                },
+                &request_context,
+                "tool_profile_set",
+                "profile_set",
+                true,
             )
             .await
-            .is_ok();
+            .map(Json);
+        if cancellation.is_cancelled() {
+            return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                &mut authority_guard,
+                &session_id,
+                "after_profile_restore_boundary",
+                action_result.as_ref(),
+            ));
+        }
+        // The audited profile transition above necessarily writes new
+        // provenance/timestamp metadata. Re-apply the byte-exact pre-call row
+        // before readback so ordinary completion has the same restoration
+        // contract as cancellation/unwind cleanup.
+        let exact_profile_restore_result = authority_guard.restore_prior_profile_assignment();
+        if cancellation.is_cancelled() {
+            return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                &mut authority_guard,
+                &session_id,
+                "after_profile_restore",
+                action_result.as_ref(),
+            ));
+        }
 
         // 5) release the lease only if this call newly acquired it.
-        let released_lease = if acquired {
-            self.control_lease_release(request_context.clone())
-                .await
-                .is_ok()
+        let operator_panic_observed = authority_guard.operator_panic_observed();
+        let lease_release_result = if acquired && !operator_panic_observed {
+            Some(
+                self.control_lease_release_authority_locked(session_id.clone()),
+            )
         } else {
-            false
+            None
         };
+        let persisted_lease_restore_result =
+            authority_guard.reconcile_persisted_lease_after_async_cleanup();
+        if cancellation.is_cancelled() {
+            return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                &mut authority_guard,
+                &session_id,
+                "after_lease_cleanup",
+                action_result.as_ref(),
+            ));
+        }
 
+        // 6) Independently read both physical cleanup Sources of Truth. Tool
+        // return values are not cleanup verdicts: profile_set/release can fail
+        // after a partial commit, and a stale persisted lease row can restore a
+        // lease that appeared released in process memory.
+        let profile_readback = self.tool_profile_snapshot(Some(&session_id));
+        let lease_readback = self
+            .control_lease_status_authority_locked(session_id.clone())
+            .map(|response| response.0);
+        // `control_lease_status_authority_locked` may restore continuity state
+        // and persist fresh timestamps. Its return value is therefore not the
+        // final durable-row verdict; read the raw CF_SESSIONS bytes afterward.
+        let persisted_lease_final_readback =
+            super::session_continuity::snapshot_persisted_session_lease_row(
+                &self.m3_state_handle(),
+                &session_id,
+            );
+
+        let cleanup_error =
+            act_foreground_cleanup_postcondition_error(ActForegroundCleanupEvidence {
+                session_id: &session_id,
+                prior_profile,
+                acquired_lease: acquired,
+                lease_owner_before: authority_guard.lease_owner_before.as_deref(),
+                escalation_result: &escalation_result,
+                action_result: action_result.as_ref(),
+                profile_restore_result: &profile_restore_result,
+                lease_release_result: lease_release_result.as_ref(),
+                persisted_lease_restore_result: &persisted_lease_restore_result,
+                persisted_lease_final_readback: &persisted_lease_final_readback,
+                expected_persisted_lease_after_cleanup: if acquired {
+                    &authority_guard.prior_persisted_lease
+                } else {
+                    &authority_guard.expected_retained_persisted_lease
+                },
+                operator_panic_observed,
+                exact_profile_restore_result: &exact_profile_restore_result,
+                prior_profile_value_sha256: &authority_guard.prior_profile_value_sha256,
+                profile_readback: &profile_readback,
+                lease_readback: &lease_readback,
+            });
+        if authority_guard.operator_panic_observed() {
+            let mut guard_cleanup = authority_guard.cleanup_now("operator_panic_observed");
+            if !guard_cleanup.cleanup_ok {
+                if let Some(retry) = authority_guard
+                    .cleanup_with_bounded_retries("operator_panic_observed_retry")
+                {
+                    guard_cleanup = retry;
+                }
+            }
+            return Err(act_foreground_operator_interrupted_error(
+                &session_id,
+                cleanup_error.as_ref(),
+                action_result.as_ref(),
+                guard_cleanup,
+            ));
+        }
+        if cancellation.is_cancelled() {
+            return Err(cleanup_act_foreground_after_shutdown_cancellation(
+                &mut authority_guard,
+                &session_id,
+                "after_cleanup_readback",
+                action_result.as_ref(),
+            ));
+        }
+        if let Some(error) = cleanup_error {
+            authority_guard
+                .cleanup_with_bounded_retries("cleanup_postcondition_failure");
+            return Err(error);
+        }
+
+        // Cleanup is verified at this point. Preserve the original escalation
+        // or delegated-action error only after completion is linearized against
+        // the physical operator-panic epoch. Disarm-before-read closes the
+        // final check/use window without requiring a timing assumption.
+        let operator_panic_epoch_at_arm = authority_guard.operator_panic_epoch_at_arm;
+        if let Err(operator_panic_epoch_after) =
+            authority_guard.disarm_if_operator_epoch_stable(operator_panic_epoch_at_arm)
+        {
+            tracing::warn!(
+                code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                detail_code = "ACT_FOREGROUND_OPERATOR_PANIC_AT_COMPLETION",
+                session_id,
+                operator_panic_epoch_at_arm = authority_guard.operator_panic_epoch_at_arm,
+                operator_panic_epoch_after,
+                source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                "operator panic advanced at the foreground completion boundary; re-running physical cleanup"
+            );
+            let mut guard_cleanup = authority_guard.cleanup_now("operator_panic_at_completion");
+            if !guard_cleanup.cleanup_ok {
+                if let Some(retry) = authority_guard
+                    .cleanup_with_bounded_retries("operator_panic_at_completion_retry")
+                {
+                    guard_cleanup = retry;
+                }
+            }
+            return Err(act_foreground_operator_interrupted_error(
+                &session_id,
+                None,
+                action_result.as_ref(),
+                guard_cleanup,
+            ));
+        }
+        escalation_result?;
+        let Some(action_result) = action_result else {
+            tracing::error!(
+                code = error_codes::TOOL_INTERNAL_ERROR,
+                detail_code = "ACT_FOREGROUND_ACTION_RESULT_MISSING",
+                session_id,
+                source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                "act_foreground escalation succeeded but the delegated action result is missing"
+            );
+            return Err(ErrorData::new(
+                ErrorCode(-32099),
+                "act operation=foreground escalation succeeded without a delegated action result",
+                Some(json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "detail_code": "ACT_FOREGROUND_ACTION_RESULT_MISSING",
+                    "tool": "act",
+                    "operation": "foreground",
+                    "session_id": session_id,
+                    "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                    "remediation": "inspect daemon logs and the act command-audit row; do not retry until the foreground facade state machine is repaired",
+                })),
+            ));
+        };
         let action = action_result?.0;
+        let profile_after = profile_readback?;
+        let lease_after = lease_readback?;
+        let released_lease = acquired && !lease_after.is_owner;
         Ok(Json(ActForegroundResponse {
             ok: action.ok,
             escalation: ActForegroundEscalation {
@@ -1391,12 +3320,305 @@ impl SynapseService {
                 released_lease,
                 prior_profile: prior_profile.as_str().to_owned(),
                 escalated_to: "break_glass".to_owned(),
-                restored_profile: prior_profile.as_str().to_owned(),
-                profile_restored,
+                restored_profile: profile_after.profile.as_str().to_owned(),
+                profile_restored: profile_after.profile == prior_profile,
+                lease_cleanup_verified: !acquired || !lease_after.is_owner,
+                session_holds_lease_after: lease_after.is_owner,
+                cleanup_source_of_truth: ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH.to_owned(),
             },
             action,
         }))
+        })
+        .catch_unwind()
+        .await;
+        match transaction {
+            Ok(result) => result,
+            Err(panic) => {
+                let panic_description = consume_panic_payload(panic);
+                let cleanup =
+                    authority_guard.cleanup_with_bounded_retries("caught_transaction_panic");
+                Err(ErrorData::new(
+                    ErrorCode(-32099),
+                    "act operation=foreground panicked; bounded authority cleanup completed before the final command audit",
+                    Some(json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "detail_code": "ACT_FOREGROUND_TRANSACTION_PANICKED",
+                        "tool": "act",
+                        "operation": "foreground",
+                        "session_id": session_id,
+                        "panic": panic_description,
+                        "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+                        "cleanup": cleanup,
+                        "remediation": "inspect the final act command-audit row, exact profile row, persisted lease row, process-global lease, and daemon drain logs before retrying",
+                    })),
+                ))
+            }
+        }
     }
+}
+
+fn act_foreground_cleanup_postconditions(
+    session_id: &str,
+    prior_profile: super::tool_profiles::ToolProfileKind,
+    session_authority_must_be_released: bool,
+    lease_owner_before: Option<&str>,
+    profile_after: Option<super::tool_profiles::ToolProfileKind>,
+    lease_readback_ok: bool,
+    lease_owner_after: Option<&str>,
+) -> (bool, bool) {
+    let profile_restored = profile_after == Some(prior_profile);
+    let lease_cleanup_verified = lease_readback_ok
+        && if session_authority_must_be_released {
+            lease_owner_after != Some(session_id)
+        } else {
+            lease_owner_after == lease_owner_before
+        };
+    (profile_restored, lease_cleanup_verified)
+}
+
+struct ActForegroundCleanupEvidence<'a> {
+    session_id: &'a str,
+    prior_profile: super::tool_profiles::ToolProfileKind,
+    acquired_lease: bool,
+    lease_owner_before: Option<&'a str>,
+    escalation_result: &'a Result<Json<super::tool_profiles::ToolProfileSetResponse>, ErrorData>,
+    action_result: Option<&'a Result<Json<TargetActResponse>, ErrorData>>,
+    profile_restore_result:
+        &'a Result<Json<super::tool_profiles::ToolProfileSetResponse>, ErrorData>,
+    lease_release_result:
+        Option<&'a Result<Json<super::lease_tools::ControlLeaseResponse>, ErrorData>>,
+    persisted_lease_restore_result:
+        &'a Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String>,
+    persisted_lease_final_readback:
+        &'a Result<super::session_continuity::PersistedSessionLeaseRowSnapshot, String>,
+    expected_persisted_lease_after_cleanup:
+        &'a super::session_continuity::PersistedSessionLeaseRowSnapshot,
+    operator_panic_observed: bool,
+    exact_profile_restore_result:
+        &'a Result<super::tool_profiles::ToolProfileRowReadback, ErrorData>,
+    prior_profile_value_sha256: &'a str,
+    profile_readback: &'a Result<super::tool_profiles::ToolProfileSnapshot, ErrorData>,
+    lease_readback: &'a Result<super::lease_tools::ControlLeaseResponse, ErrorData>,
+}
+
+fn act_foreground_cleanup_postcondition_error(
+    evidence: ActForegroundCleanupEvidence<'_>,
+) -> Option<ErrorData> {
+    let ActForegroundCleanupEvidence {
+        session_id,
+        prior_profile,
+        acquired_lease,
+        lease_owner_before,
+        escalation_result,
+        action_result,
+        profile_restore_result,
+        lease_release_result,
+        persisted_lease_restore_result,
+        persisted_lease_final_readback,
+        expected_persisted_lease_after_cleanup,
+        operator_panic_observed,
+        exact_profile_restore_result,
+        prior_profile_value_sha256,
+        profile_readback,
+        lease_readback,
+    } = evidence;
+    let profile_after = profile_readback
+        .as_ref()
+        .ok()
+        .map(|snapshot| snapshot.profile);
+    let lease_readback_ok = lease_readback.is_ok();
+    let lease_owner_after = lease_readback
+        .as_ref()
+        .ok()
+        .and_then(|snapshot| snapshot.owner_session_id.as_deref());
+    let (profile_kind_restored, lease_cleanup_verified) = act_foreground_cleanup_postconditions(
+        session_id,
+        prior_profile,
+        acquired_lease || operator_panic_observed,
+        lease_owner_before,
+        profile_after,
+        lease_readback_ok,
+        lease_owner_after,
+    );
+    let profile_value_sha256_after = profile_readback
+        .as_ref()
+        .ok()
+        .and_then(|snapshot| snapshot.policy_row.as_ref())
+        .map(|row| row.value_sha256.as_str());
+    let exact_profile_restore_attempt_ok = exact_profile_restore_result.is_ok();
+    let profile_assignment_restored =
+        profile_value_sha256_after == Some(prior_profile_value_sha256);
+    let profile_restored = profile_kind_restored && profile_assignment_restored;
+    let profile_restore_attempt_ok = profile_restore_result.is_ok();
+    let lease_release_attempt_ok = lease_release_result.is_none_or(Result::is_ok);
+    let persisted_lease_restore_attempt_ok = persisted_lease_restore_result.is_ok();
+    let persisted_lease_final_readback_ok = persisted_lease_final_readback.is_ok();
+    let persisted_lease_row_verified = persisted_lease_final_readback.as_ref().is_ok_and(|after| {
+        if operator_panic_observed {
+            !after.row_exists()
+        } else {
+            after == expected_persisted_lease_after_cleanup
+        }
+    });
+    let readbacks_ok =
+        profile_readback.is_ok() && lease_readback.is_ok() && persisted_lease_final_readback_ok;
+
+    if profile_restore_attempt_ok
+        && exact_profile_restore_attempt_ok
+        && lease_release_attempt_ok
+        && persisted_lease_restore_attempt_ok
+        && persisted_lease_row_verified
+        && readbacks_ok
+        && profile_restored
+        && lease_cleanup_verified
+    {
+        return None;
+    }
+
+    let profile_restore_error = profile_restore_result
+        .as_ref()
+        .err()
+        .map(act_foreground_error_diagnostics);
+    let exact_profile_restore_error = exact_profile_restore_result
+        .as_ref()
+        .err()
+        .map(act_foreground_error_diagnostics);
+    let lease_release_error = lease_release_result
+        .and_then(|result| result.as_ref().err())
+        .map(act_foreground_error_diagnostics);
+    let persisted_lease_restore_error = persisted_lease_restore_result.as_ref().err().cloned();
+    let persisted_lease_final_readback_error =
+        persisted_lease_final_readback.as_ref().err().cloned();
+    let profile_readback_error = profile_readback
+        .as_ref()
+        .err()
+        .map(act_foreground_error_diagnostics);
+    let lease_readback_error = lease_readback
+        .as_ref()
+        .err()
+        .map(act_foreground_error_diagnostics);
+    let escalation_error = escalation_result
+        .as_ref()
+        .err()
+        .map(act_foreground_error_diagnostics);
+    let action_diagnostics = act_foreground_action_diagnostics(action_result);
+
+    tracing::error!(
+        code = error_codes::ACTION_POSTCONDITION_FAILED,
+        detail_code = ACT_FOREGROUND_CLEANUP_FAILED_DETAIL_CODE,
+        session_id,
+        prior_profile = prior_profile.as_str(),
+        acquired_lease,
+        profile_restore_attempt_ok,
+        exact_profile_restore_attempt_ok,
+        lease_release_attempt_ok,
+        persisted_lease_restore_attempt_ok,
+        persisted_lease_final_readback_ok,
+        persisted_lease_row_verified,
+        operator_panic_observed,
+        readbacks_ok,
+        profile_restored,
+        lease_cleanup_verified,
+        source_of_truth = ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+        "act_foreground cleanup failed its independently read Source-of-Truth postconditions"
+    );
+
+    Some(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "act operation=foreground cleanup postcondition failed: profile_restored={profile_restored}, lease_cleanup_verified={lease_cleanup_verified}"
+        ),
+        Some(json!({
+            "code": error_codes::ACTION_POSTCONDITION_FAILED,
+            "detail_code": ACT_FOREGROUND_CLEANUP_FAILED_DETAIL_CODE,
+            "tool": "act",
+            "operation": "foreground",
+            "session_id": session_id,
+            "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH,
+            "expected": {
+                "profile": prior_profile.as_str(),
+                "profile_value_sha256": prior_profile_value_sha256,
+                "session_must_not_own_lease": acquired_lease,
+                "lease_owner_before": lease_owner_before,
+                "persisted_lease_row_present": if operator_panic_observed {
+                    false
+                } else {
+                    expected_persisted_lease_after_cleanup.row_exists()
+                },
+                "operator_panic_observed": operator_panic_observed,
+            },
+            "cleanup_attempts": {
+                "profile_restore": {
+                    "attempted": true,
+                    "ok": profile_restore_attempt_ok,
+                    "error": profile_restore_error,
+                },
+                "exact_profile_assignment_restore": {
+                    "attempted": true,
+                    "ok": exact_profile_restore_attempt_ok,
+                    "error": exact_profile_restore_error,
+                },
+                "lease_release": {
+                    "attempted": acquired_lease && !operator_panic_observed,
+                    "ok": lease_release_attempt_ok,
+                    "error": lease_release_error,
+                },
+                "persisted_lease_restore": {
+                    "attempted": true,
+                    "ok": persisted_lease_restore_attempt_ok,
+                    "exact_row_verified": persisted_lease_row_verified,
+                    "error": persisted_lease_restore_error,
+                },
+                "persisted_lease_final_readback": {
+                    "ok": persisted_lease_final_readback_ok,
+                    "error": persisted_lease_final_readback_error,
+                },
+            },
+            "readback": {
+                "profile": profile_after.map(|profile| profile.as_str()),
+                "profile_value_sha256": profile_value_sha256_after,
+                "profile_error": profile_readback_error,
+                "lease_owner_session_id": lease_owner_after,
+                "lease_owner_before": lease_owner_before,
+                "lease_error": lease_readback_error,
+                "profile_restored": profile_restored,
+                "profile_kind_restored": profile_kind_restored,
+                "profile_assignment_restored": profile_assignment_restored,
+                "lease_cleanup_verified": lease_cleanup_verified,
+                "persisted_lease_row_verified": persisted_lease_row_verified,
+            },
+            "escalation_error": escalation_error,
+            "action_diagnostics": action_diagnostics,
+            "remediation": "inspect the named profile and lease Sources of Truth, restore the prior profile through profile operation=set, release this session's lease through act operation=lease_release, and do not retry the foreground action until both readbacks match",
+        })),
+    ))
+}
+
+fn act_foreground_action_diagnostics(
+    action_result: Option<&Result<Json<TargetActResponse>, ErrorData>>,
+) -> Value {
+    match action_result {
+        Some(Ok(response)) => json!({
+            "status": "returned",
+            "response": &response.0,
+        }),
+        Some(Err(error)) => json!({
+            "status": "error",
+            "error": act_foreground_error_diagnostics(error),
+        }),
+        None => json!({
+            "status": "not_attempted",
+            "reason": "profile escalation did not complete",
+        }),
+    }
+}
+
+fn act_foreground_error_diagnostics(error: &ErrorData) -> Value {
+    json!({
+        "code": target_act_error_code(error).unwrap_or(error_codes::TOOL_INTERNAL_ERROR),
+        "message": error.message.to_string(),
+        "data": error.data.clone(),
+    })
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2339,6 +4561,7 @@ fn target_act_invoke_uia_element(
     operation: &'static str,
     element_id: &ElementId,
 ) -> Result<(), ErrorData> {
+    ensure_target_act_operator_panic_boundary(operation)?;
     synapse_action::invoke_element(element_id).map_err(|error| {
         mcp_error(
             error.code(),
@@ -2351,6 +4574,7 @@ fn target_act_scroll_uia_element_into_view(
     operation: &'static str,
     element_id: &ElementId,
 ) -> Result<(), ErrorData> {
+    ensure_target_act_operator_panic_boundary(operation)?;
     synapse_a11y::scroll_element_into_view(element_id).map_err(|error| {
         mcp_error(
             error.code(),
@@ -2589,6 +4813,7 @@ async fn target_act_save_impl(
         NotepadSaveCommandSource::Menu,
         NotepadSaveCommandSource::Accelerator,
     ] {
+        ensure_target_act_operator_panic_boundary("save_before_notepad_save_command")?;
         let attempt = send_notepad_save_command(hwnd, source)?;
         attempts.push(attempt);
         if let Some(after) =
@@ -2875,7 +5100,15 @@ fn send_notepad_save_command(
         },
     };
 
-    let hwnd = HWND(hwnd as *mut c_void);
+    let native_hwnd = synapse_core::win32_hwnd::hwnd_from_wire(hwnd).ok_or_else(|| {
+        mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            format!(
+                "target_act verb=save target HWND {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
+            ),
+        )
+    })?;
+    let hwnd = HWND(native_hwnd as *mut c_void);
     if hwnd.0.is_null() || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return Err(mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,
@@ -3232,6 +5465,7 @@ async fn target_act_cdp_dom_primitive(
         &request_details,
         &session_id,
     )?;
+    ensure_target_act_operator_panic_boundary("cdp_dom_primitive_before_dispatch")?;
     let result =
         synapse_a11y::cdp_dom_primitive_node(&endpoint, &routed_target_id, backend_node_id, action)
             .await
@@ -3414,6 +5648,7 @@ async fn target_act_browser_dom_action(
                 format!("target_act select options encode failed: {error}"),
             )
         })?;
+    ensure_target_act_operator_panic_boundary("browser_dom_action_before_dispatch")?;
     let mut result = crate::chrome_debugger_bridge::dom_action(
         crate::chrome_debugger_bridge::ChromeDebuggerDomActionRequest {
             hwnd: window_hwnd,
@@ -3669,6 +5904,7 @@ async fn target_act_coordinate_click(
                 &request_details,
                 &session_id,
             )?;
+            ensure_target_act_operator_panic_boundary("coordinate_click_before_bridge_dispatch")?;
             let result = crate::chrome_debugger_bridge::coordinate_click(
                 crate::chrome_debugger_bridge::ChromeDebuggerCoordinateClickRequest {
                     hwnd: window_hwnd,
@@ -3761,6 +5997,7 @@ async fn target_act_coordinate_click(
                 &params.modifiers,
                 Some(target_root_hwnd),
             )?;
+            ensure_target_act_operator_panic_boundary("coordinate_click_before_native_dispatch")?;
             let response = service
                 .act_click(Parameters(click_params), request_context.clone())
                 .await;
@@ -4028,6 +6265,7 @@ fn target_act_set_window_bounds(
         &request_details,
         &session_id,
     )?;
+    ensure_target_act_operator_panic_boundary("set_window_bounds_before_set_window_pos")?;
     let result = synapse_a11y::set_window_bounds(
         window_hwnd,
         params.x,
@@ -4429,6 +6667,7 @@ async fn target_act_bridge_cdp_input(
         session_id,
     )?;
     let coordinate_space = coordinate.map(|value| value.space.as_bridge_str());
+    ensure_target_act_operator_panic_boundary("bridge_cdp_input_before_dispatch")?;
     let result = crate::chrome_debugger_bridge::cdp_input(
         crate::chrome_debugger_bridge::ChromeDebuggerCdpInputRequest {
             hwnd: window_hwnd,
@@ -4550,6 +6789,7 @@ async fn target_act_hover_dispatch(
 ) -> Result<Value, ErrorData> {
     let element =
         target_act_tap_element(endpoint, window_hwnd, cdp_target_id, params, "hover").await?;
+    ensure_target_act_operator_panic_boundary("hover_before_mouse_move_dispatch")?;
     let point = synapse_a11y::cdp_aim_node(
         endpoint,
         "",
@@ -4619,6 +6859,7 @@ async fn target_act_raw_cdp_click_dispatch(
         Some(TargetActMouseButton::Left) | None => synapse_a11y::CdpMouseButton::Left,
     };
     let modifiers = target_act_click_modifiers_cdp_mask(&params.modifiers);
+    ensure_target_act_operator_panic_boundary("click_before_mouse_dispatch")?;
     let point = synapse_a11y::cdp_click_node(
         endpoint,
         "",
@@ -4679,6 +6920,7 @@ async fn target_act_touch_tap_dispatch(
             x: f64::from(coordinate.x),
             y: f64::from(coordinate.y),
         };
+        ensure_target_act_operator_panic_boundary("tap_before_coordinate_touch_dispatch")?;
         let tap = synapse_a11y::cdp_touch_tap_target(endpoint, cdp_target_id, point)
             .await
             .map_err(|error| {
@@ -4703,6 +6945,7 @@ async fn target_act_touch_tap_dispatch(
 
     let element =
         target_act_tap_element(endpoint, window_hwnd, cdp_target_id, params, "tap").await?;
+    ensure_target_act_operator_panic_boundary("tap_before_element_touch_dispatch")?;
     let tap = synapse_a11y::cdp_touch_tap_node(
         endpoint,
         "",
@@ -5179,6 +7422,7 @@ async fn target_act_scroll(
         verify_delta: false,
         verify_timeout_ms: default_verify_timeout_ms(),
     };
+    ensure_target_act_operator_panic_boundary("scroll_before_input_delivery")?;
     target_act_delegate_response(
         "act_scroll",
         service
@@ -5763,6 +8007,8 @@ fn target_act_focus_window_preflight(
     session_id: &str,
     target: &SessionTarget,
 ) -> Result<(), ErrorData> {
+    let profile = service.tool_profile_snapshot(Some(session_id))?.profile;
+    target_act_focus_window_profile_preflight(session_id, profile)?;
     if service
         .target_claim_for_session(session_id, target)?
         .is_none()
@@ -5784,6 +8030,31 @@ fn target_act_focus_window_preflight(
             "target_act verb=focus_window requires this MCP session to own the foreground input lease before deliberate real-foreground activation",
         )),
     }
+}
+
+fn target_act_focus_window_profile_preflight(
+    session_id: &str,
+    profile: super::tool_profiles::ToolProfileKind,
+) -> Result<(), ErrorData> {
+    if !profile.allows_foreground_tier() {
+        return Err(ErrorData::new(
+            rmcp::model::ErrorCode(-32099),
+            format!(
+                "target_act verb=focus_window requires profile=break_glass or full_capability; current profile={}",
+                profile.as_str()
+            ),
+            Some(json!({
+                "code": error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "tool": "act",
+                "operation": "focus_window",
+                "session_id": session_id,
+                "profile": profile.as_str(),
+                "source_of_truth": "CF_SESSIONS tool-profile policy row",
+                "remediation": TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION,
+            })),
+        ));
+    }
+    Ok(())
 }
 
 fn target_act_read_delegated_tool(
@@ -6143,6 +8414,194 @@ fn target_act_secret_safe_path_segment(segment: &str) -> String {
     segment.replace('~', "~0").replace('/', "~1")
 }
 
+async fn target_act_run_shell(
+    service: &SynapseService,
+    params: &TargetActParams,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    let command = require_param(params.command.clone(), "run_shell", "command")?;
+    let timeout_ms = params
+        .timeout_ms
+        .unwrap_or(DEFAULT_TARGET_ACT_SHELL_TIMEOUT_MS);
+    ensure_target_act_operator_panic_boundary("run_shell_before_durable_process_launch")?;
+    let start = service
+        .act_run_shell_start(
+            Parameters(ActRunShellStartParams {
+                command,
+                args: params.args.clone(),
+                working_dir: params.working_dir.clone(),
+                env: Default::default(),
+                timeout_ms: Some(timeout_ms),
+                job_id: None,
+            }),
+            request_context.clone(),
+        )
+        .await?;
+    let job_id = start.0.job.job_id.clone();
+
+    loop {
+        if let Err(error) = ensure_target_act_operator_panic_boundary(
+            "run_shell_after_launch_before_status_readback",
+        ) {
+            target_act_cancel_shell_job_after_operator_panic(
+                service,
+                &job_id,
+                request_context,
+                "after_launch_before_status_readback",
+            )
+            .await;
+            return Err(error);
+        }
+
+        let mut status_future = Box::pin(service.act_run_shell_status(
+            Parameters(ActRunShellStatusParams {
+                job_id: job_id.clone(),
+                tail_bytes: 1_048_576,
+            }),
+            request_context.clone(),
+        ));
+        let mut status_result = None;
+        let mut panic_error = None;
+        loop {
+            tokio::select! {
+                result = &mut status_future => {
+                    status_result = Some(result);
+                    break;
+                }
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    if let Err(error) = ensure_target_act_operator_panic_boundary(
+                        "run_shell_while_waiting_for_status_readback",
+                    ) {
+                        panic_error = Some(error);
+                        break;
+                    }
+                }
+            }
+        }
+        drop(status_future);
+        if let Some(error) = panic_error {
+            target_act_cancel_shell_job_after_operator_panic(
+                service,
+                &job_id,
+                request_context,
+                "while_waiting_for_status_readback",
+            )
+            .await;
+            return Err(error);
+        }
+        let status = status_result.ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "target_act run_shell status monitor ended without a status or panic verdict",
+            )
+        })??;
+        if status.0.running {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            continue;
+        }
+
+        ensure_target_act_operator_panic_boundary(
+            "run_shell_after_terminal_readback_before_response",
+        )?;
+        let mut result = target_act_result(&status.0)?;
+        if let Some(object) = result.as_object_mut() {
+            object.insert("exit_code".to_owned(), json!(status.0.job.exit_code));
+            object.insert("stdout".to_owned(), json!(&status.0.stdout_tail));
+            object.insert("stderr".to_owned(), json!(&status.0.stderr_tail));
+            object.insert(
+                "duration_ms".to_owned(),
+                json!(status.0.job.duration_ms.unwrap_or_default()),
+            );
+            object.insert("timed_out".to_owned(), json!(status.0.job.timed_out));
+            object.insert("error_code".to_owned(), json!(&status.0.job.error_code));
+            object.insert(
+                "error_message".to_owned(),
+                json!(&status.0.job.error_message),
+            );
+            object.insert(
+                "stdout_truncated".to_owned(),
+                json!(status.0.stdout_len_bytes > 1_048_576),
+            );
+            object.insert(
+                "stderr_truncated".to_owned(),
+                json!(status.0.stderr_len_bytes > 1_048_576),
+            );
+            object.insert("backgrounded".to_owned(), json!(false));
+            object.insert("job_id".to_owned(), json!(&job_id));
+            object.insert(
+                "operator_panic_monitored_durable_wait".to_owned(),
+                json!(true),
+            );
+        }
+        return Ok((
+            "act_run_shell_start+act_run_shell_status",
+            true,
+            TARGET_ACT_STATUS_OK,
+            result,
+        ));
+    }
+}
+
+async fn target_act_cancel_shell_job_after_operator_panic(
+    service: &SynapseService,
+    job_id: &str,
+    request_context: &RequestContext<RoleServer>,
+    stage: &'static str,
+) {
+    match service
+        .act_run_shell_cancel(
+            Parameters(ActRunShellJobIdParams {
+                job_id: job_id.to_owned(),
+            }),
+            request_context.clone(),
+        )
+        .await
+    {
+        Ok(readback)
+            if !readback.0.status.running && readback.0.remaining_process_ids.is_empty() =>
+        {
+            tracing::warn!(
+                code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                detail_code = "TARGET_ACT_RUN_SHELL_OPERATOR_PANIC_CANCELLED",
+                job_id,
+                stage,
+                termination_status = readback.0.termination_status,
+                "operator panic cancelled the exact target_act shell job with terminal process readback"
+            );
+        }
+        Ok(readback) => {
+            let drain = service
+                .drain_state_handle()
+                .mark_draining("target_act_run_shell_operator_panic_cleanup_unverified");
+            tracing::error!(
+                code = error_codes::ACTION_POSTCONDITION_FAILED,
+                detail_code = "TARGET_ACT_RUN_SHELL_OPERATOR_PANIC_CLEANUP_UNVERIFIED",
+                job_id,
+                stage,
+                running = readback.0.status.running,
+                remaining_process_ids = ?readback.0.remaining_process_ids,
+                termination_status = readback.0.termination_status,
+                drain = ?drain,
+                "operator panic shell cancellation did not prove the exact process tree terminal; daemon drained"
+            );
+        }
+        Err(error) => {
+            let drain = service
+                .drain_state_handle()
+                .mark_draining("target_act_run_shell_operator_panic_cleanup_failed");
+            tracing::error!(
+                code = error_codes::ACTION_POSTCONDITION_FAILED,
+                detail_code = "TARGET_ACT_RUN_SHELL_OPERATOR_PANIC_CLEANUP_FAILED",
+                job_id,
+                stage,
+                error = %error,
+                drain = ?drain,
+                "operator panic shell cancellation failed before terminal process readback; daemon drained"
+            );
+        }
+    }
+}
+
 async fn target_act_key_press(
     service: &SynapseService,
     params: &TargetActParams,
@@ -6157,6 +8616,7 @@ async fn target_act_key_press(
     let verb = params.verb.as_str();
     let keys = target_act_key_chord_keys(params, verb)?;
     let press_params = target_act_press_params(keys, params.wait_timeout_ms, verb)?;
+    ensure_target_act_operator_panic_boundary("key_before_input_delivery")?;
     let response = service
         .act_press(Parameters(press_params), request_context.clone())
         .await;
@@ -6228,6 +8688,7 @@ async fn target_act_insert_or_append_text(
     if append {
         let press_params =
             target_act_press_params(vec!["ctrl".to_owned(), "end".to_owned()], None, verb)?;
+        ensure_target_act_operator_panic_boundary("append_text_before_move_caret_to_end")?;
         let key_response = service
             .act_press(Parameters(press_params), request_context.clone())
             .await;
@@ -6255,6 +8716,7 @@ async fn target_act_insert_or_append_text(
     }
 
     let type_params = target_act_type_params(text, params.wait_timeout_ms, None)?;
+    ensure_target_act_operator_panic_boundary("text_insert_before_type_delivery")?;
     let type_response = service
         .act_type(Parameters(type_params), request_context.clone())
         .await;
@@ -6404,6 +8866,7 @@ async fn target_act_insert_or_append_text_native(
         &request_details,
         &session_id,
     )?;
+    ensure_target_act_operator_panic_boundary("native_text_before_value_mutation")?;
     let result = if append {
         synapse_a11y::append_element_text(&element_id, &text)
     } else {
@@ -6451,6 +8914,7 @@ async fn target_act_focus_for_text_insert(
     {
         if let Some(element_id) = target_act_legacy_click_element_id(raw_element_id)? {
             let click_params = target_act_click_params(element_id, 1, None, &[])?;
+            ensure_target_act_operator_panic_boundary("text_focus_before_native_click")?;
             let response = service
                 .act_click(Parameters(click_params), request_context.clone())
                 .await;
@@ -6799,6 +9263,7 @@ async fn target_act_set_selection_web(
             &request_details,
             &session_id,
         )?;
+        ensure_target_act_operator_panic_boundary("set_selection_before_web_selection_mutation")?;
         let result = synapse_a11y::cdp_evaluate_on_element(
             &endpoint,
             &element_target_id,
@@ -6962,6 +9427,7 @@ async fn target_act_set_selection_native(
         &request_details,
         &session_id,
     )?;
+    ensure_target_act_operator_panic_boundary("set_selection_before_native_selection_mutation")?;
     let result =
         synapse_a11y::set_element_text_selection(&element_id, start, end).map_err(|error| {
             mcp_error(
@@ -7278,6 +9744,7 @@ fn target_act_window_coordinate_foreground_preflight(
     let holds_lease =
         synapse_action::lease::status().owner_session_id.as_deref() == Some(session_id);
     if holds_lease {
+        ensure_target_act_operator_panic_boundary("coordinate_click_before_lease_context_refocus")?;
         if let Err(error) = synapse_a11y::focus_window_with_intent(
             target_root,
             synapse_a11y::ForegroundActivationIntent::LeaseContextRestore {

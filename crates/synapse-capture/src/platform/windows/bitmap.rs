@@ -186,7 +186,7 @@ pub fn window_region_to_bgra_bitmap_printwindow(
 ) -> Result<CapturedWindowBgraBitmap, CaptureError> {
     validate_bitmap_region(region)?;
     let hwnd_value = hwnd;
-    let hwnd = hwnd_from_i64(hwnd);
+    let hwnd = hwnd_from_i64(hwnd)?;
     let (window_width, window_height) = window_capture_extent(hwnd)?;
     validate_region_inside_window(region, window_width, window_height)?;
     let bytes = printwindow_region_bgra(hwnd, hwnd_value, region, window_width, window_height)?;
@@ -219,7 +219,7 @@ pub fn window_region_to_bgra_bitmap_printwindow(
 }
 
 pub fn window_capture_region(hwnd: i64) -> Result<Rect, CaptureError> {
-    let hwnd = hwnd_from_i64(hwnd);
+    let hwnd = hwnd_from_i64(hwnd)?;
     let (w, h) = window_capture_extent(hwnd)?;
     let region = Rect { x: 0, y: 0, w, h };
     validate_bitmap_region(region)?;
@@ -228,7 +228,7 @@ pub fn window_capture_region(hwnd: i64) -> Result<Rect, CaptureError> {
 
 pub fn client_region_to_window_region(hwnd: i64, region: Rect) -> Result<Rect, CaptureError> {
     validate_bitmap_region(region)?;
-    let hwnd = hwnd_from_i64(hwnd);
+    let hwnd = hwnd_from_i64(hwnd)?;
 
     if unsafe { IsIconic(hwnd) }.as_bool() {
         let (window_width, window_height) = window_capture_extent(hwnd)?;

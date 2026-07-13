@@ -2,9 +2,101 @@ use synapse_core::{Action, Backend, Key, KeyCode};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    ForegroundRestoreCurrentDecision, M2State, RECORDING_BACKEND_ENV,
-    foreground_restore_current_decision, recording_backend_enabled,
+    ForegroundRestoreCurrentDecision, M2State, OperatorPanicActionBoundary, RECORDING_BACKEND_ENV,
+    arm_operator_panic_action_admission, foreground_restore_current_decision,
+    recording_backend_enabled,
 };
+
+#[test]
+fn operator_panic_pending_closes_raw_action_admission_until_exact_finalization() {
+    let _serial = crate::test_support::lease_serial("m2_operator_panic_pending_admission");
+    synapse_action::isolate_interrupt_epochs_for_test();
+    synapse_action::lease::isolate_for_test();
+    let mut token = synapse_action::request_operator_panic_interrupt();
+    let generation = token.generation();
+    let _prior = synapse_action::force_preempt_input_lease_for_operator_panic(
+        "m2_action_admission_test",
+        generation,
+    );
+
+    let error = arm_operator_panic_action_admission("act_type", "test_entry")
+        .expect_err("pending physical panic must close raw action admission");
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("code")),
+        Some(&serde_json::json!(
+            synapse_core::error_codes::SAFETY_OPERATOR_HOTKEY_FIRED
+        ))
+    );
+
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut token
+    ));
+    let synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) =
+        synapse_action::complete_operator_panic_safety_generation(token)
+            .unwrap_or_else(|detail| panic!("complete test panic: {detail}"))
+    else {
+        panic!("isolated test generation must own finalization");
+    };
+    let _cleared = synapse_action::force_clear_operator_panic_input_lease_generation(
+        finalization.generation(),
+        "m2_action_admission_test_cleanup",
+    );
+    assert!(synapse_action::finish_operator_panic_safety_finalization(
+        finalization,
+        true
+    ));
+    arm_operator_panic_action_admission("act_type", "test_after_cleanup")
+        .unwrap_or_else(|error| panic!("exact finalization must reopen admission: {error:?}"));
+}
+
+#[test]
+fn operator_panic_boundary_rejects_fully_finalized_intervening_wave() {
+    let _serial = crate::test_support::lease_serial("m2_operator_panic_boundary_epoch");
+    synapse_action::isolate_interrupt_epochs_for_test();
+    synapse_action::lease::isolate_for_test();
+
+    let boundary = OperatorPanicActionBoundary::arm("act_scroll", "test_preflight")
+        .expect("initial operator-panic admission should be open");
+    let epoch_at_arm = boundary.epoch_at_arm();
+
+    let mut token = synapse_action::request_operator_panic_interrupt();
+    let generation = token.generation();
+    let _prior = synapse_action::force_preempt_input_lease_for_operator_panic(
+        "m2_boundary_epoch_test",
+        generation,
+    );
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut token
+    ));
+    let synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) =
+        synapse_action::complete_operator_panic_safety_generation(token)
+            .unwrap_or_else(|detail| panic!("complete test panic: {detail}"))
+    else {
+        panic!("isolated test generation must own finalization");
+    };
+    let _cleared = synapse_action::force_clear_operator_panic_input_lease_generation(
+        finalization.generation(),
+        "m2_boundary_epoch_test_cleanup",
+    );
+    assert!(synapse_action::finish_operator_panic_safety_finalization(
+        finalization,
+        true
+    ));
+
+    let readback = synapse_action::operator_panic_safety_readback();
+    assert!(!readback.pending);
+    assert_ne!(readback.epoch, epoch_at_arm);
+    let error = boundary
+        .ensure("test_delayed_physical_dispatch")
+        .expect_err("a fully finalized intervening panic must supersede delayed dispatch");
+    let data = error.data.expect("boundary rejection should be structured");
+    assert_eq!(
+        data["code"],
+        serde_json::json!(synapse_core::error_codes::SAFETY_OPERATOR_HOTKEY_FIRED)
+    );
+    assert_eq!(data["operator_panic_epoch_at_arm"], epoch_at_arm);
+    assert_eq!(data["operator_panic"]["pending"], false);
+}
 
 #[test]
 fn from_env_reads_recording_backend_env() {
@@ -51,6 +143,62 @@ async fn m2_state_spawns_running_emitter_inside_runtime() {
     assert_eq!(snapshot.held_key_timer_count, 0);
     assert!(snapshot.held_buttons.is_empty());
     assert!(snapshot.pad_state.is_empty());
+}
+
+#[tokio::test]
+async fn m2_state_reports_transferred_emitter_owner_until_done_readback() {
+    let before = Some("false");
+    let cancel = CancellationToken::new();
+    let substitute: std::sync::Arc<dyn synapse_action::ActionBackend> =
+        std::sync::Arc::new(synapse_action::RecordingBackend::new());
+    let mut state = M2State::from_recording_backend_env_with_actor_backend(
+        before,
+        cancel.clone(),
+        "shutdown",
+        None,
+        Some(substitute),
+    );
+    let mut done = state
+        .emitter_done_receiver()
+        .unwrap_or_else(|| panic!("runtime M2 state should expose emitter done receiver"));
+    let join = state
+        .take_emitter_task()
+        .unwrap_or_else(|| panic!("runtime M2 state should transfer emitter join handle"));
+
+    println!(
+        "readback=m2_state scenario=transferred_owner before_done={:?} externally_owned={} emitter_running={} emitter_available={}",
+        done.borrow().is_some(),
+        state.emitter_task_externally_owned,
+        state.emitter_running(),
+        state.emitter_available()
+    );
+    assert!(state.emitter_task_externally_owned);
+    assert!(state.emitter_running());
+    assert!(state.emitter_available());
+
+    cancel.cancel();
+    let final_snapshot = join
+        .await
+        .unwrap_or_else(|error| panic!("emitter join should complete after cancel: {error}"));
+    done.changed()
+        .await
+        .unwrap_or_else(|error| panic!("emitter done watch should update after cancel: {error}"));
+    let done_snapshot = done
+        .borrow()
+        .clone()
+        .unwrap_or_else(|| panic!("emitter done receiver should contain final snapshot"));
+
+    println!(
+        "readback=m2_state scenario=transferred_owner after_cancelled={} after_done={:?} emitter_running={} emitter_available={} final_held_keys={:?}",
+        cancel.is_cancelled(),
+        done.borrow().is_some(),
+        state.emitter_running(),
+        state.emitter_available(),
+        final_snapshot.held_keys
+    );
+    assert_eq!(done_snapshot, final_snapshot);
+    assert!(!state.emitter_running());
+    assert!(!state.emitter_available());
 }
 
 #[tokio::test]

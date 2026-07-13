@@ -6,7 +6,7 @@
 //!   `cargo run -p synapse-a11y --example cdp_axtree_probe -- <http://127.0.0.1:9222>`
 //!
 //! Synthetic known input → known expected output: the navigated page contains a
-//! heading "Hello FSV", a button "Apply", a link "YC Link", and an email
+//! heading "Hello Probe", a button "Apply", a link "YC Link", and an email
 //! textbox, so the printed AX tree can be checked by eye against those.
 
 #[cfg(windows)]
@@ -29,7 +29,7 @@ mod windows_impl {
     use chromiumoxide::cdp::browser_protocol::dom::GetBoxModelParams;
     use futures_util::StreamExt as _;
 
-    const KNOWN_PAGE: &str = "data:text/html,<html><body><h1>Hello FSV</h1>\
+    const KNOWN_PAGE: &str = "data:text/html,<html><body><h1>Hello Probe</h1>\
 <button>Apply</button><a href='#x'>YC Link</a>\
 <label>Email<input type='email' aria-label='email'></label></body></html>";
 

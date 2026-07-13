@@ -8,7 +8,7 @@ pub fn uia_worker_readback() -> crate::A11yResult<crate::UiaWorkerReadback> {
     common::worker_readback()
 }
 
-pub use events::{WinEventSubscription, subscribe_win_events};
+pub use events::{WinEventSubscription, retained_live_owner_count, subscribe_win_events};
 pub use resolve::{
     append_element_text, click_element_action, element_bounding_rect, element_metadata,
     element_scroll_state, element_value, expand_state_of, expand_state_of_id, focus_element,

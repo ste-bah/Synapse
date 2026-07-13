@@ -3041,7 +3041,7 @@ mod tests {
 
         // before: the synthetic key has no CF_KV row.
         let db = service.workspace_db()?;
-        let row_key = workspace_row_key("run-1552", "fsv-1552-k1");
+        let row_key = workspace_row_key("run-1552", "regression-1552-k1");
         assert_eq!(
             readback_absent_workspace_row(&db, &row_key)?.exact_match_count,
             0,
@@ -3051,7 +3051,7 @@ mod tests {
         let get = service.workspace_get_impl_at(
             WorkspaceGetParams {
                 run_id: Some("run-1552".to_owned()),
-                key: "fsv-1552-k1".to_owned(),
+                key: "regression-1552-k1".to_owned(),
                 absent_ok: true,
             },
             "session-absent-ok",
@@ -3087,7 +3087,7 @@ mod tests {
         service.workspace_put_impl_at(
             WorkspacePutParams {
                 run_id: Some("run-1552".to_owned()),
-                key: "fsv-1552-k1".to_owned(),
+                key: "regression-1552-k1".to_owned(),
                 expected_version: None,
                 value: Some(json!("2+2=4")),
                 artifact: None,
@@ -3100,7 +3100,7 @@ mod tests {
         let get = service.workspace_get_impl_at(
             WorkspaceGetParams {
                 run_id: Some("run-1552".to_owned()),
-                key: "fsv-1552-k1".to_owned(),
+                key: "regression-1552-k1".to_owned(),
                 absent_ok: true,
             },
             "session-reader",
@@ -3134,7 +3134,7 @@ mod tests {
         let error = match service.workspace_get_impl_at(
             WorkspaceGetParams {
                 run_id: Some("run-1552".to_owned()),
-                key: "fsv-1552-missing".to_owned(),
+                key: "regression-1552-missing".to_owned(),
                 absent_ok: false,
             },
             "session-fail-closed",
@@ -3167,7 +3167,7 @@ mod tests {
         service.workspace_put_impl_at(
             WorkspacePutParams {
                 run_id: Some("run-1552".to_owned()),
-                key: "fsv-1552-k1".to_owned(),
+                key: "regression-1552-k1".to_owned(),
                 expected_version: None,
                 value: Some(json!("2+2=4")),
                 artifact: None,
@@ -3180,7 +3180,7 @@ mod tests {
         let wait = service.workspace_wait_impl(
             WorkspaceWaitParams {
                 run_id: Some("run-1552".to_owned()),
-                key: "fsv-1552-k1".to_owned(),
+                key: "regression-1552-k1".to_owned(),
                 timeout_ms: 1_000,
                 poll_interval_ms: 5,
             },
@@ -3190,7 +3190,7 @@ mod tests {
         // after: wait resolves immediately with the same readback as get.
         assert!(wait.ok);
         assert!(wait.found);
-        assert_eq!(wait.key, "fsv-1552-k1");
+        assert_eq!(wait.key, "regression-1552-k1");
         assert_eq!(wait.entry.value, Some(json!("2+2=4")));
         assert!(wait.poll_count >= 1);
         println!(
@@ -3211,7 +3211,7 @@ mod tests {
 
         // before: the key is never written.
         let db = service.workspace_db()?;
-        let row_key = workspace_row_key("run-1552", "fsv-1552-never");
+        let row_key = workspace_row_key("run-1552", "regression-1552-never");
         assert_eq!(
             readback_absent_workspace_row(&db, &row_key)?.exact_match_count,
             0
@@ -3220,7 +3220,7 @@ mod tests {
         let error = match service.workspace_wait_impl(
             WorkspaceWaitParams {
                 run_id: Some("run-1552".to_owned()),
-                key: "fsv-1552-never".to_owned(),
+                key: "regression-1552-never".to_owned(),
                 timeout_ms: 5,
                 poll_interval_ms: 1,
             },
@@ -3266,7 +3266,7 @@ mod tests {
         let too_large = match service.workspace_wait_impl(
             WorkspaceWaitParams {
                 run_id: Some("run-1552".to_owned()),
-                key: "fsv-1552-k1".to_owned(),
+                key: "regression-1552-k1".to_owned(),
                 timeout_ms: MAX_WORKSPACE_WAIT_TIMEOUT_MS + 1,
                 poll_interval_ms: 5,
             },
@@ -3285,7 +3285,7 @@ mod tests {
         let zero = match service.workspace_wait_impl(
             WorkspaceWaitParams {
                 run_id: Some("run-1552".to_owned()),
-                key: "fsv-1552-k1".to_owned(),
+                key: "regression-1552-k1".to_owned(),
                 timeout_ms: 0,
                 poll_interval_ms: 5,
             },

@@ -13,9 +13,14 @@ pub(in crate::m2::press) async fn execute_live_press_sequence(
     hold_ms: u32,
     backend: Backend,
     connection_closed_cancel: Option<CancellationToken>,
+    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let mut pressed = Vec::with_capacity(keys.len());
     for key in &keys {
+        if let Err(error) = boundary.ensure("immediately_before_live_press_key_down") {
+            release_pressed_keys(&handle, &pressed, backend).await;
+            return Err(error);
+        }
         if let Err(error) = handle
             .execute(Action::KeyDown {
                 key: key.clone(),
@@ -30,7 +35,14 @@ pub(in crate::m2::press) async fn execute_live_press_sequence(
         maybe_force_panic_after_keydown();
     }
 
+    if let Err(error) = boundary.ensure("after_live_press_key_downs_before_hold") {
+        release_pressed_keys(&handle, &pressed, backend).await;
+        return Err(error);
+    }
     let hold_end = wait_for_hold_end(hold_ms, connection_closed_cancel).await;
+    let boundary_error = boundary
+        .ensure("after_live_press_hold_before_release")
+        .err();
 
     let mut first_error = None;
     for key in pressed.iter().rev() {
@@ -46,6 +58,17 @@ pub(in crate::m2::press) async fn execute_live_press_sequence(
         }
     }
 
+    if let Some(error) = boundary_error {
+        if let Some(release_error) = first_error.as_ref() {
+            tracing::error!(
+                code = synapse_core::error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                detail_code = "LIVE_PRESS_KEY_RELEASE_AFTER_OPERATOR_PANIC_FAILED",
+                detail = %release_error,
+                "operator panic superseded held live keys and best-effort key-up cleanup failed"
+            );
+        }
+        return Err(error);
+    }
     if let Some(error) = first_error {
         return Err(action_error_to_mcp(&error));
     }

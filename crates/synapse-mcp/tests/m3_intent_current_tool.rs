@@ -1,5 +1,6 @@
-//! `intent_current` integration FSV (#854): real daemon, real `RocksDB`, real
-//! MCP calls. Plants a mineable morning routine (outlook → excel → teams) over
+//! Supporting `intent_current` integration evidence (#854): real daemon,
+//! `RocksDB`, and MCP calls. Manual FSV remains separate. Plants a mineable
+//! morning routine (outlook → excel → teams) over
 //! seven consecutive days, mines it, confirms it, then drives the live
 //! intent-matcher surface against synthetic "as of" instants:
 //!
@@ -282,8 +283,9 @@ async fn intent_current_matches_live_routine_prefix_and_is_honest() -> anyhow::R
     assert_eq!(top["schedule"]["within_tolerance"], true);
     assert!(top["confidence"].as_f64().context("confidence")? > 0.0);
 
-    // FSV: the matched-step episode ids are physical CF_EPISODES rows — resolve
-    // the first one through episode_get and confirm app + identity.
+    // Supporting integration readback: the matched-step episode ids are
+    // physical CF_EPISODES rows — resolve the first one through episode_get and
+    // confirm app + identity. Manual FSV remains separate.
     let matched_episode_id = top["matched_steps"][0]["episode_id"]
         .as_str()
         .context("episode_id")?;

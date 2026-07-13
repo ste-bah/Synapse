@@ -7,6 +7,8 @@
 //! process table and the storage column families as the sources of truth — no
 //! mocks. The owning Windows job (KILL_ON_JOB_CLOSE) guarantees no orphan
 //! survives even if an assertion fails, because the service drop closes it.
+//! These checks are supporting real-process regression evidence only; manual
+//! FSV remains separate.
 //!
 //! The real-process acceptance tests below are `#[ignore]`d: they spawn and
 //! force-kill real `powershell.exe` victims and assert host-load-sensitive
@@ -16,10 +18,405 @@
 //! makes them flaky as a default gate — not because the kill path is wrong.
 //! The deterministic logic (id validation, param defaults, tree-exit polling,
 //! confirm-token gating, empty-fleet no-op, unknown/dead-session handling)
-//! stays in the default gate; run the acceptance FSV explicitly with
+//! stays in the default gate; run the supporting real-process checks explicitly with
 //! `cargo test -p synapse-mcp -- --ignored agent_control`.
 
 use super::*;
+
+fn synthetic_spawn_activity(
+    sequence: u64,
+    in_flight: u64,
+    cleanup_incident: bool,
+) -> super::super::m4_tools::AgentSpawnActivityReadback {
+    super::super::m4_tools::AgentSpawnActivityReadback {
+        sequence,
+        in_flight,
+        operator_panic_epoch: 7,
+        operator_panic_safety_pending: true,
+        cleanup_incident,
+    }
+}
+
+#[test]
+fn operator_panic_k2_requires_unchanged_spawn_sequence_and_zero_in_flight() {
+    let baseline = synthetic_spawn_activity(10, 1, false);
+    let quiescent_same_sequence = synthetic_spawn_activity(10, 0, false);
+    assert!(operator_panic_spawn_activity_stable(
+        &baseline,
+        &quiescent_same_sequence,
+        true
+    ));
+
+    let entered_during_sweep = synthetic_spawn_activity(11, 0, false);
+    assert!(
+        !operator_panic_spawn_activity_stable(&baseline, &entered_during_sweep, true),
+        "a racing admission must force another fleet-stop round"
+    );
+
+    let still_in_flight = synthetic_spawn_activity(10, 1, false);
+    assert!(!operator_panic_spawn_activity_stable(
+        &baseline,
+        &still_in_flight,
+        true
+    ));
+
+    let cleanup_unverified = synthetic_spawn_activity(10, 0, true);
+    assert!(!operator_panic_spawn_activity_stable(
+        &baseline,
+        &cleanup_unverified,
+        true
+    ));
+    assert!(!operator_panic_spawn_activity_stable(
+        &baseline,
+        &quiescent_same_sequence,
+        false
+    ));
+
+    let mutation_zero_before = super::super::operator_panic_boundary::McpMutationActivitySnapshot {
+        sequence: 41,
+        in_flight: 0,
+    };
+    let mutation_zero_after = mutation_zero_before;
+    assert!(operator_panic_mcp_mutation_activity_stable(
+        &mutation_zero_before,
+        &mutation_zero_after
+    ));
+    assert!(!operator_panic_mcp_mutation_activity_stable(
+        &mutation_zero_before,
+        &super::super::operator_panic_boundary::McpMutationActivitySnapshot {
+            sequence: 42,
+            in_flight: 0,
+        }
+    ));
+    assert!(!operator_panic_mcp_mutation_activity_stable(
+        &mutation_zero_before,
+        &super::super::operator_panic_boundary::McpMutationActivitySnapshot {
+            sequence: 41,
+            in_flight: 1,
+        }
+    ));
+}
+
+fn synthetic_extension_owner_readback(
+    disable_sequence: u64,
+    command_activity_sequence: u64,
+    command_last_completed_sequence: u64,
+) -> crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerReadback {
+    crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerReadback {
+        enabled: false,
+        disable_sequence,
+        command_activity_sequence,
+        command_last_completed_sequence,
+        command_in_flight_count: 1,
+        mutation_handlers_started_count: 7,
+        mutation_handlers_completed_count: 7,
+        worker_boot_id: "worker-stable".to_owned(),
+        browser_session_id: Some("browser-session-stable".to_owned()),
+        ledger_browser_session_id: "browser-session-stable".to_owned(),
+        browser_session_continuity_matched: true,
+        stale_browser_session_owner_count: 0,
+        storage_state_loaded: true,
+        storage_state_load_error: None,
+        persisted_state_revision: 9,
+        persisted_in_flight_mutation: None,
+        unresolved_debugger_command_timeouts: Vec::new(),
+        unresolved_worker_restart_mutation_count: 0,
+        owner_continuity_healthy: true,
+        active_after: crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerCounts::default(),
+        fully_drained: true,
+    }
+}
+
+fn synthetic_extension_k2_readback() -> OperatorPanicChromeExtensionOwnersReadback {
+    let disable_sequence = 4;
+    OperatorPanicChromeExtensionOwnersReadback {
+        disable: Some(synthetic_extension_owner_readback(disable_sequence, 17, 16)),
+        disable_error: None,
+        cleanup: Some(
+            crate::chrome_debugger_bridge::ChromeDebuggerExtensionCleanupReadback {
+                owner: synthetic_extension_owner_readback(disable_sequence, 18, 17),
+                expected_disable_sequence: disable_sequence,
+                opened_tabs_found: 0,
+                opened_tabs_closed: 0,
+                closed_opened_tabs: Vec::new(),
+                remaining_opened_tabs: Vec::new(),
+                init_scripts_found: 0,
+                init_scripts_removed: 0,
+                init_script_effects_found: 0,
+                init_script_effects_cleared: 0,
+                reloaded_init_script_effect_tabs: Vec::new(),
+                bindings_found: 0,
+                bindings_removed: 0,
+                debugger_tabs_found: 0,
+                debugger_tabs_detached: 0,
+                detached_debugger_tabs: Vec::new(),
+                dialog_policies_found: 0,
+                dialog_policies_disabled: 0,
+                file_chooser_interceptions_found: 0,
+                file_chooser_interceptions_disabled: 0,
+                clocks_found: 0,
+                clocks_uninstalled: 0,
+                failures: Vec::new(),
+            },
+        ),
+        cleanup_error: None,
+        cdp_target_owner_reconciliation: Some(
+            super::super::m1_tools::OperatorPanicCdpTargetOwnerReconciliationReadback {
+                successful_physical_closes: 0,
+                targets: Vec::new(),
+                remaining_extension_memory_owner_keys: Vec::new(),
+                remaining_extension_persisted_owner_keys: Vec::new(),
+                remaining_owner_readback_error: None,
+                failures: Vec::new(),
+                terminal: true,
+            },
+        ),
+        cdp_target_owner_reconciliation_error: None,
+        before_command_drain: Some(synthetic_extension_owner_readback(disable_sequence, 19, 18)),
+        before_command_drain_error: None,
+        after_command_drain: Some(synthetic_extension_owner_readback(disable_sequence, 20, 19)),
+        after_command_drain_error: None,
+        terminal: false,
+    }
+}
+
+#[test]
+fn operator_panic_extension_k2_rejects_worker_restart_and_unresolved_persisted_effects() {
+    let clean = synthetic_extension_k2_readback();
+    assert!(operator_panic_chrome_extension_terminal(&clean));
+
+    let mut restarted = clean.clone();
+    restarted
+        .after_command_drain
+        .as_mut()
+        .expect("synthetic after readback")
+        .worker_boot_id = "worker-restarted".to_owned();
+    assert!(!operator_panic_chrome_extension_terminal(&restarted));
+
+    let mut unresolved_restart = clean.clone();
+    let after = unresolved_restart
+        .after_command_drain
+        .as_mut()
+        .expect("synthetic after readback");
+    after.unresolved_worker_restart_mutation_count = 1;
+    after.owner_continuity_healthy = false;
+    assert!(!operator_panic_chrome_extension_terminal(
+        &unresolved_restart
+    ));
+
+    let mut persisted_in_flight = clean.clone();
+    persisted_in_flight
+        .after_command_drain
+        .as_mut()
+        .expect("synthetic after readback")
+        .persisted_in_flight_mutation = Some(serde_json::json!({ "kind": "initScript" }));
+    assert!(!operator_panic_chrome_extension_terminal(
+        &persisted_in_flight
+    ));
+
+    let mut executed_init_effect = clean;
+    executed_init_effect
+        .after_command_drain
+        .as_mut()
+        .expect("synthetic after readback")
+        .active_after
+        .executed_init_script_effect_unresolved_count = 1;
+    assert!(!operator_panic_chrome_extension_terminal(
+        &executed_init_effect
+    ));
+}
+
+#[tokio::test]
+async fn operator_panic_closed_extension_tabs_reconcile_only_exact_m1_owner_rows()
+-> anyhow::Result<()> {
+    let temp = TempDir::new()?;
+    let service = regression_service(temp.path());
+    let extension_endpoint = "chrome-extension://test/chrome.tabs";
+    let closed_target_id = "chrome-tab:42";
+    let remaining_target_id = "chrome-tab:43";
+    let closed_owner_key = service.register_cdp_target_owner(super::super::CdpTargetOwner {
+        session_id: "closed-owner-session".to_owned(),
+        window_hwnd: 0x4242,
+        endpoint: extension_endpoint.to_owned(),
+        chrome_window_id: Some(7),
+        capture_window_hwnd: None,
+        cdp_target_id: closed_target_id.to_owned(),
+        requested_url: "about:blank".to_owned(),
+        target_url: "about:blank".to_owned(),
+        created_at_unix_ms: 42,
+    })?;
+    let remaining_owner_key = service.register_cdp_target_owner(super::super::CdpTargetOwner {
+        session_id: "remaining-owner-session".to_owned(),
+        window_hwnd: 0x4343,
+        endpoint: extension_endpoint.to_owned(),
+        chrome_window_id: Some(7),
+        capture_window_hwnd: None,
+        cdp_target_id: remaining_target_id.to_owned(),
+        requested_url: "about:blank".to_owned(),
+        target_url: "about:blank".to_owned(),
+        created_at_unix_ms: 43,
+    })?;
+
+    let first = service
+        .reconcile_operator_panic_extension_target_owners(1, &[(42, closed_target_id.to_owned())])
+        .await;
+    assert!(
+        !first.terminal,
+        "an extension owner row without a physical-close pair must remain visible and fail closed"
+    );
+    assert_eq!(first.targets.len(), 1);
+    assert!(first.targets[0].terminal);
+    assert!(first.targets[0].memory_owner_keys_after.is_empty());
+    assert!(first.targets[0].persisted_owner_keys_after.is_empty());
+    assert!(
+        first
+            .remaining_extension_memory_owner_keys
+            .contains(&remaining_owner_key)
+    );
+    assert!(
+        first
+            .remaining_extension_persisted_owner_keys
+            .contains(&remaining_owner_key)
+    );
+    assert!(
+        !first
+            .remaining_extension_memory_owner_keys
+            .contains(&closed_owner_key)
+    );
+    assert!(
+        service
+            .read_persisted_cdp_target_owners_for_target_id(closed_target_id)?
+            .is_empty(),
+        "separate CF_SESSIONS readback must prove the physically closed target row absent"
+    );
+    assert_eq!(
+        service
+            .read_persisted_cdp_target_owners_for_target_id(remaining_target_id)?
+            .len(),
+        1,
+        "a target without a physical-close pair must retain its persisted owner row"
+    );
+
+    let structurally_invalid = service
+        .reconcile_operator_panic_extension_target_owners(
+            1,
+            &[(99, remaining_target_id.to_owned())],
+        )
+        .await;
+    assert!(!structurally_invalid.terminal);
+    assert!(!structurally_invalid.targets[0].failures.is_empty());
+    assert_eq!(
+        service
+            .read_persisted_cdp_target_owners_for_target_id(remaining_target_id)?
+            .len(),
+        1,
+        "a structurally inconsistent close pair must never delete an owner row"
+    );
+
+    let second = service
+        .reconcile_operator_panic_extension_target_owners(
+            1,
+            &[(43, remaining_target_id.to_owned())],
+        )
+        .await;
+    assert!(second.terminal);
+    assert!(second.remaining_extension_memory_owner_keys.is_empty());
+    assert!(second.remaining_extension_persisted_owner_keys.is_empty());
+    Ok(())
+}
+
+#[test]
+fn respawn_outer_spawn_guard_rejects_original_panic_after_exact_finalization() {
+    let _serial = crate::test_support::lease_serial("respawn_outer_spawn_guard_serial");
+    synapse_action::isolate_interrupt_epochs_for_test();
+    let before = super::super::m4_tools::agent_spawn_activity_readback();
+    let outer = super::super::m4_tools::AgentSpawnInFlightGuard::enter(
+        "deterministic_respawn_outer_guard_test",
+    )
+    .expect("respawn outer guard should arm before the synthetic panic");
+    let armed = super::super::m4_tools::agent_spawn_activity_readback();
+    assert_eq!(armed.sequence, before.sequence.saturating_add(1));
+    assert_eq!(armed.in_flight, before.in_flight.saturating_add(1));
+
+    // Model the historical race precisely: panic fires while respawn is busy
+    // killing its prior process, and K2 reaches exact finalization before the
+    // replacement-spawn call. Pending is false again, but the entry epoch must
+    // remain permanently poisoned for this respawn operation.
+    let mut token = synapse_action::request_operator_panic_interrupt();
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut token
+    ));
+    let synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) =
+        synapse_action::complete_operator_panic_safety_generation(token)
+            .unwrap_or_else(|detail| panic!("complete synthetic respawn panic: {detail}"))
+    else {
+        panic!("isolated synthetic respawn panic must own finalization");
+    };
+    assert!(synapse_action::finish_operator_panic_safety_finalization(
+        finalization,
+        true
+    ));
+    assert!(!synapse_action::operator_panic_safety_pending());
+
+    let error = outer
+        .ensure("respawn_immediately_before_replacement_spawn")
+        .expect_err("the original panic epoch must reject a fresh replacement launch");
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("detail_code"))
+            .and_then(Value::as_str),
+        Some("AGENT_SPAWN_OPERATOR_PANIC_PREARMED")
+    );
+    drop(outer);
+    let after = super::super::m4_tools::agent_spawn_activity_readback();
+    assert_eq!(after.in_flight, before.in_flight);
+}
+
+#[test]
+fn operator_panic_k2_accepts_exact_or_intermediate_newer_tagged_operator_lease() {
+    let operator_lease = synapse_action::LeaseStatus {
+        held: true,
+        owner_session_id: Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID.to_owned()),
+        acquired_at_ms_ago: Some(0),
+        renewed_at_ms_ago: Some(0),
+        ttl_ms: Some(synapse_action::OPERATOR_PREEMPT_LEASE_TTL_MS),
+        expires_in_ms: Some(synapse_action::OPERATOR_PREEMPT_LEASE_TTL_MS),
+    };
+
+    assert!(operator_panic_k2_lease_retained(
+        1,
+        3,
+        Some(1),
+        &operator_lease
+    ));
+    assert!(
+        operator_panic_k2_lease_retained(1, 3, Some(2), &operator_lease),
+        "a third published panic must not invalidate the second K1 lease while the first K2 completes"
+    );
+    assert!(!operator_panic_k2_lease_retained(
+        2,
+        3,
+        Some(1),
+        &operator_lease
+    ));
+    assert!(!operator_panic_k2_lease_retained(
+        1,
+        3,
+        Some(4),
+        &operator_lease
+    ));
+
+    let mut agent_lease = operator_lease;
+    agent_lease.owner_session_id = Some("agent-session".to_owned());
+    assert!(!operator_panic_k2_lease_retained(
+        1,
+        3,
+        Some(2),
+        &agent_lease
+    ));
+}
 
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -114,17 +511,17 @@ fn process_readback_of_dead_pid_reports_no_live_processes() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_for_tree_exit_returns_immediately_for_empty_tree() {
     let (remaining, waited) = wait_for_tree_exit_async(&[], 5_000).await;
     assert!(remaining.is_empty(), "no pids means nothing remains alive");
-    assert!(
-        waited < 1_000,
-        "an already-empty tree must not burn the grace window, waited {waited}ms"
+    assert_eq!(
+        waited, 0,
+        "an already-empty tree must return without advancing the Tokio deadline"
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn wait_for_tree_exit_reports_survivors_after_grace() {
     // The current process is alive, so `owned_live_process_ids` reports it as a
     // survivor — proving the timeout path returns the still-live pid rather than
@@ -155,6 +552,7 @@ async fn operator_panic_empty_fleet_deletes_prior_lease_row_and_audits() -> anyh
     // reads once the service is built.
     let temp = TempDir::new()?;
     let service = regression_service(temp.path());
+    synapse_action::isolate_interrupt_epochs_for_test();
     let owner = "session-operator-panic-prior";
     let acquired = match synapse_action::lease::try_acquire(
         owner,
@@ -164,20 +562,34 @@ async fn operator_panic_empty_fleet_deletes_prior_lease_row_and_audits() -> anyh
         | synapse_action::LeaseOutcome::Renewed(status) => status,
         other => anyhow::bail!("owner lease acquire failed unexpectedly: {other:?}"),
     };
-    // Match the real hotkey's K1 ordering: snapshot and preempt the live lease
-    // immediately. The previous test performed a synchronous RocksDB write
-    // between acquire and this snapshot; under a saturated full suite that
-    // setup write could consume the entire 5 s synthetic TTL, so `status()`
-    // correctly expired the lease and `force_preempt` returned None (#1617).
-    let lease_before = synapse_action::lease::status();
-    let preempted_lease = synapse_action::force_preempt_input_lease("operator_panic_test");
+    // Preserve the exact successful-acquire readback as K1's synthetic
+    // `lease_before`, then preempt immediately. Calling `status()` here made
+    // this setup depend on scheduler wall time: a >5 s deschedule could expire
+    // the test lease before the preemption even though no parallel writer had
+    // touched its isolated cell (#1617). The behavior under test derives the
+    // prior owner from `preempted_lease`, not from a second status read.
+    let lease_before = acquired.clone();
+    let mut operator_panic_token = synapse_action::request_operator_panic_interrupt();
+    let operator_panic_generation = operator_panic_token.generation();
+    let preempted_lease = synapse_action::force_preempt_input_lease_for_operator_panic(
+        "operator_panic_test",
+        operator_panic_generation,
+    );
     let lease_after_preempt = synapse_action::lease::status();
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut operator_panic_token
+    ));
     assert_eq!(lease_before.owner_session_id.as_deref(), Some(owner));
     assert_eq!(
         preempted_lease
             .as_ref()
             .and_then(|status| status.owner_session_id.as_deref()),
         Some(owner)
+    );
+    assert_eq!(
+        lease_after_preempt.owner_session_id.as_deref(),
+        Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID),
+        "the isolated K1 cell must expose the operator handoff"
     );
 
     // The K2 trigger below still reads and deletes a real CF_SESSIONS row. Its
@@ -188,6 +600,7 @@ async fn operator_panic_empty_fleet_deletes_prior_lease_row_and_audits() -> anyh
         .map_err(|error| anyhow::anyhow!("persist lease failed: {}", error.message))?;
     let immediate = OperatorHotkeyImmediateReport {
         hotkey: synapse_action::hotkey::DEFAULT_OPERATOR_HOTKEY,
+        operator_panic_generation,
         lease_before,
         preempted_lease,
         lease_after_preempt,
@@ -198,20 +611,51 @@ async fn operator_panic_empty_fleet_deletes_prior_lease_row_and_audits() -> anyh
             detail: None,
         },
         release_all_report: ReleaseAllReport {
-            result: "missing_handle",
-            error_code: Some(error_codes::ACTION_BACKEND_UNAVAILABLE),
-            detail: Some("synthetic no release handle in unit test".to_owned()),
+            result: "ok",
+            error_code: None,
+            detail: None,
         },
+        durable_browser_mutation_owners_after_disable:
+            synapse_a11y::durable_browser_mutation_owners_disable_now(),
+        release_all_elapsed_ms: 1,
         elapsed_ms: 1,
         within_budget: true,
+        k1_safety_terminal: true,
     };
 
-    let response = service
-        .operator_panic_kill_all(immediate)
-        .await
+    let response_result = service.operator_panic_kill_all(immediate).await;
+    let lease_after_k2 = synapse_action::lease::status();
+    let synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) =
+        synapse_action::complete_operator_panic_safety_generation(operator_panic_token)
+            .map_err(|detail| anyhow::anyhow!("complete synthetic panic: {detail}"))?
+    else {
+        anyhow::bail!("isolated synthetic panic must own finalization");
+    };
+    let _cleared = synapse_action::force_clear_operator_panic_input_lease_generation(
+        operator_panic_generation,
+        "operator_panic_empty_fleet_test_cleanup",
+    );
+    assert!(
+        !synapse_action::finish_operator_panic_safety_finalization(finalization, true),
+        "the deliberately unavailable extension readback must leave a sticky fail-closed incident"
+    );
+    let browser_owner_disabled = synapse_a11y::durable_browser_mutation_owners_readback();
+    let browser_owner_reset = synapse_a11y::durable_browser_mutation_owners_enable_if_unchanged(
+        browser_owner_disabled.disable_sequence,
+    )
+    .await;
+    assert!(browser_owner_reset.enabled);
+    let response = response_result
         .map_err(|error| anyhow::anyhow!("operator panic failed: {}", error.message))?;
 
-    assert!(response.all_stopped, "empty fleet should stop vacuously");
+    assert!(
+        !response.all_stopped,
+        "an empty process fleet must still fail closed when no real extension owner cleanup/readback was available"
+    );
+    assert!(
+        !response.chrome_extension_mutation_owners.terminal,
+        "K2 must not synthesize an empty extension-owner verdict without the real extension"
+    );
     assert_eq!(
         response.prior_lease_owner_session_id.as_deref(),
         Some(owner)
@@ -223,9 +667,22 @@ async fn operator_panic_empty_fleet_deletes_prior_lease_row_and_audits() -> anyh
     assert!(cleanup.row_existed_before);
     assert!(cleanup.row_deleted);
     assert!(!cleanup.row_exists_after);
-    assert!(
-        !synapse_action::lease::status().held,
-        "operator panic must release the operator lease after K2"
+    assert_eq!(lease_after_k2.held, response.lease_after.held);
+    assert_eq!(
+        lease_after_k2.owner_session_id,
+        response.lease_after.owner_session_id
+    );
+    assert_eq!(
+        response
+            .final_safety_sweep
+            .as_ref()
+            .and_then(|sweep| sweep.operator_lease_generation_after),
+        Some(operator_panic_generation)
+    );
+    assert_eq!(
+        lease_after_k2.owner_session_id.as_deref(),
+        Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID),
+        "K2 must retain the tagged operator lease for the unique finalizer"
     );
 
     let audit = service
@@ -240,6 +697,7 @@ async fn operator_panic_empty_fleet_deletes_prior_lease_row_and_audits() -> anyh
         operator_rows >= 2,
         "operator panic must write intent+final command-audit rows, found {operator_rows}"
     );
+    synapse_action::isolate_interrupt_epochs_for_test();
     Ok(())
 }
 
@@ -545,7 +1003,7 @@ fn journal_count_kind(db: &Db, session_id: &str, kind: AgentEventKind) -> usize 
 }
 
 #[tokio::test]
-#[ignore = "real-process FSV: force-kills a real OS process within a host-load-sensitive 5s confirmation budget; run with `cargo test -p synapse-mcp -- --ignored`"]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: force-kills a real OS process within a host-load-sensitive 5s confirmation budget; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn agent_kill_terminates_real_process_tree_and_journals_killed() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());
@@ -626,7 +1084,7 @@ async fn agent_kill_terminates_real_process_tree_and_journals_killed() {
 }
 
 #[tokio::test]
-#[ignore = "real-process FSV: force-kills a real OS process within a host-load-sensitive 5s confirmation budget; run with `cargo test -p synapse-mcp -- --ignored`"]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: force-kills a real OS process within a host-load-sensitive 5s confirmation budget; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn agent_kill_resolves_restart_rebuilt_spawn_from_agent_state() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());
@@ -802,7 +1260,7 @@ fn restart_kill_completion_artifact_overwrites_wrapper_fallback_race() {
 }
 
 #[tokio::test]
-#[ignore = "real-process FSV: force-kills a real OS process within a host-load-sensitive 5s confirmation budget; run with `cargo test -p synapse-mcp -- --ignored`"]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: force-kills a real OS process within a host-load-sensitive 5s confirmation budget; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn agent_kill_is_idempotent_double_kill_reports_already_dead() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());
@@ -911,7 +1369,7 @@ async fn agent_kill_unknown_session_errors_structurally() {
 }
 
 // ---------------------------------------------------------------------------
-// agent_steer (#905) — deterministic param coverage + real-process FSV
+// agent_steer (#905) — deterministic param coverage + supporting real-process evidence
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -977,7 +1435,7 @@ async fn steer_rejects_empty_and_oversized_instruction_before_resolution() {
 }
 
 #[tokio::test]
-#[ignore = "real-process FSV: spawns a real OS process victim; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: spawns a real OS process victim; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn agent_steer_delivers_cooperative_mailbox_and_journals_message_sent() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());
@@ -1087,7 +1545,7 @@ async fn agent_steer_delivers_cooperative_mailbox_and_journals_message_sent() {
 }
 
 // ---------------------------------------------------------------------------
-// agent_pause / agent_resume (#906) — deterministic param coverage + FSV
+// agent_pause / agent_resume (#906) — deterministic param coverage + supporting regression evidence
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1342,7 +1800,7 @@ fn respawn_manifest_invalid_working_dir_errors_before_spawn() {
 }
 
 #[tokio::test]
-#[ignore = "real-process FSV: registers a real spawned victim to exercise manifest reconstruction; run with `cargo test -p synapse-mcp -- --ignored`"]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: registers a real spawned victim to exercise manifest reconstruction; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn respawn_plan_reconstructs_identity_from_physical_manifest() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());
@@ -1423,7 +1881,7 @@ async fn respawn_plan_reconstructs_identity_from_physical_manifest() {
 }
 
 #[tokio::test]
-#[ignore = "real-process FSV: suspends/resumes a real OS process and reads the thread table back; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: suspends/resumes a real OS process and reads the thread table back; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn agent_pause_resume_freezes_real_process_tree_and_is_idempotent() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());
@@ -1536,7 +1994,7 @@ async fn agent_pause_resume_freezes_real_process_tree_and_is_idempotent() {
 }
 
 #[tokio::test]
-#[ignore = "real-process FSV: spawns a real OS process victim; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: spawns a real OS process victim; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn agent_interrupt_delivers_cooperative_mailbox_and_journals_interrupted() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());
@@ -1623,7 +2081,7 @@ async fn agent_interrupt_delivers_cooperative_mailbox_and_journals_interrupted()
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-#[ignore = "real-process FSV: force-kills three real OS processes and asserts a host-load-sensitive 10s budget; run with `cargo test -p synapse-mcp -- --ignored`"]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: force-kills three real OS processes and asserts a host-load-sensitive 10s budget; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn fleet_stop_kill_terminates_every_live_agent() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());
@@ -1735,7 +2193,7 @@ async fn fleet_stop_empty_fleet_is_honest_noop() {
 }
 
 #[tokio::test]
-#[ignore = "real-process FSV: spawns/force-kills real OS process victims; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: spawns/force-kills real OS process victims; host-load-sensitive; run with `cargo test -p synapse-mcp -- --ignored`"]
 async fn fleet_stop_filters_by_agent_kind() {
     let temp = TempDir::new().expect("temp dir");
     let service = regression_service(temp.path());

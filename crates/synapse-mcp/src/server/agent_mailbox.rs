@@ -2640,7 +2640,8 @@ mod tests {
         assert_eq!(response.delivered_count, 3);
         assert_eq!(response.skipped_count, 0);
 
-        // FSV: each recipient has exactly one physical row; sender has none.
+        // Supporting regression readback: each recipient has exactly one
+        // physical row; sender has none. Manual FSV remains separate.
         for who in ["a", "b", "c"] {
             let inbox = service.agent_inbox_impl_at(inbox_params(false, &[]), who, now + 1)?;
             assert_eq!(inbox.returned_count, 1, "recipient {who}");

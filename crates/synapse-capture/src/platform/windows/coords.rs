@@ -9,7 +9,7 @@ use crate::CaptureError;
 use super::common::hwnd_from_i64;
 
 pub fn screen_to_window(point: Point, hwnd: i64) -> Result<Point, CaptureError> {
-    let hwnd = hwnd_from_i64(hwnd);
+    let hwnd = hwnd_from_i64(hwnd)?;
     let mut raw = POINT {
         x: point.x,
         y: point.y,
@@ -24,7 +24,7 @@ pub fn screen_to_window(point: Point, hwnd: i64) -> Result<Point, CaptureError> 
 }
 
 pub fn window_to_screen(point: Point, hwnd: i64) -> Result<Point, CaptureError> {
-    let hwnd = hwnd_from_i64(hwnd);
+    let hwnd = hwnd_from_i64(hwnd)?;
     let mut raw = POINT {
         x: point.x,
         y: point.y,

@@ -1160,9 +1160,10 @@ mod tests {
             .oldest_returned_ts_ns
             .expect("a newest-first page with returned rows must expose its oldest-ts anchor");
 
-        // Full State Verification of the documented resume: `has_older` promises the
-        // caller can page further back by windowing with `end_ts_ns`. Prove that is
-        // actionable (not a dead end) by actually retrieving the one remaining older
+        // Supporting regression readback for the documented resume: `has_older`
+        // promises the caller can page further back by windowing with
+        // `end_ts_ns`. Verify that is actionable (not a dead end) by actually
+        // retrieving the one remaining older
         // match straight from the real on-disk CF_ACTION_LOG.
         let older_page = service
             .command_audit_query(CommandAuditQueryParams {

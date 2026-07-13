@@ -67,7 +67,8 @@ const ASSIST_PLAN_RECORD_VERSION: u32 = 1;
 const ENGINE_VERSION_DEFAULTS: &str = "see SuggestionConfig::from_env";
 
 /// Engine knobs. Defaults are deliberately conservative (anti-Clippy);
-/// every one is overridable by env so the gates are FSV-testable.
+/// every one is overridable by env so supporting regression checks and manual
+/// verification can use deterministic thresholds.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SuggestionConfig {
     /// Minimum intent confidence to surface (default 0.6).
@@ -171,6 +172,7 @@ pub struct AssistMitigation {
     pub source_event_id: String,
     pub detector: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub target_window_hwnd: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_pid: Option<u32>,
@@ -579,6 +581,12 @@ fn assist_candidate_from_event(
         .clamp(0.0, 1.0);
     let window = event.data.get("window").unwrap_or(&Value::Null);
     let target_window_hwnd = window.get("hwnd").and_then(Value::as_i64);
+    if let Some(hwnd) = target_window_hwnd {
+        validate_stored_assist_target_hwnd(
+            &format!("CF_EVENTS assist row {}", event.event_id),
+            hwnd,
+        )?;
+    }
     let target_pid = window
         .get("pid")
         .and_then(Value::as_u64)
@@ -632,6 +640,28 @@ fn assist_candidate_from_event(
         remaining_step_count: 1,
         mitigation,
     }))
+}
+
+pub(crate) fn validate_stored_assist_target_hwnd(
+    record_ref: &str,
+    hwnd: i64,
+) -> Result<i64, ErrorData> {
+    if crate::m1::window_hwnd_shape_is_canonical(hwnd) {
+        return Ok(hwnd);
+    }
+    tracing::error!(
+        code = error_codes::STORAGE_CORRUPTED,
+        source_of_truth = record_ref,
+        field = "target_window_hwnd",
+        actual_value = hwnd,
+        accepted_range = "1..=u32::MAX",
+        remediation = "remove or repair the corrupt assist event/suggestion row and regenerate it from a live canonical window readback",
+        "stored assist target contains a noncanonical HWND"
+    );
+    Err(mcp_error(
+        error_codes::STORAGE_CORRUPTED,
+        format!("{record_ref} has noncanonical target_window_hwnd={hwnd}; expected 1..=4294967295"),
+    ))
 }
 
 fn load_recent_assist_opportunities(
@@ -1472,6 +1502,7 @@ pub struct SuggestionAcceptParams {
     /// use the MCP session's existing CDP/window target; if neither exists, the
     /// step is refused with evidence instead of using the human foreground.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub browser_window_hwnd: Option<i64>,
     /// Timeout applied to launch-window/postcondition waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1524,6 +1555,23 @@ mod tests {
     use super::*;
     use synapse_core::SCHEMA_VERSION;
     use synapse_storage::Db;
+
+    #[test]
+    fn stored_assist_target_enforces_canonical_hwnd_before_native_readback() {
+        for invalid in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let error = validate_stored_assist_target_hwnd("CF_KV suggestion row test", invalid)
+                .expect_err("noncanonical stored HWND must be classified as corruption");
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data.get("code")),
+                Some(&serde_json::json!(error_codes::STORAGE_CORRUPTED))
+            );
+        }
+        assert_eq!(
+            validate_stored_assist_target_hwnd("CF_KV suggestion row test", i64::from(u32::MAX),)
+                .expect("u32::MAX is a canonical HWND wire value"),
+            i64::from(u32::MAX)
+        );
+    }
 
     fn config() -> SuggestionConfig {
         SuggestionConfig {

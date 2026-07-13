@@ -2,10 +2,19 @@
 
 Date: 2026-06-24T17:43:32.3755181-05:00
 Issue: https://github.com/ChrisRoyse/Synapse/issues/994
+
+> **Current D1 classification (2026-07-13):** The renamed script referenced
+> below is supporting diagnostic automation only; it does not perform or accept
+> FSV. Its output was not, and is not now, sufficient by itself for acceptance.
+> The historical transcript values remain evidence from the separately observed
+> manual run. Current acceptance requires an agent to use the strict production
+> MCP client and independently read each physical Source of Truth before and
+> after every manual trigger.
+
 Command:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fsv\issue-994-human-active-target-isolation.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\diagnostics\issue-994-human-active-target-isolation-diagnostic.ps1
 ```
 
 ## Result

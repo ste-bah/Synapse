@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use synapse_core::{Rect, UiaPattern};
+use synapse_core::{Rect, UiaPattern, win32_hwnd::hwnd_to_wire};
 use uiautomation::{
     UIAutomation, UIElement,
     core::UICacheRequest,
@@ -546,7 +546,7 @@ fn control_type_name(control_type: ControlType) -> String {
 pub(super) fn cached_hwnd(element: &UIElement) -> Option<i64> {
     let handle = element.get_cached_native_window_handle().ok()?;
     let raw: isize = handle.into();
-    Some(raw as i64)
+    Some(hwnd_to_wire(raw))
 }
 
 pub(super) fn non_empty(value: String) -> Option<String> {
@@ -671,11 +671,6 @@ fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
 #[allow(clippy::needless_pass_by_value)]
 pub(super) fn map_uia_error(err: uiautomation::Error) -> A11yError {
     A11yError::internal(err.to_string())
-}
-
-#[allow(clippy::missing_const_for_fn)]
-fn _hwnd_from_i64(hwnd: i64) -> HWND {
-    HWND(hwnd as *mut c_void)
 }
 
 #[cfg(test)]

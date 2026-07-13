@@ -407,7 +407,7 @@ const fn context(elapsed_ms: u64, events: &[Event], cancelled: bool) -> HoldLife
 
 fn drain(rx: &mut mpsc::Receiver<synapse_action::ActionMessage>) -> Vec<Action> {
     let mut actions = Vec::new();
-    while let Ok((action, _ack)) = rx.try_recv() {
+    while let Ok((action, _ack, _operator_panic_epoch_at_enqueue)) = rx.try_recv() {
         actions.push(action);
     }
     actions
@@ -419,7 +419,7 @@ fn wait_for_action(
 ) -> Result<Action, Box<dyn std::error::Error>> {
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     loop {
-        while let Ok((action, _ack)) = rx.try_recv() {
+        while let Ok((action, _ack, _operator_panic_epoch_at_enqueue)) = rx.try_recv() {
             if predicate(&action) {
                 return Ok(action);
             }

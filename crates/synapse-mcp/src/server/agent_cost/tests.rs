@@ -260,7 +260,8 @@ fn price_put_list_delete_roundtrip_physical_rows() {
     assert_eq!(put.price.cache_read_micro_usd_per_mtok, 300_000);
     assert_eq!(put.price.cache_creation_micro_usd_per_mtok, 3_750_000);
 
-    // FSV: the row physically exists under the expected key and decodes back.
+    // Supporting regression readback: the row physically exists under the
+    // expected key and decodes back. Manual FSV remains separate.
     let key = price_row_key("claude-fable-5");
     let stored = get_exact_kv_row(&db, &key)
         .expect("read")
@@ -809,9 +810,10 @@ fn empty_store_yields_zero_rollup() {
 }
 
 // ---------------------------------------------------------------------------
-// End-to-end FSV against the REAL captured CLI fixtures (no synthetic usage).
-// Ingest through the real #900 parser, then reconcile agent_cost against the
-// physical rows and the CLI's own reported cost.
+// End-to-end supporting integration evidence against REAL captured CLI
+// fixtures (no synthetic usage). Ingest through the real #900 parser, then
+// reconcile agent_cost against the physical rows and the CLI's own reported
+// cost. Manual FSV remains separate.
 // ---------------------------------------------------------------------------
 
 fn plant_spawn_dir(root: &Path, spawn_id: &str, source: TranscriptSource, stdout: &str) -> PathBuf {
@@ -858,12 +860,12 @@ fn authoritative_row(db: &Db, spawn_id: &str, want_kind_prefix: &str) -> AgentTr
 }
 
 #[test]
-fn fsv_claude_real_fixture_multi_model_attribution_reconciles_to_zero() {
+fn real_fixture_claude_multi_model_attribution_reconciles_to_zero() {
     let temp = TempDir::new().expect("tempdir");
     let service = service_with_db(temp.path());
     let db = db_of(&service);
     let root = TempDir::new().expect("spawn root");
-    let spawn = "agent-spawn-claudefsv";
+    let spawn = "agent-spawn-claude-regression";
 
     // 1. Ingest the REAL Claude capture through the production #900 parser.
     let log_dir = plant_spawn_dir(
@@ -909,7 +911,7 @@ fn fsv_claude_real_fixture_multi_model_attribution_reconciles_to_zero() {
     assert_eq!(haiku.input_tokens, 1246);
     assert_eq!(haiku.cost_micro_usd, Some(1_331)); // $0.001331
     println!(
-        "FSV[claude] modelUsage: fable={:?} haiku={:?} top_level_cc_1h={:?} session_cost_micro={:?}",
+        "supporting_regression[claude] modelUsage: fable={:?} haiku={:?} top_level_cc_1h={:?} session_cost_micro={:?}",
         fable.cost_micro_usd,
         haiku.cost_micro_usd,
         usage.cache_creation_1h_input_tokens,
@@ -976,7 +978,7 @@ fn fsv_claude_real_fixture_multi_model_attribution_reconciles_to_zero() {
     };
     assert_eq!(haiku_computed, 1_331);
     println!(
-        "FSV[claude] computed_micro={computed} source_reported_micro={:?} delta_micro={:?} (fable={fable_computed} + haiku={haiku_computed})",
+        "supporting_regression[claude] computed_micro={computed} source_reported_micro={:?} delta_micro={:?} (fable={fable_computed} + haiku={haiku_computed})",
         s.source_reported_micro_usd, s.reconciliation_delta_micro_usd
     );
 
@@ -985,7 +987,7 @@ fn fsv_claude_real_fixture_multi_model_attribution_reconciles_to_zero() {
 }
 
 #[test]
-fn fsv_claude_partial_pricing_surfaces_unpriced_side_model() {
+fn real_fixture_claude_partial_pricing_surfaces_unpriced_side_model() {
     // When the operator prices only the primary model, the sub-agent model is
     // honestly surfaced as unpriced and the delta exposes exactly its cost —
     // never hidden, never guessed.
@@ -1024,12 +1026,12 @@ fn fsv_claude_partial_pricing_surfaces_unpriced_side_model() {
 }
 
 #[test]
-fn fsv_codex_real_fixture_bills_cumulative_turn_with_cache_subtracted() {
+fn real_fixture_codex_bills_cumulative_turn_with_cache_subtracted() {
     let temp = TempDir::new().expect("tempdir");
     let service = service_with_db(temp.path());
     let db = db_of(&service);
     let root = TempDir::new().expect("spawn root");
-    let spawn = "agent-spawn-codexfsv";
+    let spawn = "agent-spawn-codex-regression";
 
     let log_dir = plant_spawn_dir(
         root.path(),
@@ -1050,7 +1052,7 @@ fn fsv_codex_real_fixture_bills_cumulative_turn_with_cache_subtracted() {
     assert_eq!(usage.cache_read_input_tokens, Some(103_296));
     assert_eq!(usage.output_tokens, Some(2_110));
     println!(
-        "FSV[codex] physical turn row: in={:?} cached={:?} out={:?} reasoning={:?}",
+        "supporting_regression[codex] physical turn row: in={:?} cached={:?} out={:?} reasoning={:?}",
         usage.input_tokens,
         usage.cache_read_input_tokens,
         usage.output_tokens,
@@ -1069,7 +1071,7 @@ fn fsv_codex_real_fixture_bills_cumulative_turn_with_cache_subtracted() {
     // No price set for this model -> honestly unpriced, tokens still counted.
     match &s.cost {
         CostOutcome::Unpriced { model_id } => {
-            println!("FSV[codex] unpriced model surfaced: {model_id}");
+            println!("supporting_regression[codex] unpriced model surfaced: {model_id}");
         }
         CostOutcome::Priced { .. } => panic!("model was not priced"),
     }
@@ -1077,7 +1079,7 @@ fn fsv_codex_real_fixture_bills_cumulative_turn_with_cache_subtracted() {
 }
 
 #[test]
-fn fsv_codex_real_fixture_priced_via_spawn_manifest_model() {
+fn real_fixture_codex_priced_via_spawn_manifest_model() {
     // The Codex `exec --json` stream carries no model id (#949 part 1). The
     // spawn manifest written at launch is the authoritative source; the ingester
     // seeds the cursor from it so every Codex row is stamped and priceable.
@@ -1106,7 +1108,8 @@ fn fsv_codex_real_fixture_priced_via_spawn_manifest_model() {
         "a real capture must parse fully"
     );
 
-    // FSV: the physical turn.completed row now carries the manifest model.
+    // Supporting regression readback: the physical turn.completed row now
+    // carries the manifest model. Manual FSV remains separate.
     let turn = authoritative_row(&db, spawn, "turn.completed");
     assert_eq!(
         turn.model.as_deref(),
@@ -1114,7 +1117,7 @@ fn fsv_codex_real_fixture_priced_via_spawn_manifest_model() {
         "manifest model must be stamped onto Codex rows"
     );
     println!(
-        "FSV[codex] manifest-stamped model on physical row: {:?}",
+        "supporting_regression[codex] manifest-stamped model on physical row: {:?}",
         turn.model
     );
 
@@ -1148,7 +1151,7 @@ fn fsv_codex_real_fixture_priced_via_spawn_manifest_model() {
             assert_eq!(cost.cache_read_micro_usd, 12_912);
             assert_eq!(cost.total_micro_usd, 85_808);
             println!(
-                "FSV[codex] priced via manifest model: total_micro={}",
+                "supporting_regression[codex] priced via manifest model: total_micro={}",
                 cost.total_micro_usd
             );
         }
@@ -1532,7 +1535,7 @@ fn per_template_rollup_reconciles_and_buckets_unattributed() {
         "per_template must reconcile with fleet"
     );
     println!(
-        "FSV[per_template] rev={} unattributed={} fleet={} (reconciles)",
+        "supporting_regression[per_template] rev={} unattributed={} fleet={} (reconciles)",
         rev.computed_micro_usd, resid.computed_micro_usd, out.fleet.computed_micro_usd
     );
 }
@@ -1601,7 +1604,7 @@ fn per_task_rollup_groups_by_task_and_carries_template() {
         "per_task must reconcile with fleet"
     );
     println!(
-        "FSV[per_task] alpha={} beta={} unattributed={} fleet={} (reconciles)",
+        "supporting_regression[per_task] alpha={} beta={} unattributed={} fleet={} (reconciles)",
         alpha.computed_micro_usd,
         beta.computed_micro_usd,
         resid.computed_micro_usd,
@@ -1741,7 +1744,7 @@ fn per_template_surfaces_unpriced_model_and_counts_incomplete() {
     let summed: u64 = groups.iter().map(|g| g.computed_micro_usd).sum();
     assert_eq!(summed, out.fleet.computed_micro_usd);
     println!(
-        "FSV[per_template unpriced] rev.computed={} unpriced_models={:?}",
+        "supporting_regression[per_template unpriced] rev.computed={} unpriced_models={:?}",
         rev.computed_micro_usd, rev.unpriced_models
     );
 }

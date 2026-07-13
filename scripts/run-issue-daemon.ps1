@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Start a manual/issue FSV Synapse daemon from a copied dev binary.
+  Start an issue-diagnostic Synapse daemon from a copied dev binary.
 
 .DESCRIPTION
   Windows locks a running executable. Running
@@ -53,7 +53,7 @@ param(
     [string]$DbPath = "$env:LOCALAPPDATA\synapse\db-issue-daemon",
     [string]$ProfileDir = "$env:USERPROFILE\.cargo\bin\profiles",
     [string]$RunRoot = "$env:LOCALAPPDATA\synapse\codex-run",
-    [string]$RunLabel = 'issue-fsv',
+    [string]$RunLabel = 'issue-diagnostic',
     [string]$LogLevel = 'info',
     [ValidateRange(1, 120)][int]$StartupTimeoutSeconds = 15,
     [switch]$SkipBuild,
@@ -224,7 +224,7 @@ Assert-LocalPath -Name 'SourceExe' -Path $sourceExe
 $runRootFull = Resolve-NewPath $RunRoot
 Assert-LocalPath -Name 'RunRoot' -Path $runRootFull
 $safeLabel = ($RunLabel -replace '[^A-Za-z0-9_.-]', '_').Trim('._-')
-if ([string]::IsNullOrWhiteSpace($safeLabel)) { $safeLabel = 'issue-fsv' }
+if ([string]::IsNullOrWhiteSpace($safeLabel)) { $safeLabel = 'issue-diagnostic' }
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
 $runDir = Join-Path $runRootFull $safeLabel
 $runExe = Join-Path $runDir "synapse-mcp-$safeLabel-$stamp.exe"
@@ -297,7 +297,7 @@ $readback = [ordered]@{
     log_note = 'daemon stdout/stderr are not redirected by this helper so caller stream captures do not hang on long-lived child handles; use db/event logs for runtime diagnostics'
     readback_path = (Join-Path $runDir "synapse-mcp-$safeLabel-$stamp.readback.json")
     command_line = $procRow.CommandLine
-    remediation = 'Stop this exact PID when the issue FSV daemon is no longer needed; do not kill terminal or IDE processes.'
+    remediation = 'Stop this exact PID when the issue-diagnostic daemon is no longer needed; do not kill terminal or IDE processes.'
 }
 
 $readbackJson = $readback | ConvertTo-Json -Depth 8

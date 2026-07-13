@@ -173,7 +173,7 @@ const fn mouse_button(action: ButtonAction) -> Action {
 
 fn drain(rx: &mut mpsc::Receiver<ActionMessage>) -> Vec<Action> {
     let mut actions = Vec::new();
-    while let Ok((action, _ack)) = rx.try_recv() {
+    while let Ok((action, _ack, _operator_panic_epoch_at_enqueue)) = rx.try_recv() {
         actions.push(action);
     }
     actions

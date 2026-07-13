@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use synapse_core::{ElementId, Rect};
+use synapse_core::{ElementId, Rect, win32_hwnd::hwnd_from_wire};
 use uiautomation::{
     UIAutomation, UIElement,
     patterns::{
@@ -69,8 +69,12 @@ pub(super) fn re_resolve_on_worker(
     let parts = id.parts().map_err(|err| A11yError::InvalidElementId {
         detail: err.to_string(),
     })?;
-    let hwnd = isize::try_from(parts.hwnd).map_err(|err| A11yError::InvalidElementId {
-        detail: err.to_string(),
+    let hwnd = hwnd_from_wire(parts.hwnd).ok_or_else(|| A11yError::InvalidElementId {
+        detail: format!(
+            "element id contains non-canonical hwnd {}; expected 1..={}",
+            parts.hwnd,
+            u32::MAX
+        ),
     })?;
     if let Some(found) = find_by_runtime_id_hex(
         automation,

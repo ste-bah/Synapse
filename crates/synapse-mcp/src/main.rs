@@ -58,6 +58,7 @@ mod connect;
 mod daemon_lifecycle;
 mod desktop_worker;
 mod doctor;
+mod emitter_shutdown;
 mod http;
 mod local_agent;
 mod m1;
@@ -81,11 +82,21 @@ use synapse_telemetry::{TelemetryConfig, TelemetryGuard, init_tracing};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::filter::LevelFilter;
 
-use crate::server::SynapseService;
 use crate::stdio_eof::CancelOnEofRead;
+use crate::{
+    emitter_shutdown::{
+        M2EmitterDrainReport, M2EmitterOwner, ShutdownTaskOwner, drain_m2_emitter_owner,
+        take_m2_emitter_owner,
+    },
+    server::SynapseService,
+};
 
 const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
 const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
+const STDIO_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+type StdioServiceTask =
+    ShutdownTaskOwner<Result<rmcp::service::QuitReason, tokio::task::JoinError>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum Mode {
@@ -495,8 +506,441 @@ fn configure_telemetry_from_level(log_level: &str) -> anyhow::Result<TelemetryGu
     .context("initialize telemetry")
 }
 
+fn aggregate_stdio_shutdown_results(
+    reason: &'static str,
+    results: Vec<(&'static str, anyhow::Result<()>)>,
+) -> anyhow::Result<()> {
+    let failures = results
+        .into_iter()
+        .filter_map(|(phase, result)| result.err().map(|error| (phase, format!("{error:#}"))))
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let detail = failures
+        .iter()
+        .map(|(phase, error)| format!("{phase}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    tracing::error!(
+        code = "MCP_STDIO_SHUTDOWN_INCOMPLETE",
+        reason,
+        failure_count = failures.len(),
+        failures = ?failures,
+        "stdio shutdown completed all cleanup attempts but one or more physical postconditions failed"
+    );
+    use std::io::Write as _;
+    if let Err(stderr_error) = writeln!(
+        std::io::stderr().lock(),
+        "synapse-mcp stdio shutdown error: reason={reason} failures={detail}"
+    ) {
+        tracing::error!(
+            code = "MCP_STDIO_SHUTDOWN_STDERR_WRITE_FAILED",
+            reason,
+            error = %stderr_error,
+            "failed to write stdio shutdown failure to stderr"
+        );
+    }
+    anyhow::bail!("stdio shutdown incomplete ({reason}): {detail}")
+}
+
+fn inspect_stdio_service_task_join(
+    result: Result<
+        Result<rmcp::service::QuitReason, tokio::task::JoinError>,
+        tokio::task::JoinError,
+    >,
+    source: &'static str,
+) -> (bool, anyhow::Result<()>) {
+    match result {
+        Ok(Ok(rmcp::service::QuitReason::JoinError(error))) => {
+            // `waiting()` awaited the private rmcp JoinHandle, so the service
+            // task is terminal even though one of its owned send tasks failed.
+            (
+                true,
+                Err(anyhow::Error::new(error)).with_context(|| {
+                    format!("rmcp stdio service reported an internal join failure ({source})")
+                }),
+            )
+        }
+        Ok(Ok(reason)) => {
+            tracing::info!(
+                code = "MCP_STDIO_SERVICE_TASK_JOINED",
+                source,
+                quit_reason = ?reason,
+                "owned rmcp stdio service task reached a terminal join"
+            );
+            (true, Ok(()))
+        }
+        Ok(Err(error)) => {
+            // The private rmcp task was awaited and is terminal; preserve its
+            // failed JoinError in the process verdict without retaining locks
+            // for a task that no longer exists.
+            (
+                true,
+                Err(anyhow::Error::new(error))
+                    .with_context(|| format!("join rmcp stdio service task ({source})")),
+            )
+        }
+        Err(error) => {
+            // The outer owner failed before it could publish the result of
+            // `RunningService::waiting`. Its Drop can detach rmcp's private
+            // JoinHandle, so terminal ownership is unproven even if this outer
+            // JoinError itself is terminal.
+            (
+                false,
+                Err(anyhow::Error::new(error)).with_context(|| {
+                    format!("stdio service join owner failed before inner join readback ({source})")
+                }),
+            )
+        }
+    }
+}
+
+async fn stop_stdio_service_task_after_cancel(
+    service_task: &mut StdioServiceTask,
+    source: &'static str,
+) -> (bool, anyhow::Result<()>) {
+    match tokio::time::timeout(STDIO_SERVICE_STOP_TIMEOUT, &mut *service_task).await {
+        Ok(result) => inspect_stdio_service_task_join(result, source),
+        Err(_elapsed) => {
+            let detail = format!(
+                "rmcp stdio service did not reach an owned terminal join within {} ms after cancellation ({source}); retaining the live outer waiting() JoinHandle and daemon lifetime locks until process teardown so rmcp's private service-task owner is never detached",
+                STDIO_SERVICE_STOP_TIMEOUT.as_millis()
+            );
+            tracing::error!(
+                code = "MCP_STDIO_SERVICE_STOP_TIMEOUT",
+                source,
+                stop_timeout_ms = STDIO_SERVICE_STOP_TIMEOUT.as_millis(),
+                "rmcp stdio service-task ownership did not reach a trustworthy terminal state; retaining its exact outer owner"
+            );
+            (false, Err(anyhow::anyhow!(detail)))
+        }
+    }
+}
+
+const fn stdio_lifetime_locks_safe_to_close(
+    authority_safe_to_unlock: bool,
+    server_dispatch_quiescent: bool,
+    m2_emitter_safe: bool,
+    win_event_owners_quiescent: bool,
+    hotkey_owners_quiescent: bool,
+    k2_tasks_quiescent: bool,
+    desktop_worker_owners_quiescent: bool,
+    retained_shutdown_task_owners_quiescent: bool,
+    unresolved_shell_child_owners_quiescent: bool,
+    activity_recorder_retained_owners_quiescent: bool,
+) -> bool {
+    authority_safe_to_unlock
+        && server_dispatch_quiescent
+        && m2_emitter_safe
+        && win_event_owners_quiescent
+        && hotkey_owners_quiescent
+        && k2_tasks_quiescent
+        && desktop_worker_owners_quiescent
+        && retained_shutdown_task_owners_quiescent
+        && unresolved_shell_child_owners_quiescent
+        && activity_recorder_retained_owners_quiescent
+}
+
+fn close_stdio_lifetime_locks(
+    shell_job_store: crate::single_instance::ShellJobStoreLockGuard,
+    single_instance: crate::single_instance::SingleInstanceGuard,
+    authority_safe_to_unlock: bool,
+    server_dispatch_quiescent: bool,
+    m2_emitter_safe: bool,
+    win_event_owners_quiescent: bool,
+    hotkey_owners_quiescent: bool,
+    k2_tasks_quiescent: bool,
+    reason: &'static str,
+) -> anyhow::Result<()> {
+    let desktop_worker_owner_report = crate::desktop_worker::desktop_worker_retained_owner_report();
+    let desktop_worker_owners_quiescent = desktop_worker_owner_report.active_owner_count == 0;
+    let retained_shutdown_task_owner_report =
+        crate::emitter_shutdown::retained_shutdown_task_owner_report();
+    let retained_shutdown_task_owners_quiescent =
+        retained_shutdown_task_owner_report.safe_to_unlock();
+    let unresolved_shell_child_owner_report = crate::m4::unresolved_shell_child_owner_report();
+    let unresolved_shell_child_owners_quiescent =
+        unresolved_shell_child_owner_report.safe_to_unlock();
+    let activity_recorder_retained_owner_readback =
+        crate::m3::activity_recorder::retained_owner_readback();
+    let activity_recorder_retained_owners_quiescent =
+        activity_recorder_retained_owner_readback.safe_to_unlock();
+    if !stdio_lifetime_locks_safe_to_close(
+        authority_safe_to_unlock,
+        server_dispatch_quiescent,
+        m2_emitter_safe,
+        win_event_owners_quiescent,
+        hotkey_owners_quiescent,
+        k2_tasks_quiescent,
+        desktop_worker_owners_quiescent,
+        retained_shutdown_task_owners_quiescent,
+        unresolved_shell_child_owners_quiescent,
+        activity_recorder_retained_owners_quiescent,
+    ) {
+        tracing::error!(
+            code = "MCP_STDIO_LIFETIME_LOCKS_RETAINED",
+            reason,
+            authority_safe_to_unlock,
+            server_dispatch_quiescent,
+            m2_emitter_safe,
+            win_event_owners_quiescent,
+            hotkey_owners_quiescent,
+            k2_tasks_quiescent,
+            desktop_worker_owners_quiescent,
+            desktop_worker_owner_report = ?desktop_worker_owner_report,
+            retained_shutdown_task_owners_quiescent,
+            retained_shutdown_task_owner_report = ?retained_shutdown_task_owner_report,
+            unresolved_shell_child_owners_quiescent,
+            unresolved_shell_child_owner_report = ?unresolved_shell_child_owner_report,
+            activity_recorder_retained_owners_quiescent,
+            activity_recorder_retained_owner_readback = ?activity_recorder_retained_owner_readback,
+            "one or more stdio daemon task owners remained live; retaining both daemon lifetime locks until process teardown"
+        );
+        use std::io::Write as _;
+        if let Err(stderr_error) = writeln!(
+            std::io::stderr().lock(),
+            "synapse-mcp fatal shutdown error: reason={reason} authority_safe_to_unlock={authority_safe_to_unlock} server_dispatch_quiescent={server_dispatch_quiescent} m2_emitter_safe={m2_emitter_safe} win_event_owners_quiescent={win_event_owners_quiescent} hotkey_owners_quiescent={hotkey_owners_quiescent} k2_tasks_quiescent={k2_tasks_quiescent} desktop_worker_owners_quiescent={desktop_worker_owners_quiescent} desktop_worker_owner_report={desktop_worker_owner_report:?} retained_shutdown_task_owners_quiescent={retained_shutdown_task_owners_quiescent} retained_shutdown_task_owner_report={retained_shutdown_task_owner_report:?} unresolved_shell_child_owners_quiescent={unresolved_shell_child_owners_quiescent} unresolved_shell_child_owner_report={unresolved_shell_child_owner_report:?} activity_recorder_retained_owners_quiescent={activity_recorder_retained_owners_quiescent} activity_recorder_retained_owner_readback={activity_recorder_retained_owner_readback:?}; daemon lifetime locks retained until process teardown"
+        ) {
+            tracing::error!(
+                code = "MCP_STDIO_LIFETIME_LOCK_RETAIN_STDERR_WRITE_FAILED",
+                reason,
+                error = %stderr_error,
+                "failed to write retained lifetime-lock failure to stderr"
+            );
+        }
+        // These guards are deliberately retained, not ordinarily dropped. A
+        // nonzero authority owner or an unproven rmcp dispatch owner means
+        // releasing either lock could admit a successor while old work still
+        // owns storage, rollback, audit, or transport state.
+        // Windows closes the owned handles at process teardown after Tokio has
+        // torn down the remaining task; startup stale-sidecar recovery handles
+        // the deliberately unwritten graceful-close evidence.
+        std::mem::forget(shell_job_store);
+        std::mem::forget(single_instance);
+        anyhow::bail!(
+            "refused to release daemon lifetime locks after {reason}: authority_safe_to_unlock={authority_safe_to_unlock} server_dispatch_quiescent={server_dispatch_quiescent} m2_emitter_safe={m2_emitter_safe} win_event_owners_quiescent={win_event_owners_quiescent} hotkey_owners_quiescent={hotkey_owners_quiescent} k2_tasks_quiescent={k2_tasks_quiescent} desktop_worker_owners_quiescent={desktop_worker_owners_quiescent} desktop_worker_owner_report={desktop_worker_owner_report:?} retained_shutdown_task_owners_quiescent={retained_shutdown_task_owners_quiescent} retained_shutdown_task_owner_report={retained_shutdown_task_owner_report:?} unresolved_shell_child_owners_quiescent={unresolved_shell_child_owners_quiescent} unresolved_shell_child_owner_report={unresolved_shell_child_owner_report:?} activity_recorder_retained_owners_quiescent={activity_recorder_retained_owners_quiescent} activity_recorder_retained_owner_readback={activity_recorder_retained_owner_readback:?}"
+        );
+    }
+    crate::single_instance::close_daemon_lifetime_locks(shell_job_store, single_instance)
+        .map(|_readback| ())
+        .map_err(anyhow::Error::new)
+        .with_context(|| format!("close daemon lifetime locks after {reason}"))
+}
+
+fn inspect_authority_finalizer_drain(
+    result: Result<
+        crate::server::AuthorityFinalizerDrainReadback,
+        crate::server::AuthorityFinalizerDrainFailure,
+    >,
+    context: &'static str,
+) -> (bool, anyhow::Result<()>) {
+    let safe_to_unlock = match &result {
+        Ok(readback) => readback.safe_to_unlock(),
+        Err(error) => error.readback.safe_to_unlock(),
+    };
+    let verdict = result
+        .map(|_readback| ())
+        .map_err(anyhow::Error::new)
+        .context(context);
+    (safe_to_unlock, verdict)
+}
+
+async fn drain_stdio_m2_owner(
+    owner: &mut Option<M2EmitterOwner>,
+    reason: &'static str,
+) -> M2EmitterDrainReport {
+    drain_m2_emitter_owner(owner.take(), "stdio", reason).await
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WinEventShutdownHistoryReadback {
+    report_count: usize,
+    retained_owner_count: usize,
+    unsafe_owner_ids: Vec<u64>,
+    failures: Vec<String>,
+}
+
+impl WinEventShutdownHistoryReadback {
+    pub(crate) fn owners_quiescent(&self) -> bool {
+        self.report_count >= self.unsafe_owner_ids.len()
+            && self.retained_owner_count == 0
+            && self.unsafe_owner_ids.is_empty()
+    }
+
+    pub(crate) fn verdict(&self) -> anyhow::Result<()> {
+        if self.failures.is_empty() && self.owners_quiescent() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "WinEvent shutdown history contains an unsafe physical owner: {}; readback={self:?}",
+                self.failures.join("; ")
+            )
+        }
+    }
+}
+
+pub(crate) fn win_event_shutdown_history_readback() -> WinEventShutdownHistoryReadback {
+    let history = synapse_a11y::win_event_shutdown_report_history();
+    let retained_owner_count = synapse_a11y::retained_win_event_owner_count();
+    win_event_shutdown_history_readback_from(&history, retained_owner_count)
+}
+
+fn win_event_shutdown_history_readback_from(
+    history: &[synapse_a11y::WinEventSubscriptionShutdownRecord],
+    retained_owner_count: usize,
+) -> WinEventShutdownHistoryReadback {
+    let mut unsafe_owner_ids = Vec::new();
+    let mut failures = Vec::new();
+    for record in history {
+        if let Err(error) = record.report.verdict() {
+            unsafe_owner_ids.push(record.owner_id);
+            failures.push(format!(
+                "owner_id={} failed immutable shutdown readback: {error}",
+                record.owner_id
+            ));
+        }
+    }
+    if retained_owner_count != 0 {
+        failures.push(format!(
+            "{retained_owner_count} exact WinEvent owner(s) remain retained"
+        ));
+    }
+    WinEventShutdownHistoryReadback {
+        report_count: history.len(),
+        retained_owner_count,
+        unsafe_owner_ids,
+        failures,
+    }
+}
+
+fn inspect_win_event_shutdown_history(context: &'static str) -> (bool, anyhow::Result<()>) {
+    let readback = win_event_shutdown_history_readback();
+    let owners_quiescent = readback.owners_quiescent();
+    tracing::info!(
+        code = "MCP_WIN_EVENT_SHUTDOWN_HISTORY_FINAL_READBACK",
+        context,
+        readback = ?readback,
+        "readback=win_event_shutdown_history edge=transport_shutdown after_service_owner_drop"
+    );
+    let verdict = readback.verdict().with_context(|| context);
+    (owners_quiescent, verdict)
+}
+
+struct StdioOperatorOwnerDrain {
+    hotkey_owners_quiescent: bool,
+    k2_tasks_quiescent: bool,
+    hotkey_verdict: anyhow::Result<()>,
+    k2_verdict: anyhow::Result<()>,
+}
+
+async fn drain_stdio_operator_owners(
+    guard: &mut Option<synapse_action::OperatorHotkeyGuard>,
+    reason: &'static str,
+) -> StdioOperatorOwnerDrain {
+    let k2_before = safety::operator_panic_k2_task_owner_readback();
+    let hotkey_report = safety::shutdown_operator_hotkey(guard, reason);
+    let install_unwind_retained_live_owner =
+        safety::operator_hotkey_install_unwind_retained_live_owner();
+    let hotkey_owners_quiescent = !install_unwind_retained_live_owner
+        && hotkey_report
+            .as_ref()
+            .is_none_or(synapse_action::OperatorHotkeyShutdownReport::owners_quiescent);
+    let hotkey_verdict = if install_unwind_retained_live_owner {
+        Err(anyhow::anyhow!(
+            "operator-hotkey installation unwind retained a live exact owner"
+        ))
+    } else {
+        hotkey_report.as_ref().map_or(Ok(()), |report| {
+            report.verdict().map_err(|error| anyhow::anyhow!("{error}"))
+        })
+    };
+    let k2_report = safety::drain_operator_panic_k2_tasks(reason, hotkey_owners_quiescent).await;
+    let k2_tasks_quiescent = k2_report.owners_quiescent();
+    let k2_verdict = k2_report.verdict();
+    tracing::info!(
+        code = "MCP_STDIO_OPERATOR_OWNER_DRAIN_READBACK",
+        reason,
+        hotkey_report = ?hotkey_report,
+        install_unwind_retained_live_owner,
+        k2_before = ?k2_before,
+        k2_report = ?k2_report,
+        "readback=operator_hotkey_and_k2_owners edge=stdio_shutdown after_checked_drain"
+    );
+    if !hotkey_owners_quiescent {
+        safety::retain_operator_hotkey_guard_to_process_exit(guard, reason);
+    }
+    StdioOperatorOwnerDrain {
+        hotkey_owners_quiescent,
+        k2_tasks_quiescent,
+        hotkey_verdict,
+        k2_verdict,
+    }
+}
+
+fn begin_stdio_graceful_exit_finalization(
+    reason: &'static str,
+) -> (
+    Option<daemon_lifecycle::GracefulExitFinalizationGuard>,
+    anyhow::Result<()>,
+) {
+    let unresolved_shell_child_owner_report = crate::m4::unresolved_shell_child_owner_report();
+    if !unresolved_shell_child_owner_report.safe_to_unlock() {
+        tracing::error!(
+            code = "MCP_STDIO_LIFECYCLE_FINALIZATION_REFUSED",
+            reason,
+            unresolved_shell_child_owner_report = ?unresolved_shell_child_owner_report,
+            "refusing graceful lifecycle finalization while an exact shell child/job owner remains unresolved"
+        );
+        return (
+            None,
+            Err(anyhow::anyhow!(
+                "refused graceful stdio lifecycle finalization ({reason}): unresolved_shell_child_owner_report={unresolved_shell_child_owner_report:?}"
+            )),
+        );
+    }
+    tracing::info!(
+        code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_START",
+        source = reason,
+        pid = std::process::id(),
+        "locking daemon lifecycle finalization before releasing stdio lifetime locks"
+    );
+    match daemon_lifecycle::begin_graceful_exit_finalization() {
+        Ok(finalization) => (Some(finalization), Ok(())),
+        Err(error) => (
+            None,
+            Err(error).with_context(|| {
+                format!(
+                    "lock graceful lifecycle transaction before stdio lifetime-lock close ({reason})"
+                )
+            }),
+        ),
+    }
+}
+
+fn finish_stdio_graceful_exit_finalization(
+    finalization: Option<daemon_lifecycle::GracefulExitFinalizationGuard>,
+    source: &'static str,
+) -> anyhow::Result<()> {
+    let finalization = finalization.ok_or_else(|| {
+        anyhow::anyhow!(
+            "stdio shutdown postconditions passed without an owned lifecycle finalization guard ({source})"
+        )
+    })?;
+    daemon_lifecycle::record_graceful_exit_after_lifetime_lock_close(finalization, source)
+        .with_context(|| format!("record daemon lifecycle graceful stdio exit ({source})"))?;
+    tracing::info!(
+        code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_OK",
+        source,
+        pid = std::process::id(),
+        "daemon lifecycle graceful stdio exit written before successor configuration"
+    );
+    Ok(())
+}
+
 async fn run_stdio(
-    telemetry_guard: TelemetryGuard,
+    _telemetry_guard: TelemetryGuard,
     m2_config: &m2::M2ServiceConfig,
     m3_config: m3::M3ServiceConfig,
     m4_config: m4::M4ServiceConfig,
@@ -517,7 +961,8 @@ async fn run_stdio(
         .db_path
         .clone()
         .unwrap_or_else(crate::m3::default_db_path);
-    let _single_instance = match crate::single_instance::SingleInstanceGuard::acquire(&db_path) {
+    let single_instance_guard = match crate::single_instance::SingleInstanceGuard::acquire(&db_path)
+    {
         Ok(guard) => {
             tracing::info!(
                 code = "MCP_DAEMON_SINGLE_INSTANCE_ACQUIRED",
@@ -546,13 +991,102 @@ async fn run_stdio(
                 "synapse-mcp error: another synapse-mcp daemon already owns {} (holder pid {holder}); use --mode connect to reach the shared daemon instead of starting a second one",
                 db_path.display()
             );
-            drop(telemetry_guard);
             return Ok(ExitCode::from(3));
         }
         Err(err @ crate::single_instance::SingleInstanceError::Io { .. }) => {
             return Err(anyhow::Error::new(err)).context("acquire daemon single-instance lock");
         }
     };
+
+    let shell_job_root = match m4::shell_job_root_dir() {
+        Ok(root) => root,
+        Err(error) => {
+            let detail = error.message.to_string();
+            let error_data = error.data.unwrap_or(serde_json::Value::Null);
+            tracing::error!(
+                code = "MCP_DAEMON_SHELL_JOB_STORE_ROOT_RESOLUTION_FAILED",
+                mode = "stdio",
+                db_path = %db_path.display(),
+                detail = %detail,
+                error_data = ?error_data,
+                "refusing to start: durable shell-job store root could not be resolved"
+            );
+            eprintln!(
+                "synapse-mcp error: durable shell-job store root could not be resolved: {detail}; data={error_data}"
+            );
+            anyhow::bail!("resolve durable shell-job store root: {detail}; data={error_data}");
+        }
+    };
+    let shell_job_store_lock_guard = match crate::single_instance::ShellJobStoreLockGuard::acquire(
+        &shell_job_root,
+    ) {
+        Ok(guard) => {
+            tracing::info!(
+                code = "MCP_DAEMON_SHELL_JOB_STORE_LOCK_ACQUIRED",
+                mode = "stdio",
+                store_root = %guard.store_root().display(),
+                lock_path = %guard.lock_path().display(),
+                pid = std::process::id(),
+                "daemon acquired exclusive shell-job store ownership"
+            );
+            guard
+        }
+        Err(crate::single_instance::ShellJobStoreLockError::AlreadyOwned {
+            store_root,
+            lock_path,
+            holder_pid,
+        }) => {
+            let holder = holder_pid.map_or_else(|| "unknown".to_owned(), |pid| pid.to_string());
+            tracing::error!(
+                code = "MCP_DAEMON_SHELL_JOB_STORE_ALREADY_OWNED",
+                mode = "stdio",
+                store_root = %store_root.display(),
+                lock_path = %lock_path.display(),
+                holder_pid = %holder,
+                db_path = %db_path.display(),
+                "refusing to start: another daemon owns the durable shell-job store"
+            );
+            eprintln!(
+                "synapse-mcp error: another daemon owns shell-job store {} via {} (holder pid {holder}); stop it or configure a different SYNAPSE_SHELL_JOB_ROOT",
+                store_root.display(),
+                lock_path.display()
+            );
+            return Ok(ExitCode::from(3));
+        }
+        Err(error @ crate::single_instance::ShellJobStoreLockError::Io { .. }) => {
+            tracing::error!(
+                code = "MCP_DAEMON_SHELL_JOB_STORE_LOCK_FAILED",
+                mode = "stdio",
+                detail = %error,
+                db_path = %db_path.display(),
+                "refusing to start: durable shell-job store ownership could not be acquired"
+            );
+            return Err(anyhow::Error::new(error))
+                .context("acquire durable shell-job store lifetime lock");
+        }
+    };
+    let canonical_shell_job_root = shell_job_store_lock_guard.store_root().to_path_buf();
+    if let Err(error) = m4::freeze_shell_job_root_for_daemon(&canonical_shell_job_root) {
+        let detail = error.message.to_string();
+        let error_data = error.data.unwrap_or(serde_json::Value::Null);
+        tracing::error!(
+            code = "MCP_DAEMON_SHELL_JOB_STORE_ROOT_FREEZE_FAILED",
+            mode = "stdio",
+            db_path = %db_path.display(),
+            shell_job_root = %canonical_shell_job_root.display(),
+            detail = %detail,
+            error_data = ?error_data,
+            "refusing to start: guarded shell-job store root could not be frozen for daemon operations"
+        );
+        eprintln!(
+            "synapse-mcp error: guarded shell-job store root {} could not be frozen: {detail}; data={error_data}",
+            canonical_shell_job_root.display()
+        );
+        anyhow::bail!(
+            "freeze guarded durable shell-job store root {}: {detail}; data={error_data}",
+            canonical_shell_job_root.display()
+        );
+    }
 
     let lifecycle_paths = daemon_lifecycle::configure(daemon_lifecycle::DaemonLifecycleConfig {
         mode: "stdio",
@@ -570,10 +1104,35 @@ async fn run_stdio(
         "daemon lifecycle ledger ready"
     );
 
-    // #1510: drain the durable shell-job store's terminal-job backlog once at
-    // boot, now that this process holds the single-instance lock and is the
-    // authoritative owner of the store. Best-effort — never blocks or fails boot.
-    m4::reap_stale_shell_jobs_on_startup();
+    // #1568: corrupt durable shell-job evidence is a startup safety gate. Run
+    // it only after the independent shell-job lifetime lock proves this process
+    // owns that store, and before the stdio transport can accept any request.
+    // Ordinary TTL retention inside this pass remains best-effort.
+    if let Err(error) = m4::reap_stale_shell_jobs_on_startup() {
+        let detail = error.message.to_string();
+        let error_data = error.data.unwrap_or(serde_json::Value::Null);
+        tracing::error!(
+            code = "MCP_DAEMON_STARTUP_SHELL_JOB_RECOVERY_FAILED",
+            mode = "stdio",
+            db_path = %db_path.display(),
+            shell_job_root = %canonical_shell_job_root.display(),
+            detail = %detail,
+            error_data = ?error_data,
+            "refusing to start: corrupt durable shell-job recovery did not reach a verified terminal disposition"
+        );
+        daemon_lifecycle::record_startup_exit(
+            "startup_corrupt_shell_job_recovery_failed",
+            serde_json::json!({
+                "mode": "stdio",
+                "db_path": db_path.display().to_string(),
+                "shell_job_root": canonical_shell_job_root.display().to_string(),
+                "detail": detail,
+                "error_data": error_data,
+            }),
+        )
+        .context("record daemon lifecycle startup corrupt-shell-job recovery failure")?;
+        return Ok(ExitCode::from(4));
+    }
 
     let rmcp_token = CancellationToken::new();
     let emitter_shutdown_token = CancellationToken::new();
@@ -588,9 +1147,69 @@ async fn run_stdio(
     )
     .context("initialize Synapse service state")?;
     synapse_action::install_panic_hook();
-    let _operator_hotkey_guard = safety::install_operator_hotkey(service.clone())
-        .context("install operator panic hotkey")?;
-    let m2_emitter_done = service.m2_emitter_done_receiver();
+    let authority_finalizer_service = service.clone();
+    let mut m2_emitter_owner = Some(take_m2_emitter_owner(&service));
+    let mut operator_hotkey_guard = match safety::install_operator_hotkey(service.clone())
+        .context("install operator panic hotkey")
+    {
+        Ok(guard) => guard,
+        Err(install_error) => {
+            rmcp_token.cancel();
+            emitter_shutdown_token.cancel();
+            emitter_connection_closed_token.cancel();
+            let mut no_hotkey_guard = None;
+            let operator_drain = drain_stdio_operator_owners(
+                &mut no_hotkey_guard,
+                "stdio_operator_hotkey_install_failed",
+            )
+            .await;
+            let (authority_safe_to_unlock, authority_drain) = inspect_authority_finalizer_drain(
+                authority_finalizer_service
+                    .drain_authority_finalizers()
+                    .await,
+                "drain authority finalizers after stdio hotkey install failure",
+            );
+            let emitter_report = drain_stdio_m2_owner(
+                &mut m2_emitter_owner,
+                "stdio_operator_hotkey_install_failed",
+            )
+            .await;
+            let m2_emitter_safe = emitter_report.safe_to_unlock();
+            let emitter_drain = emitter_report
+                .verdict()
+                .context("drain M2 emitter after stdio hotkey install failure");
+            drop(authority_finalizer_service);
+            drop(service);
+            let (win_event_owners_quiescent, win_event_shutdown_history) =
+                inspect_win_event_shutdown_history(
+                    "inspect WinEvent shutdown history after stdio hotkey install failure",
+                );
+            let lifetime_lock_close = close_stdio_lifetime_locks(
+                shell_job_store_lock_guard,
+                single_instance_guard,
+                authority_safe_to_unlock,
+                true,
+                m2_emitter_safe,
+                win_event_owners_quiescent,
+                operator_drain.hotkey_owners_quiescent,
+                operator_drain.k2_tasks_quiescent,
+                "stdio operator hotkey install failure",
+            );
+            return aggregate_stdio_shutdown_results(
+                "stdio_operator_hotkey_install_failed",
+                vec![
+                    ("operator_hotkey_install", Err(install_error)),
+                    ("authority_finalizer_drain", authority_drain),
+                    ("m2_emitter_drain", emitter_drain),
+                    ("win_event_shutdown_history", win_event_shutdown_history),
+                    ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
+                    ("operator_panic_k2_drain", operator_drain.k2_verdict),
+                    ("lifetime_lock_close", lifetime_lock_close),
+                ],
+            )
+            .map(|()| ExitCode::from(1));
+        }
+    };
     let (stdin, stdout) = rmcp::transport::stdio();
     let stdin = CancelOnEofRead::new(
         stdin,
@@ -599,76 +1218,368 @@ async fn run_stdio(
         "MCP_STDIO_EOF_CONNECTION_CLOSED",
         "stdio",
     );
-    let start = service.serve_with_ct((stdin, stdout), rmcp_token.clone());
-    tokio::pin!(start);
+    let mut start = Box::pin(service.serve_with_ct((stdin, stdout), rmcp_token.clone()));
     let service = tokio::select! {
         service = &mut start => match service {
             Ok(service) => service,
             Err(err) if err.to_string().contains("connection closed") => {
                 tracing::info!(code = "MCP_STDIO_CLOSED_BEFORE_INIT", "stdio closed before init");
-                daemon_lifecycle::record_graceful_exit("stdio_closed_before_init")
-                    .context("record daemon lifecycle graceful stdio close before init")?;
-                drop(telemetry_guard);
+                rmcp_token.cancel();
+                emitter_connection_closed_token.cancel();
+                let operator_drain = drain_stdio_operator_owners(
+                    &mut operator_hotkey_guard,
+                    "stdio_connection_closed_before_init",
+                )
+                .await;
+                let (authority_safe_to_unlock, authority_drain) =
+                    inspect_authority_finalizer_drain(
+                        authority_finalizer_service.drain_authority_finalizers().await,
+                        "drain authority finalizers after stdio closed before init",
+                    );
+                let emitter_report = drain_stdio_m2_owner(
+                    &mut m2_emitter_owner,
+                    "stdio_connection_closed_before_init",
+                )
+                .await;
+                let m2_emitter_safe = emitter_report.safe_to_unlock();
+                let emitter_drain = emitter_report
+                    .verdict()
+                    .context("drain M2 emitter after stdio closed before init");
+                drop(start);
+                drop(authority_finalizer_service);
+                let (win_event_owners_quiescent, win_event_shutdown_history) =
+                    inspect_win_event_shutdown_history(
+                        "inspect WinEvent shutdown history after stdio closed before init",
+                    );
+                let (lifecycle_finalization, lifecycle_finalization_begin) =
+                    begin_stdio_graceful_exit_finalization("stdio_closed_before_init");
+                let lifetime_lock_close = close_stdio_lifetime_locks(
+                    shell_job_store_lock_guard,
+                    single_instance_guard,
+                    authority_safe_to_unlock,
+                    true,
+                    m2_emitter_safe,
+                    win_event_owners_quiescent,
+                    operator_drain.hotkey_owners_quiescent,
+                    operator_drain.k2_tasks_quiescent,
+                    "stdio connection closed before init",
+                );
+                aggregate_stdio_shutdown_results(
+                    "stdio_connection_closed_before_init",
+                    vec![
+                        ("authority_finalizer_drain", authority_drain),
+                        ("m2_emitter_drain", emitter_drain),
+                        ("win_event_shutdown_history", win_event_shutdown_history),
+                        ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
+                        ("operator_panic_k2_drain", operator_drain.k2_verdict),
+                        (
+                            "lifecycle_finalization_begin",
+                            lifecycle_finalization_begin,
+                        ),
+                        ("lifetime_lock_close", lifetime_lock_close),
+                    ],
+                )?;
+                finish_stdio_graceful_exit_finalization(
+                    lifecycle_finalization,
+                    "stdio_closed_before_init",
+                )?;
                 return Ok(ExitCode::SUCCESS);
             }
-            Err(err) => return Err(err).context("start rmcp stdio service"),
+            Err(err) => {
+                let start_error = anyhow::Error::new(err).context("start rmcp stdio service");
+                rmcp_token.cancel();
+                emitter_shutdown_token.cancel();
+                let operator_drain = drain_stdio_operator_owners(
+                    &mut operator_hotkey_guard,
+                    "stdio_start_failed_before_init",
+                )
+                .await;
+                let (authority_safe_to_unlock, authority_drain) =
+                    inspect_authority_finalizer_drain(
+                        authority_finalizer_service.drain_authority_finalizers().await,
+                        "drain authority finalizers after stdio startup failure",
+                    );
+                let emitter_report = drain_stdio_m2_owner(
+                    &mut m2_emitter_owner,
+                    "stdio_start_failed_before_init",
+                )
+                .await;
+                let m2_emitter_safe = emitter_report.safe_to_unlock();
+                let emitter_drain = emitter_report
+                    .verdict()
+                    .context("drain M2 emitter after stdio startup failure");
+                drop(start);
+                drop(authority_finalizer_service);
+                let (win_event_owners_quiescent, win_event_shutdown_history) =
+                    inspect_win_event_shutdown_history(
+                        "inspect WinEvent shutdown history after stdio startup failure",
+                    );
+                let lifetime_lock_close = close_stdio_lifetime_locks(
+                    shell_job_store_lock_guard,
+                    single_instance_guard,
+                    authority_safe_to_unlock,
+                    true,
+                    m2_emitter_safe,
+                    win_event_owners_quiescent,
+                    operator_drain.hotkey_owners_quiescent,
+                    operator_drain.k2_tasks_quiescent,
+                    "stdio startup failure",
+                );
+                return aggregate_stdio_shutdown_results(
+                    "stdio_start_failed_before_init",
+                    vec![
+                        ("rmcp_start", Err(start_error)),
+                        ("authority_finalizer_drain", authority_drain),
+                        ("m2_emitter_drain", emitter_drain),
+                        ("win_event_shutdown_history", win_event_shutdown_history),
+                        ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
+                        ("operator_panic_k2_drain", operator_drain.k2_verdict),
+                        ("lifetime_lock_close", lifetime_lock_close),
+                    ],
+                )
+                .map(|()| ExitCode::from(1));
+            }
         },
         signal = wait_for_shutdown_signal("during startup") => {
-            signal?;
+            if let Err(error) = &signal {
+                tracing::error!(
+                    code = "MCP_STDIO_SHUTDOWN_SIGNAL_WAIT_FAILED",
+                    phase = "during_startup",
+                    error = %error,
+                    "stdio shutdown-signal listener failed before initialization"
+                );
+            }
             rmcp_token.cancel();
             emitter_shutdown_token.cancel();
-            tracing::info!(code = "MCP_SHUTDOWN_GRACEFUL", "shutdown signal received before init");
-            daemon_lifecycle::record_graceful_exit("stdio_signal_before_init")
-                .context("record daemon lifecycle graceful stdio shutdown before init")?;
-            drop(telemetry_guard);
-            std::process::exit(0);
+            if signal.is_ok() {
+                tracing::info!(code = "MCP_SHUTDOWN_GRACEFUL", "shutdown signal received before init");
+            }
+            // No request may outlive the daemon-owned lock guards. Close
+            // authority admission and drain the emitter before returning
+            // through ordinary Rust control flow so every PID sidecar/lock and
+            // telemetry guard runs its destructor.
+            let operator_drain = drain_stdio_operator_owners(
+                &mut operator_hotkey_guard,
+                "stdio_signal_before_init",
+            )
+            .await;
+            let (authority_safe_to_unlock, authority_drain) =
+                inspect_authority_finalizer_drain(
+                    authority_finalizer_service.drain_authority_finalizers().await,
+                    "drain authority finalizers after stdio signal before init",
+                );
+            let emitter_report =
+                drain_stdio_m2_owner(&mut m2_emitter_owner, "stdio_signal_before_init").await;
+            let m2_emitter_safe = emitter_report.safe_to_unlock();
+            let emitter_drain = emitter_report
+                .verdict()
+                .context("drain M2 emitter after stdio signal before init");
+            drop(start);
+            drop(authority_finalizer_service);
+            let (win_event_owners_quiescent, win_event_shutdown_history) =
+                inspect_win_event_shutdown_history(
+                    "inspect WinEvent shutdown history after stdio signal before init",
+                );
+            let (lifecycle_finalization, lifecycle_finalization_begin) =
+                begin_stdio_graceful_exit_finalization("stdio_signal_before_init");
+            let lifetime_lock_close = close_stdio_lifetime_locks(
+                shell_job_store_lock_guard,
+                single_instance_guard,
+                authority_safe_to_unlock,
+                true,
+                m2_emitter_safe,
+                win_event_owners_quiescent,
+                operator_drain.hotkey_owners_quiescent,
+                operator_drain.k2_tasks_quiescent,
+                "stdio signal before init",
+            );
+            aggregate_stdio_shutdown_results(
+                "stdio_signal_before_init",
+                vec![
+                    (
+                        "shutdown_signal",
+                        signal.context("wait for stdio shutdown signal during startup"),
+                    ),
+                    ("authority_finalizer_drain", authority_drain),
+                    ("m2_emitter_drain", emitter_drain),
+                    ("win_event_shutdown_history", win_event_shutdown_history),
+                    ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
+                    ("operator_panic_k2_drain", operator_drain.k2_verdict),
+                    (
+                        "lifecycle_finalization_begin",
+                        lifecycle_finalization_begin,
+                    ),
+                    ("lifetime_lock_close", lifetime_lock_close),
+                ],
+            )?;
+            finish_stdio_graceful_exit_finalization(
+                lifecycle_finalization,
+                "stdio_signal_before_init",
+            )?;
+            return Ok(ExitCode::SUCCESS);
         }
     };
+    drop(start);
     let shutdown = service.cancellation_token();
-    let mut wait_task = tokio::spawn(async move { service.waiting().await });
+    // `RunningService::waiting()` takes rmcp's private JoinHandle before its
+    // first await. Keep that future inside an exact outer JoinHandle: a completed
+    // outer join proves the private service task was joined; dropping/aborting
+    // an in-flight waiting future would detach it and is never a stop verdict.
+    let mut service_task = ShutdownTaskOwner::new(
+        "stdio_rmcp_service_waiting",
+        tokio::spawn(service.waiting()),
+    );
 
     let code = tokio::select! {
-        wait = &mut wait_task => {
-            wait.context("join rmcp service")??;
+        wait = &mut service_task => {
+            let (server_dispatch_quiescent, service_task_join) =
+                inspect_stdio_service_task_join(wait, "stdio_service_completed");
             emitter_connection_closed_token.cancel();
-            wait_for_m2_emitter_done(m2_emitter_done).await;
+            let operator_drain = drain_stdio_operator_owners(
+                &mut operator_hotkey_guard,
+                "stdio_service_completed",
+            )
+            .await;
+            let (authority_safe_to_unlock, authority_drain) =
+                inspect_authority_finalizer_drain(
+                    authority_finalizer_service.drain_authority_finalizers().await,
+                    "drain authority finalizers after stdio service completion",
+                );
+            let emitter_report =
+                drain_stdio_m2_owner(&mut m2_emitter_owner, "stdio_service_completed").await;
+            let m2_emitter_safe = emitter_report.safe_to_unlock();
+            let emitter_drain = emitter_report
+                .verdict()
+                .context("drain M2 emitter after stdio service completion");
+            drop(authority_finalizer_service);
+            let (win_event_owners_quiescent, win_event_shutdown_history) =
+                inspect_win_event_shutdown_history(
+                    "inspect WinEvent shutdown history after stdio service completion",
+                );
+            let (lifecycle_finalization, lifecycle_finalization_begin) =
+                begin_stdio_graceful_exit_finalization("stdio_service_completed");
+            debug_assert!(service_task.terminal_join_observed());
+            service_task.acknowledge_terminal_outcome();
+            drop(service_task);
+            let lifetime_lock_close = close_stdio_lifetime_locks(
+                shell_job_store_lock_guard,
+                single_instance_guard,
+                authority_safe_to_unlock,
+                server_dispatch_quiescent,
+                m2_emitter_safe,
+                win_event_owners_quiescent,
+                operator_drain.hotkey_owners_quiescent,
+                operator_drain.k2_tasks_quiescent,
+                "stdio service completion",
+            );
+            aggregate_stdio_shutdown_results(
+                "stdio_service_completed",
+                vec![
+                    ("rmcp_service_task_join", service_task_join),
+                    ("authority_finalizer_drain", authority_drain),
+                    ("m2_emitter_drain", emitter_drain),
+                    ("win_event_shutdown_history", win_event_shutdown_history),
+                    ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
+                    ("operator_panic_k2_drain", operator_drain.k2_verdict),
+                    (
+                        "lifecycle_finalization_begin",
+                        lifecycle_finalization_begin,
+                    ),
+                    ("lifetime_lock_close", lifetime_lock_close),
+                ],
+            )?;
+            finish_stdio_graceful_exit_finalization(
+                lifecycle_finalization,
+                "stdio_service_completed",
+            )?;
             ExitCode::SUCCESS
         }
         signal = wait_for_shutdown_signal("after init") => {
-            signal?;
-            tracing::info!(code = "MCP_SHUTDOWN_GRACEFUL", "shutdown signal received");
+            if let Err(error) = &signal {
+                tracing::error!(
+                    code = "MCP_STDIO_SHUTDOWN_SIGNAL_WAIT_FAILED",
+                    phase = "after_init",
+                    error = %error,
+                    "stdio shutdown-signal listener failed after initialization"
+                );
+            } else {
+                tracing::info!(code = "MCP_SHUTDOWN_GRACEFUL", "shutdown signal received");
+            }
             emitter_shutdown_token.cancel();
             shutdown.cancel();
-            wait_for_m2_emitter_done(m2_emitter_done).await;
-            wait_task.abort();
-            daemon_lifecycle::record_graceful_exit("stdio_signal_after_init")
-                .context("record daemon lifecycle graceful stdio shutdown after init")?;
-            drop(telemetry_guard);
-            std::process::exit(0);
+            let (server_dispatch_quiescent, service_task_join) =
+                stop_stdio_service_task_after_cancel(
+                    &mut service_task,
+                    "stdio_signal_after_init",
+            )
+            .await;
+            let operator_drain = drain_stdio_operator_owners(
+                &mut operator_hotkey_guard,
+                "stdio_signal_after_init",
+            )
+            .await;
+            let (authority_safe_to_unlock, authority_drain) =
+                inspect_authority_finalizer_drain(
+                    authority_finalizer_service.drain_authority_finalizers().await,
+                    "drain authority finalizers after stdio signal after init",
+                );
+            let emitter_report =
+                drain_stdio_m2_owner(&mut m2_emitter_owner, "stdio_signal_after_init").await;
+            let m2_emitter_safe = emitter_report.safe_to_unlock();
+            let emitter_drain = emitter_report
+                .verdict()
+                .context("drain M2 emitter after stdio signal after init");
+            drop(authority_finalizer_service);
+            let (win_event_owners_quiescent, win_event_shutdown_history) =
+                inspect_win_event_shutdown_history(
+                    "inspect WinEvent shutdown history after stdio signal after init",
+                );
+            let (lifecycle_finalization, lifecycle_finalization_begin) =
+                begin_stdio_graceful_exit_finalization("stdio_signal_after_init");
+            if service_task.terminal_join_observed() {
+                service_task.acknowledge_terminal_outcome();
+            }
+            drop(service_task);
+            let lifetime_lock_close = close_stdio_lifetime_locks(
+                shell_job_store_lock_guard,
+                single_instance_guard,
+                authority_safe_to_unlock,
+                server_dispatch_quiescent,
+                m2_emitter_safe,
+                win_event_owners_quiescent,
+                operator_drain.hotkey_owners_quiescent,
+                operator_drain.k2_tasks_quiescent,
+                "stdio signal after init",
+            );
+            aggregate_stdio_shutdown_results(
+                "stdio_signal_after_init",
+                vec![
+                    (
+                        "shutdown_signal",
+                        signal.context("wait for stdio shutdown signal after init"),
+                    ),
+                    ("rmcp_service_task_join", service_task_join),
+                    ("authority_finalizer_drain", authority_drain),
+                    ("m2_emitter_drain", emitter_drain),
+                    ("win_event_shutdown_history", win_event_shutdown_history),
+                    ("operator_hotkey_shutdown", operator_drain.hotkey_verdict),
+                    ("operator_panic_k2_drain", operator_drain.k2_verdict),
+                    (
+                        "lifecycle_finalization_begin",
+                        lifecycle_finalization_begin,
+                    ),
+                    ("lifetime_lock_close", lifetime_lock_close),
+                ],
+            )?;
+            finish_stdio_graceful_exit_finalization(
+                lifecycle_finalization,
+                "stdio_signal_after_init",
+            )?;
+            return Ok(ExitCode::SUCCESS);
         }
     };
 
-    daemon_lifecycle::record_graceful_exit("stdio_service_completed")
-        .context("record daemon lifecycle graceful stdio service completion")?;
-    drop(telemetry_guard);
     Ok(code)
-}
-
-#[cfg(windows)]
-async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
-    let mut ctrl_break = tokio::signal::windows::ctrl_break()
-        .with_context(|| format!("register ctrl-break handler {phase}"))?;
-    tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.with_context(|| format!("wait for ctrl-c {phase}"))?;
-        }
-        received = ctrl_break.recv() => {
-            if received.is_none() {
-                anyhow::bail!("ctrl-break stream ended while waiting for shutdown signal {phase}");
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -678,21 +1589,174 @@ async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
         .with_context(|| format!("wait for ctrl-c {phase}"))
 }
 
-async fn wait_for_m2_emitter_done(
-    done: Option<tokio::sync::watch::Receiver<Option<synapse_action::ActionStateSnapshot>>>,
-) {
-    let Some(mut done) = done else {
-        return;
-    };
-    let _wait_result = tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            if done.borrow().is_some() {
-                break;
-            }
-            if done.changed().await.is_err() {
-                break;
-            }
+#[cfg(windows)]
+async fn wait_for_shutdown_signal(phase: &'static str) -> anyhow::Result<()> {
+    // Ctrl+Break can be delivered to one CREATE_NEW_PROCESS_GROUP without
+    // broadcasting Ctrl+C into the operator's terminal. Treat both Windows
+    // console shutdown controls as the same graceful lifecycle boundary.
+    let mut ctrl_c = tokio::signal::windows::ctrl_c()
+        .with_context(|| format!("register ctrl-c handler {phase}"))?;
+    let mut ctrl_break = tokio::signal::windows::ctrl_break()
+        .with_context(|| format!("register ctrl-break handler {phase}"))?;
+    tokio::select! {
+        signal = ctrl_c.recv() => signal
+            .ok_or_else(|| anyhow::anyhow!("ctrl-c handler closed while waiting {phase}")),
+        signal = ctrl_break.recv() => signal
+            .ok_or_else(|| anyhow::anyhow!("ctrl-break handler closed while waiting {phase}")),
+    }
+}
+
+#[cfg(test)]
+mod stdio_shutdown_tests {
+    use super::*;
+
+    fn clean_win_event_shutdown_record(
+        owner_id: u64,
+    ) -> synapse_a11y::WinEventSubscriptionShutdownRecord {
+        synapse_a11y::WinEventSubscriptionShutdownRecord {
+            owner_id,
+            report: synapse_a11y::WinEventSubscriptionShutdownReport {
+                reason: "synthetic_stdio_history",
+                thread_id: owner_id as u32,
+                hook_count: 2,
+                stop_requested: true,
+                stop_wake_sent: true,
+                sender_disconnected: true,
+                subscription_slot_released: true,
+                thread_owner_present: true,
+                thread_terminal: true,
+                thread_joined: true,
+                thread_exit_report_received: true,
+                unregister_attempted: 2,
+                unregister_succeeded: 2,
+                unregister_failed_event_ids: Vec::new(),
+                exact_owner_retained: false,
+                failures: Vec::new(),
+            },
         }
-    })
-    .await;
+    }
+
+    #[test]
+    fn stdio_shutdown_aggregation_retains_every_failed_phase() {
+        let error = aggregate_stdio_shutdown_results(
+            "synthetic_shutdown",
+            vec![
+                (
+                    "rmcp_service_task_join",
+                    Err(anyhow::anyhow!("dispatch stuck")),
+                ),
+                (
+                    "authority_finalizer_drain",
+                    Err(anyhow::anyhow!("admission poisoned")),
+                ),
+                ("m2_emitter_drain", Err(anyhow::anyhow!("emitter timeout"))),
+            ],
+        )
+        .expect_err("any failed shutdown phase must reject a graceful verdict");
+        let detail = format!("{error:#}");
+
+        assert!(detail.contains("rmcp_service_task_join: dispatch stuck"));
+        assert!(detail.contains("authority_finalizer_drain: admission poisoned"));
+        assert!(detail.contains("m2_emitter_drain: emitter timeout"));
+    }
+
+    #[tokio::test]
+    async fn owned_service_join_completion_is_quiescent() {
+        let service_task = tokio::spawn(async {
+            tokio::task::yield_now().await;
+            Ok(rmcp::service::QuitReason::Closed)
+        });
+        let (quiescent, result) =
+            inspect_stdio_service_task_join(service_task.await, "owned_join_completed");
+
+        assert!(
+            quiescent,
+            "completed outer join proves the inner join result"
+        );
+        result.expect("clean owned join should pass the shutdown phase");
+    }
+
+    #[tokio::test]
+    async fn cancelled_outer_service_join_owner_is_not_quiescent() {
+        let service_task = tokio::spawn(async {
+            std::future::pending::<Result<rmcp::service::QuitReason, tokio::task::JoinError>>()
+                .await
+        });
+        service_task.abort();
+        let (quiescent, result) =
+            inspect_stdio_service_task_join(service_task.await, "outer_owner_cancelled");
+        let detail = format!(
+            "{:#}",
+            result.expect_err("cancelled outer owner must fail the shutdown phase")
+        );
+
+        assert!(
+            !quiescent,
+            "an aborted waiting() owner can detach rmcp's private task"
+        );
+        assert!(detail.contains("before inner join readback"));
+    }
+
+    #[test]
+    fn stdio_lifetime_unlock_requires_every_owner_set_quiescent() {
+        assert!(stdio_lifetime_locks_safe_to_close(
+            true, true, true, true, true, true, true, true, true, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            false, true, true, true, true, true, true, true, true, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            true, false, true, true, true, true, true, true, true, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            true, true, false, true, true, true, true, true, true, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            true, true, true, false, true, true, true, true, true, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            true, true, true, true, false, true, true, true, true, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            true, true, true, true, true, false, true, true, true, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            true, true, true, true, true, true, false, true, true, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            true, true, true, true, true, true, true, false, true, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            true, true, true, true, true, true, true, true, false, true
+        ));
+        assert!(!stdio_lifetime_locks_safe_to_close(
+            true, true, true, true, true, true, true, true, true, false
+        ));
+    }
+
+    #[test]
+    fn win_event_history_rejects_any_older_failed_owner_and_retained_owner() {
+        let clean = clean_win_event_shutdown_record(22);
+        let clean_readback =
+            win_event_shutdown_history_readback_from(std::slice::from_ref(&clean), 0);
+        assert!(clean_readback.owners_quiescent());
+        clean_readback.verdict().expect(
+            "a nonzero installed-hook count is safe when every hook was physically unregistered",
+        );
+
+        let mut failed = clean_win_event_shutdown_record(21);
+        failed.report.stop_wake_sent = false;
+        let history = [clean, failed];
+        let failed_readback = win_event_shutdown_history_readback_from(&history, 0);
+        assert!(!failed_readback.owners_quiescent());
+        let detail = failed_readback
+            .verdict()
+            .expect_err("an older immutable failed owner must remain fail-closed")
+            .to_string();
+        assert!(detail.contains("owner_id=21"));
+
+        let retained_readback = win_event_shutdown_history_readback_from(&history[..1], 1);
+        assert!(!retained_readback.owners_quiescent());
+        assert!(retained_readback.verdict().is_err());
+    }
 }

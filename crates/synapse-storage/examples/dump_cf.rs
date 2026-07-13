@@ -1,4 +1,6 @@
-//! Offline column-family dump for manual Full-State-Verification.
+//! Offline column-family readback utility.
+//!
+//! Its output is supporting storage evidence only; manual FSV remains separate.
 //!
 //! Opens a Synapse `RocksDB` strictly READ-ONLY and prints every row of one
 //! column family so physical storage state can be verified independently of

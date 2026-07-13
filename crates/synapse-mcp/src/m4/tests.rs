@@ -2,6 +2,48 @@
 
 use super::*;
 
+fn collect_spawn_target_window_ranges(value: &serde_json::Value, ranges: &mut Vec<(u64, u64)>) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(window_hwnd) = object.get("window_hwnd")
+                && let (Some(minimum), Some(maximum)) = (
+                    window_hwnd
+                        .get("minimum")
+                        .and_then(serde_json::Value::as_u64),
+                    window_hwnd
+                        .get("maximum")
+                        .and_then(serde_json::Value::as_u64),
+                )
+            {
+                ranges.push((minimum, maximum));
+            }
+            for child in object.values() {
+                collect_spawn_target_window_ranges(child, ranges);
+            }
+        }
+        serde_json::Value::Array(array) => {
+            for child in array {
+                collect_spawn_target_window_ranges(child, ranges);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn act_spawn_agent_target_schema_enforces_canonical_window_handle_range() {
+    let schema = serde_json::to_value(schemars::schema_for!(ActSpawnAgentTarget))
+        .expect("spawn target schema should serialize");
+    let mut ranges = Vec::new();
+    collect_spawn_target_window_ranges(&schema, &mut ranges);
+
+    assert_eq!(
+        ranges,
+        vec![(1, u64::from(u32::MAX)), (1, u64::from(u32::MAX))],
+        "schema={schema}"
+    );
+}
+
 #[cfg(windows)]
 #[test]
 fn shell_search_tool_readback_resolves_windows_builtins() {
@@ -9,8 +51,8 @@ fn shell_search_tool_readback_resolves_windows_builtins() {
     // jobs receive. `findstr` and `powershell` are Windows built-ins that
     // `ensure_windows_path_entries` always merges into the child PATH, so
     // they must resolve to real files — otherwise the readback (and the
-    // shell env it describes) is broken. This is the FSV anchor: a missing
-    // findstr here means the child PATH is not actually usable.
+    // shell env it describes) is broken. This is supporting regression
+    // coverage only; a missing findstr means the child PATH is not usable.
     let readback = shell_search_tool_readback();
     assert!(
         readback.starts_with("shell_search_tools "),
@@ -105,7 +147,7 @@ fn uncontained_recursive_delete_detection() {
     // Safe: recursive delete of an explicit workspace path (no home ref).
     assert_eq!(
         detect_uncontained_recursive_delete(
-            "Remove-Item C:\\code\\Synapse\\target\\fsv -Recurse -Force"
+            "Remove-Item C:\\code\\Synapse\\target\\regression-artifacts -Recurse -Force"
         ),
         None
     );
@@ -167,7 +209,7 @@ fn validate_run_shell_params_allows_workspace_recursive_delete() {
         vec![
             "-NoProfile",
             "-Command",
-            "Remove-Item C:\\code\\Synapse\\target\\fsv -Recurse -Force",
+            "Remove-Item C:\\code\\Synapse\\target\\regression-artifacts -Recurse -Force",
         ],
         1000,
     );
@@ -278,6 +320,42 @@ fn spawn_params(cli: ActSpawnAgentCli, prompt: Option<&str>) -> ActSpawnAgentPar
         template_id: None,
         template_version: None,
         template_config_hash: None,
+    }
+}
+
+#[test]
+fn spawn_target_runtime_rejects_noncanonical_window_handles_before_launch() {
+    for window_hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+        for target in [
+            ActSpawnAgentTarget::Window { window_hwnd },
+            ActSpawnAgentTarget::Cdp {
+                window_hwnd,
+                cdp_target_id: "chrome-tab:shape-test".to_owned(),
+            },
+        ] {
+            let mut params = spawn_params(ActSpawnAgentCli::Codex, Some("shape check"));
+            params.target = Some(target);
+            let error = validate_agent_spawn_params(&params)
+                .expect_err("noncanonical spawn target must fail before launch");
+            let data = error.data.expect("HWND shape error must be structured");
+            assert_eq!(data["field"], "window_hwnd");
+            assert_eq!(data["actual_value"], window_hwnd);
+        }
+    }
+
+    for target in [
+        ActSpawnAgentTarget::Window {
+            window_hwnd: i64::from(u32::MAX),
+        },
+        ActSpawnAgentTarget::Cdp {
+            window_hwnd: i64::from(u32::MAX),
+            cdp_target_id: "chrome-tab:shape-test".to_owned(),
+        },
+    ] {
+        let mut params = spawn_params(ActSpawnAgentCli::Codex, Some("shape check"));
+        params.target = Some(target);
+        validate_agent_spawn_params(&params)
+            .expect("maximum canonical spawn target HWND must remain valid");
     }
 }
 
@@ -544,6 +622,31 @@ fn launch_params(target: &str, args: Vec<&str>, timeout_ms: u64) -> ActLaunchPar
         windows_console_window_state: None,
         desktop: None,
     }
+}
+
+#[cfg(windows)]
+fn windows_process_ids_by_name(name: &str) -> Vec<u32> {
+    let escaped = name.replace('\'', "''");
+    let output = StdCommand::new("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!(
+                "Get-CimInstance Win32_Process | Where-Object {{ $_.Name -ieq '{escaped}' }} | ForEach-Object {{ $_.ProcessId }}"
+            ),
+        ])
+        .output()
+        .unwrap_or_else(|error| panic!("read Windows process table for {name}: {error}"));
+    assert!(
+        output.status.success(),
+        "process table read failed for {name}: status={:?} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect()
 }
 
 #[test]
@@ -1240,6 +1343,64 @@ fn shell_job_status_and_request_store_safe_command_metadata() {
 }
 
 #[test]
+fn shell_job_status_read_refuses_cross_directory_job_identity_substitution() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create status identity temp dir: {error}"));
+    let paths = temp_shell_job_paths(&temp);
+    let params = ActRunShellStartParams {
+        command: "powershell.exe".to_owned(),
+        args: vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            "exit 0".to_owned(),
+        ],
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: Some("status-record-b".to_owned()),
+    };
+    let authorization = RunShellAuthorization {
+        command_line: shell_command_line_from_parts(&params.command, &params.args),
+        matched_pattern: "__synthetic_status_identity__".to_owned(),
+    };
+    let status = shell_job_status_record(
+        "status-record-b",
+        "running",
+        &params,
+        &paths,
+        "request-sha",
+        &authorization,
+        "2026-07-13T00:00:00Z".to_owned(),
+        Some(4242),
+        None,
+    );
+    write_shell_job_status(&paths.status_path, &status)
+        .unwrap_or_else(|error| panic!("write substituted status record: {error}"));
+    let before = fs::read(&paths.status_path).expect("read status before mismatch check");
+
+    let error = read_shell_job_status(&paths.status_path, "status-record-a")
+        .expect_err("a status from another job id must be rejected");
+    let after = fs::read(&paths.status_path).expect("read status after mismatch check");
+    assert_eq!(before, after, "identity refusal must not mutate the record");
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str),
+        Some("job_status_job_id_mismatch")
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("persisted_job_id"))
+            .and_then(Value::as_str),
+        Some("status-record-b")
+    );
+}
+
+#[test]
 fn shell_job_status_rewrite_has_no_missing_poll_window() {
     use std::{
         sync::{
@@ -1352,12 +1513,24 @@ fn shell_status_read_notfound_gate_distinguishes_replace_from_missing() {
     // exists, so the read must fail immediately rather than burning the
     // 500 ms replace-tolerance window.
     assert!(!status_path.exists());
-    assert!(!shell_status_replace_in_flight(&status_path));
-    let missing = read_shell_status_bytes(&status_path);
+    assert!(
+        !shell_status_replace_in_flight(&status_path)
+            .expect("genuine-missing staging inspection must succeed")
+    );
+    let mut missing_retry_count = 0usize;
+    let missing = read_shell_status_bytes_with_retry_observer(&status_path, |_| {
+        missing_retry_count += 1;
+    });
     println!(
-        "readback=read_shell_status_bytes edge=genuine_missing after=err:{} replace_in_flight:{}",
+        "readback=read_shell_status_bytes edge=genuine_missing after=err:{} replace_in_flight:{} retry_count:{}",
         missing.is_err(),
         shell_status_replace_in_flight(&status_path)
+            .expect("post-read genuine-missing staging inspection must succeed"),
+        missing_retry_count,
+    );
+    assert_eq!(
+        missing_retry_count, 0,
+        "genuine NOT_FOUND must not enter the atomic-replace retry loop"
     );
     assert!(missing.is_err(), "absent status file must error");
     assert_eq!(
@@ -1367,7 +1540,7 @@ fn shell_status_read_notfound_gate_distinguishes_replace_from_missing() {
     );
 
     // Arm 2 — mid-replace window: target absent but a writer's unique staging
-    // sibling is present, so the reader retries. A concurrent thread
+    // sibling is present, so the reader retries. A synchronous retry observer
     // atomically lands the real file (unique temp -> fsync -> rename, exactly
     // as `write_shell_job_status` does); the read must then succeed with the
     // delivered WHOLE-file bytes, never an empty/partial slice. No timing
@@ -1378,25 +1551,26 @@ fn shell_status_read_notfound_gate_distinguishes_replace_from_missing() {
     std::fs::write(&seed_staging, b"pending-replace")
         .unwrap_or_else(|error| panic!("seed staging sibling: {error}"));
     assert!(
-        shell_status_replace_in_flight(&status_path),
+        shell_status_replace_in_flight(&status_path)
+            .expect("seeded staging inspection must succeed"),
         "seeded staging sibling must register as an in-flight replace"
     );
-    let writer_status_path = status_path.clone();
-    let writer_bytes = delivered.clone();
-    let seed_for_writer = seed_staging.clone();
-    let writer = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(60));
-        let landing = shell_status_temp_path(&writer_status_path);
-        write_shell_job_status_staging(&landing, &writer_bytes)
+    let mut retry_observed = false;
+    let recovered = read_shell_status_bytes_with_retry_observer(&status_path, |attempt| {
+        assert_eq!(attempt, 1, "replacement should land on the first retry");
+        assert!(
+            !retry_observed,
+            "replacement observer must run exactly once"
+        );
+        retry_observed = true;
+        let landing = shell_status_temp_path(&status_path);
+        write_shell_job_status_staging(&landing, &delivered)
             .unwrap_or_else(|error| panic!("stage replacement status: {error}"));
-        commit_shell_job_status_file(&landing, &writer_status_path, "issue1568-mid-replace")
+        commit_shell_job_status_file(&landing, &status_path, "issue1568-mid-replace")
             .unwrap_or_else(|error| panic!("commit replacement status: {error}"));
-        let _ = std::fs::remove_file(&seed_for_writer);
+        std::fs::remove_file(&seed_staging)
+            .unwrap_or_else(|error| panic!("remove seeded staging sibling: {error}"));
     });
-    let recovered = read_shell_status_bytes(&status_path);
-    writer
-        .join()
-        .unwrap_or_else(|error| panic!("writer thread should join: {error:?}"));
     println!(
         "readback=read_shell_status_bytes edge=mid_replace after=ok:{}",
         recovered.is_ok()
@@ -1405,6 +1579,29 @@ fn shell_status_read_notfound_gate_distinguishes_replace_from_missing() {
         recovered.expect("mid-replace read must recover once the file lands"),
         delivered,
         "reader must return the freshly delivered whole-file bytes, never empty/partial"
+    );
+    assert!(retry_observed, "reader must exercise the retry branch");
+}
+
+#[cfg(windows)]
+#[test]
+fn shell_status_missing_path_propagates_staging_inspection_failure() {
+    let temp =
+        tempfile::TempDir::new().unwrap_or_else(|error| panic!("create temp status dir: {error}"));
+    let non_directory = temp.path().join("not-a-directory");
+    fs::write(&non_directory, b"physical file")
+        .unwrap_or_else(|error| panic!("seed non-directory parent: {error}"));
+    let status_path = non_directory.join("status.json");
+    let error = read_shell_status_bytes(&status_path)
+        .expect_err("an unreadable staging parent must not look genuinely absent");
+
+    println!(
+        "readback=read_shell_status_bytes edge=staging_inspection_failure path={} after_error={error}",
+        status_path.display()
+    );
+    assert!(
+        error.to_string().contains("staging inspection failed"),
+        "inspection context must survive: {error}"
     );
 }
 
@@ -1809,6 +2006,109 @@ fn shell_job_reconciliation_preserves_monitor_terminal_status() {
     assert_eq!(readback_after_unobserved.exit_code, Some(0));
 }
 
+#[test]
+fn shell_job_reconciliation_serializes_latest_read_and_commit_with_terminal_writer() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create reconciliation race temp dir: {error}"));
+    let paths = ShellJobPaths {
+        job_dir: temp.path().to_path_buf(),
+        stdout_path: temp.path().join("stdout.log"),
+        stderr_path: temp.path().join("stderr.log"),
+        status_path: temp.path().join("status.json"),
+        request_path: temp.path().join("request.json"),
+        remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+    };
+    let params = ActRunShellStartParams {
+        command: "powershell.exe".to_owned(),
+        args: vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            "Write-Output reconciliation-lock-ok".to_owned(),
+        ],
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: Some("reconciliation-lock-order".to_owned()),
+    };
+    let authorization = RunShellAuthorization {
+        command_line: shell_command_line_from_parts(&params.command, &params.args),
+        matched_pattern: "__any_permitted__".to_owned(),
+    };
+    let request_sha = run_shell_start_request_sha256(&params)
+        .unwrap_or_else(|error| panic!("reconciliation request should hash: {error}"));
+    let running = shell_job_status_record(
+        "reconciliation-lock-order",
+        "running",
+        &params,
+        &paths,
+        &request_sha,
+        &authorization,
+        "2026-07-13T00:00:00Z".to_owned(),
+        Some(4242),
+        None,
+    );
+    write_shell_job_status(&paths.status_path, &running)
+        .unwrap_or_else(|error| panic!("initial live status should write: {error}"));
+
+    let mut stale_candidate = running.clone();
+    stale_candidate.status = "finalizing".to_owned();
+    stale_candidate.completed_at = Some("2026-07-13T00:00:02Z".to_owned());
+    stale_candidate.duration_ms = Some(2_000);
+
+    let mut terminal = running;
+    terminal.status = "ok".to_owned();
+    terminal.exit_code = Some(0);
+    terminal.completed_at = Some("2026-07-13T00:00:01Z".to_owned());
+    terminal.duration_ms = Some(1_000);
+
+    // Hold the destination stripe while the reconciliation thread reaches the
+    // lock boundary. The channel is the scheduler coordination point: no
+    // elapsed-time assumption is involved. Commit the monitor's terminal state
+    // under that ownership, then let reconciliation acquire and read it.
+    let write_lock = shell_status_write_lock(&paths.status_path);
+    let write_guard = write_lock
+        .lock()
+        .unwrap_or_else(|error| panic!("reconciliation stripe should lock: {error}"));
+    let (attempt_tx, attempt_rx) = std::sync::mpsc::sync_channel(0);
+    let thread_paths = paths.clone();
+    let reconciler = std::thread::spawn(move || {
+        write_shell_job_reconciliation_status_before_lock(&thread_paths, stale_candidate, || {
+            attempt_tx
+                .send(())
+                .unwrap_or_else(|error| panic!("announce reconciliation lock attempt: {error}"));
+        })
+    });
+    attempt_rx
+        .recv()
+        .unwrap_or_else(|error| panic!("observe reconciliation lock attempt: {error}"));
+    let committed = write_shell_job_status_locked(&paths.status_path, &terminal)
+        .unwrap_or_else(|error| panic!("terminal status should commit under stripe: {error}"));
+    assert_eq!(committed, terminal);
+    drop(write_guard);
+
+    let preserved = reconciler
+        .join()
+        .unwrap_or_else(|error| panic!("reconciliation thread should join: {error:?}"))
+        .unwrap_or_else(|error| panic!("reconciliation should preserve terminal: {error}"));
+    assert_eq!(preserved, terminal);
+
+    // Reacquire the stripe for an independent exact-byte and structured disk
+    // readback after both writers finish.
+    let verification_guard = write_lock
+        .lock()
+        .unwrap_or_else(|error| panic!("verification stripe should lock: {error}"));
+    let actual_bytes = fs::read(&paths.status_path)
+        .unwrap_or_else(|error| panic!("status bytes should read: {error}"));
+    let expected = shell_job_status_with_safe_command_metadata(&terminal);
+    let expected_bytes = serde_json::to_vec_pretty(&expected)
+        .unwrap_or_else(|error| panic!("expected terminal should encode: {error}"));
+    let actual: ActRunShellJobStatus = serde_json::from_slice(&actual_bytes)
+        .unwrap_or_else(|error| panic!("status bytes should decode: {error}"));
+    assert_eq!(actual_bytes, expected_bytes);
+    assert_eq!(actual, expected);
+    drop(verification_guard);
+}
+
 // #1334: a durable job whose status still claims "running" but whose backing
 // process is dead must be reconciled off the live set, not retained forever.
 // Source of truth = the persisted status file on disk after reconcile.
@@ -1878,6 +2178,108 @@ fn reconcile_demotes_running_job_with_dead_pid_off_live_set() {
         .unwrap_or_else(|error| panic!("status should read after reconcile: {error}"));
     assert_ne!(on_disk.status, "running");
     assert!(!shell_job_live_status(&on_disk.status));
+}
+
+#[test]
+fn reconcile_refuses_recycled_pid_identity_without_terminating_current_process() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create identity reconcile temp dir: {error}"));
+    let paths = ShellJobPaths {
+        job_dir: temp.path().to_path_buf(),
+        stdout_path: temp.path().join("stdout.log"),
+        stderr_path: temp.path().join("stderr.log"),
+        status_path: temp.path().join("status.json"),
+        request_path: temp.path().join("request.json"),
+        remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+    };
+    let mut command = if cfg!(windows) {
+        let mut command = StdCommand::new("powershell.exe");
+        command.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+        command
+    } else {
+        let mut command = StdCommand::new("sh");
+        command.args(["-c", "sleep 30"]);
+        command
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    apply_no_window_std(&mut command);
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn exact identity fixture: {error}"));
+    let pid = child.id();
+    let actual_identity = capture_local_process_identity(pid)
+        .unwrap_or_else(|error| panic!("capture fixture identity: {error}"));
+    resume_suspended_shell_child(&actual_identity)
+        .unwrap_or_else(|error| panic!("resume contained fixture: {error}"));
+    let mut stale_identity = actual_identity.clone();
+    stale_identity.start_time = stale_identity.start_time.saturating_add(1);
+    let params = ActRunShellStartParams {
+        command: "synthetic-recycled-pid".to_owned(),
+        args: Vec::new(),
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: Some("recycled-pid-identity".to_owned()),
+    };
+    let authorization = RunShellAuthorization {
+        command_line: params.command.clone(),
+        matched_pattern: "__synthetic_identity__".to_owned(),
+    };
+    let mut status = shell_job_status_record(
+        "recycled-pid-identity",
+        "running",
+        &params,
+        &paths,
+        "synthetic-request",
+        &authorization,
+        chrono::Utc::now().to_rfc3339(),
+        Some(pid),
+        None,
+    );
+    status.local_process_identity = Some(stale_identity);
+    write_shell_job_status(&paths.status_path, &status)
+        .unwrap_or_else(|error| panic!("persist stale identity status: {error}"));
+
+    assert!(!shell_job_process_still_running(&status));
+    let error = reconcile_shell_job_process_state(status, &paths)
+        .expect_err("reconcile must fail closed on stale creation identity");
+    let data = error
+        .data
+        .as_ref()
+        .unwrap_or_else(|| panic!("identity mismatch error should include structured data"));
+    let fixture_still_alive = child
+        .try_wait()
+        .unwrap_or_else(|error| panic!("poll exact fixture after reconcile: {error}"))
+        .is_none();
+    let persisted = read_shell_job_status(&paths.status_path, "recycled-pid-identity")
+        .unwrap_or_else(|error| panic!("status should remain readable after refusal: {error}"));
+    println!(
+        "reconcile_recycled_pid before=expected_start:{} actual_start:{} refused_data:{} persisted_status:{} fixture_still_alive:{}",
+        actual_identity.start_time.saturating_add(1),
+        actual_identity.start_time,
+        data,
+        persisted.status,
+        fixture_still_alive
+    );
+    assert_eq!(
+        data.get("reason").and_then(serde_json::Value::as_str),
+        Some("job_local_process_identity_mismatch")
+    );
+    assert_eq!(persisted.status, "running");
+    assert!(
+        fixture_still_alive,
+        "identity mismatch must never terminate the process currently using that numeric pid"
+    );
+
+    child
+        .kill()
+        .unwrap_or_else(|error| panic!("terminate exact fixture pid {pid}: {error}"));
+    child
+        .wait()
+        .unwrap_or_else(|error| panic!("reap exact fixture pid {pid}: {error}"));
 }
 
 #[test]
@@ -2179,7 +2581,7 @@ fn shell_remote_scope_ssh_option_parser_is_case_sensitive() {
 }
 
 #[test]
-fn shell_remote_tracking_plan_wraps_direct_ssh_remote_command() {
+fn historical_remote_tracking_plan_fixture_preserves_control_argv() {
     let args = vec![
         "-o".to_owned(),
         "BatchMode=yes".to_owned(),
@@ -2187,31 +2589,49 @@ fn shell_remote_tracking_plan_wraps_direct_ssh_remote_command() {
         "bash -lc 'exec -a synapse940 sleep 60'".to_owned(),
     ];
 
-    let plan = ssh_remote_tracking_plan("ssh.exe", &args, "issue940-track")
+    let ssh_command = if cfg!(windows) { "ssh.exe" } else { "ssh" };
+    let plan = ssh_remote_tracking_plan(ssh_command, &args, "issue940-track")
+        .expect("direct ssh replay controls should pass preflight")
         .expect("direct ssh remote command should be tracking-capable");
 
     println!(
         "readback=act_run_shell_remote_tracking edge=wrap before=args:{args:?} after={plan:?}"
     );
     assert_eq!(plan.remote_identity, "aiwonder");
+    let canonical_ssh = trusted_ssh_automatic_replay_executable(ssh_command)
+        .expect("tracking preflight must resolve one exact trusted executable");
+    assert_eq!(plan.command, ssh_command);
+    assert_eq!(Path::new(&plan.cleanup_command), canonical_ssh);
     assert_eq!(
         plan.remote_command,
         "bash -lc 'exec -a synapse940 sleep 60'"
     );
-    assert_eq!(plan.spawn_args[0], "-o");
-    assert_eq!(plan.spawn_args[1], "BatchMode=yes");
-    assert_eq!(plan.spawn_args[2], "aiwonder");
+    assert_eq!(plan.control_args, vec!["-o", "BatchMode=yes", "aiwonder"]);
+    assert_eq!(
+        &plan.spawn_args[..plan.control_args.len()],
+        plan.control_args.as_slice(),
+        "the initial tracked spawn must retain the caller's SSH control argv byte-for-byte"
+    );
+    assert_eq!(&plan.effective_control_args[..2], ["-F", "none"]);
     let remote_wrapper = plan
         .spawn_args
         .last()
         .expect("wrapper command should be appended after destination");
-    assert!(remote_wrapper.contains("setsid sh -c"));
+    assert!(remote_wrapper.contains("setsid env SYNAPSE_REMOTE_JOB_TOKEN="));
+    assert!(remote_wrapper.contains("exec 3<&0"));
+    assert!(remote_wrapper.contains("<&3 &"));
+    assert!(remote_wrapper.contains("env -u SYNAPSE_REMOTE_JOB_TOKEN"));
+    assert!(remote_wrapper.contains("ownership_token_sha256=%s"));
+    assert!(!remote_wrapper.contains("ownership_token=%s"));
     assert!(remote_wrapper.contains("SYNAPSE_REMOTE_PROCESS_V1 job_id=issue940-track"));
+    assert!(remote_wrapper.contains("hasattr(os, \"pidfd_open\")"));
+    assert!(remote_wrapper.contains("hasattr(signal, \"pidfd_send_signal\")"));
+    assert!(valid_remote_ownership_token(&plan.ownership_token));
     assert!(remote_wrapper.contains("bash -lc"));
 }
 
 #[test]
-fn shell_wrapped_powershell_ssh_remote_command_is_tracked() {
+fn shell_wrapped_powershell_ssh_remote_command_is_rejected_before_spawn() {
     let args = vec![
         "-NoLogo".to_owned(),
         "-NoProfile".to_owned(),
@@ -2232,10 +2652,11 @@ fn shell_wrapped_powershell_ssh_remote_command_is_tracked() {
     let invocation = shell_job_ssh_command_invocation(&params.command, &params.args)
         .expect("single PowerShell SSH command should be parseable");
     let scope = shell_job_remote_process_scope_from_start_params(&params);
-    let spawn_plan = shell_job_spawn_plan(&params, "issue1019-powershell-ssh");
+    let error = shell_job_spawn_plan(&params, "issue1019-powershell-ssh")
+        .expect_err("durable promotion must not replace PowerShell with direct ssh");
 
     println!(
-        "readback=act_run_shell_remote_tracking edge=powershell_ssh before=command:{} args:{args:?} after=invocation:{invocation:?} scope:{scope:?} spawn:{spawn_plan:?}",
+        "readback=act_run_shell_remote_tracking edge=powershell_ssh_wrapper_refused before=command:{} args:{args:?} after=invocation:{invocation:?} scope:{scope:?} error:{error:?}",
         params.command
     );
     assert_eq!(invocation.command, "ssh");
@@ -2252,14 +2673,33 @@ fn shell_wrapped_powershell_ssh_remote_command_is_tracked() {
             .iter()
             .any(|evidence| evidence.contains("shell_wrapped_ssh:powershell"))
     );
-    assert_eq!(spawn_plan.command, "ssh");
-    assert!(spawn_plan.args.last().is_some_and(|arg| {
-        arg.contains("SYNAPSE_REMOTE_PROCESS_V1 job_id=issue1019-powershell-ssh")
-    }));
+    assert_eq!(
+        error.code,
+        ErrorCode(-32099),
+        "shell semantic preflight failures use the tool-error envelope"
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str),
+        Some(error_codes::ACTION_TARGET_INVALID)
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str),
+        Some("ssh_durable_semantic_preservation_unavailable")
+    );
+    assert_eq!(params.command, "powershell.exe");
+    assert_eq!(params.args, args);
 }
 
 #[test]
-fn shell_wrapped_complex_powershell_script_is_not_guessed_as_trackable_ssh() {
+fn shell_wrapped_complex_powershell_script_is_refused_conservatively() {
     let args = vec![
         "-NoProfile".to_owned(),
         "-Command".to_owned(),
@@ -2276,10 +2716,11 @@ fn shell_wrapped_complex_powershell_script_is_not_guessed_as_trackable_ssh() {
 
     let invocation = shell_job_ssh_command_invocation(&params.command, &params.args);
     let scope = shell_job_remote_process_scope_from_start_params(&params);
-    let spawn_plan = shell_job_spawn_plan(&params, "issue1019-complex-powershell");
+    let error = shell_job_spawn_plan(&params, "issue1019-complex-powershell")
+        .expect_err("a complex wrapper containing ssh must be refused before spawn");
 
     println!(
-        "readback=act_run_shell_remote_tracking edge=complex_powershell before=command:{} args:{args:?} after=invocation:{invocation:?} scope:{scope:?} spawn:{spawn_plan:?}",
+        "readback=act_run_shell_remote_tracking edge=complex_powershell before=command:{} args:{args:?} after=invocation:{invocation:?} scope:{scope:?} error:{error:?}",
         params.command
     );
     assert!(invocation.is_none());
@@ -2288,12 +2729,18 @@ fn shell_wrapped_complex_powershell_script_is_not_guessed_as_trackable_ssh() {
         scope.remote_cleanup_status,
         SHELL_REMOTE_CLEANUP_NOT_APPLICABLE
     );
-    assert_eq!(spawn_plan.command, "powershell.exe");
-    assert_eq!(spawn_plan.args, args);
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str),
+        Some("ssh_durable_semantic_preservation_unavailable")
+    );
 }
 
 #[test]
-fn shell_wrapped_powershell_ssh_with_escaped_remote_quotes_is_not_rewritten() {
+fn shell_wrapped_powershell_ssh_with_escaped_remote_quotes_is_refused() {
     let script = "ssh -o BatchMode=yes -i //wsl.localhost/Ubuntu-24.04/home/cabdru/.ssh/id_ed25519 -l croyse aiwonder \"sh -lc 'd=$HOME/synapse_issue1259; mkdir -p \\\"$d\\\"; printf 0 > \\\"$d/remote.rc\\\"; exit 0'\"";
     let args = vec![
         "-NoProfile".to_owned(),
@@ -2311,10 +2758,11 @@ fn shell_wrapped_powershell_ssh_with_escaped_remote_quotes_is_not_rewritten() {
 
     let invocation = shell_job_ssh_command_invocation(&params.command, &params.args);
     let scope = shell_job_remote_process_scope_from_start_params(&params);
-    let spawn_plan = shell_job_spawn_plan(&params, "issue1259-escaped-powershell");
+    let error = shell_job_spawn_plan(&params, "issue1259-escaped-powershell")
+        .expect_err("escaped PowerShell SSH must be refused rather than guessed/re-written");
 
     println!(
-        "readback=act_run_shell_remote_tracking edge=escaped_powershell_quotes before=script:{script:?} after=invocation:{invocation:?} scope:{scope:?} spawn:{spawn_plan:?}"
+        "readback=act_run_shell_remote_tracking edge=escaped_powershell_quotes before=script:{script:?} after=invocation:{invocation:?} scope:{scope:?} error:{error:?}"
     );
     assert!(invocation.is_none());
     assert_eq!(scope.transport, SHELL_REMOTE_TRANSPORT_LOCAL);
@@ -2322,12 +2770,18 @@ fn shell_wrapped_powershell_ssh_with_escaped_remote_quotes_is_not_rewritten() {
         scope.remote_cleanup_status,
         SHELL_REMOTE_CLEANUP_NOT_APPLICABLE
     );
-    assert_eq!(spawn_plan.command, "powershell.exe");
-    assert_eq!(spawn_plan.args, args);
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str),
+        Some("ssh_durable_semantic_preservation_unavailable")
+    );
 }
 
 #[test]
-fn shell_remote_tracking_plan_refuses_ssh_modes_without_cleanup_handle() {
+fn historical_remote_tracking_fixture_refuses_modes_without_cleanup_handle() {
     let forwarding = vec![
         "-N".to_owned(),
         "-L".to_owned(),
@@ -2336,15 +2790,20 @@ fn shell_remote_tracking_plan_refuses_ssh_modes_without_cleanup_handle() {
     ];
     let subsystem = vec!["-s".to_owned(), "aiwonder".to_owned(), "sftp".to_owned()];
 
-    let forwarding_plan = ssh_remote_tracking_plan("ssh.exe", &forwarding, "issue940-forward");
-    let subsystem_plan = ssh_remote_tracking_plan("ssh.exe", &subsystem, "issue940-subsystem");
+    let ssh_command = if cfg!(windows) { "ssh.exe" } else { "ssh" };
+    let forwarding_plan = ssh_remote_tracking_plan(ssh_command, &forwarding, "issue940-forward")
+        .unwrap_or_else(|error| panic!("forward-only mode should remain untracked: {error}"));
+    let subsystem_plan = ssh_remote_tracking_plan(ssh_command, &subsystem, "issue940-subsystem");
     let subsystem_scope = ssh_remote_process_scope("ssh.exe", &subsystem, "regression_subsystem");
 
     println!(
         "readback=act_run_shell_remote_tracking edge=unsupported before=-N:{forwarding:?},-s:{subsystem:?} after=-N:{forwarding_plan:?},-s:{subsystem_plan:?},scope:{subsystem_scope:?}"
     );
     assert!(forwarding_plan.is_none());
-    assert!(subsystem_plan.is_none());
+    assert!(
+        subsystem_plan.is_err(),
+        "a remote subsystem command cannot be wrapped without a cleanup-equivalent plan"
+    );
     assert_eq!(
         subsystem_scope.remote_cleanup_status,
         SHELL_REMOTE_CLEANUP_NOT_TRACKED
@@ -2822,7 +3281,7 @@ fn issue1274_remote_liveness_marker_parser_distinguishes_alive_and_gone() {
         None
     );
     assert!(command.contains(SHELL_REMOTE_LIVENESS_MARKER));
-    assert!(command.contains("ps -o pgid="));
+    assert!(command.contains("live_process_ids_in_group"));
     assert!(!command.contains("kill -TERM"));
     assert!(!command.contains("kill -KILL"));
 }
@@ -3087,15 +3546,18 @@ client_loop: send disconnect: Broken pipe
 #[cfg(windows)]
 #[tokio::test]
 async fn issue1604_inline_fast_command_reports_exit_promptly() {
+    let zero_started = Instant::now();
+    let zero_deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     let mut zero = TokioCommand::new("cmd.exe")
         .args(["/c", "exit 0"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap_or_else(|error| panic!("spawn zero-exit child: {error}"));
-    let (zero_exit, zero_timed_out) = wait_shell_child(&mut zero, 60_000)
-        .await
-        .unwrap_or_else(|error| panic!("wait zero-exit: {error:?}"));
+    let (zero_exit, zero_timed_out) =
+        wait_shell_child(&mut zero, 60_000, zero_started, zero_deadline)
+            .await
+            .unwrap_or_else(|error| panic!("wait zero-exit: {error:?}"));
     println!(
         "readback=wait_shell_child issue=1604 edge=fast_exit_zero after=exit_code:{zero_exit:?} timed_out:{zero_timed_out}"
     );
@@ -3103,15 +3565,18 @@ async fn issue1604_inline_fast_command_reports_exit_promptly() {
     assert!(!zero_timed_out, "a fast clean exit is never timed_out");
 
     // Zero-duration nonzero exit: exit-evidence (code 3) preserved, not timed_out.
+    let nonzero_started = Instant::now();
+    let nonzero_deadline = tokio::time::Instant::now() + Duration::from_mins(1);
     let mut nonzero = TokioCommand::new("cmd.exe")
         .args(["/c", "exit 3"])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .unwrap_or_else(|error| panic!("spawn nonzero-exit child: {error}"));
-    let (nonzero_exit, nonzero_timed_out) = wait_shell_child(&mut nonzero, 60_000)
-        .await
-        .unwrap_or_else(|error| panic!("wait nonzero-exit: {error:?}"));
+    let (nonzero_exit, nonzero_timed_out) =
+        wait_shell_child(&mut nonzero, 60_000, nonzero_started, nonzero_deadline)
+            .await
+            .unwrap_or_else(|error| panic!("wait nonzero-exit: {error:?}"));
     println!(
         "readback=wait_shell_child issue=1604 edge=fast_exit_nonzero after=exit_code:{nonzero_exit:?} timed_out:{nonzero_timed_out}"
     );
@@ -3119,13 +3584,117 @@ async fn issue1604_inline_fast_command_reports_exit_promptly() {
     assert!(!nonzero_timed_out);
 }
 
+#[cfg(windows)]
+#[test]
+fn shell_status_missing_retry_policy_is_state_based() {
+    assert!(shell_status_open_error_is_retryable(
+        io::ErrorKind::NotFound,
+        Some(2),
+        true,
+        false,
+    ));
+    assert!(shell_status_open_error_is_retryable(
+        io::ErrorKind::NotFound,
+        Some(2),
+        false,
+        true,
+    ));
+    assert!(!shell_status_open_error_is_retryable(
+        io::ErrorKind::NotFound,
+        Some(2),
+        false,
+        false,
+    ));
+    assert!(shell_status_open_error_is_retryable(
+        io::ErrorKind::PermissionDenied,
+        Some(5),
+        false,
+        false,
+    ));
+}
+
+#[test]
+fn issue1604_inline_timeout_budget_preserves_exact_milliseconds() {
+    assert_eq!(inline_shell_timeout_budget(1), Duration::from_millis(1));
+    assert_eq!(inline_shell_timeout_budget(200), Duration::from_millis(200));
+    assert_eq!(
+        inline_shell_timeout_budget(u64::MAX),
+        Duration::from_millis(u64::MAX)
+    );
+}
+
+#[test]
+fn issue1604_completed_timeout_verdict_never_invents_runtime_from_scheduler_delay() {
+    let budget = Duration::from_millis(200);
+    assert_eq!(
+        completed_inline_timeout_verdict(
+            Some(Duration::from_millis(199)),
+            Duration::from_secs(30),
+            budget,
+        ),
+        Some(false),
+        "kernel runtime wins over a late task poll"
+    );
+    assert_eq!(
+        completed_inline_timeout_verdict(
+            Some(Duration::from_millis(201)),
+            Duration::from_millis(201),
+            budget,
+        ),
+        Some(true)
+    );
+    assert_eq!(
+        completed_inline_timeout_verdict(None, Duration::from_millis(199), budget),
+        Some(false),
+        "a pre-budget observation is unambiguously complete"
+    );
+    assert_eq!(
+        completed_inline_timeout_verdict(None, Duration::from_secs(30), budget),
+        None,
+        "without kernel runtime, post-budget completion is ambiguous and must fail loud"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn issue1604_inline_timeout_boundary_uses_tokio_deadline_not_host_clock() {
+    let budget = inline_shell_timeout_budget(200);
+    let completes_before =
+        wait_with_inline_shell_timeout_at(tokio::time::Instant::now() + budget, async {
+            tokio::time::sleep(Duration::from_millis(199)).await;
+            "completed"
+        })
+        .await;
+    assert_eq!(completes_before.unwrap(), "completed");
+
+    let exceeds = wait_with_inline_shell_timeout_at(tokio::time::Instant::now() + budget, async {
+        tokio::time::sleep(Duration::from_millis(201)).await;
+        "too late"
+    })
+    .await;
+    assert!(
+        exceeds.is_err(),
+        "201 ms future must exceed the 200 ms budget"
+    );
+
+    let prearmed_deadline = tokio::time::Instant::now() + budget;
+    tokio::time::advance(Duration::from_millis(201)).await;
+    let first_poll_after_deadline =
+        wait_with_inline_shell_timeout_at(prearmed_deadline, std::future::pending::<()>()).await;
+    assert!(
+        first_poll_after_deadline.is_err(),
+        "an absolute deadline must not grant a fresh budget when first polled late"
+    );
+}
+
 // #1604/#1616 inline: a timeout must classify the command as timed out and
-// return only after the real OS process has been terminated and reaped. Those
-// state postconditions prove the timeout path without asserting on scheduler
-// wall time, which is unbounded under full-suite CPU saturation.
+// return only after the exact OS process identity has been terminated and
+// reaped. Those state postconditions prove the timeout path without asserting
+// on scheduler wall time, which is unbounded under full-suite CPU saturation.
 #[cfg(windows)]
 #[tokio::test]
 async fn issue1604_inline_timeout_classifies_and_reaps_process() {
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
     let mut child = TokioCommand::new("powershell.exe")
         .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
         .stdout(Stdio::null())
@@ -3135,17 +3704,21 @@ async fn issue1604_inline_timeout_classifies_and_reaps_process() {
     let pid = child
         .id()
         .unwrap_or_else(|| panic!("spawned sleeper must expose its pid"));
-    assert!(
-        process_exists(pid),
-        "precondition: sleeper pid {pid} is live"
+    let identity = capture_local_process_identity(pid)
+        .unwrap_or_else(|error| panic!("capture sleeper identity: {error}"));
+    let identity_before = local_process_identity_state(&identity);
+    assert_eq!(
+        identity_before,
+        LocalProcessIdentityState::Match,
+        "precondition: exact sleeper identity {identity:?} is live"
     );
-    let (exit_code, timed_out) = wait_shell_child(&mut child, 200)
+    let (exit_code, timed_out) = wait_shell_child(&mut child, 200, started, deadline)
         .await
         .unwrap_or_else(|error| panic!("wait sleeper: {error:?}"));
+    let final_identity_state = local_process_identity_state(&identity);
     println!(
-        "readback=wait_shell_child issue=1604 edge=timeout_reap after=pid:{pid} exit_code:{exit_code:?} timed_out:{timed_out} child_id:{:?} os_process_exists:{}",
+        "readback=wait_shell_child issue=1604 edge=timeout_reap after=identity:{identity:?} exit_code:{exit_code:?} timed_out:{timed_out} child_id:{:?} identity_state:{final_identity_state:?}",
         child.id(),
-        process_exists(pid)
     );
     assert!(
         timed_out,
@@ -3157,8 +3730,333 @@ async fn issue1604_inline_timeout_classifies_and_reaps_process() {
     );
     assert_eq!(child.id(), None, "timeout path must reap the child");
     assert!(
-        !process_exists(pid),
-        "timeout path returned while sleeper pid {pid} was still live"
+        matches!(
+            final_identity_state,
+            LocalProcessIdentityState::Exited
+                | LocalProcessIdentityState::Absent
+                | LocalProcessIdentityState::Mismatch(_)
+        ),
+        "timeout path returned while exact sleeper identity was not proven terminal: expected={identity:?} actual={final_identity_state:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn cleanup_child_failure_path_terminates_and_reaps_exact_real_process() {
+    let mut command = StdCommand::new("powershell.exe");
+    command
+        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    apply_no_window_std(&mut command);
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn cleanup-path sleeper: {error}"));
+    let pid = child.id();
+    let identity = capture_local_process_identity(pid)
+        .unwrap_or_else(|error| panic!("capture cleanup-path sleeper identity: {error}"));
+    assert!(
+        process_exists(pid),
+        "precondition: cleanup-path sleeper pid {pid} is live"
+    );
+
+    let cleanup = terminate_and_reap_cleanup_child_bounded(&mut child, &identity);
+    let exact_handle_readback = child
+        .try_wait()
+        .unwrap_or_else(|error| panic!("read exact child handle after cleanup: {error}"));
+    let os_process_exists_after = process_exists(pid);
+    println!(
+        "cleanup_child_failure_path after=cleanup:{cleanup:?} exact_handle:{exact_handle_readback:?} os_process_exists:{os_process_exists_after}"
+    );
+    assert!(cleanup.reap.reaped, "{cleanup:?}");
+    assert!(!cleanup.reap.timed_out, "{cleanup:?}");
+    assert!(
+        exact_handle_readback.is_some(),
+        "the separate exact-handle read must observe a reaped child"
+    );
+    assert!(
+        !os_process_exists_after,
+        "cleanup returned while owned pid {pid} was still live"
+    );
+}
+
+#[test]
+fn contained_cleanup_requires_empty_descendant_readback_before_success() {
+    let exact_reap = ExactChildReapReadback {
+        kill_error: None,
+        reaped: true,
+        exit_code: Some(1),
+        exit_status: Some("synthetic exit".to_owned()),
+        timed_out: false,
+        poll_attempts: 1,
+        poll_error_count: 0,
+        last_poll_error: None,
+        elapsed_ms: 0,
+    };
+    let mut cleanup = ContainedCleanupChildReadback {
+        initial: CleanupChildTerminationReadback {
+            owned_root_pid: 4242,
+            tree_termination_attempted: true,
+            tree_termination_status: "terminated".to_owned(),
+            remaining_process_ids: vec![4343],
+            reap: exact_reap,
+        },
+        job_close: Ok(()),
+        post_job_close_reap: None,
+        final_identity_state: LocalProcessIdentityState::Absent,
+    };
+    assert!(
+        !cleanup.cleanup_verified(),
+        "a surviving descendant must keep cleanup unresolved: {cleanup:?}"
+    );
+
+    cleanup.initial.remaining_process_ids.clear();
+    assert!(
+        cleanup.cleanup_verified(),
+        "exact root reap + empty tree + closed job + absent identity is terminal: {cleanup:?}"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn local_process_identity_mismatch_refuses_real_child_termination() {
+    let params = shell_params(
+        "powershell.exe",
+        vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 60"],
+        60_000,
+    );
+    let mut spawned = spawn_shell_child(&params, None)
+        .unwrap_or_else(|error| panic!("spawn contained identity-mismatch child: {error}"));
+    let pid = spawned.local_process_identity.pid;
+    let state_before = local_process_identity_state(&spawned.local_process_identity);
+    let mut mismatched = spawned.local_process_identity.clone();
+    mismatched.start_time = mismatched
+        .start_time
+        .checked_add(1)
+        .unwrap_or_else(|| panic!("synthetic creation-time mismatch should fit"));
+
+    let refused = terminate_shell_job_process_tree(&mismatched);
+    let exact_child_after_refusal = spawned
+        .child
+        .try_wait()
+        .unwrap_or_else(|error| panic!("read exact child after mismatch refusal: {error}"));
+    let actual_state_after_refusal = local_process_identity_state(&spawned.local_process_identity);
+
+    // Cleanup is authorized only with the exact captured identity.
+    let authorized_cleanup = terminate_shell_job_process_tree(&spawned.local_process_identity);
+    let exact_reap = terminate_and_reap_tokio_child_bounded(
+        &mut spawned.child,
+        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+    );
+    let job_close = spawned.process_job.close_checked();
+    let final_state = local_process_identity_state(&spawned.local_process_identity);
+    println!(
+        "local_process_identity_mismatch pid={pid} before={state_before:?} refused={refused:?} exact_child_after_refusal={exact_child_after_refusal:?} state_after_refusal={actual_state_after_refusal:?} authorized_cleanup={authorized_cleanup:?} exact_reap={exact_reap:?} job_close={job_close:?} after={final_state:?}"
+    );
+
+    assert_eq!(state_before, LocalProcessIdentityState::Match);
+    assert!(!refused.attempted, "{refused:?}");
+    assert!(
+        refused.status.starts_with("identity_verification_failed:"),
+        "{refused:?}"
+    );
+    assert_eq!(
+        exact_child_after_refusal, None,
+        "a mismatched creation identity must not terminate the real child"
+    );
+    assert_eq!(actual_state_after_refusal, LocalProcessIdentityState::Match);
+    assert!(authorized_cleanup.remaining_process_ids.is_empty());
+    assert!(exact_reap.reaped, "{exact_reap:?}");
+    assert!(job_close.is_ok(), "{job_close:?}");
+    assert!(
+        matches!(
+            final_state,
+            LocalProcessIdentityState::Exited | LocalProcessIdentityState::Absent
+        ),
+        "authorized cleanup must leave a terminal non-live identity state: {final_state:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn owned_process_job_checked_close_retains_real_protected_handle_for_drop_retry() {
+    use windows::{
+        Win32::{
+            Foundation::{HANDLE_FLAG_PROTECT_FROM_CLOSE, HANDLE_FLAGS, SetHandleInformation},
+            System::JobObjects::CreateJobObjectW,
+        },
+        core::PCWSTR,
+    };
+
+    let handle = unsafe { CreateJobObjectW(None, PCWSTR::null()) }
+        .unwrap_or_else(|error| panic!("create real protected-close job handle: {error}"));
+    let mut job = OwnedProcessJob {
+        handle: Some(handle),
+    };
+    unsafe {
+        SetHandleInformation(
+            handle,
+            HANDLE_FLAG_PROTECT_FROM_CLOSE.0,
+            HANDLE_FLAG_PROTECT_FROM_CLOSE,
+        )
+    }
+    .unwrap_or_else(|error| panic!("protect real job handle from close: {error}"));
+
+    let protected_close = job.close_checked();
+    let retained_after_failure = job.handle.is_some();
+    unsafe { SetHandleInformation(handle, HANDLE_FLAG_PROTECT_FROM_CLOSE.0, HANDLE_FLAGS(0)) }
+        .unwrap_or_else(|error| panic!("clear real job handle close protection: {error}"));
+    let retry_close = job.close_checked();
+    println!(
+        "owned_process_job_checked_close protected_close={protected_close:?} retained_after_failure={retained_after_failure} retry_close={retry_close:?} handle_after_retry={:?}",
+        job.handle
+    );
+
+    assert!(protected_close.is_err(), "{protected_close:?}");
+    assert!(
+        retained_after_failure,
+        "failed CloseHandle must retain the exact handle for the Drop backstop"
+    );
+    assert!(retry_close.is_ok(), "{retry_close:?}");
+    assert!(job.handle.is_none());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn initial_running_status_store_failure_reaps_real_contained_child() {
+    let _root_guard = ShellJobRootGuard::new();
+    let job_id = "initial-running-status-store-failure";
+    let (_allocated_job_id, paths) = create_shell_job_paths(Some(job_id))
+        .unwrap_or_else(|error| panic!("create real durable job directory: {error}"));
+    fs::create_dir(&paths.status_path)
+        .unwrap_or_else(|error| panic!("create status-path directory failure source: {error}"));
+    let inline_params = shell_params(
+        "powershell.exe",
+        vec!["-NoProfile", "-Command", "Start-Sleep -Seconds 60"],
+        60_000,
+    );
+    let start_params = ActRunShellStartParams {
+        command: inline_params.command.clone(),
+        args: inline_params.args.clone(),
+        working_dir: inline_params.working_dir.clone(),
+        env: inline_params.env.clone(),
+        timeout_ms: None,
+        job_id: Some(job_id.to_owned()),
+    };
+    let authorization = RunShellAuthorization {
+        command_line: shell_command_line_from_parts(&start_params.command, &start_params.args),
+        matched_pattern: "__synthetic_status_store_failure__".to_owned(),
+    };
+    let started = Instant::now();
+    let started_at = chrono::Utc::now().to_rfc3339();
+    let request_sha256 = run_shell_start_request_sha256(&start_params)
+        .unwrap_or_else(|error| panic!("hash status-store failure request: {error}"));
+    let mut spawned = spawn_shell_child(&inline_params, None)
+        .unwrap_or_else(|error| panic!("spawn real contained status-store child: {error}"));
+    let identity = spawned.local_process_identity.clone();
+    let state_before = local_process_identity_state(&identity);
+    let mut status = shell_job_status_record(
+        job_id,
+        "running",
+        &start_params,
+        &paths,
+        &request_sha256,
+        &authorization,
+        started_at,
+        Some(identity.pid),
+        None,
+    );
+    status.local_process_identity = Some(identity.clone());
+
+    let error = persist_running_shell_job_status_or_cleanup(
+        &paths,
+        &mut status,
+        &mut spawned.child,
+        &identity,
+        &mut spawned.process_job,
+        started,
+    )
+    .expect_err("a directory at status.json must make the real store commit fail");
+    let exact_child_after = spawned
+        .child
+        .try_wait()
+        .unwrap_or_else(|read_error| panic!("read exact child after store failure: {read_error}"));
+    let state_after = local_process_identity_state(&identity);
+    let status_metadata = fs::metadata(&paths.status_path)
+        .unwrap_or_else(|read_error| panic!("read physical status-path state: {read_error}"));
+    let cleanup_verified = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("cleanup_verified"))
+        .and_then(Value::as_bool);
+    println!(
+        "initial_running_status_store_failure pid={} before={state_before:?} error={:?} terminal_status={} cleanup_verified={cleanup_verified:?} exact_child_after={exact_child_after:?} after={state_after:?} status_path_is_dir={} status_dir_entries={:?}",
+        identity.pid,
+        error.message,
+        status.status,
+        status_metadata.is_dir(),
+        fs::read_dir(&paths.status_path)
+            .unwrap_or_else(|read_error| panic!(
+                "inventory physical status directory: {read_error}"
+            ))
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<Result<Vec<_>, _>>()
+    );
+
+    assert_eq!(state_before, LocalProcessIdentityState::Match);
+    assert_eq!(cleanup_verified, Some(true), "{error:?}");
+    assert_eq!(
+        status.status, "start_status_persist_failed_reaped",
+        "{status:?}"
+    );
+    assert!(exact_child_after.is_some());
+    assert_eq!(state_after, LocalProcessIdentityState::Absent);
+    assert!(status_metadata.is_dir());
+    assert!(
+        !process_exists(identity.pid),
+        "store failure returned while owned pid {} was live",
+        identity.pid
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn pid_unavailable_cleanup_helper_confirms_an_already_reaped_real_child() {
+    let mut child = TokioCommand::new("cmd.exe")
+        .args(["/c", "exit 23"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap_or_else(|error| panic!("spawn pid-unavailable regression child: {error}"));
+    let exit = child
+        .wait()
+        .await
+        .unwrap_or_else(|error| panic!("reap regression child precondition: {error}"));
+    assert_eq!(exit.code(), Some(23));
+    assert_eq!(
+        child.id(),
+        None,
+        "precondition: Tokio hides the pid after exact-child reaping"
+    );
+
+    let cleanup = terminate_and_reap_tokio_child_bounded(
+        &mut child,
+        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+    );
+    let exact_handle_readback = child
+        .try_wait()
+        .unwrap_or_else(|error| panic!("read already-reaped exact child handle: {error}"));
+    println!(
+        "pid_unavailable_cleanup_helper after=cleanup:{cleanup:?} exact_handle:{exact_handle_readback:?}"
+    );
+    assert!(cleanup.reaped, "{cleanup:?}");
+    assert!(!cleanup.timed_out, "{cleanup:?}");
+    assert_eq!(cleanup.exit_code, Some(23));
+    assert_eq!(
+        exact_handle_readback.and_then(|status| status.code()),
+        Some(23)
     );
 }
 
@@ -3306,7 +4204,7 @@ fn ssh_cleanup_command_parts_prefers_live_original_args_over_safe_status_args() 
 }
 
 #[test]
-fn shell_wrapped_ssh_cleanup_sidecar_survives_redacted_status_args() {
+fn shell_wrapped_ssh_refusal_does_not_create_cleanup_sidecar() {
     let temp = tempfile::TempDir::new()
         .unwrap_or_else(|error| panic!("create temp shell status dir: {error}"));
     let paths = ShellJobPaths {
@@ -3335,58 +4233,718 @@ fn shell_wrapped_ssh_cleanup_sidecar_survives_redacted_status_args() {
         timeout_ms: None,
         job_id: Some("issue1019-sidecar".to_owned()),
     };
-    let authorization = RunShellAuthorization {
-        command_line: shell_command_line_from_parts(&params.command, &params.args),
-        matched_pattern: "__any_permitted__".to_owned(),
-    };
-    let status = shell_job_status_record(
-        "issue1019-sidecar",
-        "running",
-        &params,
-        &paths,
-        "request-sha",
-        &authorization,
-        "2026-06-15T00:00:00Z".to_owned(),
-        Some(1234),
-        None,
-    );
 
-    write_shell_remote_cleanup_invocation(&paths, &params)
-        .unwrap_or_else(|error| panic!("cleanup sidecar should write: {error}"));
-    let cleanup = read_shell_remote_cleanup_invocation(&paths, "issue1019-sidecar")
-        .unwrap_or_else(|error| panic!("cleanup sidecar should read: {error}"))
-        .unwrap_or_else(|| panic!("cleanup sidecar should exist"));
-    let persisted_invocation = shell_job_cleanup_invocation(&status, None, Some(&cleanup))
-        .unwrap_or_else(|| panic!("parse persisted cleanup sidecar invocation"));
-    let persisted_parts = ssh_direct_command_parts(&persisted_invocation.args)
-        .unwrap_or_else(|| panic!("parse persisted sidecar cleanup args"));
+    write_shell_job_request(&paths, &params, "request-sha", None)
+        .unwrap_or_else(|error| panic!("request evidence should write: {error}"));
+    let before_request = fs::read(&paths.request_path).expect("read request before refusal");
+    let error = shell_job_spawn_plan(&params, "issue1019-sidecar")
+        .expect_err("PowerShell wrapper semantics cannot be promoted to direct ssh");
+    let after_request = fs::read(&paths.request_path).expect("read request after refusal");
 
     println!(
-        "readback=act_run_shell_remote_cleanup edge=shell_wrapped_redacted_status before=args_redacted:{} after=cleanup:{cleanup:?} invocation:{persisted_invocation:?}",
-        status.args_redacted
+        "readback=act_run_shell_remote_cleanup edge=shell_wrapped_refused before=request_sha256:{} after=error:{error:?} sidecar_exists:{}",
+        sha256_hex(&before_request),
+        paths.remote_cleanup_path.exists()
     );
-    assert_eq!(persisted_invocation.command, "ssh");
-    assert!(status.args_redacted);
+    assert_eq!(before_request, after_request);
+    assert!(!paths.remote_cleanup_path.exists());
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str),
+        Some("ssh_durable_semantic_preservation_unavailable")
+    );
+}
+
+#[test]
+fn remote_cleanup_sidecar_rejects_identity_digest_and_local_execution_drift() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create sidecar validation temp dir: {error}"));
+    let paths = ShellJobPaths {
+        job_dir: temp.path().to_path_buf(),
+        stdout_path: temp.path().join("stdout.log"),
+        stderr_path: temp.path().join("stderr.log"),
+        status_path: temp.path().join("status.json"),
+        request_path: temp.path().join("request.json"),
+        remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+    };
+    let base = ShellRemoteCleanupInvocation {
+        schema_version: 1,
+        transport: SHELL_REMOTE_TRANSPORT_SSH.to_owned(),
+        command: "ssh".to_owned(),
+        control_args: vec!["host-b.example".to_owned()],
+        remote_identity: "host-a.example".to_owned(),
+        source_evidence: "supporting_regression".to_owned(),
+        args_sha256: sha256_hex(b"legacy-argv"),
+        request_args_sha256: None,
+        effective_control_args: None,
+        effective_args_sha256: None,
+        request_effective_config: None,
+        cleanup_effective_config: None,
+        ownership_token: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    write_pretty_json_file(&paths.remote_cleanup_path, &base, "remote cleanup")
+        .unwrap_or_else(|error| panic!("write identity-drift sidecar: {error}"));
+    let identity_error = read_shell_remote_cleanup_invocation(&paths, "identity-drift")
+        .expect_err("recorded identity differing from parsed destination must fail");
     assert!(
-        persisted_parts
-            .control_args
+        identity_error.contains("identity differs"),
+        "{identity_error}"
+    );
+
+    let mut unsafe_option = base.clone();
+    unsafe_option.remote_identity = "host-b.example".to_owned();
+    unsafe_option.control_args = vec![
+        "-o".to_owned(),
+        "ProxyCommand=powershell.exe -Command Write-Output unsafe".to_owned(),
+        "host-b.example".to_owned(),
+    ];
+    write_pretty_json_file(&paths.remote_cleanup_path, &unsafe_option, "remote cleanup")
+        .unwrap_or_else(|error| panic!("write unsafe-option sidecar: {error}"));
+    let option_error = read_shell_remote_cleanup_invocation(&paths, "unsafe-option")
+        .expect_err("ProxyCommand automatic replay must fail");
+    assert!(
+        option_error.contains("outside the automatic-replay allowlist"),
+        "{option_error}"
+    );
+
+    let mut invalid_digest = base;
+    invalid_digest.remote_identity = "host-b.example".to_owned();
+    invalid_digest.args_sha256 = "not-a-digest".to_owned();
+    write_pretty_json_file(
+        &paths.remote_cleanup_path,
+        &invalid_digest,
+        "remote cleanup",
+    )
+    .unwrap_or_else(|error| panic!("write invalid-digest sidecar: {error}"));
+    let digest_error = read_shell_remote_cleanup_invocation(&paths, "invalid-digest")
+        .expect_err("invalid legacy digest must fail");
+    assert!(digest_error.contains("lowercase SHA-256"), "{digest_error}");
+}
+
+#[test]
+fn remote_cleanup_reads_actual_legacy_schema1_artifact_without_new_optional_field() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create legacy sidecar temp dir: {error}"));
+    let paths = ShellJobPaths {
+        job_dir: temp.path().to_path_buf(),
+        stdout_path: temp.path().join("stdout.log"),
+        stderr_path: temp.path().join("stderr.log"),
+        status_path: temp.path().join("status.json"),
+        request_path: temp.path().join("request.json"),
+        remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+    };
+    // Serialize the historical wire shape as a JSON object rather than the
+    // current Rust struct. In particular, request_args_sha256 is physically
+    // absent, proving serde(default) compatibility with an actual schema-v1
+    // artifact instead of a newly serialized facsimile containing null.
+    let artifact = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "transport": "ssh",
+        "command": "ssh",
+        "control_args": ["legacy.example"],
+        "remote_identity": "legacy.example",
+        "source_evidence": "historical_schema1_artifact",
+        "args_sha256": sha256_hex(b"historical-unrecomputable-argv"),
+        "created_at": "2026-06-15T00:00:00Z"
+    }))
+    .expect("encode historical schema-v1 artifact");
+    assert!(!String::from_utf8_lossy(&artifact).contains("request_args_sha256"));
+    fs::write(&paths.remote_cleanup_path, &artifact)
+        .unwrap_or_else(|error| panic!("write historical schema-v1 artifact: {error}"));
+
+    let readback = read_shell_remote_cleanup_invocation(&paths, "legacy-schema1")
+        .unwrap_or_else(|error| panic!("historical schema-v1 artifact should decode: {error}"))
+        .expect("historical sidecar exists");
+    assert_eq!(readback.schema_version, 1);
+    assert_eq!(readback.remote_identity, "legacy.example");
+    assert_eq!(readback.request_args_sha256, None);
+}
+
+#[test]
+fn remote_cleanup_automatic_replay_is_allowlisted_and_config_independent() {
+    let live_schema1_args = vec![
+        "-n".to_owned(),
+        "-T".to_owned(),
+        "-i".to_owned(),
+        r"C:\Users\synthetic_fixture\.ssh\id_ed25519_fixture".to_owned(),
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "ClearAllForwardings=yes".to_owned(),
+        "-o".to_owned(),
+        "IdentitiesOnly=yes".to_owned(),
+        "fixture-user@fixture-host.example".to_owned(),
+    ];
+    assert_eq!(
+        ssh_control_args_unsafe_for_automatic_replay(&live_schema1_args),
+        None,
+        "the structurally equivalent legacy argv's disabling options and identity path remain read-only replay compatible"
+    );
+    let hardened = hardened_ssh_automatic_replay_args(&live_schema1_args)
+        .expect("allowlisted legacy argv must receive the canonical safe prefix");
+    assert_eq!(&hardened[..2], &["-F".to_owned(), "none".to_owned()]);
+    assert!(hardened.ends_with(&live_schema1_args));
+    let rendered = hardened.join(" ").to_ascii_lowercase();
+    for required in [
+        "batchmode=yes",
+        "clearallforwardings=yes",
+        "permitlocalcommand=no",
+        "proxycommand=none",
+        "proxyjump=none",
+        "controlmaster=no",
+        "controlpath=none",
+        "controlpersist=no",
+        "forwardagent=no",
+        "forwardx11=no",
+        "tunnel=no",
+    ] {
+        assert!(
+            rendered.contains(required),
+            "missing safe baseline {required}"
+        );
+    }
+
+    let unsafe_families: &[&[&str]] = &[
+        &["-E", "cleanup.log", "host.example"],
+        &["-J", "jump.example", "host.example"],
+        &["-L", "8080:localhost:80", "host.example"],
+        &["-R", "8080:localhost:80", "host.example"],
+        &["-D", "1080", "host.example"],
+        &["-S", "control.sock", "host.example"],
+        &["-w", "any:any", "host.example"],
+        &["-F", "mutable-config", "host.example"],
+        &["-I", "mutable-provider", "host.example"],
+        &["-i", "relative-identity", "host.example"],
+        &["-o", "ProxyCommand=helper", "host.example"],
+        &["-o", "ProxyJump=jump.example", "host.example"],
+        &["-o", "LocalCommand=helper", "host.example"],
+        &["-o", "PermitLocalCommand=yes", "host.example"],
+        &["-o", "ControlMaster=yes", "host.example"],
+        &["-o", "ControlPath=control.sock", "host.example"],
+        &["-o", "ControlPersist=yes", "host.example"],
+        &["-o", "LocalForward=8080 localhost:80", "host.example"],
+        &["-o", "RemoteForward=8080 localhost:80", "host.example"],
+        &["-o", "DynamicForward=1080", "host.example"],
+        &["-o", "Tunnel=yes", "host.example"],
+        &["-o", "KnownHostsCommand=helper", "host.example"],
+        &["-o", "PKCS11Provider=provider", "host.example"],
+        &["-o", "SecurityKeyProvider=provider", "host.example"],
+    ];
+    for unsafe_argv in unsafe_families {
+        let argv = unsafe_argv
             .iter()
-            .any(|arg| arg == "//wsl.localhost/Ubuntu-24.04/home/cabdru/.ssh/id_ed25519")
+            .map(|value| (*value).to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            ssh_control_args_unsafe_for_automatic_replay(&argv).is_some(),
+            "side-effecting/mutable SSH argv must fail closed: {argv:?}"
+        );
+        assert!(hardened_ssh_automatic_replay_args(&argv).is_err());
+    }
+
+    let unsafe_start = ActRunShellStartParams {
+        command: "ssh".to_owned(),
+        args: vec![
+            "-J".to_owned(),
+            "jump.example".to_owned(),
+            "host.example".to_owned(),
+            "true".to_owned(),
+        ],
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: None,
+    };
+    let unsafe_plan = shell_job_spawn_plan(&unsafe_start, "unsafe-proxy-jump");
+    assert!(unsafe_plan.is_err(), "unsafe replay must fail before spawn");
+
+    let relative_identity_start = ActRunShellStartParams {
+        command: "ssh".to_owned(),
+        args: vec![
+            "-i".to_owned(),
+            "relative-identity".to_owned(),
+            "host.example".to_owned(),
+            "true".to_owned(),
+        ],
+        working_dir: Some(r"C:\synthetic\different-working-dir".to_owned()),
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: None,
+    };
+    let relative_identity_plan =
+        shell_job_spawn_plan(&relative_identity_start, "unsafe-relative-identity");
+    assert!(
+        relative_identity_plan.is_err(),
+        "a working-directory-relative identity must fail before spawn"
+    );
+}
+
+#[test]
+fn explicit_start_refuses_direct_ssh_before_any_job_artifact() {
+    let _root_guard = ShellJobRootGuard::new();
+    let job_id = "unsafe-ssh-preflight-state";
+    let root = shell_durable_job_root_dir()
+        .unwrap_or_else(|error| panic!("resolve synthetic durable job root: {error}"));
+    let paths = shell_job_paths_from_root(&root, job_id);
+    println!(
+        "readback=act_run_shell_start edge=unsafe_ssh_preflight before=job_dir_exists:{} status_exists:{}",
+        paths.job_dir.exists(),
+        paths.status_path.exists()
+    );
+
+    let params = ActRunShellStartParams {
+        command: "ssh".to_owned(),
+        args: vec![
+            "-J".to_owned(),
+            "jump.example".to_owned(),
+            "host.example".to_owned(),
+            "true".to_owned(),
+        ],
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: Some(job_id.to_owned()),
+    };
+    let authorization = RunShellAuthorization {
+        command_line: shell_command_line_from_parts(&params.command, &params.args),
+        matched_pattern: "__synthetic_preflight__".to_owned(),
+    };
+    let error = start_authorized_shell_job(params, &authorization, None)
+        .expect_err("every explicit SSH start must be refused before spawn/artifact creation");
+
+    println!(
+        "readback=act_run_shell_start edge=ssh_semantic_refusal after=error:{:?} job_dir_exists:{} request_exists:{} status_exists:{} sidecar_exists:{} stdout_exists:{} stderr_exists:{}",
+        error.message,
+        paths.job_dir.exists(),
+        paths.request_path.exists(),
+        paths.status_path.exists(),
+        paths.remote_cleanup_path.exists(),
+        paths.stdout_path.exists(),
+        paths.stderr_path.exists(),
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str),
+        Some("ssh_durable_semantic_preservation_unavailable")
+    );
+    assert!(!paths.job_dir.exists());
+    assert!(!paths.request_path.exists());
+    assert!(!paths.status_path.exists());
+    assert!(!paths.remote_cleanup_path.exists());
+    assert!(!paths.stdout_path.exists());
+    assert!(!paths.stderr_path.exists());
+
+    let wrapped_job_id = "wrapped-ssh-explicit-start";
+    let wrapped_paths = shell_job_paths_from_root(&root, wrapped_job_id);
+    let wrapped = ActRunShellStartParams {
+        command: "powershell.exe".to_owned(),
+        args: vec![
+            "-NoProfile".to_owned(),
+            "-Command".to_owned(),
+            "Write-Output before; ssh host.example \"printf wrapped\"".to_owned(),
+        ],
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: Some(wrapped_job_id.to_owned()),
+    };
+    let wrapped_authorization = RunShellAuthorization {
+        command_line: shell_command_line_from_parts(&wrapped.command, &wrapped.args),
+        matched_pattern: "__synthetic_preflight__".to_owned(),
+    };
+    let wrapped_error = start_authorized_shell_job(wrapped, &wrapped_authorization, None)
+        .expect_err("wrapped SSH explicit start must be refused before artifact creation");
+    assert_eq!(
+        wrapped_error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str),
+        Some("ssh_durable_semantic_preservation_unavailable")
+    );
+    assert!(!wrapped_paths.job_dir.exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn durable_ssh_refusal_covers_wrappers_bash_dialect_and_stdin_without_mutation() {
+    let _root_guard = ShellJobRootGuard::new();
+    let durable_root = shell_durable_job_root_dir()
+        .unwrap_or_else(|error| panic!("resolve hermetic durable root: {error}"));
+    let temp = tempfile::TempDir::new().expect("create SSH refusal sentinel directory");
+    let sentinel = temp.path().join("wrapper-spawned.txt");
+    let sentinel_literal = path_string(&sentinel).replace('\'', "''");
+    let wrapper_script = format!(
+        "Set-Content -LiteralPath '{sentinel_literal}' -Value spawned; ssh host.example \"printf wrapped\""
+    );
+    let cases = [
+        (
+            "direct_bash_process_substitution",
+            "ssh".to_owned(),
+            vec![
+                "host.example".to_owned(),
+                "mapfile -t rows < <(printf 'x\\n'); printf '%s\\n' \"${rows[@]}\"".to_owned(),
+            ],
+            ActRunShellExecutionMode::Auto,
+        ),
+        (
+            "direct_stdin_reader",
+            "ssh".to_owned(),
+            vec![
+                "host.example".to_owned(),
+                "IFS= read -r value; printf '%s\\n' \"$value\"".to_owned(),
+            ],
+            ActRunShellExecutionMode::Durable,
+        ),
+        (
+            "powershell_wrapper",
+            "powershell.exe".to_owned(),
+            vec![
+                "-NoProfile".to_owned(),
+                "-Command".to_owned(),
+                wrapper_script,
+            ],
+            ActRunShellExecutionMode::Auto,
+        ),
+    ];
+
+    for (case, command, args, execution_mode) in cases {
+        let params = ActRunShellParams {
+            command: command.clone(),
+            args: args.clone(),
+            working_dir: None,
+            env: BTreeMap::new(),
+            timeout_ms: DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS + 1,
+            execution_mode,
+            durable_timeout_ms: None,
+            idempotency_key: None,
+        };
+        let authorization = RunShellAuthorization {
+            command_line: shell_command_line(&params),
+            matched_pattern: "__synthetic_ssh_semantic_refusal__".to_owned(),
+        };
+        let error = run_authorized_shell(
+            params,
+            &authorization,
+            DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS,
+            None,
+        )
+        .await
+        .expect_err("durable SSH must fail before execution");
+        let data = error
+            .data
+            .as_ref()
+            .unwrap_or_else(|| panic!("{case} refusal must be structured: {error:?}"));
+        println!(
+            "durable_ssh_refusal case={case} command={command:?} args_sha256={} error={error:?} sentinel_exists:{} durable_root_exists:{}",
+            shell_args_sha256(&args),
+            sentinel.exists(),
+            durable_root.exists()
+        );
+        assert_eq!(
+            data.get("reason").and_then(Value::as_str),
+            Some("ssh_durable_semantic_preservation_unavailable"),
+            "case={case}"
+        );
+        assert_eq!(
+            data.get("remediation").and_then(Value::as_str),
+            Some("use_bounded_inline_execution"),
+            "case={case}"
+        );
+        assert!(!sentinel.exists(), "case={case}: wrapper process ran");
+        assert!(
+            !durable_root.exists()
+                || fs::read_dir(&durable_root)
+                    .expect("read hermetic durable root")
+                    .next()
+                    .is_none(),
+            "case={case}: refusal created a durable artifact"
+        );
+    }
+
+    let bounded_inline = ActRunShellParams {
+        command: "ssh".to_owned(),
+        args: vec!["host.example".to_owned(), "printf inline".to_owned()],
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: 60_000,
+        execution_mode: ActRunShellExecutionMode::Inline,
+        durable_timeout_ms: None,
+        idempotency_key: None,
+    };
+    validate_run_shell_execution_plan(&bounded_inline, DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS)
+        .expect("bounded inline SSH is the supported remediation");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn real_spawn_failure_persists_a_complete_independently_readable_status() {
+    let _root_guard = ShellJobRootGuard::new();
+    let job_id = "spawn-failure-durable-readback";
+    let root = shell_durable_job_root_dir()
+        .unwrap_or_else(|error| panic!("resolve synthetic durable job root: {error}"));
+    let paths = shell_job_paths_from_root(&root, job_id);
+    let missing_executable = root.join("executable-that-does-not-exist-synapse-regression");
+    assert!(
+        !missing_executable.exists(),
+        "precondition: executable path must be absent"
+    );
+    let params = ActRunShellStartParams {
+        command: path_string(&missing_executable),
+        args: vec!["synthetic-argument".to_owned()],
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: Some(job_id.to_owned()),
+    };
+    let authorization = RunShellAuthorization {
+        command_line: shell_command_line_from_parts(&params.command, &params.args),
+        matched_pattern: "__synthetic_missing_executable__".to_owned(),
+    };
+
+    let error = start_authorized_shell_job(params, &authorization, None)
+        .expect_err("the physically absent executable must fail to spawn");
+    let status_bytes = fs::read(&paths.status_path).unwrap_or_else(|read_error| {
+        panic!("separately read durable spawn status bytes: {read_error}")
+    });
+    let raw_status: ActRunShellJobStatus = serde_json::from_slice(&status_bytes)
+        .unwrap_or_else(|decode_error| panic!("decode durable spawn status bytes: {decode_error}"));
+    let public_readback = read_shell_job_status(&paths.status_path, job_id)
+        .unwrap_or_else(|read_error| panic!("read durable spawn status: {read_error}"));
+    println!(
+        "real_spawn_failure after=error:{:?} raw_status:{raw_status:?} public_readback:{public_readback:?}",
+        error.message
+    );
+    assert_eq!(raw_status, public_readback);
+    assert_eq!(public_readback.status, "spawn_failed");
+    assert!(public_readback.pid.is_none());
+    assert!(public_readback.completed_at.is_some());
+    assert_eq!(
+        public_readback.error_code.as_deref(),
+        Some(error_codes::ACTION_TARGET_INVALID)
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(Value::as_str),
+        Some("spawn_failed")
+    );
+}
+
+#[test]
+fn unverified_post_spawn_cleanup_is_nonterminal_until_exact_reap() {
+    let cleanup = ExactChildReapReadback {
+        kill_error: Some("synthetic kill uncertainty".to_owned()),
+        reaped: false,
+        exit_code: None,
+        exit_status: None,
+        timed_out: true,
+        poll_attempts: 2,
+        poll_error_count: 1,
+        last_poll_error: Some("synthetic poll uncertainty".to_owned()),
+        elapsed_ms: SHELL_CHILD_REAP_BACKSTOP_MS,
+    };
+    let readback = spawn_failure_readback(
+        "local_process_identity_capture_failed",
+        &cleanup,
+        true,
+        Some(&Err("synthetic job close uncertainty".to_owned())),
+        false,
+        Some(&LocalProcessIdentityState::Unreadable(
+            "synthetic identity uncertainty".to_owned(),
+        )),
+        false,
+    );
+    assert!(!readback.cleanup_verified, "{readback:?}");
+    assert!(!readback.exact_child_reaped, "{readback:?}");
+    assert!(
+        shell_job_live_status(SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED),
+        "unverified exact ownership must remain a live durable state"
     );
     assert!(
-        !persisted_parts
-            .control_args
-            .iter()
-            .any(|arg| arg.contains("[redacted-arg:"))
+        !shell_job_terminal_status(SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED),
+        "unverified exact ownership must not be reported terminal"
     );
+    assert!(shell_job_terminal_status("spawn_failed_reaped"));
+}
+
+#[test]
+fn terminal_status_verifier_surfaces_a_real_store_commit_failure() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create status failure temp dir: {error}"));
+    let job_dir = temp.path().join("job");
+    fs::create_dir(&job_dir)
+        .unwrap_or_else(|error| panic!("create status failure job dir: {error}"));
+    let paths = ShellJobPaths {
+        job_dir: job_dir.clone(),
+        stdout_path: job_dir.join("stdout.log"),
+        stderr_path: job_dir.join("stderr.log"),
+        // A directory at the final file path deterministically makes the real
+        // atomic replace fail on every supported host filesystem.
+        status_path: job_dir.join("status.json"),
+        request_path: job_dir.join("request.json"),
+        remote_cleanup_path: job_dir.join("remote-cleanup.json"),
+    };
+    fs::create_dir(&paths.status_path)
+        .unwrap_or_else(|error| panic!("create conflicting status directory: {error}"));
+    let params = ActRunShellStartParams {
+        command: "synthetic-command".to_owned(),
+        args: Vec::new(),
+        working_dir: None,
+        env: BTreeMap::new(),
+        timeout_ms: None,
+        job_id: Some("status-commit-failure".to_owned()),
+    };
+    let authorization = RunShellAuthorization {
+        command_line: params.command.clone(),
+        matched_pattern: "__synthetic_status_commit__".to_owned(),
+    };
+    let mut status = shell_job_status_record(
+        "status-commit-failure",
+        "spawn_failed",
+        &params,
+        &paths,
+        "synthetic-request-sha256",
+        &authorization,
+        "2026-07-13T00:00:00Z".to_owned(),
+        None,
+        None,
+    );
+    status.completed_at = Some("2026-07-13T00:00:01Z".to_owned());
+    status.error_code = Some(error_codes::ACTION_TARGET_INVALID.to_owned());
+    status.error_message = Some("synthetic physical spawn failure".to_owned());
+
+    let failure = persist_and_verify_shell_job_status(&paths.status_path, &status)
+        .expect_err("a directory cannot be atomically replaced by status.json");
+    let entries = fs::read_dir(&job_dir)
+        .unwrap_or_else(|error| panic!("read job dir after failed commit: {error}"))
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("read job dir entry: {error}"))
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "terminal_status_verifier after=failure:{failure:?} status_path_is_dir:{} entries:{entries:?}",
+        paths.status_path.is_dir()
+    );
+    assert_eq!(failure.error_code, error_codes::STORAGE_WRITE_FAILED);
+    assert_eq!(failure.reason, "job_status_write_failed");
+    assert!(paths.status_path.is_dir());
+    assert_eq!(entries, vec!["status.json".to_owned()]);
+}
+
+#[test]
+fn remote_cleanup_v2_rejects_control_and_request_replay_divergence() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create v2 divergence temp dir: {error}"));
+    let paths = ShellJobPaths {
+        job_dir: temp.path().to_path_buf(),
+        stdout_path: temp.path().join("stdout.log"),
+        stderr_path: temp.path().join("stderr.log"),
+        status_path: temp.path().join("status.json"),
+        request_path: temp.path().join("request.json"),
+        remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+    };
+    let request_digest = shell_args_sha256(&["host-a.example".to_owned(), "true".to_owned()]);
+    fs::write(
+        &paths.request_path,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "args_sha256": request_digest.clone()
+        }))
+        .expect("encode request binding"),
+    )
+    .expect("write request binding");
+    let base = ShellRemoteCleanupInvocation {
+        schema_version: 2,
+        transport: SHELL_REMOTE_TRANSPORT_SSH.to_owned(),
+        command: "ssh".to_owned(),
+        control_args: vec!["host-a.example".to_owned()],
+        remote_identity: "host-a.example".to_owned(),
+        source_evidence: "v2_replay_divergence_regression".to_owned(),
+        args_sha256: shell_args_sha256(&["host-a.example".to_owned()]),
+        request_args_sha256: Some(request_digest.clone()),
+        effective_control_args: None,
+        effective_args_sha256: None,
+        request_effective_config: None,
+        cleanup_effective_config: None,
+        ownership_token: None,
+        created_at: "2026-06-15T00:00:00Z".to_owned(),
+    };
+
+    let mut control_drift = base.clone();
+    control_drift.control_args = vec!["host-b.example".to_owned()];
+    control_drift.remote_identity = "host-b.example".to_owned();
+    write_pretty_json_file(&paths.remote_cleanup_path, &control_drift, "remote cleanup")
+        .expect("write control-drift sidecar");
+    let control_error = read_shell_remote_cleanup_invocation(&paths, "control-drift")
+        .expect_err("control argv drift without a matching digest must fail");
     assert!(
-        !cleanup
-            .control_args
-            .iter()
-            .any(|arg| arg.contains("exec -a issue1019"))
+        control_error.contains("control argv digest differs"),
+        "{control_error}"
     );
-    assert_eq!(cleanup.remote_identity, "aiwonder.mst.com");
-    assert_eq!(cleanup.source_evidence, "shell_wrapped_ssh:powershell");
+
+    let mut request_drift = base.clone();
+    request_drift.request_args_sha256 = Some(sha256_hex(b"different-request-argv"));
+    write_pretty_json_file(&paths.remote_cleanup_path, &request_drift, "remote cleanup")
+        .expect("write request-drift sidecar");
+    let request_error = read_shell_remote_cleanup_invocation(&paths, "request-drift")
+        .expect_err("sidecar/request digest divergence must fail");
+    assert!(
+        request_error.contains("not bound to request argv"),
+        "{request_error}"
+    );
+
+    let mut policy_drift = base;
+    policy_drift.schema_version = 3;
+    policy_drift.command = trusted_ssh_automatic_replay_executable("ssh")
+        .expect("v3 synthetic sidecar needs an exact trusted executable")
+        .to_string_lossy()
+        .into_owned();
+    let mut persisted_effective = hardened_ssh_automatic_replay_args(&policy_drift.control_args)
+        .expect("synthetic v3 controls are replay-safe");
+    persisted_effective.insert(persisted_effective.len() - 1, "-C".to_owned());
+    policy_drift.effective_args_sha256 = Some(shell_args_sha256(&persisted_effective));
+    policy_drift.effective_control_args = Some(persisted_effective);
+    write_pretty_json_file(&paths.remote_cleanup_path, &policy_drift, "remote cleanup")
+        .expect("write replay-policy-drift sidecar");
+    let policy_error = read_shell_remote_cleanup_invocation(&paths, "policy-drift")
+        .expect_err("v3 effective argv differing from current policy must fail closed");
+    assert!(
+        policy_error.contains("replay policy drifted"),
+        "{policy_error}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn remote_cleanup_replay_accepts_system32_openssh_and_rejects_arbitrary_leaf_path() {
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let system_ssh = system_root.join("System32").join("OpenSSH").join("ssh.exe");
+    assert!(
+        system_ssh.is_file(),
+        "configured Windows host must provide System32 OpenSSH at {}",
+        system_ssh.display()
+    );
+    assert!(trusted_ssh_automatic_replay_executable(&system_ssh.to_string_lossy()).is_some());
+
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create arbitrary ssh temp dir: {error}"));
+    let arbitrary = temp.path().join("ssh.exe");
+    fs::write(&arbitrary, b"not the trusted ssh binary")
+        .unwrap_or_else(|error| panic!("write arbitrary ssh leaf: {error}"));
+    assert!(trusted_ssh_automatic_replay_executable(&arbitrary.to_string_lossy()).is_none());
 }
 
 #[test]
@@ -3402,6 +4960,67 @@ fn shell_cleanup_output_excerpt_is_bounded_and_one_line() {
 }
 
 #[test]
+fn shell_cleanup_capture_enforces_exact_physical_file_boundary() {
+    let mut capture = tempfile::tempfile().expect("create real cleanup capture file");
+    let exact = vec![b'x'; SHELL_CLEANUP_CAPTURE_CAP_BYTES as usize];
+    capture
+        .write_all(&exact)
+        .expect("write exact-cap cleanup capture bytes");
+    capture.sync_all().expect("flush exact-cap cleanup capture");
+    let accepted =
+        read_bounded_cleanup_capture(&mut capture, SHELL_CLEANUP_CAPTURE_CAP_BYTES, "stdout")
+            .expect("exact cap must be accepted");
+    assert_eq!(accepted.byte_len, exact.len() as u64);
+    assert_eq!(accepted.sha256, sha256_hex(&exact));
+    assert_eq!(accepted.text.len(), exact.len());
+
+    capture
+        .seek(SeekFrom::End(0))
+        .expect("seek cleanup capture end");
+    capture
+        .write_all(b"y")
+        .expect("write cap-plus-one cleanup byte");
+    capture
+        .sync_all()
+        .expect("flush cap-plus-one cleanup capture");
+    let error =
+        read_bounded_cleanup_capture(&mut capture, SHELL_CLEANUP_CAPTURE_CAP_BYTES, "stdout")
+            .expect_err("cap-plus-one physical capture must fail closed");
+    assert!(
+        error.contains("actual_bytes=1048577"),
+        "physical length must be reported: {error}"
+    );
+}
+
+#[test]
+fn shell_cleanup_capture_hashes_physical_invalid_utf8_bytes() {
+    let mut capture = tempfile::tempfile().expect("create real cleanup capture file");
+    let physical = [0xff, b'S', b'Y', b'N', 0x80, b'\n'];
+    capture
+        .write_all(&physical)
+        .expect("write invalid-UTF8 cleanup capture bytes");
+    capture
+        .sync_all()
+        .expect("flush invalid-UTF8 cleanup capture bytes");
+
+    let readback =
+        read_bounded_cleanup_capture(&mut capture, SHELL_CLEANUP_CAPTURE_CAP_BYTES, "stdout")
+            .expect("bounded invalid UTF-8 capture must remain diagnosable");
+    println!(
+        "readback=cleanup_capture edge=invalid_utf8 physical_len={} physical_sha256={} text={:?}",
+        readback.byte_len, readback.sha256, readback.text
+    );
+    assert_eq!(readback.byte_len, physical.len() as u64);
+    assert_eq!(readback.sha256, sha256_hex(&physical));
+    assert_ne!(
+        readback.sha256,
+        sha256_hex(readback.text.as_bytes()),
+        "lossy protocol text must never replace the physical-byte evidence digest"
+    );
+    assert!(readback.text.contains('\u{fffd}'));
+}
+
+#[test]
 fn shell_remote_process_marker_updates_cleanup_handle() {
     let mut scope = ssh_remote_process_scope(
         "ssh.exe",
@@ -3414,6 +5033,7 @@ fn shell_remote_process_marker_updates_cleanup_handle() {
         session_id: None,
         status: "running".to_owned(),
         pid: Some(4242),
+        local_process_identity: None,
         command: "ssh.exe".to_owned(),
         command_metadata_policy: SHELL_COMMAND_METADATA_POLICY.to_owned(),
         args: vec!["aiwonder".to_owned(), "sleep 60".to_owned()],
@@ -3446,6 +5066,7 @@ fn shell_remote_process_marker_updates_cleanup_handle() {
         matched_pattern: "^ssh".to_owned(),
         remote_process_scope: scope.clone(),
         diagnostics: None,
+        spawn_failure: None,
     };
     let stderr =
         "noise\nSYNAPSE_REMOTE_PROCESS_V1 job_id=issue940-marker pid=12345 pgid=12345 sid=12345\n";
@@ -3478,17 +5099,375 @@ fn shell_remote_process_marker_updates_cleanup_handle() {
     );
     assert_eq!(concatenated_metadata.pid, "54321");
     assert_eq!(concatenated_metadata.pgid, "54321");
+
+    let owned_stderr = "SYNAPSE_REMOTE_PROCESS_V1 job_id=issue940-marker pid=65432 pgid=65432 sid=65432 boot_id=11111111-2222-4333-8444-555555555555 start_time=987654 ownership_token=0123456789abcdef0123456789abcdef\n";
+    let owned_metadata = parse_remote_process_metadata(owned_stderr, "issue940-marker")
+        .expect("complete boot/start/token identity should parse");
+    assert_eq!(
+        owned_metadata.boot_id.as_deref(),
+        Some("11111111-2222-4333-8444-555555555555")
+    );
+    assert_eq!(owned_metadata.start_time.as_deref(), Some("987654"));
+    assert_eq!(
+        owned_metadata.ownership_token.as_deref(),
+        Some("0123456789abcdef0123456789abcdef")
+    );
+
+    let malformed_then_valid = "SYNAPSE_REMOTE_PROCESS_V1 job_id=issue940-marker pid=65432 pgid=65432 boot_id=truncated\nSYNAPSE_REMOTE_PROCESS_V1 job_id=issue940-marker pid=76543 pgid=76543 sid=76543\n";
+    assert_eq!(
+        parse_remote_process_metadata(malformed_then_valid, "issue940-marker")
+            .expect("a malformed marker must not hide a later complete marker")
+            .pid,
+        "76543"
+    );
 }
 
 #[test]
-fn shell_remote_cleanup_command_uses_dash_compatible_negative_pgid() {
-    let command = ssh_remote_cleanup_command("12345", "12345");
+fn remote_markers_bind_local_token_by_digest_without_disclosing_it() {
+    let token = "0123456789abcdef0123456789abcdef";
+    let token_sha256 = sha256_hex(token.as_bytes());
+    let process_marker = format!(
+        "{SHELL_REMOTE_PROCESS_MARKER} job_id=digest-marker pid=65432 pgid=65432 sid=65432 boot_id=11111111-2222-4333-8444-555555555555 start_time=987654 ownership_token_sha256={token_sha256}\n"
+    );
+    let exit_marker = format!(
+        "{SHELL_REMOTE_EXIT_MARKER} job_id=digest-marker pid=65432 pgid=65432 ownership_token_sha256={token_sha256} exit_code=0\n"
+    );
 
-    println!("readback=act_run_shell_remote_cleanup edge=dash_kill_syntax after={command:?}");
-    assert!(command.contains("kill -TERM -\"$pgid\""));
-    assert!(command.contains("kill -KILL -\"$pgid\""));
-    assert!(!command.contains("kill -TERM --"));
-    assert!(!command.contains("kill -KILL --"));
+    let process =
+        parse_remote_process_metadata_with_ownership(&process_marker, "digest-marker", Some(token))
+            .expect("sidecar token must verify its digest marker");
+    let exit =
+        parse_remote_exit_metadata_with_ownership(&exit_marker, "digest-marker", Some(token))
+            .expect("sidecar token must verify its exit digest marker");
+
+    assert_eq!(process.ownership_token.as_deref(), Some(token));
+    assert_eq!(exit.ownership_token.as_deref(), Some(token));
+    assert!(!process_marker.contains(token));
+    assert!(!exit_marker.contains(token));
+    assert!(
+        parse_remote_process_metadata_with_ownership(
+            &process_marker,
+            "digest-marker",
+            Some("ffffffffffffffffffffffffffffffff")
+        )
+        .is_none(),
+        "a different durable token cannot claim the marker"
+    );
+    assert!(
+        parse_remote_process_metadata(&process_marker, "digest-marker").is_none(),
+        "digest-only markers require their local durable sidecar"
+    );
+}
+
+#[test]
+fn historical_remote_cleanup_fixture_uses_pidfd_and_guardian_owned_group() {
+    let identity = RemoteProcessOwnershipIdentity {
+        boot_id: "11111111-2222-4333-8444-555555555555".to_owned(),
+        start_time: "987654".to_owned(),
+        ownership_token: "0123456789abcdef0123456789abcdef".to_owned(),
+    };
+    let command = ssh_remote_cleanup_command("12345", "12345", &identity);
+    let liveness = ssh_remote_liveness_command("12345", "12345");
+    let guardian = ssh_remote_tracking_command(
+        "SYNAPSE_REMOTE_PROCESS_V1 job_id=guardian-test",
+        "SYNAPSE_REMOTE_EXIT_V1 job_id=guardian-test",
+        &identity.ownership_token,
+        "sleep 60",
+    );
+
+    println!(
+        "readback=act_run_shell_remote_cleanup edge=pidfd_guardian after=cleanup:{command:?} liveness:{liveness:?} guardian:{guardian:?}"
+    );
+    assert!(command.contains("os.pidfd_open"));
+    assert!(command.contains("signal.pidfd_send_signal"));
+    assert!(command.contains("before = read_identity()"));
+    assert!(command.contains("after = read_identity()"));
+    assert!(!command.contains("os.killpg"));
+    assert!(command.contains("live_process_ids_in_group"));
+    assert!(command.contains("process_group_exists"));
+    assert!(command.contains("if not group_exists"));
+    assert!(liveness.contains("live_process_ids_in_group"));
+    assert!(liveness.contains("process_group_exists"));
+    assert!(liveness.contains("member_count"));
+    assert!(!liveness.contains("ps -o pgid"));
+    assert!(guardian.contains("trap terminate_owned_group TERM HUP INT"));
+    assert!(guardian.contains("kill -TERM -\"$pgid\""));
+    assert!(guardian.contains("kill -KILL -\"$pgid\""));
+    assert!(guardian.contains("process_group_term_signal_failed"));
+    assert!(guardian.contains("process_group_enumeration_failed"));
+    assert!(guardian.contains("process_group_kill_signal_failed"));
+    assert!(guardian.contains("python3 -c \"$group_probe_script\""));
+    assert!(guardian.contains("natural_completion_group_term_failed"));
+    assert!(guardian.contains("natural_completion_group_inspection_failed"));
+    assert!(guardian.contains("python3 -c \"$group_existence_script\""));
+    assert!(guardian.contains("remote_group_survived_guardian_exit"));
+    assert!(guardian.contains("post_guardian_group_inspection_failed"));
+    assert!(guardian.contains("pwd.getpwuid(os.getuid()).pw_shell"));
+    assert!(guardian.contains("account_login_shell_unavailable"));
+    assert!(
+        guardian.contains("env -u SYNAPSE_REMOTE_JOB_TOKEN \"$account_shell\" -c \"$cmd\" <&3 &")
+    );
+    assert!(guardian.matches("exec 3<&0").count() >= 2);
+    assert!(
+        !guardian.contains("\nsh -c \"$cmd\" &"),
+        "tracked payload execution must retain the remote account shell's language"
+    );
+    let kernel_absence_probe = guardian
+        .find("python3 -c \"$group_existence_script\"")
+        .expect("tracker must perform a separate kernel PGID readback");
+    let terminal_marker_write = guardian
+        .find("pid=%s pgid=%s ownership_token_sha256=%s exit_code=%s")
+        .expect("tracker terminal marker write must be explicit");
+    assert!(
+        kernel_absence_probe < terminal_marker_write,
+        "the tracker must not emit terminal evidence before kernel group absence"
+    );
+}
+
+#[test]
+fn shell_remote_cleanup_outer_timeout_covers_the_complete_proof_budget() {
+    let inner_proof_budget_ms = SHELL_REMOTE_CLEANUP_PIDFD_WAIT_MS
+        + SHELL_REMOTE_GROUP_ABSENCE_PROBE_ATTEMPTS * SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS;
+    assert_eq!(inner_proof_budget_ms, 17_000);
+    assert_eq!(SHELL_REMOTE_CLEANUP_TRANSPORT_MARGIN_MS, 8_000);
+    assert_eq!(
+        SHELL_REMOTE_CLEANUP_TIMEOUT_MS,
+        inner_proof_budget_ms + SHELL_REMOTE_CLEANUP_TRANSPORT_MARGIN_MS
+    );
+    assert_eq!(SHELL_REMOTE_CLEANUP_TIMEOUT_MS, 25_000);
+
+    let identity = RemoteProcessOwnershipIdentity {
+        boot_id: "01234567-89ab-cdef-0123-456789abcdef".to_owned(),
+        start_time: "123456".to_owned(),
+        ownership_token: "0123456789abcdef0123456789abcdef".to_owned(),
+    };
+    let command = ssh_remote_cleanup_command("12345", "12345", &identity);
+    assert!(command.contains("poller.poll(12000)"));
+    assert!(command.contains("range(25)"));
+    assert!(command.contains("time.sleep(200 / 1000)"));
+}
+
+#[test]
+fn remote_group_liveness_parser_distinguishes_group_state_and_inspection_failure() {
+    let alive = "SYNAPSE_REMOTE_LIVENESS_V1 pid=12345 pgid=12345 status=alive member_count=2\n";
+    let gone =
+        "SYNAPSE_REMOTE_LIVENESS_V1 pid=12345 pgid=12345 status=already_gone member_count=0\n";
+    let inspection_failed =
+        "SYNAPSE_REMOTE_LIVENESS_V1 pid=12345 pgid=12345 status=inspection_failed member_count=0\n";
+    assert_eq!(
+        parse_remote_liveness_status(alive, "12345", "12345").as_deref(),
+        Some("alive")
+    );
+    assert_eq!(
+        parse_remote_liveness_status(gone, "12345", "12345").as_deref(),
+        Some("already_gone")
+    );
+    assert_eq!(
+        parse_remote_liveness_status(inspection_failed, "12345", "12345").as_deref(),
+        Some("inspection_failed")
+    );
+    assert_eq!(
+        parse_remote_liveness_status(gone, "54321", "12345"),
+        None,
+        "a marker for another numeric guardian cannot authorize this group"
+    );
+}
+
+#[test]
+fn remote_cleanup_rejects_reused_pid_when_birth_or_token_identity_mismatches() {
+    let expected = RemoteProcessOwnershipIdentity {
+        boot_id: "11111111-2222-4333-8444-555555555555".to_owned(),
+        start_time: "987654".to_owned(),
+        ownership_token: "0123456789abcdef0123456789abcdef".to_owned(),
+    };
+    let reused_token = "SYNAPSE_REMOTE_CLEANUP_V1 pid=12345 pgid=12345 boot_id=11111111-2222-4333-8444-555555555555 start_time=987654 ownership_token=ffffffffffffffffffffffffffffffff status=terminated\n";
+    let reused_birth = "SYNAPSE_REMOTE_CLEANUP_V1 pid=12345 pgid=12345 boot_id=11111111-2222-4333-8444-555555555555 start_time=987655 ownership_token=0123456789abcdef0123456789abcdef status=terminated\n";
+    let refused = "SYNAPSE_REMOTE_CLEANUP_V1 pid=12345 pgid=12345 boot_id=11111111-2222-4333-8444-555555555555 start_time=987654 ownership_token=0123456789abcdef0123456789abcdef status=identity_mismatch\n";
+
+    assert_eq!(
+        parse_remote_cleanup_status(reused_token, "12345", "12345", Some(&expected)),
+        None,
+        "a recycled PID with another token cannot claim cleanup success"
+    );
+    assert_eq!(
+        parse_remote_cleanup_status(reused_birth, "12345", "12345", Some(&expected)),
+        None,
+        "a recycled PID with another birth time cannot claim cleanup success"
+    );
+    assert_eq!(
+        parse_remote_cleanup_status(refused, "12345", "12345", Some(&expected)).as_deref(),
+        Some("identity_mismatch")
+    );
+
+    let legacy = ActRunShellRemoteProcessScope {
+        remote_process_id: Some("12345".to_owned()),
+        remote_process_group_id: Some("12345".to_owned()),
+        ..ActRunShellRemoteProcessScope::default()
+    };
+    assert_eq!(
+        remote_process_ownership_identity(&legacy)
+            .expect("wholly absent identity is a recognized legacy record"),
+        None
+    );
+    let partial = ActRunShellRemoteProcessScope {
+        remote_boot_id: Some(expected.boot_id),
+        ..legacy
+    };
+    assert!(
+        remote_process_ownership_identity(&partial).is_err(),
+        "partial ownership identity must fail closed"
+    );
+}
+
+#[test]
+fn remote_recovery_intent_and_outcome_are_immutable_digest_bound_records() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create remote recovery record temp dir: {error}"));
+    let paths = ShellJobPaths {
+        job_dir: temp.path().to_path_buf(),
+        stdout_path: temp.path().join("stdout.log"),
+        stderr_path: temp.path().join("stderr.log"),
+        status_path: temp.path().join("status.json"),
+        request_path: temp.path().join("request.json"),
+        remote_cleanup_path: temp.path().join("remote-cleanup.json"),
+    };
+    let recovery_id = "recovery-record-binding";
+    let intent = ShellJobRemoteRecoveryIntent {
+        schema_version: 1,
+        recovery_id: recovery_id.to_owned(),
+        job_id: "remote-record-job".to_owned(),
+        created_at: "2026-06-15T00:00:00Z".to_owned(),
+        quarantine_job_dir: temp
+            .path()
+            .join("quarantine")
+            .to_string_lossy()
+            .into_owned(),
+        remote_identity_sha256: sha256_hex(b"host.example"),
+        remote_pid: "12345".to_owned(),
+        remote_pgid: "12345".to_owned(),
+        remote_boot_id: "123e4567-e89b-12d3-a456-426614174000".to_owned(),
+        remote_process_start_time: "998877".to_owned(),
+        remote_ownership_token_sha256: sha256_hex(b"0123456789abcdef0123456789abcdef"),
+        cleanup_sidecar_sha256: sha256_hex(b"sidecar bytes"),
+        cleanup_sidecar_schema_version: 2,
+        reason: "supporting_regression".to_owned(),
+    };
+    let intent_sha256 =
+        persist_remote_recovery_intent(&paths, &intent).expect("persist immutable intent");
+    let (intent_readback, intent_readback_sha256) =
+        read_existing_remote_recovery_intent(&paths, "remote-record-job")
+            .expect("read intent")
+            .expect("intent exists");
+    assert_eq!(intent_readback, intent);
+    assert_eq!(intent_readback_sha256, intent_sha256);
+    assert!(
+        persist_remote_recovery_intent(&paths, &intent).is_err(),
+        "an immutable intent must never be overwritten"
+    );
+
+    let liveness_after = ShellJobRemoteCommandEvidence {
+        operation: "resume_liveness_after".to_owned(),
+        exit_code: Some(0),
+        stdout_byte_len: b"already gone marker".len() as u64,
+        stdout_sha256: sha256_hex(b"already gone marker"),
+        stderr_byte_len: 0,
+        stderr_sha256: sha256_hex(b""),
+        parsed_status: "already_gone".to_owned(),
+    };
+    let outcome = ShellJobRemoteRecoveryOutcome {
+        schema_version: 1,
+        recovery_id: recovery_id.to_owned(),
+        job_id: "remote-record-job".to_owned(),
+        completed_at: "2026-06-15T00:00:01Z".to_owned(),
+        intent_sha256: intent_sha256.clone(),
+        cleanup: None,
+        liveness_after,
+        verdict: "remote_already_gone_after_durable_cleanup_intent".to_owned(),
+    };
+    let outcome_sha256 =
+        persist_remote_recovery_outcome(&paths, &outcome).expect("persist immutable outcome");
+    let (outcome_readback, outcome_readback_sha256) =
+        read_existing_remote_recovery_outcome(&paths, "remote-record-job")
+            .expect("read outcome")
+            .expect("outcome exists");
+    assert_eq!(outcome_readback, outcome);
+    assert_eq!(outcome_readback_sha256, outcome_sha256);
+    assert_eq!(
+        existing_remote_recovery_id(&paths, "remote-record-job").expect("bound recovery id"),
+        Some(recovery_id.to_owned())
+    );
+
+    let mut impossible_outcome = outcome.clone();
+    impossible_outcome.verdict = "remote_identity_bound_cleanup_verified".to_owned();
+    assert!(
+        validate_remote_recovery_outcome_semantics(&impossible_outcome, "remote-record-job")
+            .is_err(),
+        "identity-bound verdict cannot omit cleanup or use resume evidence"
+    );
+    let mut malformed_digest_outcome = outcome.clone();
+    malformed_digest_outcome.liveness_after.stdout_sha256 = "not-a-digest".to_owned();
+    assert!(
+        validate_remote_recovery_outcome_semantics(&malformed_digest_outcome, "remote-record-job")
+            .is_err(),
+        "persisted command evidence must carry a lowercase physical-byte digest"
+    );
+    let mut inconsistent_length_outcome = outcome.clone();
+    inconsistent_length_outcome.liveness_after.stdout_byte_len = 0;
+    assert!(
+        validate_remote_recovery_outcome_semantics(
+            &inconsistent_length_outcome,
+            "remote-record-job"
+        )
+        .is_err(),
+        "zero-byte evidence cannot claim a non-empty physical-byte digest"
+    );
+    let impossible_manifest = ShellJobQuarantineManifest {
+        schema_version: SHELL_JOB_QUARANTINE_MANIFEST_SCHEMA_VERSION,
+        recovery_id: recovery_id.to_owned(),
+        job_id: "remote-record-job".to_owned(),
+        quarantined_at: "2026-06-15T00:00:02Z".to_owned(),
+        reason: "supporting_regression".to_owned(),
+        startup_safety_boundary: "supporting_regression".to_owned(),
+        source_job_dir: temp.path().join("source").to_string_lossy().into_owned(),
+        quarantine_job_dir: temp
+            .path()
+            .join("quarantine")
+            .to_string_lossy()
+            .into_owned(),
+        status_read_error: "synthetic corrupt status".to_owned(),
+        original_artifact_count: 0,
+        original_artifact_bytes: 0,
+        pre_recovery_artifact_count: 0,
+        pre_recovery_artifact_bytes: 0,
+        recovery_generated_artifact_count: 0,
+        recovery_generated_artifact_bytes: 0,
+        artifacts: Vec::new(),
+        remote_verification: ShellJobQuarantineRemoteVerification {
+            sidecar_present: true,
+            process_marker_present: true,
+            remote_identity_sha256: Some(sha256_hex(b"host.example")),
+            remote_pid: Some("12345".to_owned()),
+            remote_pgid: Some("12345".to_owned()),
+            liveness_before: Some(ShellJobRemoteCommandEvidence {
+                operation: "liveness_before".to_owned(),
+                exit_code: Some(0),
+                stdout_byte_len: b"already gone marker".len() as u64,
+                stdout_sha256: sha256_hex(b"already gone marker"),
+                stderr_byte_len: 0,
+                stderr_sha256: sha256_hex(b""),
+                parsed_status: "already_gone".to_owned(),
+            }),
+            cleanup: None,
+            liveness_after: Some(outcome.liveness_after.clone()),
+            recovery_intent_sha256: Some(intent_sha256),
+            recovery_outcome_sha256: Some(outcome_sha256),
+            verdict: "remote_identity_bound_cleanup_verified".to_owned(),
+        },
+    };
+    assert!(
+        validate_shell_job_quarantine_remote_verification(&impossible_manifest).is_err(),
+        "manifest validator must reject impossible verdict/evidence combinations"
+    );
 }
 
 #[test]
@@ -4588,6 +6567,47 @@ async fn launch_wait_refuses_console_window_title_wait() {
 }
 
 #[cfg(windows)]
+#[tokio::test]
+async fn launch_window_wait_timeout_cleans_exact_spawned_process() {
+    let charmap = r"C:\Windows\System32\charmap.exe";
+    assert!(
+        std::path::Path::new(charmap).exists(),
+        "Windows charmap.exe must exist for the real GUI cleanup regression"
+    );
+    let before = windows_process_ids_by_name("charmap.exe");
+    assert!(
+        before.is_empty(),
+        "precondition: no pre-existing charmap.exe processes so exact cleanup is unambiguous: {before:?}"
+    );
+
+    let mut params = launch_params(charmap, Vec::new(), 250);
+    params.wait_for_window_title_regex = Some("^SynapseLaunchNoSuchWindow$".to_owned());
+    let config = launch_config_for(&params);
+
+    let error = match launch(&config, params).await {
+        Ok(response) => panic!("window wait should time out and clean up: {response:?}"),
+        Err(error) => error,
+    };
+    let after = windows_process_ids_by_name("charmap.exe");
+    println!(
+        "readback=act_launch_window_wait edge=gui_timeout_cleanup before={before:?} after={after:?} error={error}"
+    );
+
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(|code| code.as_str()),
+        Some(error_codes::ACTION_LAUNCH_WINDOW_NOT_FOUND)
+    );
+    assert!(
+        after.is_empty(),
+        "act_launch returned a timeout while exact spawned charmap.exe processes remained live: {after:?}"
+    );
+}
+
+#[cfg(windows)]
 async fn read_text_file_with_retry(path: &std::path::Path) -> String {
     for _ in 0..100 {
         match std::fs::read_to_string(path) {
@@ -4650,7 +6670,7 @@ async fn shell_caps_stdout_and_marks_truncated() {
 
 #[cfg(windows)]
 #[tokio::test]
-#[ignore = "real-process FSV: spawns + tree-kills a real powershell.exe; the spawn/kill wall-clock balloons on a saturated host (run explicitly with `cargo test -p synapse-mcp -- --ignored`). See M4_ACT_RUN_SHELL timeout-path perf follow-up."]
+#[ignore = "supporting real-process regression evidence only; manual FSV remains separate: spawns + tree-kills a real powershell.exe; the spawn/kill wall-clock balloons on a saturated host (run explicitly with `cargo test -p synapse-mcp -- --ignored`). See M4_ACT_RUN_SHELL timeout-path perf follow-up."]
 async fn shell_timeout_kills_process_and_marks_timed_out() {
     let params = shell_params(
         "powershell.exe",
@@ -5062,9 +7082,578 @@ fn seed_synthetic_shell_job(
     paths
 }
 
-// #1510 full-state verification: seed synthetic jobs with backdated
-// completion timestamps and prove — by reading the filesystem, the source of
-// truth — that only aged *terminal* jobs are removed while live, finalizing,
+#[test]
+fn shell_job_quarantine_artifact_accounting_fails_closed_on_u64_overflow() {
+    // Metadata-only boundary coverage: no enormous file or allocation is
+    // needed to prove that evidence totals cannot wrap or saturate.
+    let pre_recovery = vec![
+        ShellJobQuarantineArtifact {
+            relative_path: "status.json".to_owned(),
+            byte_len: u64::MAX,
+            sha256: sha256_hex(b"status"),
+        },
+        ShellJobQuarantineArtifact {
+            relative_path: "stdout.log".to_owned(),
+            byte_len: 1,
+            sha256: sha256_hex(b"stdout"),
+        },
+    ];
+    let pre_error = shell_job_quarantine_artifact_accounting(&pre_recovery)
+        .expect_err("pre-recovery byte evidence overflow must fail closed");
+    assert!(
+        pre_error.contains("pre-recovery artifact byte total overflow")
+            && pre_error.contains(&format!("before={} add=1", u64::MAX)),
+        "{pre_error}"
+    );
+
+    let recovery_generated = vec![
+        ShellJobQuarantineArtifact {
+            relative_path: "remote-recovery-intent-boundary.json".to_owned(),
+            byte_len: u64::MAX,
+            sha256: sha256_hex(b"intent"),
+        },
+        ShellJobQuarantineArtifact {
+            relative_path: "remote-recovery-outcome-boundary.json".to_owned(),
+            byte_len: 1,
+            sha256: sha256_hex(b"outcome"),
+        },
+    ];
+    let generated_error = shell_job_quarantine_artifact_accounting(&recovery_generated)
+        .expect_err("recovery-generated byte evidence overflow must fail closed");
+    assert!(
+        generated_error.contains("recovery-generated artifact byte total overflow")
+            && generated_error.contains(&format!("before={} add=1", u64::MAX)),
+        "{generated_error}"
+    );
+}
+
+#[test]
+fn startup_corrupt_local_job_is_atomically_quarantined_with_hash_manifest() {
+    let _root_guard = ShellJobRootGuard::new();
+    let root = shell_durable_job_root_dir()
+        .unwrap_or_else(|error| panic!("durable root should resolve: {error}"));
+    fs::create_dir_all(&root).unwrap_or_else(|error| panic!("durable root should create: {error}"));
+    let valid = seed_synthetic_shell_job(
+        &root,
+        "startup-recovery-valid",
+        "ok",
+        &chrono::Utc::now().to_rfc3339(),
+        Some(&chrono::Utc::now().to_rfc3339()),
+    );
+    let job_id = "startup-recovery-corrupt";
+    let corrupt = shell_job_paths_from_root(&root, job_id);
+    fs::create_dir_all(&corrupt.job_dir)
+        .unwrap_or_else(|error| panic!("corrupt job dir should create: {error}"));
+    let status_bytes = vec![0u8; 37];
+    let request_bytes =
+        b"{\"command\":\"powershell.exe\",\"args\":[],\"args_redacted\":false}\n".to_vec();
+    let stdout_bytes = b"synthetic stdout\n".to_vec();
+    let stderr_bytes = b"synthetic local stderr\n".to_vec();
+    let expected_artifact_bytes = [
+        status_bytes.len(),
+        request_bytes.len(),
+        stdout_bytes.len(),
+        stderr_bytes.len(),
+    ]
+    .into_iter()
+    .sum::<usize>() as u64;
+    for (path, bytes) in [
+        (&corrupt.status_path, status_bytes.as_slice()),
+        (&corrupt.request_path, request_bytes.as_slice()),
+        (&corrupt.stdout_path, stdout_bytes.as_slice()),
+        (&corrupt.stderr_path, stderr_bytes.as_slice()),
+    ] {
+        fs::write(path, bytes)
+            .unwrap_or_else(|error| panic!("seed {} should write: {error}", path.display()));
+    }
+
+    let readback = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("startup recovery should succeed: {error}"));
+    println!("readback=startup_corrupt_shell_job edge=local_corrupt after={readback:?}");
+
+    assert_eq!(readback.scanned_job_dirs, 2, "{readback:?}");
+    assert_eq!(readback.retained_valid_status_jobs, 1, "{readback:?}");
+    assert_eq!(readback.corrupt_status_jobs, 1, "{readback:?}");
+    assert_eq!(readback.quarantined_jobs, 1, "{readback:?}");
+    assert_eq!(readback.remote_state_verified_jobs, 0, "{readback:?}");
+    assert_eq!(
+        readback.retained_unverifiable_remote_jobs, 0,
+        "{readback:?}"
+    );
+    assert_eq!(readback.recovery_failures, 0, "{readback:?}");
+    assert_eq!(readback.bytes_quarantined, expected_artifact_bytes);
+    assert!(valid.job_dir.is_dir(), "valid status job must remain live");
+    assert!(
+        !corrupt.job_dir.exists(),
+        "corrupt source directory must be absent after the atomic move"
+    );
+
+    let quarantine_dir = PathBuf::from(
+        readback
+            .quarantine_paths_sample
+            .first()
+            .expect("quarantine destination readback"),
+    );
+    let manifest_path = PathBuf::from(
+        readback
+            .manifest_paths_sample
+            .first()
+            .expect("manifest path readback"),
+    );
+    assert!(quarantine_dir.is_dir(), "physical quarantine dir exists");
+    assert!(manifest_path.is_file(), "physical manifest exists");
+    let manifest_bytes = fs::read(&manifest_path)
+        .unwrap_or_else(|error| panic!("manifest should read back: {error}"));
+    let manifest: ShellJobQuarantineManifest = serde_json::from_slice(&manifest_bytes)
+        .unwrap_or_else(|error| panic!("manifest should decode: {error}"));
+    let completion_path =
+        quarantine_dir.join(format!("quarantine-complete-{}.json", manifest.recovery_id));
+    let completion_bytes = fs::read(&completion_path)
+        .unwrap_or_else(|error| panic!("completion should read back: {error}"));
+    let completion: ShellJobQuarantineCompletion = serde_json::from_slice(&completion_bytes)
+        .unwrap_or_else(|error| panic!("completion should decode: {error}"));
+    assert_eq!(
+        manifest.schema_version,
+        SHELL_JOB_QUARANTINE_MANIFEST_SCHEMA_VERSION
+    );
+    assert_eq!(manifest.job_id, job_id);
+    assert_eq!(manifest.original_artifact_count, 4);
+    assert_eq!(manifest.original_artifact_bytes, readback.bytes_quarantined);
+    assert_eq!(manifest.pre_recovery_artifact_count, 4);
+    assert_eq!(
+        manifest.pre_recovery_artifact_bytes,
+        readback.bytes_quarantined
+    );
+    assert_eq!(manifest.recovery_generated_artifact_count, 0);
+    assert_eq!(manifest.recovery_generated_artifact_bytes, 0);
+    assert_eq!(completion.recovery_id, manifest.recovery_id);
+    assert_eq!(completion.job_id, manifest.job_id);
+    assert_eq!(completion.manifest_sha256, sha256_hex(&manifest_bytes));
+    assert_eq!(
+        completion.manifest_file_name,
+        manifest_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    );
+    assert_eq!(
+        manifest.remote_verification.verdict,
+        "not_remote_or_remote_process_never_tracked"
+    );
+    assert!(
+        manifest.status_read_error.contains("invalid"),
+        "status decode failure should be preserved: {}",
+        manifest.status_read_error
+    );
+    for (name, expected) in [
+        ("status.json", status_bytes.as_slice()),
+        ("request.json", request_bytes.as_slice()),
+        ("stdout.log", stdout_bytes.as_slice()),
+        ("stderr.log", stderr_bytes.as_slice()),
+    ] {
+        let actual = fs::read(quarantine_dir.join(name))
+            .unwrap_or_else(|error| panic!("quarantined {name} should read: {error}"));
+        assert_eq!(actual, expected, "quarantined {name} bytes differ");
+        let artifact = manifest
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == name)
+            .unwrap_or_else(|| panic!("manifest should inventory {name}"));
+        assert_eq!(artifact.byte_len, expected.len() as u64);
+        assert_eq!(artifact.sha256, sha256_hex(expected));
+    }
+
+    // Crash boundary 1: the final manifest is durable in the source job, but
+    // the atomic directory move has not happened. Resume the same recovery id
+    // instead of creating a second manifest/authorization.
+    fs::remove_file(&completion_path)
+        .unwrap_or_else(|error| panic!("remove completion for source-resume simulation: {error}"));
+    fs::rename(&quarantine_dir, &corrupt.job_dir)
+        .unwrap_or_else(|error| panic!("restore committed-manifest source state: {error}"));
+    let source_resumed = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("committed source manifest should resume: {error}"));
+    assert_eq!(source_resumed.quarantined_jobs, 1, "{source_resumed:?}");
+    assert!(!corrupt.job_dir.exists());
+    assert!(quarantine_dir.is_dir());
+    let source_resumed_manifest: ShellJobQuarantineManifest =
+        serde_json::from_slice(&fs::read(&manifest_path).expect("resumed manifest bytes"))
+            .expect("resumed manifest decode");
+    assert_eq!(source_resumed_manifest.recovery_id, manifest.recovery_id);
+    assert!(completion_path.is_file());
+
+    // Crash boundary 2: the directory move is durable, but completion commit
+    // has not happened. Include the exact staging-file shape left by a crash
+    // during that commit; reconciliation must remove only that owned staging
+    // artifact and reconstruct/read back completion from the manifest.
+    fs::remove_file(&completion_path)
+        .unwrap_or_else(|error| panic!("remove completion for moved-resume simulation: {error}"));
+    let stale_completion_stage = quarantine_dir.join(format!(
+        "{}.tmp.4242.7",
+        completion_path.file_name().unwrap().to_string_lossy()
+    ));
+    fs::write(&stale_completion_stage, b"partial completion staging bytes")
+        .unwrap_or_else(|error| panic!("seed stale completion stage: {error}"));
+    let moved_resumed = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("moved quarantine should complete: {error}"));
+    assert_eq!(moved_resumed.quarantined_jobs, 0, "{moved_resumed:?}");
+    assert!(completion_path.is_file());
+    assert!(!stale_completion_stage.exists());
+    let moved_completion: ShellJobQuarantineCompletion =
+        serde_json::from_slice(&fs::read(&completion_path).expect("rebuilt completion bytes"))
+            .expect("rebuilt completion decode");
+    assert_eq!(moved_completion.recovery_id, manifest.recovery_id);
+    assert_eq!(
+        moved_completion.manifest_sha256,
+        sha256_hex(&manifest_bytes)
+    );
+
+    let second = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("second stable startup recovery should succeed: {error}"));
+    assert_eq!(second.corrupt_status_jobs, 0, "{second:?}");
+    assert_eq!(second.quarantined_jobs, 0, "{second:?}");
+    assert_eq!(second.retained_valid_status_jobs, 1, "{second:?}");
+    assert_eq!(second.unexpected_job_root_entries, 0, "{second:?}");
+    assert!(
+        shell_job_quarantine_root_dir()
+            .expect("sibling quarantine root")
+            .is_dir(),
+        "the sibling quarantine store remains physical evidence after the second scan"
+    );
+
+    let unexplained = quarantine_dir.join("unexplained-after-completion.bin");
+    fs::write(&unexplained, b"must-not-be-silently-ignored")
+        .unwrap_or_else(|error| panic!("seed changed quarantine evidence: {error}"));
+    let changed_error = recover_corrupt_shell_jobs_on_startup()
+        .expect_err("changed completed quarantine evidence must refuse startup");
+    assert_eq!(
+        changed_error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(serde_json::Value::as_str),
+        Some("startup_quarantine_evidence_unverified")
+    );
+    fs::remove_file(&unexplained)
+        .unwrap_or_else(|error| panic!("remove changed quarantine evidence: {error}"));
+    let repaired = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("exact quarantine set should recover: {error}"));
+    assert_eq!(repaired.recovery_failures, 0, "{repaired:?}");
+}
+
+#[test]
+fn startup_corrupt_empty_status_is_quarantined_as_boundary_input() {
+    let _root_guard = ShellJobRootGuard::new();
+    let root = shell_durable_job_root_dir()
+        .unwrap_or_else(|error| panic!("durable root should resolve: {error}"));
+    let job_id = "startup-recovery-empty";
+    let paths = shell_job_paths_from_root(&root, job_id);
+    fs::create_dir_all(&paths.job_dir)
+        .unwrap_or_else(|error| panic!("empty job dir should create: {error}"));
+    fs::write(&paths.status_path, b"")
+        .unwrap_or_else(|error| panic!("empty status should write: {error}"));
+    let request_bytes = b"{\"command\":\"powershell.exe\",\"args\":[],\"args_redacted\":false}\n";
+    fs::write(&paths.request_path, request_bytes)
+        .unwrap_or_else(|error| panic!("typed local request should write: {error}"));
+
+    let readback = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("empty status recovery should succeed: {error}"));
+    println!("readback=startup_corrupt_shell_job edge=empty_status after={readback:?}");
+    assert_eq!(readback.corrupt_status_jobs, 1, "{readback:?}");
+    assert_eq!(readback.quarantined_jobs, 1, "{readback:?}");
+    assert_eq!(
+        readback.bytes_quarantined,
+        request_bytes.len() as u64,
+        "{readback:?}"
+    );
+    assert!(!paths.job_dir.exists(), "empty corrupt source must move");
+    let quarantine_dir = PathBuf::from(&readback.quarantine_paths_sample[0]);
+    assert_eq!(
+        fs::metadata(quarantine_dir.join("status.json"))
+            .expect("quarantined empty status metadata")
+            .len(),
+        0
+    );
+}
+
+#[test]
+fn startup_missing_status_is_retained_as_io_uncertainty_not_quarantined() {
+    let _root_guard = ShellJobRootGuard::new();
+    let root = shell_durable_job_root_dir()
+        .unwrap_or_else(|error| panic!("durable root should resolve: {error}"));
+    let paths = shell_job_paths_from_root(&root, "startup-recovery-missing-status");
+    fs::create_dir_all(&paths.job_dir)
+        .unwrap_or_else(|error| panic!("missing-status job dir should create: {error}"));
+    let evidence = b"request-created-before-status";
+    fs::write(&paths.request_path, evidence)
+        .unwrap_or_else(|error| panic!("missing-status request should write: {error}"));
+
+    let readback = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("uncertain status pass should return readback: {error}"));
+    assert_eq!(readback.corrupt_status_jobs, 0, "{readback:?}");
+    assert_eq!(readback.quarantined_jobs, 0, "{readback:?}");
+    assert_eq!(readback.recovery_failures, 1, "{readback:?}");
+    assert!(paths.job_dir.is_dir(), "uncertain job must remain in place");
+    assert_eq!(
+        fs::read(&paths.request_path).expect("retained request readback"),
+        evidence
+    );
+    let startup_error = reap_stale_shell_jobs_on_startup()
+        .expect_err("missing status uncertainty must refuse daemon startup");
+    assert_eq!(
+        startup_error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("reason"))
+            .and_then(serde_json::Value::as_str),
+        Some("startup_corrupt_shell_job_recovery_incomplete")
+    );
+    assert!(paths.job_dir.is_dir(), "failed startup preserves evidence");
+}
+
+#[test]
+fn startup_corrupt_unexpected_job_root_entries_refuse_startup_without_mutation() {
+    let _root_guard = ShellJobRootGuard::new();
+    let root = shell_durable_job_root_dir()
+        .unwrap_or_else(|error| panic!("durable root should resolve: {error}"));
+    fs::create_dir_all(&root).unwrap_or_else(|error| panic!("durable root should create: {error}"));
+    let unexpected_dir = root.join("unexpected.invalid");
+    let unexpected_file = root.join("orphan.tmp");
+    fs::create_dir(&unexpected_dir)
+        .unwrap_or_else(|error| panic!("unexpected directory should create: {error}"));
+    let known_bytes = b"unclassified durable artifact\n";
+    fs::write(&unexpected_file, known_bytes)
+        .unwrap_or_else(|error| panic!("unexpected file should write: {error}"));
+
+    let readback = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("root inventory should return readback: {error}"));
+    println!("readback=startup_corrupt_shell_job edge=unexpected_root_entries after={readback:?}");
+    assert_eq!(readback.scanned_job_dirs, 0, "{readback:?}");
+    assert_eq!(readback.unexpected_job_root_entries, 2, "{readback:?}");
+    assert_eq!(
+        readback.unexpected_job_root_entries_sample.len(),
+        2,
+        "{readback:?}"
+    );
+    assert!(unexpected_dir.is_dir(), "unexpected directory is retained");
+    assert_eq!(
+        fs::read(&unexpected_file).expect("unexpected file readback"),
+        known_bytes,
+        "classification must not mutate unexplained evidence"
+    );
+
+    let startup_error = reap_stale_shell_jobs_on_startup()
+        .expect_err("unexpected durable artifacts must prevent daemon startup");
+    let startup_data = startup_error
+        .data
+        .as_ref()
+        .expect("startup gate error must be structured");
+    assert_eq!(
+        startup_data.get("code").and_then(serde_json::Value::as_str),
+        Some(error_codes::STORAGE_WRITE_FAILED)
+    );
+    assert_eq!(
+        startup_data
+            .pointer("/readback/unexpected_job_root_entries")
+            .and_then(serde_json::Value::as_u64),
+        Some(2)
+    );
+    assert!(
+        unexpected_dir.is_dir(),
+        "failed startup preserves directory"
+    );
+    assert_eq!(
+        fs::read(&unexpected_file).expect("post-refusal file readback"),
+        known_bytes,
+        "failed startup preserves unexplained file bytes"
+    );
+}
+
+#[test]
+fn corrupt_status_recovery_refuses_missing_remote_proof_for_request_ssh_intent() {
+    let temp = tempfile::TempDir::new()
+        .unwrap_or_else(|error| panic!("create corrupt SSH request temp dir: {error}"));
+    let paths = temp_shell_job_paths(&temp);
+    fs::write(
+        &paths.request_path,
+        b"{\"command\":\"ssh.exe\",\"args\":[\"host.example\",\"sleep 60\"],\"args_redacted\":false}\n",
+    )
+    .unwrap_or_else(|error| panic!("write SSH request evidence: {error}"));
+    fs::write(&paths.stderr_path, b"transport started without a marker\n")
+        .unwrap_or_else(|error| panic!("write marker-free stderr: {error}"));
+
+    let error = verify_corrupt_shell_job_remote_state(
+        &paths,
+        "corrupt-request-ssh",
+        "synthetic-recovery",
+        &temp.path().join("quarantine-destination"),
+    )
+    .expect_err("typed SSH request without ownership proof must remain unresolved");
+    assert!(error.contains("request.json records SSH intent"), "{error}");
+    assert!(error.contains("request_direct_ssh_family:ssh"), "{error}");
+
+    fs::remove_file(&paths.request_path).expect("remove request for missing-evidence boundary");
+    let missing = verify_corrupt_shell_job_remote_state(
+        &paths,
+        "corrupt-request-missing",
+        "synthetic-recovery-missing",
+        &temp.path().join("quarantine-destination-missing"),
+    )
+    .expect_err("missing request cannot positively exclude legacy SSH intent");
+    assert!(missing.contains("request.json is absent"), "{missing}");
+}
+
+#[test]
+fn startup_corrupt_ssh_sidecar_without_process_marker_is_retained_fail_closed() {
+    let _root_guard = ShellJobRootGuard::new();
+    let root = shell_durable_job_root_dir()
+        .unwrap_or_else(|error| panic!("durable root should resolve: {error}"));
+    let job_id = "startup-recovery-remote-unverified";
+    let paths = shell_job_paths_from_root(&root, job_id);
+    fs::create_dir_all(&paths.job_dir)
+        .unwrap_or_else(|error| panic!("remote corrupt job dir should create: {error}"));
+    let status_bytes = b"{ invalid remote status";
+    fs::write(&paths.status_path, status_bytes)
+        .unwrap_or_else(|error| panic!("remote corrupt status should write: {error}"));
+    fs::write(
+        &paths.stderr_path,
+        b"ssh transport failed before a process marker\n",
+    )
+    .unwrap_or_else(|error| panic!("remote stderr should write: {error}"));
+    let invocation = ShellRemoteCleanupInvocation {
+        schema_version: 1,
+        transport: SHELL_REMOTE_TRANSPORT_SSH.to_owned(),
+        command: "ssh".to_owned(),
+        control_args: vec!["synthetic-host.invalid".to_owned()],
+        remote_identity: "synthetic-host.invalid".to_owned(),
+        source_evidence: "startup_recovery_regression".to_owned(),
+        args_sha256: sha256_hex(b"synthetic ssh args"),
+        request_args_sha256: None,
+        effective_control_args: None,
+        effective_args_sha256: None,
+        request_effective_config: None,
+        cleanup_effective_config: None,
+        ownership_token: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+    write_pretty_json_file(&paths.remote_cleanup_path, &invocation, "remote cleanup")
+        .unwrap_or_else(|error| panic!("remote cleanup sidecar should write: {error}"));
+
+    let readback = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("remote-unverified pass should return readback: {error}"));
+    println!("readback=startup_corrupt_shell_job edge=ssh_without_marker after={readback:?}");
+    assert_eq!(readback.corrupt_status_jobs, 1, "{readback:?}");
+    assert_eq!(readback.quarantined_jobs, 0, "{readback:?}");
+    assert_eq!(
+        readback.retained_unverifiable_remote_jobs, 1,
+        "{readback:?}"
+    );
+    assert_eq!(readback.recovery_failures, 0, "{readback:?}");
+    assert!(paths.job_dir.is_dir(), "unverifiable remote job retained");
+    assert_eq!(
+        fs::read(&paths.status_path).expect("retained status bytes"),
+        status_bytes
+    );
+    assert!(
+        !shell_job_quarantine_root_dir()
+            .expect("quarantine root")
+            .exists(),
+        "fail-closed remote classification must not create a quarantine destination"
+    );
+
+    // The daemon entry points call this wrapper before exposing stdio or an
+    // HTTP listener. Pin its caller-facing contract: retaining even one corrupt
+    // remote job is an error, not a best-effort startup warning.
+    let startup_error = reap_stale_shell_jobs_on_startup()
+        .expect_err("daemon startup gate must reject unverifiable remote process state");
+    println!(
+        "readback=startup_corrupt_shell_job edge=ssh_without_marker startup_error={startup_error:?}"
+    );
+    let startup_data = startup_error
+        .data
+        .as_ref()
+        .expect("startup gate error must be structured");
+    assert_eq!(
+        startup_data.get("code").and_then(serde_json::Value::as_str),
+        Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
+    );
+    assert_eq!(
+        startup_data
+            .get("reason")
+            .and_then(serde_json::Value::as_str),
+        Some("startup_corrupt_shell_job_recovery_incomplete")
+    );
+    assert_eq!(
+        startup_data
+            .pointer("/readback/retained_unverifiable_remote_jobs")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert!(
+        paths.job_dir.is_dir(),
+        "failed startup must preserve the unresolved job evidence"
+    );
+}
+
+#[test]
+fn startup_corrupt_raw_truncated_remote_marker_is_retained_fail_closed() {
+    let _root_guard = ShellJobRootGuard::new();
+    let root = shell_durable_job_root_dir()
+        .unwrap_or_else(|error| panic!("durable root should resolve: {error}"));
+    let job_id = "startup-recovery-truncated-remote-marker";
+    let paths = shell_job_paths_from_root(&root, job_id);
+    fs::create_dir_all(&paths.job_dir)
+        .unwrap_or_else(|error| panic!("truncated-marker job dir should create: {error}"));
+    let status_bytes = b"{ corrupt status with possible remote process";
+    let stderr_bytes =
+        format!("transport noise\n{SHELL_REMOTE_PROCESS_MARKER} job_id={job_id} pid=12345 pgid=\n");
+    fs::write(&paths.status_path, status_bytes)
+        .unwrap_or_else(|error| panic!("corrupt status should write: {error}"));
+    fs::write(&paths.stderr_path, stderr_bytes.as_bytes())
+        .unwrap_or_else(|error| panic!("truncated marker stderr should write: {error}"));
+
+    let readback = recover_corrupt_shell_jobs_on_startup()
+        .unwrap_or_else(|error| panic!("recovery inventory should return: {error}"));
+    println!(
+        "readback=startup_corrupt_shell_job edge=raw_truncated_remote_marker after={readback:?}"
+    );
+    assert_eq!(readback.corrupt_status_jobs, 1, "{readback:?}");
+    assert_eq!(readback.quarantined_jobs, 0, "{readback:?}");
+    assert_eq!(
+        readback.retained_unverifiable_remote_jobs, 1,
+        "{readback:?}"
+    );
+    assert!(
+        paths.job_dir.is_dir(),
+        "uncertain remote evidence is retained"
+    );
+    assert_eq!(
+        fs::read(&paths.status_path).expect("retained corrupt status readback"),
+        status_bytes
+    );
+    assert_eq!(
+        fs::read(&paths.stderr_path).expect("retained marker stderr readback"),
+        stderr_bytes.as_bytes()
+    );
+    let startup_error = reap_stale_shell_jobs_on_startup()
+        .expect_err("raw malformed remote marker must refuse daemon startup");
+    assert_eq!(
+        startup_error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(serde_json::Value::as_str),
+        Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
+    );
+    assert!(
+        paths.job_dir.is_dir(),
+        "startup refusal preserves all evidence"
+    );
+}
+
+// #1510 supporting filesystem regression evidence; manual FSV remains separate:
+// seed synthetic jobs with backdated completion timestamps and verify — by
+// reading the filesystem — that only aged *terminal* jobs are removed while live, finalizing,
 // recently-terminal, and unreadable jobs survive.
 #[test]
 fn reap_stale_shell_jobs_removes_only_aged_terminal_jobs() {
@@ -5130,7 +7719,8 @@ fn reap_stale_shell_jobs_removes_only_aged_terminal_jobs() {
         reap_stale_shell_jobs().unwrap_or_else(|error| panic!("reap should succeed: {error}"));
     println!("readback=shell_job_reap edge=mixed_store after={readback:?}");
 
-    // Full-state verification against the filesystem itself.
+    // Supporting regression readback against the filesystem itself; manual FSV
+    // remains separate.
     assert!(
         !old_ok.job_dir.exists(),
         "aged terminal ok job must be gone from disk"
@@ -5433,6 +8023,10 @@ async fn shell_durable_timeout_persists_budget_expired_code() {
         assert_eq!(status.job.status, "timed_out");
         assert!(status.job.timed_out);
         assert_eq!(
+            status.job.exit_code, None,
+            "forced durable timeout cleanup must not become a natural command exit code"
+        );
+        assert_eq!(
             status.job.error_code.as_deref(),
             Some(error_codes::ACTION_BUDGET_EXPIRED)
         );
@@ -5513,8 +8107,9 @@ async fn wait_shell_job_child_enforces_budget_when_starved_timer_misses_self_exi
 #[tokio::test]
 async fn wait_shell_job_child_classifies_budget_from_os_runtime_under_starvation() {
     // Case A (false-negative guard, #1588): the child genuinely outran its 40 ms
-    // cap (~150 ms), but the monitor only reaches the wait ~400 ms after spawn,
-    // so `child.wait()` resolves instantly. It must still be timed_out.
+    // cap (~150 ms), but the monitor reaches the wait only after an exact OS
+    // read proves the process exited, so `child.wait()` resolves instantly. It
+    // must still be timed_out.
     let started = Instant::now();
     let mut over_budget = TokioCommand::new("powershell.exe")
         .args(["-NoProfile", "-Command", "Start-Sleep -Milliseconds 150"])
@@ -5522,7 +8117,26 @@ async fn wait_shell_job_child_classifies_budget_from_os_runtime_under_starvation
         .stderr(Stdio::null())
         .spawn()
         .unwrap_or_else(|error| panic!("spawn over-budget child: {error}"));
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    let over_budget_identity = capture_local_process_identity(
+        over_budget
+            .id()
+            .expect("over-budget child must expose a pid before exact reap"),
+    )
+    .unwrap_or_else(|error| panic!("capture over-budget child identity: {error}"));
+    let exit_backstop = Instant::now() + Duration::from_secs(10);
+    loop {
+        if matches!(
+            local_process_identity_state(&over_budget_identity),
+            LocalProcessIdentityState::Exited
+        ) {
+            break;
+        }
+        assert!(
+            Instant::now() < exit_backstop,
+            "over-budget child did not reach exact exited state before the regression backstop"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let (over_exit, over_timed_out, over_err) =
         wait_shell_job_child(&mut over_budget, Some(40), started).await;
     println!(
@@ -5532,6 +8146,16 @@ async fn wait_shell_job_child_classifies_budget_from_os_runtime_under_starvation
     assert!(
         over_timed_out,
         "a child that ran ~150 ms under a 40 ms cap must be timed_out even when observed late (exit_code={over_exit:?})"
+    );
+    assert_eq!(
+        over_exit,
+        Some(0),
+        "the already-exited exact child must retain its natural exit evidence"
+    );
+    assert_eq!(
+        over_budget.id(),
+        None,
+        "the already-exited exact child must be reaped"
     );
 
     // Case B (false-positive guard, the regression a spawn-relative wall clock

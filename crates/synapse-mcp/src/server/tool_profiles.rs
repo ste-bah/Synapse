@@ -2735,6 +2735,15 @@ impl SynapseService {
             "tool.invocation kind=profile"
         );
         let params = params.0;
+        let authority_session_id =
+            super::context::mcp_session_id_from_request_context(&request_context)?;
+        let _authority_gate = if let Some(session_id) = authority_session_id.as_deref() {
+            let gate = self.lock_session_authority(session_id).await?;
+            self.reject_terminated_session_tool_call("profile", session_id)?;
+            Some(gate)
+        } else {
+            None
+        };
         match params.operation {
             ProfileOperation::Status => Ok(Json(ProfileResponse {
                 operation: ProfileOperation::Status,
@@ -2761,6 +2770,7 @@ impl SynapseService {
                         &request_context,
                         "profile",
                         "set",
+                        true,
                     )
                     .await?;
                 Ok(Json(ProfileResponse {
@@ -2829,6 +2839,14 @@ impl SynapseService {
             kind = "tool_profile_status",
             "tool.invocation kind=tool_profile_status"
         );
+        let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
+        let _authority_gate = if let Some(session_id) = session_id.as_deref() {
+            let gate = self.lock_session_authority(session_id).await?;
+            self.reject_terminated_session_tool_call("tool_profile_status", session_id)?;
+            Some(gate)
+        } else {
+            None
+        };
         self.tool_profile_status_response(&request_context)
             .map(Json)
     }
@@ -2851,6 +2869,7 @@ impl SynapseService {
             &request_context,
             "tool_profile_set",
             "profile_set",
+            false,
         )
         .await
         .map(Json)
@@ -3100,12 +3119,13 @@ impl SynapseService {
         })
     }
 
-    async fn tool_profile_set_response(
+    pub(super) async fn tool_profile_set_response(
         &self,
         params: ToolProfileSetParams,
         request_context: &RequestContext<RoleServer>,
         audit_tool: &'static str,
         audit_verb: &'static str,
+        authority_gate_held: bool,
     ) -> Result<ToolProfileSetResponse, ErrorData> {
         let session_id = super::context::mcp_session_id_from_request_context(request_context)?
             .ok_or_else(|| {
@@ -3116,6 +3136,12 @@ impl SynapseService {
                     ),
                 )
             })?;
+        let _authority_gate = if authority_gate_held {
+            None
+        } else {
+            Some(self.lock_session_authority(&session_id).await?)
+        };
+        self.reject_terminated_session_tool_call(audit_tool, &session_id)?;
         let reason = normalize_reason(params.reason.as_deref())?;
         let before = self.tool_profile_snapshot(Some(&session_id))?;
         let lease_proof = break_glass_lease_proof(&session_id, params.profile);
@@ -3492,7 +3518,7 @@ impl SynapseService {
             == Some("local-model")
     }
 
-    fn read_tool_profile_assignment(
+    pub(super) fn read_tool_profile_assignment(
         &self,
         session_id: &str,
     ) -> Result<Option<ToolProfileRowReadback>, ErrorData> {
@@ -3545,7 +3571,7 @@ impl SynapseService {
         }))
     }
 
-    fn write_tool_profile_assignment(
+    pub(super) fn write_tool_profile_assignment(
         &self,
         session_id: &str,
         profile: ToolProfileKind,
@@ -3602,6 +3628,86 @@ impl SynapseService {
             "persisted MCP tool profile to CF_SESSIONS"
         );
         Ok(readback)
+    }
+
+    /// Restore the byte-exact profile assignment captured before a temporary
+    /// authority transition, including its provenance and original timestamp.
+    /// This is synchronous so a cancellation/unwind guard can use it from
+    /// `Drop` without depending on another async poll.
+    pub(super) fn restore_tool_profile_assignment_exact(
+        &self,
+        before: &ToolProfileAssignment,
+    ) -> Result<ToolProfileRowReadback, ErrorData> {
+        let encoded = synapse_storage::encode_json(before).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "encode exact tool profile restore failed for {}: {error}",
+                    before.session_id
+                ),
+            )
+        })?;
+        let expected_sha256 = sha256_hex(&encoded);
+        let db = self.m3_storage()?;
+        let key = tool_profile_key(&before.session_id);
+        db.put_batch_pressure_bypass(cf::CF_SESSIONS, [(key, encoded)])
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let readback = self
+            .read_tool_profile_assignment(&before.session_id)?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "tool profile row missing after exact restore for {}",
+                        before.session_id
+                    ),
+                )
+            })?;
+        if readback.value_sha256 != expected_sha256 {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "tool profile row readback hash mismatch after exact restore for {}",
+                    before.session_id
+                ),
+            ));
+        }
+        tracing::info!(
+            code = "MCP_TOOL_PROFILE_AUTHORITY_GUARD_RESTORED",
+            session_id = before.session_id,
+            profile = before.profile.as_str(),
+            value_sha256 = %readback.value_sha256,
+            "readback=CF_SESSIONS after=authority_guard_profile_row_restored"
+        );
+        Ok(readback)
+    }
+
+    /// Delete a scoped profile row at the authoritative session-teardown
+    /// boundary and prove absence with a separate read. Callers must hold the
+    /// session authority gate.
+    pub(super) fn delete_tool_profile_assignment_for_terminated_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(bool, bool), ErrorData> {
+        let row_existed_before = self.read_tool_profile_assignment(session_id)?.is_some();
+        let db = self.m3_storage()?;
+        db.delete_batch(cf::CF_SESSIONS, [tool_profile_key(session_id)])
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let row_exists_after = self.read_tool_profile_assignment(session_id)?.is_some();
+        if row_exists_after {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!("tool profile row still exists after teardown for {session_id}"),
+            ));
+        }
+        tracing::info!(
+            code = "MCP_TOOL_PROFILE_TERMINATED_SESSION_DELETED",
+            session_id,
+            row_existed_before,
+            row_exists_after,
+            "readback=CF_SESSIONS after=terminated_session_profile_absent"
+        );
+        Ok((row_existed_before, row_existed_before && !row_exists_after))
     }
 
     pub(crate) fn full_sanitized_tools(&self) -> Vec<Tool> {
@@ -3838,16 +3944,16 @@ fn foreground_route_readiness(
 fn foreground_capability_policy(profile: ToolProfileKind) -> ToolProfileForegroundCapability {
     let (preferred_path, real_os_foreground_path) = match profile {
         ToolProfileKind::NormalAgent => (
-            "only registered public facade tools are visible in the normal profile; implementation tools require an explicit advanced profile or a facade route",
-            "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
+            "the <=40 public facade surface is visible; target-scoped work uses target/act/browser operations and raw implementation tools remain hidden",
+            "act operation=foreground acquires the lease, temporarily transitions authority, delegates internally, and verifies profile/lease cleanup; raw foreground primitives remain hidden",
         ),
         ToolProfileKind::BrowserControl => (
             "the <=40 public browser/action facades are visible in the task profile; raw implementation browser tools stay hidden behind those facades",
-            "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
+            "act operation=foreground is the only public real-foreground escalation route; it owns the lease/profile lifecycle and cleanup readback",
         ),
         ToolProfileKind::BrowserDebugger => (
-            "the browser_debugger facade is visible by default and its raw CDP/chrome.debugger operations are enabled only by this explicit profile",
-            "act operation=lease_acquire + profile operation=set break_glass + raw foreground primitive; denied without lease/reason/confirm",
+            "the browser_debugger facade stays schema-stable and debugger-backed operations are enabled only by this explicit profile; raw debugger tools remain hidden",
+            "act operation=foreground is the only public real-foreground escalation route; browser-debugger authority does not expose raw OS primitives",
         ),
         ToolProfileKind::BreakGlass | ToolProfileKind::FullCapability => (
             "the <=40 public facade surface stays visible; broader authority is routed through facade operations and audited action guards",

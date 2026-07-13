@@ -15,7 +15,7 @@
     "to_package_id": "profile.luanti.minetest.signed",
     "to_package_version": "0.1.0",
     "target_package_key": "profile_registry/v1/package/profile.luanti.minetest.signed/0.1.0",
-    "reason": "manual-fsv-rollback-from-synthetic-bad-update",
+    "reason": "synthetic-rollback-from-bad-update",
     "trust_status": "trusted",
     "signature_status": "verified",
     "signer_id": "synapse.fixture.signer",

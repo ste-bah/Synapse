@@ -6,6 +6,7 @@ pub mod intent;
 pub mod retention;
 pub mod routines;
 pub mod types;
+pub mod win32_hwnd;
 
 pub use defaults::{DEFAULT_AIM_TRACK_EMA_ALPHA, SCHEMA_VERSION};
 pub use types::{

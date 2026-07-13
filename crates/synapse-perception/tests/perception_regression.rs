@@ -386,7 +386,7 @@ fn assembler_global_only_fs_succeeds_without_window_sensors() -> TestResult {
     });
     input.fs_recent = vec![FsEvent {
         at: Utc::now(),
-        path: "C:\\code\\GameEditor\\target\\fsv\\readback.json".to_owned(),
+        path: "C:\\code\\GameEditor\\target\\regression\\readback.json".to_owned(),
         kind: FsEventKind::Modified,
         size_bytes: Some(2048),
     }];
@@ -407,7 +407,7 @@ fn assembler_global_only_fs_succeeds_without_window_sensors() -> TestResult {
     assert_eq!(observation.fs_recent.len(), 1);
     assert_eq!(
         observation.fs_recent[0].path,
-        "C:\\code\\GameEditor\\target\\fsv\\readback.json"
+        "C:\\code\\GameEditor\\target\\regression\\readback.json"
     );
     assert!(observation.focused.is_none());
     assert!(observation.elements.is_empty());

@@ -29,6 +29,7 @@ criterion.workspace = true
 futures-util.workspace = true
 proptest.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 
 [[bench]]
 name = "uia_snapshot_depth2_60elem"

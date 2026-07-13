@@ -2149,7 +2149,8 @@ mod tests {
             .expect("approve-with-edits");
         assert_eq!(decided.after_status, ApprovalStatus::Accepted);
 
-        // FSV: re-read the physical CF_KV row — not the return value.
+        // Supporting regression readback: re-read the physical CF_KV row, not
+        // the return value. Manual FSV remains separate.
         let stored = get_approval(&db, &id).expect("get").expect("row").item;
         println!(
             "after: status={} edited_args={:?}",

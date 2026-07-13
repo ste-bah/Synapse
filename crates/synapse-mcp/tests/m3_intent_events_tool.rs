@@ -1,5 +1,6 @@
-//! `intent_detect_tick` + intent-event bus integration FSV (#855): real daemon,
-//! real `RocksDB`, real event bus, real reflex runtime, real MCP calls.
+//! Supporting integration evidence for `intent_detect_tick` and the intent-event
+//! bus (#855): real daemon, `RocksDB`, event bus, reflex runtime, and MCP calls.
+//! Manual FSV remains separate.
 //!
 //! Plants a mineable morning routine (outlook → excel → teams) over seven days,
 //! mines and confirms it, registers a planted `on_event` reflex keyed on the
@@ -205,7 +206,8 @@ async fn intent_detect_tick_drives_transitions_and_fires_on_event_reflex() -> an
     .await?;
 
     // An on_event reflex's action runs through the action scope gate; activate a
-    // known profile so firing has a scope, exactly like the reflex_history FSV.
+    // known profile so firing has a scope, exactly like the reflex_history
+    // regression coverage.
     structured(
         &client
             .tools_call("profile_activate", json!({"profile_id": "notepad"}))
@@ -350,8 +352,9 @@ async fn intent_detect_tick_drives_transitions_and_fires_on_event_reflex() -> an
         "intent-detected must reach the reflex subscriber: {detected}"
     );
 
-    // FSV: the planted reflex actually fired on the published event — the
-    // physical CF_REFLEX_AUDIT row names intent-detected as its trigger.
+    // Supporting integration readback: the planted reflex actually fired on
+    // the published event — the physical CF_REFLEX_AUDIT row names
+    // intent-detected as its trigger. Manual FSV remains separate.
     let trigger_kind = wait_for_reflex_fired(&mut client, &reflex_id).await?;
     println!("readback=reflex_fired trigger_kind={trigger_kind}");
     assert_eq!(trigger_kind, "intent-detected");

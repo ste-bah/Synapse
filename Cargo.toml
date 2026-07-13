@@ -45,6 +45,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tracing-appender = "0.2.5"
 futures-util = "0.3.32"
+http = "1.4.0"
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
 opentelemetry = "0.32.0"
@@ -68,6 +69,8 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
+    "Win32_System_WindowsProgramming",
+    "Wdk_System_SystemInformation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
@@ -114,6 +117,7 @@ sysinfo = { version = "0.39.2", default-features = false, features = ["system"] 
 notify = "9.0.0-rc.4"
 fs2 = "0.4.3"
 reqwest = "0.13.3"
+sse-stream = "0.2.3"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif"] }
 proptest = "1.11.0"
 criterion = "0.8.2"

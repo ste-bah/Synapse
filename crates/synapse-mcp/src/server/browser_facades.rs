@@ -127,6 +127,7 @@ pub struct BrowserDebuggerParams {
     /// Envelope-level target alias (#1551/#1593). Browser HWND that owns the
     /// target; folded into the selected operation spec's `window_hwnd`.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub evaluate: Option<BrowserEvaluateParams>,

@@ -1,8 +1,8 @@
-//! Dev/FSV utility: dump `CF_AGENT_EVENTS` journal rows as JSON lines.
+//! Developer readback utility: dump `CF_AGENT_EVENTS` journal rows as JSON lines.
 //!
-//! Physical readback of the #897 agent-event journal (including the #898
-//! state-machine rows) for Full State Verification: run it against a stopped
-//! daemon's `--db` directory and diff what the journal actually holds against
+//! Its output is supporting storage evidence only; manual FSV remains separate.
+//! Run it against a stopped daemon's `--db` directory and diff the physical
+//! #897 agent-event journal (including the #898 state-machine rows) against
 //! what the live tools reported.
 //!
 //! ```text

@@ -101,8 +101,8 @@ Click/type/value/key/stroke/scroll/pad/clipboard primitives. Foreground tiers re
 | `act_scroll` | Scroll at pointer/point | `dy=0`, `dx=0`, `at?`, `target?`, `smooth=false` | emits scroll |
 | `act_pad` | Apply virtual gamepad report | `report` (req), `pad_id=0`, `controller=X360`, `backend=Vigem`, `hold_ms?` | virtual gamepad |
 | `act_clipboard` | Read/write/clear session virtual clipboard | `verb` (req), `text?`, `format=Text` | virtual clipboard (no OS clipboard by default) |
-| `action_diagnostic_rate_limit_override` | FSV diag: force rate limiter empty | `confirm`, `ttl_ms=5000` | mutates rate limiter (test) |
-| `action_diagnostic_queue_full_setup` | FSV diag: saturate action queue | `confirm`, `blocker_duration_ms=5000` | blocks action queue (test) |
+| `action_diagnostic_rate_limit_override` | Supporting diagnostic: force rate limiter empty; its return is not an FSV verdict | `confirm`, `ttl_ms=5000` | mutates rate limiter (test) |
+| `action_diagnostic_queue_full_setup` | Supporting diagnostic: saturate action queue; its return is not an FSV verdict | `confirm`, `blocker_duration_ms=5000` | blocks action queue (test) |
 | `release_all` | Release all held input state | none | resets input |
 
 ## 16.4 Action / M4 — `m4_tools.rs`

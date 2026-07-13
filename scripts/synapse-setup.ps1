@@ -2747,6 +2747,79 @@ function Get-SynapseObjectPropertyValue {
     return $null
 }
 
+function Format-SynapseHealthSubsystemStatuses {
+    param([AllowNull()]$Health)
+
+    $subsystems = Get-SynapseObjectPropertyValue -Object $Health -Names @('subsystems')
+    if ($null -eq $subsystems) {
+        return '<missing>'
+    }
+
+    $statuses = @()
+    foreach ($prop in @($subsystems.PSObject.Properties | Sort-Object Name)) {
+        $status = [string](Get-SynapseObjectPropertyValue -Object $prop.Value -Names @('status'))
+        if ([string]::IsNullOrWhiteSpace($status)) {
+            $status = '<missing>'
+        }
+        $statuses += ("{0}={1}" -f $prop.Name, $status)
+    }
+    if ($statuses.Count -eq 0) {
+        return '<none>'
+    }
+    return ($statuses -join ',')
+}
+
+function Test-SynapseHealthCriticalSubsystemsReady {
+    param([AllowNull()]$Health)
+
+    $subsystems = Get-SynapseObjectPropertyValue -Object $Health -Names @('subsystems')
+    if ($null -eq $subsystems) {
+        return [pscustomobject]@{
+            Ok = $false
+            Detail = 'health.subsystems missing'
+        }
+    }
+
+    $criticalNames = @(
+        'action',
+        'daemon_drain',
+        'daemon_lifecycle',
+        'facade_contract',
+        'http',
+        'perception',
+        'public_tool_registry',
+        'storage'
+    )
+    $missing = @()
+    $bad = @()
+    foreach ($name in $criticalNames) {
+        $node = Get-SynapseObjectPropertyValue -Object $subsystems -Names @($name)
+        if ($null -eq $node) {
+            $missing += $name
+            continue
+        }
+        $status = [string](Get-SynapseObjectPropertyValue -Object $node -Names @('status'))
+        if ($status -ne 'ok') {
+            if ([string]::IsNullOrWhiteSpace($status)) {
+                $status = '<missing>'
+            }
+            $bad += ("{0}={1}" -f $name, $status)
+        }
+    }
+
+    if ($missing.Count -gt 0 -or $bad.Count -gt 0) {
+        return [pscustomobject]@{
+            Ok = $false
+            Detail = ("missing={0} bad={1}" -f (Format-SynapseLimitedList -Items $missing), (Format-SynapseLimitedList -Items $bad))
+        }
+    }
+
+    return [pscustomobject]@{
+        Ok = $true
+        Detail = 'critical_subsystems_ok'
+    }
+}
+
 function Read-SynapseMcpSseJsonResponse {
     param(
         [Parameter(Mandatory=$true)][string]$Content,
@@ -3382,45 +3455,70 @@ function Test-SynapseCandidateDaemon {
 
     $candidateRoot = New-SynapseSetupRunDirectory -Root (Join-Path $LogDir 'setup-candidates') -Purpose 'candidate'
     $candidateDb = Join-Path $candidateRoot 'db'
+    $candidateShellJobRoot = Join-Path $candidateRoot 'shell-jobs'
     New-Item -ItemType Directory -Force -Path $candidateDb | Out-Null
+    New-Item -ItemType Directory -Force -Path $candidateShellJobRoot | Out-Null
     $candidateBind = New-SynapseCandidateBind
     $candidateHash = Get-SynapseFileSha256 -Path $CandidateExePath
-    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb profiles=$ProfilesDir"
+    Info "Candidate daemon health preflight starting exe=$CandidateExePath sha256=$candidateHash bind=$candidateBind db=$candidateDb shell_job_root=$candidateShellJobRoot profiles=$ProfilesDir"
 
     $candidate = $null
     $health = $null
+    $lastHealthError = $null
     $surface = $null
     try {
-        $candidate = Start-Process `
-            -FilePath $CandidateExePath `
-            -ArgumentList @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--log-level','info') `
-            -WindowStyle Hidden `
-            -PassThru
+        $previousShellJobRoot = Get-Item Env:SYNAPSE_SHELL_JOB_ROOT -ErrorAction SilentlyContinue
+        try {
+            $env:SYNAPSE_SHELL_JOB_ROOT = $candidateShellJobRoot
+            $candidate = Start-Process `
+                -FilePath $CandidateExePath `
+                -ArgumentList @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--log-level','info') `
+                -WindowStyle Hidden `
+                -PassThru
+        } finally {
+            if ($previousShellJobRoot) {
+                $env:SYNAPSE_SHELL_JOB_ROOT = $previousShellJobRoot.Value
+            } else {
+                Remove-Item Env:SYNAPSE_SHELL_JOB_ROOT -ErrorAction SilentlyContinue
+            }
+        }
         $deadline = (Get-Date).AddSeconds(25)
         do {
             Start-Sleep -Milliseconds 500
             $read = Read-SynapseHealthForRestartGuard -Bind $candidateBind -Token $tokenRead.Token
-            if ($read.Ok -and $read.Health.ok) {
+            if ($read.Ok) {
                 $health = $read.Health
                 break
             }
+            $lastHealthError = $read.Error
         } while ((Get-Date) -lt $deadline)
 
         if ($null -eq $health) {
             $alive = [bool](Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue)
             $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $candidateBind)
-            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} bind={4} listeners={5} remediation=the newly built daemon was not healthy on an isolated DB/port; old live daemon was not touched. Inspect candidate logs and setup-build.log." -f `
+            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} bind={4} listeners={5} last_error={6} remediation=the newly built daemon did not answer /health on an isolated DB/port; old live daemon was not touched. Inspect candidate logs and setup-build.log." -f `
                 $CandidateExePath,
                 $candidateHash,
                 $candidate.Id,
                 $alive,
                 $candidateBind,
-                (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners))
+                (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners),
+                $lastHealthError)
         }
 
         $healthPid = [int]$health.pid
         if ($healthPid -ne [int]$candidate.Id) {
             Die "SYNAPSE_CANDIDATE_PID_MISMATCH expected_pid=$($candidate.Id) health_pid=$healthPid bind=$candidateBind remediation=health came from an unexpected process; refusing handoff"
+        }
+        if ($health.ok -ne $true) {
+            $subsystemStatuses = @()
+            if ($health.subsystems) {
+                foreach ($prop in @($health.subsystems.PSObject.Properties | Sort-Object Name)) {
+                    $subsystemStatuses += ("{0}={1}" -f $prop.Name, ([string]$prop.Value.status))
+                }
+            }
+            $statusText = if ($subsystemStatuses.Count -gt 0) { $subsystemStatuses -join ',' } else { '<none>' }
+            Info "WARN: candidate daemon /health returned ok=false during isolated preflight; continuing with pid/tool-surface validation subsystem_statuses=$statusText"
         }
         $surface = Read-SynapseDaemonToolSurface -Bind $candidateBind -Token $tokenRead.Token -Health $health
         if ($surface.tool_count -lt 1) {
@@ -3432,6 +3530,7 @@ function Test-SynapseCandidateDaemon {
             Pid = $healthPid
             Bind = $candidateBind
             DbPath = $candidateDb
+            ShellJobRoot = $candidateShellJobRoot
             ExePath = $CandidateExePath
             Sha256 = $candidateHash
             ToolCount = $surface.tool_count
@@ -5864,25 +5963,39 @@ Info "Task registered and started."
 Step "Verifying daemon health (http://$Bind/health)"
 $ok = $false
 $healthPid = $null
+$lastHealthError = $null
+$lastHealthSubsystemStatuses = '<none>'
 for ($i=0; $i -lt 15; $i++) {
     Start-Sleep -Seconds 2
     try {
         $h = Invoke-RestMethod -Uri "http://$Bind/health" -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 4
-        if ($h.ok) {
+        $lastHealthSubsystemStatuses = Format-SynapseHealthSubsystemStatuses -Health $h
+        $criticalReady = Test-SynapseHealthCriticalSubsystemsReady -Health $h
+        if ($criticalReady.Ok) {
             Info ("Daemon OK: pid={0} version={1} db={2}" -f $h.pid, $h.version, $h.subsystems.storage.db_path)
+            if ($h.ok -ne $true) {
+                Info "WARN: daemon /health returned ok=false after install, but critical non-Chrome subsystems are ready; continuing to Chrome bridge repair/readback. subsystem_statuses=$lastHealthSubsystemStatuses"
+            }
             $healthPid = [int]$h.pid
             $ok = $true; break
+        } else {
+            $lastHealthError = $criticalReady.Detail
+            Info "WARN: daemon /health responded but critical subsystems are not ready yet attempt=$($i + 1) detail=$($criticalReady.Detail) subsystem_statuses=$lastHealthSubsystemStatuses"
         }
-    } catch { }
+    } catch {
+        $lastHealthError = $_.Exception.Message
+    }
 }
 if (-not $ok) {
     $failureListeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
     $failureProcesses = @(Get-SynapseMcpProcessSnapshot)
-    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3}`nlisteners:`n{4}`nprocesses:`n{5}`nremediation=inspect {6} and synapse.log.* under {7} for launch / STORAGE_* / bind errors" -f `
+    $failureDetail = ("SYNAPSE_INSTALL_HEALTH_FAILED bind={0} candidate_sha256={1} installed_sha256={2} backup={3} last_health_error={4} last_subsystem_statuses={5}`nlisteners:`n{6}`nprocesses:`n{7}`nremediation=inspect {8} and synapse.log.* under {9} for launch / STORAGE_* / bind errors" -f `
         $Bind,
         $installSourceHash,
         $installedHash,
         ($(if ($backupPath) { $backupPath } else { '<none>' })),
+        ($(if ([string]::IsNullOrWhiteSpace($lastHealthError)) { '<none>' } else { $lastHealthError })),
+        $lastHealthSubsystemStatuses,
         (Format-SynapseTcpBindListenerSnapshot -Snapshot $failureListeners),
         (Format-SynapseMcpProcessSnapshot -Snapshot $failureProcesses),
         $launcherLog,

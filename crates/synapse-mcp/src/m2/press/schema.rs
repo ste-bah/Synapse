@@ -48,6 +48,7 @@ pub struct ActPressParams {
         default,
         description = "Explicit per-call routing override (HWND). Routes keyboard input to this window's background CDP/PostMessage tier instead of the session's bound target, making multi-window / multi-agent automation deterministic (mirrors observe.window_hwnd). With cdp_target_id, the browser window that owns the CDP endpoint."
     )]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     #[schemars(
@@ -87,6 +88,7 @@ pub struct ActKeymapParams {
         default,
         description = "Explicit per-call routing override (HWND); see act_press.window_hwnd."
     )]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     #[schemars(

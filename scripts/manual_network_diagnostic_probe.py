@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Operator-run live network verification for the raw-CDP MCP network tools.
+"""Supporting network diagnostics for the raw-CDP MCP network tools.
 
 This probe uses the public streamable-HTTP MCP transport, launches a dedicated
 raw-CDP Chrome profile, serves a local HTTP/WebSocket fixture, and exercises:
 request capture, single-request body readback, route fulfill/abort/continue,
 extra headers/User-Agent overrides, HAR record/replay, and WebSocket frame
-capture. It is evidence for the network tool cluster; it is not a substitute
-for any broader human FSV gate.
+capture. Its output is supporting diagnostic evidence only. It does not perform
+or accept Full State Verification (FSV). Under AGENTS.md D1, an agent must
+perform FSV manually through the strict production MCP client and independently
+read each physical Source of Truth before and after the trigger.
 """
 
 from __future__ import annotations
@@ -117,7 +119,7 @@ def read_ws_frame(sock: Any) -> tuple[int, bytes]:
     return opcode, payload
 
 
-class NetworkFsvHandler(BaseHTTPRequestHandler):
+class NetworkDiagnosticHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     run_id = ""
 
@@ -252,9 +254,9 @@ class NetworkFsvHandler(BaseHTTPRequestHandler):
 
     def send_index(self) -> None:
         run_id = self.run_id
-        html = f"""<!doctype html><meta charset=\"utf-8\"><title>network fsv {run_id}</title><body><h1>network fsv {run_id}</h1><script>
+        html = f"""<!doctype html><meta charset=\"utf-8\"><title>network diagnostic {run_id}</title><body><h1>network diagnostic {run_id}</h1><script>
 window.fetchJson = async (url, opts={{}}) => {{ const r = await fetch(url, opts); const text = await r.text(); let body; try {{ body = JSON.parse(text); }} catch {{ body = text; }} return {{ok:r.ok,status:r.status,body,headers:Object.fromEntries(r.headers.entries())}}; }};
-window.runBasicFetches = async (run) => {{ const json = await window.fetchJson(`/api/data?case=basic&run=${{run}}`); const text = await fetch(`/text.txt?case=basic&run=${{run}}`).then(r=>r.text()); const binary = Array.from(new Uint8Array(await fetch(`/binary.bin?case=basic&run=${{run}}`).then(r=>r.arrayBuffer()))); let failed = false; try {{ await fetch('http://127.0.0.1:9/synapse-fsv-fail'); }} catch (e) {{ failed = true; }} return {{json,text,binary,failed}}; }};
+window.runBasicFetches = async (run) => {{ const json = await window.fetchJson(`/api/data?case=basic&run=${{run}}`); const text = await fetch(`/text.txt?case=basic&run=${{run}}`).then(r=>r.text()); const binary = Array.from(new Uint8Array(await fetch(`/binary.bin?case=basic&run=${{run}}`).then(r=>r.arrayBuffer()))); let failed = false; try {{ await fetch('http://127.0.0.1:9/synapse-diagnostic-fail'); }} catch (e) {{ failed = true; }} return {{json,text,binary,failed}}; }};
 window.loadImage = (src) => new Promise(resolve => {{ const img = new Image(); img.onload = () => resolve({{loaded:true,width:img.naturalWidth,height:img.naturalHeight}}); img.onerror = () => resolve({{loaded:false,error:'image-error'}}); img.src = src; document.body.appendChild(img); }});
 window.runWs = (url, msg) => new Promise(resolve => {{ const ws = new WebSocket(url); const events=[]; ws.onopen = () => {{ events.push('open'); ws.send(msg); }}; ws.onmessage = e => events.push('message:' + e.data); ws.onerror = () => events.push('error'); ws.onclose = e => resolve({{events, code:e.code, reason:e.reason, clean:e.wasClean}}); }});
 </script></body>""".encode("utf-8")
@@ -389,12 +391,12 @@ class Probe:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.run_id = str(int(time.time() * 1000))
-        self.work_dir = Path(args.work_dir) if args.work_dir else Path(tempfile.mkdtemp(prefix="synapse-network-fsv-"))
+        self.work_dir = Path(args.work_dir) if args.work_dir else Path(tempfile.mkdtemp(prefix="synapse-network-diagnostic-"))
         self.work_dir.mkdir(parents=True, exist_ok=True)
         self.result_path = self.work_dir / "result.json"
         self.har_path = self.work_dir / "network.har"
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), NetworkFsvHandler)
-        NetworkFsvHandler.run_id = self.run_id
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), NetworkDiagnosticHandler)
+        NetworkDiagnosticHandler.run_id = self.run_id
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
         self.page_url = f"{self.base_url}/index.html?run={self.run_id}"
         self.client: McpHttpClient | None = None
@@ -420,7 +422,7 @@ class Probe:
         try:
             self.out("server_started", base_url=self.base_url)
             self.client = McpHttpClient(
-                self.args.mcp_url, resolve_bearer_token(), "synapse-network-fsv"
+                self.args.mcp_url, resolve_bearer_token(), "synapse-network-diagnostic"
             )
             tools = self.client.initialize()
             tool_names = {tool.get("name") for tool in tools if isinstance(tool, dict)}
@@ -569,7 +571,7 @@ class Probe:
             self.client,
             self.target_id,
             self.hwnd,
-            lambda entry: "127.0.0.1:9/synapse-fsv-fail" in (entry.get("url") or "")
+            lambda entry: "127.0.0.1:9/synapse-diagnostic-fail" in (entry.get("url") or "")
             and entry.get("loading_failed"),
             12,
             "failed request",
@@ -836,7 +838,7 @@ class Probe:
 
     def run_override_checks(self) -> None:
         assert self.client is not None and self.target_id is not None and self.hwnd is not None
-        ua = f"SynapseNetworkFSV/{self.run_id}"
+        ua = f"SynapseNetworkDiagnostic/{self.run_id}"
         override = call(
             self.client,
             "browser_network_overrides",

@@ -8,7 +8,7 @@ use super::{
     CdpTargetOwner, DEFAULT_BROWSER_WAIT_POLLING_INTERVAL_MS, DEFAULT_BROWSER_WAIT_TIMEOUT_MS,
     ErrorData, MAX_BROWSER_SET_CONTENT_HTML_BYTES, MAX_BROWSER_WAIT_POLLING_INTERVAL_MS,
     MAX_BROWSER_WAIT_TIMEOUT_MS, MAX_CDP_NAVIGATE_WAIT_TIMEOUT_MS,
-    MIN_BROWSER_WAIT_POLLING_INTERVAL_MS, SessionOwnedChromiumWindow, SessionTarget,
+    MIN_BROWSER_WAIT_POLLING_INTERVAL_MS, Parameters, SessionOwnedChromiumWindow, SessionTarget,
     SetTargetParam, SynapseService, TargetClaimTargetParam, TargetOperation, TargetParams,
     TargetWire, attach_find_hygiene_annotations, attach_ocr_hygiene_annotations,
     background_tab_activation_foregrounded_requested_window, browser_nav_delegate_error,
@@ -22,7 +22,8 @@ use super::{
     downscale_captured_bitmap, format_chromium_window_candidates,
     hidden_desktop_pip_ended_response, hidden_worker_target_miss,
     is_stale_chrome_window_id_mapping_refusal, mcp_error, ocr_cache_key, page_text_info_from_parts,
-    perception_window_hwnd, resolve_browser_evaluate_timeout_ms, resolve_browser_tag_source,
+    passive_chromium_selection_invariant_error, perception_window_hwnd,
+    resolve_browser_evaluate_timeout_ms, resolve_browser_tag_source,
     resolve_capture_target_window_context, screenshot_downscale_scale,
     select_single_active_browser_tab, sha256_hex, target_claim_param_from_set, target_wire,
     template_value, unavailable_page_vitals_info, validate_browser_add_init_script_params,
@@ -50,7 +51,7 @@ use crate::m1::{
     BrowserWaitForSelectorParams, BrowserWaitForSelectorState, BrowserWaitForState,
     BrowserWaitForUrlMatchKind, BrowserWaitForUrlParams, CdpActivateTabParams, CdpNavigateAction,
     CdpTargetInfoParams, FindResponse, FindResult, FindResultKind, HiddenDesktopPipFrameParams,
-    HiddenDesktopPipStreamStatus, ScreenshotOperation, ScreenshotParams,
+    HiddenDesktopPipStreamStatus, ObserveParams, ScreenshotOperation, ScreenshotParams,
 };
 use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
 use base64::Engine as _;
@@ -1618,8 +1619,9 @@ fn decide_passive_chromium_window_breaks_owner_ties_by_recency() {
 }
 
 // #1592 — session_owned_chromium_windows derives its view from the live CDP
-// target-owner registry. Full-state verification: register owners for two
-// sessions, then read back the derived per-session window list.
+// target-owner registry. Supporting regression readback: register owners for
+// two sessions, then read back the derived per-session window list. Manual FSV
+// remains separate.
 #[test]
 fn session_owned_chromium_windows_reads_live_owner_registry() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
@@ -1657,9 +1659,10 @@ fn session_owned_chromium_windows_reads_live_owner_registry() -> anyhow::Result<
 }
 
 // #1592 self-heal — clearing a stale cached chrome_window_id must mutate the
-// live owner registry. Full-state verification: register an owner carrying a
-// chrome_window_id, clear it, then read the registry back and confirm it is now
-// None while every other field is untouched. A second clear is a no-op.
+// live owner registry. Supporting regression readback: register an owner
+// carrying a chrome_window_id, clear it, then read the registry back and confirm
+// it is now None while every other field is untouched. A second clear is a
+// no-op; manual FSV remains separate.
 #[test]
 fn clear_owner_cached_chrome_window_id_drops_only_the_window_id() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
@@ -3525,6 +3528,215 @@ fn cdp_target_perception_refuses_window_downgrade() {
 }
 
 #[test]
+fn passive_chromium_selection_invariant_errors_are_stable_structured_and_actionable() {
+    for (stage, candidate_count, owned_count) in [
+        ("single_candidate", 1, 0),
+        ("single_owned_candidate", 3, 1),
+        ("multiple_owned_candidates", 4, 2),
+    ] {
+        let error = passive_chromium_selection_invariant_error(
+            "browser_tabs",
+            stage,
+            candidate_count,
+            owned_count,
+        );
+        let data = error
+            .data
+            .as_ref()
+            .expect("invariant error must carry structured context");
+
+        assert_eq!(data["code"], json!(error_codes::TOOL_INTERNAL_ERROR));
+        assert_eq!(
+            data["detail_code"],
+            json!("M1_PASSIVE_CHROMIUM_SELECTION_INVARIANT_BROKEN")
+        );
+        assert_eq!(data["tool"], json!("browser_tabs"));
+        assert_eq!(data["stage"], json!(stage));
+        assert_eq!(data["candidate_count"], json!(candidate_count));
+        assert_eq!(data["owned_count"], json!(owned_count));
+        assert!(
+            data["source_of_truth"]
+                .as_str()
+                .is_some_and(|value| value.contains("candidate"))
+        );
+        assert!(
+            data["remediation"]
+                .as_str()
+                .is_some_and(|value| value.contains("target operation=list"))
+        );
+    }
+}
+
+#[test]
+fn set_session_target_rejects_noncanonical_hwnd_before_persisting_source_of_truth()
+-> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let service = service_with_temp_db(dir.path())?;
+    let session_id = "issue1620-invalid-target-boundary";
+    let invalid_targets = [
+        SessionTarget::Window { hwnd: -1 },
+        SessionTarget::Cdp {
+            window_hwnd: 0,
+            cdp_target_id: "chrome-tab:must-not-persist".to_owned(),
+        },
+        SessionTarget::Window {
+            hwnd: i64::from(u32::MAX) + 1,
+        },
+        SessionTarget::Cdp {
+            window_hwnd: i64::MAX,
+            cdp_target_id: "chrome-tab:high-bits-must-not-persist".to_owned(),
+        },
+    ];
+
+    for target in invalid_targets {
+        let persistence_target = target.clone();
+        let error = service
+            .set_session_target_authority_locked(session_id, target)
+            .expect_err("noncanonical target HWND must fail at the persistence boundary");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&json!(error_codes::TOOL_PARAMS_INVALID))
+        );
+        assert!(
+            service.session_target(Some(session_id))?.is_none(),
+            "CF_SESSIONS and in-memory target state must remain absent"
+        );
+        let persistence_error = service
+            .persist_session_target(session_id, &persistence_target)
+            .expect_err("direct persistence seam must reject noncanonical target HWND");
+        assert_eq!(
+            persistence_error
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code")),
+            Some(&json!(error_codes::TOOL_PARAMS_INVALID))
+        );
+        assert!(service.session_target(Some(session_id))?.is_none());
+    }
+
+    Ok(())
+}
+
+#[test]
+fn cdp_resolvers_reject_noncanonical_explicit_hwnd_before_owner_or_target_lookup()
+-> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let service = service_with_temp_db(dir.path())?;
+    for window_hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+        let mutation = service
+            .resolve_cdp_tab_mutation_target(
+                "browser_evaluate",
+                "issue1620-shape-session",
+                Some(window_hwnd),
+                Some("chrome-tab:not-owned"),
+            )
+            .expect_err("HWND shape must be checked before CDP ownership");
+        assert_eq!(
+            mutation
+                .data
+                .as_ref()
+                .and_then(|data| data.get("actual_value")),
+            Some(&json!(window_hwnd))
+        );
+
+        let context = service
+            .resolve_cdp_context_window("issue1620-shape-session", Some(window_hwnd))
+            .expect_err("HWND shape must be checked before CDP context lookup");
+        assert_eq!(
+            context
+                .data
+                .as_ref()
+                .and_then(|data| data.get("actual_value")),
+            Some(&json!(window_hwnd))
+        );
+
+        let info = service
+            .resolve_cdp_target_info_target(
+                "issue1620-shape-session",
+                &CdpTargetInfoParams {
+                    window_hwnd: Some(window_hwnd),
+                    cdp_target_id: Some("chrome-tab:not-owned".to_owned()),
+                },
+            )
+            .expect_err("HWND shape must be checked before target-info ownership");
+        assert_eq!(
+            info.data.as_ref().and_then(|data| data.get("actual_value")),
+            Some(&json!(window_hwnd))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn perception_window_hwnd_rejects_noncanonical_explicit_and_session_values() {
+    for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+        let explicit = perception_window_hwnd("observe", &None, Some(hwnd))
+            .expect_err("noncanonical explicit HWND must fail before desktop routing");
+        assert_eq!(
+            explicit
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+
+        let session_target = Some(SessionTarget::Window { hwnd });
+        let resolved = perception_window_hwnd("find", &session_target, None)
+            .expect_err("noncanonical session HWND must fail before desktop routing");
+        assert_eq!(
+            resolved
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+
+        let cdp_target = Some(SessionTarget::Cdp {
+            window_hwnd: hwnd,
+            cdp_target_id: "chrome-tab:shape-validation".to_owned(),
+        });
+        let resolved = perception_window_hwnd("observe", &cdp_target, None)
+            .expect_err("noncanonical CDP session HWND must fail before target classification");
+        assert_eq!(
+            resolved
+                .data
+                .as_ref()
+                .and_then(|data| data.get("code"))
+                .and_then(Value::as_str),
+            Some(error_codes::TOOL_PARAMS_INVALID)
+        );
+    }
+}
+
+#[tokio::test]
+async fn observe_global_only_rejects_nonpositive_explicit_hwnd() -> anyhow::Result<()> {
+    let dir = TempDir::new()?;
+    let service = service_with_temp_db(dir.path())?;
+    let params: ObserveParams = serde_json::from_value(json!({
+        "include": ["fs"],
+        "window_hwnd": -1
+    }))?;
+
+    let error = match service
+        .observe_without_request_context_for_test(Parameters(params))
+        .await
+    {
+        Ok(_) => panic!("global-only observe ignored a malformed explicit HWND"),
+        Err(error) => error,
+    };
+    let data = error.data.expect("structured HWND validation data");
+    assert_eq!(
+        data.get("code").and_then(Value::as_str),
+        Some(error_codes::TOOL_PARAMS_INVALID)
+    );
+    assert_eq!(data.get("tool").and_then(Value::as_str), Some("observe"));
+    assert_eq!(data.get("actual_value").and_then(Value::as_i64), Some(-1));
+    Ok(())
+}
+
+#[test]
 fn cdp_target_info_resolution_denial_writes_session_audit_row() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     let service = service_with_temp_db(dir.path())?;
@@ -3798,7 +4010,7 @@ fn cdp_close_recovers_persisted_owner_with_exact_active_same_agent_target() -> a
     })?;
     close_session_registry_row(&service, owner_session, now.saturating_add(1))?;
     service.cdp_target_owners_ref().lock().unwrap().clear();
-    service.set_session_target(
+    service.set_session_target_authority_locked(
         current_session,
         SessionTarget::Cdp {
             window_hwnd: 0x1401,
@@ -3851,7 +4063,7 @@ fn cdp_close_active_target_recovery_refuses_wrong_client_identity() -> anyhow::R
     })?;
     close_session_registry_row(&service, owner_session, now.saturating_add(1))?;
     service.cdp_target_owners_ref().lock().unwrap().clear();
-    service.set_session_target(
+    service.set_session_target_authority_locked(
         current_session,
         SessionTarget::Cdp {
             window_hwnd: 0x1402,
@@ -4106,7 +4318,7 @@ fn cdp_readback_recovers_live_same_agent_stale_memory_owner() -> anyhow::Result<
         target_url: "about:blank#issue1411".to_owned(),
         created_at_unix_ms: now.saturating_sub(5_000),
     })?;
-    service.set_session_target(
+    service.set_session_target_authority_locked(
         current_session,
         SessionTarget::Cdp {
             window_hwnd: 0x1411,
@@ -4208,7 +4420,7 @@ fn cdp_navigation_recovery_refuses_wrong_client_identity() -> anyhow::Result<()>
         created_at_unix_ms: now.saturating_sub(5_000),
     })?;
     service.cdp_target_owners_ref().lock().unwrap().clear();
-    service.set_session_target(
+    service.set_session_target_authority_locked(
         current_session,
         SessionTarget::Cdp {
             window_hwnd: 0x1413,

@@ -2377,15 +2377,16 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn api_key_secret_round_trips_and_is_ciphertext_at_rest() -> anyhow::Result<()> {
-        // FSV: the plaintext key must never appear in the stored CF_KV bytes,
-        // yet read_model_secret must recover it exactly, and model_secret_present
-        // must reflect existence. Source of truth = the raw CF_KV secret row.
+        // Supporting regression readback: the plaintext key must never appear
+        // in the stored CF_KV bytes, yet read_model_secret must recover it
+        // exactly, and model_secret_present must reflect existence. The raw
+        // CF_KV secret row is the storage evidence; manual FSV remains separate.
         let (_dir, db) = temp_db()?;
-        let model = "deepseek-secret-fsv";
-        let plaintext = "sk-deepseek-FSV-PLAINTEXT-should-not-persist-9f8e7d";
+        let model = "deepseek-secret-regression";
+        let plaintext = "sk-deepseek-REGRESSION-PLAINTEXT-should-not-persist-9f8e7d";
 
         assert!(!model_secret_present(&db, model)?, "no secret before store");
-        put_model_secret(&db, model, plaintext, "session-fsv")?;
+        put_model_secret(&db, model, plaintext, "session-regression")?;
         assert!(
             model_secret_present(&db, model)?,
             "secret present after store"

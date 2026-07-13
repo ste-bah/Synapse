@@ -7,29 +7,32 @@ use super::{
     AgentSpawnTaskStartedResponse, ErrorData, Json, LaunchWindowState,
     MAX_AGENT_SPAWN_WAIT_TIMEOUT_MS, Parameters, RunShellAuthorization, SessionTarget,
     ShellExecutionContext, SynapseService, TargetWire, assign_owned_process_job,
-    authorize_run_shell, authorize_run_shell_start, cancel_shell_job, execute_combo,
-    launch_for_session, launch_process_history_row, launch_process_history_row_key,
+    authorize_run_shell, authorize_run_shell_start, cancel_shell_job, execute_combo_with_boundary,
+    launch_for_session_with_boundary, launch_process_history_row, launch_process_history_row_key,
     launch_request_details, mcp_error, prepare_run_shell_params_for_context,
-    prepare_run_shell_start_params_for_context, required_combo_permissions, run_authorized_shell,
-    run_shell_idempotency_completed_row, run_shell_idempotency_replay,
-    run_shell_idempotency_reservation_row, run_shell_idempotency_row_key,
-    run_shell_request_details, run_shell_start_request_details,
-    shell_execution_context_for_session, shell_job_status, start_authorized_shell_job, tool,
-    tool_router, validate_agent_spawn_params, validate_run_shell_execution_plan,
+    prepare_run_shell_start_params_for_context, required_combo_permissions,
+    run_authorized_shell_with_boundary, run_shell_idempotency_completed_row,
+    run_shell_idempotency_replay, run_shell_idempotency_reservation_row,
+    run_shell_idempotency_row_key, run_shell_request_details, run_shell_start_request_details,
+    shell_execution_context_for_session, shell_job_status,
+    start_authorized_shell_job_with_boundary, tool, tool_router, validate_agent_spawn_params,
+    validate_run_shell_execution_plan,
 };
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    future::Future,
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 use synapse_core::{error_codes, new_reflex_id};
 use synapse_storage::{cf, decode_json};
@@ -122,38 +125,104 @@ const AGENT_SPAWN_LOG_TAIL_BYTES: usize = 8 * 1024;
 const AGENT_SPAWN_ORPHAN_RECOVERY_STALE_MS: u64 = 10 * 60 * 1000;
 const LOCAL_MODEL_SPAWN_MAX_PROBE_AGE_MS: u64 = 15 * 60 * 1000;
 static AGENT_SPAWN_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
-static AGENT_SPAWN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static AGENT_SPAWN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static AGENT_SPAWN_CLEANUP_INCIDENT: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct AgentSpawnActivityReadback {
+    pub(crate) sequence: u64,
+    pub(crate) in_flight: u64,
+    pub(crate) operator_panic_epoch: u64,
+    pub(crate) operator_panic_safety_pending: bool,
+    pub(crate) cleanup_incident: bool,
+}
+
+pub(crate) fn agent_spawn_activity_readback() -> AgentSpawnActivityReadback {
+    loop {
+        let sequence_before = AGENT_SPAWN_SEQUENCE.load(Ordering::SeqCst);
+        let in_flight = AGENT_SPAWN_IN_FLIGHT.load(Ordering::SeqCst);
+        let sequence_after = AGENT_SPAWN_SEQUENCE.load(Ordering::SeqCst);
+        if sequence_before == sequence_after {
+            let operator_panic = synapse_action::operator_panic_safety_readback();
+            return AgentSpawnActivityReadback {
+                sequence: sequence_after,
+                in_flight,
+                operator_panic_epoch: operator_panic.epoch,
+                operator_panic_safety_pending: operator_panic.pending,
+                cleanup_incident: AGENT_SPAWN_CLEANUP_INCIDENT.load(Ordering::SeqCst),
+            };
+        }
+    }
+}
 
 #[derive(Debug)]
-struct AgentSpawnInFlightGuard {
-    spawn_id: String,
+pub(crate) struct AgentSpawnInFlightGuard {
+    source: &'static str,
+    spawn_id: Option<String>,
+    cli: Option<ActSpawnAgentCli>,
     sequence: u64,
     in_flight_at_start: u64,
+    operator_panic_epoch_at_entry: u64,
     started_at: Instant,
 }
 
 impl AgentSpawnInFlightGuard {
-    fn enter(spawn_id: &str, cli: ActSpawnAgentCli) -> Self {
-        let sequence = AGENT_SPAWN_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    pub(crate) fn enter(source: &'static str) -> Result<Self, ErrorData> {
+        Self::enter_with_pre_guard_hook(source, || {})
+    }
+
+    fn enter_with_pre_guard_hook(
+        source: &'static str,
+        after_precheck: impl FnOnce(),
+    ) -> Result<Self, ErrorData> {
+        let operator_panic_epoch_at_entry = synapse_action::operator_panic_safety_readback().epoch;
+        ensure_agent_spawn_operator_panic_not_observed(
+            source,
+            operator_panic_epoch_at_entry,
+            "before_spawn_activity_guard",
+        )?;
+        after_precheck();
+        // Publish in-flight first. A K2 snapshot can therefore never observe a
+        // newly allocated sequence with zero owners if this thread is preempted
+        // between the two atomics.
         let in_flight_at_start = AGENT_SPAWN_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+        let sequence = AGENT_SPAWN_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
+        let guard = Self {
+            source,
+            spawn_id: None,
+            cli: None,
+            sequence,
+            in_flight_at_start,
+            operator_panic_epoch_at_entry,
+            started_at: Instant::now(),
+        };
         tracing::info!(
             code = "AGENT_SPAWN_IN_FLIGHT_ENTER",
-            spawn_id,
-            cli = cli.as_str(),
+            source,
             sequence,
             in_flight_at_start,
+            operator_panic_epoch_at_entry,
             "act_spawn_agent entered provisioning"
         );
-        Self {
-            spawn_id: spawn_id.to_owned(),
-            sequence,
-            in_flight_at_start,
-            started_at: Instant::now(),
-        }
+        guard.ensure("after_spawn_activity_guard")?;
+        Ok(guard)
+    }
+
+    fn identify(&mut self, spawn_id: &str, cli: ActSpawnAgentCli) {
+        self.spawn_id = Some(spawn_id.to_owned());
+        self.cli = Some(cli);
+    }
+
+    pub(crate) fn ensure(&self, stage: &'static str) -> Result<(), ErrorData> {
+        ensure_agent_spawn_operator_panic_not_observed(
+            self.source,
+            self.operator_panic_epoch_at_entry,
+            stage,
+        )
     }
 
     fn in_flight_now() -> u64 {
-        AGENT_SPAWN_IN_FLIGHT.load(Ordering::SeqCst)
+        agent_spawn_activity_readback().in_flight
     }
 }
 
@@ -163,12 +232,138 @@ impl Drop for AgentSpawnInFlightGuard {
         let in_flight_after = before.saturating_sub(1);
         tracing::info!(
             code = "AGENT_SPAWN_IN_FLIGHT_EXIT",
-            spawn_id = %self.spawn_id,
+            source = self.source,
+            spawn_id = ?self.spawn_id,
+            cli = ?self.cli.map(ActSpawnAgentCli::as_str),
             sequence = self.sequence,
             in_flight_after,
             elapsed_ms = duration_ms_u64(self.started_at.elapsed()),
             "act_spawn_agent left provisioning"
         );
+    }
+}
+
+fn ensure_agent_spawn_operator_panic_not_observed(
+    source: &'static str,
+    operator_panic_epoch_at_entry: u64,
+    stage: &'static str,
+) -> Result<(), ErrorData> {
+    let operator_panic = synapse_action::operator_panic_safety_readback();
+    if operator_panic.pending || operator_panic.epoch != operator_panic_epoch_at_entry {
+        let activity = agent_spawn_activity_readback();
+        return Err(agent_spawn_tool_error(
+            error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            "act_spawn_agent was superseded by the physical operator panic control",
+            json!({
+                "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                "detail_code": "AGENT_SPAWN_OPERATOR_PANIC_PREARMED",
+                "source": source,
+                "stage": stage,
+                "operator_panic_epoch_at_entry": operator_panic_epoch_at_entry,
+                "activity": activity,
+                "source_of_truth": "AGENT_SPAWN_SEQUENCE + AGENT_SPAWN_IN_FLIGHT + synapse_action operator-panic safety readback",
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn agent_spawn_operator_panic_cleanup_error(
+    error: ErrorData,
+    stage: &'static str,
+    cleanup: Value,
+) -> ErrorData {
+    agent_spawn_tool_error(
+        error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+        "act_spawn_agent was superseded by operator panic after process launch; exact cleanup was attempted",
+        json!({
+            "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            "detail_code": "AGENT_SPAWN_OPERATOR_PANIC_AFTER_LAUNCH",
+            "stage": stage,
+            "source_error_message": error.message,
+            "source_error_data": error.data,
+            "cleanup": cleanup,
+            "activity": agent_spawn_activity_readback(),
+        }),
+    )
+}
+
+fn ensure_m4_physical_mutation_boundary(
+    preflight: &super::action_preflight::ActionPreflightReadback,
+    stage: &'static str,
+) -> Result<(), ErrorData> {
+    crate::server::operator_panic_boundary::ensure_mcp_mutation(stage)?;
+    preflight.ensure_operator_panic_boundary(stage)
+}
+
+fn action_preflight_cleanup_error(
+    error: ErrorData,
+    stage: &'static str,
+    cleanup: Value,
+) -> ErrorData {
+    let mut data = match error.data {
+        Some(Value::Object(data)) => data,
+        Some(original_data) => {
+            let mut data = serde_json::Map::new();
+            data.insert("original_data".to_owned(), original_data);
+            data
+        }
+        None => serde_json::Map::new(),
+    };
+    data.insert("physical_mutation_boundary_stage".to_owned(), json!(stage));
+    data.insert("physical_mutation_cleanup".to_owned(), cleanup);
+    ErrorData::new(
+        error.code,
+        error.message.to_string(),
+        Some(Value::Object(data)),
+    )
+}
+
+fn shell_operator_panic_cancel_verified(response: &ActRunShellCancelResponse) -> bool {
+    shell_operator_panic_cleanup_verified(
+        &response.remaining_process_ids,
+        response.status.running,
+        response.remote_process_scope.remote_cleanup_required,
+        response.remote_process_scope.remote_cleanup_verified,
+    )
+}
+
+fn shell_operator_panic_cleanup_verified(
+    remaining_process_ids: &[u32],
+    running: bool,
+    remote_cleanup_required: bool,
+    remote_cleanup_verified: bool,
+) -> bool {
+    remaining_process_ids.is_empty()
+        && !running
+        && (!remote_cleanup_required || remote_cleanup_verified)
+}
+
+fn agent_spawn_operator_panic_cleanup_verified(
+    remaining_process_ids: &[u32],
+    session_teardown_error: Option<&str>,
+    session_teardown_failure_count: Option<u32>,
+) -> bool {
+    remaining_process_ids.is_empty()
+        && session_teardown_error.is_none()
+        && session_teardown_failure_count.is_none_or(|failure_count| failure_count == 0)
+}
+
+async fn await_agent_spawn_phase_under_operator_panic_guard<T, E>(
+    guard: &AgentSpawnInFlightGuard,
+    stage: &'static str,
+    future: impl Future<Output = Result<T, E>>,
+    panic_error: impl Fn(ErrorData) -> E,
+) -> Result<T, E> {
+    guard.ensure(stage).map_err(&panic_error)?;
+    let mut future = Box::pin(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return result,
+            _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                guard.ensure(stage).map_err(&panic_error)?;
+            }
+        }
     }
 }
 
@@ -302,14 +497,60 @@ impl SynapseService {
         );
         let required = required_combo_permissions(&params.0)?;
         self.require_m3_permissions("act_combo", &required)?;
-        if let Err(error) = self.ensure_supported_use_allows_action("act_combo") {
-            self.audit_action_denied_for_request("act_combo", &error, &request_context);
-            return Err(error);
-        }
+        let preflight = match self.ensure_supported_use_allows_action("act_combo") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied_for_request("act_combo", &error, &request_context);
+                return Err(error);
+            }
+        };
         self.refresh_reflex_audit_context()?;
         self.audit_action_started_for_request("act_combo", &request_context)?;
         let runtime = self.reflex_runtime()?;
-        let result = execute_combo(runtime, params.0).await;
+        let runtime_for_cleanup = runtime.clone();
+        let boundary = |stage| ensure_m4_physical_mutation_boundary(&preflight, stage);
+        let mut result = execute_combo_with_boundary(runtime, params.0, &boundary).await;
+        if let Ok(response) = &result
+            && let Err(error) = boundary("act_combo_immediately_after_reflex_schedule")
+        {
+            let (cleanup, cleanup_verified) = match runtime_for_cleanup.lock() {
+                Ok(mut runtime) => match runtime.cancel(&response.combo_id) {
+                    Ok(outcome) => (json!({ "cancel_outcome": format!("{outcome:?}") }), true),
+                    Err(cancel_error) => (
+                        json!({
+                            "cancel_error_code": cancel_error.code(),
+                            "cancel_error": cancel_error.to_string(),
+                        }),
+                        false,
+                    ),
+                },
+                Err(_error) => (
+                    json!({
+                        "cancel_error_code": error_codes::TOOL_INTERNAL_ERROR,
+                        "cancel_error": "reflex runtime lock poisoned while cancelling operator-panic-superseded act_combo",
+                    }),
+                    false,
+                ),
+            };
+            let drain = if cleanup_verified {
+                None
+            } else {
+                synapse_action::record_operator_panic_safety_incident();
+                Some(
+                    self.drain_state_handle()
+                        .mark_draining("operator_panic_act_combo_cleanup_unverified"),
+                )
+            };
+            result = Err(action_preflight_cleanup_error(
+                error,
+                "act_combo_immediately_after_reflex_schedule",
+                json!({
+                    "cleanup": cleanup,
+                    "cleanup_verified": cleanup_verified,
+                    "drain": drain,
+                }),
+            ));
+        }
         self.audit_action_result_for_request("act_combo", &result, &request_context)?;
         result.map(Json)
     }
@@ -508,10 +749,13 @@ impl SynapseService {
             command = %params.0.command,
             "tool.invocation kind=act_run_shell"
         );
-        if let Err(error) = self.ensure_supported_use_allows_action("act_run_shell") {
-            self.audit_action_denied_for_request("act_run_shell", &error, &request_context);
-            return Err(error);
-        }
+        let preflight = match self.ensure_supported_use_allows_action("act_run_shell") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied_for_request("act_run_shell", &error, &request_context);
+                return Err(error);
+            }
+        };
         let raw_params = params.0;
         let session_id = require_shell_session_id(&request_context)?;
         let shell_context = shell_execution_context_for_session(&session_id)?;
@@ -538,7 +782,7 @@ impl SynapseService {
             &command_payload,
             &session_id,
         )?;
-        let result = match authorize_run_shell(&self.m4_config, &params) {
+        let mut result = match authorize_run_shell(&self.m4_config, &params) {
             Ok(authorization) => {
                 run_shell_with_idempotency(
                     self,
@@ -546,11 +790,29 @@ impl SynapseService {
                     authorization,
                     self.m4_config.run_shell_inline_await_limit_ms(),
                     Some(&shell_context),
+                    &preflight,
                 )
                 .await
             }
             Err(error) => Err(error),
         };
+        if let Ok(response) = &result
+            && let Err(error) =
+                ensure_m4_physical_mutation_boundary(&preflight, "act_run_shell_after_execution")
+        {
+            let cleanup = cleanup_shell_job_after_operator_panic(
+                self,
+                response.job_id.as_deref(),
+                &session_id,
+                "act_run_shell_after_execution",
+            )
+            .await;
+            result = Err(action_preflight_cleanup_error(
+                error,
+                "act_run_shell_after_execution",
+                cleanup,
+            ));
+        }
         match &result {
             Ok(response) => self.command_audit_final(
                 super::command_audit::CommandAuditInput::mcp(
@@ -601,10 +863,17 @@ impl SynapseService {
             command = %params.0.command,
             "tool.invocation kind=act_run_shell_start"
         );
-        if let Err(error) = self.ensure_supported_use_allows_action("act_run_shell") {
-            self.audit_action_denied_for_request("act_run_shell_start", &error, &request_context);
-            return Err(error);
-        }
+        let preflight = match self.ensure_supported_use_allows_action("act_run_shell") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied_for_request(
+                    "act_run_shell_start",
+                    &error,
+                    &request_context,
+                );
+                return Err(error);
+            }
+        };
         let raw_params = params.0;
         let session_id = require_shell_session_id(&request_context)?;
         let shell_context = shell_execution_context_for_session(&session_id)?;
@@ -630,12 +899,32 @@ impl SynapseService {
             &command_payload,
             &session_id,
         )?;
-        let result = match authorize_run_shell_start(&self.m4_config, &params) {
-            Ok(authorization) => {
-                start_authorized_shell_job(params, &authorization, Some(&shell_context))
-            }
+        let boundary = |stage| ensure_m4_physical_mutation_boundary(&preflight, stage);
+        let mut result = match authorize_run_shell_start(&self.m4_config, &params) {
+            Ok(authorization) => start_authorized_shell_job_with_boundary(
+                params,
+                &authorization,
+                Some(&shell_context),
+                &boundary,
+            ),
             Err(error) => Err(error),
         };
+        if let Ok(response) = &result
+            && let Err(error) = boundary("act_run_shell_start_after_process_launch")
+        {
+            let cleanup = cleanup_shell_job_after_operator_panic(
+                self,
+                Some(&response.job.job_id),
+                &session_id,
+                "act_run_shell_start_after_process_launch",
+            )
+            .await;
+            result = Err(action_preflight_cleanup_error(
+                error,
+                "act_run_shell_start_after_process_launch",
+                cleanup,
+            ));
+        }
         match &result {
             Ok(response) => {
                 self.command_audit_final(super::command_audit::CommandAuditInput::mcp(
@@ -688,7 +977,7 @@ impl SynapseService {
             job_id = %params.0.job_id,
             "tool.invocation kind=act_run_shell_status"
         );
-        if let Err(error) = self.ensure_supported_use_allows_action("act_run_shell") {
+        if let Err(error) = self.ensure_supported_use_allows_shell_observe_or_cancel() {
             self.audit_action_denied_for_request("act_run_shell_status", &error, &request_context);
             return Err(error);
         }
@@ -723,7 +1012,7 @@ impl SynapseService {
             job_id = %params.0.job_id,
             "tool.invocation kind=act_run_shell_cancel"
         );
-        if let Err(error) = self.ensure_supported_use_allows_action("act_run_shell") {
+        if let Err(error) = self.ensure_supported_use_allows_shell_observe_or_cancel() {
             self.audit_action_denied_for_request("act_run_shell_cancel", &error, &request_context);
             return Err(error);
         }
@@ -835,13 +1124,16 @@ impl SynapseService {
             target = %params.0.target,
             "tool.invocation kind=act_launch"
         );
-        if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
-            self.audit_action_denied_for_request("act_launch", &error, &request_context);
-            return Err(error);
-        }
+        let preflight = match self.ensure_supported_use_allows_action("act_launch") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied_for_request("act_launch", &error, &request_context);
+                return Err(error);
+            }
+        };
         let params = params.0;
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?;
-        self.act_launch_for_session_id(params, session_id)
+        self.act_launch_for_session_id(params, session_id, &preflight)
             .await
             .map(Json)
     }
@@ -894,6 +1186,7 @@ impl SynapseService {
         request: ActSpawnAgentRequest,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<ActSpawnAgentResponse, ErrorData> {
+        let mut spawn_activity = AgentSpawnInFlightGuard::enter("mcp_or_task_dispatch")?;
         if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
             self.audit_action_denied_for_request(ACT_SPAWN_AGENT, &error, request_context);
             return Err(error);
@@ -930,6 +1223,7 @@ impl SynapseService {
         // event of this lifecycle (#897) shares one attribution anchor; a
         // spawn that cannot be journaled is refused before launching.
         let spawn_id = format!("agent-spawn-{}", new_reflex_id());
+        spawn_activity.identify(&spawn_id, agent_kind);
         let command_payload =
             agent_spawn_request_details(&params, started_by_session_id.as_deref());
         let command_before = json!({
@@ -949,8 +1243,20 @@ impl SynapseService {
         ))?;
         self.journal_spawn_requested(&spawn_id, &params, started_by_session_id.as_deref())?;
         let result = self
-            .act_spawn_agent_impl(params, started_by_session_id, spawn_id.clone())
+            .act_spawn_agent_impl(
+                params,
+                started_by_session_id,
+                spawn_id.clone(),
+                &spawn_activity,
+            )
             .await;
+        if let Err(error) = spawn_activity.ensure("mcp_after_spawn_impl") {
+            if let Ok(response) = &result {
+                self.cleanup_spawn_response_after_operator_panic(response, "mcp_after_spawn_impl")
+                    .await;
+            }
+            return Err(error);
+        }
         match &result {
             Ok(response) => {
                 if let Err(journal_error) = self.journal_spawn_ready(response) {
@@ -1034,6 +1340,7 @@ impl SynapseService {
         &self,
         params: ActLaunchParams,
         session_id: Option<String>,
+        preflight: &super::action_preflight::ActionPreflightReadback,
     ) -> Result<ActLaunchResponse, ErrorData> {
         let command_payload = launch_request_details(&params);
         let command_before = json!({
@@ -1059,15 +1366,41 @@ impl SynapseService {
         } else {
             self.audit_action_started_with_details("act_launch", &command_payload)?;
         }
-        let result = match launch_for_session(
+        let boundary = |stage| ensure_m4_physical_mutation_boundary(preflight, stage);
+        let result = match launch_for_session_with_boundary(
             &self.m4_config,
             params.clone(),
             session_id.as_deref(),
+            &boundary,
         )
         .await
         {
             Ok(mut outcome) => {
                 let response = outcome.response.clone();
+                if let Err(error) = boundary("act_launch_after_low_level_launch") {
+                    let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
+                    let cleanup_verified = cleanup.remaining_process_ids.is_empty();
+                    let drain = if cleanup_verified {
+                        None
+                    } else {
+                        synapse_action::record_operator_panic_safety_incident();
+                        Some(
+                            self.drain_state_handle()
+                                .mark_draining("operator_panic_act_launch_cleanup_unverified"),
+                        )
+                    };
+                    return Err(action_preflight_cleanup_error(
+                        error,
+                        "act_launch_after_low_level_launch",
+                        json!({
+                            "source_of_truth": "exact launched process tree + separate process-table readback",
+                            "pid": response.pid,
+                            "termination": cleanup,
+                            "cleanup_verified": cleanup_verified,
+                            "drain": drain,
+                        }),
+                    ));
+                }
                 let process_job = if session_id.is_some() {
                     match assign_owned_process_job(response.pid, "act_launch", None) {
                         Ok(process_job) => Some(process_job),
@@ -1284,6 +1617,50 @@ async fn cancel_shell_job_blocking(
         .map_err(|error| blocking_worker_join_error("act_run_shell_cancel", error))?
 }
 
+async fn cleanup_shell_job_after_operator_panic(
+    service: &SynapseService,
+    job_id: Option<&str>,
+    session_id: &str,
+    stage: &'static str,
+) -> Value {
+    let Some(job_id) = job_id else {
+        return json!({
+            "source_of_truth": "inline shell response (child already exited and was reaped)",
+            "stage": stage,
+            "cleanup_verified": true,
+            "cancel_attempted": false,
+        });
+    };
+    let cancel = cancel_shell_job_blocking(
+        ActRunShellJobIdParams {
+            job_id: job_id.to_owned(),
+        },
+        session_id.to_owned(),
+    )
+    .await;
+    let cleanup_verified = cancel
+        .as_ref()
+        .is_ok_and(shell_operator_panic_cancel_verified);
+    let drain = if cleanup_verified {
+        None
+    } else {
+        synapse_action::record_operator_panic_safety_incident();
+        Some(
+            service
+                .drain_state_handle()
+                .mark_draining("operator_panic_shell_cleanup_unverified"),
+        )
+    };
+    json!({
+        "source_of_truth": "durable shell status + identity-bound local process tree + remote cleanup readback",
+        "stage": stage,
+        "job_id": job_id,
+        "cancel": cancel,
+        "cleanup_verified": cleanup_verified,
+        "drain": drain,
+    })
+}
+
 fn blocking_worker_join_error(tool: &str, error: tokio::task::JoinError) -> ErrorData {
     mcp_error(
         error_codes::TOOL_INTERNAL_ERROR,
@@ -1296,6 +1673,7 @@ impl SynapseService {
         &self,
         params: ActSpawnAgentParams,
     ) -> Result<ActSpawnAgentResponse, ErrorData> {
+        let mut spawn_activity = AgentSpawnInFlightGuard::enter("dashboard_local_model")?;
         tracing::info!(
             code = "DASHBOARD_LOCAL_MODEL_SPAWN_REQUESTED",
             kind = ACT_SPAWN_AGENT,
@@ -1333,6 +1711,7 @@ impl SynapseService {
         let command_payload = agent_spawn_request_details(&params, None);
         self.audit_action_started_with_details(ACT_SPAWN_AGENT, &command_payload)?;
         let spawn_id = format!("agent-spawn-{}", new_reflex_id());
+        spawn_activity.identify(&spawn_id, agent_kind);
         let command_before = json!({
             "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
             "spawn_id": &spawn_id,
@@ -1354,8 +1733,18 @@ impl SynapseService {
         )?;
         self.journal_spawn_requested(&spawn_id, &params, None)?;
         let result = self
-            .act_spawn_agent_impl(params, None, spawn_id.clone())
+            .act_spawn_agent_impl(params, None, spawn_id.clone(), &spawn_activity)
             .await;
+        if let Err(error) = spawn_activity.ensure("dashboard_local_model_after_spawn_impl") {
+            if let Ok(response) = &result {
+                self.cleanup_spawn_response_after_operator_panic(
+                    response,
+                    "dashboard_local_model_after_spawn_impl",
+                )
+                .await;
+            }
+            return Err(error);
+        }
         match &result {
             Ok(response) => {
                 if let Err(journal_error) = self.journal_spawn_ready(response) {
@@ -1439,6 +1828,7 @@ impl SynapseService {
         &self,
         request: ActSpawnAgentRequest,
     ) -> Result<ActSpawnAgentResponse, ErrorData> {
+        let mut spawn_activity = AgentSpawnInFlightGuard::enter("dashboard_or_task_dispatch")?;
         tracing::info!(
             code = "DASHBOARD_AGENT_SPAWN_REQUESTED",
             kind = ACT_SPAWN_AGENT,
@@ -1483,6 +1873,7 @@ impl SynapseService {
         let command_payload = agent_spawn_request_details(&params, None);
         self.audit_action_started_with_details(ACT_SPAWN_AGENT, &command_payload)?;
         let spawn_id = format!("agent-spawn-{}", new_reflex_id());
+        spawn_activity.identify(&spawn_id, agent_kind);
         let command_before = json!({
             "source_of_truth": "CF_AGENT_EVENTS, CF_PROCESS_HISTORY, session registry, agent spawn artifacts",
             "spawn_id": &spawn_id,
@@ -1504,8 +1895,18 @@ impl SynapseService {
         )?;
         self.journal_spawn_requested(&spawn_id, &params, None)?;
         let result = self
-            .act_spawn_agent_impl(params, None, spawn_id.clone())
+            .act_spawn_agent_impl(params, None, spawn_id.clone(), &spawn_activity)
             .await;
+        if let Err(error) = spawn_activity.ensure("dashboard_after_spawn_impl") {
+            if let Ok(response) = &result {
+                self.cleanup_spawn_response_after_operator_panic(
+                    response,
+                    "dashboard_after_spawn_impl",
+                )
+                .await;
+            }
+            return Err(error);
+        }
         match &result {
             Ok(response) => {
                 if let Err(journal_error) = self.journal_spawn_ready(response) {
@@ -1775,25 +2176,31 @@ impl SynapseService {
         params: ActSpawnAgentParams,
         started_by_session_id: Option<String>,
         spawn_id: String,
+        in_flight: &AgentSpawnInFlightGuard,
     ) -> Result<ActSpawnAgentResponse, ErrorData> {
         validate_agent_spawn_params(&params)?;
         validate_spawn_target(&params.target)?;
         let agent_kind = params.effective_cli()?;
         let local_model_row = if agent_kind.is_local_model() {
             Some(
-                self.require_spawn_local_model_row(
-                    &params,
-                    started_by_session_id
-                        .as_deref()
-                        .unwrap_or("dashboard_spawn_agent"),
+                await_agent_spawn_phase_under_operator_panic_guard(
+                    in_flight,
+                    "while_resolving_local_model_spawn_prerequisite",
+                    self.require_spawn_local_model_row(
+                        &params,
+                        started_by_session_id
+                            .as_deref()
+                            .unwrap_or("dashboard_spawn_agent"),
+                    ),
+                    |error| error,
                 )
                 .await?,
             )
         } else {
             None
         };
+        in_flight.ensure("impl_after_async_prerequisites")?;
         let mut timing = AgentSpawnTiming::new();
-        let in_flight = AgentSpawnInFlightGuard::enter(&spawn_id, agent_kind);
 
         let orphan_recovery = recover_orphaned_agent_spawn_terminal_artifacts()?;
         if orphan_recovery.recovered_count > 0 {
@@ -1900,6 +2307,7 @@ impl SynapseService {
         };
 
         timing.mark_prelaunch_done();
+        in_flight.ensure("immediately_before_physical_agent_launch")?;
         timing.mark_launch_started();
         let launch_response = match launch_agent_spawn_with_terminal_capture(
             &self.m4_config,
@@ -1921,7 +2329,7 @@ impl SynapseService {
                         "launch_host": launch_host.to_json(),
                         "source_error_message": error.message.clone(),
                         "source_error_data": error.data,
-                        "spawn_timing": timing.readback(&in_flight, params.wait_timeout_ms),
+                        "spawn_timing": timing.readback(in_flight, params.wait_timeout_ms),
                     }),
                 );
                 return Err(augment_agent_spawn_error_with_artifacts(
@@ -1936,6 +2344,19 @@ impl SynapseService {
             }
         };
         timing.mark_launch_completed();
+        if let Err(error) = in_flight.ensure("immediately_after_physical_agent_launch") {
+            return Err(self
+                .cleanup_launched_agent_after_operator_panic(
+                    launch_response.pid,
+                    None,
+                    &files,
+                    &params,
+                    &spawn_id,
+                    "immediately_after_physical_agent_launch",
+                    error,
+                )
+                .await);
+        }
         let process_job = match assign_owned_process_job(
             launch_response.pid,
             ACT_SPAWN_AGENT,
@@ -2007,8 +2428,10 @@ impl SynapseService {
         timing.mark_session_wait_started();
         let session_wait_deadline =
             agent_spawn_wait_deadline_from(Instant::now(), params.wait_timeout_ms)?;
-        let mut matched = match self
-            .wait_for_spawned_agent_session(
+        let mut matched = match await_agent_spawn_phase_under_operator_panic_guard(
+            in_flight,
+            "while_waiting_for_spawned_agent_session",
+            self.wait_for_spawned_agent_session(
                 &params,
                 agent_kind,
                 &spawn_id,
@@ -2017,8 +2440,10 @@ impl SynapseService {
                 launch_response.pid,
                 &files,
                 session_wait_deadline,
-            )
-            .await
+            ),
+            |error| json!({ "operator_panic_error": error }),
+        )
+        .await
         {
             Ok(matched) => matched,
             Err(error) => {
@@ -2033,7 +2458,7 @@ impl SynapseService {
                         "reason": "session_registry_readback_timeout",
                         "wait_timeout_ms": params.wait_timeout_ms,
                         "wait_error": error,
-                        "spawn_timing": timing.readback(&in_flight, params.wait_timeout_ms),
+                        "spawn_timing": timing.readback(in_flight, params.wait_timeout_ms),
                         "cleanup": cleanup,
                     }),
                 );
@@ -2054,7 +2479,7 @@ impl SynapseService {
                         "stdout_tail": tail_file_lossy(&files.stdout_path, AGENT_SPAWN_LOG_TAIL_BYTES),
                         "stderr_tail": tail_file_lossy(&files.stderr_path, AGENT_SPAWN_LOG_TAIL_BYTES),
                         "final_message_tail": tail_file_lossy(&files.final_message_path, AGENT_SPAWN_LOG_TAIL_BYTES),
-                        "spawn_timing": timing.readback(&in_flight, params.wait_timeout_ms),
+                        "spawn_timing": timing.readback(in_flight, params.wait_timeout_ms),
                         "wait_error": error,
                         "cleanup": cleanup,
                         "completion_artifacts": completion_artifacts,
@@ -2063,12 +2488,27 @@ impl SynapseService {
             }
         };
         timing.mark_session_matched();
+        if let Err(error) = in_flight.ensure("after_spawned_session_wait") {
+            return Err(self
+                .cleanup_launched_agent_after_operator_panic(
+                    launch_response.pid,
+                    Some(&matched.session_id),
+                    &files,
+                    &params,
+                    &spawn_id,
+                    "after_spawned_session_wait",
+                    error,
+                )
+                .await);
+        }
 
         timing.mark_task_wait_started();
         let task_wait_deadline =
             agent_spawn_wait_deadline_from(Instant::now(), params.wait_timeout_ms)?;
-        let task_started = match self
-            .wait_for_spawned_agent_task_started(
+        let task_started = match await_agent_spawn_phase_under_operator_panic_guard(
+            in_flight,
+            "while_waiting_for_spawned_agent_task_start",
+            self.wait_for_spawned_agent_task_started(
                 &params,
                 agent_kind,
                 &spawn_id,
@@ -2078,8 +2518,10 @@ impl SynapseService {
                 launch_response.pid,
                 &files,
                 task_wait_deadline,
-            )
-            .await
+            ),
+            |error| json!({ "operator_panic_error": error }),
+        )
+        .await
         {
             Ok(task_started) => task_started,
             Err(error) => {
@@ -2095,7 +2537,7 @@ impl SynapseService {
                         "wait_timeout_ms": params.wait_timeout_ms,
                         "task_start_error": error,
                         "session_id": matched.session_id,
-                        "spawn_timing": timing.readback(&in_flight, params.wait_timeout_ms),
+                        "spawn_timing": timing.readback(in_flight, params.wait_timeout_ms),
                         "cleanup": cleanup,
                     }),
                 );
@@ -2119,7 +2561,7 @@ impl SynapseService {
                         "stdout_tail": tail_file_lossy(&files.stdout_path, AGENT_SPAWN_LOG_TAIL_BYTES),
                         "stderr_tail": tail_file_lossy(&files.stderr_path, AGENT_SPAWN_LOG_TAIL_BYTES),
                         "final_message_tail": tail_file_lossy(&files.final_message_path, AGENT_SPAWN_LOG_TAIL_BYTES),
-                        "spawn_timing": timing.readback(&in_flight, params.wait_timeout_ms),
+                        "spawn_timing": timing.readback(in_flight, params.wait_timeout_ms),
                         "task_start_error": error,
                         "cleanup": cleanup,
                         "completion_artifacts": completion_artifacts,
@@ -2128,6 +2570,19 @@ impl SynapseService {
             }
         };
         timing.mark_task_started();
+        if let Err(error) = in_flight.ensure("after_spawned_task_start_wait") {
+            return Err(self
+                .cleanup_launched_agent_after_operator_panic(
+                    launch_response.pid,
+                    Some(&matched.session_id),
+                    &files,
+                    &params,
+                    &spawn_id,
+                    "after_spawned_task_start_wait",
+                    error,
+                )
+                .await);
+        }
         if let Err(error) =
             self.require_spawned_agent_session_live(&matched.session_id, &files, agent_kind)
         {
@@ -2296,7 +2751,7 @@ impl SynapseService {
             ));
         }
 
-        Ok(ActSpawnAgentResponse {
+        let response = ActSpawnAgentResponse {
             spawn_id,
             cli: agent_kind,
             kind: agent_kind,
@@ -2320,6 +2775,146 @@ impl SynapseService {
             template_version: params.template_version,
             template_config_hash: params.template_config_hash,
             log_paths: files.to_response(),
+        };
+        if let Err(error) = in_flight.ensure("before_spawn_ready_response") {
+            let cleanup = self
+                .cleanup_spawn_response_after_operator_panic(
+                    &response,
+                    "before_spawn_ready_response",
+                )
+                .await;
+            return Err(agent_spawn_operator_panic_cleanup_error(
+                error,
+                "before_spawn_ready_response",
+                cleanup,
+            ));
+        }
+        Ok(response)
+    }
+
+    async fn cleanup_launched_agent_after_operator_panic(
+        &self,
+        launcher_process_id: u32,
+        session_id: Option<&str>,
+        files: &AgentSpawnFiles,
+        params: &ActSpawnAgentParams,
+        spawn_id: &str,
+        stage: &'static str,
+        error: ErrorData,
+    ) -> ErrorData {
+        let cleanup = self
+            .cleanup_agent_spawn_process_and_session_after_operator_panic(
+                launcher_process_id,
+                session_id,
+                spawn_id,
+                stage,
+            )
+            .await;
+        let completion_artifacts = write_agent_spawn_daemon_terminal_artifacts(
+            files,
+            params,
+            spawn_id,
+            "operator_panic_cancelled",
+            "physical operator panic superseded the spawn after its process launch; exact owned cleanup was attempted",
+            json!({
+                "reason": "operator_panic_after_agent_launch",
+                "stage": stage,
+                "cleanup": &cleanup,
+            }),
+        );
+        agent_spawn_operator_panic_cleanup_error(
+            error,
+            stage,
+            json!({
+                "cleanup": cleanup,
+                "completion_artifacts": completion_artifacts,
+            }),
+        )
+    }
+
+    pub(crate) async fn cleanup_spawn_response_after_operator_panic(
+        &self,
+        response: &ActSpawnAgentResponse,
+        stage: &'static str,
+    ) -> Value {
+        self.cleanup_agent_spawn_process_and_session_after_operator_panic(
+            response.launcher_process_id,
+            Some(&response.session_id),
+            &response.spawn_id,
+            stage,
+        )
+        .await
+    }
+
+    async fn cleanup_agent_spawn_process_and_session_after_operator_panic(
+        &self,
+        launcher_process_id: u32,
+        session_id: Option<&str>,
+        spawn_id: &str,
+        stage: &'static str,
+    ) -> Value {
+        let process_cleanup = crate::m4::terminate_owned_process_tree(launcher_process_id);
+        let (session_teardown, session_teardown_error) = match session_id {
+            Some(session_id) => match self.session_lifecycle_state() {
+                Ok(lifecycle) => match lifecycle
+                    .teardown_session_with_options_report(
+                        session_id,
+                        "operator_panic_agent_spawn_cleanup",
+                        super::session_lifecycle::SessionTeardownOptions::explicit_kill(),
+                    )
+                    .await
+                {
+                    Ok(report) => (Some(report), None),
+                    Err(error) => (None, Some(error.message.to_string())),
+                },
+                Err(error) => (None, Some(error.message.to_string())),
+            },
+            None => (None, None),
+        };
+        let cleanup_verified = agent_spawn_operator_panic_cleanup_verified(
+            &process_cleanup.remaining_process_ids,
+            session_teardown_error.as_deref(),
+            session_teardown.as_ref().map(|report| report.failure_count),
+        );
+        if !cleanup_verified {
+            AGENT_SPAWN_CLEANUP_INCIDENT.store(true, Ordering::SeqCst);
+            let drain = self
+                .drain_state_handle()
+                .mark_draining("operator_panic_agent_spawn_cleanup_unverified");
+            tracing::error!(
+                code = error_codes::ACTION_POSTCONDITION_FAILED,
+                detail_code = "AGENT_SPAWN_OPERATOR_PANIC_CLEANUP_UNVERIFIED",
+                spawn_id,
+                launcher_process_id,
+                session_id,
+                stage,
+                process_cleanup = ?process_cleanup,
+                session_teardown = ?session_teardown,
+                session_teardown_error = ?session_teardown_error,
+                drain = ?drain,
+                "operator panic raced a spawned agent launch and exact cleanup did not reach a terminal postcondition"
+            );
+        } else {
+            tracing::warn!(
+                code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                detail_code = "AGENT_SPAWN_OPERATOR_PANIC_CLEANUP_VERIFIED",
+                spawn_id,
+                launcher_process_id,
+                session_id,
+                stage,
+                "operator panic raced a spawned agent launch; exact process/session cleanup was verified"
+            );
+        }
+        json!({
+            "source_of_truth": "owned launcher process tree + session lifecycle physical cleanup readback",
+            "spawn_id": spawn_id,
+            "launcher_process_id": launcher_process_id,
+            "session_id": session_id,
+            "stage": stage,
+            "process_cleanup": process_cleanup,
+            "session_teardown": session_teardown,
+            "session_teardown_error": session_teardown_error,
+            "cleanup_verified": cleanup_verified,
         })
     }
 
@@ -3203,11 +3798,20 @@ async fn run_shell_with_idempotency(
     authorization: RunShellAuthorization,
     inline_await_limit_ms: u64,
     context: Option<&ShellExecutionContext>,
+    preflight: &super::action_preflight::ActionPreflightReadback,
 ) -> Result<ActRunShellResponse, ErrorData> {
     validate_run_shell_execution_plan(&params, inline_await_limit_ms)?;
     let session_id = context.map(ShellExecutionContext::session_id);
+    let boundary = |stage| ensure_m4_physical_mutation_boundary(preflight, stage);
     let Some(row_key) = run_shell_idempotency_row_key(&params, session_id)? else {
-        return run_authorized_shell(params, &authorization, inline_await_limit_ms, context).await;
+        return run_authorized_shell_with_boundary(
+            params,
+            &authorization,
+            inline_await_limit_ms,
+            context,
+            &boundary,
+        )
+        .await;
     };
 
     let runtime = service.reflex_runtime()?;
@@ -3232,13 +3836,35 @@ async fn run_shell_with_idempotency(
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     }
 
-    let response = run_authorized_shell(
+    if let Err(error) = boundary("act_run_shell_before_idempotent_process_launch") {
+        return Err(clear_failed_run_shell_idempotency_reservation(
+            service,
+            &runtime,
+            &row_key,
+            "act_run_shell_before_idempotent_process_launch",
+            error,
+        ));
+    }
+    let response = match run_authorized_shell_with_boundary(
         params.clone(),
         &authorization,
         inline_await_limit_ms,
         context,
+        &boundary,
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            return Err(clear_failed_run_shell_idempotency_reservation(
+                service,
+                &runtime,
+                &row_key,
+                "act_run_shell_authorized_execution_failed",
+                error,
+            ));
+        }
+    };
     let completed =
         run_shell_idempotency_completed_row(&params, &authorization, &response, session_id)?;
     {
@@ -3253,4 +3879,82 @@ async fn run_shell_with_idempotency(
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     }
     Ok(response)
+}
+
+fn clear_failed_run_shell_idempotency_reservation(
+    service: &SynapseService,
+    runtime: &Arc<std::sync::Mutex<synapse_reflex::ReflexRuntime>>,
+    row_key: &[u8],
+    stage: &'static str,
+    error: ErrorData,
+) -> ErrorData {
+    let mut delete_error = None;
+    let mut readback_error = None;
+    let mut row_exists_after = None;
+    match runtime.lock() {
+        Ok(runtime) => {
+            if let Err(storage_error) =
+                runtime.storage_delete_rows(cf::CF_KV, vec![row_key.to_vec()])
+            {
+                delete_error = Some(storage_error.to_string());
+            }
+            match runtime.storage_kv_row(row_key) {
+                Ok(row) => row_exists_after = Some(row.is_some()),
+                Err(storage_error) => readback_error = Some(storage_error.to_string()),
+            }
+        }
+        Err(_error) => {
+            delete_error = Some(
+                "reflex runtime lock poisoned while deleting failed act_run_shell idempotency reservation"
+                    .to_owned(),
+            );
+        }
+    }
+    let cleanup_verified =
+        delete_error.is_none() && readback_error.is_none() && row_exists_after == Some(false);
+    let drain = (!cleanup_verified).then(|| {
+        service
+            .drain_state_handle()
+            .mark_draining("act_run_shell_idempotency_cleanup_unverified")
+    });
+    if !cleanup_verified {
+        tracing::error!(
+            code = error_codes::ACTION_POSTCONDITION_FAILED,
+            detail_code = "ACT_RUN_SHELL_IDEMPOTENCY_RESERVATION_CLEANUP_UNVERIFIED",
+            stage,
+            row_key = %String::from_utf8_lossy(row_key),
+            delete_error = ?delete_error,
+            readback_error = ?readback_error,
+            row_exists_after = ?row_exists_after,
+            drain = ?drain,
+            "failed act_run_shell left an idempotency reservation whose physical cleanup could not be verified"
+        );
+    }
+    let mut data = match error.data {
+        Some(Value::Object(data)) => data,
+        Some(original_data) => {
+            let mut data = Map::new();
+            data.insert("original_data".to_owned(), original_data);
+            data
+        }
+        None => Map::new(),
+    };
+    data.insert(
+        "idempotency_reservation_cleanup".to_owned(),
+        json!({
+            "stage": stage,
+            "row_key": String::from_utf8_lossy(row_key),
+            "delete_error": delete_error,
+            "readback_error": readback_error,
+            "row_exists_after": row_exists_after,
+            "cleanup_verified": cleanup_verified,
+            "source_of_truth": "CF_KV exact idempotency row readback after synchronous delete",
+            "drain": drain,
+        }),
+    );
+    ErrorData::new(
+        error.code,
+        error.message.to_string(),
+        Some(Value::Object(data)),
+    )
 }

@@ -1,6 +1,9 @@
 use std::{ffi::c_void, mem, path::Path};
 
-use synapse_core::{AccessibleSubtree, ForegroundContext, Point, Rect};
+use synapse_core::{
+    AccessibleSubtree, ForegroundContext, Point, Rect,
+    win32_hwnd::{hwnd_from_wire, hwnd_to_wire, native_hwnds_equal},
+};
 use uiautomation::{
     UIElement,
     types::{ElementMode, TreeScope},
@@ -44,7 +47,7 @@ pub fn snapshot_focused_window(depth: u32) -> A11yResult<AccessibleSubtree> {
             detail: "GetForegroundWindow returned null".to_owned(),
         });
     }
-    super::snapshot::snapshot_window_from_hwnd(hwnd.0 as isize as i64, depth)
+    super::snapshot::snapshot_window_from_hwnd(hwnd_to_wire(hwnd.0 as isize), depth)
 }
 
 pub fn current_foreground_context() -> A11yResult<ForegroundContext> {
@@ -54,28 +57,18 @@ pub fn current_foreground_context() -> A11yResult<ForegroundContext> {
             detail: "GetForegroundWindow returned null".to_owned(),
         });
     }
-    foreground_context(hwnd.0 as isize as i64)
+    foreground_context(hwnd_to_wire(hwnd.0 as isize))
 }
 
 pub fn window_from_hwnd(hwnd: i64) -> A11yResult<UIElement> {
-    let hwnd = HWND(hwnd as *mut c_void);
-    if hwnd.0.is_null() {
-        return Err(A11yError::NoForeground {
-            detail: "HWND was null".to_owned(),
-        });
-    }
+    let _hwnd = hwnd_from_wire_value(hwnd)?;
     Err(A11yError::internal(
         "direct UIElement HWND lookup is disabled; use snapshot_window_from_hwnd so UIA stays on the dedicated MTA worker",
     ))
 }
 
 pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -> A11yResult<()> {
-    let hwnd = HWND(hwnd as *mut c_void);
-    if hwnd.0.is_null() {
-        return Err(A11yError::NoForeground {
-            detail: "HWND was null".to_owned(),
-        });
-    }
+    let hwnd = hwnd_from_wire_value(hwnd)?;
     tracing::info!(
         code = "FOREGROUND_ACTIVATION_INTENT_ACCEPTED",
         caller = intent.caller(),
@@ -85,7 +78,7 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
     );
     restore_window_for_focus(hwnd);
     let _ = unsafe { SetForegroundWindow(hwnd) };
-    if unsafe { GetForegroundWindow() }.0 == hwnd.0 {
+    if native_hwnds_equal(unsafe { GetForegroundWindow() }.0 as isize, hwnd.0 as isize) {
         Ok(())
     } else {
         let current_thread = unsafe { GetCurrentThreadId() };
@@ -113,7 +106,7 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
         let _ = unsafe { BringWindowToTop(hwnd) };
         unsafe { SwitchToThisWindow(hwnd, true) };
         let focused = unsafe { SetForegroundWindow(hwnd) }.as_bool()
-            || unsafe { GetForegroundWindow() }.0 == hwnd.0;
+            || native_hwnds_equal(unsafe { GetForegroundWindow() }.0 as isize, hwnd.0 as isize);
 
         if attached_target {
             let _ = unsafe { AttachThreadInput(current_thread, target_thread, false) };
@@ -178,12 +171,7 @@ fn restore_window_for_focus(hwnd: HWND) {
 }
 
 pub fn is_window_minimized(hwnd: i64) -> A11yResult<bool> {
-    let hwnd = HWND(hwnd as *mut c_void);
-    if hwnd.0.is_null() {
-        return Err(A11yError::NoForeground {
-            detail: "HWND was null".to_owned(),
-        });
-    }
+    let hwnd = valid_hwnd(hwnd)?;
     Ok(unsafe { IsIconic(hwnd) }.as_bool())
 }
 
@@ -213,24 +201,19 @@ pub fn millis_since_last_input() -> A11yResult<u64> {
 pub fn is_top_level_window(hwnd: i64) -> A11yResult<bool> {
     let hwnd = valid_hwnd(hwnd)?;
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
-    Ok(root.0 == hwnd.0)
+    Ok(native_hwnds_equal(root.0 as isize, hwnd.0 as isize))
 }
 
 pub fn top_level_root_hwnd(hwnd: i64) -> A11yResult<i64> {
     let seed = valid_hwnd(hwnd)?;
     let root = unsafe { GetAncestor(seed, GA_ROOT) };
     let root = if root.0.is_null() { seed } else { root };
-    let root = valid_hwnd(root.0 as isize as i64)?;
-    Ok(root.0 as isize as i64)
+    let root = valid_hwnd(hwnd_to_wire(root.0 as isize))?;
+    Ok(hwnd_to_wire(root.0 as isize))
 }
 
 pub fn close_window(hwnd: i64) -> A11yResult<()> {
-    let hwnd = HWND(hwnd as *mut c_void);
-    if hwnd.0.is_null() {
-        return Err(A11yError::NoForeground {
-            detail: "HWND was null".to_owned(),
-        });
-    }
+    let hwnd = hwnd_from_wire_value(hwnd)?;
     unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) }.map_err(|err| {
         A11yError::internal(format!(
             "PostMessageW(WM_CLOSE) failed for hwnd 0x{:x}: {err}",
@@ -250,7 +233,7 @@ pub fn snapshot_window_for_process(pid: u32, depth: u32) -> A11yResult<Accessibl
     let hwnd = find_window_for_pid(pid).ok_or_else(|| A11yError::NoForeground {
         detail: format!("no visible top-level window for pid {pid}"),
     })?;
-    super::snapshot::snapshot_window_from_hwnd(hwnd.0 as isize as i64, depth)
+    super::snapshot::snapshot_window_from_hwnd(hwnd_to_wire(hwnd.0 as isize), depth)
 }
 
 pub fn top_level_window_hwnd_by_name(name: String) -> A11yResult<Option<i64>> {
@@ -285,7 +268,7 @@ pub fn foreground_context(hwnd: i64) -> A11yResult<ForegroundContext> {
         |name| name.to_string_lossy().into_owned(),
     );
     Ok(ForegroundContext {
-        hwnd: hwnd.0 as isize as i64,
+        hwnd: hwnd_to_wire(hwnd.0 as isize),
         pid,
         process_name,
         process_path,
@@ -303,7 +286,7 @@ pub fn foreground_context(hwnd: i64) -> A11yResult<ForegroundContext> {
 pub fn visible_top_level_window_contexts() -> A11yResult<Vec<ForegroundContext>> {
     Ok(visible_top_level_hwnds()?
         .into_iter()
-        .filter_map(|hwnd| foreground_context(hwnd.0 as isize as i64).ok())
+        .filter_map(|hwnd| foreground_context(hwnd_to_wire(hwnd.0 as isize)).ok())
         .filter(|context| !context.window_title.is_empty())
         .collect())
 }
@@ -376,12 +359,7 @@ pub fn set_window_bounds(
     width: Option<i32>,
     height: Option<i32>,
 ) -> A11yResult<WindowBoundsOutcome> {
-    let handle = HWND(hwnd as *mut c_void);
-    if !unsafe { IsWindow(Some(handle)) }.as_bool() {
-        return Err(A11yError::internal(format!(
-            "set_window_bounds: HWND 0x{hwnd:x} is not a live top-level window"
-        )));
-    }
+    let handle = valid_hwnd(hwnd)?;
     // Preserve the current value on any axis the caller did not specify.
     let current = window_rect(handle)?;
     let pos_x = x.unwrap_or(current.x);
@@ -489,12 +467,7 @@ const fn is_invalid_window_handle_error(error: &windows::core::Error) -> bool {
 }
 
 fn valid_hwnd(hwnd: i64) -> A11yResult<HWND> {
-    let hwnd = HWND(hwnd as *mut c_void);
-    if hwnd.0.is_null() {
-        return Err(A11yError::NoForeground {
-            detail: "HWND was null".to_owned(),
-        });
-    }
+    let hwnd = hwnd_from_wire_value(hwnd)?;
     if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         Ok(hwnd)
     } else {
@@ -502,4 +475,13 @@ fn valid_hwnd(hwnd: i64) -> A11yResult<HWND> {
             detail: format!("HWND 0x{:x} is not a valid window", hwnd.0 as isize),
         })
     }
+}
+
+fn hwnd_from_wire_value(hwnd: i64) -> A11yResult<HWND> {
+    let native = hwnd_from_wire(hwnd).ok_or_else(|| A11yError::NoForeground {
+        detail: format!(
+            "HWND wire value {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
+        ),
+    })?;
+    Ok(HWND(native as *mut c_void))
 }

@@ -36,6 +36,7 @@ use crate::m3::suggestions::{
     accept_suggestion_for_execution, assist_plan_for_suggestion, list_suggestions,
     load_suggestion_by_id, record_suggestion_execution_feedback, required_permissions_accept,
     required_permissions_list, required_permissions_tick, suggestion_tick,
+    validate_stored_assist_target_hwnd,
 };
 use crate::m4::{ActLaunchParams, LaunchWindowState};
 
@@ -640,6 +641,13 @@ impl SynapseService {
                 ),
             );
         };
+        let hwnd = match validate_stored_assist_target_hwnd(
+            &format!("CF_KV suggestion row {}", suggestion.suggestion_id),
+            hwnd,
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(error) => return error_step_report(started, step, &error),
+        };
         match synapse_a11y::foreground_context(hwnd) {
             Ok(context) => {
                 let process_matches = mitigation
@@ -766,9 +774,10 @@ impl SynapseService {
         session_id: Option<&str>,
     ) -> PlanStepExecutionReport {
         let started = now_ts_ns();
-        if let Err(error) = self.ensure_supported_use_allows_action("act_launch") {
-            return error_step_report(started, step, &error);
-        }
+        let preflight = match self.ensure_supported_use_allows_action("act_launch") {
+            Ok(preflight) => preflight,
+            Err(error) => return error_step_report(started, step, &error),
+        };
         let launch = ActLaunchParams {
             target: step.source_app.clone(),
             args: Vec::new(),
@@ -786,7 +795,7 @@ impl SynapseService {
             desktop: session_id.map(|_| "agent:session".to_owned()),
         };
         let result = self
-            .act_launch_for_session_id(launch, session_id.map(ToOwned::to_owned))
+            .act_launch_for_session_id(launch, session_id.map(ToOwned::to_owned), &preflight)
             .await;
         match result {
             Ok(response) => {
@@ -907,6 +916,13 @@ impl SynapseService {
 }
 
 fn validate_suggestion_accept_params(params: &SuggestionAcceptParams) -> Result<(), ErrorData> {
+    if let Some(browser_window_hwnd) = params.browser_window_hwnd {
+        crate::m1::validate_hwnd_shape(
+            "suggestion_accept",
+            "browser_window_hwnd",
+            browser_window_hwnd,
+        )?;
+    }
     if params.suggestion_id.trim().is_empty() {
         return Err(crate::m1::mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -1133,4 +1149,35 @@ fn url_host_matches(url: &str, expected_host: &str) -> bool {
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
         .is_some_and(|host| host == expected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggestion_accept_enforces_canonical_browser_hwnd_before_plan_execution() {
+        for invalid in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let params = SuggestionAcceptParams {
+                suggestion_id: "suggestion-1".to_owned(),
+                browser_window_hwnd: Some(invalid),
+                ..SuggestionAcceptParams::default()
+            };
+            let error = validate_suggestion_accept_params(&params)
+                .expect_err("noncanonical browser HWND must fail before plan execution");
+            let data = error.data.as_ref().expect("structured HWND error data");
+            assert_eq!(
+                data.get("field").and_then(Value::as_str),
+                Some("browser_window_hwnd")
+            );
+        }
+
+        let params = SuggestionAcceptParams {
+            suggestion_id: "suggestion-1".to_owned(),
+            browser_window_hwnd: Some(i64::from(u32::MAX)),
+            ..SuggestionAcceptParams::default()
+        };
+        validate_suggestion_accept_params(&params)
+            .expect("u32::MAX is a canonical HWND wire value");
+    }
 }

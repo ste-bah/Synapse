@@ -10,6 +10,10 @@ use super::SynapseService;
 #[serde(deny_unknown_fields)]
 pub(super) struct ActionPreflightReadback {
     pub tool: &'static str,
+    /// Physical operator-panic generation armed before scope/target checks.
+    /// Every non-ActionHandle mutation route must recheck this value at its
+    /// irreversible boundary after any auto-wait or asynchronous preparation.
+    pub operator_panic_epoch_at_arm: u64,
     pub target_profile_id: Option<ProfileId>,
     pub active_profile_id_before: Option<ProfileId>,
     pub applied: bool,
@@ -48,6 +52,7 @@ impl SynapseService {
     pub(super) fn preflight_action_foreground(
         &self,
         tool: &'static str,
+        operator_panic_epoch_at_arm: u64,
         runtime: &ProfileRuntime,
         active_profile_id_before: Option<ProfileId>,
         foreground: ForegroundContext,
@@ -55,7 +60,12 @@ impl SynapseService {
         let before = foreground_proof(runtime, &foreground);
         Ok((
             foreground,
-            not_applicable_preflight(tool, active_profile_id_before, before),
+            not_applicable_preflight(
+                tool,
+                operator_panic_epoch_at_arm,
+                active_profile_id_before,
+                before,
+            ),
         ))
     }
 }
@@ -125,10 +135,12 @@ pub(super) fn tool_requires_live_foreground(tool: &str) -> bool {
 /// foreground present rather than hard-failing `A11Y_NO_FOREGROUND` (#1061).
 pub(super) fn no_foreground_preflight(
     tool: &'static str,
+    operator_panic_epoch_at_arm: u64,
     active_profile_id_before: Option<ProfileId>,
 ) -> ActionPreflightReadback {
     ActionPreflightReadback {
         tool,
+        operator_panic_epoch_at_arm,
         target_profile_id: None,
         active_profile_id_before,
         applied: false,
@@ -154,11 +166,13 @@ pub(super) fn no_foreground_preflight(
 
 fn not_applicable_preflight(
     tool: &'static str,
+    operator_panic_epoch_at_arm: u64,
     active_profile_id_before: Option<ProfileId>,
     before: ForegroundProof,
 ) -> ActionPreflightReadback {
     ActionPreflightReadback {
         tool,
+        operator_panic_epoch_at_arm,
         target_profile_id: None,
         active_profile_id_before,
         applied: false,
@@ -170,6 +184,23 @@ fn not_applicable_preflight(
         focus_error: None,
         after: Some(before),
         readback_error: None,
+    }
+}
+
+impl ActionPreflightReadback {
+    pub(super) fn ensure_operator_panic_boundary(
+        &self,
+        stage: &'static str,
+    ) -> Result<(), ErrorData> {
+        // Preserve the epoch captured by the outer production MCP request.
+        // A facade/batch must never make an old request safe again merely by
+        // entering this tool after a complete K1/K2 wave and arming locally.
+        super::operator_panic_boundary::ensure_mcp_mutation(stage)?;
+        crate::m2::ensure_operator_panic_action_admission(
+            self.tool,
+            stage,
+            self.operator_panic_epoch_at_arm,
+        )
     }
 }
 

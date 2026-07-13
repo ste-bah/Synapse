@@ -290,14 +290,14 @@ mod tests {
 
     #[test]
     fn fs_path_token_hashes_without_raw_path() {
-        let root = PathBuf::from(r"C:\synapse-fsv");
+        let root = PathBuf::from(r"C:\synapse-regression");
         let path = root.join("nested").join("known.txt");
 
         let token = redacted_fs_path_token(&root, &path);
 
         assert!(token.starts_with("sha256:"));
         assert!(!token.contains("known.txt"));
-        assert!(!token.contains("synapse-fsv"));
+        assert!(!token.contains("synapse-regression"));
     }
 
     #[test]

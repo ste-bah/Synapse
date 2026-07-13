@@ -3,11 +3,12 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write as _},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Mutex, MutexGuard, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, bail};
+use fs2::FileExt as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -18,6 +19,7 @@ const RUN_CURRENT_FILE: &str = "daemon-run-current.json";
 const TOOL_LAST_FILE: &str = "daemon-tool-last.json";
 const TOOL_EVENTS_FILE: &str = "daemon-tool-events.jsonl";
 const EXIT_EVENTS_FILE: &str = "daemon-exit.jsonl";
+const LIFECYCLE_LOCK_FILE: &str = "daemon-lifecycle.lock";
 
 /// Maximum size in bytes the active daemon tool-event ledger
 /// (`daemon-tool-events.jsonl`) may reach before it is rotated to a numbered
@@ -152,7 +154,8 @@ struct DaemonLifecycleState {
 
 #[derive(Debug)]
 pub(crate) struct ToolCallGuard {
-    seq: u64,
+    run_id: String,
+    seq: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -164,6 +167,113 @@ pub(crate) struct ContextEvent {
     pub foreground: Option<Value>,
     pub foreground_read_error: Option<Value>,
     pub detail: Value,
+}
+
+/// Holds the lifecycle transaction and in-process lifecycle state across the
+/// exact daemon-lifetime-lock release boundary. A successor may acquire the
+/// daemon lock once the caller closes it, but its lifecycle `configure` call
+/// cannot inspect `daemon-run-current.json` until this guard has durably
+/// published the predecessor's graceful exit and released the transaction.
+pub(crate) struct GracefulExitFinalizationGuard {
+    // Keep the ledger field first: on unwind its Drop unlocks the cross-process
+    // transaction before the state mutex is released to another local writer.
+    ledger: LifecycleLedgerLock,
+    state: MutexGuard<'static, Option<DaemonLifecycleState>>,
+}
+
+struct LifecycleLedgerLock {
+    file: Option<File>,
+    path: PathBuf,
+    operation: &'static str,
+}
+
+impl LifecycleLedgerLock {
+    fn acquire(db_path: &Path, operation: &'static str) -> anyhow::Result<Self> {
+        fs::create_dir_all(db_path)
+            .with_context(|| format!("create lifecycle lock directory {}", db_path.display()))?;
+        let path = db_path.join(LIFECYCLE_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("open lifecycle transaction lock {}", path.display()))?;
+        file.lock_exclusive().with_context(|| {
+            format!(
+                "lock lifecycle transaction {} for {operation}",
+                path.display()
+            )
+        })?;
+        Ok(Self {
+            file: Some(file),
+            path,
+            operation,
+        })
+    }
+
+    fn unlock_checked(&mut self) -> anyhow::Result<()> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(());
+        };
+        fs2::FileExt::unlock(file).with_context(|| {
+            format!(
+                "unlock lifecycle transaction {} after {}",
+                self.path.display(),
+                self.operation
+            )
+        })?;
+        self.file = None;
+        Ok(())
+    }
+}
+
+impl Drop for LifecycleLedgerLock {
+    fn drop(&mut self) {
+        if self.file.is_none() {
+            return;
+        }
+        if let Err(error) = self.unlock_checked() {
+            tracing::error!(
+                code = "MCP_DAEMON_LIFECYCLE_LOCK_DROP_FAILED",
+                operation = self.operation,
+                lock_path = %self.path.display(),
+                error = %error,
+                "failed to unlock daemon lifecycle transaction during Drop; closing the owned file handle as the final OS-lock backstop"
+            );
+            eprintln!(
+                "synapse-mcp daemon lifecycle lock cleanup failed: operation={} path={} error={error:#}",
+                self.operation,
+                self.path.display()
+            );
+        }
+    }
+}
+
+fn combine_lifecycle_action_and_unlock<T>(
+    operation: &'static str,
+    action_result: anyhow::Result<T>,
+    unlock_result: anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    match (action_result, unlock_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_value), Err(unlock_error)) => Err(unlock_error),
+        (Err(error), Err(unlock_error)) => Err(anyhow::anyhow!(
+            "{operation} failed: {error:#}; lifecycle transaction unlock also failed: {unlock_error:#}"
+        )),
+    }
+}
+
+fn with_lifecycle_ledger_lock<T>(
+    db_path: &Path,
+    operation: &'static str,
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut lock = LifecycleLedgerLock::acquire(db_path, operation)?;
+    let action_result = action();
+    let unlock_result = lock.unlock_checked();
+    combine_lifecycle_action_and_unlock(operation, action_result, unlock_result)
 }
 
 pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonLifecyclePaths> {
@@ -181,19 +291,14 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         exit_events_path: config.db_path.join(EXIT_EVENTS_FILE).display().to_string(),
     };
 
-    let previous_run = read_optional_json::<RunRecord>(Path::new(&paths.run_current_path))
-        .with_context(|| {
-            format!(
-                "read daemon lifecycle current run {}",
-                paths.run_current_path
-            )
-        })?;
-    let previous_last_tool = read_optional_json::<ToolEvent>(Path::new(&paths.tool_last_path))
-        .with_context(|| format!("read daemon lifecycle last tool {}", paths.tool_last_path))?;
-
     let run = RunRecord {
         schema_version: SCHEMA_VERSION,
-        run_id: format!("{}-{}", now_unix_ms(), std::process::id()),
+        run_id: format!(
+            "{}-{}-{}",
+            now_unix_ms(),
+            std::process::id(),
+            uuid::Uuid::now_v7().simple()
+        ),
         pid: std::process::id(),
         mode: config.mode.to_owned(),
         bind_addr: config.bind_addr,
@@ -202,44 +307,55 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         ended_at_unix_ms: None,
         ended_reason: None,
     };
+    with_lifecycle_ledger_lock(&config.db_path, "configure daemon lifecycle", || {
+        let previous_run = read_optional_json::<RunRecord>(Path::new(&paths.run_current_path))
+            .with_context(|| {
+                format!(
+                    "read daemon lifecycle current run {}",
+                    paths.run_current_path
+                )
+            })?;
+        let previous_last_tool = read_optional_json::<ToolEvent>(Path::new(&paths.tool_last_path))
+            .with_context(|| format!("read daemon lifecycle last tool {}", paths.tool_last_path))?;
 
-    if let Some(previous) = previous_run.as_ref()
-        && previous.ended_at_unix_ms.is_none()
-    {
-        append_json_line(
-            Path::new(&paths.exit_events_path),
-            &ExitEvent {
-                schema_version: SCHEMA_VERSION,
-                run_id: previous.run_id.clone(),
-                pid: previous.pid,
-                event_kind: "previous_run_unclean".to_owned(),
-                cause: "process_missing_on_startup".to_owned(),
-                detail: json!({
-                    "new_pid": std::process::id(),
-                    "new_run_id": run.run_id,
-                    "reason": "daemon-run-current had no ended_at_unix_ms when this daemon acquired the DB lock",
-                }),
-                recorded_at_unix_ms: now_unix_ms(),
-                run: Some(previous.clone()),
-                last_tool_event: previous_last_tool.clone(),
-                in_flight_tool_events: previous_last_tool
-                    .iter()
-                    .filter(|event| event.status == "started")
-                    .cloned()
-                    .collect(),
-                paths: paths.clone(),
-            },
-        )
-        .with_context(|| {
-            format!(
-                "append previous unclean daemon exit event {}",
-                paths.exit_events_path
+        if let Some(previous) = previous_run.as_ref()
+            && previous.ended_at_unix_ms.is_none()
+        {
+            append_json_line(
+                Path::new(&paths.exit_events_path),
+                &ExitEvent {
+                    schema_version: SCHEMA_VERSION,
+                    run_id: previous.run_id.clone(),
+                    pid: previous.pid,
+                    event_kind: "previous_run_unclean".to_owned(),
+                    cause: "process_missing_on_startup".to_owned(),
+                    detail: json!({
+                        "new_pid": std::process::id(),
+                        "new_run_id": run.run_id,
+                        "reason": "daemon-run-current had no ended_at_unix_ms when this daemon acquired the DB lock",
+                    }),
+                    recorded_at_unix_ms: now_unix_ms(),
+                    run: Some(previous.clone()),
+                    last_tool_event: previous_last_tool.clone(),
+                    in_flight_tool_events: previous_last_tool
+                        .iter()
+                        .filter(|event| event.status == "started")
+                        .cloned()
+                        .collect(),
+                    paths: paths.clone(),
+                },
             )
-        })?;
-    }
+            .with_context(|| {
+                format!(
+                    "append previous unclean daemon exit event {}",
+                    paths.exit_events_path
+                )
+            })?;
+        }
 
-    write_json_atomic(Path::new(&paths.run_current_path), &run)
-        .with_context(|| format!("write daemon current run {}", paths.run_current_path))?;
+        write_json_atomic(Path::new(&paths.run_current_path), &run)
+            .with_context(|| format!("write daemon current run {}", paths.run_current_path))
+    })?;
     // Seed the in-memory ledger size from the file that survives across daemon
     // restarts, so the very first append after startup rotates when the active
     // segment was already at the cap. A missing file simply starts at zero.
@@ -323,7 +439,10 @@ pub(crate) fn begin_tool_call(start: ToolCallStart) -> anyhow::Result<ToolCallGu
     };
     write_tool_event(state, &event)?;
     state.in_flight.insert(seq, event);
-    Ok(ToolCallGuard { seq })
+    Ok(ToolCallGuard {
+        run_id: state.run.run_id.clone(),
+        seq: Some(seq),
+    })
 }
 
 pub(crate) fn record_context_event(input: ContextEvent) -> anyhow::Result<u64> {
@@ -366,36 +485,145 @@ pub(crate) fn record_context_event(input: ContextEvent) -> anyhow::Result<u64> {
 
 impl ToolCallGuard {
     pub(crate) fn finish_ok_with_effective_target(
-        self,
+        mut self,
         effective_target: Option<Value>,
     ) -> anyhow::Result<()> {
-        finish_tool_call(self.seq, "ok", None, None, effective_target)
+        self.finish("ok", None, None, effective_target)
     }
 
-    pub(crate) fn finish_error(self, error: Value) -> anyhow::Result<()> {
-        finish_tool_call(self.seq, "error", Some(error), None, None)
+    pub(crate) fn finish_error(mut self, error: Value) -> anyhow::Result<()> {
+        self.finish("error", Some(error), None, None)
     }
 
     pub(crate) fn finish_error_with_effective_target(
-        self,
+        mut self,
         error: Value,
         effective_target: Option<Value>,
     ) -> anyhow::Result<()> {
-        finish_tool_call(self.seq, "error", Some(error), None, effective_target)
+        self.finish("error", Some(error), None, effective_target)
     }
 
-    pub(crate) fn finish_panic(self, panic: Value) -> anyhow::Result<()> {
-        finish_tool_call(self.seq, "panic", None, Some(panic), None)
+    pub(crate) fn finish_panic(mut self, panic: Value) -> anyhow::Result<()> {
+        self.finish("panic", None, Some(panic), None)
+    }
+
+    fn finish(
+        &mut self,
+        status: &'static str,
+        error: Option<Value>,
+        panic: Option<Value>,
+        effective_target: Option<Value>,
+    ) -> anyhow::Result<()> {
+        let seq = self
+            .seq
+            .ok_or_else(|| anyhow::anyhow!("daemon lifecycle tool guard is already terminal"))?;
+        let result = finish_tool_call(&self.run_id, seq, status, error, panic, effective_target);
+        if result.is_ok() {
+            self.seq = None;
+        }
+        result
     }
 }
 
-pub(crate) fn record_graceful_exit(source: &'static str) -> anyhow::Result<()> {
-    record_exit(
-        "daemon_exit",
-        "graceful",
-        json!({
-            "source": source,
-        }),
+impl Drop for ToolCallGuard {
+    fn drop(&mut self) {
+        let Some(seq) = self.seq.take() else {
+            return;
+        };
+        let run_id = self.run_id.clone();
+        let fallback = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            finish_tool_call(
+                &run_id,
+                seq,
+                "error",
+                Some(json!({
+                    "code": synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "detail_code": "MCP_TOOL_CALL_GUARD_DROPPED_UNFINISHED",
+                    "detail": "the routed MCP call owner was dropped before explicit lifecycle finalization",
+                    "source_of_truth": "daemon lifecycle ToolCallGuard Drop backstop",
+                })),
+                None,
+                None,
+            )
+        }));
+        match fallback {
+            Ok(Ok(())) => {
+                tracing::error!(
+                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    detail_code = "MCP_TOOL_CALL_GUARD_DROPPED_UNFINISHED",
+                    run_id,
+                    seq,
+                    "an unfinished MCP tool lifecycle owner was finalized by its Drop backstop"
+                );
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    detail_code = "MCP_TOOL_CALL_GUARD_DROP_FINALIZATION_FAILED",
+                    run_id,
+                    seq,
+                    error = %error,
+                    "an unfinished MCP tool lifecycle owner could not publish its Drop backstop"
+                );
+                eprintln!(
+                    "synapse-mcp unfinished tool lifecycle cleanup failed: run_id={run_id} seq={seq} error={error:#}"
+                );
+            }
+            Err(payload) => {
+                let detail = consume_panic_payload(payload);
+                tracing::error!(
+                    code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    detail_code = "MCP_TOOL_CALL_GUARD_DROP_PANICKED",
+                    run_id,
+                    seq,
+                    detail,
+                    "an unfinished MCP tool lifecycle Drop backstop panicked"
+                );
+                eprintln!(
+                    "synapse-mcp unfinished tool lifecycle cleanup panicked: run_id={run_id} seq={seq} detail={detail}"
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn begin_graceful_exit_finalization() -> anyhow::Result<GracefulExitFinalizationGuard> {
+    let state = state_slot()
+        .lock()
+        .map_err(|_error| anyhow::anyhow!("daemon lifecycle state lock poisoned"))?;
+    let configured = state
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("daemon lifecycle ledger is not configured"))?;
+    let ledger = LifecycleLedgerLock::acquire(
+        Path::new(&configured.paths.db_path),
+        "finalize graceful daemon exit across lifetime-lock release",
+    )?;
+    Ok(GracefulExitFinalizationGuard { ledger, state })
+}
+
+pub(crate) fn record_graceful_exit_after_lifetime_lock_close(
+    mut finalization: GracefulExitFinalizationGuard,
+    source: &'static str,
+) -> anyhow::Result<()> {
+    let action_result = finalization
+        .state
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("daemon lifecycle ledger became unconfigured"))
+        .and_then(|state| {
+            record_exit_for_state_locked(
+                state,
+                "daemon_exit",
+                "graceful",
+                json!({
+                    "source": source,
+                }),
+            )
+        });
+    let unlock_result = finalization.ledger.unlock_checked();
+    combine_lifecycle_action_and_unlock(
+        "finalize graceful daemon exit across lifetime-lock release",
+        action_result,
+        unlock_result,
     )
 }
 
@@ -514,7 +742,57 @@ pub(crate) fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Str
         .unwrap_or_else(|| "<non-string panic payload>".to_owned())
 }
 
+/// Extract a useful panic diagnostic and consume the payload. Unknown payloads
+/// are explicitly dropped under a second unwind boundary because user-defined
+/// payload destructors can themselves panic. Only an unknown *secondary* panic
+/// payload is leaked, after it has been logged, to prevent recursive destructor
+/// panics from aborting the process during safety cleanup.
+pub(crate) fn consume_panic_payload(payload: Box<dyn std::any::Any + Send>) -> String {
+    let payload = match payload.downcast::<String>() {
+        Ok(message) => return *message,
+        Err(payload) => payload,
+    };
+    let payload = match payload.downcast::<&'static str>() {
+        Ok(message) => return (*message).to_owned(),
+        Err(payload) => payload,
+    };
+    let original_type_id = format!("{:?}", payload.as_ref().type_id());
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(payload))) {
+        Ok(()) => format!("non-string panic payload (type_id={original_type_id})"),
+        Err(secondary) => {
+            let secondary_text = secondary
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| secondary.downcast_ref::<&'static str>().copied())
+                .map(str::to_owned);
+            let secondary_type_id = format!("{:?}", secondary.as_ref().type_id());
+            tracing::error!(
+                code = synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                detail_code = "PANIC_PAYLOAD_DROP_PANICKED",
+                original_type_id = %original_type_id,
+                secondary_type_id = %secondary_type_id,
+                secondary = secondary_text.as_deref().unwrap_or("non-string panic payload"),
+                "dropping a caught panic payload panicked; preserving process safety"
+            );
+            if secondary_text.is_some() {
+                drop(secondary);
+            } else {
+                // Log first, then leak only this unknown secondary payload. Its
+                // destructor just panicked and retrying it risks process abort.
+                std::mem::forget(secondary);
+            }
+            format!(
+                "non-string panic payload (type_id={original_type_id}); payload Drop panicked: {}",
+                secondary_text.unwrap_or_else(|| {
+                    format!("non-string secondary payload (type_id={secondary_type_id})")
+                })
+            )
+        }
+    }
+}
+
 fn finish_tool_call(
+    run_id: &str,
     seq: u64,
     status: &'static str,
     error: Option<Value>,
@@ -528,7 +806,13 @@ fn finish_tool_call(
     let Some(state) = guard.as_mut() else {
         bail!("daemon lifecycle ledger is not configured");
     };
-    let Some(mut event) = state.in_flight.remove(&seq) else {
+    if state.run.run_id != run_id {
+        bail!(
+            "daemon lifecycle tool event {seq} belongs to superseded run {run_id}, current run is {}",
+            state.run.run_id
+        );
+    }
+    let Some(mut event) = state.in_flight.get(&seq).cloned() else {
         bail!("daemon lifecycle in-flight tool event {seq} is missing");
     };
     let finished_at_unix_ms = now_unix_ms();
@@ -538,7 +822,9 @@ fn finish_tool_call(
     event.effective_target = effective_target;
     event.error = error;
     event.panic = panic;
-    write_tool_event(state, &event)
+    write_tool_event(state, &event)?;
+    state.in_flight.remove(&seq);
+    Ok(())
 }
 
 fn record_panic(info: &std::panic::PanicHookInfo<'_>) -> anyhow::Result<()> {
@@ -549,12 +835,7 @@ fn record_panic(info: &std::panic::PanicHookInfo<'_>) -> anyhow::Result<()> {
             "column": location.column(),
         })
     });
-    let payload = info
-        .payload()
-        .downcast_ref::<&str>()
-        .map(|s| (*s).to_owned())
-        .or_else(|| info.payload().downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "<non-string panic payload>".to_owned());
+    let payload = panic_payload_message(info.payload());
     append_diagnostic_event(
         "panic",
         "panic",
@@ -592,12 +873,18 @@ fn append_diagnostic_event(
         in_flight_tool_events: state.in_flight.values().cloned().collect(),
         paths: state.paths.clone(),
     };
-    append_json_line(Path::new(&state.paths.exit_events_path), &event).with_context(|| {
-        format!(
-            "append daemon diagnostic event {}",
-            state.paths.exit_events_path
-        )
-    })
+    with_lifecycle_ledger_lock(
+        Path::new(&state.paths.db_path),
+        "append daemon diagnostic event",
+        || {
+            append_json_line(Path::new(&state.paths.exit_events_path), &event).with_context(|| {
+                format!(
+                    "append daemon diagnostic event {}",
+                    state.paths.exit_events_path
+                )
+            })
+        },
+    )
 }
 
 fn record_exit(event_kind: &'static str, cause: &'static str, detail: Value) -> anyhow::Result<()> {
@@ -608,6 +895,27 @@ fn record_exit(event_kind: &'static str, cause: &'static str, detail: Value) -> 
     let Some(state) = guard.as_mut() else {
         bail!("daemon lifecycle ledger is not configured");
     };
+    record_exit_for_state(state, event_kind, cause, detail)
+}
+
+fn record_exit_for_state(
+    state: &mut DaemonLifecycleState,
+    event_kind: &'static str,
+    cause: &'static str,
+    detail: Value,
+) -> anyhow::Result<()> {
+    let db_path = PathBuf::from(&state.paths.db_path);
+    with_lifecycle_ledger_lock(&db_path, "record daemon exit", || {
+        record_exit_for_state_locked(state, event_kind, cause, detail)
+    })
+}
+
+fn record_exit_for_state_locked(
+    state: &mut DaemonLifecycleState,
+    event_kind: &'static str,
+    cause: &'static str,
+    detail: Value,
+) -> anyhow::Result<()> {
     let mut run = state.run.clone();
     run.ended_at_unix_ms = Some(now_unix_ms());
     run.ended_reason = Some(cause.to_owned());
@@ -625,14 +933,38 @@ fn record_exit(event_kind: &'static str, cause: &'static str, detail: Value) -> 
         in_flight_tool_events: state.in_flight.values().cloned().collect(),
         paths: state.paths.clone(),
     };
+    let current = read_optional_json::<RunRecord>(Path::new(&state.paths.run_current_path))
+        .with_context(|| {
+            format!(
+                "read daemon current run before exit finalization {}",
+                state.paths.run_current_path
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "daemon current run disappeared before exit finalization: {}",
+                state.paths.run_current_path
+            )
+        })?;
+    let owns_run_current = current.run_id == state.run.run_id;
     append_json_line(Path::new(&state.paths.exit_events_path), &event)
         .with_context(|| format!("append daemon exit event {}", state.paths.exit_events_path))?;
-    write_json_atomic(Path::new(&state.paths.run_current_path), &run).with_context(|| {
-        format!(
-            "write daemon ended current run {}",
-            state.paths.run_current_path
-        )
-    })?;
+    if owns_run_current {
+        write_json_atomic(Path::new(&state.paths.run_current_path), &run).with_context(|| {
+            format!(
+                "write daemon ended current run {}",
+                state.paths.run_current_path
+            )
+        })?;
+    }
+    if !owns_run_current {
+        tracing::info!(
+            code = "MCP_DAEMON_LIFECYCLE_RUN_CURRENT_SUPERSEDED",
+            run_id = %state.run.run_id,
+            run_current_path = %state.paths.run_current_path,
+            "recorded this daemon's exit event without overwriting a successor's current-run record"
+        );
+    }
     state.run = run;
     Ok(())
 }
@@ -911,9 +1243,58 @@ fn duration_millis(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
+
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn consume_panic_payload_preserves_string_diagnostic() {
+        let message = consume_panic_payload(Box::new("synthetic tool panic"));
+
+        assert_eq!(message, "synthetic tool panic");
+    }
+
+    #[test]
+    fn consume_panic_payload_drops_unknown_payload() {
+        struct MarksDrop(Arc<AtomicBool>);
+
+        impl Drop for MarksDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let message = consume_panic_payload(Box::new(MarksDrop(Arc::clone(&dropped))));
+
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(message.starts_with("non-string panic payload"));
+    }
+
+    #[test]
+    fn consume_panic_payload_contains_payload_destructor_panic() {
+        struct PanicOnDrop;
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                panic!("synthetic panic-payload destructor failure");
+            }
+        }
+
+        let result = std::panic::catch_unwind(|| consume_panic_payload(Box::new(PanicOnDrop)));
+
+        let message = result.unwrap_or_else(|_panic| {
+            panic!("panic payload consumer must contain destructor panics")
+        });
+        assert!(message.contains("payload Drop panicked"));
+        assert!(message.contains("synthetic panic-payload destructor failure"));
+    }
 
     #[test]
     fn records_tool_start_and_finish_to_physical_files() {
@@ -951,6 +1332,49 @@ mod tests {
         assert_eq!(events.lines().count(), 2);
         assert!(events.contains("\"status\":\"started\""));
         assert!(events.contains("\"status\":\"ok\""));
+    }
+
+    #[test]
+    fn unfinished_tool_guard_drop_publishes_terminal_error() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure(DaemonLifecycleConfig {
+            mode: "http",
+            bind_addr: Some("127.0.0.1:7700".to_owned()),
+            db_path: temp.path().to_path_buf(),
+        })
+        .unwrap();
+
+        let guard = begin_tool_call(ToolCallStart {
+            tool: "observe".to_owned(),
+            mcp_session_id: Some("session-cancelled".to_owned()),
+            audit_context: None,
+            audit_context_read_error: None,
+            foreground: None,
+            foreground_read_error: None,
+            session_target: None,
+            session_target_read_error: None,
+        })
+        .unwrap();
+        drop(guard);
+
+        let last: ToolEvent = read_optional_json(Path::new(&paths.tool_last_path))
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.tool, "observe");
+        assert_eq!(last.status, "error");
+        assert_eq!(
+            last.error
+                .as_ref()
+                .and_then(|error| error.get("detail_code"))
+                .and_then(Value::as_str),
+            Some("MCP_TOOL_CALL_GUARD_DROPPED_UNFINISHED")
+        );
+        assert!(
+            in_flight_tool_calls_for_session("session-cancelled")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1068,7 +1492,7 @@ mod tests {
             db_path: temp.path().to_path_buf(),
         })
         .unwrap();
-        let _guard = begin_tool_call(ToolCallStart {
+        let guard = begin_tool_call(ToolCallStart {
             tool: "observe".to_owned(),
             mcp_session_id: Some("session-crash".to_owned()),
             audit_context: None,
@@ -1079,6 +1503,8 @@ mod tests {
             session_target_read_error: None,
         })
         .unwrap();
+        // Simulate process loss: a real process crash does not run Drop.
+        std::mem::forget(guard);
 
         configure(DaemonLifecycleConfig {
             mode: "http",
@@ -1092,6 +1518,140 @@ mod tests {
         assert!(exits.contains("\"cause\":\"process_missing_on_startup\""));
         assert!(exits.contains("\"tool\":\"observe\""));
         assert!(exits.contains("\"status\":\"started\""));
+    }
+
+    #[test]
+    fn superseded_daemon_exit_never_overwrites_successor_run_current() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure(DaemonLifecycleConfig {
+            mode: "http",
+            bind_addr: Some("127.0.0.1:7700".to_owned()),
+            db_path: temp.path().to_path_buf(),
+        })
+        .unwrap();
+        let mut old_state = state_slot()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("old lifecycle state")
+            .clone();
+        let old_run_id = old_state.run.run_id.clone();
+
+        let mut successor_before = old_state.run.clone();
+        successor_before.run_id = "synthetic-successor-run".to_owned();
+        successor_before.pid = old_state.run.pid.saturating_add(1);
+        successor_before.bind_addr = Some("127.0.0.1:7701".to_owned());
+        successor_before.started_at_unix_ms = old_state.run.started_at_unix_ms.saturating_add(1);
+        with_lifecycle_ledger_lock(temp.path(), "publish synthetic successor", || {
+            write_json_atomic(Path::new(&paths.run_current_path), &successor_before)
+        })
+        .unwrap();
+        assert_ne!(successor_before.run_id, old_run_id);
+        assert!(successor_before.ended_at_unix_ms.is_none());
+
+        record_exit_for_state(
+            &mut old_state,
+            "daemon_exit",
+            "graceful",
+            json!({"source": "delayed_old_daemon"}),
+        )
+        .unwrap();
+
+        let successor_after: RunRecord = read_optional_json(Path::new(&paths.run_current_path))
+            .unwrap()
+            .expect("successor current-run row after old exit");
+        assert_eq!(successor_after.run_id, successor_before.run_id);
+        assert!(successor_after.ended_at_unix_ms.is_none());
+        let exits = fs::read_to_string(&paths.exit_events_path).unwrap();
+        let old_graceful = exits
+            .lines()
+            .filter_map(|line| serde_json::from_str::<ExitEvent>(line).ok())
+            .any(|event| {
+                event.run_id == old_run_id
+                    && event.cause == "graceful"
+                    && event.detail.get("source").and_then(Value::as_str)
+                        == Some("delayed_old_daemon")
+            });
+        assert!(old_graceful, "old daemon exit event must remain durable");
+    }
+
+    #[test]
+    fn graceful_finalization_serializes_successor_read_after_exit_write() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure(DaemonLifecycleConfig {
+            mode: "http",
+            bind_addr: Some("127.0.0.1:7700".to_owned()),
+            db_path: temp.path().to_path_buf(),
+        })
+        .unwrap();
+        let predecessor = state_slot()
+            .lock()
+            .unwrap()
+            .as_ref()
+            .expect("predecessor lifecycle state")
+            .run
+            .clone();
+        let predecessor_run_id = predecessor.run_id.clone();
+        let mut successor = predecessor.clone();
+        successor.run_id = "synthetic-serialized-successor".to_owned();
+        successor.pid = predecessor.pid.saturating_add(1);
+        successor.started_at_unix_ms = predecessor.started_at_unix_ms.saturating_add(1);
+        successor.ended_at_unix_ms = None;
+        successor.ended_reason = None;
+
+        let finalization = begin_graceful_exit_finalization().unwrap();
+        let contender_db_path = temp.path().to_path_buf();
+        let contender_run_path = PathBuf::from(&paths.run_current_path);
+        let contender_successor = successor.clone();
+        let (contention_tx, contention_rx) = mpsc::channel();
+        let contender = std::thread::spawn(move || {
+            let lock_path = contender_db_path.join(LIFECYCLE_LOCK_FILE);
+            let lock_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            let contention = fs2::FileExt::try_lock_exclusive(&lock_file)
+                .expect_err("predecessor finalization must physically own lifecycle lock")
+                .to_string();
+            contention_tx.send(contention).unwrap();
+
+            fs2::FileExt::lock_exclusive(&lock_file).unwrap();
+            let predecessor_seen = read_optional_json::<RunRecord>(&contender_run_path)
+                .unwrap()
+                .expect("predecessor row after serialized lifecycle acquisition");
+            write_json_atomic(&contender_run_path, &contender_successor).unwrap();
+            fs2::FileExt::unlock(&lock_file).unwrap();
+            predecessor_seen
+        });
+        let contention = contention_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("successor must independently observe the held lifecycle transaction");
+        assert!(!contention.is_empty());
+
+        record_graceful_exit_after_lifetime_lock_close(finalization, "serialized_predecessor_test")
+            .unwrap();
+        let predecessor_seen = contender.join().expect("join successor lifecycle writer");
+
+        assert_eq!(predecessor_seen.run_id, predecessor_run_id);
+        assert!(predecessor_seen.ended_at_unix_ms.is_some());
+        assert_eq!(predecessor_seen.ended_reason.as_deref(), Some("graceful"));
+        let current: RunRecord = read_optional_json(Path::new(&paths.run_current_path))
+            .unwrap()
+            .expect("successor current-run row");
+        assert_eq!(current.run_id, successor.run_id);
+        assert!(current.ended_at_unix_ms.is_none());
+        let exits = fs::read_to_string(&paths.exit_events_path).unwrap();
+        assert!(exits.lines().any(|line| {
+            serde_json::from_str::<ExitEvent>(line).is_ok_and(|event| {
+                event.run_id == predecessor_run_id
+                    && event.cause == "graceful"
+                    && event.detail.get("source").and_then(Value::as_str)
+                        == Some("serialized_predecessor_test")
+            })
+        }));
     }
 
     fn configure_temp(temp: &tempfile::TempDir) -> DaemonLifecyclePaths {

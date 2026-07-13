@@ -1,3 +1,10 @@
+# Supporting diagnostic only. Its output is supporting diagnostic evidence only.
+# This script does not perform or accept Full State Verification (FSV). Under
+# AGENTS.md D1, an agent must perform FSV manually
+# through the strict production MCP client and independently read each physical
+# Source of Truth before and after the trigger.
+# `synapse-fsv-toast-history` is a public compatibility identity and is
+# intentionally unchanged.
 param(
     [string]$Bind = '127.0.0.1:7700',
     [string]$TokenPath = "$env:APPDATA\synapse\token.txt",
@@ -10,7 +17,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Die($Message) { throw "[issue871-fsv] $Message" }
+function Die($Message) { throw "[issue871-diagnostic] $Message" }
 
 function Assert-True {
     param(
@@ -489,7 +496,7 @@ Ensure-Binary -Path $ToastHelperExe -CargoArgs @('build', '-p', 'synapse-mcp', '
 Ensure-Binary -Path $OverlayExe -CargoArgs @('build', '-p', 'synapse-overlay') -Name 'synapse-overlay'
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$marker = "issue871-fsv-$stamp"
+$marker = "issue871-diagnostic-$stamp"
 $screenshotPath = Join-Path ([System.IO.Path]::GetTempPath()) "$marker-dashboard.png"
 $sessionA = $null
 $sessionB = $null
@@ -514,8 +521,8 @@ try {
     } while ($null -eq $healthRest -and (Get-Date) -lt $deadline)
     Assert-True ($null -ne $healthRest -and $healthRest.ok -eq $true) "daemon health failed at http://$Bind/health"
 
-    $sessionA = Open-McpSession -Bind $Bind -Token $token -Name 'issue871-fsv-agent-a'
-    $sessionB = Open-McpSession -Bind $Bind -Token $token -Name 'issue871-fsv-agent-b'
+    $sessionA = Open-McpSession -Bind $Bind -Token $token -Name 'issue871-diagnostic-agent-a'
+    $sessionB = Open-McpSession -Bind $Bind -Token $token -Name 'issue871-diagnostic-agent-b'
 
     $toolsList = Invoke-McpMethod -Bind $Bind -Token $token -SessionId $sessionA -NextId ([ref]$nextA) -Method 'tools/list' -Params @{}
     $toolNames = @($toolsList.tools | ForEach-Object { [string]$_.name })
@@ -552,7 +559,7 @@ try {
     if ($null -eq $dashboardWindow) { $dashboardWindow = @($chromeWindows | Select-Object -First 1) }
     $dashboardWindowHwnd = [int64]$dashboardWindow.hwnd
 
-    $dashboardUrl = "http://$Bind/dashboard?fsv=$marker#/system"
+    $dashboardUrl = "http://$Bind/dashboard?diagnostic=$marker#/system"
     $newTab = Invoke-McpTool -Bind $Bind -Token $token -SessionId $sessionA -NextId ([ref]$nextA) -Name 'browser_tabs' -Arguments @{
         operation = 'new'
         window_hwnd = $dashboardWindowHwnd
@@ -640,8 +647,8 @@ try {
     Assert-True ([int]$overlayStatus.pending_approvals -eq (Count-PendingRows -Rows $trayState.approvals.data.rows)) 'tray pending approvals mismatch'
 
     $toastDedupe = "issue871-toast-$marker"
-    $toastTitle = "Issue #871 FSV toast $marker"
-    $toastBody = "Actionable approval toast for assist-surface acceptance."
+    $toastTitle = "Issue #871 diagnostic toast $marker"
+    $toastBody = "Actionable approval toast for the assist-surface diagnostic."
     $request = Invoke-McpTool -Bind $Bind -Token $token -SessionId $sessionA -NextId ([ref]$nextA) -Name 'approval_request' -Arguments @{
         kind = 'suggestion'
         title = $toastTitle
@@ -688,7 +695,7 @@ try {
     $gateToolUseId = "issue871-gate-$stamp"
     $gateSpawn = "agent-spawn-issue871-$stamp"
     $gateDedupe = "gate:${gateSpawn}:${gateToolUseId}"
-    $gateInput = @{ command = "git push origin issue871-fsv-$stamp" }
+    $gateInput = @{ command = "git push origin issue871-diagnostic-$stamp" }
     $gateCall = Start-McpToolCallAsync -Bind $Bind -Token $token -SessionId $sessionB -NextId ([ref]$nextB) -Name 'approval_gate' -Arguments @{
         tool_name = 'Bash'
         tool_use_id = $gateToolUseId
@@ -702,7 +709,7 @@ try {
     $gateDecision = Invoke-DashboardPost -Path '/dashboard/approval/decide' -Body @{
         approval_id = $gateApprovalId
         decision = 'accept'
-        note = "issue871 FSV dashboard accept resumes blocked approval_gate"
+        note = "issue871 diagnostic dashboard accept resumes blocked approval_gate"
     } -Token $token
     Assert-True ([string]$gateDecision.decision.after_status -eq 'accepted') 'dashboard approval decide did not accept gate row'
     $gateVerdict = Receive-McpToolCallAsync -Call $gateCall
@@ -801,7 +808,7 @@ try {
             Invoke-DashboardPost -Path '/dashboard/approval/decide' -Body @{
                 approval_id = $gateApprovalId
                 decision = 'decline'
-                note = 'issue871 FSV cleanup after interrupted gate run'
+                note = 'issue871 diagnostic cleanup after interrupted gate run'
             } -Token $token | Out-Null
         } catch {
             Write-Warning "failed to cleanup gate approval ${gateApprovalId}: $($_.Exception.Message)"

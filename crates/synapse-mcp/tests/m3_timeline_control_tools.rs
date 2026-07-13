@@ -1,6 +1,7 @@
-//! Integration FSV for the #843 recorder controls: `timeline_pause`,
-//! `timeline_resume`, `timeline_exclusions`, and `timeline_purge`, driven
-//! through the real MCP stdio server against a real `RocksDB`.
+//! Supporting integration evidence for the #843 recorder controls:
+//! `timeline_pause`, `timeline_resume`, `timeline_exclusions`, and
+//! `timeline_purge`, driven through the real MCP stdio server against a real
+//! `RocksDB`. Manual FSV remains separate.
 //!
 //! The stdio server hosts no live recorder (that is the HTTP daemon's job),
 //! so these tests verify the durable layer the tools own end to end: control

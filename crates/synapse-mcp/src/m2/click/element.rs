@@ -47,6 +47,7 @@ pub(super) async fn execute_element_click(
     timing: DoubleClickTiming,
     started: Instant,
     foreground_click_policy: ForegroundClickPolicy,
+    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<ActClickResponse, ErrorData> {
     if element_is_coordinate_only(&element.element_id) || !params.use_invoke_pattern {
         return execute_coordinate_element_click(
@@ -59,6 +60,7 @@ pub(super) async fn execute_element_click(
             Vec::new(),
             "coordinate_direct",
             foreground_click_policy,
+            boundary,
         )
         .await;
     }
@@ -95,6 +97,7 @@ pub(super) async fn execute_element_click(
                 tier_attempts,
                 "coordinate_fallback_on_selection_only_list_item",
                 foreground_click_policy,
+                boundary,
             )
             .await;
         }
@@ -120,6 +123,7 @@ pub(super) async fn execute_element_click(
     let mut backend_used = "software";
     let mut uia_outcomes = Vec::new();
     for click_index in 0..params.clicks {
+        boundary.ensure("immediately_before_uia_element_click")?;
         let outcome_result = if let Some(recording) = recording {
             click_element_or_fallback(&element.element_id, recording, &mut state, params.button)
         } else {
@@ -165,6 +169,7 @@ pub(super) async fn execute_element_click(
                             tier_attempts,
                             "coordinate_fallback_on_unsupported",
                             foreground_click_policy,
+                            boundary,
                         )
                         .await;
                     }
@@ -219,6 +224,7 @@ pub(super) async fn execute_element_click(
                             tier_attempts,
                             "coordinate_fallback_on_selection_readback_failure",
                             foreground_click_policy,
+                            boundary,
                         )
                         .await;
                     }
@@ -406,6 +412,7 @@ async fn execute_coordinate_element_click(
     mut tier_attempts: Vec<ActClickTierAttempt>,
     trace_outcome: &'static str,
     foreground_click_policy: ForegroundClickPolicy,
+    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<ActClickResponse, ErrorData> {
     let screen_point = match element_center(&element.element_id) {
         Ok(screen_point) => screen_point,
@@ -433,8 +440,9 @@ async fn execute_coordinate_element_click(
     );
     let actions = coordinate_click_actions(params, screen_point);
     let backend_used = if let Some(recording) = recording {
+        boundary.ensure("immediately_before_coordinate_element_recording_dispatch")?;
         if let Err(error) =
-            record::execute_recording(recording, &actions, params.clicks, timing).await
+            record::execute_recording(recording, &actions, params.clicks, timing, boundary).await
         {
             let error_code = click_error_code(&error);
             let reason_code = click_reason_for_error_code(&error_code);
@@ -470,7 +478,8 @@ async fn execute_coordinate_element_click(
             params.hold_ms,
             &mut tier_attempts,
         )?;
-        match record::execute_actor_actions(handle, actions, timing).await {
+        boundary.ensure("immediately_before_coordinate_element_foreground_dispatch")?;
+        match record::execute_actor_actions(handle, actions, timing, boundary).await {
             Ok(()) => {
                 tier_attempts.push(click_tier_delivered(
                     CLICK_TIER_FOREGROUND,
@@ -493,7 +502,9 @@ async fn execute_coordinate_element_click(
             }
         }
     } else {
-        match post_element_window_message_click(params, element, screen_point, timing).await {
+        match post_element_window_message_click(params, element, screen_point, timing, boundary)
+            .await
+        {
             Ok(backend_used) => {
                 tier_attempts.push(click_tier_delivered(
                     CLICK_TIER_POSTMESSAGE,
@@ -523,7 +534,9 @@ async fn execute_coordinate_element_click(
                     params.hold_ms,
                     &mut tier_attempts,
                 )?;
-                match record::execute_actor_actions(handle, actions, timing).await {
+                boundary
+                    .ensure("immediately_before_coordinate_element_foreground_fallback_dispatch")?;
+                match record::execute_actor_actions(handle, actions, timing, boundary).await {
                     Ok(()) => {
                         tier_attempts.push(click_tier_delivered(
                             CLICK_TIER_FOREGROUND,
@@ -691,6 +704,7 @@ pub(super) async fn execute_element_postmessage_click(
     mut tier_attempts: Vec<ActClickTierAttempt>,
     timing: DoubleClickTiming,
     started: Instant,
+    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<ActClickResponse, ErrorData> {
     let screen_point = match element_center(&element.element_id) {
         Ok(point) => point,
@@ -708,7 +722,9 @@ pub(super) async fn execute_element_postmessage_click(
         }
     };
     let backend_used =
-        match post_element_window_message_click(params, element, screen_point, timing).await {
+        match post_element_window_message_click(params, element, screen_point, timing, boundary)
+            .await
+        {
             Ok(backend_used) => {
                 tier_attempts.push(click_tier_delivered(
                     CLICK_TIER_POSTMESSAGE,
@@ -773,15 +789,18 @@ async fn post_element_window_message_click(
     element: &ActClickElementTarget,
     screen_point: Point,
     timing: DoubleClickTiming,
+    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<String, ErrorData> {
     let readback =
         windows_hwnd_message_click_readback(&element.element_id, screen_point, params.button)
             .map_err(|error| action_error_to_mcp(&error))?;
     for click_index in 0..params.clicks {
+        boundary.ensure("immediately_before_postmessage_mouse_down")?;
         post_mouse_message(readback.hwnd, WM_MOUSEMOVE, 0, readback.client_point)
             .map_err(|error| action_error_to_mcp(&error))?;
         let (down_message, up_message, down_wparam) =
             mouse_button_messages(params.button).map_err(|error| action_error_to_mcp(&error))?;
+        boundary.ensure("immediately_before_postmessage_mouse_button_down")?;
         post_mouse_message(
             readback.hwnd,
             down_message,
@@ -790,8 +809,24 @@ async fn post_element_window_message_click(
         )
         .map_err(|error| action_error_to_mcp(&error))?;
         sleep(Duration::from_millis(u64::from(params.hold_ms))).await;
-        post_mouse_message(readback.hwnd, up_message, 0, readback.client_point)
-            .map_err(|error| action_error_to_mcp(&error))?;
+        let boundary_error = boundary
+            .ensure("after_postmessage_mouse_hold_before_release")
+            .err();
+        let release_result =
+            post_mouse_message(readback.hwnd, up_message, 0, readback.client_point)
+                .map_err(|error| action_error_to_mcp(&error));
+        if let Some(error) = boundary_error {
+            if let Err(release_error) = release_result {
+                tracing::error!(
+                    code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                    detail_code = "POSTMESSAGE_MOUSE_RELEASE_AFTER_OPERATOR_PANIC_FAILED",
+                    detail = %release_error,
+                    "operator panic superseded a held PostMessage click and its best-effort button-up cleanup failed"
+                );
+            }
+            return Err(error);
+        }
+        release_result?;
 
         tracing::info!(
             code = "M2_ACT_CLICK_ELEMENT_HWND_MESSAGE_FALLBACK",
@@ -825,6 +860,7 @@ async fn post_element_window_message_click(
     element: &ActClickElementTarget,
     _screen_point: Point,
     _timing: DoubleClickTiming,
+    _boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<String, ErrorData> {
     Err(action_error_to_mcp(&ActionError::BackendUnavailable {
         detail: format!(
@@ -1168,17 +1204,19 @@ fn window_class_name(hwnd: HWND) -> String {
 
 #[cfg(windows)]
 fn hwnd_from_i64(hwnd: i64) -> Result<HWND, ActionError> {
-    if hwnd == 0 {
-        return Err(ActionError::TargetInvalid {
-            detail: "act_click element root hwnd is null".to_owned(),
-        });
-    }
-    Ok(HWND(hwnd as isize as *mut c_void))
+    let native = synapse_core::win32_hwnd::hwnd_from_wire(hwnd).ok_or_else(|| {
+        ActionError::TargetInvalid {
+            detail: format!(
+                "act_click element root hwnd {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
+            ),
+        }
+    })?;
+    Ok(HWND(native as *mut c_void))
 }
 
 #[cfg(windows)]
 fn hwnd_to_i64(hwnd: HWND) -> i64 {
-    hwnd.0 as isize as i64
+    synapse_core::win32_hwnd::hwnd_to_wire(hwnd.0 as isize)
 }
 
 #[cfg(test)]

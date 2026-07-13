@@ -53,7 +53,10 @@ pub struct ActSetValueResponse {
     pub elapsed_ms: u32,
 }
 
-pub async fn act_set_value(params: ActSetValueParams) -> Result<ActSetValueResponse, ErrorData> {
+pub(crate) async fn act_set_value_with_boundary(
+    params: ActSetValueParams,
+    boundary: super::OperatorPanicActionBoundary,
+) -> Result<ActSetValueResponse, ErrorData> {
     let started = Instant::now();
     validate_set_value_params(&params)?;
     let requested_len = char_count(&params.text)?;
@@ -66,6 +69,7 @@ pub async fn act_set_value(params: ActSetValueParams) -> Result<ActSetValueRespo
     let before_len = char_count(&before.value)?;
     let before_readback = value_readback_json(&params.element_id, &before);
 
+    boundary.ensure("immediately_before_set_element_value")?;
     let set_readback = match synapse_a11y::set_element_value(&params.element_id, &params.text) {
         Ok(readback) => readback,
         Err(error) => {

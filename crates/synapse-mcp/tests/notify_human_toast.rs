@@ -1,4 +1,5 @@
-//! Full State Verification for `notify_human` (issue #866).
+//! Supporting real-platform integration evidence for `notify_human` (#866);
+//! manual FSV remains separate.
 //!
 //! These tests run against the real Windows notification platform — no mocks.
 //! The daemon raises actual toasts (popup-suppressed so test runs do not spam
@@ -76,7 +77,7 @@ fn unique_marker() -> anyhow::Result<String> {
         .duration_since(std::time::UNIX_EPOCH)
         .context("system clock before unix epoch")?
         .as_nanos();
-    Ok(format!("fsv-{nanos}-{}", std::process::id()))
+    Ok(format!("notify-regression-{nanos}-{}", std::process::id()))
 }
 
 #[tokio::test]
@@ -89,7 +90,7 @@ async fn notify_human_delivers_dedupes_and_redelivers_after_dismissal() -> anyho
         .tools_call(
             "notify_human",
             json!({
-                "title": format!("Synapse FSV {marker}"),
+                "title": format!("Synapse notification regression {marker}"),
                 "body": "happy-path toast raised by notify_human_toast.rs",
                 "kind": "info",
                 "dedupe_key": marker,
@@ -149,7 +150,7 @@ async fn notify_human_delivers_dedupes_and_redelivers_after_dismissal() -> anyho
         .tools_call(
             "notify_human",
             json!({
-                "title": format!("Synapse FSV duplicate {marker}"),
+                "title": format!("Synapse notification duplicate {marker}"),
                 "body": "this repeat must be suppressed",
                 "kind": "info",
                 "dedupe_key": marker,
@@ -175,7 +176,7 @@ async fn notify_human_delivers_dedupes_and_redelivers_after_dismissal() -> anyho
         .tools_call(
             "notify_human",
             json!({
-                "title": format!("Synapse FSV redelivery {marker}"),
+                "title": format!("Synapse notification redelivery {marker}"),
                 "body": "after dismissal the same dedupe_key must deliver again",
                 "kind": "warning",
                 "dedupe_key": marker,
@@ -205,7 +206,7 @@ async fn notify_human_without_dedupe_key_uses_unique_tags() -> anyhow::Result<()
             .tools_call(
                 "notify_human",
                 json!({
-                    "title": format!("Synapse FSV unique {marker} #{index}"),
+                    "title": format!("Synapse notification unique {marker} #{index}"),
                     "body": "",
                     "kind": "success",
                     "suppress_popup": true,

@@ -171,6 +171,33 @@ impl SynapseService {
         let params = params.0;
         validate_lease_ttl_ms("control_lease_acquire", params.ttl_ms)?;
         let session_id = require_lease_session_id(&request_context)?;
+        let operator_panic_epoch_at_entry =
+            arm_control_lease_operator_panic_gate("control_lease_acquire", &session_id)?;
+        let authority_gate = self.lock_session_authority(&session_id).await;
+        ensure_control_lease_operator_panic_not_observed(
+            "control_lease_acquire",
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "after_authority_gate_wait",
+        )?;
+        let _authority_gate = authority_gate?;
+        self.reject_terminated_session_tool_call("control_lease_acquire", &session_id)?;
+        ensure_control_lease_operator_panic_not_observed(
+            "control_lease_acquire",
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "after_session_validation_before_mutation",
+        )?;
+        self.control_lease_acquire_authority_locked(params, session_id)
+    }
+
+    /// Internal transaction step for callers that already hold this session's
+    /// authority gate (notably `act operation=foreground`).
+    pub(super) fn control_lease_acquire_authority_locked(
+        &self,
+        params: ControlLeaseAcquireParams,
+        session_id: String,
+    ) -> Result<Json<ControlLeaseResponse>, ErrorData> {
         self.restore_session_lease_if_needed(&session_id)?;
         let command_payload = json!({ "ttl_ms": params.ttl_ms });
         let command_before = json!({
@@ -322,6 +349,32 @@ impl SynapseService {
             "tool.invocation kind=control_lease_release"
         );
         let session_id = require_lease_session_id(&request_context)?;
+        let operator_panic_epoch_at_entry =
+            arm_control_lease_operator_panic_gate("control_lease_release", &session_id)?;
+        let authority_gate = self.lock_session_authority(&session_id).await;
+        ensure_control_lease_operator_panic_not_observed(
+            "control_lease_release",
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "after_authority_gate_wait",
+        )?;
+        let _authority_gate = authority_gate?;
+        self.reject_terminated_session_tool_call("control_lease_release", &session_id)?;
+        ensure_control_lease_operator_panic_not_observed(
+            "control_lease_release",
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "after_session_validation_before_mutation",
+        )?;
+        self.control_lease_release_authority_locked(session_id)
+    }
+
+    /// Internal transaction step for callers that already hold this session's
+    /// authority gate (notably `act operation=foreground`).
+    pub(super) fn control_lease_release_authority_locked(
+        &self,
+        session_id: String,
+    ) -> Result<Json<ControlLeaseResponse>, ErrorData> {
         self.restore_session_lease_if_needed(&session_id)?;
         let command_payload = json!({});
         let command_before = json!({
@@ -448,9 +501,29 @@ impl SynapseService {
         let params = params.0;
         validate_lease_ttl_ms("control_lease_handoff", params.ttl_ms)?;
         let session_id = require_lease_session_id(&request_context)?;
-        self.restore_session_lease_if_needed(&session_id)?;
         let to_session = params.to_session;
         self.ensure_handoff_recipient_live(&session_id, &to_session)?;
+        let operator_panic_epoch_at_entry =
+            arm_control_lease_operator_panic_gate("control_lease_handoff", &session_id)?;
+        let authority_gates = self
+            .lock_session_authorities(&[&session_id, &to_session])
+            .await;
+        ensure_control_lease_operator_panic_not_observed(
+            "control_lease_handoff",
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "after_authority_gate_wait",
+        )?;
+        let _authority_gates = authority_gates?;
+        self.reject_terminated_session_tool_call("control_lease_handoff", &session_id)?;
+        self.reject_terminated_session_tool_call("control_lease_handoff", &to_session)?;
+        ensure_control_lease_operator_panic_not_observed(
+            "control_lease_handoff",
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "after_session_validation_before_mutation",
+        )?;
+        self.restore_session_lease_if_needed(&session_id)?;
         let command_payload = json!({
             "to_session": &to_session,
             "ttl_ms": params.ttl_ms,
@@ -602,9 +675,128 @@ impl SynapseService {
             "tool.invocation kind=control_lease_status"
         );
         let session_id = require_lease_session_id(&request_context)?;
+        let operator_panic_epoch_at_entry =
+            arm_control_lease_operator_panic_gate("control_lease_status", &session_id)?;
+        let authority_gate = self.lock_session_authority(&session_id).await;
+        ensure_control_lease_operator_panic_not_observed(
+            "control_lease_status",
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "after_authority_gate_wait",
+        )?;
+        let _authority_gate = authority_gate?;
+        self.reject_terminated_session_tool_call("control_lease_status", &session_id)?;
+        ensure_control_lease_operator_panic_not_observed(
+            "control_lease_status",
+            &session_id,
+            operator_panic_epoch_at_entry,
+            "after_session_validation_before_restore",
+        )?;
+        self.control_lease_status_authority_locked(session_id)
+    }
+
+    /// Status can restore a durable continuity row into process memory, so it
+    /// participates in the same authority transaction despite being a read in
+    /// the common case.
+    pub(super) fn control_lease_status_authority_locked(
+        &self,
+        session_id: String,
+    ) -> Result<Json<ControlLeaseResponse>, ErrorData> {
         self.restore_session_lease_if_needed(&session_id)?;
         Ok(Json(lease_status_for_session(&session_id)))
     }
+}
+
+/// Arms raw lease-tool admission before it can wait on session authority. The
+/// physical operator panic control has precedence over every lease continuity
+/// restore or mutation, including status (which can restore a durable row).
+fn arm_control_lease_operator_panic_gate(
+    tool: &'static str,
+    session_id: &str,
+) -> Result<u64, ErrorData> {
+    let operator_panic_epoch_at_entry = synapse_action::operator_panic_epoch();
+    ensure_control_lease_operator_panic_not_observed(
+        tool,
+        session_id,
+        operator_panic_epoch_at_entry,
+        "before_authority_gate_wait",
+    )?;
+    Ok(operator_panic_epoch_at_entry)
+}
+
+fn ensure_control_lease_operator_panic_not_observed(
+    tool: &'static str,
+    session_id: &str,
+    operator_panic_epoch_at_entry: u64,
+    stage: &'static str,
+) -> Result<(), ErrorData> {
+    if super::operator_panic_boundary::is_mcp_request_guarded() {
+        super::operator_panic_boundary::ensure_mcp_mutation(stage)?;
+    }
+    let operator_panic = synapse_action::operator_panic_safety_readback();
+    control_lease_operator_panic_state_result(
+        tool,
+        session_id,
+        operator_panic_epoch_at_entry,
+        operator_panic.epoch,
+        operator_panic.pending,
+        stage,
+    )
+}
+
+fn control_lease_operator_panic_state_result(
+    tool: &'static str,
+    session_id: &str,
+    operator_panic_epoch_at_entry: u64,
+    operator_panic_epoch_after: u64,
+    operator_panic_safety_pending: bool,
+    stage: &'static str,
+) -> Result<(), ErrorData> {
+    if !operator_panic_safety_pending && operator_panic_epoch_after == operator_panic_epoch_at_entry
+    {
+        return Ok(());
+    }
+
+    let detail_code = match tool {
+        "control_lease_acquire" => "CONTROL_LEASE_ACQUIRE_OPERATOR_PANIC_PREARMED",
+        "control_lease_release" => "CONTROL_LEASE_RELEASE_OPERATOR_PANIC_PREARMED",
+        "control_lease_handoff" => "CONTROL_LEASE_HANDOFF_OPERATOR_PANIC_PREARMED",
+        "control_lease_status" => "CONTROL_LEASE_STATUS_OPERATOR_PANIC_PREARMED",
+        "dashboard_control_lease_force_release" => {
+            "DASHBOARD_CONTROL_LEASE_FORCE_RELEASE_OPERATOR_PANIC_PREARMED"
+        }
+        "dashboard_control_lease_handoff" => {
+            "DASHBOARD_CONTROL_LEASE_HANDOFF_OPERATOR_PANIC_PREARMED"
+        }
+        _ => "CONTROL_LEASE_OPERATOR_PANIC_PREARMED",
+    };
+    tracing::warn!(
+        code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+        detail_code,
+        tool,
+        session_id,
+        stage,
+        operator_panic_epoch_at_entry,
+        operator_panic_epoch_after,
+        operator_panic_safety_pending,
+        "operator panic superseded a raw control-lease request before its authority transition"
+    );
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!("{tool} was superseded by the physical operator panic control"),
+        Some(json!({
+            "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            "detail_code": detail_code,
+            "tool": tool,
+            "session_id": session_id,
+            "stage": stage,
+            "operator_panic_epoch_at_entry": operator_panic_epoch_at_entry,
+            "operator_panic_epoch_after": operator_panic_epoch_after,
+            "operator_panic_safety_pending": operator_panic_safety_pending,
+            "source_of_truth": "synapse_action::operator_panic_epoch + operator_panic_outstanding",
+            "remediation": "the physical operator panic control supersedes this request; inspect operator-panic audit and retry only after the safety transaction is terminal and its lease state is understood",
+        })),
+    ))
 }
 
 pub(super) fn validate_lease_ttl_ms(tool: &'static str, ttl_ms: u64) -> Result<(), ErrorData> {
@@ -924,6 +1116,10 @@ impl SynapseService {
         confirmed: bool,
     ) -> Result<DashboardControlLeaseForceReleaseResponse, ErrorData> {
         validate_session_id(&owner_session_id)?;
+        let operator_panic_epoch_at_entry = arm_control_lease_operator_panic_gate(
+            "dashboard_control_lease_force_release",
+            &owner_session_id,
+        )?;
         let before = lease_status_for_session(&owner_session_id);
         let command_payload = json!({
             "owner_session_id": &owner_session_id,
@@ -951,6 +1147,33 @@ impl SynapseService {
                 error_codes::TOOL_PARAMS_INVALID,
                 "dashboard lease force-release requires confirmation",
             );
+            self.command_audit_final(
+                super::command_audit::CommandAuditInput::mcp(
+                    "control_lease_force_release",
+                    "lease_force_release",
+                    None,
+                    Some(owner_session_id.clone()),
+                    command_payload,
+                    command_before,
+                    json!({
+                        "source_of_truth": DASHBOARD_LEASE_SOURCE_OF_TRUTH,
+                        "owner": lease_status_for_session(&owner_session_id),
+                    }),
+                    "error",
+                )
+                .with_channel("dashboard")
+                .with_error(
+                    super::command_audit::command_audit_error_from_error_data(&error),
+                ),
+            )?;
+            return Err(error);
+        }
+        if let Err(error) = ensure_control_lease_operator_panic_not_observed(
+            "dashboard_control_lease_force_release",
+            &owner_session_id,
+            operator_panic_epoch_at_entry,
+            "after_confirmation_before_mutation",
+        ) {
             self.command_audit_final(
                 super::command_audit::CommandAuditInput::mcp(
                     "control_lease_force_release",
@@ -1070,7 +1293,17 @@ impl SynapseService {
         ttl_ms: u64,
     ) -> Result<DashboardControlLeaseHandoffResponse, ErrorData> {
         validate_session_id(&from_session_id)?;
+        let operator_panic_epoch_at_entry = arm_control_lease_operator_panic_gate(
+            "dashboard_control_lease_handoff",
+            &from_session_id,
+        )?;
         self.ensure_handoff_recipient_live(&from_session_id, &to_session_id)?;
+        ensure_control_lease_operator_panic_not_observed(
+            "dashboard_control_lease_handoff",
+            &from_session_id,
+            operator_panic_epoch_at_entry,
+            "before_continuity_restore",
+        )?;
         self.restore_session_lease_if_needed(&from_session_id)?;
         let before_from = lease_status_for_session(&from_session_id);
         let before_to = lease_status_for_session(&to_session_id);
@@ -1084,6 +1317,12 @@ impl SynapseService {
             "from": &before_from,
             "to": &before_to,
         });
+        ensure_control_lease_operator_panic_not_observed(
+            "dashboard_control_lease_handoff",
+            &from_session_id,
+            operator_panic_epoch_at_entry,
+            "before_audit_intent_and_mutation",
+        )?;
         self.command_audit_intent(
             super::command_audit::CommandAuditInput::mcp(
                 "control_lease_handoff",
@@ -1321,8 +1560,9 @@ fn lease_not_held_error(session_id: &str, error: &synapse_action::LeaseError) ->
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_lease_for_session, handoff_lease_for_session, lease_status_for_session,
-        release_lease_for_session, validate_lease_ttl_ms,
+        acquire_lease_for_session, control_lease_operator_panic_state_result,
+        handoff_lease_for_session, lease_status_for_session, release_lease_for_session,
+        validate_lease_ttl_ms,
     };
     use crate::test_support;
     use synapse_core::error_codes;
@@ -1344,6 +1584,113 @@ mod tests {
             .as_ref()
             .and_then(|data| data.get(field))
             .and_then(serde_json::Value::as_u64)
+    }
+
+    fn error_bool(error: &rmcp::ErrorData, field: &str) -> Option<bool> {
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get(field))
+            .and_then(serde_json::Value::as_bool)
+    }
+
+    #[test]
+    fn raw_lease_operator_panic_gate_rejects_changed_epoch_and_pending_k2() {
+        control_lease_operator_panic_state_result(
+            "control_lease_acquire",
+            "panic-gate-session",
+            41,
+            41,
+            false,
+            "before_authority_gate_wait",
+        )
+        .expect("stable, terminal safety state must admit a new lease request");
+
+        let changed = control_lease_operator_panic_state_result(
+            "control_lease_acquire",
+            "panic-gate-session",
+            41,
+            42,
+            false,
+            "after_authority_gate_wait",
+        )
+        .expect_err("a panic generation published while authority waited must reject");
+        assert_eq!(
+            error_code(&changed).as_deref(),
+            Some(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED)
+        );
+        assert_eq!(
+            error_u64(&changed, "operator_panic_epoch_at_entry"),
+            Some(41)
+        );
+        assert_eq!(error_u64(&changed, "operator_panic_epoch_after"), Some(42));
+        assert_eq!(
+            changed
+                .data
+                .as_ref()
+                .and_then(|data| data.get("detail_code"))
+                .and_then(serde_json::Value::as_str),
+            Some("CONTROL_LEASE_ACQUIRE_OPERATOR_PANIC_PREARMED")
+        );
+
+        let pending = control_lease_operator_panic_state_result(
+            "control_lease_status",
+            "panic-gate-session",
+            42,
+            42,
+            true,
+            "before_authority_gate_wait",
+        )
+        .expect_err("the same published epoch must remain denied until K2 is terminal");
+        assert_eq!(
+            error_code(&pending).as_deref(),
+            Some(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED)
+        );
+        assert_eq!(
+            error_bool(&pending, "operator_panic_safety_pending"),
+            Some(true)
+        );
+        assert_eq!(
+            pending
+                .data
+                .as_ref()
+                .and_then(|data| data.get("detail_code"))
+                .and_then(serde_json::Value::as_str),
+            Some("CONTROL_LEASE_STATUS_OPERATOR_PANIC_PREARMED")
+        );
+
+        for (tool, detail_code) in [
+            (
+                "dashboard_control_lease_force_release",
+                "DASHBOARD_CONTROL_LEASE_FORCE_RELEASE_OPERATOR_PANIC_PREARMED",
+            ),
+            (
+                "dashboard_control_lease_handoff",
+                "DASHBOARD_CONTROL_LEASE_HANDOFF_OPERATOR_PANIC_PREARMED",
+            ),
+        ] {
+            let dashboard_error = control_lease_operator_panic_state_result(
+                tool,
+                synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID,
+                42,
+                42,
+                true,
+                "dashboard_admission",
+            )
+            .expect_err("dashboard lease mutation must fail closed while panic safety is pending");
+            assert_eq!(
+                error_code(&dashboard_error).as_deref(),
+                Some(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED)
+            );
+            assert_eq!(
+                dashboard_error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("detail_code"))
+                    .and_then(serde_json::Value::as_str),
+                Some(detail_code)
+            );
+        }
     }
 
     #[test]
@@ -1381,7 +1728,7 @@ mod tests {
     #[test]
     fn acquire_then_status_then_release_round_trip() -> anyhow::Result<()> {
         let _serial = test_support::lease_serial(TEST_RESET_REASON);
-        let session = "fsv-tool-acquire";
+        let session = "regression-tool-acquire";
         let acquired = acquire_lease_for_session(session, 5_000)
             .map_err(|error| anyhow::anyhow!("acquire failed: {error:?}"))?;
         assert_eq!(acquired.outcome, "acquired");
@@ -1418,8 +1765,8 @@ mod tests {
     #[test]
     fn second_session_is_refused_busy_with_holder() -> anyhow::Result<()> {
         let _serial = test_support::lease_serial(TEST_RESET_REASON);
-        let owner = "fsv-tool-busy-owner";
-        let contender = "fsv-tool-busy-contender";
+        let owner = "regression-tool-busy-owner";
+        let contender = "regression-tool-busy-contender";
         let _held = acquire_lease_for_session(owner, 5_000)
             .map_err(|error| anyhow::anyhow!("owner acquire failed: {error:?}"))?;
 
@@ -1452,8 +1799,8 @@ mod tests {
     #[test]
     fn owner_handoff_transfers_to_recipient_and_prior_owner_is_busy() -> anyhow::Result<()> {
         let _serial = test_support::lease_serial(TEST_RESET_REASON);
-        let owner = "fsv-tool-handoff-owner";
-        let recipient = "fsv-tool-handoff-recipient";
+        let owner = "regression-tool-handoff-owner";
+        let recipient = "regression-tool-handoff-recipient";
         let _held = acquire_lease_for_session(owner, 5_000)
             .map_err(|error| anyhow::anyhow!("owner acquire failed: {error:?}"))?;
 
@@ -1487,8 +1834,8 @@ mod tests {
     #[test]
     fn non_owner_release_errors_not_held() -> anyhow::Result<()> {
         let _serial = test_support::lease_serial(TEST_RESET_REASON);
-        let owner = "fsv-tool-nonowner-owner";
-        let intruder = "fsv-tool-nonowner-intruder";
+        let owner = "regression-tool-nonowner-owner";
+        let intruder = "regression-tool-nonowner-intruder";
         let _held = acquire_lease_for_session(owner, 5_000)
             .map_err(|error| anyhow::anyhow!("owner acquire failed: {error:?}"))?;
 
@@ -1512,7 +1859,7 @@ mod tests {
         // physically honest readback, not ACTION_FOREGROUND_LEASE_NOT_HELD.
         let _serial = test_support::lease_serial(TEST_RESET_REASON);
         test_support::reset_lease(TEST_RESET_REASON);
-        let session = "fsv-tool-idempotent-release";
+        let session = "regression-tool-idempotent-release";
 
         let response = release_lease_for_session(session)
             .map_err(|error| anyhow::anyhow!("unheld release must succeed: {error:?}"))?;
@@ -1539,7 +1886,7 @@ mod tests {
         // silently test the wrong path (release of a still-owned lease).
         let _serial = test_support::lease_serial(TEST_RESET_REASON);
         test_support::reset_lease(TEST_RESET_REASON);
-        let session = "fsv-tool-expired-release";
+        let session = "regression-tool-expired-release";
         let _held = acquire_lease_for_session(session, 1)
             .map_err(|error| anyhow::anyhow!("acquire failed: {error:?}"))?;
         std::thread::sleep(std::time::Duration::from_millis(
@@ -1570,7 +1917,7 @@ mod tests {
     #[test]
     fn repeat_acquire_by_owner_renews() -> anyhow::Result<()> {
         let _serial = test_support::lease_serial(TEST_RESET_REASON);
-        let session = "fsv-tool-renew";
+        let session = "regression-tool-renew";
         let _first = acquire_lease_for_session(session, 5_000)
             .map_err(|error| anyhow::anyhow!("first acquire failed: {error:?}"))?;
         let second = acquire_lease_for_session(session, 5_000)

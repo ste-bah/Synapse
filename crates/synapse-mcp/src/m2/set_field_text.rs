@@ -28,7 +28,7 @@ use serde_json::{Value, json};
 use synapse_core::{ElementId, UiaPattern, error_codes};
 
 use crate::m1::mcp_error;
-use crate::m2::set_value::{ActSetValueParams, act_set_value};
+use crate::m2::set_value::ActSetValueParams;
 use crate::m2::{
     default_auto_wait_timeout_ms,
     postcondition::{ActPostcondition, default_verify_timeout_ms, text_signature},
@@ -77,6 +77,7 @@ pub struct ActSetFieldTextLocator {
     /// Explicit top-level target window. If omitted, Synapse uses the active
     /// session window/CDP target, or the legacy element_id's HWND as a hint.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub role: Option<String>,
@@ -266,6 +267,7 @@ pub(crate) fn chromium_editable_requires_foreground(
 pub(crate) async fn act_set_field_text_web(
     params: &ActSetFieldTextParams,
     backend_node_id: i64,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActSetFieldTextResponse, ErrorData> {
     let started = std::time::Instant::now();
     let element_id = required_element_id(params)?;
@@ -315,6 +317,7 @@ pub(crate) async fn act_set_field_text_web(
     .await
     .map_err(|error| cdp_tier_error(element_id, backend_node_id, "before_value_read", &error))?;
 
+    boundary.ensure("immediately_before_cdp_set_node_text")?;
     let readback = synapse_a11y::cdp_set_node_text(
         &endpoint,
         &title_hint,
@@ -365,13 +368,17 @@ pub(crate) async fn act_set_field_text_web(
 /// re-shaped into the `act_set_field_text` wire response.
 pub(crate) async fn act_set_field_text_native(
     params: &ActSetFieldTextParams,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActSetFieldTextResponse, ErrorData> {
     let started = std::time::Instant::now();
-    let response = act_set_value(ActSetValueParams {
-        element_id: required_element_id(params)?.clone(),
-        text: params.text.clone(),
-        verify_timeout_ms: params.verify_timeout_ms,
-    })
+    let response = super::set_value::act_set_value_with_boundary(
+        ActSetValueParams {
+            element_id: required_element_id(params)?.clone(),
+            text: params.text.clone(),
+            verify_timeout_ms: params.verify_timeout_ms,
+        },
+        boundary,
+    )
     .await?;
     let postcondition = ActPostcondition {
         detail: response

@@ -11,9 +11,11 @@ pub(super) async fn execute_actor_actions(
     handle: ActionHandle,
     actions: Vec<Action>,
     timing: DoubleClickTiming,
+    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let action_count = actions.len();
     for (action_index, action) in actions.into_iter().enumerate() {
+        boundary.ensure("immediately_before_click_actor_action")?;
         handle
             .execute(action)
             .await
@@ -28,12 +30,14 @@ pub(super) async fn execute_recording(
     actions: &[Action],
     click_count: u8,
     timing: DoubleClickTiming,
+    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let before_events = recording.events();
     let before_event_count = before_events.len();
     let mut emit_state = EmitState::new();
     let action_count = actions.len();
     for (action_index, action) in actions.iter().enumerate() {
+        boundary.ensure("immediately_before_recorded_click_action")?;
         recording
             .execute(action, &mut emit_state)
             .map_err(|error| action_error_to_mcp(&error))?;

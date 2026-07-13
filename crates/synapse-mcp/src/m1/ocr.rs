@@ -414,7 +414,7 @@ fn empty_ocr_result(request: &ResolvedReadTextRequest) -> OcrResult {
 /// Kept OUT of [`ocr_result_or_empty`] on purpose: `read_text` caches the raw
 /// empty observation in `CF_OCR_CACHE` (keyed on pixels+backend), so a gate
 /// buried in the OCR pass is silently bypassed on a cache hit — the exact defect
-/// FSV caught, where `require_text:true` returned a cached `no_text:true`
+/// manual FSV caught, where `require_text:true` returned a cached `no_text:true`
 /// success. Enforcing absence here, on the final post-cache result, makes it
 /// fire identically on cache hits and misses, independent of how the perception
 /// layer represented "no glyphs" (`Err(OcrNoText)` vs `Ok(vec![])`). It also
@@ -772,10 +772,10 @@ mod tests {
 
     #[test]
     fn ocr_empty_regions_vec_respects_require_text() {
-        // FSV #1557 regression: WinRT signals "no glyphs" as Ok(vec![]) rather
+        // Manual FSV #1557 regression: WinRT signals "no glyphs" as Ok(vec![]) rather
         // than Err(OcrNoText), and read_text caches that empty observation. The
         // require_text gate runs on the final (post-cache) result, so it fires on
-        // this representation AND on a cache hit — the exact bug FSV caught where
+        // this representation AND on a cache hit — the exact bug manual FSV caught where
         // require_text:true returned a cached no_text:true success.
         let result = ocr_result_or_empty(Ok(Vec::new()), &empty_ocr_test_request(false))
             .expect("an empty Ok vec is a valid empty observation");

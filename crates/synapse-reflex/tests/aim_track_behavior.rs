@@ -97,7 +97,7 @@ fn step_dispatch_queues_action_and_reports_resolved_element()
         &handle,
         &EventBus::default(),
     )?;
-    let (queued, _ack) = rx.try_recv()?;
+    let (queued, _ack, _operator_panic_epoch_at_enqueue) = rx.try_recv()?;
 
     assert_eq!(
         queued,

@@ -2,18 +2,26 @@
 
 Issue: https://github.com/ChrisRoyse/Synapse/issues/852
 
+> **Current D1 classification (2026-07-13):** The renamed script referenced
+> below is supporting diagnostic automation only; it does not perform or accept
+> FSV. Its output was not, and is not now, sufficient by itself for acceptance.
+> The historical transcript values remain evidence from the separately observed
+> manual run. Current acceptance requires an agent to use the strict production
+> MCP client and independently read each physical Source of Truth before and
+> after every manual trigger.
+
 This transcript records the manual full-state verification run for the mining
 acceptance issue. The planted routine was verified against a fresh physical
 RocksDB store through the real HTTP MCP daemon surface, then the shared daemon
 was rebuilt and restarted from this checkout to prove the same tools are
 available to the live Codex-connected Synapse runtime.
 
-## Durable Script
+## Supporting Diagnostic Script
 
-The repeatable FSV script is:
+The retained supporting diagnostic is:
 
 ```powershell
-.\scripts\fsv\issue-852-mining-acceptance.ps1 `
+.\scripts\diagnostics\issue-852-mining-diagnostic.ps1 `
   -SynapseMcpExe .\target\release\synapse-mcp.exe
 ```
 
@@ -22,9 +30,10 @@ uses Streamable HTTP MCP directly, seeds probe rows, verifies the full
 timeline->episode->routine->digest chain, calls `session_end`, stops the temp
 daemon, and removes the temp root in `finally`.
 
-Direct HTTP was used for the script because the current Codex process can have
-stale generated schemas immediately after tool-surface changes. No new Codex
-terminal was opened or required.
+The historical diagnostic used direct HTTP because that Codex process had stale
+generated schemas after tool-surface changes. Under current D1, that caller does
+not establish strict production-client schema parity and cannot be an FSV
+trigger; a freshly wired production MCP client is required for manual FSV.
 
 ## Code Surface
 

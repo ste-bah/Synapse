@@ -1099,6 +1099,30 @@ fn act_type_visual_delta_only_reconciles_missing_text_surface() {
 
 #[test]
 fn act_type_visual_delta_target_window_params_fail_closed() {
+    for invalid in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+        let mut params = act_type_params(true, None);
+        params.verify_target_window_hwnd = Some(invalid);
+        let error = act_type_visual_delta_target_window(&params, None)
+            .expect_err("noncanonical visual verification HWND must fail before capture");
+        let data = error.data.as_ref().expect("structured HWND error data");
+        assert_eq!(
+            data.get("field").and_then(Value::as_str),
+            Some("verify_target_window_hwnd")
+        );
+        assert_eq!(
+            data.get("actual_value").and_then(Value::as_i64),
+            Some(invalid)
+        );
+    }
+
+    let mut canonical_max = act_type_params(true, None);
+    canonical_max.verify_target_window_hwnd = Some(i64::from(u32::MAX));
+    assert_eq!(
+        act_type_visual_delta_target_window(&canonical_max, None)
+            .expect("u32::MAX is a canonical HWND wire value"),
+        Some(i64::from(u32::MAX))
+    );
+
     let mut params = act_type_params(false, None);
     params.verify_target_window_hwnd = Some(0x1234);
     let error = act_type_visual_delta_target_window(&params, None)

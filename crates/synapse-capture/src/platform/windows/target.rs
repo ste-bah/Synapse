@@ -6,7 +6,7 @@ use crate::CaptureError;
 use super::common::hwnd_from_i64;
 
 pub fn validate_hwnd(hwnd: i64) -> Result<(), CaptureError> {
-    let hwnd = hwnd_from_i64(hwnd);
+    let hwnd = hwnd_from_i64(hwnd)?;
     if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         Ok(())
     } else {

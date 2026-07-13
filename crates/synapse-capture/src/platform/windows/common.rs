@@ -10,7 +10,13 @@ pub(super) fn capture_unsupported<E: std::fmt::Display>(err: E) -> CaptureError 
     }
 }
 
-#[allow(clippy::missing_const_for_fn)]
-pub(super) fn hwnd_from_i64(hwnd: i64) -> HWND {
-    HWND(hwnd as *mut c_void)
+pub(super) fn hwnd_from_i64(hwnd: i64) -> Result<HWND, CaptureError> {
+    let native = synapse_core::win32_hwnd::hwnd_from_wire(hwnd).ok_or_else(|| {
+        CaptureError::TargetInvalid {
+            detail: format!(
+                "HWND wire value {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
+            ),
+        }
+    })?;
+    Ok(HWND(native as *mut c_void))
 }

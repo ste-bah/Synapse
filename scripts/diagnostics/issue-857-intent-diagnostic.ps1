@@ -1,3 +1,8 @@
+# Supporting diagnostic only. Its output is supporting diagnostic evidence only.
+# This script does not perform or accept Full State Verification (FSV). Under
+# AGENTS.md D1, an agent must perform FSV manually
+# through the strict production MCP client and independently read each physical
+# Source of Truth before and after the trigger.
 param(
     [string]$SynapseMcpExe = (Join-Path $PSScriptRoot '..\..\target\release\synapse-mcp.exe'),
     [string]$ProfileDir = "$env:USERPROFILE\.cargo\bin\profiles",
@@ -9,7 +14,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Die($Message) { throw "[issue857-fsv] $Message" }
+function Die($Message) { throw "[issue857-diagnostic] $Message" }
 
 function Assert-True {
     param(
@@ -164,7 +169,7 @@ function Open-McpSession {
     $initParams = [ordered]@{
         protocolVersion = '2025-06-18'
         capabilities = @{}
-        clientInfo = [ordered]@{ name = 'issue857-fsv'; version = '1' }
+        clientInfo = [ordered]@{ name = 'issue857-diagnostic'; version = '1' }
     }
     $initResponse = Invoke-McpHttpPost -Bind $Bind -Token $Token -Method 'initialize' -Params $initParams -Id 1
     $sessionId = @($initResponse.Headers['Mcp-Session-Id'])[0]
@@ -307,8 +312,8 @@ function New-FocusRow {
             title = $Title
             pid = 857
             hwnd = 857
-            source = 'issue857-fsv'
-            fsv_marker = $Marker
+            source = 'issue857-diagnostic'
+            diagnostic_marker = $Marker
         }
     }
 }
@@ -322,8 +327,8 @@ function New-IdleRow {
         payload = @{
             idle_ms_at_detection = 180000
             idle_timeout_ms = 180000
-            source = 'issue857-fsv'
-            fsv_marker = $Marker
+            source = 'issue857-diagnostic'
+            diagnostic_marker = $Marker
         }
     }
 }
@@ -352,9 +357,9 @@ Assert-True ($token.Length -ge 16) "token too short at $TokenPath"
 $env:SYNAPSE_BEARER_TOKEN = $token
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$marker = "issue857-fsv-$stamp"
+$marker = "issue857-diagnostic-$stamp"
 $bind = Get-FreeLoopbackBind
-$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "synapse-issue857-fsv-$stamp"
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "synapse-issue857-diagnostic-$stamp"
 $dbPath = Join-Path $tempRoot 'db'
 $logPath = Join-Path $tempRoot 'daemon.log'
 $errPath = Join-Path $tempRoot 'daemon.err.log'
@@ -466,7 +471,7 @@ try {
     $confirm = Invoke-McpTool -Bind $bind -Token $token -SessionId $sessionId -NextId ([ref]$nextId) -Name 'routine_update' -Arguments @{
         routine_id = $routineId
         action = 'confirm'
-        note = 'issue857 FSV confirmed mined routine library'
+        note = 'issue857 diagnostic confirmed mined routine library'
     }
     Assert-True ([string]$confirm.lifecycle_after -eq 'confirmed') "confirm lifecycle_after=$($confirm.lifecycle_after)"
 
@@ -553,7 +558,7 @@ try {
     $feedbackAbandoned = Invoke-McpTool -Bind $bind -Token $token -SessionId $sessionId -NextId ([ref]$nextId) -Name 'routine_feedback' -Arguments @{
         routine_id = $routineId
         outcome = 'abandoned'
-        note = 'issue857 FSV abandon provenance after intent-abandoned'
+        note = 'issue857 diagnostic abandon provenance after intent-abandoned'
         now_ts_ns = (Convert-LocalDateTimeToUnixNs -LocalDateTime ($liveBase.AddMinutes(41)))
     }
     Assert-True ([int]$feedbackAbandoned.abandon_count -eq 1) "abandon_count mismatch: $($feedbackAbandoned.abandon_count)"
@@ -563,7 +568,7 @@ try {
     $feedbackDeclined = Invoke-McpTool -Bind $bind -Token $token -SessionId $sessionId -NextId ([ref]$nextId) -Name 'routine_feedback' -Arguments @{
         routine_id = $routineId
         outcome = 'declined'
-        note = 'issue857 FSV decline lowers confidence and starts cooldown'
+        note = 'issue857 diagnostic decline lowers confidence and starts cooldown'
         now_ts_ns = (Convert-LocalDateTimeToUnixNs -LocalDateTime ($liveBase.AddMinutes(42)))
     }
     Assert-True ([int]$feedbackDeclined.decline_count -eq 1) "decline_count mismatch: $($feedbackDeclined.decline_count)"
@@ -575,7 +580,7 @@ try {
     $feedbackAccepted = Invoke-McpTool -Bind $bind -Token $token -SessionId $sessionId -NextId ([ref]$nextId) -Name 'routine_feedback' -Arguments @{
         routine_id = $routineId
         outcome = 'accepted'
-        note = 'issue857 FSV accept raises confidence and clears cooldown'
+        note = 'issue857 diagnostic accept raises confidence and clears cooldown'
         now_ts_ns = (Convert-LocalDateTimeToUnixNs -LocalDateTime ($liveBase.AddMinutes(43)))
     }
     Assert-True ([int]$feedbackAccepted.accept_count -eq 1) "accept_count mismatch: $($feedbackAccepted.accept_count)"
@@ -584,7 +589,7 @@ try {
     Assert-True ([int]$feedbackAccepted.consecutive_declines -eq 0) "accepted did not reset consecutive_declines"
     Assert-True ($feedbackAccepted.suppressed -eq $false) 'accepted should clear suppression'
     Assert-True ([double]$feedbackAccepted.effective_confidence -gt [double]$feedbackDeclined.effective_confidence) "accept did not raise effective confidence"
-    Assert-True ([double]$feedbackAccepted.effective_confidence -lt $minedConfidence) "acceptance lower bound should keep effective confidence below mined confidence after one decline"
+    Assert-True ([double]$feedbackAccepted.effective_confidence -lt $minedConfidence) "feedback lower bound should keep effective confidence below mined confidence after one decline"
 
     $inspectAfterFeedback = Invoke-McpTool -Bind $bind -Token $token -SessionId $sessionId -NextId ([ref]$nextId) -Name 'routine_inspect' -Arguments @{ routine_id = $routineId }
     Assert-True (@($inspectAfterFeedback.state.feedback_events).Count -eq 3) "feedback_events count mismatch: $(@($inspectAfterFeedback.state.feedback_events).Count)"

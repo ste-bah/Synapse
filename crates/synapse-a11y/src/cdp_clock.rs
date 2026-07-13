@@ -63,6 +63,14 @@ pub struct CdpClockResult {
     pub readback: CdpClockReadback,
 }
 
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct CdpClockDurableDrainReadback {
+    pub found: usize,
+    pub uninstalled: usize,
+    pub failures: Vec<String>,
+    pub active_after: usize,
+}
+
 #[derive(Clone, Debug)]
 struct ClockSlot {
     endpoint: String,
@@ -93,6 +101,13 @@ pub async fn cdp_clock(
     time_unix_ms: Option<u64>,
     delta_ms: Option<u64>,
 ) -> A11yResult<CdpClockResult> {
+    if operation != CdpClockOperation::Status
+        && !crate::cdp_network::durable_browser_mutation_owners_enabled()
+    {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "durable browser mutation owners are disabled by operator panic; refusing browser clock mutation".to_owned(),
+        });
+    }
     let target_id = target_id.trim();
     if target_id.is_empty() {
         return Err(A11yError::CdpAttachFailed {
@@ -146,7 +161,7 @@ async fn install_clock(
                 clock_init_script(),
                 None,
                 None,
-                Some(true),
+                Some(false),
             )
             .await?;
             newly_added = true;
@@ -266,6 +281,68 @@ const fn clock_init_script() -> &'static str {
     CLOCK_INIT_SCRIPT
 }
 
+pub(crate) fn durable_clock_active_count_readback() -> Result<usize, String> {
+    registry()
+        .lock()
+        .map(|slots| slots.len())
+        .map_err(|_| "browser clock registry lock is poisoned".to_owned())
+}
+
+pub(crate) async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadback {
+    let slots = match registry().lock() {
+        Ok(mut slots) => std::mem::take(&mut *slots),
+        Err(_) => {
+            return CdpClockDurableDrainReadback {
+                failures: vec!["browser clock registry lock is poisoned".to_owned()],
+                active_after: usize::MAX,
+                ..Default::default()
+            };
+        }
+    };
+    let found = slots.len();
+    let mut uninstalled = 0usize;
+    let mut failures = Vec::new();
+    let mut failed_slots = Vec::new();
+    for (target_id, slot) in slots {
+        let current_cleanup =
+            run_clock_js(&slot.endpoint, &target_id, "uninstall", json!({})).await;
+        let future_cleanup = crate::cdp_action::cdp_remove_init_script_target(
+            &slot.endpoint,
+            &target_id,
+            &slot.init_script_identifier,
+        )
+        .await;
+        match (current_cleanup, future_cleanup) {
+            (Ok(readback), Ok(_)) if !readback.installed => {
+                uninstalled = uninstalled.saturating_add(1);
+            }
+            (current, future) => {
+                failures.push(format!(
+                    "uninstall browser clock for target {target_id:?}: current={:?}; future={:?}",
+                    current.err(),
+                    future.err()
+                ));
+                failed_slots.push((target_id, slot));
+            }
+        }
+    }
+    if !failed_slots.is_empty() {
+        match registry().lock() {
+            Ok(mut slots) => slots.extend(failed_slots),
+            Err(_) => failures.push(
+                "browser clock registry lock poisoned while retaining failed cleanup".to_owned(),
+            ),
+        }
+    }
+    let active_after = durable_clock_active_count_readback().unwrap_or(usize::MAX);
+    CdpClockDurableDrainReadback {
+        found,
+        uninstalled,
+        failures,
+        active_after,
+    }
+}
+
 const CLOCK_INIT_SCRIPT: &str = r#"
 (() => {
   const VERSION = "synapse-clock-2026-06-21-v1";
@@ -273,6 +350,13 @@ const CLOCK_INIT_SCRIPT: &str = r#"
     return globalThis.__synapseClock;
   }
   const NativeDate = globalThis.Date;
+  const nativeGlobalDescriptors = new Map();
+  for (const name of ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame"]) {
+    nativeGlobalDescriptors.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+  }
+  const nativePerformanceNowDescriptor = globalThis.performance
+    ? Object.getOwnPropertyDescriptor(globalThis.performance, "now")
+    : undefined;
   const nativePerformanceNow = globalThis.performance && globalThis.performance.now
     ? globalThis.performance.now.bind(globalThis.performance)
     : () => 0;
@@ -412,6 +496,32 @@ const CLOCK_INIT_SCRIPT: &str = r#"
     }
     return status();
   }
+  function uninstall() {
+    state.timers.clear();
+    for (const [name, descriptor] of nativeGlobalDescriptors.entries()) {
+      try {
+        if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+        else delete globalThis[name];
+      } catch (error) {
+        recordError(error);
+      }
+    }
+    if (globalThis.performance) {
+      try {
+        if (nativePerformanceNowDescriptor) {
+          Object.defineProperty(globalThis.performance, "now", nativePerformanceNowDescriptor);
+        } else {
+          delete globalThis.performance.now;
+        }
+      } catch (error) {
+        recordError(error);
+      }
+    }
+    state.installed = false;
+    const readback = status();
+    try { delete globalThis.__synapseClock; } catch (_) {}
+    return readback;
+  }
   function setFixedTime(args) {
     if (!state.installed) throw new Error("Synapse browser clock is not installed");
     state.nowMs = toFiniteMs(args && args.timeMs, state.nowMs);
@@ -438,6 +548,7 @@ const CLOCK_INIT_SCRIPT: &str = r#"
       if (method === "setFixedTime") return setFixedTime(args || {});
       if (method === "fastForward") return fastForward(args || {});
       if (method === "pauseAt") return pauseAt(args || {});
+      if (method === "uninstall") return uninstall();
       throw new Error("Unknown Synapse browser clock method: " + method);
     }
   };

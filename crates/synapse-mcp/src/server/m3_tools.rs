@@ -194,21 +194,54 @@ impl SynapseService {
         let params = params.0;
         let required = crate::m3::reflex::required_permissions_register(&params)?;
         self.require_m3_permissions("reflex_register", &required)?;
-        if let Err(error) = self.ensure_supported_use_allows_action("reflex_register") {
-            self.audit_action_denied("reflex_register", &error);
-            return Err(error);
-        }
+        let preflight = match self.ensure_supported_use_allows_action("reflex_register") {
+            Ok(preflight) => preflight,
+            Err(error) => {
+                self.audit_action_denied("reflex_register", &error);
+                return Err(error);
+            }
+        };
         self.refresh_reflex_audit_context()?;
         if crate::m3::reflex::requires_a11y_event_bridge(&params) {
             self.ensure_a11y_event_bridge()?;
         }
         let runtime = self.reflex_runtime()?;
         self.install_reflex_action_gate(&runtime)?;
+        preflight.ensure_operator_panic_boundary("immediately_before_reflex_register")?;
         let response = register_reflex(&runtime, params.clone())?;
+        if let Err(error) =
+            preflight.ensure_operator_panic_boundary("immediately_after_reflex_register")
+        {
+            let rollback = ReflexCancelParams {
+                reflex_id: response.reflex_id,
+            };
+            let _rollback_result = cancel_reflex(&runtime, &rollback);
+            return Err(error);
+        }
         if let Some(request) = params.file_jsonl_tail_watcher_request(response.reflex_id.clone()) {
+            if let Err(error) =
+                preflight.ensure_operator_panic_boundary("before_reflex_file_watcher_install")
+            {
+                let rollback = ReflexCancelParams {
+                    reflex_id: response.reflex_id,
+                };
+                let _rollback_result = cancel_reflex(&runtime, &rollback);
+                return Err(error);
+            }
             let m3_state = self.m3_state_handle();
             let event_bus = self.sse_state()?.event_bus();
             if let Err(error) = install_file_jsonl_tail_watcher(&m3_state, request, event_bus) {
+                let rollback = ReflexCancelParams {
+                    reflex_id: response.reflex_id,
+                };
+                let _rollback_result = cancel_reflex(&runtime, &rollback);
+                return Err(error);
+            }
+            if let Err(error) =
+                preflight.ensure_operator_panic_boundary("after_reflex_file_watcher_install")
+            {
+                let _cancelled_watcher =
+                    cancel_file_jsonl_tail_watcher(&m3_state, &response.reflex_id);
                 let rollback = ReflexCancelParams {
                     reflex_id: response.reflex_id,
                 };

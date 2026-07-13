@@ -72,6 +72,7 @@ pub struct BrowserCookiesParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Defaults to the session target's window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -145,6 +146,7 @@ pub struct BrowserStorageParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Defaults to the session target's window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -316,6 +318,14 @@ impl SynapseService {
             "expiresUnixSeconds": params.expires_unix_seconds,
             "session": params.session,
         });
+        if matches!(
+            params.operation,
+            BrowserCookiesOperation::Set | BrowserCookiesOperation::Clear
+        ) {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_cookies_before_set_or_clear",
+            )?;
+        }
         let mut readback = crate::chrome_debugger_bridge::cookies(
             window_hwnd,
             cdp_target_id,
@@ -331,6 +341,14 @@ impl SynapseService {
                 ),
             )
         })?;
+        if matches!(
+            params.operation,
+            BrowserCookiesOperation::Set | BrowserCookiesOperation::Clear
+        ) {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_cookies_after_set_or_clear",
+            )?;
+        }
         let redacted_value_count = redact_browser_secret_values(&mut readback)
             + u32::try_from(redact_url_fields_for_public_readback(&mut readback))
                 .unwrap_or(u32::MAX);
@@ -368,6 +386,16 @@ impl SynapseService {
             "clearBeforeLoad": params.clear_before_load,
             "url": params.url,
         });
+        if matches!(
+            params.operation,
+            BrowserStorageOperation::Set
+                | BrowserStorageOperation::Clear
+                | BrowserStorageOperation::LoadState
+        ) {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_storage_before_page_state_mutation",
+            )?;
+        }
         let mut readback = crate::chrome_debugger_bridge::storage_state(
             window_hwnd,
             cdp_target_id,
@@ -383,6 +411,16 @@ impl SynapseService {
                 ),
             )
         })?;
+        if matches!(
+            params.operation,
+            BrowserStorageOperation::Set
+                | BrowserStorageOperation::Clear
+                | BrowserStorageOperation::LoadState
+        ) {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_storage_after_page_state_mutation",
+            )?;
+        }
         let redacted_value_count = redact_browser_secret_values(&mut readback)
             + u32::try_from(redact_url_fields_for_public_readback(&mut readback))
                 .unwrap_or(u32::MAX);

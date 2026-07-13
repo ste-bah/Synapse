@@ -2,10 +2,19 @@
 
 Date: 2026-06-24T18:35:12.7442179-05:00
 Issue: https://github.com/ChrisRoyse/Synapse/issues/1220
+
+> **Current D1 classification (2026-07-13):** The renamed script referenced
+> below is supporting diagnostic automation only; it does not perform or accept
+> FSV. Its output was not, and is not now, sufficient by itself for acceptance.
+> The historical transcript values remain evidence from the separately observed
+> manual run. Current acceptance requires an agent to use the strict production
+> MCP client and independently read each physical Source of Truth before and
+> after every manual trigger.
+
 Command:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fsv\issue-1220-foreground-lane-concurrency.ps1 -Count 50 -BatchSize 10
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\diagnostics\issue-1220-foreground-lane-concurrency-diagnostic.ps1 -Count 50 -BatchSize 10
 ```
 
 ## Result

@@ -5,10 +5,8 @@ use super::{
     ActSetValueParams, ActSetValueResponse, ActStrokeParams, ActStrokeResponse, ActTypeParams,
     ActTypeResponse, ErrorData, Json, Parameters, ReleaseAllParams, ReleaseAllResponse,
     SessionTarget, SynapseService, act_click_with_handle_and_lease, act_clipboard_session_buffer,
-    act_focus_window, act_focus_window_request_details, act_focus_window_target_hwnd,
-    act_pad_with_handle, act_press_with_handle, act_scroll_with_handle, act_set_value,
-    act_set_value_request_details, act_stroke_validation_failure_details, act_stroke_with_handle,
-    act_type_with_handle,
+    act_focus_window_request_details, act_focus_window_target_hwnd, act_set_value_request_details,
+    act_stroke_validation_failure_details,
     action_preflight::{ActionPreflightReadback, ForegroundProof},
     release_all_with_handles, tool, tool_router, validate_act_stroke_params,
 };
@@ -21,10 +19,13 @@ use crate::m2::postcondition::{
 use crate::m2::{
     ActClickPostcondition, ActClickTierAttempt, ActStrokePlan, CLICK_REASON_NO_OBSERVED_DELTA,
     CLICK_TIER_FOREGROUND, CLICK_TIER_POSTMESSAGE, ForegroundClickPolicy, HwndKeyboardTargetState,
-    PressBackend, ResolvedKeymapPress, TypeBackend, act_click_postmessage_with_params,
-    act_keymap_response_from_press, act_press_cdp_target, act_press_normalized_labels,
-    act_press_postmessage_target, act_stroke_cdp_target, act_stroke_error_details,
-    act_stroke_request_details, action_from_press_params, action_from_type_params,
+    OperatorPanicActionBoundary, PressBackend, ResolvedKeymapPress, TypeBackend,
+    act_click_postmessage_with_params, act_focus_window_with_boundary,
+    act_keymap_response_from_press, act_pad_with_handle_and_boundary, act_press_cdp_target,
+    act_press_normalized_labels, act_press_postmessage_target, act_press_with_handle_and_boundary,
+    act_scroll_with_handle_and_boundary, act_set_value_with_boundary, act_stroke_cdp_target,
+    act_stroke_error_details, act_stroke_request_details, act_stroke_with_handle_and_boundary,
+    act_type_with_handle_and_boundary, action_from_press_params, action_from_type_params,
     attach_click_tier_attempts, click_params_can_route_background_first,
     click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
     click_tier_failed, emitted_text, hwnd_keyboard_target_state, resolve_keymap_press,
@@ -52,8 +53,8 @@ use synapse_perception::ObservationInput;
 use tokio_util::sync::CancellationToken;
 
 const ACT_STROKE_FOREGROUND_MONITOR_INTERVAL_MS: u64 = 10;
-const ACTION_DIAGNOSTIC_RATE_LIMIT_CONFIRM: &str = "force-real-rate-limit-for-fsv";
-const ACTION_DIAGNOSTIC_QUEUE_FULL_CONFIRM: &str = "saturate-real-action-queue-for-fsv";
+const ACTION_DIAGNOSTIC_RATE_LIMIT_CONFIRM: &str = "force-real-rate-limit-for-diagnostic";
+const ACTION_DIAGNOSTIC_QUEUE_FULL_CONFIRM: &str = "saturate-real-action-queue-for-diagnostic";
 const ACTION_DIAGNOSTIC_MAX_TTL_MS: u64 = 10_000;
 const ACTION_DIAGNOSTIC_MIN_TTL_MS: u64 = 100;
 const ACTION_DIAGNOSTIC_MAX_QUEUE_BLOCKER_MS: u32 = 10_000;
@@ -165,6 +166,10 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_click",
+            preflight.operator_panic_epoch_at_arm,
+        );
         self.audit_action_started_with_details_for_request(
             "act_click",
             &action_preflight_details(&preflight),
@@ -187,6 +192,7 @@ impl SynapseService {
             None,
             None,
             ActionabilityAutoWaitRequirement::Action,
+            boundary,
         )
         .await
         {
@@ -257,11 +263,18 @@ impl SynapseService {
                 target_window_hwnd,
                 foreground_click_policy,
                 started,
+                boundary,
             )
             .await
         } else {
-            act_click_with_handle_and_lease(handle, recording, params, foreground_click_policy)
-                .await
+            act_click_with_handle_and_lease(
+                handle,
+                recording,
+                params,
+                foreground_click_policy,
+                boundary,
+            )
+            .await
         };
         let result = match result {
             Ok(response) if response.required_foreground => Ok(response),
@@ -325,6 +338,10 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_type",
+            preflight.operator_panic_epoch_at_arm,
+        );
         self.audit_action_started_with_details_for_request(
             "act_type",
             &action_preflight_details(&preflight),
@@ -347,6 +364,7 @@ impl SynapseService {
             None,
             None,
             ActionabilityAutoWaitRequirement::Editable,
+            boundary,
         )
         .await
         {
@@ -376,7 +394,12 @@ impl SynapseService {
         let emitted = emitted_text(&params);
         if let Some(session_id_for_target) = session_id.as_deref() {
             match self
-                .act_type_chrome_bridge_session_target(session_id_for_target, &params, &emitted)
+                .act_type_chrome_bridge_session_target(
+                    session_id_for_target,
+                    &params,
+                    &emitted,
+                    boundary,
+                )
                 .await
             {
                 Ok(Some(response)) => {
@@ -442,7 +465,7 @@ impl SynapseService {
                 return result.map(Json);
             }
             if let Err(error) = self
-                .click_act_type_foreground_fallback_target(handle.clone(), target)
+                .click_act_type_foreground_fallback_target(handle.clone(), target, boundary)
                 .await
             {
                 let result: Result<ActTypeResponse, ErrorData> = Err(error);
@@ -521,7 +544,7 @@ impl SynapseService {
             } else {
                 None
             };
-        let result = act_type_with_handle(handle, recording, params).await;
+        let result = act_type_with_handle_and_boundary(handle, recording, params, boundary).await;
         let result = match (result, before_text_signature) {
             (Ok(response), Some(before)) => match self
                 .verify_act_type_response(
@@ -585,6 +608,10 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_set_value",
+            preflight.operator_panic_epoch_at_arm,
+        );
         self.audit_action_started_with_details_for_request(
             "act_set_value",
             &json!({
@@ -618,7 +645,7 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
-        let result = match act_set_value(params).await {
+        let result = match act_set_value_with_boundary(params, boundary).await {
             Ok(response) if response.required_foreground => Ok(response),
             other => {
                 let action_source_of_truth = background_result_source_of_truth(
@@ -767,6 +794,10 @@ impl SynapseService {
         resolution_phase: &'static str,
     ) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData> {
         let element_id = crate::m2::required_element_id(params)?;
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_set_field_text",
+            preflight.operator_panic_epoch_at_arm,
+        );
         maybe_auto_wait_for_actionability(
             self,
             "act_set_field_text",
@@ -777,6 +808,7 @@ impl SynapseService {
             None,
             None,
             ActionabilityAutoWaitRequirement::Editable,
+            boundary,
         )
         .await?;
         let route = match crate::m2::set_field_text_route(element_id) {
@@ -795,7 +827,11 @@ impl SynapseService {
             #[cfg(windows)]
             crate::m2::SetFieldTextRoute::Web { backend_node_id } => {
                 self.act_set_field_text_background_guarded(params, |params| {
-                    Box::pin(crate::m2::act_set_field_text_web(params, backend_node_id))
+                    Box::pin(crate::m2::act_set_field_text_web(
+                        params,
+                        backend_node_id,
+                        boundary,
+                    ))
                 })
                 .await
             }
@@ -815,13 +851,14 @@ impl SynapseService {
                     &process_name,
                     metadata,
                     preflight,
+                    boundary,
                     request_context,
                 )
                 .await
             }
             crate::m2::SetFieldTextRoute::NativeBackground => {
                 self.act_set_field_text_background_guarded(params, |params| {
-                    Box::pin(crate::m2::act_set_field_text_native(params))
+                    Box::pin(crate::m2::act_set_field_text_native(params, boundary))
                 })
                 .await
             }
@@ -938,6 +975,10 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_focus_window",
+            preflight.operator_panic_epoch_at_arm,
+        );
         self.audit_action_started_with_details_for_request(
             "act_focus_window",
             &json!({
@@ -978,7 +1019,7 @@ impl SynapseService {
                 }
             };
         lease_guard.disable_context_restore("act_focus_window_intentional_foreground_change");
-        let result = act_focus_window(params).await;
+        let result = act_focus_window_with_boundary(params, boundary).await;
         self.audit_action_result_for_request("act_focus_window", &result, &request_context)?;
         result.map(Json)
     }
@@ -1005,6 +1046,10 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_press",
+            preflight.operator_panic_epoch_at_arm,
+        );
         self.audit_action_started_with_details_for_request(
             "act_press",
             &action_preflight_details(&preflight),
@@ -1043,6 +1088,7 @@ impl SynapseService {
             params.window_hwnd,
             params.cdp_target_id.as_deref(),
             ActionabilityAutoWaitRequirement::Action,
+            boundary,
         )
         .await
         {
@@ -1053,7 +1099,12 @@ impl SynapseService {
         let (handle, recording, connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         match self
-            .try_act_press_background_target(params.clone(), recording.is_some(), &request_context)
+            .try_act_press_background_target(
+                params.clone(),
+                recording.is_some(),
+                &request_context,
+                boundary,
+            )
             .await
         {
             Ok(Some(response)) => {
@@ -1097,8 +1148,14 @@ impl SynapseService {
                 return result.map(Json);
             }
         };
-        let result =
-            act_press_with_handle(handle, recording, connection_closed_cancel, params).await;
+        let result = act_press_with_handle_and_boundary(
+            handle,
+            recording,
+            connection_closed_cancel,
+            params,
+            boundary,
+        )
+        .await;
         let result = match (result, before_delta_signature) {
             (Ok(response), Some(before)) => {
                 self.verify_act_press_response(
@@ -1147,6 +1204,10 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_keymap",
+            preflight.operator_panic_epoch_at_arm,
+        );
         self.audit_action_started_with_details_for_request(
             "act_keymap",
             &json!({
@@ -1192,7 +1253,12 @@ impl SynapseService {
         let (handle, recording, connection_closed_cancel) =
             self.m2_action_context_for_request(&request_context)?;
         match self
-            .try_act_keymap_background_target(&resolved, recording.is_some(), &request_context)
+            .try_act_keymap_background_target(
+                &resolved,
+                recording.is_some(),
+                &request_context,
+                boundary,
+            )
             .await
         {
             Ok(Some(response)) => {
@@ -1224,11 +1290,12 @@ impl SynapseService {
                 return Err(error);
             }
         };
-        let result = act_press_with_handle(
+        let result = act_press_with_handle_and_boundary(
             handle,
             recording,
             connection_closed_cancel,
             resolved.press.clone(),
+            boundary,
         )
         .await
         .map(|response| act_keymap_response_from_press(&resolved, response));
@@ -1280,6 +1347,10 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_stroke",
+            preflight.operator_panic_epoch_at_arm,
+        );
         self.audit_action_started_with_details_for_request(
             "act_stroke",
             &act_stroke_audit_details(&stroke_details, &preflight),
@@ -1299,6 +1370,7 @@ impl SynapseService {
                 &plan,
                 recording.is_some(),
                 &request_context,
+                boundary,
             )
             .await
         {
@@ -1372,7 +1444,14 @@ impl SynapseService {
         let foreground_monitor =
             should_monitor_act_stroke_foreground(recording.is_some(), plan.requires_input_lease())
                 .then(|| self.start_act_stroke_foreground_monitor(&preflight));
-        let result = act_stroke_with_handle(handle, recording, params.clone(), plan.clone()).await;
+        let result = act_stroke_with_handle_and_boundary(
+            handle,
+            recording,
+            params.clone(),
+            plan.clone(),
+            boundary,
+        )
+        .await;
         let foreground_error = await_act_stroke_foreground_monitor(foreground_monitor).await;
         let result = match foreground_error {
             Some(error) => Err(error),
@@ -1467,6 +1546,10 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_scroll",
+            preflight.operator_panic_epoch_at_arm,
+        );
         self.audit_action_started_with_details_for_request(
             "act_scroll",
             &action_preflight_details(&preflight),
@@ -1536,7 +1619,7 @@ impl SynapseService {
         } else {
             None
         };
-        let result = act_scroll_with_handle(handle, recording, params).await;
+        let result = act_scroll_with_handle_and_boundary(handle, recording, params, boundary).await;
         let result = match (result, before_delta_signature) {
             (Ok(response), Some(before)) => {
                 self.verify_act_scroll_response(response, before, verify_timeout_ms, point_region)
@@ -1596,6 +1679,10 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let boundary = OperatorPanicActionBoundary::from_armed(
+            "act_pad",
+            preflight.operator_panic_epoch_at_arm,
+        );
         self.audit_action_started_with_details_for_request(
             "act_pad",
             &action_preflight_details(&preflight),
@@ -1627,7 +1714,7 @@ impl SynapseService {
             None
         };
         let verify_timeout_ms = params.verify_timeout_ms;
-        let result = act_pad_with_handle(handle, recording, params).await;
+        let result = act_pad_with_handle_and_boundary(handle, recording, params, boundary).await;
         let result = match (result, before_snapshot, snapshot_handle) {
             (Ok(response), Some(before), Some(snapshot_handle)) => {
                 self.verify_act_pad_response(response, before, snapshot_handle, verify_timeout_ms)
@@ -1689,7 +1776,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "FSV diagnostic: temporarily force the real software action rate limiter empty so the next real act_stroke proves ACTION_RATE_LIMITED through the normal MCP action path"
+        description = "Supporting diagnostic only: temporarily force the real software action rate limiter empty so the next real act_stroke exercises ACTION_RATE_LIMITED through the normal MCP action path. Its response is not an acceptance verdict; manual state verification remains separate."
     )]
     pub async fn action_diagnostic_rate_limit_override(
         &self,
@@ -1747,7 +1834,10 @@ impl SynapseService {
             }),
             &request_context,
         )?;
+        let boundary =
+            OperatorPanicActionBoundary::from_armed(TOOL, preflight.operator_panic_epoch_at_arm);
         let control = self.m2_rate_limit_control()?;
+        boundary.ensure("immediately_before_diagnostic_rate_limit_override")?;
         let override_readback = control
             .override_backend(ResolvedBackend::Software, 0, 0)
             .map_err(diagnostic_action_error_to_mcp)?;
@@ -1771,7 +1861,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "FSV diagnostic: saturate the real bounded action queue behind a long software blocker so the next real act_stroke proves ACTION_QUEUE_FULL through the normal MCP action path"
+        description = "Supporting diagnostic only: saturate the real bounded action queue behind a long software blocker so the next real act_stroke exercises ACTION_QUEUE_FULL through the normal MCP action path. Its response is not an acceptance verdict; manual state verification remains separate."
     )]
     pub async fn action_diagnostic_queue_full_setup(
         &self,
@@ -1830,6 +1920,8 @@ impl SynapseService {
             }),
             &request_context,
         )?;
+        let boundary =
+            OperatorPanicActionBoundary::from_armed(TOOL, preflight.operator_panic_epoch_at_arm);
         let (handle, recording, _connection_closed_cancel) =
             self.m2_action_context_for_session_id(None)?;
         if recording.is_some() {
@@ -1848,6 +1940,7 @@ impl SynapseService {
         let from = synapse_action::backend::software::cursor_position()
             .map_err(diagnostic_action_error_to_mcp)?;
         let to = diagnostic_adjacent_point(from);
+        boundary.ensure("immediately_before_diagnostic_queue_blocker")?;
         handle
             .try_execute(diagnostic_queue_blocker_action(
                 from,
@@ -1857,7 +1950,7 @@ impl SynapseService {
             .map_err(diagnostic_action_error_to_mcp)?;
         tokio::time::sleep(Duration::from_millis(ACTION_DIAGNOSTIC_QUEUE_SETTLE_MS)).await;
         let (filler_attempts, queued_fillers, queue_full_observed) =
-            saturate_action_queue(&handle)?;
+            saturate_action_queue(&handle, boundary)?;
         if !queue_full_observed {
             let error = mcp_error(
                 error_codes::TOOL_INTERNAL_ERROR,
@@ -2025,6 +2118,7 @@ async fn maybe_auto_wait_for_actionability(
     explicit_window_hwnd: Option<i64>,
     explicit_cdp_target_id: Option<&str>,
     requirement: ActionabilityAutoWaitRequirement,
+    boundary: OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     if !enabled {
         return Ok(());
@@ -2047,6 +2141,7 @@ async fn maybe_auto_wait_for_actionability(
             explicit_window_hwnd,
             explicit_cdp_target_id,
             requirement,
+            boundary,
         )
         .await
     }
@@ -2059,6 +2154,7 @@ async fn maybe_auto_wait_for_actionability(
             explicit_window_hwnd,
             explicit_cdp_target_id,
             requirement,
+            boundary,
         );
         Err(mcp_error(
             error_codes::A11Y_NOT_AVAILABLE,
@@ -2078,6 +2174,7 @@ async fn auto_wait_for_actionability(
     explicit_window_hwnd: Option<i64>,
     explicit_cdp_target_id: Option<&str>,
     requirement: ActionabilityAutoWaitRequirement,
+    boundary: OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let backend_node_id =
         synapse_a11y::cdp_backend_from_element_id(element_id).ok_or_else(|| {
@@ -2146,6 +2243,7 @@ async fn auto_wait_for_actionability(
             ),
         ));
     };
+    boundary.ensure("immediately_before_auto_wait_scroll_into_view")?;
     let scroll =
         synapse_a11y::cdp_scroll_into_view_node(&endpoint, &cdp_target_id, backend_node_id)
             .await
@@ -2622,12 +2720,14 @@ impl SynapseService {
         target_window_hwnd: Option<i64>,
         foreground_click_policy: ForegroundClickPolicy,
         started: Instant,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<ActClickResponse, ErrorData> {
         match act_click_with_handle_and_lease(
             handle.clone(),
             recording.clone(),
             params.clone(),
             foreground_click_policy.clone(),
+            boundary,
         )
         .await
         {
@@ -2659,6 +2759,7 @@ impl SynapseService {
                                 target_window_hwnd,
                                 tier_attempts,
                                 foreground_click_policy,
+                                boundary,
                             )
                             .await
                         } else if should_try_click_foreground_tier(&tier_attempts) {
@@ -2671,6 +2772,7 @@ impl SynapseService {
                                 target_window_hwnd,
                                 tier_attempts,
                                 foreground_click_policy,
+                                boundary,
                             )
                             .await
                         } else {
@@ -2721,6 +2823,7 @@ impl SynapseService {
                         target_window_hwnd,
                         tier_attempts,
                         foreground_click_policy,
+                        boundary,
                     )
                     .await
                 } else if should_try_click_foreground_tier(&tier_attempts) {
@@ -2733,6 +2836,7 @@ impl SynapseService {
                         target_window_hwnd,
                         tier_attempts,
                         foreground_click_policy,
+                        boundary,
                     )
                     .await
                 } else {
@@ -2753,8 +2857,9 @@ impl SynapseService {
         target_window_hwnd: Option<i64>,
         tier_attempts: Vec<ActClickTierAttempt>,
         foreground_click_policy: ForegroundClickPolicy,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<ActClickResponse, ErrorData> {
-        match act_click_postmessage_with_params(&params, tier_attempts).await {
+        match act_click_postmessage_with_params(&params, tier_attempts, boundary).await {
             Ok(response) => {
                 match self
                     .verify_click_response(
@@ -2778,6 +2883,7 @@ impl SynapseService {
                                 target_window_hwnd,
                                 tier_attempts,
                                 foreground_click_policy,
+                                boundary,
                             )
                             .await
                         } else {
@@ -2799,6 +2905,7 @@ impl SynapseService {
                         target_window_hwnd,
                         tier_attempts,
                         foreground_click_policy,
+                        boundary,
                     )
                     .await
                 } else {
@@ -2819,10 +2926,17 @@ impl SynapseService {
         target_window_hwnd: Option<i64>,
         prior_attempts: Vec<ActClickTierAttempt>,
         foreground_click_policy: ForegroundClickPolicy,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<ActClickResponse, ErrorData> {
         params.use_invoke_pattern = false;
-        match act_click_with_handle_and_lease(handle, recording, params, foreground_click_policy)
-            .await
+        match act_click_with_handle_and_lease(
+            handle,
+            recording,
+            params,
+            foreground_click_policy,
+            boundary,
+        )
+        .await
         {
             Ok(mut response) => {
                 let current_attempts = std::mem::take(&mut response.tier_attempts);
@@ -3094,6 +3208,7 @@ impl SynapseService {
         &self,
         handle: ActionHandle,
         target: &ActTypeForegroundFallbackTarget,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<(), ErrorData> {
         let point = act_type_target_center_point(target)?;
         let actions = [
@@ -3111,6 +3226,7 @@ impl SynapseService {
             },
         ];
         for action in actions {
+            boundary.ensure("immediately_before_act_type_foreground_fallback_click")?;
             handle
                 .execute(action)
                 .await
@@ -3188,6 +3304,7 @@ impl SynapseService {
         process_name: &str,
         metadata: synapse_a11y::ElementMetadataReadback,
         preflight: &ActionPreflightReadback,
+        boundary: OperatorPanicActionBoundary,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData> {
         let started = Instant::now();
@@ -3249,6 +3366,7 @@ impl SynapseService {
         // click into another window.
         let mut target = target;
         if metadata.patterns.contains(&UiaPattern::ScrollItem) {
+            boundary.ensure("immediately_before_set_field_text_scroll_into_view")?;
             synapse_a11y::scroll_element_into_view(&element_id).map_err(|error| {
                 set_field_text_foreground_error(
                     &target,
@@ -3325,6 +3443,7 @@ impl SynapseService {
             },
         ];
         for action in click_actions {
+            boundary.ensure("immediately_before_set_field_text_foreground_click")?;
             handle.execute(action).await.map_err(|error| {
                 set_field_text_foreground_error(
                     &target,
@@ -3353,6 +3472,7 @@ impl SynapseService {
         act_type_foreground_fallback_focus_matches_target(&target, &focus_readback.signature)?;
 
         let select_all = crate::m2::select_all_chord_action(60, Backend::Auto)?;
+        boundary.ensure("immediately_before_set_field_text_select_all")?;
         handle.execute(select_all).await.map_err(|error| {
             set_field_text_foreground_error(
                 &target,
@@ -3379,6 +3499,7 @@ impl SynapseService {
                 },
             )
         };
+        boundary.ensure("immediately_before_set_field_text_replacement_input")?;
         handle.execute(replace_action).await.map_err(|error| {
             set_field_text_foreground_error(
                 &target,
@@ -3572,6 +3693,7 @@ impl SynapseService {
         session_id: &str,
         params: &ActTypeParams,
         emitted: &str,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<Option<ActTypeResponse>, ErrorData> {
         if params.into_element.is_some() {
             return Ok(None);
@@ -3601,6 +3723,7 @@ impl SynapseService {
             )
         })?;
         let started = Instant::now();
+        boundary.ensure("immediately_before_chrome_bridge_type_active_element")?;
         let readback =
             crate::chrome_debugger_bridge::type_active_element(window_hwnd, &cdp_target_id, emitted)
                 .await
@@ -3961,6 +4084,7 @@ impl SynapseService {
         params: ActPressParams,
         recording_active: bool,
         request_context: &RequestContext<RoleServer>,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<Option<ActPressResponse>, ErrorData> {
         if !press_background_target_candidate(&params, recording_active) {
             return Ok(None);
@@ -3979,11 +4103,11 @@ impl SynapseService {
                 window_hwnd,
                 cdp_target_id,
             } => self
-                .act_press_cdp_background_target(window_hwnd, cdp_target_id, params)
+                .act_press_cdp_background_target(window_hwnd, cdp_target_id, params, boundary)
                 .await
                 .map(Some),
             SessionTarget::Window { hwnd } => self
-                .act_press_postmessage_background_target(hwnd, params)
+                .act_press_postmessage_background_target(hwnd, params, boundary)
                 .await
                 .map(Some),
         }
@@ -3994,11 +4118,13 @@ impl SynapseService {
         resolved: &ResolvedKeymapPress,
         recording_active: bool,
         request_context: &RequestContext<RoleServer>,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<Option<ActKeymapResponse>, ErrorData> {
         self.try_act_press_background_target(
             resolved.press.clone(),
             recording_active,
             request_context,
+            boundary,
         )
         .await
         .map(|response| response.map(|response| act_keymap_response_from_press(resolved, response)))
@@ -4010,6 +4136,7 @@ impl SynapseService {
         plan: &ActStrokePlan,
         recording_active: bool,
         request_context: &RequestContext<RoleServer>,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<Option<ActStrokeResponse>, ErrorData> {
         if recording_active || params.requests_hardware_backend() {
             return Ok(None);
@@ -4046,9 +4173,15 @@ impl SynapseService {
                 ),
             )
         })?;
-        act_stroke_cdp_target(&endpoint, &cdp_target_id, params.clone(), plan.clone())
-            .await
-            .map(Some)
+        act_stroke_cdp_target(
+            &endpoint,
+            &cdp_target_id,
+            params.clone(),
+            plan.clone(),
+            boundary,
+        )
+        .await
+        .map(Some)
     }
 
     async fn act_press_cdp_background_target(
@@ -4056,6 +4189,7 @@ impl SynapseService {
         window_hwnd: i64,
         cdp_target_id: String,
         params: ActPressParams,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<ActPressResponse, ErrorData> {
         let endpoint = synapse_a11y::endpoint_for_window(window_hwnd).ok_or_else(|| {
             mcp_error(
@@ -4074,7 +4208,8 @@ impl SynapseService {
             None
         };
         let verify_timeout_ms = params.verify_timeout_ms;
-        let mut response = act_press_cdp_target(&endpoint, &cdp_target_id, params).await?;
+        let mut response =
+            act_press_cdp_target(&endpoint, &cdp_target_id, params, boundary).await?;
         if let Some(before) = before {
             tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
             let after = self
@@ -4096,6 +4231,7 @@ impl SynapseService {
         &self,
         root_hwnd: i64,
         params: ActPressParams,
+        boundary: OperatorPanicActionBoundary,
     ) -> Result<ActPressResponse, ErrorData> {
         let expected_effect = hwnd_keyboard_expected_effect(&params)?;
         let before = self.capture_hwnd_keyboard_delta_signature(root_hwnd)?;
@@ -4108,7 +4244,7 @@ impl SynapseService {
             None
         };
         let verify_timeout_ms = params.verify_timeout_ms;
-        let mut response = act_press_postmessage_target(root_hwnd, params).await?;
+        let mut response = act_press_postmessage_target(root_hwnd, params, boundary).await?;
         tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
         let after = self.capture_hwnd_keyboard_delta_signature(root_hwnd)?;
         response.postcondition = match verify_hwnd_keyboard_delta_signature(
@@ -4736,6 +4872,7 @@ fn act_type_visual_delta_target_window(
     let Some(hwnd) = params.verify_target_window_hwnd else {
         return Ok(None);
     };
+    let hwnd = crate::m1::validate_hwnd_shape("act_type", "verify_target_window_hwnd", hwnd)?;
     if !params.verify_delta {
         return Err(act_type_visual_delta_params_invalid(
             "verify_delta",
@@ -4755,13 +4892,6 @@ fn act_type_visual_delta_target_window(
             "expected_browser_url_regex",
             "verify_target_window_hwnd cannot replace browser URL verification; remove one postcondition",
             "conflicting_postconditions",
-        ));
-    }
-    if hwnd <= 0 {
-        return Err(act_type_visual_delta_params_invalid(
-            "verify_target_window_hwnd",
-            "verify_target_window_hwnd must be a positive top-level HWND",
-            "invalid_hwnd",
         ));
     }
     Ok(Some(hwnd))
@@ -6679,6 +6809,7 @@ fn diagnostic_queue_blocker_action(from: Point, to: Point, duration_ms: u32) -> 
 
 fn saturate_action_queue(
     handle: &synapse_action::ActionHandle,
+    boundary: OperatorPanicActionBoundary,
 ) -> Result<(u32, u32, bool), ErrorData> {
     let mut filler_attempts = 0_u32;
     let mut queued_fillers = 0_u32;
@@ -6689,6 +6820,7 @@ fn saturate_action_queue(
             dy: 0.0,
             backend: Backend::Software,
         };
+        boundary.ensure("immediately_before_diagnostic_queue_filler")?;
         match handle.try_execute(action) {
             Ok(()) => {
                 queued_fillers = queued_fillers.saturating_add(1);
@@ -6890,13 +7022,14 @@ fn set_field_text_locator_window_hwnd(
     target: Option<&SessionTarget>,
 ) -> Result<i64, ErrorData> {
     if let Some(window_hwnd) = locator.window_hwnd {
-        return Ok(window_hwnd);
+        return crate::m1::validate_window_hwnd_shape("act_set_field_text", window_hwnd);
     }
     if let Some(target) = target {
-        return Ok(match target {
+        let window_hwnd = match target {
             SessionTarget::Window { hwnd } => *hwnd,
             SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
-        });
+        };
+        return crate::m1::validate_window_hwnd_shape("act_set_field_text", window_hwnd);
     }
     if let Some(element_id) = params.element_id.as_ref() {
         let hwnd = element_id
@@ -6910,7 +7043,8 @@ fn set_field_text_locator_window_hwnd(
                 )
             })?
             .hwnd;
-        return synapse_a11y::top_level_root_hwnd(hwnd).or(Ok(hwnd));
+        let window_hwnd = synapse_a11y::top_level_root_hwnd(hwnd).or(Ok(hwnd))?;
+        return crate::m1::validate_window_hwnd_shape("act_set_field_text", window_hwnd);
     }
     Err(mcp_error(
         error_codes::TARGET_NOT_SET,

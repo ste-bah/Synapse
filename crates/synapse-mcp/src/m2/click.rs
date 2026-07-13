@@ -100,14 +100,21 @@ impl ForegroundClickPolicy {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub async fn act_click_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActClickParams,
 ) -> Result<ActClickResponse, ErrorData> {
-    act_click_with_handle_and_lease(handle, recording, params, ForegroundClickPolicy::default())
-        .await
+    let boundary = super::OperatorPanicActionBoundary::arm("act_click", "direct_call_entry")?;
+    act_click_with_handle_and_lease(
+        handle,
+        recording,
+        params,
+        ForegroundClickPolicy::default(),
+        boundary,
+    )
+    .await
 }
 
 pub(crate) async fn act_click_with_handle_and_lease(
@@ -115,6 +122,7 @@ pub(crate) async fn act_click_with_handle_and_lease(
     recording: Option<Arc<RecordingBackend>>,
     params: ActClickParams,
     foreground_click_policy: ForegroundClickPolicy,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActClickResponse, ErrorData> {
     validate_click_params(&params)?;
     if params.deprecated_curve_alias_used {
@@ -133,7 +141,15 @@ pub(crate) async fn act_click_with_handle_and_lease(
         && let Some(backend) = synapse_a11y::cdp_backend_from_element_id(&element.element_id)
     {
         ensure_element_transport_backend_allowed(&params, "CDP")?;
-        return execute_cdp_click(&params, element, backend, double_click_timing, started).await;
+        return execute_cdp_click(
+            &params,
+            element,
+            backend,
+            double_click_timing,
+            started,
+            boundary,
+        )
+        .await;
     }
     if let ActClickTarget::Element(element) = &params.target {
         reject_click_modifiers_for_non_cdp(&params, "native/UIA element targets")?;
@@ -146,6 +162,7 @@ pub(crate) async fn act_click_with_handle_and_lease(
             double_click_timing,
             started,
             foreground_click_policy,
+            boundary,
         )
         .await;
     }
@@ -169,9 +186,15 @@ pub(crate) async fn act_click_with_handle_and_lease(
     }
 
     let tier_attempts = if let Some(recording) = recording {
-        if let Err(error) =
-            record::execute_recording(&recording, &actions, params.clicks, double_click_timing)
-                .await
+        boundary.ensure("immediately_before_coordinate_recording_dispatch")?;
+        if let Err(error) = record::execute_recording(
+            &recording,
+            &actions,
+            params.clicks,
+            double_click_timing,
+            boundary,
+        )
+        .await
         {
             let error_code = click_error_code(&error);
             let reason_code = click_reason_for_error_code(&error_code);
@@ -199,7 +222,8 @@ pub(crate) async fn act_click_with_handle_and_lease(
             params.hold_ms,
             &mut tier_attempts,
         )?;
-        match record::execute_actor_actions(handle, actions, double_click_timing).await {
+        boundary.ensure("immediately_before_coordinate_action_dispatch")?;
+        match record::execute_actor_actions(handle, actions, double_click_timing, boundary).await {
             Ok(()) => {
                 tier_attempts.push(click_tier_delivered(
                     CLICK_TIER_FOREGROUND,
@@ -246,6 +270,7 @@ pub(crate) async fn act_click_with_handle_and_lease(
 pub(crate) async fn act_click_postmessage_with_params(
     params: &ActClickParams,
     mut prior_attempts: Vec<ActClickTierAttempt>,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActClickResponse, ErrorData> {
     validate_click_params(params)?;
     let started = Instant::now();
@@ -259,6 +284,7 @@ pub(crate) async fn act_click_postmessage_with_params(
                 prior_attempts,
                 double_click_timing,
                 started,
+                boundary,
             )
             .await
         }
@@ -293,6 +319,7 @@ async fn execute_cdp_click(
     backend_node_id: i64,
     double_click_timing: synapse_action::DoubleClickTiming,
     started: Instant,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActClickResponse, ErrorData> {
     use synapse_core::MouseButton;
 
@@ -340,6 +367,7 @@ async fn execute_cdp_click(
     let modifiers = cdp_click_modifier_bits(&params.modifiers);
 
     if let Some(endpoint) = synapse_a11y::endpoint_for_window(hwnd) {
+        boundary.ensure("immediately_before_cdp_click_node")?;
         synapse_a11y::cdp_click_node(
             &endpoint,
             &title_hint,
@@ -375,6 +403,7 @@ async fn execute_cdp_click(
                 crate::chrome_debugger_bridge::ChromeDebuggerMouseButton::Middle
             }
         };
+        boundary.ensure("immediately_before_chrome_bridge_click_node")?;
         crate::chrome_debugger_bridge::click_node(
             hwnd,
             &title_hint,
@@ -526,6 +555,10 @@ pub(crate) fn click_params_can_route_background_first(params: &ActClickParams) -
 }
 
 pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i64>, ErrorData> {
+    let verify_target_window_hwnd = params
+        .verify_target_window_hwnd
+        .map(|hwnd| crate::m1::validate_hwnd_shape("act_click", "verify_target_window_hwnd", hwnd))
+        .transpose()?;
     match &params.target {
         ActClickTarget::Element(element) => {
             let parsed_hwnd = element
@@ -550,7 +583,7 @@ pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i
                     ),
                 )
             })?;
-            if let Some(expected) = params.verify_target_window_hwnd {
+            if let Some(expected) = verify_target_window_hwnd {
                 let expected_root = verified_top_level_hwnd(expected).map_err(|detail| {
                     mcp_error(
                         error_codes::ACTION_TARGET_INVALID,
@@ -570,8 +603,7 @@ pub(crate) fn click_target_root_hwnd(params: &ActClickParams) -> Result<Option<i
             }
             Ok(Some(hwnd))
         }
-        ActClickTarget::Point(_) => params
-            .verify_target_window_hwnd
+        ActClickTarget::Point(_) => verify_target_window_hwnd
             .map(|hwnd| {
                 verified_top_level_hwnd(hwnd).map_err(|detail| {
                     mcp_error(
@@ -621,7 +653,12 @@ pub(crate) fn click_target_foreground_guard_hwnds(
 
 #[cfg(windows)]
 fn verified_top_level_hwnd(hwnd: i64) -> Result<i64, String> {
-    let seed = HWND(hwnd as isize as *mut std::ffi::c_void);
+    let native = synapse_core::win32_hwnd::hwnd_from_wire(hwnd).ok_or_else(|| {
+        format!(
+            "HWND wire value {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
+        )
+    })?;
+    let seed = HWND(native as *mut std::ffi::c_void);
     if seed.0.is_null() || !unsafe { IsWindow(Some(seed)) }.as_bool() {
         return Err(format!("element HWND 0x{hwnd:x} is not a live window"));
     }
@@ -633,12 +670,18 @@ fn verified_top_level_hwnd(hwnd: i64) -> Result<i64, String> {
             root.0 as usize
         ));
     }
-    Ok(root.0 as usize as i64)
+    Ok(synapse_core::win32_hwnd::hwnd_to_wire(root.0 as isize))
 }
 
 #[cfg(not(windows))]
 fn verified_top_level_hwnd(hwnd: i64) -> Result<i64, String> {
-    Ok(hwnd)
+    synapse_core::win32_hwnd::hwnd_from_wire(hwnd)
+        .map(|_native| hwnd)
+        .ok_or_else(|| {
+            format!(
+                "HWND wire value {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
+            )
+        })
 }
 
 pub(crate) fn click_error_code(error: &ErrorData) -> String {

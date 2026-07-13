@@ -5,6 +5,14 @@ Host: Windows user `hotra`
 Daemon bind: `127.0.0.1:7700`
 Branch: `main`
 
+> **Current D1 classification (2026-07-13):** The renamed script referenced
+> below is supporting diagnostic automation only; it does not perform or accept
+> FSV. Its output was not, and is not now, sufficient by itself for acceptance.
+> The historical transcript values remain evidence from the separately observed
+> manual run. Current acceptance requires an agent to use the strict production
+> MCP client and independently read each physical Source of Truth before and
+> after every manual trigger.
+
 ## Setup and live state
 
 - Source was current with `origin/main` before the run: `7cd9a15af6a59c4096acf6b713fc56e69202eb74`.
@@ -18,7 +26,7 @@ Branch: `main`
 
 ## Code and tool changes verified
 
-- Added `scripts/fsv/issue-871-assist-surface-acceptance.ps1`, a live FSV script that:
+- The former automation is now retained as `scripts/diagnostics/issue-871-assist-surface-diagnostic.ps1`, a supporting diagnostic that:
   - opens two independent HTTP MCP sessions,
   - uses only an already-open Chrome window,
   - verifies physical Action Center toast XML and accept URI,
@@ -26,7 +34,7 @@ Branch: `main`
   - compares dashboard panels to MCP/HTTP storage, timeline, and daemon state,
   - toggles the tray recorder control through `synapse-overlay --toggle-once`,
   - blocks a live `approval_gate`, accepts it from the dashboard endpoint, and verifies the gate returns `allow`.
-- Added `synapse-fsv-toast-history`, a Windows-only helper that reads/removes `Synapse.Daemon` Action Center history rows and extracts approval action URIs from physical toast XML.
+- Added `synapse-fsv-toast-history`, a Windows-only helper that reads/removes `Synapse.Daemon` Action Center history rows and extracts approval action URIs from physical toast XML. Its name is retained as a public compatibility identity; it is not an automated FSV claim.
 - Added `synapse-overlay --toggle-once` so the real tray pause/resume control path is testable without synthetic Win32 tray clicks.
 - Hardened `approval_protocol` parsing for Windows ShellExecute handoff variants (`"synapse-approval://..."` and `synapse-approval://decide/?...`).
 - Changed dashboard storage summary to use exact row counts (`storage_cf_row_counts`) so dashboard storage SoT matches `storage_inspect`.
@@ -41,7 +49,7 @@ Branch: `main`
 Command:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fsv\issue-871-assist-surface-acceptance.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\diagnostics\issue-871-assist-surface-diagnostic.ps1
 ```
 
 Result:
@@ -118,5 +126,5 @@ Note: `browser_screenshot` failed in the Chrome bridge image readback path, but 
 - `cargo test -p synapse-mcp --bin synapse-mcp approval_protocol -- --nocapture`
 - `cargo build -p synapse-mcp --bin synapse-fsv-toast-history`
 - `cargo build -p synapse-overlay`
-- `powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fsv\issue-871-assist-surface-acceptance.ps1`
+- PowerShell parser check for `scripts/diagnostics/issue-871-assist-surface-diagnostic.ps1`
 

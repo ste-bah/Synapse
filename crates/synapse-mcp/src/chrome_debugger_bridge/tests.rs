@@ -1404,3 +1404,129 @@ fn aria_redaction_honors_browser_supplied_redacted_flag() {
     assert_eq!(node.value_length, Some(12));
     assert_eq!(node.value_hash.as_deref(), Some("sha256:deadbeefdeadbeef"));
 }
+
+fn authoritative_empty_extension_owner_readback() -> ChromeDebuggerExtensionOwnerReadback {
+    serde_json::from_value(json!({
+        "enabled": false,
+        "disable_sequence": 7,
+        "command_activity_sequence": 12,
+        "command_last_completed_sequence": 11,
+        "command_in_flight_count": 1,
+        "mutation_handlers_started_count": 4,
+        "mutation_handlers_completed_count": 4,
+        "worker_boot_id": "worker-test",
+        "browser_session_id": "browser-session-test",
+        "ledger_browser_session_id": "browser-session-test",
+        "browser_session_continuity_matched": true,
+        "stale_browser_session_owner_count": 0,
+        "storage_state_loaded": true,
+        "storage_state_load_error": null,
+        "persisted_state_revision": 9,
+        "persisted_in_flight_mutation": null,
+        "unresolved_debugger_command_timeouts": [],
+        "unresolved_worker_restart_mutation_count": 0,
+        "owner_continuity_healthy": true,
+        "active_after": {
+            "opened_tab_count": 0,
+            "init_script_count": 0,
+            "binding_count": 0,
+            "debugger_attached_tab_count": 0,
+            "unresolved_debugger_command_timeout_count": 0,
+            "executed_init_script_effect_unresolved_count": 0,
+            "dialog_policy_count": 0,
+            "dialog_auto_handle_in_flight_count": 0,
+            "file_chooser_interception_count": 0,
+            "clock_count": 0,
+            "viewport_override_count": 0,
+            "device_override_count": 0,
+            "geolocation_override_count": 0,
+            "locale_override_count": 0,
+            "media_override_count": 0,
+            "network_override_count": 0,
+            "mutation_handler_in_flight_count": 0
+        },
+        "fully_drained": true
+    }))
+    .expect("decode healthy extension-owner readback")
+}
+
+#[test]
+fn extension_owner_readback_requires_persisted_browser_session_continuity() {
+    let healthy = authoritative_empty_extension_owner_readback();
+    assert!(extension_owner_readback_is_authoritative_empty(&healthy));
+
+    let mut restored_owner = healthy.clone();
+    restored_owner.active_after.opened_tab_count = 1;
+    restored_owner.fully_drained = false;
+    assert!(!extension_owner_readback_is_authoritative_empty(
+        &restored_owner
+    ));
+
+    let mut stale_session = healthy.clone();
+    stale_session.browser_session_continuity_matched = false;
+    stale_session.stale_browser_session_owner_count = 1;
+    assert!(!extension_owner_readback_is_authoritative_empty(
+        &stale_session
+    ));
+
+    let mut storage_failure = healthy.clone();
+    storage_failure.storage_state_load_error = Some("chrome.storage.local.get failed".to_owned());
+    storage_failure.owner_continuity_healthy = false;
+    assert!(!extension_owner_readback_is_authoritative_empty(
+        &storage_failure
+    ));
+
+    let mut unstable_command_snapshot = healthy.clone();
+    unstable_command_snapshot.command_in_flight_count = 2;
+    assert!(!extension_owner_readback_is_authoritative_empty(
+        &unstable_command_snapshot
+    ));
+}
+
+#[test]
+fn extension_owner_readback_retains_unresolved_debugger_timeout() {
+    let mut readback = authoritative_empty_extension_owner_readback();
+    readback.unresolved_debugger_command_timeouts.push(
+        ChromeDebuggerExtensionUnresolvedDebuggerCommandTimeout {
+            id: "worker-test:12:1".to_owned(),
+            tab_id: 42,
+            method: "Runtime.evaluate".to_owned(),
+            activity_sequence: 12,
+            worker_boot_id: "worker-test".to_owned(),
+            timed_out_at_unix_ms: 1_700_000_000_000,
+            neutralization_method: None,
+        },
+    );
+    assert!(!extension_owner_readback_is_authoritative_empty(&readback));
+}
+
+#[test]
+fn delivered_mutation_is_retained_across_transport_loss() {
+    let (sender, _receiver) = oneshot::channel();
+    let mut inner = BridgeInner::default();
+    inner.pending.insert(
+        "command-test".to_owned(),
+        PendingResponse {
+            host_id: "host-test".to_owned(),
+            kind: "openTab".to_owned(),
+            sender: Some(sender),
+            mutation_capable: true,
+            delivered: true,
+            caller_timed_out: false,
+            transport_lost: false,
+        },
+    );
+
+    let stats = preserve_delivered_mutations_on_transport_loss(
+        &mut inner,
+        "host-test",
+        "synthetic transport loss",
+    );
+    let pending = inner
+        .pending
+        .get("command-test")
+        .expect("delivered mutation remains owned");
+    assert_eq!(stats.delivered_mutations_preserved, 1);
+    assert!(pending.sender.is_none());
+    assert!(pending.transport_lost);
+}

@@ -189,6 +189,8 @@ async fn spawn_press_and_wait_for_held_key(
             500,
             Backend::Software,
             None,
+            crate::m2::OperatorPanicActionBoundary::arm("act_press", "test_live_sequence")
+                .expect("operator panic admission should be open for live press test"),
         ));
         if let Some(snapshot) = wait_for_held_key_or_press_done(snapshot_handle, "a", &press).await
         {

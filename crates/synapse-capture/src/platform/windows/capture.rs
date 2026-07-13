@@ -1,4 +1,4 @@
-use std::{ffi::c_void, slice, thread, time::Duration};
+use std::{slice, thread, time::Duration};
 
 use synapse_core::Rect;
 use windows::{
@@ -27,7 +27,7 @@ use crate::{
 };
 
 use super::{
-    common::capture_unsupported,
+    common::{capture_unsupported, hwnd_from_i64},
     dpi::{current_thread_priority, set_capture_thread_priority},
     target::validate_hwnd,
 };
@@ -55,7 +55,8 @@ pub fn run_graphics_capture(
         }
         CaptureTarget::Window { hwnd } => {
             validate_hwnd(hwnd)?;
-            let window = Window::from_raw_hwnd(hwnd as *mut c_void);
+            let hwnd = hwnd_from_i64(hwnd)?;
+            let window = Window::from_raw_hwnd(hwnd.0);
             start_graphics_capture_with_item(window, config, ctx)
         }
     }

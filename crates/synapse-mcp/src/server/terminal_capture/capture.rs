@@ -1117,7 +1117,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "real-process FSV: opens a real owned ConPTY and captures a child's output. Run from an INTERACTIVE console session (`cargo test -p synapse-mcp -- --ignored`). The conpty-hosted child fails DLL init (0xC0000142) or hangs under restricted automation window-stations, which is an environment limitation, not a capture-code defect — the byte->asciicast and byte->screen transforms are fully covered by the default-gate unit tests."]
+    #[ignore = "supporting real-process integration evidence only; manual FSV remains separate: opens a real owned ConPTY and captures a child's output. Run from an INTERACTIVE console session (`cargo test -p synapse-mcp -- --ignored`). The conpty-hosted child fails DLL init (0xC0000142) or hangs under restricted automation window-stations, which is an environment limitation, not a capture-code defect — the byte->asciicast and byte->screen transforms are fully covered by the default-gate unit tests."]
     fn captures_real_process_output_to_valid_asciicast_v3() {
         let temp = tempfile::TempDir::new().expect("temp dir");
         let asciicast_path = temp.path().join("session.cast");
@@ -1134,7 +1134,7 @@ mod tests {
             cols: 80,
             rows: 24,
             started_unix_secs: 1_700_000_000,
-            title: Some("conpty-fsv".to_owned()),
+            title: Some("conpty-regression".to_owned()),
         };
         #[cfg(not(windows))]
         let spec = CaptureSpec {
@@ -1146,7 +1146,7 @@ mod tests {
             cols: 80,
             rows: 24,
             started_unix_secs: 1_700_000_000,
-            title: Some("pty-fsv".to_owned()),
+            title: Some("pty-regression".to_owned()),
         };
 
         let summary = capture_to_asciicast(&spec, &asciicast_path).expect("capture succeeds");

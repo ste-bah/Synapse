@@ -9,7 +9,7 @@ extension requests `debugger` only for narrow target-scoped lanes:
 `geolocationEmulation`, `localeEmulation`, `mediaEmulation`, and
 `networkConditions`. Inactive normal-profile tabs use a strict
 selector-scoped synthetic MouseEvent drag path through `chrome.scripting` so
-drag FSV stays background-safe. It also dispatches HTML5 DragEvent/DataTransfer
+manual drag FSV stays background-safe. It also dispatches HTML5 DragEvent/DataTransfer
 drops in page script. `pageScreenshot` uses typed page metrics/masks/scroll via
 `chrome.scripting` plus queued `chrome.tabs.captureVisibleTab` tile stitching for
 viewport, full-page, clip, and element screenshots without `Page.captureScreenshot`.
@@ -192,7 +192,7 @@ to dispatch hover/tap/active-tab mouse-drag input, then detaches; inactive-tab
 mouse drag uses a strict in-page MouseEvent sequence. `viewportEmulation`
 attaches only long enough to call `Emulation.setDeviceMetricsOverride` or
 `Emulation.clearDeviceMetricsOverride` plus a zero-metrics disable command.
-Set accepts explicit mobile viewport semantics for DPR/mobile FSV. Because
+Set accepts explicit mobile viewport semantics for manual DPR/mobile FSV. Because
 Chrome's normal-profile extension debugger path does not make
 `deviceScaleFactor` visible as `window.devicePixelRatio` on this host, the
 normal bridge installs a narrow MAIN-world DPR shim for page scripts and removes

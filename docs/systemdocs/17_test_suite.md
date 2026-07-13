@@ -62,14 +62,14 @@ Totals are derived from the `Grep` per-file counts; treat as approximate. Per-cr
 | **End-to-end (e2e)** | Spawn the real `synapse-mcp` binary over stdio and drive it via JSON-RPC. | `StdioMcpClient` in `crates/synapse-test-utils/src/stdio_mcp_client.rs`; ~45 callers (see §4) | use of `StdioMcpClient` |
 | **Property tests** | `proptest`-style round-trip / invariant tests. | `synapse-core/tests/action_serde_proptest.rs`, `synapse-action/tests/dynamics_*_proptest.rs`, `synapse-storage/tests/compaction_ttl_proptest.rs` | `*proptest*` filenames |
 | **Snapshot/regression** | Golden snapshots and regression guards. | `crates/synapse-mcp/tests/snapshots/*.snap`, `*_regression.rs` (a11y/perception) | `.snap` files, `regression` in name |
-| **Manual FSV** | NOT a Rust test category — see §3.1. | docs + operator runbook | "FSV" references |
+| **Manual FSV** | NOT a Rust test category — see §3.1. | docs + agent-run acceptance runbook | "FSV" references |
 
 ### 3.1 What "FSV" means here
 
-**FSV = Full State Verification** (also written "Full State Verification (FSV)" in `CONTRIBUTING.md`). It is the project's **manual, human-at-the-machine acceptance gate** on the configured Windows host — *not* an automated test type. Key points from source:
+**FSV = Full State Verification** (also written "Full State Verification (FSV)" in `CONTRIBUTING.md`). It is the project's **manual acceptance gate performed by the agent** on the configured Windows host — *not* an automated test type. Key points from source:
 
 - `CONTRIBUTING.md` §4: "the project uses manual Full State Verification (FSV) on the configured Windows host as the shipping gate ... Automated tests are supporting evidence, not a substitute for verifying real behavior."
-- `docs/foreground-capability-acceptance-runbook.md` is "the **manual acceptance runbook** ... explicitly *not* an automated FSV harness." It directs the operator to trigger via the real wired MCP client, then read the Source-of-Truth (SoT) with a separate operation — "Do not use any script, helper client, or harness as acceptance."
+- `docs/foreground-capability-acceptance-runbook.md` is "the **manual acceptance runbook** ... explicitly *not* an automated FSV harness." It directs the agent to trigger via the real wired MCP client, then read the Source-of-Truth (SoT) with a separate operation — "Do not use any script, helper client, or harness as acceptance."
 - `manual-fsv-tmp/` is a gitignored scratch dir (`.gitignore` line 63: `/manual-fsv-tmp/`).
 - `manual_fsv` / `minimum_manual_fsv` also appear as **data fields** in curated profile manifests (`crates/synapse-profiles/tests/fixtures/profile_registry/.../*.toml`, key `curated.minimum_manual_fsv`) and the `profile_quality` tool (`manual_fsv_evidence_ref`). These record the minimal manual-FSV checklist a curated profile must pass; the Rust tests only assert that these fields exist/parse, not that FSV was performed.
 

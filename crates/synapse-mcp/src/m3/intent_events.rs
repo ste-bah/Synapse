@@ -38,7 +38,7 @@
 //!   host clock. This is what makes intent detection *live*.
 //! * the `intent_detect_tick` MCP tool — forces one tick on demand (and
 //!   accepts a replay `now_ts_ns`), the deterministic seam agents, dashboards,
-//!   and FSV use to drive detection at a known instant.
+//!   and manual FSV use to drive detection at a known instant.
 //!
 //! Both share a single [`SharedIntentTracker`] held in `M3State`, so the state
 //! machine has exactly one source of truth regardless of which driver advances
@@ -482,7 +482,7 @@ pub fn detect_and_publish(
 #[serde(deny_unknown_fields)]
 pub struct IntentDetectTickParams {
     /// "As of" instant (ns since epoch) to evaluate at. Defaults to now; pass
-    /// an explicit instant to drive detection at a known moment (replay/FSV).
+    /// an explicit instant to drive detection at a known moment (replay/manual FSV).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub now_ts_ns: Option<u64>,
     /// Detection confidence floor (`[0.0, 1.0]`). Defaults to the periodic

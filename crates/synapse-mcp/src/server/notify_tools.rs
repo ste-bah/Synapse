@@ -483,7 +483,7 @@ mod windows_toast {
     /// Per-call CoInitializeEx/CoUninitialize on pooled threads is NOT safe
     /// here: tearing down the last MTA invalidates windows-rs's process-wide
     /// cached activation factories, and the next toast call then dies with an
-    /// access violation that kills the daemon (observed in FSV; same reason
+    /// access violation that kills the daemon (observed during manual FSV; same reason
     /// synapse-a11y routes UIA through a dedicated COM worker thread).
     static NOTIFY_WORKER: OnceLock<Result<mpsc::Sender<NotifyCommand>, String>> = OnceLock::new();
     static LIVE_ACTIVATION_SUBSCRIPTIONS: OnceLock<Mutex<Vec<LiveActivationSubscription>>> =

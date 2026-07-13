@@ -26,6 +26,7 @@ pub struct BrowserFramesParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 

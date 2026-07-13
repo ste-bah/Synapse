@@ -1,5 +1,194 @@
 use super::*;
 
+#[test]
+fn agent_spawn_activity_guard_rejects_panic_between_precheck_and_publication() {
+    let _serial = crate::test_support::lease_serial("agent_spawn_activity_guard_serial");
+    synapse_action::isolate_interrupt_epochs_for_test();
+    let before = agent_spawn_activity_readback();
+    assert_eq!(before.in_flight, 0);
+
+    let mut token = None;
+    let error = AgentSpawnInFlightGuard::enter_with_pre_guard_hook(
+        "deterministic_spawn_guard_test",
+        || token = Some(synapse_action::request_operator_panic_interrupt()),
+    )
+    .expect_err("panic published between precheck and guard must reject admission");
+    let after = agent_spawn_activity_readback();
+
+    assert_eq!(after.sequence, before.sequence.saturating_add(1));
+    assert_eq!(after.in_flight, 0, "rejected guard must release its owner");
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("detail_code"))
+            .and_then(Value::as_str),
+        Some("AGENT_SPAWN_OPERATOR_PANIC_PREARMED")
+    );
+
+    let mut token = token.expect("test hook must publish one exact panic token");
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut token
+    ));
+    let synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) =
+        synapse_action::complete_operator_panic_safety_generation(token)
+            .unwrap_or_else(|detail| panic!("complete test panic: {detail}"))
+    else {
+        panic!("isolated test panic must own finalization");
+    };
+    assert!(synapse_action::finish_operator_panic_safety_finalization(
+        finalization,
+        true
+    ));
+    assert!(!synapse_action::operator_panic_safety_pending());
+}
+
+#[test]
+fn operator_panic_spawn_cleanup_never_accepts_metadata_only_teardown_with_live_process() {
+    assert!(agent_spawn_operator_panic_cleanup_verified(
+        &[],
+        None,
+        Some(0)
+    ));
+    assert!(
+        !agent_spawn_operator_panic_cleanup_verified(&[42_424], None, Some(0)),
+        "a closed/dead session row cannot hide a physically live replacement process"
+    );
+    assert!(!agent_spawn_operator_panic_cleanup_verified(
+        &[],
+        Some("session teardown failed"),
+        None
+    ));
+    assert!(!agent_spawn_operator_panic_cleanup_verified(
+        &[],
+        None,
+        Some(1)
+    ));
+}
+
+#[test]
+fn operator_panic_shell_cleanup_requires_local_and_remote_physical_terminal_state() {
+    assert!(shell_operator_panic_cleanup_verified(
+        &[],
+        false,
+        false,
+        false
+    ));
+    assert!(!shell_operator_panic_cleanup_verified(
+        &[42_425],
+        false,
+        false,
+        false
+    ));
+    assert!(!shell_operator_panic_cleanup_verified(
+        &[],
+        true,
+        false,
+        false
+    ));
+    assert!(!shell_operator_panic_cleanup_verified(
+        &[],
+        false,
+        true,
+        false
+    ));
+    assert!(shell_operator_panic_cleanup_verified(
+        &[],
+        false,
+        true,
+        true
+    ));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn m4_action_preflight_permit_rejects_a_fully_finalized_panic_wave() {
+    let _serial = crate::test_support::lease_serial("m4_action_preflight_epoch_serial");
+    synapse_action::isolate_interrupt_epochs_for_test();
+    let armed_epoch = synapse_action::operator_panic_epoch();
+    let preflight =
+        super::super::action_preflight::no_foreground_preflight("act_launch", armed_epoch, None);
+    let request_boundary =
+        crate::server::operator_panic_boundary::McpOperatorPanicBoundary::capture(
+            "act_launch",
+            Some("m4-action-preflight-finalized-panic-test"),
+        );
+
+    let mut token = synapse_action::request_operator_panic_interrupt();
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut token
+    ));
+    let synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) =
+        synapse_action::complete_operator_panic_safety_generation(token)
+            .unwrap_or_else(|detail| panic!("complete M4 preflight test panic: {detail}"))
+    else {
+        panic!("isolated M4 preflight test panic must own finalization");
+    };
+    assert!(synapse_action::finish_operator_panic_safety_finalization(
+        finalization,
+        true
+    ));
+    assert!(!synapse_action::operator_panic_safety_pending());
+
+    let error = crate::server::operator_panic_boundary::MCP_OPERATOR_PANIC_BOUNDARY
+        .scope(request_boundary, async move {
+            preflight
+                .ensure_operator_panic_boundary("act_launch_immediately_before_create_process")
+                .expect_err("the preflight permit must remain poisoned after exact finalization")
+        })
+        .await;
+    assert_eq!(
+        error.data.as_ref().and_then(|data| data.get("code")),
+        Some(&json!(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED))
+    );
+}
+
+#[test]
+fn failed_run_shell_boundary_deletes_and_reads_back_idempotency_reservation() {
+    let service = SynapseService::new();
+    let runtime = service
+        .reflex_runtime()
+        .expect("test service must expose reflex storage");
+    let row_key = b"m4/run-shell/idempotency/test-boundary-cleanup".to_vec();
+    {
+        let runtime = runtime.lock().expect("test reflex runtime lock");
+        runtime
+            .storage_put_kv_rows(vec![(row_key.clone(), b"in_progress".to_vec())])
+            .expect("seed exact idempotency reservation");
+        assert!(
+            runtime
+                .storage_kv_row(&row_key)
+                .expect("reservation before readback")
+                .is_some()
+        );
+    }
+
+    let error = clear_failed_run_shell_idempotency_reservation(
+        &service,
+        &runtime,
+        &row_key,
+        "deterministic_boundary_failure",
+        mcp_error(
+            error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            "synthetic operator panic boundary failure",
+        ),
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("idempotency_reservation_cleanup"))
+            .and_then(|cleanup| cleanup.get("cleanup_verified"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let after = runtime
+        .lock()
+        .expect("test reflex runtime lock after cleanup")
+        .storage_kv_row(&row_key)
+        .expect("reservation after readback");
+    assert!(after.is_none(), "failed launch must not strand in_progress");
+}
+
 fn test_spawn_params() -> ActSpawnAgentParams {
     ActSpawnAgentParams {
         cli: Some(ActSpawnAgentCli::Codex),
@@ -434,8 +623,9 @@ fn resolve_spawn_api_key_forwards_value_when_present() {
 #[cfg(windows)]
 #[test]
 fn resolve_spawn_api_key_prefers_encrypted_secret_store_over_env() {
-    // FSV: a DPAPI-encrypted stored key takes priority over the process env
-    // and round-trips through CryptProtectData/CryptUnprotectData.
+    // Supporting real-DPAPI regression evidence: an encrypted stored key takes
+    // priority over the process env and round-trips through
+    // CryptProtectData/CryptUnprotectData. Manual FSV remains separate.
     let (_dir, db) = resolver_test_db();
     let env_var = "SYNAPSE_TEST_DEEPSEEK_KEY_PRECEDENCE";
     unsafe { std::env::set_var(env_var, "env-fallback-value") };

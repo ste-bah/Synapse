@@ -1,4 +1,4 @@
-mod a11y_events;
+pub(crate) mod a11y_events;
 pub mod activity_recorder;
 pub mod approvals;
 pub mod armed_routines;
@@ -634,6 +634,11 @@ impl M3State {
         let demo_control = self
             .ensure_demo_record_control()
             .context("hydrate demo record control state for the activity recorder")?;
+        // WinEvent subscription is the last fallible activation step. Complete
+        // it before spawning recorder tasks so a hook-start failure cannot
+        // force synchronous code to drop-and-detach live Tokio owners.
+        let prepared_bridge = A11yEventBridge::prepare()
+            .context("prepare WinEvent bridge for the activity recorder")?;
         let recorder = Arc::new(ActivityRecorder::spawn(
             db,
             config,
@@ -641,11 +646,13 @@ impl M3State {
             demo_control,
             event_bus.clone(),
         )?);
+        let bridge = A11yEventBridge::start_prepared(
+            prepared_bridge,
+            event_bus,
+            Some(Arc::clone(&recorder)),
+        );
         self.activity_recorder = Some(Arc::clone(&recorder));
-        if let Err(error) = self.ensure_a11y_event_bridge(event_bus) {
-            self.activity_recorder = None;
-            return Err(error).context("start WinEvent bridge for the activity recorder");
-        }
+        self.a11y_event_bridge = Some(bridge);
         Ok(())
     }
 

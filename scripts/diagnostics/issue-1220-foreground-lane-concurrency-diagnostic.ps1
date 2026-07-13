@@ -1,3 +1,8 @@
+# Supporting diagnostic only. Its output is supporting diagnostic evidence only.
+# This script does not perform or accept Full State Verification (FSV). Under
+# AGENTS.md D1, an agent must perform FSV manually
+# through the strict production MCP client and independently read each physical
+# Source of Truth before and after the trigger.
 param(
     [int]$Count = 50,
     [int]$BatchSize = 10,
@@ -9,7 +14,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Die($Message) { throw "[issue1220-fsv] $Message" }
+function Die($Message) { throw "[issue1220-diagnostic] $Message" }
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -363,7 +368,7 @@ if (Test-Path -LiteralPath $TokenPath) {
 }
 
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
-    $OutputDir = Join-Path (Join-Path (Get-Location).Path 'manual-fsv-tmp') "issue-1220-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    $OutputDir = Join-Path (Join-Path (Get-Location).Path 'diagnostic-tmp') "issue-1220-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
 }
 $artifactRoot = (New-Item -ItemType Directory -Force -Path $OutputDir).FullName
 
@@ -400,7 +405,7 @@ try {
     Assert-True ($null -ne $notepad -and $notepad.MainWindowHandle -ne 0) 'no second foreground-driver window found'
     Set-DriverForegroundWindow -Hwnd ([int64]$notepad.MainWindowHandle)
 
-    $observer = Open-McpSession -Bind $Bind -Token $token -Name 'issue1220-fsv-observer'
+    $observer = Open-McpSession -Bind $Bind -Token $token -Name 'issue1220-diagnostic-observer'
     $health = Invoke-McpTool -Bind $Bind -Token $token -SessionId $observer -NextId ([ref]$nextO) -Name 'health' -Arguments @{} -TimeoutSec 30
     Assert-True ([bool]$health.ok) 'health not ok'
 
@@ -411,7 +416,7 @@ try {
     $baselineWin32 = Get-PhysicalSample -Label 'baseline-before-lanes'
 
     for ($i = 1; $i -le $Count; $i++) {
-        $sessionName = 'issue1220-fsv-lane-{0:d2}' -f $i
+        $sessionName = 'issue1220-diagnostic-lane-{0:d2}' -f $i
         $sessionId = Open-McpSession -Bind $Bind -Token $token -Name $sessionName
         $nextId = 1000 + ($i * 100)
         $open = Invoke-McpTool -Bind $Bind -Token $token -SessionId $sessionId -NextId ([ref]$nextId) -Name 'cdp_open_tab' -Arguments @{ window_hwnd = $chromeHwnd; url = 'about:blank' } -TimeoutSec 45
