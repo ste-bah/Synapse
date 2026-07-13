@@ -22,6 +22,7 @@ const DEFAULT_FOCUS_STABLE_MS: u32 = 75;
 #[serde(deny_unknown_fields)]
 pub struct ActFocusWindowParams {
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub hwnd: Option<i64>,
     #[serde(default)]
     pub title_regex: Option<String>,
@@ -95,8 +96,9 @@ const fn default_focus_stable_ms() -> u32 {
     DEFAULT_FOCUS_STABLE_MS
 }
 
-pub async fn act_focus_window(
+pub(crate) async fn act_focus_window_with_boundary(
     params: ActFocusWindowParams,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActFocusWindowResponse, ErrorData> {
     let started = Instant::now();
     validate_focus_window_params(&params)?;
@@ -106,7 +108,7 @@ pub async fn act_focus_window(
     let before = synapse_a11y::current_foreground_context()
         .map_err(|error| a11y_error_to_focus_mcp("before_foreground_read", error, None))?;
     let matched = resolve_focus_target(&requested)?;
-    let activation = activate_focus_window_once(&before, &matched)?;
+    let activation = activate_focus_window_once(&before, &matched, boundary)?;
     let verification = verify_focus_window(&params, &matched, &target_readback, activation).await?;
     let before_signature = hash_json(&before)?;
     let after_signature = hash_json(&verification.after)?;
@@ -222,12 +224,7 @@ fn requested_target(params: &ActFocusWindowParams) -> Result<RequestedFocusTarge
         ));
     }
     if let Some(hwnd) = params.hwnd {
-        if hwnd == 0 {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!("{TOOL} hwnd must be non-zero"),
-            ));
-        }
+        let hwnd = crate::m1::validate_hwnd_shape(TOOL, "hwnd", hwnd)?;
         return Ok(RequestedFocusTarget::Hwnd(hwnd));
     }
     if let Some(pid) = params.pid {
@@ -411,12 +408,14 @@ async fn verify_focus_window(
 fn activate_focus_window_once(
     before: &ForegroundContext,
     matched: &ForegroundContext,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<FocusActivation, ErrorData> {
     let plan = focus_activation_plan(before.hwnd, matched.hwnd);
     if plan.attempts == 0 {
         return Ok(plan);
     }
 
+    boundary.ensure("immediately_before_focus_window_with_intent")?;
     synapse_a11y::focus_window_with_intent(
         matched.hwnd,
         synapse_a11y::ForegroundActivationIntent::OperatorRequested { caller: TOOL },
@@ -633,7 +632,46 @@ fn window_summaries(contexts: &[ForegroundContext]) -> Vec<WindowSummary> {
 
 #[cfg(test)]
 mod tests {
-    use super::{METHOD_ALREADY_FOREGROUND, METHOD_SET_FOREGROUND, focus_activation_plan};
+    use super::{
+        ActFocusWindowParams, METHOD_ALREADY_FOREGROUND, METHOD_SET_FOREGROUND,
+        RequestedFocusTarget, focus_activation_plan, requested_target,
+    };
+
+    fn hwnd_params(hwnd: i64) -> ActFocusWindowParams {
+        ActFocusWindowParams {
+            hwnd: Some(hwnd),
+            title_regex: None,
+            pid: None,
+            verify_timeout_ms: 100,
+            stable_ms: 0,
+        }
+    }
+
+    #[test]
+    fn focus_hwnd_schema_and_runtime_enforce_canonical_user_handle_range() {
+        let schema = serde_json::to_value(rmcp::schemars::schema_for!(ActFocusWindowParams))
+            .expect("focus params schema should serialize");
+        assert_eq!(
+            schema["properties"]["hwnd"]["minimum"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            schema["properties"]["hwnd"]["maximum"],
+            serde_json::json!(u32::MAX)
+        );
+
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let error = requested_target(&hwnd_params(hwnd))
+                .expect_err("noncanonical HWND must fail before Win32 lookup");
+            let data = error.data.expect("HWND shape error must be structured");
+            assert_eq!(data["field"], "hwnd");
+            assert_eq!(data["actual_value"], hwnd);
+        }
+        assert!(matches!(
+            requested_target(&hwnd_params(i64::from(u32::MAX))),
+            Ok(RequestedFocusTarget::Hwnd(hwnd)) if hwnd == i64::from(u32::MAX)
+        ));
+    }
 
     #[test]
     fn focus_activation_plan_is_zero_or_one_activation() {

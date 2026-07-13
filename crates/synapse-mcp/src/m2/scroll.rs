@@ -97,10 +97,11 @@ pub struct ActScrollResponse {
     pub postcondition: ActPostcondition,
 }
 
-pub async fn act_scroll_with_handle(
+pub(crate) async fn act_scroll_with_handle_and_boundary(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActScrollParams,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActScrollResponse, ErrorData> {
     validate_scroll_params(&params)?;
     let started = Instant::now();
@@ -117,10 +118,16 @@ pub async fn act_scroll_with_handle(
             if let Some(backend_node_id) =
                 synapse_a11y::cdp_backend_from_element_id(&target.element_id)
             {
-                return execute_cdp_scroll(&params, &target.element_id, backend_node_id, started)
-                    .await;
+                return execute_cdp_scroll(
+                    &params,
+                    &target.element_id,
+                    backend_node_id,
+                    started,
+                    boundary,
+                )
+                .await;
             }
-            return execute_uia_scroll(&params, &target.element_id, started).await;
+            return execute_uia_scroll(&params, &target.element_id, started, boundary).await;
         }
         #[cfg(not(windows))]
         {
@@ -139,13 +146,13 @@ pub async fn act_scroll_with_handle(
     let mut backend_used = "software";
 
     if let Some(recording) = recording {
-        execute_recording(&recording, &actions, &params).await?;
+        execute_recording(&recording, &actions, &params, boundary).await?;
     } else if let Some(point) = params.at.map(Into::into) {
-        let dispatch = execute_targeted_scroll_actions(&params, point).await?;
+        let dispatch = execute_targeted_scroll_actions(&params, point, boundary).await?;
         wheel_event_count = dispatch.wheel_event_count;
         backend_used = dispatch.backend_used;
     } else {
-        execute_scroll_actions(&handle, actions, params.smooth).await?;
+        execute_scroll_actions(&handle, actions, params.smooth, boundary).await?;
     }
 
     Ok(response(
@@ -211,6 +218,7 @@ async fn execute_cdp_scroll(
     element_id: &ElementId,
     backend_node_id: i64,
     started: Instant,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActScrollResponse, ErrorData> {
     let hwnd = element_id
         .parts()
@@ -249,6 +257,7 @@ async fn execute_cdp_scroll(
     };
     let deltas = cdp_wheel_deltas(params)?;
     let wheel_event_count = deltas.len();
+    boundary.ensure("immediately_before_cdp_scroll_node")?;
     let point = synapse_a11y::cdp_scroll_node(
         &endpoint,
         &title_hint,
@@ -316,7 +325,9 @@ async fn execute_uia_scroll(
     params: &ActScrollParams,
     element_id: &ElementId,
     started: Instant,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActScrollResponse, ErrorData> {
+    boundary.ensure("immediately_before_uia_scroll_element")?;
     let mut readback =
         synapse_a11y::scroll_element(element_id, params.dy, params.dx).map_err(|error| {
             mcp_error(
@@ -564,19 +575,22 @@ struct ScrollDispatchResult {
 async fn execute_targeted_scroll_actions(
     params: &ActScrollParams,
     point: Point,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ScrollDispatchResult, ErrorData> {
-    execute_targeted_scroll_actions_platform(params, point).await
+    execute_targeted_scroll_actions_platform(params, point, boundary).await
 }
 
 #[cfg(windows)]
 async fn execute_targeted_scroll_actions_platform(
     params: &ActScrollParams,
     point: Point,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ScrollDispatchResult, ErrorData> {
     let readback =
         windows_hwnd_message_scroll_readback(point).map_err(|error| action_error_to_mcp(&error))?;
     let mut wheel_event_count = 0_usize;
     for delta in wheel_delta_chunks(params.dy).map_err(|error| action_error_to_mcp(&error))? {
+        boundary.ensure("immediately_before_postmessage_vertical_wheel")?;
         post_wheel_message(readback.hwnd, WM_MOUSEWHEEL, delta, point)
             .map_err(|error| action_error_to_mcp(&error))?;
         wheel_event_count = wheel_event_count.saturating_add(1);
@@ -593,6 +607,7 @@ async fn execute_targeted_scroll_actions_platform(
         );
     }
     for delta in wheel_delta_chunks(params.dx).map_err(|error| action_error_to_mcp(&error))? {
+        boundary.ensure("immediately_before_postmessage_horizontal_wheel")?;
         post_wheel_message(readback.hwnd, WM_MOUSEHWHEEL, delta, point)
             .map_err(|error| action_error_to_mcp(&error))?;
         wheel_event_count = wheel_event_count.saturating_add(1);
@@ -618,6 +633,7 @@ async fn execute_targeted_scroll_actions_platform(
 async fn execute_targeted_scroll_actions_platform(
     _params: &ActScrollParams,
     point: Point,
+    _boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ScrollDispatchResult, ErrorData> {
     Err(action_error_to_mcp(&ActionError::BackendUnavailable {
         detail: format!("act_scroll at={point:?} targeted window-message path requires Windows"),
@@ -628,9 +644,11 @@ async fn execute_scroll_actions(
     handle: &ActionHandle,
     actions: Vec<Action>,
     smooth: bool,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let last_index = actions.len().saturating_sub(1);
     for (index, action) in actions.into_iter().enumerate() {
+        boundary.ensure("immediately_before_foreground_scroll_dispatch")?;
         handle
             .execute(action)
             .await
@@ -723,12 +741,14 @@ async fn execute_recording(
     recording: &RecordingBackend,
     actions: &[Action],
     params: &ActScrollParams,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let before_events = recording.events();
     let before_event_count = before_events.len();
     let mut emit_state = EmitState::new();
     let last_index = actions.len().saturating_sub(1);
     for (index, action) in actions.iter().enumerate() {
+        boundary.ensure("immediately_before_recorded_scroll_dispatch")?;
         recording
             .execute(action, &mut emit_state)
             .map_err(|error| action_error_to_mcp(&error))?;
@@ -1061,17 +1081,19 @@ fn window_class_name(hwnd: HWND) -> String {
 
 #[cfg(windows)]
 fn hwnd_from_i64(hwnd: i64) -> Result<HWND, ActionError> {
-    if hwnd == 0 {
-        return Err(ActionError::TargetInvalid {
-            detail: "act_scroll target hwnd is null".to_owned(),
-        });
-    }
-    Ok(HWND(hwnd as isize as *mut c_void))
+    let native = synapse_core::win32_hwnd::hwnd_from_wire(hwnd).ok_or_else(|| {
+        ActionError::TargetInvalid {
+            detail: format!(
+                "act_scroll target hwnd {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
+            ),
+        }
+    })?;
+    Ok(HWND(native as *mut c_void))
 }
 
 #[cfg(windows)]
 fn hwnd_to_i64(hwnd: HWND) -> i64 {
-    hwnd.0 as isize as i64
+    synapse_core::win32_hwnd::hwnd_to_wire(hwnd.0 as isize)
 }
 
 #[cfg(test)]

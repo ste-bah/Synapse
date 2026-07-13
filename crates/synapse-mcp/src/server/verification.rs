@@ -29,6 +29,28 @@ const BINDING_SCHEMA: u32 = 1;
 const MAX_CODES: usize = 25;
 static AUDIT_SEQ: AtomicU64 = AtomicU64::new(0);
 
+fn validate_persisted_verification_hwnd(tool: &str, hwnd: i64) -> Result<(), ErrorData> {
+    if crate::m1::window_hwnd_shape_is_canonical(hwnd) {
+        return Ok(());
+    }
+    tracing::error!(
+        code = synapse_core::error_codes::STORAGE_CORRUPTED,
+        tool,
+        field = "window_hwnd",
+        actual_value = hwnd,
+        accepted_range = "1..=u32::MAX",
+        source_of_truth = "CF_KV verification/binding/v1 persisted binding",
+        remediation = "delete or repair the named corrupted verification binding, then recreate it through verification operation=bind",
+        "persisted verification binding contains a noncanonical HWND"
+    );
+    Err(mcp_error(
+        synapse_core::error_codes::STORAGE_CORRUPTED,
+        format!(
+            "{tool} persisted verification binding window_hwnd must be in 1..=4294967295; got {hwnd}"
+        ),
+    ))
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct VerificationInboxParams {
@@ -38,6 +60,7 @@ pub struct VerificationInboxParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Defaults to the session target's window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Logical source label for the audit trail (e.g. `gmail`, `outlook`).
     #[serde(default)]
@@ -77,6 +100,7 @@ pub struct VerificationPollParams {
     #[serde(default)]
     pub cdp_target_id: Option<String>,
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Logical source label for the audit trail (e.g. `gmail`).
     #[serde(default)]
@@ -158,6 +182,7 @@ pub struct VerificationBindParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning that tab.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Whether verification_inbox/poll may auto-resolve to this binding (default true).
     #[serde(default)]
@@ -362,13 +387,16 @@ impl SynapseService {
         // `verification_inbox source=gmail` finds the bound Gmail tab without a
         // per-call cdp_target_id. Falls back to the session target otherwise.
         let (cdp_target_id, window_hwnd) = if cdp_target_id.is_none() && window_hwnd.is_none() {
-            match self.verification_resolve_binding(source) {
+            match self.verification_resolve_binding(source)? {
                 Some(binding) => (binding.cdp_target_id, binding.window_hwnd),
                 None => (None, None),
             }
         } else {
             (cdp_target_id, window_hwnd)
         };
+        if let Some(window_hwnd) = window_hwnd {
+            crate::m1::validate_window_hwnd_shape("verification", window_hwnd)?;
+        }
         // Read the page's VISIBLE TEXT (cross-frame innerText via the bridge's
         // targetInfoPageText), not outerHTML: real webmail (Gmail ~5 MB) is
         // head-heavy and the bridge caps pageContent at 2 MiB, so outerHTML
@@ -473,6 +501,9 @@ impl SynapseService {
                 "verification_bind requires a non-empty source",
             ));
         }
+        if let Some(window_hwnd) = params.window_hwnd {
+            crate::m1::validate_window_hwnd_shape("verification_bind", window_hwnd)?;
+        }
         let session_id = super::context::mcp_session_id_from_request_context(&request_context)?
             .unwrap_or_else(|| "stdio".to_owned());
         let binding = VerificationBinding {
@@ -537,10 +568,23 @@ impl SynapseService {
                 )
             })?;
         let mut sources = Vec::new();
-        for (_key, raw) in rows {
-            if let Ok(binding) = serde_json::from_slice::<VerificationBinding>(&raw) {
-                sources.push(binding);
+        for (key, raw) in rows {
+            let binding = serde_json::from_slice::<VerificationBinding>(&raw).map_err(|error| {
+                mcp_error(
+                    synapse_core::error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "verification_sources could not decode persisted binding key {:?}: {error}",
+                        String::from_utf8_lossy(&key)
+                    ),
+                )
+            })?;
+            if let Some(window_hwnd) = binding.window_hwnd {
+                validate_persisted_verification_hwnd(
+                    "verification_sources_persisted_binding",
+                    window_hwnd,
+                )?;
             }
+            sources.push(binding);
             if sources.len() >= max {
                 break;
             }
@@ -554,20 +598,44 @@ impl SynapseService {
     }
 
     /// Resolve a source's enabled binding (verification/binding/v1/<source>) for
-    /// verification_inbox/poll auto-resolution. Returns None on any miss so the
-    /// caller falls back to the session target.
-    fn verification_resolve_binding(&self, source: &str) -> Option<VerificationBinding> {
-        let db = self.verification_db().ok()?;
+    /// verification_inbox/poll auto-resolution. An absent exact key returns
+    /// `None`; storage, decode, and HWND-shape failures are surfaced rather than
+    /// silently masquerading as a missing binding.
+    fn verification_resolve_binding(
+        &self,
+        source: &str,
+    ) -> Result<Option<VerificationBinding>, ErrorData> {
+        let db = self.verification_db()?;
         let key = format!("{BINDING_PREFIX}{source}");
-        let rows = db.scan_cf_prefix(cf::CF_KV, key.as_bytes()).ok()?;
+        let rows = db
+            .scan_cf_prefix(cf::CF_KV, key.as_bytes())
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("verification binding lookup failed for source {source:?}: {error}"),
+                )
+            })?;
         for (raw_key, raw) in rows {
             if raw_key.as_slice() != key.as_bytes() {
                 continue; // exact-source match only (avoid prefix collisions)
             }
-            let binding = serde_json::from_slice::<VerificationBinding>(&raw).ok()?;
-            return binding.enabled.then_some(binding);
+            let binding = serde_json::from_slice::<VerificationBinding>(&raw).map_err(|error| {
+                mcp_error(
+                    synapse_core::error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "verification binding decode failed for source {source:?} key {key:?}: {error}"
+                    ),
+                )
+            })?;
+            if let Some(window_hwnd) = binding.window_hwnd {
+                validate_persisted_verification_hwnd(
+                    "verification_persisted_binding",
+                    window_hwnd,
+                )?;
+            }
+            return Ok(binding.enabled.then_some(binding));
         }
-        None
+        Ok(None)
     }
 
     fn verification_db(&self) -> Result<std::sync::Arc<Db>, ErrorData> {

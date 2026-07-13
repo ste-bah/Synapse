@@ -44,10 +44,9 @@ pub(crate) async fn post_key_sequence(
     root_hwnd: i64,
     keys: &[Key],
     hold_ms: u32,
+    boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<HwndKeyboardTargetState, ErrorData> {
-    post_key_sequence_impl(root_hwnd, keys, hold_ms)
-        .await
-        .map_err(|error| action_error_to_mcp(&error))
+    post_key_sequence_impl(root_hwnd, keys, hold_ms, boundary).await
 }
 
 #[cfg(windows)]
@@ -55,24 +54,31 @@ async fn post_key_sequence_impl(
     root_hwnd: i64,
     keys: &[Key],
     hold_ms: u32,
-) -> Result<HwndKeyboardTargetState, ActionError> {
-    let key_specs = keys.iter().map(key_spec).collect::<Result<Vec<_>, _>>()?;
+    boundary: crate::m2::OperatorPanicActionBoundary,
+) -> Result<HwndKeyboardTargetState, ErrorData> {
+    let key_specs = keys
+        .iter()
+        .map(key_spec)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| action_error_to_mcp(&error))?;
     // #1332: a Shift+navigation chord extends the selection ONLY if the control
     // reads the OS Shift key-state, which PostMessage WM_KEYDOWN cannot set — the
     // caret would just move WITHOUT selecting (a silent false success). Fail loud
     // with the correct alternatives instead.
     if let Some(nav) = shift_navigation_chord(&key_specs) {
-        return Err(ActionError::BackendUnavailable {
+        return Err(action_error_to_mcp(&ActionError::BackendUnavailable {
             detail: format!(
                 "act_press PostMessage cannot extend a selection with Shift+{nav}: WM_KEYDOWN cannot set the OS Shift key-state the control reads, so the caret would move without selecting. Use target_act verb=set_selection for an exact background selection, or acquire the foreground input lease (backend=hardware) for real Shift+navigation."
             ),
-        });
+        }));
     }
     let mut release_keys = false;
     let target_hwnd = {
-        let target = best_keyboard_target(root_hwnd)?;
+        let target =
+            best_keyboard_target(root_hwnd).map_err(|error| action_error_to_mcp(&error))?;
         if is_ctrl_a_shortcut(&key_specs) {
-            select_all_edit_target(&target)?;
+            boundary.ensure("immediately_before_postmessage_select_all")?;
+            select_all_edit_target(&target).map_err(|error| action_error_to_mcp(&error))?;
             hwnd_to_i64(target.hwnd)
         } else if let Some(chord) = edit_control_chord(&key_specs) {
             // #1331: PostMessage WM_KEYDOWN cannot set OS key-state, so editing
@@ -81,38 +87,68 @@ async fn post_key_sequence_impl(
             // and verify the real effect (clipboard sequence number for copy/cut,
             // window-text change for paste/undo/redo) so we never falsely report
             // success on a chord the control ignored.
-            send_edit_control_chord(&target, &chord)?;
+            boundary.ensure("immediately_before_postmessage_edit_chord")?;
+            send_edit_control_chord(&target, &chord)
+                .map_err(|error| action_error_to_mcp(&error))?;
             hwnd_to_i64(target.hwnd)
         } else if is_plain_printable_text(&key_specs) {
-            post_char_messages(target.hwnd, &key_specs)?;
+            boundary.ensure("immediately_before_postmessage_plain_text")?;
+            post_char_messages(target.hwnd, &key_specs)
+                .map_err(|error| action_error_to_mcp(&error))?;
             hwnd_to_i64(target.hwnd)
         } else {
             for spec in &key_specs {
+                boundary.ensure("immediately_before_postmessage_key_down")?;
                 post_key_message(
                     target.hwnd,
                     windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
                     spec,
-                )?;
+                )
+                .map_err(|error| action_error_to_mcp(&error))?;
             }
             release_keys = true;
-            post_char_messages(target.hwnd, &key_specs)?;
+            boundary.ensure("immediately_before_postmessage_key_chars")?;
+            post_char_messages(target.hwnd, &key_specs)
+                .map_err(|error| action_error_to_mcp(&error))?;
             hwnd_to_i64(target.hwnd)
         }
     };
     if hold_ms > 0 {
         tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
     }
-    let target = hwnd_from_i64(target_hwnd)?;
+    let boundary_error = boundary
+        .ensure("after_postmessage_key_hold_before_release")
+        .err();
+    let target = hwnd_from_i64(target_hwnd).map_err(|error| action_error_to_mcp(&error))?;
+    let mut release_error = None;
     if release_keys {
         for spec in key_specs.iter().rev() {
-            post_key_message(
+            if let Err(error) = post_key_message(
                 target,
                 windows::Win32::UI::WindowsAndMessaging::WM_KEYUP,
                 spec,
-            )?;
+            ) && release_error.is_none()
+            {
+                release_error = Some(action_error_to_mcp(&error));
+            }
         }
     }
-    target_state(best_keyboard_target(root_hwnd)?)
+    if let Some(error) = boundary_error {
+        if let Some(release_error) = release_error {
+            tracing::error!(
+                code = synapse_core::error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                detail_code = "POSTMESSAGE_KEY_RELEASE_AFTER_OPERATOR_PANIC_FAILED",
+                detail = %release_error,
+                "operator panic superseded held PostMessage keys and best-effort key-up cleanup failed"
+            );
+        }
+        return Err(error);
+    }
+    if let Some(error) = release_error {
+        return Err(error);
+    }
+    let target = best_keyboard_target(root_hwnd).map_err(|error| action_error_to_mcp(&error))?;
+    target_state(target).map_err(|error| action_error_to_mcp(&error))
 }
 
 #[cfg(not(windows))]
@@ -120,10 +156,11 @@ async fn post_key_sequence_impl(
     _root_hwnd: i64,
     _keys: &[Key],
     _hold_ms: u32,
-) -> Result<HwndKeyboardTargetState, ActionError> {
-    Err(ActionError::BackendUnavailable {
+    _boundary: crate::m2::OperatorPanicActionBoundary,
+) -> Result<HwndKeyboardTargetState, ErrorData> {
+    Err(action_error_to_mcp(&ActionError::BackendUnavailable {
         detail: "act_press PostMessage keyboard tier is only available on Windows".to_owned(),
-    })
+    }))
 }
 
 #[cfg(windows)]
@@ -743,17 +780,19 @@ fn hwnd_from_i64(hwnd: i64) -> Result<windows::Win32::Foundation::HWND, ActionEr
     use std::ffi::c_void;
     use windows::Win32::Foundation::HWND;
 
-    if hwnd == 0 {
-        return Err(ActionError::TargetInvalid {
-            detail: "act_press PostMessage target hwnd is null".to_owned(),
-        });
-    }
-    Ok(HWND(hwnd as isize as *mut c_void))
+    let native = synapse_core::win32_hwnd::hwnd_from_wire(hwnd).ok_or_else(|| {
+        ActionError::TargetInvalid {
+            detail: format!(
+                "act_press PostMessage target hwnd {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
+            ),
+        }
+    })?;
+    Ok(HWND(native as *mut c_void))
 }
 
 #[cfg(windows)]
 fn hwnd_to_i64(hwnd: windows::Win32::Foundation::HWND) -> i64 {
-    hwnd.0 as isize as i64
+    synapse_core::win32_hwnd::hwnd_to_wire(hwnd.0 as isize)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

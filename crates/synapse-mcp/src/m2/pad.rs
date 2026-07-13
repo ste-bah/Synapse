@@ -106,10 +106,21 @@ pub struct ActPadResponse {
     pub postcondition: ActPostcondition,
 }
 
+#[cfg(test)]
 pub async fn act_pad_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActPadParams,
+) -> Result<ActPadResponse, ErrorData> {
+    let boundary = super::OperatorPanicActionBoundary::arm("act_pad", "direct_call_entry")?;
+    act_pad_with_handle_and_boundary(handle, recording, params, boundary).await
+}
+
+pub(crate) async fn act_pad_with_handle_and_boundary(
+    handle: ActionHandle,
+    recording: Option<Arc<RecordingBackend>>,
+    params: ActPadParams,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActPadResponse, ErrorData> {
     validate_params(&params)?;
     let started = Instant::now();
@@ -125,18 +136,40 @@ pub async fn act_pad_with_handle(
     };
 
     if let Some(recording) = recording {
-        execute_recording(&recording, &report_action, params.hold_ms, &neutral_action)?;
+        execute_recording(
+            &recording,
+            &report_action,
+            params.hold_ms,
+            &neutral_action,
+            boundary,
+        )?;
     } else {
+        boundary.ensure("immediately_before_pad_report_dispatch")?;
         handle
             .execute(report_action)
             .await
             .map_err(|error| action_error_to_mcp(&error))?;
         if let Some(hold_ms) = params.hold_ms {
             tokio::time::sleep(Duration::from_millis(u64::from(hold_ms))).await;
-            handle
+            let boundary_error = boundary
+                .ensure("after_pad_hold_before_neutral_cleanup")
+                .err();
+            let neutral_result = handle
                 .execute(neutral_action)
                 .await
-                .map_err(|error| action_error_to_mcp(&error))?;
+                .map_err(|error| action_error_to_mcp(&error));
+            if let Some(error) = boundary_error {
+                if let Err(neutral_error) = neutral_result {
+                    tracing::error!(
+                        code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                        detail_code = "PAD_NEUTRAL_AFTER_OPERATOR_PANIC_FAILED",
+                        detail = %neutral_error,
+                        "operator panic superseded a held pad report and best-effort neutral cleanup failed"
+                    );
+                }
+                return Err(error);
+            }
+            neutral_result?;
         }
     }
 
@@ -257,14 +290,17 @@ fn execute_recording(
     report_action: &Action,
     hold_ms: Option<u32>,
     neutral_action: &Action,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let before_events = recording.events();
     let before_event_count = before_events.len();
     let mut emit_state = EmitState::new();
+    boundary.ensure("immediately_before_recorded_pad_report_dispatch")?;
     recording
         .execute(report_action, &mut emit_state)
         .map_err(|error| action_error_to_mcp(&error))?;
     if hold_ms.is_some() {
+        boundary.ensure("immediately_before_recorded_pad_neutral_dispatch")?;
         recording
             .execute(neutral_action, &mut emit_state)
             .map_err(|error| action_error_to_mcp(&error))?;

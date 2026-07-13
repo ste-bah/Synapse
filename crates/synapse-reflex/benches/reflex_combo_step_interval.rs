@@ -122,7 +122,9 @@ fn spawn_action_time_drain(
     thread::Builder::new()
         .name("synapse-reflex-bench-combo-drain".to_owned())
         .spawn(move || {
-            while let Some((_action, ack)) = action_rx.blocking_recv() {
+            while let Some((_action, ack, _operator_panic_epoch_at_enqueue)) =
+                action_rx.blocking_recv()
+            {
                 let _ = time_tx.send(Instant::now());
                 let _ = ack.send(Ok(()));
             }

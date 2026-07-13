@@ -5120,11 +5120,11 @@ cdp_open_tab, target_claim, target_act, browser_evaluate, workspace_put.";
     -> anyhow::Result<()> {
         let tools = tools_named(["agent_ask_operator"]);
         let task = "Exact-contract Synapse task. Use exactly these real Synapse tools in this exact order:\n\
-1. agent_ask_operator {\"question\":\"\",\"context\":\"FSV-1028-EMPTY\",\"timeout_ms\":120000,\"notify\":false,\"suppress_popup\":true}";
+1. agent_ask_operator {\"question\":\"\",\"context\":\"REGRESSION-1028-EMPTY\",\"timeout_ms\":120000,\"notify\":false,\"suppress_popup\":true}";
         let contract = infer_task_tool_contract(task, &tools).expect("exact tool contract");
         let model_args: JsonObject = serde_json::from_value(json!({
             "question": "",
-            "context": "FSV-1028-EMPTY",
+            "context": "REGRESSION-1028-EMPTY",
             "timeout_ms": 120000,
             "notify": false,
             "suppress_popup": true,

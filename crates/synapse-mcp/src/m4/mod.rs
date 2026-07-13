@@ -2,10 +2,11 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashSet},
     fs::{self, OpenOptions},
+    future::Future,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -18,6 +19,8 @@ use rmcp::{
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use synapse_core::win32_hwnd::{hwnd_from_wire, hwnd_to_wire};
 use synapse_core::{
     Action, Backend, ComboInput, ComboStep, ForegroundContext, Key, Rect, error_codes,
     new_reflex_id,
@@ -33,6 +36,9 @@ use crate::{
 };
 
 const MAX_COMBO_STEPS: usize = 256;
+const PHYSICAL_MUTATION_BOUNDARY_POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) type PhysicalMutationBoundary<'a> =
+    dyn Fn(&'static str) -> Result<(), ErrorData> + Send + Sync + 'a;
 pub(crate) const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 pub const DEFAULT_RUN_SHELL_INLINE_AWAIT_LIMIT_MS: u64 = 90_000;
 pub const DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS: u64 = 110_000;
@@ -63,6 +69,7 @@ const RUN_SHELL_INLINE_AWAIT_LIMIT_ENV: &str = "SYNAPSE_RUN_SHELL_INLINE_AWAIT_L
 /// command/target without an allowlist entry.
 const ANY_PERMITTED_SENTINEL: &str = "__any_permitted__";
 const SHELL_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
+const SHELL_CLEANUP_CAPTURE_CAP_BYTES: u64 = 1024 * 1024;
 pub(crate) const SHELL_JOB_TAIL_DEFAULT_BYTES: u64 = 64 * 1024;
 const SHELL_JOB_TAIL_MAX_BYTES: u64 = 1024 * 1024;
 const SHELL_JOB_DASHBOARD_TAIL_BYTES: u64 = 2 * 1024;
@@ -124,6 +131,7 @@ const SHELL_REMOTE_CLEANUP_PRE_MARKER_TERMINAL: &str =
 const SHELL_JOB_STATUS_REMOTE_TRANSPORT_LOST: &str = "transport_lost_process_may_still_run";
 const SHELL_JOB_STATUS_REMOTE_EXITED_LOCAL_STALE: &str =
     "remote_process_exited_local_transport_stale";
+const SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED: &str = "spawn_cleanup_unverified";
 const SHELL_REMOTE_CLEANUP_TRANSPORT_LOST: &str = "transport_lost_process_may_still_run";
 const SHELL_REMOTE_CLEANUP_ALREADY_GONE: &str = "remote_process_already_gone";
 const SHELL_REMOTE_PROCESS_MARKER: &str = "SYNAPSE_REMOTE_PROCESS_V1";
@@ -132,8 +140,24 @@ const SHELL_REMOTE_CLEANUP_MARKER: &str = "SYNAPSE_REMOTE_CLEANUP_V1";
 const SHELL_REMOTE_LIVENESS_MARKER: &str = "SYNAPSE_REMOTE_LIVENESS_V1";
 const SHELL_REMOTE_METADATA_PREFIX_BYTES: usize = 128 * 1024;
 const SHELL_REMOTE_METADATA_WAIT_MS: u64 = 1_500;
-const SHELL_REMOTE_CLEANUP_TIMEOUT_MS: u64 = 15_000;
+const SHELL_REMOTE_CLEANUP_PIDFD_WAIT_MS: u64 = 12_000;
+const SHELL_REMOTE_GROUP_ABSENCE_PROBE_ATTEMPTS: u64 = 25;
+const SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS: u64 = 200;
+const SHELL_REMOTE_CLEANUP_TRANSPORT_MARGIN_MS: u64 = 8_000;
+// The caller must outlive every bounded step in the remote proof protocol. The
+// margin covers SSH connection/process startup and evidence flush after the
+// 12-second pidfd wait plus the five-second kernel PGID-absence proof.
+const SHELL_REMOTE_CLEANUP_TIMEOUT_MS: u64 = SHELL_REMOTE_CLEANUP_PIDFD_WAIT_MS
+    + SHELL_REMOTE_GROUP_ABSENCE_PROBE_ATTEMPTS * SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS
+    + SHELL_REMOTE_CLEANUP_TRANSPORT_MARGIN_MS;
 const SHELL_REMOTE_LIVENESS_TIMEOUT_MS: u64 = 2_500;
+const SHELL_SSH_CONFIG_PREFLIGHT_TIMEOUT_MS: u64 = 2_500;
+/// A hard safety backstop for reaping an exact child handle after termination
+/// has already been requested. This is not a runtime-performance assertion: the
+/// caller reports timeout as an explicit cleanup failure with the last process
+/// state it could read, rather than blocking a daemon worker forever.
+const SHELL_CHILD_REAP_BACKSTOP_MS: u64 = 5_000;
+const SHELL_CHILD_REAP_POLL_INTERVAL_MS: u64 = 10;
 pub const SHELL_PATTERN_TOO_BROAD: &str = "SHELL_PATTERN_TOO_BROAD";
 pub const LAUNCH_PATTERN_TOO_BROAD: &str = "LAUNCH_PATTERN_TOO_BROAD";
 
@@ -411,7 +435,7 @@ pub struct ActComboResponse {
     pub started_at_ms: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ActRunShellParams {
     #[schemars(
@@ -643,7 +667,7 @@ pub struct ActRunShellCancelResponse {
     pub status: ActRunShellStatusResponse,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ActRunShellRemoteProcessScope {
     pub transport: String,
@@ -657,6 +681,18 @@ pub struct ActRunShellRemoteProcessScope {
     pub remote_process_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_process_group_id: Option<String>,
+    /// Kernel boot UUID captured by the owned remote guardian before it starts
+    /// the requested command. Together with `remote_process_start_time`, this
+    /// prevents a recycled numeric PID from authorizing cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_boot_id: Option<String>,
+    /// `/proc/<pid>/stat` field 22, in clock ticks after boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_process_start_time: Option<String>,
+    /// Per-job nonce inherited by the owned remote guardian. This is an
+    /// ownership correlation token, not a credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_ownership_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cleanup_error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -676,6 +712,9 @@ impl Default for ActRunShellRemoteProcessScope {
             remote_identity: None,
             remote_process_id: None,
             remote_process_group_id: None,
+            remote_boot_id: None,
+            remote_process_start_time: None,
+            remote_ownership_token: None,
             remote_cleanup_error_code: None,
             remote_cleanup_message: None,
             detection_evidence: Vec::new(),
@@ -683,7 +722,7 @@ impl Default for ActRunShellRemoteProcessScope {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ActRunShellJobStatus {
     pub schema_version: u32,
@@ -692,6 +731,11 @@ pub struct ActRunShellJobStatus {
     pub session_id: Option<String>,
     pub status: String,
     pub pid: Option<u32>,
+    /// Immutable kernel process identity captured from the exact spawned child.
+    /// A numeric PID alone never authorizes destructive cleanup because the OS
+    /// may recycle it after the original process exits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_process_identity: Option<ActRunShellLocalProcessIdentity>,
     pub command: String,
     #[serde(default = "default_shell_command_metadata_policy")]
     #[schemars(!default)]
@@ -746,6 +790,43 @@ pub struct ActRunShellJobStatus {
     pub remote_process_scope: ActRunShellRemoteProcessScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<ActRunShellJobDiagnostics>,
+    /// Evidence for a child that failed after `CreateProcess`/`spawn` returned.
+    /// A post-spawn failure is terminal only when the exact child handle (and,
+    /// when acquired, its kill-on-close job authority) reached a verified
+    /// terminal state. Otherwise the durable record remains explicitly live
+    /// while the daemon retains the exact owner for bounded retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_failure: Option<ActRunShellSpawnFailureReadback>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActRunShellLocalProcessIdentity {
+    pub pid: u32,
+    /// Windows: `GetProcessTimes` creation FILETIME in 100 ns ticks. Other
+    /// platforms: the kernel/process-table start-time value exposed by sysinfo.
+    pub start_time: u64,
+    pub start_time_source: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ActRunShellSpawnFailureReadback {
+    pub stage: String,
+    pub child_created: bool,
+    pub cleanup_verified: bool,
+    pub exact_child_reaped: bool,
+    pub exact_child_kill_error: Option<String>,
+    pub exact_child_reap_timed_out: bool,
+    pub exact_child_reap_poll_attempts: u64,
+    pub exact_child_reap_poll_error_count: u64,
+    pub exact_child_reap_last_poll_error: Option<String>,
+    pub exact_child_reap_elapsed_ms: u64,
+    pub process_job_acquired: bool,
+    pub process_job_close: Option<String>,
+    pub tree_cleanup_verified: bool,
+    pub final_identity_state: Option<String>,
+    pub exact_owner_retained: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -756,6 +837,13 @@ struct ShellJobPaths {
     status_path: PathBuf,
     request_path: PathBuf,
     remote_cleanup_path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ShellJobStatusPersistenceFailure {
+    error_code: &'static str,
+    reason: &'static str,
+    detail: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -928,9 +1016,11 @@ impl ActSpawnAgentCli {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActSpawnAgentTarget {
     Window {
+        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
         window_hwnd: i64,
     },
     Cdp {
+        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
         window_hwnd: i64,
         cdp_target_id: String,
     },
@@ -1366,6 +1456,13 @@ pub fn validate_agent_spawn_params(params: &ActSpawnAgentParams) -> Result<(), E
             "act_spawn_agent model_ref is only valid when kind is local_model",
         ));
     }
+    if let Some(target) = &params.target {
+        let window_hwnd = match target {
+            ActSpawnAgentTarget::Window { window_hwnd }
+            | ActSpawnAgentTarget::Cdp { window_hwnd, .. } => *window_hwnd,
+        };
+        crate::m1::validate_window_hwnd_shape("act_spawn_agent", window_hwnd)?;
+    }
     if let Some(ActSpawnAgentTarget::Cdp { cdp_target_id, .. }) = &params.target {
         if cdp_target_id.trim().is_empty()
             || !cdp_target_id.chars().all(|ch| ('!'..='~').contains(&ch))
@@ -1560,9 +1657,67 @@ pub fn launch_process_history_row(
     })
 }
 
+fn allow_physical_mutation(_stage: &'static str) -> Result<(), ErrorData> {
+    Ok(())
+}
+
+fn physical_mutation_boundary_error(
+    error: ErrorData,
+    stage: &'static str,
+    cleanup: Value,
+) -> ErrorData {
+    let mut data = match error.data {
+        Some(Value::Object(data)) => data,
+        Some(original_data) => {
+            let mut data = serde_json::Map::new();
+            data.insert("original_data".to_owned(), original_data);
+            data
+        }
+        None => serde_json::Map::new(),
+    };
+    data.insert("physical_mutation_boundary_stage".to_owned(), json!(stage));
+    data.insert("physical_mutation_cleanup".to_owned(), cleanup);
+    ErrorData::new(
+        error.code,
+        error.message.to_string(),
+        Some(Value::Object(data)),
+    )
+}
+
+async fn await_physical_mutation_boundary<T>(
+    boundary: &PhysicalMutationBoundary<'_>,
+    stage: &'static str,
+    future: impl Future<Output = T>,
+) -> Result<T, ErrorData> {
+    boundary(stage)?;
+    crate::server::operator_panic_boundary::ensure_mcp_request_not_cancelled(stage)?;
+    let mut future = Box::pin(future);
+    loop {
+        tokio::select! {
+            result = &mut future => return Ok(result),
+            _ = tokio::time::sleep(PHYSICAL_MUTATION_BOUNDARY_POLL_INTERVAL) => {
+                boundary(stage)?;
+                crate::server::operator_panic_boundary::ensure_mcp_request_not_cancelled(stage)?;
+            }
+        }
+    }
+}
+
+#[allow(
+    dead_code,
+    reason = "kept as the direct M4 combo helper for unit tests and non-server callers"
+)]
 pub async fn execute_combo(
     runtime: Arc<Mutex<ReflexRuntime>>,
     params: ActComboParams,
+) -> Result<ActComboResponse, ErrorData> {
+    execute_combo_with_boundary(runtime, params, &allow_physical_mutation).await
+}
+
+pub(crate) async fn execute_combo_with_boundary(
+    runtime: Arc<Mutex<ReflexRuntime>>,
+    params: ActComboParams,
+    boundary: &PhysicalMutationBoundary<'_>,
 ) -> Result<ActComboResponse, ErrorData> {
     validate_combo_params(&params)?;
     let idempotency_present = params.idempotency_key.is_some();
@@ -1576,6 +1731,7 @@ pub async fn execute_combo(
     })?;
     let combo_id = new_reflex_id();
     let reflex = ScheduledReflex::combo(combo_id.clone(), ComboParams::new(steps, params.backend));
+    boundary("act_combo_immediately_before_reflex_schedule")?;
     let state = runtime
         .lock()
         .map_err(|_err| {
@@ -1684,6 +1840,23 @@ pub async fn run_authorized_shell(
     inline_await_limit_ms: u64,
     context: Option<&ShellExecutionContext>,
 ) -> Result<ActRunShellResponse, ErrorData> {
+    run_authorized_shell_with_boundary(
+        params,
+        authorization,
+        inline_await_limit_ms,
+        context,
+        &allow_physical_mutation,
+    )
+    .await
+}
+
+pub(crate) async fn run_authorized_shell_with_boundary(
+    params: ActRunShellParams,
+    authorization: &RunShellAuthorization,
+    inline_await_limit_ms: u64,
+    context: Option<&ShellExecutionContext>,
+    boundary: &PhysicalMutationBoundary<'_>,
+) -> Result<ActRunShellResponse, ErrorData> {
     validate_run_shell_execution_plan(&params, inline_await_limit_ms)?;
     let started = Instant::now();
     let idempotency_present = params.idempotency_key.is_some();
@@ -1693,7 +1866,12 @@ pub async fn run_authorized_shell(
         direct_shell_background_reason(&params, inline_await_limit_ms)
     {
         let start_params = run_shell_params_to_start_params(params);
-        let started_job = start_authorized_shell_job(start_params, authorization, context)?;
+        let started_job = start_authorized_shell_job_with_boundary(
+            start_params,
+            authorization,
+            context,
+            boundary,
+        )?;
         act_run_shell_background_response(
             started_job.job,
             elapsed_ms_u32(started),
@@ -1702,7 +1880,8 @@ pub async fn run_authorized_shell(
             requested_execution_mode,
         )
     } else {
-        run_allowlisted_shell(params, inline_await_limit_ms, context).await?
+        run_allowlisted_shell_with_boundary(params, inline_await_limit_ms, context, boundary)
+            .await?
     };
     let trace_command_line = if let Some(job) = &result.job {
         job.command_line.as_str()
@@ -1762,7 +1941,14 @@ pub fn validate_run_shell_execution_plan(
     params: &ActRunShellParams,
     inline_await_limit_ms: u64,
 ) -> Result<(), ErrorData> {
-    let _ = (params, inline_await_limit_ms);
+    if let Some(background_reason) = direct_shell_background_reason(params, inline_await_limit_ms) {
+        reject_new_durable_ssh_promotion(
+            &params.command,
+            &params.args,
+            Some(background_reason),
+            None,
+        )?;
+    }
     Ok(())
 }
 
@@ -1972,23 +2158,173 @@ pub fn prepare_run_shell_start_params_for_context(
     Ok(params)
 }
 
+#[allow(
+    dead_code,
+    reason = "kept as the direct M4 durable-shell helper for unit tests and non-server callers"
+)]
 pub fn start_authorized_shell_job(
     params: ActRunShellStartParams,
     authorization: &RunShellAuthorization,
     context: Option<&ShellExecutionContext>,
 ) -> Result<ActRunShellStartResponse, ErrorData> {
+    start_authorized_shell_job_with_boundary(
+        params,
+        authorization,
+        context,
+        &allow_physical_mutation,
+    )
+}
+
+pub(crate) fn start_authorized_shell_job_with_boundary(
+    params: ActRunShellStartParams,
+    authorization: &RunShellAuthorization,
+    context: Option<&ShellExecutionContext>,
+    boundary: &PhysicalMutationBoundary<'_>,
+) -> Result<ActRunShellStartResponse, ErrorData> {
+    let _ = unresolved_shell_child_owner_report();
+    // This gate deliberately precedes request hashing and job-directory
+    // creation. A refused SSH durable promotion must not spawn a local/remote
+    // process or leave a synthetic tracked-job artifact that recovery could
+    // later mistake for acquired ownership.
+    reject_new_durable_ssh_promotion(
+        &params.command,
+        &params.args,
+        Some("explicit_act_run_shell_start"),
+        params.job_id.as_deref(),
+    )?;
     let started = Instant::now();
     let started_at = chrono::Utc::now().to_rfc3339();
     let request_sha256 = run_shell_start_request_sha256(&params)?;
     let (job_id, paths) = create_shell_job_paths(params.job_id.as_deref())?;
     write_shell_job_request(&paths, &params, &request_sha256, context)?;
-    write_shell_remote_cleanup_invocation(&paths, &params)?;
+    // Prepare the tracked argv and its recovery sidecar once. They are one
+    // safety object: spawning a guardian without the exact replayable sidecar
+    // would create a remote process that cancel/startup recovery cannot own.
+    let spawn_plan = match shell_job_spawn_plan(&params, &job_id) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let mut status = shell_job_status_record(
+                &job_id,
+                "spawn_refused",
+                &params,
+                &paths,
+                &request_sha256,
+                authorization,
+                started_at.clone(),
+                None,
+                context,
+            );
+            mark_shell_job_remote_pre_marker_terminal(
+                &mut status,
+                "act_run_shell_start_preflight",
+                "spawn_refused",
+                RemotePreMarkerTerminalEvidence {
+                    reason: "tracking_preflight_refused_before_spawn",
+                    pattern: "no_child_process_created",
+                },
+            );
+            // Preflight runs before output files or a child exist, so this is
+            // stronger than stderr-based pre-marker inference: no remote
+            // process could have started even when the original argv was too
+            // unsafe for the ordinary tracking-pending classifier.
+            status.remote_process_scope.remote_cleanup_required = false;
+            status.remote_process_scope.remote_cleanup_verified = false;
+            status.remote_process_scope.remote_cleanup_status =
+                SHELL_REMOTE_CLEANUP_PRE_MARKER_TERMINAL.to_owned();
+            status.remote_process_scope.remote_cleanup_error_code = None;
+            status.remote_process_scope.remote_cleanup_message = Some(
+                "SSH tracking preflight refused the prepared plan before any child process was created"
+                    .to_owned(),
+            );
+            push_unique_evidence(
+                &mut status.remote_process_scope.detection_evidence,
+                "remote_tracking_pre_marker_terminal:tracking_preflight_refused_before_spawn"
+                    .to_owned(),
+            );
+            status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            status.duration_ms =
+                Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            status.error_code = Some(extract_error_code(&error));
+            status.error_message = Some(error.message.to_string());
+            let durable_state_failure = match write_shell_job_status(&paths.status_path, &status) {
+                Ok(()) => match read_shell_job_status(&paths.status_path, &job_id) {
+                    Ok(readback)
+                        if readback.status == "spawn_refused"
+                            && readback.pid.is_none()
+                            && readback.error_code == status.error_code =>
+                    {
+                        tracing::info!(
+                            code = "M4_ACT_RUN_SHELL_PREFLIGHT_REFUSAL_PERSISTED",
+                            job_id,
+                            status_path = %paths.status_path.display(),
+                            "persisted and independently read back SSH tracking preflight refusal"
+                        );
+                        None
+                    }
+                    Ok(readback) => Some((
+                        error_codes::STORAGE_READ_FAILED,
+                        "spawn_refused_readback_mismatch",
+                        format!(
+                            "expected status=spawn_refused pid=None error_code={:?}; actual status={} pid={:?} error_code={:?}",
+                            status.error_code, readback.status, readback.pid, readback.error_code
+                        ),
+                    )),
+                    Err(read_error) => Some((
+                        error_codes::STORAGE_READ_FAILED,
+                        "spawn_refused_readback_failed",
+                        format!("{read_error:?}"),
+                    )),
+                },
+                Err(write_error) => Some((
+                    error_codes::STORAGE_WRITE_FAILED,
+                    "spawn_refused_write_failed",
+                    format!("{write_error:?}"),
+                )),
+            };
+            if let Some((durable_error_code, reason, durable_detail)) = durable_state_failure {
+                tracing::error!(
+                    code = "M4_ACT_RUN_SHELL_PREFLIGHT_REFUSAL_DURABLE_STATE_FAILED",
+                    job_id,
+                    reason,
+                    durable_detail,
+                    policy_error = %error.message,
+                    status_path = %paths.status_path.display(),
+                    "SSH tracking preflight refusal durable state could not be verified"
+                );
+                return Err(shell_tool_error(
+                    durable_error_code,
+                    format!(
+                        "act_run_shell_start refused unsafe SSH tracking ({}) but could not verify its durable spawn_refused status: {durable_detail}",
+                        error.message
+                    ),
+                    json!({
+                        "code": durable_error_code,
+                        "job_id": job_id,
+                        "status_path": paths.status_path,
+                        "reason": reason,
+                        "durable_detail": durable_detail,
+                        "policy_error_code": extract_error_code(&error),
+                        "policy_error_message": error.message,
+                    }),
+                ));
+            }
+            return Err(error);
+        }
+    };
+    write_shell_remote_cleanup_invocation(&paths, spawn_plan.remote_cleanup_invocation.as_ref())?;
 
     let stdout_file = open_shell_job_output(&paths.stdout_path, "stdout", &job_id)?;
     let stderr_file = open_shell_job_output(&paths.stderr_path, "stderr", &job_id)?;
-    let spawned = match spawn_shell_job_child(&params, &job_id, stdout_file, stderr_file, context) {
+    boundary("act_run_shell_start_immediately_before_create_process")?;
+    let spawned = match spawn_shell_job_child(
+        &params,
+        &spawn_plan,
+        stdout_file,
+        stderr_file,
+        context,
+    ) {
         Ok(spawned) => spawned,
-        Err(error) => {
+        Err(SpawnShellJobChildFailure::BeforeSpawn(error)) => {
             let mut status = shell_job_status_record(
                 &job_id,
                 "spawn_failed",
@@ -2005,25 +2341,212 @@ pub fn start_authorized_shell_job(
                 Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
             status.error_code = Some(extract_error_code(&error));
             status.error_message = Some(error.message.to_string());
-            if let Err(write_error) = write_shell_job_status(&paths.status_path, &status) {
+            if let Err(durable_failure) =
+                persist_and_verify_shell_job_status(&paths.status_path, &status)
+            {
+                let spawn_error_code = extract_error_code(&error);
+                let spawn_error_message = error.message.to_string();
                 tracing::error!(
-                    code = "M4_ACT_RUN_SHELL_JOB_STATUS_WRITE_FAILED_AFTER_SPAWN_FAILURE",
+                    code = "M4_ACT_RUN_SHELL_JOB_STATUS_UNVERIFIED_AFTER_SPAWN_FAILURE",
                     job_id = %job_id,
-                    error = ?write_error,
-                    "act_run_shell_start could not persist spawn failure status"
+                    status_path = %paths.status_path.display(),
+                    durable_error_code = durable_failure.error_code,
+                    durable_reason = durable_failure.reason,
+                    durable_detail = durable_failure.detail,
+                    spawn_error_code,
+                    spawn_error_message,
+                    "act_run_shell_start could not verify the durable spawn failure status"
                 );
+                return Err(shell_tool_error(
+                    durable_failure.error_code,
+                    format!(
+                        "act_run_shell_start failed to spawn ({spawn_error_message}) and could not verify its durable spawn_failed status: {}",
+                        durable_failure.detail
+                    ),
+                    json!({
+                        "code": durable_failure.error_code,
+                        "job_id": job_id,
+                        "status_path": paths.status_path,
+                        "reason": durable_failure.reason,
+                        "durable_detail": durable_failure.detail,
+                        "spawn_error_code": spawn_error_code,
+                        "spawn_error_message": spawn_error_message,
+                    }),
+                ));
             }
+            tracing::info!(
+                code = "M4_ACT_RUN_SHELL_JOB_SPAWN_FAILURE_PERSISTED",
+                job_id = %job_id,
+                status_path = %paths.status_path.display(),
+                "persisted and independently read back the complete spawn_failed status"
+            );
             return Err(error);
+        }
+        Err(SpawnShellJobChildFailure::AfterSpawn(failure)) => {
+            let PostSpawnShellJobChildFailure {
+                error,
+                child,
+                process_job,
+                pid,
+                local_process_identity,
+                mut readback,
+            } = *failure;
+            let cleanup_verified = readback.cleanup_verified;
+            let spawn_error_code = extract_error_code(&error);
+            let spawn_error_message = error.message.to_string();
+            let original_error_data = error.data.clone();
+            let mut status = shell_job_status_record(
+                &job_id,
+                if cleanup_verified {
+                    "spawn_failed_reaped"
+                } else {
+                    SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED
+                },
+                &params,
+                &paths,
+                &request_sha256,
+                authorization,
+                started_at,
+                pid,
+                context,
+            );
+            status.local_process_identity = local_process_identity.clone();
+            status.error_code = Some(spawn_error_code.clone());
+            status.error_message = Some(format!(
+                "post-spawn failure at stage={}; cleanup_verified={cleanup_verified}; {spawn_error_message}",
+                readback.stage
+            ));
+            if cleanup_verified {
+                status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+                status.duration_ms =
+                    Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+            } else {
+                readback.exact_owner_retained = true;
+            }
+            status.spawn_failure = Some(readback.clone());
+
+            let pending_owner = if cleanup_verified {
+                None
+            } else {
+                let process_job_acquired = readback.process_job_acquired;
+                let process_job_close_verified = !process_job_acquired
+                    || readback.process_job_close.as_deref() == Some("Ok(())");
+                let owner = RetainedShellChildOwner {
+                    owner_id: new_reflex_id(),
+                    pid,
+                    stage: readback.stage.clone(),
+                    child: RetainedExactShellChild::Tokio(Box::new(child)),
+                    process_job,
+                    process_job_acquired,
+                    process_job_close_verified,
+                    tree_cleanup_verified: readback.tree_cleanup_verified,
+                    local_process_identity,
+                    durable_spawn_failure: Some(RetainedDurableSpawnFailure {
+                        status_path: paths.status_path.clone(),
+                        status: status.clone(),
+                    }),
+                };
+                Some(owner)
+            };
+            let durable_failure =
+                persist_and_verify_shell_job_status(&paths.status_path, &status).err();
+            // Publish the owner to the process-lifetime registry only after the
+            // unresolved durable record has completed its first commit attempt.
+            // This prevents a concurrent retry from writing the terminal state
+            // and then being overwritten by this caller's older unresolved one.
+            let retained_owner = pending_owner.map(retain_unresolved_shell_child_owner);
+            tracing::error!(
+                code = "M4_ACT_RUN_SHELL_POST_SPAWN_FAILURE_PERSISTED",
+                job_id = %job_id,
+                pid = ?pid,
+                stage = %readback.stage,
+                cleanup_verified,
+                exact_owner_retained = readback.exact_owner_retained,
+                retained_owner = ?retained_owner,
+                durable_failure = ?durable_failure,
+                status_path = %paths.status_path.display(),
+                "post-spawn failure preserved exact cleanup ownership and durable truth"
+            );
+            let response_code = durable_failure
+                .as_ref()
+                .map_or(error_codes::TOOL_INTERNAL_ERROR, |failure| {
+                    failure.error_code
+                });
+            return Err(shell_tool_error(
+                response_code,
+                if let Some(failure) = durable_failure.as_ref() {
+                    format!(
+                        "{spawn_error_message}; post-spawn cleanup_verified={cleanup_verified}, but durable status verification also failed: {}",
+                        failure.detail
+                    )
+                } else {
+                    format!(
+                        "{spawn_error_message}; post-spawn cleanup_verified={cleanup_verified}; exact_owner_retained={}",
+                        readback.exact_owner_retained
+                    )
+                },
+                json!({
+                    "code": response_code,
+                    "job_id": job_id,
+                    "pid": pid,
+                    "status_path": paths.status_path,
+                    "reason": "post_spawn_failure",
+                    "spawn_error_code": spawn_error_code,
+                    "spawn_error_message": spawn_error_message,
+                    "spawn_error_data": original_error_data,
+                    "spawn_failure": readback,
+                    "retained_owner": retained_owner,
+                    "durable_status_failure": durable_failure,
+                }),
+            ));
         }
     };
     let mut child = spawned.child;
-    let process_job = spawned.process_job;
+    let mut process_job = spawned.process_job;
+    let local_process_identity = spawned.local_process_identity;
 
     let Some(pid) = child.id() else {
-        let _ = child.start_kill();
+        // Keep the kill-on-close job authority alive while first terminating
+        // and polling the exact child handle. If that direct path cannot prove
+        // reaping, close the job object (which terminates its owned tree on
+        // Windows) and perform one final bounded exact-handle readback.
+        let initial_cleanup = terminate_and_reap_tokio_child_bounded(
+            &mut child,
+            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+        );
+        let job_close = process_job.close_checked();
+        let state_after_job_close = local_process_identity_state(&local_process_identity);
+        let post_job_close_cleanup = if initial_cleanup.reaped
+            && !matches!(
+                state_after_job_close,
+                LocalProcessIdentityState::Match | LocalProcessIdentityState::Unreadable(_)
+            ) {
+            None
+        } else {
+            Some(terminate_and_reap_tokio_child_bounded(
+                &mut child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            ))
+        };
+        let final_identity_state = local_process_identity_state(&local_process_identity);
+        let cleanup_verified = (initial_cleanup.reaped
+            || post_job_close_cleanup
+                .as_ref()
+                .is_some_and(|readback| readback.reaped))
+            && job_close.is_ok()
+            && matches!(
+                final_identity_state,
+                LocalProcessIdentityState::Exited
+                    | LocalProcessIdentityState::Absent
+                    | LocalProcessIdentityState::Mismatch(_)
+            );
         let mut status = shell_job_status_record(
             &job_id,
-            "pid_unavailable",
+            if cleanup_verified {
+                "pid_unavailable_reaped"
+            } else {
+                "pid_unavailable_cleanup_unverified"
+            },
             &params,
             &paths,
             &request_sha256,
@@ -2032,24 +2555,61 @@ pub fn start_authorized_shell_job(
             None,
             context,
         );
+        seed_shell_job_remote_ownership(&mut status, spawn_plan.remote_cleanup_invocation.as_ref());
         status.completed_at = Some(chrono::Utc::now().to_rfc3339());
         status.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
-        status.error_message = Some("spawned process id was unavailable".to_owned());
-        write_shell_job_status(&paths.status_path, &status)?;
+        status.error_message = Some(format!(
+            "spawned process id was unavailable; exact child cleanup verified={cleanup_verified}; initial_cleanup={initial_cleanup:?}; job_close={job_close:?}; state_after_job_close={state_after_job_close:?}; post_job_close_cleanup={post_job_close_cleanup:?}; final_identity_state={final_identity_state:?}"
+        ));
+        let durable_failure =
+            persist_and_verify_shell_job_status(&paths.status_path, &status).err();
+        if let Some(failure) = durable_failure.as_ref() {
+            tracing::error!(
+                code = "M4_ACT_RUN_SHELL_JOB_PID_UNAVAILABLE_DURABLE_STATE_FAILED",
+                job_id = %job_id,
+                status_path = %paths.status_path.display(),
+                cleanup_verified,
+                initial_cleanup = ?initial_cleanup,
+                job_close = ?job_close,
+                state_after_job_close = ?state_after_job_close,
+                post_job_close_cleanup = ?post_job_close_cleanup,
+                final_identity_state = ?final_identity_state,
+                durable_error_code = failure.error_code,
+                durable_reason = failure.reason,
+                durable_detail = failure.detail,
+                "pid-unavailable child cleanup status could not be durably verified"
+            );
+        }
+        let response_code = durable_failure
+            .as_ref()
+            .map_or(error_codes::TOOL_INTERNAL_ERROR, |failure| {
+                failure.error_code
+            });
         return Err(shell_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "act_run_shell_start spawned a child process but could not read its pid",
+            response_code,
+            if cleanup_verified {
+                "act_run_shell_start spawned a child process without an observable pid; the exact child handle was terminated and reaped"
+            } else {
+                "act_run_shell_start spawned a child process without an observable pid and could not verify exact-child reaping before the cleanup backstop"
+            },
             json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "code": response_code,
                 "job_id": job_id,
                 "reason": "pid_unavailable",
                 "status_path": paths.status_path,
+                "cleanup_verified": cleanup_verified,
+                "initial_cleanup": initial_cleanup,
+                "job_close": format!("{job_close:?}"),
+                "state_after_job_close": state_after_job_close,
+                "post_job_close_cleanup": post_job_close_cleanup,
+                "final_identity_state": final_identity_state,
+                "durable_status_failure": durable_failure,
             }),
         ));
     };
 
-    let status = shell_job_status_record(
+    let mut status = shell_job_status_record(
         &job_id,
         "running",
         &params,
@@ -2060,7 +2620,16 @@ pub fn start_authorized_shell_job(
         Some(pid),
         context,
     );
-    write_shell_job_status(&paths.status_path, &status)?;
+    seed_shell_job_remote_ownership(&mut status, spawn_plan.remote_cleanup_invocation.as_ref());
+    status.local_process_identity = Some(local_process_identity.clone());
+    persist_running_shell_job_status_or_cleanup(
+        &paths,
+        &mut status,
+        &mut child,
+        &local_process_identity,
+        &mut process_job,
+        started,
+    )?;
 
     let monitor_paths = paths.clone();
     let monitor_status = status.clone();
@@ -2100,6 +2669,7 @@ pub fn shell_job_status(
     params: &ActRunShellStatusParams,
     session_id: Option<&str>,
 ) -> Result<ActRunShellStatusResponse, ErrorData> {
+    let _ = unresolved_shell_child_owner_report();
     validate_shell_job_id(&params.job_id)?;
     if params.tail_bytes > SHELL_JOB_TAIL_MAX_BYTES {
         return Err(shell_tool_error(
@@ -2214,10 +2784,24 @@ fn write_shell_job_status_readback(
 }
 
 fn shell_job_process_still_running(job: &ActRunShellJobStatus) -> bool {
-    shell_job_live_status(&job.status)
-        && job
-            .pid
-            .is_some_and(|pid| shell_job_live_process_ids(&[pid]).contains(&pid))
+    if !shell_job_live_status(&job.status) {
+        return false;
+    }
+    let Some(pid) = job.pid else {
+        return false;
+    };
+    let Some(identity) = job.local_process_identity.as_ref() else {
+        // Legacy status records predate immutable creation identity.
+        return shell_job_live_process_ids(&[pid]).contains(&pid);
+    };
+    if identity.pid != pid {
+        // Malformed identity is uncertainty, never proof of absence.
+        return true;
+    }
+    matches!(
+        local_process_identity_state(identity),
+        LocalProcessIdentityState::Match | LocalProcessIdentityState::Unreadable(_)
+    )
 }
 
 fn shell_job_status_diagnostics(
@@ -2481,6 +3065,7 @@ pub fn cancel_shell_job(
     params: &ActRunShellJobIdParams,
     session_id: Option<&str>,
 ) -> Result<ActRunShellCancelResponse, ErrorData> {
+    let _ = unresolved_shell_child_owner_report();
     validate_shell_job_id(&params.job_id)?;
     let paths = shell_job_paths_for_id(session_id, &params.job_id)?;
     let mut job = read_shell_job_status(&paths.status_path, &params.job_id)?;
@@ -2494,15 +3079,17 @@ pub fn cancel_shell_job(
         cancel_requested = true;
         ensure_shell_job_remote_scope_from_process_tree(&mut job);
         job.cancel_requested = true;
-        job.status = "cancel_requested".to_owned();
+        if job.status != SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED {
+            job.status = "cancel_requested".to_owned();
+        }
         let _ = wait_for_shell_job_remote_metadata(
             &mut job,
             &paths,
             Duration::from_millis(SHELL_REMOTE_METADATA_WAIT_MS),
         )?;
         write_shell_job_status(&paths.status_path, &job)?;
-        if let Some(pid) = job.pid {
-            let termination = terminate_shell_job_process_tree(pid);
+        if job.pid.is_some() {
+            let termination = terminate_shell_job_from_status(&job);
             termination_attempted = termination.attempted;
             termination_status = termination.status;
             remaining_process_ids = termination.remaining_process_ids;
@@ -2823,6 +3410,2813 @@ pub fn cleanup_shell_jobs_for_session(
     Ok(readback)
 }
 
+const SHELL_JOB_QUARANTINE_MANIFEST_SCHEMA_VERSION: u32 = 2;
+const SHELL_JOB_RECOVERY_ID_SAMPLE_CAP: usize = 64;
+
+/// Startup-only evidence-preserving disposition for a durable shell-job
+/// directory whose `status.json` cannot be decoded. The ordinary reaper and
+/// live session cleanup deliberately never invoke this path: only daemon
+/// startup, after the canonical shell-job-store lifetime lock proves exclusive
+/// ownership of this exact frozen root, has the boundary required to classify
+/// an unreadable row as abandoned.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct ShellJobCorruptRecoveryReadback {
+    pub job_root: Option<String>,
+    pub quarantine_root: Option<String>,
+    pub scanned_job_dirs: usize,
+    pub retained_valid_status_jobs: usize,
+    pub corrupt_status_jobs: usize,
+    pub quarantined_jobs: usize,
+    pub remote_state_verified_jobs: usize,
+    pub retained_unverifiable_remote_jobs: usize,
+    pub unexpected_job_root_entries: usize,
+    pub skipped_concurrently_mutated: usize,
+    pub recovery_failures: usize,
+    pub bytes_quarantined: u64,
+    pub quarantined_job_ids_sample: Vec<String>,
+    pub retained_job_ids_sample: Vec<String>,
+    pub unexpected_job_root_entries_sample: Vec<String>,
+    pub quarantine_paths_sample: Vec<String>,
+    pub manifest_paths_sample: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShellJobQuarantineArtifact {
+    relative_path: String,
+    byte_len: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShellJobRemoteCommandEvidence {
+    operation: String,
+    exit_code: Option<i32>,
+    stdout_byte_len: u64,
+    stdout_sha256: String,
+    stderr_byte_len: u64,
+    stderr_sha256: String,
+    parsed_status: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShellJobQuarantineRemoteVerification {
+    sidecar_present: bool,
+    process_marker_present: bool,
+    remote_identity_sha256: Option<String>,
+    remote_pid: Option<String>,
+    remote_pgid: Option<String>,
+    liveness_before: Option<ShellJobRemoteCommandEvidence>,
+    cleanup: Option<ShellJobRemoteCommandEvidence>,
+    liveness_after: Option<ShellJobRemoteCommandEvidence>,
+    #[serde(default)]
+    recovery_intent_sha256: Option<String>,
+    #[serde(default)]
+    recovery_outcome_sha256: Option<String>,
+    verdict: String,
+}
+
+/// Immutable authorization record committed before corrupt-job recovery is
+/// allowed to signal a live remote guardian. A restart reuses this exact
+/// `recovery_id`; it never creates a second ambiguous authorization record.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShellJobRemoteRecoveryIntent {
+    schema_version: u32,
+    recovery_id: String,
+    job_id: String,
+    created_at: String,
+    quarantine_job_dir: String,
+    remote_identity_sha256: String,
+    remote_pid: String,
+    remote_pgid: String,
+    remote_boot_id: String,
+    remote_process_start_time: String,
+    remote_ownership_token_sha256: String,
+    cleanup_sidecar_sha256: String,
+    cleanup_sidecar_schema_version: u32,
+    reason: String,
+}
+
+/// Immutable terminal evidence linked to the pre-signal intent by digest.
+/// Keeping intent and outcome separate makes their ordering independently
+/// auditable after a crash.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShellJobRemoteRecoveryOutcome {
+    schema_version: u32,
+    recovery_id: String,
+    job_id: String,
+    completed_at: String,
+    intent_sha256: String,
+    cleanup: Option<ShellJobRemoteCommandEvidence>,
+    liveness_after: ShellJobRemoteCommandEvidence,
+    verdict: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShellJobQuarantineManifest {
+    schema_version: u32,
+    recovery_id: String,
+    job_id: String,
+    quarantined_at: String,
+    reason: String,
+    startup_safety_boundary: String,
+    source_job_dir: String,
+    quarantine_job_dir: String,
+    status_read_error: String,
+    original_artifact_count: usize,
+    original_artifact_bytes: u64,
+    /// Operator/job-produced artifacts, excluding recovery intent/outcome
+    /// records generated by this state machine.
+    #[serde(default)]
+    pre_recovery_artifact_count: usize,
+    #[serde(default)]
+    pre_recovery_artifact_bytes: u64,
+    #[serde(default)]
+    recovery_generated_artifact_count: usize,
+    #[serde(default)]
+    recovery_generated_artifact_bytes: u64,
+    artifacts: Vec<ShellJobQuarantineArtifact>,
+    remote_verification: ShellJobQuarantineRemoteVerification,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ShellJobQuarantineCompletion {
+    schema_version: u32,
+    recovery_id: String,
+    job_id: String,
+    completed_at: String,
+    quarantine_job_dir: String,
+    manifest_file_name: String,
+    manifest_sha256: String,
+    original_artifact_count: usize,
+    original_artifact_bytes: u64,
+    #[serde(default)]
+    pre_recovery_artifact_count: usize,
+    #[serde(default)]
+    pre_recovery_artifact_bytes: u64,
+    #[serde(default)]
+    recovery_generated_artifact_count: usize,
+    #[serde(default)]
+    recovery_generated_artifact_bytes: u64,
+    remote_verdict: String,
+}
+
+fn shell_job_quarantine_root_dir() -> Result<PathBuf, ErrorData> {
+    Ok(shell_job_root_dir()?.join("quarantine"))
+}
+
+fn shell_job_quarantine_artifacts(
+    job_dir: &Path,
+) -> Result<Vec<ShellJobQuarantineArtifact>, String> {
+    let entries = fs::read_dir(job_dir).map_err(|error| {
+        format!(
+            "failed to enumerate corrupt job artifacts under {}: {error}",
+            job_dir.display()
+        )
+    })?;
+    let mut artifacts = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read a corrupt job artifact entry under {}: {error}",
+                job_dir.display()
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "failed to classify corrupt job artifact {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if !file_type.is_file() {
+            return Err(format!(
+                "corrupt job artifact {} is not a regular file; refusing an unverifiable quarantine move",
+                entry.path().display()
+            ));
+        }
+        let relative_path = entry.file_name().into_string().map_err(|name| {
+            format!(
+                "corrupt job artifact name is not UTF-8: {:?}",
+                name.to_string_lossy()
+            )
+        })?;
+        let bytes = fs::read(entry.path()).map_err(|error| {
+            format!(
+                "failed to read corrupt job artifact {} before quarantine: {error}",
+                entry.path().display()
+            )
+        })?;
+        let byte_len = u64::try_from(bytes.len()).map_err(|error| {
+            format!(
+                "corrupt job artifact length cannot be represented at {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        artifacts.push(ShellJobQuarantineArtifact {
+            relative_path,
+            byte_len,
+            sha256: sha256_hex(&bytes),
+        });
+    }
+    artifacts.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    Ok(artifacts)
+}
+
+fn shell_job_quarantine_artifact_accounting(
+    artifacts: &[ShellJobQuarantineArtifact],
+) -> Result<(usize, u64, usize, u64), String> {
+    let mut pre_count = 0usize;
+    let mut pre_bytes = 0u64;
+    let mut generated_count = 0usize;
+    let mut generated_bytes = 0u64;
+    for artifact in artifacts {
+        let recovery_generated = artifact
+            .relative_path
+            .starts_with("remote-recovery-intent-")
+            || artifact
+                .relative_path
+                .starts_with("remote-recovery-outcome-");
+        if recovery_generated {
+            generated_count = generated_count.checked_add(1).ok_or_else(|| {
+                format!(
+                    "recovery-generated artifact count overflow while accounting {:?}",
+                    artifact.relative_path
+                )
+            })?;
+            generated_bytes = generated_bytes
+                .checked_add(artifact.byte_len)
+                .ok_or_else(|| {
+                    format!(
+                        "recovery-generated artifact byte total overflow while accounting {:?}: before={generated_bytes} add={}",
+                        artifact.relative_path, artifact.byte_len
+                    )
+                })?;
+        } else {
+            pre_count = pre_count.checked_add(1).ok_or_else(|| {
+                format!(
+                    "pre-recovery artifact count overflow while accounting {:?}",
+                    artifact.relative_path
+                )
+            })?;
+            pre_bytes = pre_bytes.checked_add(artifact.byte_len).ok_or_else(|| {
+                format!(
+                    "pre-recovery artifact byte total overflow while accounting {:?}: before={pre_bytes} add={}",
+                    artifact.relative_path, artifact.byte_len
+                )
+            })?;
+        }
+    }
+    Ok((pre_count, pre_bytes, generated_count, generated_bytes))
+}
+
+fn shell_job_remote_command_evidence(
+    operation: &str,
+    readback: &CleanupCommandReadback,
+    parsed_status: &str,
+) -> ShellJobRemoteCommandEvidence {
+    ShellJobRemoteCommandEvidence {
+        operation: operation.to_owned(),
+        exit_code: readback.exit_code,
+        stdout_byte_len: readback.stdout_byte_len,
+        stdout_sha256: readback.stdout_sha256.clone(),
+        stderr_byte_len: readback.stderr_byte_len,
+        stderr_sha256: readback.stderr_sha256.clone(),
+        parsed_status: parsed_status.to_owned(),
+    }
+}
+
+fn run_corrupt_job_remote_liveness_probe(
+    invocation: &ShellRemoteCleanupInvocation,
+    pid: &str,
+    pgid: &str,
+    operation: &str,
+) -> Result<(CleanupCommandReadback, String), String> {
+    run_remote_liveness_probe(
+        &invocation.command,
+        &invocation.control_args,
+        pid,
+        pgid,
+        operation,
+    )
+}
+
+fn run_remote_liveness_probe(
+    command: &str,
+    invocation_args: &[String],
+    pid: &str,
+    pgid: &str,
+    operation: &str,
+) -> Result<(CleanupCommandReadback, String), String> {
+    let mut args = hardened_ssh_automatic_replay_args(invocation_args)?;
+    args.push(ssh_remote_liveness_command(pid, pgid));
+    let readback = run_shell_cleanup_command_with_timeout(
+        command,
+        &args,
+        Duration::from_millis(SHELL_REMOTE_LIVENESS_TIMEOUT_MS),
+    )?;
+    let status = parse_remote_liveness_status(&readback.stdout, pid, pgid).ok_or_else(|| {
+        format!(
+            "{operation} returned no valid {SHELL_REMOTE_LIVENESS_MARKER}; exit={:?}; stdout_sha256={}; stderr_sha256={}",
+            readback.exit_code,
+            readback.stdout_sha256,
+            readback.stderr_sha256
+        )
+    })?;
+    if readback.exit_code != Some(0) {
+        return Err(format!(
+            "{operation} returned status={status} with nonzero/unknown exit={:?}; stdout_sha256={}; stderr_sha256={}",
+            readback.exit_code, readback.stdout_sha256, readback.stderr_sha256
+        ));
+    }
+    Ok((readback, status))
+}
+
+fn shell_job_recovery_record_paths(job_dir: &Path, prefix: &str) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(job_dir).map_err(|error| {
+        format!(
+            "failed to enumerate recovery records under {}: {error}",
+            job_dir.display()
+        )
+    })?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read recovery record entry under {}: {error}",
+                job_dir.display()
+            )
+        })?;
+        let name = entry.file_name().into_string().map_err(|name| {
+            format!(
+                "recovery record name is not UTF-8 under {}: {}",
+                job_dir.display(),
+                name.to_string_lossy()
+            )
+        })?;
+        if name.starts_with(prefix) && name.ends_with(".json") {
+            let file_type = entry.file_type().map_err(|error| {
+                format!(
+                    "failed to classify recovery record {}: {error}",
+                    entry.path().display()
+                )
+            })?;
+            if !file_type.is_file() {
+                return Err(format!(
+                    "recovery record path is not a regular file: {}",
+                    entry.path().display()
+                ));
+            }
+            paths.push(entry.path());
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn validate_recovery_sha256(value: &str, field: &str, job_id: &str) -> Result<(), String> {
+    if value.len() == 64
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "remote recovery {field} is not a lowercase SHA-256 digest for {job_id}"
+        ))
+    }
+}
+
+fn validate_remote_command_evidence_digests(
+    evidence: &ShellJobRemoteCommandEvidence,
+    role: &str,
+    job_id: &str,
+) -> Result<(), String> {
+    validate_recovery_sha256(
+        &evidence.stdout_sha256,
+        &format!("{role}_stdout_sha256"),
+        job_id,
+    )?;
+    validate_recovery_sha256(
+        &evidence.stderr_sha256,
+        &format!("{role}_stderr_sha256"),
+        job_id,
+    )?;
+    for (stream, byte_len, digest) in [
+        ("stdout", evidence.stdout_byte_len, &evidence.stdout_sha256),
+        ("stderr", evidence.stderr_byte_len, &evidence.stderr_sha256),
+    ] {
+        if byte_len > SHELL_CLEANUP_CAPTURE_CAP_BYTES {
+            return Err(format!(
+                "remote recovery {role}_{stream}_byte_len exceeds the physical capture cap for {job_id}: recorded={byte_len} cap={SHELL_CLEANUP_CAPTURE_CAP_BYTES}"
+            ));
+        }
+        let digest_is_empty = digest == &sha256_hex(b"");
+        if (byte_len == 0) != digest_is_empty {
+            return Err(format!(
+                "remote recovery {role}_{stream} length/digest emptiness differs for {job_id}: byte_len={byte_len} sha256={digest}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn read_existing_remote_recovery_intent(
+    paths: &ShellJobPaths,
+    job_id: &str,
+) -> Result<Option<(ShellJobRemoteRecoveryIntent, String)>, String> {
+    let records = shell_job_recovery_record_paths(&paths.job_dir, "remote-recovery-intent-")?;
+    if records.len() > 1 {
+        return Err(format!(
+            "corrupt job {job_id} has {} remote recovery intents; exactly zero or one is allowed",
+            records.len()
+        ));
+    }
+    let Some(path) = records.first() else {
+        return Ok(None);
+    };
+    let bytes = fs::read(path)
+        .map_err(|error| format!("failed to read remote recovery intent for {job_id}: {error}"))?;
+    let intent: ShellJobRemoteRecoveryIntent = serde_json::from_slice(&bytes).map_err(|error| {
+        format!("failed to decode remote recovery intent for {job_id}: {error}")
+    })?;
+    if intent.schema_version != 1 || intent.job_id != job_id {
+        return Err(format!(
+            "remote recovery intent schema/job identity differs for {job_id}"
+        ));
+    }
+    let expected_name = format!("remote-recovery-intent-{}.json", intent.recovery_id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return Err(format!(
+            "remote recovery intent filename differs from recovery_id for {job_id}"
+        ));
+    }
+    if !valid_remote_process_number(&intent.remote_pid)
+        || !valid_remote_process_number(&intent.remote_pgid)
+        || !valid_remote_boot_id(&intent.remote_boot_id)
+        || !valid_remote_process_start_time(&intent.remote_process_start_time)
+    {
+        return Err(format!(
+            "remote recovery intent contains malformed process identity for {job_id}"
+        ));
+    }
+    validate_recovery_sha256(
+        &intent.remote_identity_sha256,
+        "remote_identity_sha256",
+        job_id,
+    )?;
+    validate_recovery_sha256(
+        &intent.remote_ownership_token_sha256,
+        "remote_ownership_token_sha256",
+        job_id,
+    )?;
+    validate_recovery_sha256(
+        &intent.cleanup_sidecar_sha256,
+        "cleanup_sidecar_sha256",
+        job_id,
+    )?;
+    Ok(Some((intent, sha256_hex(&bytes))))
+}
+
+fn read_existing_remote_recovery_outcome(
+    paths: &ShellJobPaths,
+    job_id: &str,
+) -> Result<Option<(ShellJobRemoteRecoveryOutcome, String)>, String> {
+    let records = shell_job_recovery_record_paths(&paths.job_dir, "remote-recovery-outcome-")?;
+    if records.len() > 1 {
+        return Err(format!(
+            "corrupt job {job_id} has {} remote recovery outcomes; exactly zero or one is allowed",
+            records.len()
+        ));
+    }
+    let Some(path) = records.first() else {
+        return Ok(None);
+    };
+    let bytes = fs::read(path)
+        .map_err(|error| format!("failed to read remote recovery outcome for {job_id}: {error}"))?;
+    let outcome: ShellJobRemoteRecoveryOutcome =
+        serde_json::from_slice(&bytes).map_err(|error| {
+            format!("failed to decode remote recovery outcome for {job_id}: {error}")
+        })?;
+    if outcome.schema_version != 1 || outcome.job_id != job_id {
+        return Err(format!(
+            "remote recovery outcome schema/job identity differs for {job_id}"
+        ));
+    }
+    let expected_name = format!("remote-recovery-outcome-{}.json", outcome.recovery_id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return Err(format!(
+            "remote recovery outcome filename differs from recovery_id for {job_id}"
+        ));
+    }
+    validate_recovery_sha256(&outcome.intent_sha256, "intent_sha256", job_id)?;
+    validate_remote_recovery_outcome_semantics(&outcome, job_id)?;
+    Ok(Some((outcome, sha256_hex(&bytes))))
+}
+
+fn validate_remote_recovery_outcome_semantics(
+    outcome: &ShellJobRemoteRecoveryOutcome,
+    job_id: &str,
+) -> Result<(), String> {
+    validate_remote_command_evidence_digests(
+        &outcome.liveness_after,
+        "outcome_liveness_after",
+        job_id,
+    )?;
+    if let Some(cleanup) = outcome.cleanup.as_ref() {
+        validate_remote_command_evidence_digests(cleanup, "outcome_cleanup", job_id)?;
+    }
+    let terminal_after = outcome.liveness_after.exit_code == Some(0)
+        && outcome.liveness_after.parsed_status == "already_gone";
+    let cleanup_valid = outcome.cleanup.as_ref().is_some_and(|cleanup| {
+        cleanup.operation == "identity_bound_cleanup"
+            && cleanup.exit_code == Some(0)
+            && matches!(
+                cleanup.parsed_status.as_str(),
+                "terminated" | "already_gone"
+            )
+    });
+    let valid = match outcome.verdict.as_str() {
+        "remote_identity_bound_cleanup_verified" => {
+            cleanup_valid && terminal_after && outcome.liveness_after.operation == "liveness_after"
+        }
+        "remote_already_gone_after_durable_cleanup_intent" => {
+            outcome.cleanup.is_none()
+                && terminal_after
+                && outcome.liveness_after.operation == "resume_liveness_after"
+        }
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "remote recovery outcome has an impossible verdict/evidence shape for {job_id}: verdict={}",
+            outcome.verdict
+        ))
+    }
+}
+
+fn persist_immutable_shell_recovery_record<T>(
+    path: &Path,
+    job_id: &str,
+    role: &str,
+    value: &T,
+) -> Result<String, String>
+where
+    T: Serialize + for<'de> Deserialize<'de> + PartialEq,
+{
+    if path.try_exists().map_err(|error| {
+        format!(
+            "failed to inspect {role} existence at {}: {error}",
+            path.display()
+        )
+    })? {
+        return Err(format!(
+            "refusing to overwrite immutable {role} at {}",
+            path.display()
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("failed to encode {role} for {job_id}: {error}"))?;
+    let tmp_path = shell_status_temp_path(path);
+    if let Err(error) = write_shell_job_status_staging(&tmp_path, &bytes) {
+        let staging_cleanup = cleanup_failed_atomic_staging_file(&tmp_path);
+        return Err(format!(
+            "failed to durably stage {role} at {}: {error}; {staging_cleanup}",
+            path.display(),
+        ));
+    }
+    if let Err(error) = commit_shell_job_status_file(&tmp_path, path, job_id) {
+        let staging_cleanup = cleanup_failed_atomic_staging_file(&tmp_path);
+        return Err(format!(
+            "failed to atomically commit {role} at {}: {error}; {staging_cleanup}",
+            path.display(),
+        ));
+    }
+    let persisted = fs::read(path)
+        .map_err(|error| format!("failed to read back {role} at {}: {error}", path.display()))?;
+    if persisted != bytes {
+        return Err(format!(
+            "{role} byte readback differs at {}: expected_sha256={} actual_sha256={}",
+            path.display(),
+            sha256_hex(&bytes),
+            sha256_hex(&persisted)
+        ));
+    }
+    let decoded: T = serde_json::from_slice(&persisted)
+        .map_err(|error| format!("failed to decode {role} readback for {job_id}: {error}"))?;
+    if &decoded != value {
+        return Err(format!(
+            "{role} structured readback differs at {}",
+            path.display()
+        ));
+    }
+    Ok(sha256_hex(&persisted))
+}
+
+fn persist_remote_recovery_intent(
+    paths: &ShellJobPaths,
+    intent: &ShellJobRemoteRecoveryIntent,
+) -> Result<String, String> {
+    let path = paths.job_dir.join(format!(
+        "remote-recovery-intent-{}.json",
+        intent.recovery_id
+    ));
+    persist_immutable_shell_recovery_record(&path, &intent.job_id, "remote recovery intent", intent)
+}
+
+fn persist_remote_recovery_outcome(
+    paths: &ShellJobPaths,
+    outcome: &ShellJobRemoteRecoveryOutcome,
+) -> Result<String, String> {
+    let path = paths.job_dir.join(format!(
+        "remote-recovery-outcome-{}.json",
+        outcome.recovery_id
+    ));
+    persist_immutable_shell_recovery_record(
+        &path,
+        &outcome.job_id,
+        "remote recovery outcome",
+        outcome,
+    )
+}
+
+fn run_corrupt_job_identity_bound_remote_cleanup(
+    invocation: &ShellRemoteCleanupInvocation,
+    pid: &str,
+    pgid: &str,
+    identity: &RemoteProcessOwnershipIdentity,
+) -> Result<(CleanupCommandReadback, String), String> {
+    let mut args = hardened_ssh_automatic_replay_args(&invocation.control_args)?;
+    args.push(ssh_remote_cleanup_command(pid, pgid, identity));
+    let readback = run_shell_cleanup_command_with_timeout(
+        &invocation.command,
+        &args,
+        Duration::from_millis(SHELL_REMOTE_CLEANUP_TIMEOUT_MS),
+    )?;
+    let status = parse_remote_cleanup_status(&readback.stdout, pid, pgid, Some(identity))
+        .ok_or_else(|| {
+            format!(
+                "startup identity-bound cleanup returned no valid {SHELL_REMOTE_CLEANUP_MARKER}; exit={:?}; stdout_sha256={}; stderr_sha256={}",
+                readback.exit_code,
+                readback.stdout_sha256,
+                readback.stderr_sha256
+            )
+        })?;
+    if readback.exit_code != Some(0) || !matches!(status.as_str(), "already_gone" | "terminated") {
+        return Err(format!(
+            "startup identity-bound cleanup did not reach a verified terminal status; status={status}; exit={:?}; stdout_sha256={}; stderr_sha256={}",
+            readback.exit_code, readback.stdout_sha256, readback.stderr_sha256
+        ));
+    }
+    Ok((readback, status))
+}
+
+/// Inspect the durable request only when corrupt-status recovery otherwise has
+/// no remote ownership evidence. A typed local request can positively exclude
+/// SSH intent; missing, malformed, or redacted shell metadata is uncertainty
+/// and therefore cannot authorize quarantine.
+fn corrupt_shell_job_request_ssh_intent(
+    paths: &ShellJobPaths,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    let request_bytes = match fs::read(&paths.request_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(format!(
+                "request.json is absent for {job_id}; SSH intent cannot be excluded without a sidecar or process marker"
+            ));
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not read request.json while excluding SSH intent for {job_id}: {error}"
+            ));
+        }
+    };
+    let request: Value = serde_json::from_slice(&request_bytes).map_err(|error| {
+        format!("could not decode request.json while excluding SSH intent for {job_id}: {error}")
+    })?;
+    let command = request
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            format!(
+                "request.json has no typed command metadata for {job_id}; SSH intent is unverifiable"
+            )
+        })?;
+    if let Some(client) = ssh_family_client_for_executable(command) {
+        return Ok(Some(format!(
+            "request_direct_ssh_family:{client}:{}",
+            executable_leaf(command)
+        )));
+    }
+
+    let args_redacted = match request.get("args_redacted") {
+        None => false,
+        Some(Value::Bool(redacted)) => *redacted,
+        Some(_) => {
+            return Err(format!(
+                "request.json args_redacted metadata is not boolean for {job_id}; SSH intent is unverifiable"
+            ));
+        }
+    };
+    let args = match request.get("args") {
+        None => {
+            return Err(format!(
+                "request.json has no typed args metadata for {job_id}; shell-wrapped SSH intent is unverifiable"
+            ));
+        }
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value.as_str().map(ToOwned::to_owned).ok_or_else(|| {
+                    format!(
+                        "request.json args metadata contains a non-string value for {job_id}; SSH intent is unverifiable"
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => {
+            return Err(format!(
+                "request.json args metadata is not an array for {job_id}; SSH intent is unverifiable"
+            ));
+        }
+    };
+    if let Some(evidence) = durable_ssh_promotion_evidence(command, &args) {
+        return Ok(Some(format!("request_{evidence}")));
+    }
+    if args_redacted
+        && matches!(
+            executable_leaf(command).to_ascii_lowercase().as_str(),
+            "powershell"
+                | "powershell.exe"
+                | "pwsh"
+                | "pwsh.exe"
+                | "cmd"
+                | "cmd.exe"
+                | "sh"
+                | "bash"
+                | "dash"
+                | "zsh"
+                | "ksh"
+        )
+    {
+        return Err(format!(
+            "request.json shell arguments are redacted for {job_id}; SSH intent cannot be excluded without a sidecar or process marker"
+        ));
+    }
+    Ok(None)
+}
+
+fn verify_corrupt_shell_job_remote_state(
+    paths: &ShellJobPaths,
+    job_id: &str,
+    recovery_id: &str,
+    quarantine_job_dir: &Path,
+) -> Result<ShellJobQuarantineRemoteVerification, String> {
+    let sidecar_present = paths.remote_cleanup_path.try_exists().map_err(|error| {
+        format!(
+            "could not inspect remote cleanup sidecar {}: {error}",
+            paths.remote_cleanup_path.display()
+        )
+    })?;
+    let stderr = match fs::read(&paths.stderr_path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(format!(
+                "could not read stderr while excluding an SSH remote process marker for {job_id}: {error}"
+            ));
+        }
+    };
+    let stderr_text = String::from_utf8_lossy(&stderr);
+    // A truncated/future-version marker is evidence that remote tracking may
+    // have started even when the strict V1 parser cannot recover its fields.
+    // Never reinterpret that uncertainty as "not remote".
+    let raw_process_marker_present = stderr_text.contains("SYNAPSE_REMOTE_PROCESS_");
+    let invocation = if sidecar_present {
+        Some(
+            read_shell_remote_cleanup_invocation(paths, job_id)?.ok_or_else(|| {
+                "remote cleanup sidecar disappeared during startup recovery".to_owned()
+            })?,
+        )
+    } else {
+        None
+    };
+    let expected_ownership_token = invocation
+        .as_ref()
+        .and_then(|invocation| invocation.ownership_token.as_deref());
+    let metadata = parse_remote_process_metadata_with_ownership(
+        &stderr_text,
+        job_id,
+        expected_ownership_token,
+    );
+    if !sidecar_present && metadata.is_none() {
+        if raw_process_marker_present {
+            return Err(format!(
+                "stderr contains a raw SYNAPSE_REMOTE_PROCESS_ marker for {job_id}, but no valid process identity and no remote-cleanup.json sidecar; remote state is unverifiable"
+            ));
+        }
+        if let Some(request_evidence) = corrupt_shell_job_request_ssh_intent(paths, job_id)? {
+            return Err(format!(
+                "request.json records SSH intent for {job_id} ({request_evidence}), but no remote-cleanup.json sidecar or process marker proves remote ownership/state"
+            ));
+        }
+        return Ok(ShellJobQuarantineRemoteVerification {
+            sidecar_present: false,
+            process_marker_present: false,
+            remote_identity_sha256: None,
+            remote_pid: None,
+            remote_pgid: None,
+            liveness_before: None,
+            cleanup: None,
+            liveness_after: None,
+            recovery_intent_sha256: None,
+            recovery_outcome_sha256: None,
+            verdict: "not_remote_or_remote_process_never_tracked".to_owned(),
+        });
+    }
+    if !sidecar_present {
+        return Err(format!(
+            "{SHELL_REMOTE_PROCESS_MARKER} exists for {job_id}, but remote-cleanup.json is absent; remote state is unverifiable"
+        ));
+    }
+    let invocation = invocation
+        .ok_or_else(|| "remote cleanup sidecar disappeared during startup recovery".to_owned())?;
+    let sidecar_bytes = fs::read(&paths.remote_cleanup_path).map_err(|error| {
+        format!(
+            "could not read remote cleanup sidecar bytes for recovery binding at {}: {error}",
+            paths.remote_cleanup_path.display()
+        )
+    })?;
+    let cleanup_sidecar_sha256 = sha256_hex(&sidecar_bytes);
+    let metadata = metadata.ok_or_else(|| {
+        format!(
+            "remote-cleanup.json exists for {job_id}, but stderr has no valid {SHELL_REMOTE_PROCESS_MARKER}; remote state is unverifiable"
+        )
+    })?;
+    let pid = metadata.pid;
+    let pgid = metadata.pgid;
+    let remote_identity_digest = sha256_hex(invocation.remote_identity.as_bytes());
+    let remote_identity_sha256 = Some(remote_identity_digest.clone());
+    let existing_intent = read_existing_remote_recovery_intent(paths, job_id)?;
+    let existing_outcome = read_existing_remote_recovery_outcome(paths, job_id)?;
+    if existing_outcome.is_some() && existing_intent.is_none() {
+        return Err(format!(
+            "remote recovery outcome exists without its immutable intent for {job_id}"
+        ));
+    }
+    if let Some((intent, intent_sha256)) = existing_intent.as_ref() {
+        let ownership_token_sha256 = metadata
+            .ownership_token
+            .as_deref()
+            .map(|token| sha256_hex(token.as_bytes()));
+        if intent.recovery_id != recovery_id
+            || intent.quarantine_job_dir != path_string(quarantine_job_dir)
+            || intent.remote_identity_sha256 != remote_identity_digest
+            || intent.remote_pid != pid
+            || intent.remote_pgid != pgid
+            || metadata.boot_id.as_deref() != Some(intent.remote_boot_id.as_str())
+            || metadata.start_time.as_deref() != Some(intent.remote_process_start_time.as_str())
+            || ownership_token_sha256.as_deref()
+                != Some(intent.remote_ownership_token_sha256.as_str())
+            || intent.cleanup_sidecar_sha256 != cleanup_sidecar_sha256
+            || intent.cleanup_sidecar_schema_version != invocation.schema_version
+        {
+            return Err(format!(
+                "existing remote recovery intent no longer matches marker/sidecar/quarantine identity for {job_id}; intent_sha256={intent_sha256}"
+            ));
+        }
+    }
+    if let (Some((intent, intent_sha256)), Some((outcome, _))) =
+        (existing_intent.as_ref(), existing_outcome.as_ref())
+        && (outcome.recovery_id != intent.recovery_id || outcome.intent_sha256 != *intent_sha256)
+    {
+        return Err(format!(
+            "remote recovery outcome is not bound to the immutable intent for {job_id}"
+        ));
+    }
+    let (liveness_before_readback, liveness_before_status) = run_corrupt_job_remote_liveness_probe(
+        &invocation,
+        &pid,
+        &pgid,
+        "startup remote liveness probe",
+    )?;
+    let liveness_before_evidence = shell_job_remote_command_evidence(
+        "liveness_before",
+        &liveness_before_readback,
+        &liveness_before_status,
+    );
+    let liveness_before = Some(liveness_before_evidence.clone());
+    if liveness_before_status == "already_gone" {
+        if let Some((intent, intent_sha256)) = existing_intent.as_ref() {
+            let resume_liveness_after = shell_job_remote_command_evidence(
+                "resume_liveness_after",
+                &liveness_before_readback,
+                &liveness_before_status,
+            );
+            let (cleanup, outcome_sha256, verdict) =
+                if let Some((outcome, outcome_sha256)) = existing_outcome.as_ref() {
+                    (
+                        outcome.cleanup.clone(),
+                        outcome_sha256.clone(),
+                        "remote_cleanup_recovery_resumed_verified".to_owned(),
+                    )
+                } else {
+                    // A prior daemon may have crashed after the pidfd signal but
+                    // before committing the outcome. This independent liveness
+                    // read proves the target is now gone; complete the SAME
+                    // recovery id without manufacturing a second intent.
+                    let outcome = ShellJobRemoteRecoveryOutcome {
+                        schema_version: 1,
+                        recovery_id: intent.recovery_id.clone(),
+                        job_id: job_id.to_owned(),
+                        completed_at: chrono::Utc::now().to_rfc3339(),
+                        intent_sha256: intent_sha256.clone(),
+                        cleanup: None,
+                        liveness_after: resume_liveness_after.clone(),
+                        verdict: "remote_already_gone_after_durable_cleanup_intent".to_owned(),
+                    };
+                    let digest = persist_remote_recovery_outcome(paths, &outcome)?;
+                    (None, digest, outcome.verdict)
+                };
+            return Ok(ShellJobQuarantineRemoteVerification {
+                sidecar_present: true,
+                process_marker_present: true,
+                remote_identity_sha256,
+                remote_pid: Some(pid),
+                remote_pgid: Some(pgid),
+                liveness_before,
+                cleanup,
+                liveness_after: Some(resume_liveness_after),
+                recovery_intent_sha256: Some(intent_sha256.clone()),
+                recovery_outcome_sha256: Some(outcome_sha256),
+                verdict,
+            });
+        }
+        return Ok(ShellJobQuarantineRemoteVerification {
+            sidecar_present: true,
+            process_marker_present: true,
+            remote_identity_sha256,
+            remote_pid: Some(pid),
+            remote_pgid: Some(pgid),
+            liveness_before,
+            cleanup: None,
+            liveness_after: None,
+            recovery_intent_sha256: None,
+            recovery_outcome_sha256: None,
+            verdict: "remote_already_gone_verified".to_owned(),
+        });
+    }
+    if liveness_before_status == "alive" {
+        if !matches!(invocation.schema_version, 3 | 4) {
+            return Err(format!(
+                "startup remote process is alive for pid={pid} pgid={pgid}, but cleanup sidecar schema {} does not bind the exact executable and effective replay argv; retained without destructive cleanup",
+                invocation.schema_version
+            ));
+        }
+        let (Some(boot_id), Some(start_time), Some(ownership_token)) = (
+            metadata.boot_id.as_ref(),
+            metadata.start_time.as_ref(),
+            metadata.ownership_token.as_ref(),
+        ) else {
+            return Err(format!(
+                "startup remote process is alive for pid={pid} pgid={pgid}, but its marker has no complete boot/start/token ownership identity; retained without destructive cleanup"
+            ));
+        };
+        if existing_outcome.is_some() {
+            return Err(format!(
+                "remote recovery outcome claims terminal state but pid={pid} pgid={pgid} is alive for {job_id}"
+            ));
+        }
+        let ownership_identity = RemoteProcessOwnershipIdentity {
+            boot_id: boot_id.clone(),
+            start_time: start_time.clone(),
+            ownership_token: ownership_token.clone(),
+        };
+        let (intent, intent_sha256) = if let Some((intent, digest)) = existing_intent {
+            (intent, digest)
+        } else {
+            let intent = ShellJobRemoteRecoveryIntent {
+                schema_version: 1,
+                recovery_id: recovery_id.to_owned(),
+                job_id: job_id.to_owned(),
+                created_at: chrono::Utc::now().to_rfc3339(),
+                quarantine_job_dir: path_string(quarantine_job_dir),
+                remote_identity_sha256: remote_identity_digest,
+                remote_pid: pid.clone(),
+                remote_pgid: pgid.clone(),
+                remote_boot_id: boot_id.clone(),
+                remote_process_start_time: start_time.clone(),
+                remote_ownership_token_sha256: sha256_hex(ownership_token.as_bytes()),
+                cleanup_sidecar_sha256,
+                cleanup_sidecar_schema_version: invocation.schema_version,
+                reason: "startup_corrupt_status_identity_bound_remote_cleanup".to_owned(),
+            };
+            let digest = persist_remote_recovery_intent(paths, &intent)?;
+            (intent, digest)
+        };
+        let (cleanup_readback, cleanup_status) = run_corrupt_job_identity_bound_remote_cleanup(
+            &invocation,
+            &pid,
+            &pgid,
+            &ownership_identity,
+        )?;
+        let cleanup = shell_job_remote_command_evidence(
+            "identity_bound_cleanup",
+            &cleanup_readback,
+            &cleanup_status,
+        );
+        let (liveness_after_readback, liveness_after_status) =
+            run_corrupt_job_remote_liveness_probe(
+                &invocation,
+                &pid,
+                &pgid,
+                "startup remote liveness-after probe",
+            )?;
+        if liveness_after_status != "already_gone" {
+            return Err(format!(
+                "identity-bound cleanup returned status={cleanup_status}, but separate liveness-after read found status={liveness_after_status} for pid={pid} pgid={pgid}"
+            ));
+        }
+        let liveness_after = shell_job_remote_command_evidence(
+            "liveness_after",
+            &liveness_after_readback,
+            &liveness_after_status,
+        );
+        let outcome = ShellJobRemoteRecoveryOutcome {
+            schema_version: 1,
+            recovery_id: intent.recovery_id.clone(),
+            job_id: job_id.to_owned(),
+            completed_at: chrono::Utc::now().to_rfc3339(),
+            intent_sha256: intent_sha256.clone(),
+            cleanup: Some(cleanup.clone()),
+            liveness_after: liveness_after.clone(),
+            verdict: "remote_identity_bound_cleanup_verified".to_owned(),
+        };
+        let outcome_sha256 = persist_remote_recovery_outcome(paths, &outcome)?;
+        return Ok(ShellJobQuarantineRemoteVerification {
+            sidecar_present: true,
+            process_marker_present: true,
+            remote_identity_sha256,
+            remote_pid: Some(pid),
+            remote_pgid: Some(pgid),
+            liveness_before,
+            cleanup: Some(cleanup),
+            liveness_after: Some(liveness_after),
+            recovery_intent_sha256: Some(intent_sha256),
+            recovery_outcome_sha256: Some(outcome_sha256),
+            verdict: outcome.verdict,
+        });
+    }
+    Err(format!(
+        "startup remote liveness probe returned unsupported status={liveness_before_status} for pid={pid} pgid={pgid}"
+    ))
+}
+
+fn persist_shell_job_quarantine_manifest(
+    job_dir: &Path,
+    job_id: &str,
+    recovery_id: &str,
+    manifest: &ShellJobQuarantineManifest,
+) -> Result<(PathBuf, String), String> {
+    let bytes = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| format!("failed to encode quarantine manifest for {job_id}: {error}"))?;
+    let manifest_path = job_dir.join(format!("quarantine-manifest-{recovery_id}.json"));
+    let tmp_path = shell_status_temp_path(&manifest_path);
+    if let Err(error) = write_shell_job_status_staging(&tmp_path, &bytes) {
+        let staging_cleanup = cleanup_failed_atomic_staging_file(&tmp_path);
+        return Err(format!(
+            "failed to durably stage quarantine manifest {}: {error}; {staging_cleanup}",
+            manifest_path.display(),
+        ));
+    }
+    if let Err(error) = commit_shell_job_status_file(&tmp_path, &manifest_path, job_id) {
+        let staging_cleanup = cleanup_failed_atomic_staging_file(&tmp_path);
+        return Err(format!(
+            "failed to atomically commit quarantine manifest {}: {error}; {staging_cleanup}",
+            manifest_path.display(),
+        ));
+    }
+    let persisted = fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "failed to read back quarantine manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    if persisted != bytes {
+        return Err(format!(
+            "quarantine manifest readback bytes differ at {}: expected_sha256={} actual_sha256={}",
+            manifest_path.display(),
+            sha256_hex(&bytes),
+            sha256_hex(&persisted)
+        ));
+    }
+    let decoded: ShellJobQuarantineManifest =
+        serde_json::from_slice(&persisted).map_err(|error| {
+            format!(
+                "quarantine manifest readback did not decode at {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    if &decoded != manifest {
+        return Err(format!(
+            "quarantine manifest structured readback differs at {}",
+            manifest_path.display()
+        ));
+    }
+    Ok((manifest_path, sha256_hex(&persisted)))
+}
+
+#[cfg(windows)]
+fn rename_shell_job_dir_to_quarantine(source: &Path, destination: &Path) -> io::Result<()> {
+    use windows::{
+        Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION},
+        Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
+        core::PCWSTR,
+    };
+    const RETRYABLE_CODES: [u32; 2] = [ERROR_ACCESS_DENIED.0, ERROR_SHARING_VIOLATION.0];
+    const MAX_ATTEMPTS: u32 = 24;
+    const BACKOFF_CAP_MS: u64 = 50;
+    let source_wide = path_to_nul_terminated_wide(source);
+    let destination_wide = path_to_nul_terminated_wide(destination);
+    let mut backoff_ms = 1u64;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // SAFETY: both vectors are NUL-terminated and live for the call.
+        match unsafe {
+            MoveFileExW(
+                PCWSTR(source_wide.as_ptr()),
+                PCWSTR(destination_wide.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        } {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let low_code = win32_error_low_code(&error);
+                if attempt < MAX_ATTEMPTS && RETRYABLE_CODES.contains(&low_code) {
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                    backoff_ms = backoff_ms.saturating_mul(2).min(BACKOFF_CAP_MS);
+                    continue;
+                }
+                return Err(io::Error::from_raw_os_error(low_code as i32));
+            }
+        }
+    }
+    Err(io::Error::other(
+        "quarantine directory rename exhausted retries without a terminal result",
+    ))
+}
+
+#[cfg(not(windows))]
+fn rename_shell_job_dir_to_quarantine(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)?;
+    let source_parent = source
+        .parent()
+        .ok_or_else(|| io::Error::other("quarantine source has no parent directory"))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or_else(|| io::Error::other("quarantine destination has no parent directory"))?;
+    sync_directory_entry_parent(source_parent)?;
+    if destination_parent != source_parent {
+        sync_directory_entry_parent(destination_parent)?;
+    }
+    Ok(())
+}
+
+fn verify_shell_job_quarantine_readback(
+    source: &Path,
+    destination: &Path,
+    manifest_file_name: &str,
+    expected: &ShellJobQuarantineManifest,
+) -> Result<(), String> {
+    if source.try_exists().map_err(|error| {
+        format!(
+            "failed to read source existence after quarantine move {}: {error}",
+            source.display()
+        )
+    })? {
+        return Err(format!(
+            "source job directory still exists after quarantine move: {}",
+            source.display()
+        ));
+    }
+    if !destination.is_dir() {
+        return Err(format!(
+            "quarantine destination is not a directory after move: {}",
+            destination.display()
+        ));
+    }
+    let manifest_path = destination.join(manifest_file_name);
+    let manifest_bytes = fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "failed to read quarantine manifest after directory move {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let actual: ShellJobQuarantineManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            format!(
+                "failed to decode quarantine manifest after directory move {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    if &actual != expected {
+        return Err(format!(
+            "quarantine manifest changed during directory move: {}",
+            manifest_path.display()
+        ));
+    }
+    validate_shell_job_quarantine_manifest_structure(&actual, destination, manifest_file_name)?;
+    let mut expected_file_names = expected
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.relative_path.clone())
+        .collect::<HashSet<_>>();
+    if !expected_file_names.insert(manifest_file_name.to_owned()) {
+        return Err(format!(
+            "quarantine manifest name collides with an original artifact: {manifest_file_name}"
+        ));
+    }
+    verify_shell_job_quarantine_exact_file_set(destination, &expected_file_names)?;
+    verify_shell_job_quarantine_manifest_artifacts(destination, expected)?;
+    Ok(())
+}
+
+fn verify_shell_job_quarantine_exact_file_set(
+    destination: &Path,
+    expected_file_names: &HashSet<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(destination).map_err(|error| {
+        format!(
+            "failed to enumerate quarantine destination {}: {error}",
+            destination.display()
+        )
+    })?;
+    let mut actual_file_names = HashSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read quarantine destination entry under {}: {error}",
+                destination.display()
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "failed to classify quarantine destination entry {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if !file_type.is_file() {
+            return Err(format!(
+                "quarantine destination entry is not a regular file: {}",
+                entry.path().display()
+            ));
+        }
+        let name = entry.file_name().into_string().map_err(|name| {
+            format!(
+                "quarantine destination entry name is not UTF-8: {}",
+                name.to_string_lossy()
+            )
+        })?;
+        if !actual_file_names.insert(name.clone()) {
+            return Err(format!(
+                "quarantine destination contains a duplicate file name: {name}"
+            ));
+        }
+    }
+    if &actual_file_names != expected_file_names {
+        let mut expected = expected_file_names.iter().cloned().collect::<Vec<_>>();
+        let mut actual = actual_file_names.into_iter().collect::<Vec<_>>();
+        expected.sort();
+        actual.sort();
+        return Err(format!(
+            "quarantine destination artifact set differs: expected={expected:?} actual={actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_shell_job_quarantine_remote_verification(
+    manifest: &ShellJobQuarantineManifest,
+) -> Result<(), String> {
+    let remote = &manifest.remote_verification;
+    if !remote.sidecar_present {
+        if remote.process_marker_present
+            || remote.remote_identity_sha256.is_some()
+            || remote.remote_pid.is_some()
+            || remote.remote_pgid.is_some()
+            || remote.liveness_before.is_some()
+            || remote.cleanup.is_some()
+            || remote.liveness_after.is_some()
+            || remote.recovery_intent_sha256.is_some()
+            || remote.recovery_outcome_sha256.is_some()
+            || remote.verdict != "not_remote_or_remote_process_never_tracked"
+        {
+            return Err(format!(
+                "local quarantine manifest carries inconsistent remote evidence for {}",
+                manifest.job_id
+            ));
+        }
+        return Ok(());
+    }
+    if !remote.process_marker_present
+        || remote.remote_identity_sha256.is_none()
+        || remote.remote_pid.is_none()
+        || remote.remote_pgid.is_none()
+    {
+        return Err(format!(
+            "remote quarantine manifest lacks marker/identity/process evidence for {}",
+            manifest.job_id
+        ));
+    }
+    let remote_identity_sha256 = remote.remote_identity_sha256.as_deref().ok_or_else(|| {
+        format!(
+            "remote quarantine manifest lacks identity digest for {}",
+            manifest.job_id
+        )
+    })?;
+    validate_recovery_sha256(
+        remote_identity_sha256,
+        "manifest_remote_identity_sha256",
+        &manifest.job_id,
+    )?;
+    let liveness_before = remote.liveness_before.as_ref().ok_or_else(|| {
+        format!(
+            "remote quarantine manifest lacks liveness-before evidence for {}",
+            manifest.job_id
+        )
+    })?;
+    validate_remote_command_evidence_digests(
+        liveness_before,
+        "manifest_liveness_before",
+        &manifest.job_id,
+    )?;
+    if let Some(cleanup) = remote.cleanup.as_ref() {
+        validate_remote_command_evidence_digests(cleanup, "manifest_cleanup", &manifest.job_id)?;
+    }
+    if let Some(liveness_after) = remote.liveness_after.as_ref() {
+        validate_remote_command_evidence_digests(
+            liveness_after,
+            "manifest_liveness_after",
+            &manifest.job_id,
+        )?;
+    }
+    if liveness_before.operation != "liveness_before"
+        || liveness_before.exit_code != Some(0)
+        || !matches!(
+            liveness_before.parsed_status.as_str(),
+            "alive" | "already_gone"
+        )
+    {
+        return Err(format!(
+            "remote quarantine manifest has non-terminal liveness-before evidence for {}",
+            manifest.job_id
+        ));
+    }
+    match remote.verdict.as_str() {
+        "remote_already_gone_verified" => {
+            if liveness_before.parsed_status != "already_gone"
+                || remote.cleanup.is_some()
+                || remote.liveness_after.is_some()
+                || remote.recovery_intent_sha256.is_some()
+                || remote.recovery_outcome_sha256.is_some()
+            {
+                return Err(format!(
+                    "already-gone quarantine verdict has inconsistent evidence for {}",
+                    manifest.job_id
+                ));
+            }
+        }
+        "remote_identity_bound_cleanup_verified" => {
+            let intent_sha256 = remote.recovery_intent_sha256.as_deref().ok_or_else(|| {
+                format!(
+                    "remote cleanup verdict lacks intent digest for {}",
+                    manifest.job_id
+                )
+            })?;
+            let outcome_sha256 = remote.recovery_outcome_sha256.as_deref().ok_or_else(|| {
+                format!(
+                    "remote cleanup verdict lacks outcome digest for {}",
+                    manifest.job_id
+                )
+            })?;
+            validate_recovery_sha256(intent_sha256, "manifest_intent_sha256", &manifest.job_id)?;
+            validate_recovery_sha256(outcome_sha256, "manifest_outcome_sha256", &manifest.job_id)?;
+            let cleanup = remote.cleanup.as_ref().ok_or_else(|| {
+                format!(
+                    "identity-bound cleanup verdict lacks cleanup evidence for {}",
+                    manifest.job_id
+                )
+            })?;
+            let liveness_after = remote.liveness_after.as_ref().ok_or_else(|| {
+                format!(
+                    "remote cleanup verdict lacks liveness-after evidence for {}",
+                    manifest.job_id
+                )
+            })?;
+            if liveness_before.parsed_status != "alive"
+                || cleanup.operation != "identity_bound_cleanup"
+                || cleanup.exit_code != Some(0)
+                || !matches!(
+                    cleanup.parsed_status.as_str(),
+                    "terminated" | "already_gone"
+                )
+                || liveness_after.operation != "liveness_after"
+                || liveness_after.exit_code != Some(0)
+                || liveness_after.parsed_status != "already_gone"
+            {
+                return Err(format!(
+                    "identity-bound cleanup verdict has an impossible evidence shape for {}",
+                    manifest.job_id
+                ));
+            }
+        }
+        "remote_already_gone_after_durable_cleanup_intent" => {
+            let intent_sha256 = remote.recovery_intent_sha256.as_deref().ok_or_else(|| {
+                format!(
+                    "already-gone-after-intent verdict lacks intent digest for {}",
+                    manifest.job_id
+                )
+            })?;
+            let outcome_sha256 = remote.recovery_outcome_sha256.as_deref().ok_or_else(|| {
+                format!(
+                    "already-gone-after-intent verdict lacks outcome digest for {}",
+                    manifest.job_id
+                )
+            })?;
+            validate_recovery_sha256(intent_sha256, "manifest_intent_sha256", &manifest.job_id)?;
+            validate_recovery_sha256(outcome_sha256, "manifest_outcome_sha256", &manifest.job_id)?;
+            let liveness_after = remote.liveness_after.as_ref().ok_or_else(|| {
+                format!(
+                    "already-gone-after-intent verdict lacks liveness-after for {}",
+                    manifest.job_id
+                )
+            })?;
+            if liveness_before.parsed_status != "already_gone"
+                || remote.cleanup.is_some()
+                || liveness_after.operation != "resume_liveness_after"
+                || liveness_after.exit_code != Some(0)
+                || liveness_after.parsed_status != "already_gone"
+            {
+                return Err(format!(
+                    "already-gone-after-intent verdict has an impossible evidence shape for {}",
+                    manifest.job_id
+                ));
+            }
+        }
+        "remote_cleanup_recovery_resumed_verified" => {
+            let intent_sha256 = remote.recovery_intent_sha256.as_deref().ok_or_else(|| {
+                format!(
+                    "resumed cleanup verdict lacks intent digest for {}",
+                    manifest.job_id
+                )
+            })?;
+            let outcome_sha256 = remote.recovery_outcome_sha256.as_deref().ok_or_else(|| {
+                format!(
+                    "resumed cleanup verdict lacks outcome digest for {}",
+                    manifest.job_id
+                )
+            })?;
+            validate_recovery_sha256(intent_sha256, "manifest_intent_sha256", &manifest.job_id)?;
+            validate_recovery_sha256(outcome_sha256, "manifest_outcome_sha256", &manifest.job_id)?;
+            let liveness_after = remote.liveness_after.as_ref().ok_or_else(|| {
+                format!(
+                    "resumed cleanup verdict lacks liveness-after for {}",
+                    manifest.job_id
+                )
+            })?;
+            let cleanup_valid = remote.cleanup.as_ref().is_none_or(|cleanup| {
+                cleanup.operation == "identity_bound_cleanup"
+                    && cleanup.exit_code == Some(0)
+                    && matches!(
+                        cleanup.parsed_status.as_str(),
+                        "terminated" | "already_gone"
+                    )
+            });
+            if liveness_before.parsed_status != "already_gone"
+                || !cleanup_valid
+                || liveness_after.operation != "resume_liveness_after"
+                || liveness_after.exit_code != Some(0)
+                || liveness_after.parsed_status != "already_gone"
+            {
+                return Err(format!(
+                    "resumed cleanup verdict has an impossible evidence shape for {}",
+                    manifest.job_id
+                ));
+            }
+        }
+        verdict => {
+            return Err(format!(
+                "unsupported remote quarantine verdict={verdict} for {}",
+                manifest.job_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_shell_job_quarantine_manifest_structure(
+    manifest: &ShellJobQuarantineManifest,
+    destination: &Path,
+    manifest_file_name: &str,
+) -> Result<(), String> {
+    if !matches!(manifest.schema_version, 1 | 2)
+        || manifest.quarantine_job_dir != path_string(destination)
+        || manifest_file_name != format!("quarantine-manifest-{}.json", manifest.recovery_id)
+        || destination.file_name().and_then(|name| name.to_str())
+            != Some(format!("{}-{}", manifest.job_id, manifest.recovery_id).as_str())
+    {
+        return Err(format!(
+            "quarantine manifest schema/path/name identity differs at {}",
+            destination.display()
+        ));
+    }
+    if manifest.original_artifact_count != manifest.artifacts.len() {
+        return Err(format!(
+            "quarantine manifest artifact count differs for {}: recorded={} actual={}",
+            manifest.job_id,
+            manifest.original_artifact_count,
+            manifest.artifacts.len()
+        ));
+    }
+    let mut names = HashSet::new();
+    let mut bytes = 0u64;
+    for artifact in &manifest.artifacts {
+        let relative = Path::new(&artifact.relative_path);
+        if relative.components().count() != 1
+            || relative.file_name().and_then(|name| name.to_str())
+                != Some(artifact.relative_path.as_str())
+            || !names.insert(artifact.relative_path.clone())
+            || artifact.relative_path == manifest_file_name
+            || artifact.relative_path.starts_with("quarantine-complete-")
+        {
+            return Err(format!(
+                "quarantine manifest contains unsafe/duplicate metadata-colliding artifact name {:?} for {}",
+                artifact.relative_path, manifest.job_id
+            ));
+        }
+        validate_recovery_sha256(&artifact.sha256, "artifact_sha256", &manifest.job_id)?;
+        bytes = bytes.checked_add(artifact.byte_len).ok_or_else(|| {
+            format!(
+                "quarantine manifest artifact byte total overflow for {} while adding {:?}: before={bytes} add={}",
+                manifest.job_id, artifact.relative_path, artifact.byte_len
+            )
+        })?;
+    }
+    if bytes != manifest.original_artifact_bytes {
+        return Err(format!(
+            "quarantine manifest artifact byte total differs for {}: recorded={} actual={bytes}",
+            manifest.job_id, manifest.original_artifact_bytes
+        ));
+    }
+    let (actual_pre_count, actual_pre_bytes, actual_generated_count, actual_generated_bytes) =
+        shell_job_quarantine_artifact_accounting(&manifest.artifacts)?;
+    if manifest.schema_version >= 2 {
+        let recorded_count = manifest
+            .pre_recovery_artifact_count
+            .checked_add(manifest.recovery_generated_artifact_count)
+            .ok_or_else(|| {
+                format!(
+                    "quarantine manifest recorded artifact count overflow for {}: pre={} generated={}",
+                    manifest.job_id,
+                    manifest.pre_recovery_artifact_count,
+                    manifest.recovery_generated_artifact_count
+                )
+            })?;
+        let recorded_bytes = manifest
+            .pre_recovery_artifact_bytes
+            .checked_add(manifest.recovery_generated_artifact_bytes)
+            .ok_or_else(|| {
+                format!(
+                    "quarantine manifest recorded artifact byte overflow for {}: pre={} generated={}",
+                    manifest.job_id,
+                    manifest.pre_recovery_artifact_bytes,
+                    manifest.recovery_generated_artifact_bytes
+                )
+            })?;
+        if recorded_count != manifest.original_artifact_count
+            || recorded_bytes != manifest.original_artifact_bytes
+            || manifest.pre_recovery_artifact_count != actual_pre_count
+            || manifest.pre_recovery_artifact_bytes != actual_pre_bytes
+            || manifest.recovery_generated_artifact_count != actual_generated_count
+            || manifest.recovery_generated_artifact_bytes != actual_generated_bytes
+        {
+            return Err(format!(
+                "quarantine manifest pre-recovery/generated artifact accounting differs for {}",
+                manifest.job_id
+            ));
+        }
+    }
+    validate_shell_job_quarantine_remote_verification(manifest)?;
+    if let Some(intent_sha256) = manifest
+        .remote_verification
+        .recovery_intent_sha256
+        .as_deref()
+    {
+        let name = format!("remote-recovery-intent-{}.json", manifest.recovery_id);
+        if !manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.relative_path == name && artifact.sha256 == intent_sha256)
+        {
+            return Err(format!(
+                "quarantine manifest does not inventory the exact remote recovery intent digest for {}",
+                manifest.job_id
+            ));
+        }
+    }
+    if let Some(outcome_sha256) = manifest
+        .remote_verification
+        .recovery_outcome_sha256
+        .as_deref()
+    {
+        let name = format!("remote-recovery-outcome-{}.json", manifest.recovery_id);
+        if !manifest
+            .artifacts
+            .iter()
+            .any(|artifact| artifact.relative_path == name && artifact.sha256 == outcome_sha256)
+        {
+            return Err(format!(
+                "quarantine manifest does not inventory the exact remote recovery outcome digest for {}",
+                manifest.job_id
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_shell_job_quarantine_manifest_artifacts(
+    directory: &Path,
+    manifest: &ShellJobQuarantineManifest,
+) -> Result<(), String> {
+    for artifact in &manifest.artifacts {
+        let path = directory.join(&artifact.relative_path);
+        let bytes = fs::read(&path).map_err(|error| {
+            format!(
+                "failed to read quarantined artifact {}: {error}",
+                path.display()
+            )
+        })?;
+        let actual_len = u64::try_from(bytes.len()).map_err(|error| {
+            format!(
+                "quarantined artifact length cannot be represented at {}: {error}",
+                path.display()
+            )
+        })?;
+        if actual_len != artifact.byte_len || sha256_hex(&bytes) != artifact.sha256 {
+            return Err(format!(
+                "quarantined artifact digest/length differs at {}",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn remove_stale_atomic_staging_files(
+    directory: &Path,
+    final_file_name: &str,
+) -> Result<usize, String> {
+    let prefix = format!("{final_file_name}.tmp.");
+    let mut removed = 0usize;
+    for entry in fs::read_dir(directory).map_err(|error| {
+        format!(
+            "failed to enumerate stale atomic staging files under {}: {error}",
+            directory.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read stale atomic staging entry under {}: {error}",
+                directory.display()
+            )
+        })?;
+        let name = entry.file_name().into_string().map_err(|name| {
+            format!(
+                "stale atomic staging filename is not UTF-8 under {}: {}",
+                directory.display(),
+                name.to_string_lossy()
+            )
+        })?;
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let mut segments = suffix.split('.');
+        let owned_shape =
+            segments.next().is_some_and(|value| {
+                !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+            }) && segments.next().is_some_and(|value| {
+                !value.is_empty() && value.chars().all(|ch| ch.is_ascii_digit())
+            }) && segments.next().is_none();
+        if !owned_shape {
+            return Err(format!(
+                "refusing to remove staging-like file with an unrecognized ownership suffix: {}",
+                entry.path().display()
+            ));
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "failed to classify stale atomic staging file {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if !file_type.is_file() {
+            return Err(format!(
+                "stale atomic staging path is not a regular file: {}",
+                entry.path().display()
+            ));
+        }
+        fs::remove_file(entry.path()).map_err(|error| {
+            format!(
+                "failed to remove stale atomic staging file {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        removed = removed.saturating_add(1);
+    }
+    if removed > 0 {
+        #[cfg(not(windows))]
+        sync_directory_entry_parent(directory).map_err(|error| {
+            format!(
+                "failed to sync directory after stale staging cleanup {}: {error}",
+                directory.display()
+            )
+        })?;
+    }
+    Ok(removed)
+}
+
+fn read_existing_source_quarantine_manifest(
+    job_dir: &Path,
+    job_id: &str,
+    quarantine_root: &Path,
+) -> Result<Option<(ShellJobQuarantineManifest, String, String)>, String> {
+    let manifests = shell_job_recovery_record_paths(job_dir, "quarantine-manifest-")?;
+    if manifests.len() > 1 {
+        return Err(format!(
+            "source job {job_id} has {} committed quarantine manifests; exactly zero or one is allowed",
+            manifests.len()
+        ));
+    }
+    let Some(manifest_path) = manifests.first() else {
+        return Ok(None);
+    };
+    let manifest_file_name = manifest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("quarantine manifest filename is not UTF-8 for {job_id}"))?
+        .to_owned();
+    let bytes = fs::read(manifest_path).map_err(|error| {
+        format!(
+            "failed to read committed source quarantine manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: ShellJobQuarantineManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "failed to decode committed source quarantine manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let destination = PathBuf::from(&manifest.quarantine_job_dir);
+    if manifest.job_id != job_id
+        || manifest.source_job_dir != path_string(job_dir)
+        || destination.parent() != Some(quarantine_root)
+    {
+        return Err(format!(
+            "committed source quarantine manifest identity/root differs for {job_id}"
+        ));
+    }
+    if destination.try_exists().map_err(|error| {
+        format!(
+            "failed to inspect committed manifest destination {}: {error}",
+            destination.display()
+        )
+    })? {
+        return Err(format!(
+            "both source and destination exist for committed quarantine manifest {}",
+            manifest_path.display()
+        ));
+    }
+    validate_shell_job_quarantine_manifest_structure(&manifest, &destination, &manifest_file_name)?;
+    let _ = remove_stale_atomic_staging_files(job_dir, &manifest_file_name)?;
+    let mut expected_names = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.relative_path.clone())
+        .collect::<HashSet<_>>();
+    if !expected_names.insert(manifest_file_name.clone()) {
+        return Err(format!(
+            "committed quarantine manifest collides with an original artifact for {job_id}"
+        ));
+    }
+    verify_shell_job_quarantine_exact_file_set(job_dir, &expected_names)?;
+    verify_shell_job_quarantine_manifest_artifacts(job_dir, &manifest)?;
+    Ok(Some((manifest, manifest_file_name, sha256_hex(&bytes))))
+}
+
+fn existing_remote_recovery_id(
+    paths: &ShellJobPaths,
+    job_id: &str,
+) -> Result<Option<String>, String> {
+    let intent = read_existing_remote_recovery_intent(paths, job_id)?;
+    let outcome = read_existing_remote_recovery_outcome(paths, job_id)?;
+    match (intent, outcome) {
+        (None, None) => Ok(None),
+        (Some((intent, _)), None) => Ok(Some(intent.recovery_id)),
+        (Some((intent, intent_sha256)), Some((outcome, _)))
+            if outcome.recovery_id == intent.recovery_id
+                && outcome.intent_sha256 == intent_sha256 =>
+        {
+            Ok(Some(intent.recovery_id))
+        }
+        (Some(_), Some(_)) => Err(format!(
+            "remote recovery intent/outcome identity differs for {job_id}"
+        )),
+        (None, Some(_)) => Err(format!(
+            "remote recovery outcome exists without an intent for {job_id}"
+        )),
+    }
+}
+
+fn persist_shell_job_quarantine_completion(
+    destination: &Path,
+    recovery_id: &str,
+    completion: &ShellJobQuarantineCompletion,
+    expected: &ShellJobQuarantineManifest,
+    manifest_file_name: &str,
+) -> Result<String, String> {
+    let completion_file_name = format!("quarantine-complete-{recovery_id}.json");
+    let completion_path = destination.join(&completion_file_name);
+    write_pretty_json_file(&completion_path, completion, "quarantine completion")
+        .map_err(|error| format!("failed to persist quarantine completion: {}", error.message))?;
+    let bytes = fs::read(&completion_path).map_err(|error| {
+        format!(
+            "failed to read quarantine completion {}: {error}",
+            completion_path.display()
+        )
+    })?;
+    let actual: ShellJobQuarantineCompletion = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "failed to decode quarantine completion {}: {error}",
+            completion_path.display()
+        )
+    })?;
+    if &actual != completion {
+        return Err(format!(
+            "quarantine completion structured readback differs at {}",
+            completion_path.display()
+        ));
+    }
+    let mut expected_file_names = expected
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.relative_path.clone())
+        .collect::<HashSet<_>>();
+    if !expected_file_names.insert(manifest_file_name.to_owned())
+        || !expected_file_names.insert(completion_file_name.clone())
+    {
+        return Err(
+            "quarantine completion/manifest name collides with an original artifact".to_owned(),
+        );
+    }
+    verify_shell_job_quarantine_exact_file_set(destination, &expected_file_names)?;
+    Ok(completion_file_name)
+}
+
+fn validate_quarantine_recovery_records(
+    destination: &Path,
+    manifest: &ShellJobQuarantineManifest,
+) -> Result<(), String> {
+    let remote = &manifest.remote_verification;
+    let (Some(intent_sha256), Some(outcome_sha256)) = (
+        remote.recovery_intent_sha256.as_deref(),
+        remote.recovery_outcome_sha256.as_deref(),
+    ) else {
+        if remote.recovery_intent_sha256.is_some() || remote.recovery_outcome_sha256.is_some() {
+            return Err(format!(
+                "quarantine manifest has only one remote recovery record digest for {}",
+                manifest.job_id
+            ));
+        }
+        return Ok(());
+    };
+    let intent_path = destination.join(format!(
+        "remote-recovery-intent-{}.json",
+        manifest.recovery_id
+    ));
+    let outcome_path = destination.join(format!(
+        "remote-recovery-outcome-{}.json",
+        manifest.recovery_id
+    ));
+    let intent_bytes = fs::read(&intent_path).map_err(|error| {
+        format!(
+            "failed to read quarantined remote recovery intent {}: {error}",
+            intent_path.display()
+        )
+    })?;
+    let outcome_bytes = fs::read(&outcome_path).map_err(|error| {
+        format!(
+            "failed to read quarantined remote recovery outcome {}: {error}",
+            outcome_path.display()
+        )
+    })?;
+    if sha256_hex(&intent_bytes) != intent_sha256 || sha256_hex(&outcome_bytes) != outcome_sha256 {
+        return Err(format!(
+            "remote recovery intent/outcome digest differs for {}",
+            manifest.job_id
+        ));
+    }
+    let intent: ShellJobRemoteRecoveryIntent = serde_json::from_slice(&intent_bytes)
+        .map_err(|error| format!("failed to decode quarantined remote recovery intent: {error}"))?;
+    let outcome: ShellJobRemoteRecoveryOutcome =
+        serde_json::from_slice(&outcome_bytes).map_err(|error| {
+            format!("failed to decode quarantined remote recovery outcome: {error}")
+        })?;
+    if intent.schema_version != 1
+        || outcome.schema_version != 1
+        || intent.recovery_id != manifest.recovery_id
+        || outcome.recovery_id != manifest.recovery_id
+        || intent.job_id != manifest.job_id
+        || outcome.job_id != manifest.job_id
+        || intent.quarantine_job_dir != path_string(destination)
+        || outcome.intent_sha256 != intent_sha256
+    {
+        return Err(format!(
+            "remote recovery intent/outcome structured identity differs for {}",
+            manifest.job_id
+        ));
+    }
+    validate_remote_recovery_outcome_semantics(&outcome, &manifest.job_id)?;
+    let evidence_matches = match manifest.remote_verification.verdict.as_str() {
+        "remote_identity_bound_cleanup_verified"
+        | "remote_already_gone_after_durable_cleanup_intent" => {
+            outcome.verdict == manifest.remote_verification.verdict
+                && outcome.cleanup == manifest.remote_verification.cleanup
+                && Some(&outcome.liveness_after)
+                    == manifest.remote_verification.liveness_after.as_ref()
+        }
+        "remote_cleanup_recovery_resumed_verified" => {
+            matches!(
+                outcome.verdict.as_str(),
+                "remote_identity_bound_cleanup_verified"
+                    | "remote_already_gone_after_durable_cleanup_intent"
+            ) && outcome.cleanup == manifest.remote_verification.cleanup
+        }
+        _ => false,
+    };
+    if !evidence_matches {
+        return Err(format!(
+            "remote recovery outcome evidence does not match manifest verdict for {}",
+            manifest.job_id
+        ));
+    }
+    Ok(())
+}
+
+fn verify_completed_quarantine_directory(
+    destination: &Path,
+    completion_name: &str,
+) -> Result<(), String> {
+    let completion_path = destination.join(completion_name);
+    let completion_bytes = fs::read(&completion_path).map_err(|error| {
+        format!(
+            "failed to read quarantine completion {}: {error}",
+            completion_path.display()
+        )
+    })?;
+    let completion: ShellJobQuarantineCompletion = serde_json::from_slice(&completion_bytes)
+        .map_err(|error| {
+            format!(
+                "failed to decode quarantine completion {}: {error}",
+                completion_path.display()
+            )
+        })?;
+    if !matches!(completion.schema_version, 1 | 2)
+        || completion.quarantine_job_dir != path_string(destination)
+        || completion_name != format!("quarantine-complete-{}.json", completion.recovery_id)
+    {
+        return Err(format!(
+            "quarantine completion identity/schema differs at {}",
+            completion_path.display()
+        ));
+    }
+    let manifest_path = destination.join(&completion.manifest_file_name);
+    let manifest_bytes = fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "failed to read completed quarantine manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    if sha256_hex(&manifest_bytes) != completion.manifest_sha256 {
+        return Err(format!(
+            "completed quarantine manifest digest differs at {}",
+            manifest_path.display()
+        ));
+    }
+    let manifest: ShellJobQuarantineManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            format!(
+                "failed to decode completed quarantine manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    validate_shell_job_quarantine_manifest_structure(
+        &manifest,
+        destination,
+        &completion.manifest_file_name,
+    )?;
+    if manifest.schema_version != completion.schema_version
+        || manifest.recovery_id != completion.recovery_id
+        || manifest.job_id != completion.job_id
+        || manifest.quarantine_job_dir != completion.quarantine_job_dir
+        || manifest.original_artifact_count != completion.original_artifact_count
+        || manifest.original_artifact_bytes != completion.original_artifact_bytes
+        || manifest.pre_recovery_artifact_count != completion.pre_recovery_artifact_count
+        || manifest.pre_recovery_artifact_bytes != completion.pre_recovery_artifact_bytes
+        || manifest.recovery_generated_artifact_count
+            != completion.recovery_generated_artifact_count
+        || manifest.recovery_generated_artifact_bytes
+            != completion.recovery_generated_artifact_bytes
+        || manifest.remote_verification.verdict != completion.remote_verdict
+    {
+        return Err(format!(
+            "quarantine manifest/completion fields differ at {}",
+            destination.display()
+        ));
+    }
+    if Path::new(&manifest.source_job_dir)
+        .try_exists()
+        .map_err(|error| {
+            format!(
+                "failed to inspect completed quarantine source {}: {error}",
+                manifest.source_job_dir
+            )
+        })?
+    {
+        return Err(format!(
+            "completed quarantine source unexpectedly exists: {}",
+            manifest.source_job_dir
+        ));
+    }
+    verify_shell_job_quarantine_manifest_artifacts(destination, &manifest)?;
+    validate_quarantine_recovery_records(destination, &manifest)?;
+    let _ = remove_stale_atomic_staging_files(destination, completion_name)?;
+    let mut expected_names = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.relative_path.clone())
+        .collect::<HashSet<_>>();
+    if !expected_names.insert(completion.manifest_file_name.clone())
+        || !expected_names.insert(completion_name.to_owned())
+    {
+        return Err(format!(
+            "quarantine metadata names collide with original artifacts at {}",
+            destination.display()
+        ));
+    }
+    verify_shell_job_quarantine_exact_file_set(destination, &expected_names)
+}
+
+fn reconcile_incomplete_quarantine_directory(destination: &Path) -> Result<String, String> {
+    let manifests = shell_job_recovery_record_paths(destination, "quarantine-manifest-")?;
+    if manifests.len() != 1 {
+        return Err(format!(
+            "incomplete quarantine directory {} has {} committed manifests; exactly one is required",
+            destination.display(),
+            manifests.len()
+        ));
+    }
+    let manifest_path = &manifests[0];
+    let manifest_name = manifest_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| "incomplete quarantine manifest filename is not UTF-8".to_owned())?
+        .to_owned();
+    let manifest_bytes = fs::read(manifest_path).map_err(|error| {
+        format!(
+            "failed to read incomplete quarantine manifest {}: {error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: ShellJobQuarantineManifest =
+        serde_json::from_slice(&manifest_bytes).map_err(|error| {
+            format!(
+                "failed to decode incomplete quarantine manifest {}: {error}",
+                manifest_path.display()
+            )
+        })?;
+    validate_shell_job_quarantine_manifest_structure(&manifest, destination, &manifest_name)?;
+    if Path::new(&manifest.source_job_dir)
+        .try_exists()
+        .map_err(|error| {
+            format!(
+                "failed to inspect incomplete quarantine source {}: {error}",
+                manifest.source_job_dir
+            )
+        })?
+    {
+        return Err(format!(
+            "cannot reconcile incomplete quarantine while source still exists: {}",
+            manifest.source_job_dir
+        ));
+    }
+    verify_shell_job_quarantine_manifest_artifacts(destination, &manifest)?;
+    validate_quarantine_recovery_records(destination, &manifest)?;
+    let completion_name = format!("quarantine-complete-{}.json", manifest.recovery_id);
+    let mut allowed_names = manifest
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.relative_path.clone())
+        .collect::<HashSet<_>>();
+    allowed_names.insert(manifest_name.clone());
+    for entry in fs::read_dir(destination).map_err(|error| {
+        format!(
+            "failed to enumerate incomplete quarantine staging files {}: {error}",
+            destination.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(&format!("{completion_name}.tmp.")) {
+            allowed_names.insert(name);
+        }
+    }
+    verify_shell_job_quarantine_exact_file_set(destination, &allowed_names)?;
+    let _ = remove_stale_atomic_staging_files(destination, &completion_name)?;
+    let completion = ShellJobQuarantineCompletion {
+        schema_version: manifest.schema_version,
+        recovery_id: manifest.recovery_id.clone(),
+        job_id: manifest.job_id.clone(),
+        completed_at: chrono::Utc::now().to_rfc3339(),
+        quarantine_job_dir: path_string(destination),
+        manifest_file_name: manifest_name.clone(),
+        manifest_sha256: sha256_hex(&manifest_bytes),
+        original_artifact_count: manifest.original_artifact_count,
+        original_artifact_bytes: manifest.original_artifact_bytes,
+        pre_recovery_artifact_count: manifest.pre_recovery_artifact_count,
+        pre_recovery_artifact_bytes: manifest.pre_recovery_artifact_bytes,
+        recovery_generated_artifact_count: manifest.recovery_generated_artifact_count,
+        recovery_generated_artifact_bytes: manifest.recovery_generated_artifact_bytes,
+        remote_verdict: manifest.remote_verification.verdict.clone(),
+    };
+    persist_shell_job_quarantine_completion(
+        destination,
+        &manifest.recovery_id,
+        &completion,
+        &manifest,
+        &manifest_name,
+    )
+}
+
+fn verify_existing_shell_job_quarantine_store(quarantine_root: &Path) -> Result<(), String> {
+    match quarantine_root.try_exists() {
+        Ok(false) => return Ok(()),
+        Ok(true) => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect quarantine root existence {}: {error}",
+                quarantine_root.display()
+            ));
+        }
+    }
+    let entries = fs::read_dir(quarantine_root).map_err(|error| {
+        format!(
+            "failed to enumerate quarantine root {}: {error}",
+            quarantine_root.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read quarantine root entry under {}: {error}",
+                quarantine_root.display()
+            )
+        })?;
+        if !entry
+            .file_type()
+            .map_err(|error| format!("failed to classify {}: {error}", entry.path().display()))?
+            .is_dir()
+        {
+            return Err(format!(
+                "quarantine root contains a non-directory entry: {}",
+                entry.path().display()
+            ));
+        }
+        let destination = entry.path();
+        let completions = shell_job_recovery_record_paths(&destination, "quarantine-complete-")?;
+        let completion_name = match completions.as_slice() {
+            [] => reconcile_incomplete_quarantine_directory(&destination)?,
+            [path] => path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| "quarantine completion filename is not UTF-8".to_owned())?
+                .to_owned(),
+            _ => {
+                return Err(format!(
+                    "quarantine directory {} has {} completion records; at most one is allowed",
+                    destination.display(),
+                    completions.len()
+                ));
+            }
+        };
+        verify_completed_quarantine_directory(&destination, &completion_name)?;
+    }
+    Ok(())
+}
+
+fn push_shell_job_recovery_sample(sample: &mut Vec<String>, value: String) {
+    if sample.len() < SHELL_JOB_RECOVERY_ID_SAMPLE_CAP {
+        sample.push(value);
+    }
+}
+
+fn recover_corrupt_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryReadback, ErrorData> {
+    let root = shell_durable_job_root_dir()?;
+    let quarantine_root = shell_job_quarantine_root_dir()?;
+    let mut readback = ShellJobCorruptRecoveryReadback {
+        job_root: Some(path_string(&root)),
+        quarantine_root: Some(path_string(&quarantine_root)),
+        scanned_job_dirs: 0,
+        retained_valid_status_jobs: 0,
+        corrupt_status_jobs: 0,
+        quarantined_jobs: 0,
+        remote_state_verified_jobs: 0,
+        retained_unverifiable_remote_jobs: 0,
+        unexpected_job_root_entries: 0,
+        skipped_concurrently_mutated: 0,
+        recovery_failures: 0,
+        bytes_quarantined: 0,
+        quarantined_job_ids_sample: Vec::new(),
+        retained_job_ids_sample: Vec::new(),
+        unexpected_job_root_entries_sample: Vec::new(),
+        quarantine_paths_sample: Vec::new(),
+        manifest_paths_sample: Vec::new(),
+    };
+    if let Err(detail) = verify_existing_shell_job_quarantine_store(&quarantine_root) {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            "startup corrupt shell-job recovery found incomplete or changed quarantine evidence",
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "path": quarantine_root,
+                "reason": "startup_quarantine_evidence_unverified",
+                "detail": detail,
+            }),
+        ));
+    }
+    match root.try_exists() {
+        Ok(false) => return Ok(readback),
+        Ok(true) => {}
+        Err(error) => {
+            return Err(shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "startup corrupt shell-job recovery could not determine whether the job root exists: {error}"
+                ),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "path": root,
+                    "reason": "startup_corrupt_job_root_existence_read_failed",
+                }),
+            ));
+        }
+    }
+    let entries = fs::read_dir(&root).map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("startup corrupt shell-job recovery could not read job root: {error}"),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "path": root,
+                "reason": "startup_corrupt_job_root_read_failed",
+            }),
+        )
+    })?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                readback.skipped_concurrently_mutated =
+                    readback.skipped_concurrently_mutated.saturating_add(1);
+                continue;
+            }
+            Err(error) => {
+                readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                tracing::error!(
+                    code = "M4_SHELL_JOB_STARTUP_CORRUPT_DIR_ENTRY_FAILED",
+                    error = %error,
+                    "startup corrupt shell-job recovery could not read a directory entry"
+                );
+                continue;
+            }
+        };
+        let job_dir = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                push_shell_job_recovery_sample(
+                    &mut readback.retained_job_ids_sample,
+                    path_string(&job_dir),
+                );
+                tracing::error!(
+                    code = "M4_SHELL_JOB_STARTUP_ROOT_ENTRY_CLASSIFY_FAILED",
+                    path = %path_string(&job_dir),
+                    error = %error,
+                    "startup corrupt shell-job recovery could not classify a durable job-root entry"
+                );
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            readback.unexpected_job_root_entries =
+                readback.unexpected_job_root_entries.saturating_add(1);
+            push_shell_job_recovery_sample(
+                &mut readback.unexpected_job_root_entries_sample,
+                path_string(&job_dir),
+            );
+            tracing::error!(
+                code = "M4_SHELL_JOB_STARTUP_UNEXPECTED_ROOT_ENTRY",
+                path = %path_string(&job_dir),
+                entry_kind = if file_type.is_symlink() { "symlink" } else if file_type.is_file() { "file" } else { "other" },
+                reason = "durable_job_root_entries_must_be_job_directories",
+                "startup retained an unexpected durable job-root entry and will refuse to serve requests"
+            );
+            continue;
+        }
+        let Some(job_id) = job_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(ToOwned::to_owned)
+        else {
+            readback.unexpected_job_root_entries =
+                readback.unexpected_job_root_entries.saturating_add(1);
+            push_shell_job_recovery_sample(
+                &mut readback.unexpected_job_root_entries_sample,
+                path_string(&job_dir),
+            );
+            tracing::error!(
+                code = "M4_SHELL_JOB_STARTUP_UNEXPECTED_ROOT_ENTRY",
+                path = %path_string(&job_dir),
+                entry_kind = "directory",
+                reason = "durable_job_directory_name_is_not_utf8",
+                "startup retained an unexpected durable job-root entry and will refuse to serve requests"
+            );
+            continue;
+        };
+        if validate_shell_job_id(&job_id).is_err() {
+            readback.unexpected_job_root_entries =
+                readback.unexpected_job_root_entries.saturating_add(1);
+            push_shell_job_recovery_sample(
+                &mut readback.unexpected_job_root_entries_sample,
+                path_string(&job_dir),
+            );
+            tracing::error!(
+                code = "M4_SHELL_JOB_STARTUP_UNEXPECTED_ROOT_ENTRY",
+                path = %path_string(&job_dir),
+                entry_kind = "directory",
+                reason = "durable_job_directory_name_is_invalid",
+                "startup retained an unexpected durable job-root entry and will refuse to serve requests"
+            );
+            continue;
+        }
+        readback.scanned_job_dirs = readback.scanned_job_dirs.saturating_add(1);
+        let paths = shell_job_paths_from_root(&root, &job_id);
+        let status_read_error = match read_shell_job_status(&paths.status_path, &job_id) {
+            Ok(_) => {
+                readback.retained_valid_status_jobs =
+                    readback.retained_valid_status_jobs.saturating_add(1);
+                continue;
+            }
+            Err(error) => {
+                let reason = error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("reason"))
+                    .and_then(Value::as_str);
+                let Some(reason) = reason else {
+                    readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_STARTUP_STATUS_ERROR_REASON_MISSING",
+                        job_id,
+                        status_path = %path_string(&paths.status_path),
+                        detail = %error.message,
+                        data = ?error.data,
+                        "startup retained a shell-job directory because status failure classification evidence was missing"
+                    );
+                    continue;
+                };
+                if reason != "job_status_decode_failed" {
+                    readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_STARTUP_STATUS_READ_UNCERTAIN",
+                        job_id,
+                        status_path = %path_string(&paths.status_path),
+                        reason,
+                        detail = %error.message,
+                        data = ?error.data,
+                        "startup retained a shell-job directory and will refuse to serve because status I/O/missing uncertainty is not confirmed JSON corruption"
+                    );
+                    continue;
+                }
+                error.message.to_string()
+            }
+        };
+        readback.corrupt_status_jobs = readback.corrupt_status_jobs.saturating_add(1);
+        let existing_manifest = match read_existing_source_quarantine_manifest(
+            &job_dir,
+            &job_id,
+            &quarantine_root,
+        ) {
+            Ok(manifest) => manifest,
+            Err(detail) => {
+                readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                push_shell_job_recovery_sample(
+                    &mut readback.retained_job_ids_sample,
+                    job_id.clone(),
+                );
+                tracing::error!(
+                    code = "M4_SHELL_JOB_STARTUP_SOURCE_MANIFEST_UNVERIFIED",
+                    job_id,
+                    path = %path_string(&job_dir),
+                    detail,
+                    "startup retained a corrupt shell-job directory because its committed recovery manifest could not be resumed"
+                );
+                continue;
+            }
+        };
+        let (manifest, manifest_file_name, manifest_sha256) = if let Some(existing) =
+            existing_manifest
+        {
+            existing
+        } else {
+            let recovery_id = match existing_remote_recovery_id(&paths, &job_id) {
+                Ok(Some(recovery_id)) => recovery_id,
+                Ok(None) => new_reflex_id(),
+                Err(detail) => {
+                    readback.retained_unverifiable_remote_jobs =
+                        readback.retained_unverifiable_remote_jobs.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_STARTUP_RECOVERY_ID_UNVERIFIED",
+                        job_id,
+                        detail,
+                        "startup retained a corrupt shell-job directory because durable remote recovery records were inconsistent"
+                    );
+                    continue;
+                }
+            };
+            let destination = quarantine_root.join(format!("{job_id}-{recovery_id}"));
+            let remote_verification = match verify_corrupt_shell_job_remote_state(
+                &paths,
+                &job_id,
+                &recovery_id,
+                &destination,
+            ) {
+                Ok(verification) => verification,
+                Err(detail) => {
+                    readback.retained_unverifiable_remote_jobs =
+                        readback.retained_unverifiable_remote_jobs.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_STARTUP_CORRUPT_REMOTE_UNVERIFIED",
+                        job_id,
+                        status_path = %path_string(&paths.status_path),
+                        status_read_error,
+                        detail,
+                        recovery_id,
+                        "startup retained a corrupt shell-job directory because remote process state could not be verified"
+                    );
+                    continue;
+                }
+            };
+            let artifacts = match shell_job_quarantine_artifacts(&job_dir) {
+                Ok(artifacts) => artifacts,
+                Err(detail) => {
+                    readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_STARTUP_CORRUPT_INVENTORY_FAILED",
+                        job_id,
+                        path = %path_string(&job_dir),
+                        status_read_error,
+                        detail,
+                        "startup retained a corrupt shell-job directory because its evidence inventory could not be read"
+                    );
+                    continue;
+                }
+            };
+            let (
+                pre_recovery_artifact_count,
+                pre_recovery_artifact_bytes,
+                recovery_generated_artifact_count,
+                recovery_generated_artifact_bytes,
+            ) = match shell_job_quarantine_artifact_accounting(&artifacts) {
+                Ok(accounting) => accounting,
+                Err(detail) => {
+                    readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                    push_shell_job_recovery_sample(
+                        &mut readback.retained_job_ids_sample,
+                        job_id.clone(),
+                    );
+                    tracing::error!(
+                        code = "M4_SHELL_JOB_STARTUP_ARTIFACT_ACCOUNTING_FAILED",
+                        job_id,
+                        detail,
+                        "startup retained a corrupt shell-job directory because artifact evidence accounting overflowed"
+                    );
+                    continue;
+                }
+            };
+            let Some(original_artifact_bytes) =
+                pre_recovery_artifact_bytes.checked_add(recovery_generated_artifact_bytes)
+            else {
+                readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                push_shell_job_recovery_sample(
+                    &mut readback.retained_job_ids_sample,
+                    job_id.clone(),
+                );
+                tracing::error!(
+                    code = "M4_SHELL_JOB_STARTUP_ARTIFACT_TOTAL_OVERFLOW",
+                    job_id,
+                    pre_recovery_artifact_bytes,
+                    recovery_generated_artifact_bytes,
+                    "startup retained a corrupt shell-job directory because total artifact evidence bytes overflowed"
+                );
+                continue;
+            };
+            let manifest = ShellJobQuarantineManifest {
+                schema_version: SHELL_JOB_QUARANTINE_MANIFEST_SCHEMA_VERSION,
+                recovery_id: recovery_id.clone(),
+                job_id: job_id.clone(),
+                quarantined_at: chrono::Utc::now().to_rfc3339(),
+                reason: "startup_unreadable_status_after_prior_daemon_exit".to_owned(),
+                startup_safety_boundary:
+                    "canonical_shell_job_store_lifetime_lock_held_before_daemon_accepts_requests"
+                        .to_owned(),
+                source_job_dir: path_string(&job_dir),
+                quarantine_job_dir: path_string(&destination),
+                status_read_error: status_read_error.clone(),
+                original_artifact_count: artifacts.len(),
+                original_artifact_bytes,
+                pre_recovery_artifact_count,
+                pre_recovery_artifact_bytes,
+                recovery_generated_artifact_count,
+                recovery_generated_artifact_bytes,
+                artifacts,
+                remote_verification,
+            };
+            let expected_manifest_name = format!("quarantine-manifest-{recovery_id}.json");
+            if let Err(detail) = validate_shell_job_quarantine_manifest_structure(
+                &manifest,
+                &destination,
+                &expected_manifest_name,
+            ) {
+                readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                push_shell_job_recovery_sample(
+                    &mut readback.retained_job_ids_sample,
+                    job_id.clone(),
+                );
+                tracing::error!(
+                    code = "M4_SHELL_JOB_STARTUP_QUARANTINE_MANIFEST_INVALID",
+                    job_id,
+                    detail,
+                    "startup retained a corrupt shell-job directory because its proposed manifest was inconsistent"
+                );
+                continue;
+            }
+            let (manifest_source_path, manifest_sha256) =
+                match persist_shell_job_quarantine_manifest(
+                    &job_dir,
+                    &job_id,
+                    &recovery_id,
+                    &manifest,
+                ) {
+                    Ok(readback) => readback,
+                    Err(detail) => {
+                        readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                        push_shell_job_recovery_sample(
+                            &mut readback.retained_job_ids_sample,
+                            job_id.clone(),
+                        );
+                        tracing::error!(
+                            code = "M4_SHELL_JOB_STARTUP_QUARANTINE_MANIFEST_FAILED",
+                            job_id,
+                            path = %path_string(&job_dir),
+                            detail,
+                            "startup retained a corrupt shell-job directory because its quarantine manifest was not durable"
+                        );
+                        continue;
+                    }
+                };
+            let Some(manifest_file_name) = manifest_source_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+            else {
+                readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                push_shell_job_recovery_sample(
+                    &mut readback.retained_job_ids_sample,
+                    job_id.clone(),
+                );
+                tracing::error!(
+                    code = "M4_SHELL_JOB_STARTUP_MANIFEST_FILENAME_INVALID",
+                    job_id,
+                    path = %path_string(&manifest_source_path),
+                    "startup retained a corrupt shell-job directory because the committed manifest filename was not UTF-8"
+                );
+                continue;
+            };
+            (manifest, manifest_file_name, manifest_sha256)
+        };
+        let recovery_id = manifest.recovery_id.clone();
+        let destination = PathBuf::from(&manifest.quarantine_job_dir);
+        let original_artifact_bytes = manifest.original_artifact_bytes;
+        // The committed source manifest above is the crash-recovery checkpoint.
+        // Keep the destination store physically untouched until every fail-closed
+        // verification succeeds; a root-create/rename failure is resumed from
+        // that source manifest on the next startup pass.
+        if let Err(error) = fs::create_dir_all(&quarantine_root) {
+            readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+            push_shell_job_recovery_sample(&mut readback.retained_job_ids_sample, job_id.clone());
+            tracing::error!(
+                code = "M4_SHELL_JOB_STARTUP_QUARANTINE_ROOT_CREATE_FAILED",
+                job_id,
+                quarantine_root = %path_string(&quarantine_root),
+                error = %error,
+                "startup retained a corrupt shell-job directory because quarantine root creation failed"
+            );
+            continue;
+        }
+        match rename_shell_job_dir_to_quarantine(&job_dir, &destination) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                readback.skipped_concurrently_mutated =
+                    readback.skipped_concurrently_mutated.saturating_add(1);
+                continue;
+            }
+            Err(error) => {
+                readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                push_shell_job_recovery_sample(
+                    &mut readback.retained_job_ids_sample,
+                    job_id.clone(),
+                );
+                tracing::error!(
+                    code = "M4_SHELL_JOB_STARTUP_QUARANTINE_RENAME_FAILED",
+                    job_id,
+                    source = %path_string(&job_dir),
+                    destination = %path_string(&destination),
+                    manifest_sha256,
+                    error = %error,
+                    "startup retained a corrupt shell-job directory because the atomic quarantine rename failed"
+                );
+                continue;
+            }
+        }
+        if let Err(detail) = verify_shell_job_quarantine_readback(
+            &job_dir,
+            &destination,
+            &manifest_file_name,
+            &manifest,
+        ) {
+            readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+            tracing::error!(
+                code = "M4_SHELL_JOB_STARTUP_QUARANTINE_READBACK_FAILED",
+                job_id,
+                source = %path_string(&job_dir),
+                destination = %path_string(&destination),
+                manifest_sha256,
+                detail,
+                "startup quarantine move completed but physical evidence readback failed"
+            );
+            continue;
+        }
+        let completion = ShellJobQuarantineCompletion {
+            schema_version: manifest.schema_version,
+            recovery_id: recovery_id.clone(),
+            job_id: job_id.clone(),
+            completed_at: chrono::Utc::now().to_rfc3339(),
+            quarantine_job_dir: path_string(&destination),
+            manifest_file_name: manifest_file_name.clone(),
+            manifest_sha256: manifest_sha256.clone(),
+            original_artifact_count: manifest.original_artifact_count,
+            original_artifact_bytes,
+            pre_recovery_artifact_count: manifest.pre_recovery_artifact_count,
+            pre_recovery_artifact_bytes: manifest.pre_recovery_artifact_bytes,
+            recovery_generated_artifact_count: manifest.recovery_generated_artifact_count,
+            recovery_generated_artifact_bytes: manifest.recovery_generated_artifact_bytes,
+            remote_verdict: manifest.remote_verification.verdict.clone(),
+        };
+        let completion_file_name = match persist_shell_job_quarantine_completion(
+            &destination,
+            &recovery_id,
+            &completion,
+            &manifest,
+            &manifest_file_name,
+        ) {
+            Ok(file_name) => file_name,
+            Err(detail) => {
+                readback.recovery_failures = readback.recovery_failures.saturating_add(1);
+                tracing::error!(
+                    code = "M4_SHELL_JOB_STARTUP_QUARANTINE_COMPLETION_FAILED",
+                    job_id,
+                    destination = %path_string(&destination),
+                    manifest_sha256,
+                    detail,
+                    "startup quarantine move is retained, but startup will fail because durable completion evidence could not be verified"
+                );
+                continue;
+            }
+        };
+        readback.quarantined_jobs = readback.quarantined_jobs.saturating_add(1);
+        if manifest.remote_verification.sidecar_present {
+            readback.remote_state_verified_jobs =
+                readback.remote_state_verified_jobs.saturating_add(1);
+        }
+        readback.bytes_quarantined = readback
+            .bytes_quarantined
+            .checked_add(original_artifact_bytes)
+            .ok_or_else(|| {
+                shell_tool_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "startup corrupt shell-job recovery byte accounting overflowed after a verified quarantine move",
+                    json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "reason": "startup_quarantine_byte_accounting_overflow",
+                        "job_id": job_id,
+                        "bytes_before": readback.bytes_quarantined,
+                        "bytes_added": original_artifact_bytes,
+                        "quarantine_path": destination,
+                    }),
+                )
+            })?;
+        push_shell_job_recovery_sample(&mut readback.quarantined_job_ids_sample, job_id.clone());
+        push_shell_job_recovery_sample(
+            &mut readback.quarantine_paths_sample,
+            path_string(&destination),
+        );
+        push_shell_job_recovery_sample(
+            &mut readback.manifest_paths_sample,
+            path_string(&destination.join(&manifest_file_name)),
+        );
+        tracing::warn!(
+            code = "M4_SHELL_JOB_STARTUP_CORRUPT_QUARANTINED",
+            job_id,
+            source = %path_string(&job_dir),
+            destination = %path_string(&destination),
+            manifest = %path_string(&destination.join(&manifest_file_name)),
+            completion = %path_string(&destination.join(&completion_file_name)),
+            manifest_sha256,
+            original_artifact_count = manifest.original_artifact_count,
+            original_artifact_bytes,
+            remote_verdict = %manifest.remote_verification.verdict,
+            "readback=startup_corrupt_shell_job after=atomic_quarantine_move_and_artifact_hash_verification"
+        );
+    }
+    tracing::info!(
+        code = "M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY",
+        job_root = ?readback.job_root,
+        quarantine_root = ?readback.quarantine_root,
+        scanned_job_dirs = readback.scanned_job_dirs,
+        retained_valid_status_jobs = readback.retained_valid_status_jobs,
+        corrupt_status_jobs = readback.corrupt_status_jobs,
+        quarantined_jobs = readback.quarantined_jobs,
+        remote_state_verified_jobs = readback.remote_state_verified_jobs,
+        retained_unverifiable_remote_jobs = readback.retained_unverifiable_remote_jobs,
+        unexpected_job_root_entries = readback.unexpected_job_root_entries,
+        skipped_concurrently_mutated = readback.skipped_concurrently_mutated,
+        recovery_failures = readback.recovery_failures,
+        bytes_quarantined = readback.bytes_quarantined,
+        "readback=startup_corrupt_shell_job after=job_root_and_quarantine_root_scan"
+    );
+    Ok(readback)
+}
+
 /// Default retention for settled durable shell-job directories: 7 days. A job
 /// whose backing process is no longer live (any status other than `running` or
 /// `cancel_requested`) and whose completion is older than this is eligible for
@@ -3093,11 +6487,67 @@ fn reap_stale_shell_jobs_with_ttl(ttl: Duration) -> Result<ShellJobReapReadback,
     Ok(readback)
 }
 
-/// Best-effort durable shell-job retention pass for daemon startup. Housekeeping
-/// must never block or fail daemon boot, so a reaper error is logged and
-/// swallowed; the next session teardown reaper retries. Called once from each
-/// daemon entry point (stdio and HTTP) after the single-instance lock is held.
-pub fn reap_stale_shell_jobs_on_startup() {
+/// Required corrupt-job recovery gate plus best-effort stale-job retention for
+/// daemon startup. A corrupt directory whose evidence disposition or remote
+/// state cannot be proved prevents the daemon from accepting requests. Once
+/// that gate is complete, ordinary TTL housekeeping remains best-effort and is
+/// retried on later session teardown. Called once from each daemon entry point
+/// after the canonical shell-job-store lifetime lock/root freeze and before a
+/// transport is exposed.
+pub fn reap_stale_shell_jobs_on_startup() -> Result<ShellJobCorruptRecoveryReadback, ErrorData> {
+    let corrupt_readback = match recover_corrupt_shell_jobs_on_startup() {
+        Ok(readback) => readback,
+        Err(error) => {
+            tracing::error!(
+                code = "M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY_FAILED",
+                detail = %error.message,
+                data = ?error.data,
+                "daemon startup corrupt shell-job recovery failed before a complete root readback"
+            );
+            return Err(error);
+        }
+    };
+    if corrupt_readback.retained_unverifiable_remote_jobs > 0
+        || corrupt_readback.unexpected_job_root_entries > 0
+        || corrupt_readback.skipped_concurrently_mutated > 0
+        || corrupt_readback.recovery_failures > 0
+    {
+        tracing::error!(
+            code = "M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY_INCOMPLETE",
+            corrupt_status_jobs = corrupt_readback.corrupt_status_jobs,
+            quarantined_jobs = corrupt_readback.quarantined_jobs,
+            retained_unverifiable_remote_jobs = corrupt_readback.retained_unverifiable_remote_jobs,
+            unexpected_job_root_entries = corrupt_readback.unexpected_job_root_entries,
+            skipped_concurrently_mutated = corrupt_readback.skipped_concurrently_mutated,
+            recovery_failures = corrupt_readback.recovery_failures,
+            retained_job_ids_sample = ?corrupt_readback.retained_job_ids_sample,
+            unexpected_job_root_entries_sample = ?corrupt_readback.unexpected_job_root_entries_sample,
+            "refusing daemon startup because one or more durable shell-job evidence dispositions could not be verified"
+        );
+        let code = if corrupt_readback.retained_unverifiable_remote_jobs > 0 {
+            error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED
+        } else {
+            error_codes::STORAGE_WRITE_FAILED
+        };
+        return Err(shell_tool_error(
+            code,
+            "daemon startup refused: corrupt durable shell-job recovery is incomplete",
+            json!({
+                "code": code,
+                "reason": "startup_corrupt_shell_job_recovery_incomplete",
+                "readback": corrupt_readback,
+            }),
+        ));
+    }
+    tracing::info!(
+        code = "M4_SHELL_JOB_STARTUP_CORRUPT_RECOVERY_COMPLETE",
+        scanned_job_dirs = corrupt_readback.scanned_job_dirs,
+        corrupt_status_jobs = corrupt_readback.corrupt_status_jobs,
+        quarantined_jobs = corrupt_readback.quarantined_jobs,
+        remote_state_verified_jobs = corrupt_readback.remote_state_verified_jobs,
+        bytes_quarantined = corrupt_readback.bytes_quarantined,
+        "daemon startup completed corrupt durable shell-job recovery"
+    );
     match reap_stale_shell_jobs() {
         Ok(readback) => tracing::info!(
             code = "M4_SHELL_JOB_REAP_STARTUP",
@@ -3114,6 +6564,7 @@ pub fn reap_stale_shell_jobs_on_startup() {
             "daemon startup shell-job reaper failed; will retry on next session cleanup"
         ),
     }
+    Ok(corrupt_readback)
 }
 
 pub fn shell_jobs_dashboard_snapshot(
@@ -3489,6 +6940,41 @@ pub(crate) async fn launch_for_session(
     params: ActLaunchParams,
     session_id: Option<&str>,
 ) -> Result<ActLaunchOutcome, ErrorData> {
+    launch_for_session_with_boundary(config, params, session_id, &allow_physical_mutation).await
+}
+
+fn cleanup_launched_process_after_boundary(error: ErrorData, pid: u32) -> ErrorData {
+    let cleanup = terminate_owned_process_tree(pid);
+    let cleanup_verified = cleanup.remaining_process_ids.is_empty();
+    if !cleanup_verified {
+        synapse_action::record_operator_panic_safety_incident();
+    }
+    physical_mutation_boundary_error(
+        error,
+        "act_launch_operator_panic_cleanup",
+        json!({
+            "source_of_truth": "exact launched process tree + separate process-table readback",
+            "pid": pid,
+            "termination": cleanup,
+            "cleanup_verified": cleanup_verified,
+        }),
+    )
+}
+
+fn ensure_launched_process_mutation_boundary(
+    boundary: &PhysicalMutationBoundary<'_>,
+    stage: &'static str,
+    pid: u32,
+) -> Result<(), ErrorData> {
+    boundary(stage).map_err(|error| cleanup_launched_process_after_boundary(error, pid))
+}
+
+pub(crate) async fn launch_for_session_with_boundary(
+    config: &M4ServiceConfig,
+    params: ActLaunchParams,
+    session_id: Option<&str>,
+    boundary: &PhysicalMutationBoundary<'_>,
+) -> Result<ActLaunchOutcome, ErrorData> {
     let matched_pattern = validate_launch_authorized(config, &params)?;
     let command_line = launch_command_line(&params)?;
     let wait_regex = params
@@ -3520,38 +7006,86 @@ pub(crate) async fn launch_for_session(
     let desktop_readback = launch_desktop
         .as_ref()
         .map(PreparedLaunchDesktop::to_response);
+    boundary("act_launch_immediately_before_create_process")?;
     let spawned = spawn_launch_child(&spawn_params, launch_desktop)?;
     let pid = spawned.pid;
+    ensure_launched_process_mutation_boundary(
+        boundary,
+        "act_launch_immediately_after_create_process",
+        pid,
+    )?;
     let cdp = if let Some(launch) = &cdp_launch {
-        resolve_launched_cdp_port(pid, launch).await
+        let cdp = await_physical_mutation_boundary(
+            boundary,
+            "act_launch_while_resolving_cdp",
+            resolve_launched_cdp_port(pid, launch),
+        )
+        .await
+        .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
+        ensure_launched_process_mutation_boundary(boundary, "act_launch_after_resolving_cdp", pid)?;
+        cdp
     } else {
         LaunchedCdp::default()
     };
+    let cdp_target = await_physical_mutation_boundary(
+        boundary,
+        "act_launch_while_verifying_chromium_url",
+        verify_launched_chromium_url(&params, cdp_launch.as_ref(), &cdp, params.timeout_ms),
+    )
+    .await
+    .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
+    ensure_launched_process_mutation_boundary(
+        boundary,
+        "act_launch_after_verifying_chromium_url",
+        pid,
+    )?;
     let cdp_target =
-        verify_launched_chromium_url(&params, cdp_launch.as_ref(), &cdp, params.timeout_ms).await?;
+        cdp_target.map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
     let window = if let Some(regex) = wait_regex {
         if let Some(desktop_lease) = spawned.desktop_lease.as_ref() {
-            wait_for_launch_desktop_window(
-                pid,
-                &regex,
-                params.timeout_ms,
-                &excluded_hwnds,
-                &launch_target_name,
-                &params.args,
-                desktop_lease.name().to_owned(),
-                desktop_lease.raw_handle_value(),
+            let window = await_physical_mutation_boundary(
+                boundary,
+                "act_launch_while_waiting_for_desktop_window",
+                wait_for_launch_desktop_window(
+                    pid,
+                    &regex,
+                    params.timeout_ms,
+                    &excluded_hwnds,
+                    &launch_target_name,
+                    &params.args,
+                    desktop_lease.name().to_owned(),
+                    desktop_lease.raw_handle_value(),
+                ),
             )
-            .await?
+            .await
+            .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
+            ensure_launched_process_mutation_boundary(
+                boundary,
+                "act_launch_after_waiting_for_desktop_window",
+                pid,
+            )?;
+            window.map_err(|error| cleanup_launched_process_after_boundary(error, pid))?
         } else {
-            wait_for_launch_window(
-                pid,
-                &regex,
-                params.timeout_ms,
-                &excluded_hwnds,
-                &launch_target_name,
-                &params.args,
+            let window = await_physical_mutation_boundary(
+                boundary,
+                "act_launch_while_waiting_for_window",
+                wait_for_launch_window(
+                    pid,
+                    &regex,
+                    params.timeout_ms,
+                    &excluded_hwnds,
+                    &launch_target_name,
+                    &params.args,
+                ),
             )
-            .await?
+            .await
+            .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
+            ensure_launched_process_mutation_boundary(
+                boundary,
+                "act_launch_after_waiting_for_window",
+                pid,
+            )?;
+            window.map_err(|error| cleanup_launched_process_after_boundary(error, pid))?
         }
     } else {
         WindowWaitResult::not_requested()
@@ -3586,6 +7120,7 @@ pub(crate) async fn launch_for_session(
             "act_launch matched a pre-existing/foreign window not owned by the spawned pid (#1358)"
         );
     }
+    ensure_launched_process_mutation_boundary(boundary, "act_launch_before_response", pid)?;
     Ok(ActLaunchOutcome {
         response: ActLaunchResponse {
             pid,
@@ -5733,7 +9268,7 @@ fn desktop_window_hwnds(
         lparam: LPARAM,
     ) -> BOOL {
         let search = unsafe { &mut *(lparam.0 as *mut Search) };
-        search.hwnds.push(hwnd.0 as isize as i64);
+        search.hwnds.push(hwnd_to_wire(hwnd.0 as isize));
         BOOL(1)
     }
 
@@ -5798,7 +9333,7 @@ fn hidden_desktop_window_context(hwnd: i64) -> Option<ForegroundContext> {
         UI::WindowsAndMessaging::{GetWindowRect, GetWindowTextW, GetWindowThreadProcessId},
     };
 
-    let hwnd = HWND(hwnd as isize as *mut core::ffi::c_void);
+    let hwnd = HWND(hwnd_from_wire(hwnd)? as *mut core::ffi::c_void);
     let mut pid = 0_u32;
     unsafe {
         GetWindowThreadProcessId(hwnd, Some(&raw mut pid));
@@ -5832,7 +9367,7 @@ fn hidden_desktop_window_context(hwnd: i64) -> Option<ForegroundContext> {
     );
 
     Some(ForegroundContext {
-        hwnd: hwnd.0 as isize as i64,
+        hwnd: hwnd_to_wire(hwnd.0 as isize),
         pid,
         process_name,
         process_path,
@@ -6000,7 +9535,7 @@ fn resolve_program_on_path(program: &str, path: &str, pathext: &str) -> Option<S
 /// Reports which bounded-search tools resolve inside the exact child-process
 /// environment Synapse shell jobs receive — not the daemon's own PATH.
 ///
-/// Agents are told to prefer `rg` for fast bounded FSV scans, but `rg` may be
+/// Agents are told to prefer `rg` for fast bounded manual FSV scans, but `rg` may be
 /// absent from the machine entirely (it is not a Windows built-in, and it lived
 /// in `~/.cargo/bin` which is easy to wipe). Without a deterministic
 /// availability signal an agent only learns `rg` is missing *after* a shell job
@@ -7357,6 +10892,83 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+// The daemon acquires an OS lock against a canonical shell-job root, then
+// freezes that exact path here before recovery or request serving. Every
+// production shell-job operation subsequently resolves through this value, so
+// retargeting a configured symlink/junction cannot redirect writes into an
+// unlocked store. Test-only thread-local overrides remain higher priority.
+static SHELL_JOB_ROOT_FOR_DAEMON: OnceLock<PathBuf> = OnceLock::new();
+
+pub(crate) fn freeze_shell_job_root_for_daemon(root: &Path) -> Result<(), ErrorData> {
+    let canonical = fs::canonicalize(root).map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_OPEN_FAILED,
+            format!(
+                "cannot freeze the guarded durable shell-job root {}: {error}",
+                root.display()
+            ),
+            json!({
+                "code": error_codes::STORAGE_OPEN_FAILED,
+                "reason": "shell_job_guarded_root_canonicalize_failed",
+                "root": root.display().to_string(),
+                "detail": error.to_string(),
+            }),
+        )
+    })?;
+    if !canonical.is_absolute() {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_OPEN_FAILED,
+            "guarded durable shell-job root did not resolve to an absolute path",
+            json!({
+                "code": error_codes::STORAGE_OPEN_FAILED,
+                "reason": "shell_job_guarded_root_not_absolute",
+                "root": canonical.display().to_string(),
+            }),
+        ));
+    }
+    if let Some(frozen) = SHELL_JOB_ROOT_FOR_DAEMON.get() {
+        if frozen == &canonical {
+            return Ok(());
+        }
+        return Err(shell_tool_error(
+            error_codes::STORAGE_OPEN_FAILED,
+            "durable shell-job root was already frozen to a different path",
+            json!({
+                "code": error_codes::STORAGE_OPEN_FAILED,
+                "reason": "shell_job_guarded_root_conflict",
+                "frozen_root": frozen.display().to_string(),
+                "requested_root": canonical.display().to_string(),
+            }),
+        ));
+    }
+    if let Err(candidate) = SHELL_JOB_ROOT_FOR_DAEMON.set(canonical) {
+        let Some(frozen) = SHELL_JOB_ROOT_FOR_DAEMON.get() else {
+            return Err(shell_tool_error(
+                error_codes::STORAGE_OPEN_FAILED,
+                "durable shell-job root freeze lost its initialized value",
+                json!({
+                    "code": error_codes::STORAGE_OPEN_FAILED,
+                    "reason": "shell_job_guarded_root_freeze_state_missing",
+                    "requested_root": candidate.display().to_string(),
+                }),
+            ));
+        };
+        if frozen != &candidate {
+            return Err(shell_tool_error(
+                error_codes::STORAGE_OPEN_FAILED,
+                "durable shell-job root was concurrently frozen to a different path",
+                json!({
+                    "code": error_codes::STORAGE_OPEN_FAILED,
+                    "reason": "shell_job_guarded_root_concurrent_conflict",
+                    "frozen_root": frozen.display().to_string(),
+                    "requested_root": candidate.display().to_string(),
+                }),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn shell_job_root_override() -> Option<PathBuf> {
     SHELL_JOB_ROOT_OVERRIDE.with(|cell| cell.borrow().clone())
@@ -7402,9 +11014,12 @@ impl Drop for ShellJobRootGuard {
     }
 }
 
-fn shell_job_root_dir() -> Result<PathBuf, ErrorData> {
+pub(crate) fn shell_job_root_dir() -> Result<PathBuf, ErrorData> {
     if let Some(override_root) = shell_job_root_override() {
         return Ok(override_root);
+    }
+    if let Some(frozen_root) = SHELL_JOB_ROOT_FOR_DAEMON.get() {
+        return Ok(frozen_root.clone());
     }
     // Operator/deployment seam: relocate the durable shell-job store off the
     // default per-user path (e.g. onto a faster or per-instance volume). A set
@@ -7594,6 +11209,7 @@ fn resolve_shell_working_dir(
             }
         },
     };
+
     let canonical = fs::canonicalize(&path).map_err(|error| {
         shell_tool_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -7653,46 +11269,76 @@ fn write_shell_job_request(
     write_pretty_json_file(&paths.request_path, &request, "request")
 }
 
-fn shell_remote_cleanup_invocation_from_start_params(
-    params: &ActRunShellStartParams,
-) -> Option<ShellRemoteCleanupInvocation> {
-    let invocation = shell_job_ssh_command_invocation(&params.command, &params.args)?;
-    if ssh_family_client_for_executable(&invocation.command) != Some("ssh") {
-        return None;
-    }
-    let parts = ssh_direct_command_parts(&invocation.args)?;
-    parts.remote_command.as_ref()?;
-    if parts.tracking_unsupported_reason.is_some() {
-        return None;
-    }
-    Some(ShellRemoteCleanupInvocation {
-        schema_version: 1,
-        transport: SHELL_REMOTE_TRANSPORT_SSH.to_owned(),
-        command: invocation.command,
-        control_args: parts.control_args,
-        remote_identity: parts.remote_identity,
-        source_evidence: invocation.evidence.to_owned(),
-        args_sha256: shell_args_sha256(&invocation.args),
-        created_at: chrono::Utc::now().to_rfc3339(),
-    })
-}
-
 fn write_shell_remote_cleanup_invocation(
     paths: &ShellJobPaths,
-    params: &ActRunShellStartParams,
+    invocation: Option<&ShellRemoteCleanupInvocation>,
 ) -> Result<(), ErrorData> {
-    let Some(invocation) = shell_remote_cleanup_invocation_from_start_params(params) else {
+    let Some(invocation) = invocation else {
         return Ok(());
     };
     write_pretty_json_file(&paths.remote_cleanup_path, &invocation, "remote cleanup")
+}
+
+fn seed_shell_job_remote_ownership(
+    job: &mut ActRunShellJobStatus,
+    invocation: Option<&ShellRemoteCleanupInvocation>,
+) {
+    let Some(token) = invocation.and_then(|invocation| invocation.ownership_token.as_ref()) else {
+        return;
+    };
+    job.remote_process_scope.remote_ownership_token = Some(token.clone());
+    push_unique_evidence(
+        &mut job.remote_process_scope.detection_evidence,
+        format!(
+            "remote_ownership_sidecar:token_sha256={}",
+            sha256_hex(token.as_bytes())
+        ),
+    );
+}
+
+fn ssh_effective_config_readback(
+    command: &str,
+    control_args: &[String],
+) -> Result<SshEffectiveConfigReadback, String> {
+    let mut args = Vec::with_capacity(control_args.len() + 1);
+    args.push("-G".to_owned());
+    args.extend_from_slice(control_args);
+    let readback = run_shell_cleanup_command_with_timeout(
+        command,
+        &args,
+        Duration::from_millis(SHELL_SSH_CONFIG_PREFLIGHT_TIMEOUT_MS),
+    )?;
+    if readback.exit_code != Some(0) || readback.stdout_byte_len == 0 {
+        return Err(format!(
+            "ssh -G preflight failed; exit={:?}; stdout_bytes={}; stdout_sha256={}; stderr_bytes={}; stderr_sha256={}; stderr_excerpt={:?}",
+            readback.exit_code,
+            readback.stdout_byte_len,
+            readback.stdout_sha256,
+            readback.stderr_byte_len,
+            readback.stderr_sha256,
+            shell_cleanup_output_excerpt(&readback.stderr),
+        ));
+    }
+    Ok(SshEffectiveConfigReadback {
+        fingerprint: SshEffectiveConfigFingerprint {
+            byte_len: readback.stdout_byte_len,
+            sha256: readback.stdout_sha256,
+        },
+    })
 }
 
 fn read_shell_remote_cleanup_invocation(
     paths: &ShellJobPaths,
     job_id: &str,
 ) -> Result<Option<ShellRemoteCleanupInvocation>, String> {
-    if !paths.remote_cleanup_path.exists() {
-        return Ok(None);
+    match paths.remote_cleanup_path.try_exists() {
+        Ok(false) => return Ok(None),
+        Ok(true) => {}
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect remote cleanup sidecar existence for {job_id}: {error}"
+            ));
+        }
     }
     let bytes = fs::read(&paths.remote_cleanup_path)
         .map_err(|error| format!("failed to read remote cleanup sidecar for {job_id}: {error}"))?;
@@ -7700,7 +11346,7 @@ fn read_shell_remote_cleanup_invocation(
         serde_json::from_slice(&bytes).map_err(|error| {
             format!("failed to decode remote cleanup sidecar for {job_id}: {error}")
         })?;
-    if invocation.schema_version != 1 {
+    if !matches!(invocation.schema_version, 1..=4) {
         return Err(format!(
             "unsupported remote cleanup sidecar schema_version={} for {job_id}",
             invocation.schema_version
@@ -7712,18 +11358,217 @@ fn read_shell_remote_cleanup_invocation(
             invocation.transport
         ));
     }
-    if ssh_family_client_for_executable(&invocation.command) != Some("ssh") {
+    let trusted_command =
+        trusted_ssh_automatic_replay_executable(&invocation.command).ok_or_else(|| {
+            format!(
+                "remote cleanup sidecar command is not a trusted SSH executable for {job_id}: {}",
+                invocation.command
+            )
+        })?;
+    if matches!(invocation.schema_version, 3 | 4)
+        && (!Path::new(&invocation.command).is_absolute()
+            || fs::canonicalize(&invocation.command).ok().as_ref() != Some(&trusted_command))
+    {
         return Err(format!(
-            "remote cleanup sidecar command is not ssh-family for {job_id}: {}",
-            invocation.command
+            "remote cleanup sidecar v3 does not bind the exact canonical SSH executable for {job_id}: recorded={} trusted={}",
+            invocation.command,
+            trusted_command.display()
         ));
     }
-    if ssh_direct_command_parts(&invocation.control_args).is_none() {
-        return Err(format!(
+    let parts = ssh_direct_command_parts(&invocation.control_args).ok_or_else(|| {
+        format!(
             "remote cleanup sidecar control_args do not contain an ssh destination for {job_id}"
+        )
+    })?;
+    if parts.remote_command.is_some() {
+        return Err(format!(
+            "remote cleanup sidecar control_args unexpectedly contain a remote command for {job_id}"
+        ));
+    }
+    if let Some(reason) = parts.tracking_unsupported_reason {
+        return Err(format!(
+            "remote cleanup sidecar control_args are unsafe for tracked replay for {job_id}: {reason}"
+        ));
+    }
+    if let Some(option) = ssh_control_args_unsafe_for_automatic_replay(&invocation.control_args) {
+        return Err(format!(
+            "remote cleanup sidecar contains SSH control argv outside the automatic-replay allowlist for {job_id}: {option}"
+        ));
+    }
+    if parts.remote_identity != invocation.remote_identity {
+        return Err(format!(
+            "remote cleanup sidecar identity differs from its parsed SSH destination for {job_id}: recorded={} parsed={}",
+            invocation.remote_identity, parts.remote_identity
+        ));
+    }
+    validate_lower_sha256(&invocation.args_sha256, "args_sha256", job_id)?;
+    if matches!(invocation.schema_version, 2..=4) {
+        let actual_control_args_sha256 = shell_args_sha256(&invocation.control_args);
+        if actual_control_args_sha256 != invocation.args_sha256 {
+            return Err(format!(
+                "remote cleanup sidecar control argv digest differs for {job_id}: recorded={} actual={actual_control_args_sha256}",
+                invocation.args_sha256
+            ));
+        }
+        let request_args_sha256 = invocation.request_args_sha256.as_deref().ok_or_else(|| {
+            format!(
+                "remote cleanup sidecar v{} lacks request_args_sha256 for {job_id}",
+                invocation.schema_version
+            )
+        })?;
+        validate_lower_sha256(request_args_sha256, "request_args_sha256", job_id)?;
+        let request_bytes = fs::read(&paths.request_path).map_err(|error| {
+            format!(
+                "failed to read request JSON while validating remote cleanup sidecar for {job_id}: {error}"
+            )
+        })?;
+        let request: Value = serde_json::from_slice(&request_bytes).map_err(|error| {
+            format!(
+                "failed to decode request JSON while validating remote cleanup sidecar for {job_id}: {error}"
+            )
+        })?;
+        let recorded_request_args_sha256 = request
+            .get("args_sha256")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("request JSON lacks args_sha256 for {job_id}"))?;
+        if recorded_request_args_sha256 != request_args_sha256 {
+            return Err(format!(
+                "remote cleanup sidecar is not bound to request argv for {job_id}: sidecar={request_args_sha256} request={recorded_request_args_sha256}"
+            ));
+        }
+    }
+    if matches!(invocation.schema_version, 3 | 4) {
+        let effective_control_args =
+            invocation.effective_control_args.as_ref().ok_or_else(|| {
+                format!(
+                    "remote cleanup sidecar v{} lacks effective_control_args for {job_id}",
+                    invocation.schema_version
+                )
+            })?;
+        let effective_args_sha256 =
+            invocation.effective_args_sha256.as_deref().ok_or_else(|| {
+                format!(
+                    "remote cleanup sidecar v{} lacks effective_args_sha256 for {job_id}",
+                    invocation.schema_version
+                )
+            })?;
+        validate_lower_sha256(effective_args_sha256, "effective_args_sha256", job_id)?;
+        let actual_effective_args_sha256 = shell_args_sha256(effective_control_args);
+        if actual_effective_args_sha256 != effective_args_sha256 {
+            return Err(format!(
+                "remote cleanup sidecar effective argv digest differs for {job_id}: recorded={effective_args_sha256} actual={actual_effective_args_sha256}"
+            ));
+        }
+        let current_policy_args = hardened_ssh_automatic_replay_args(&invocation.control_args)
+            .map_err(|reason| {
+                format!(
+                    "remote cleanup sidecar v{} controls no longer satisfy replay policy for {job_id}: {reason}",
+                    invocation.schema_version
+                )
+            })?;
+        if current_policy_args != *effective_control_args {
+            return Err(format!(
+                "remote cleanup sidecar replay policy drifted for {job_id}; persisted effective argv digest={effective_args_sha256} current_policy_digest={}",
+                shell_args_sha256(&current_policy_args)
+            ));
+        }
+        if invocation.schema_version == 4 {
+            let request_config = invocation
+                .request_effective_config
+                .as_ref()
+                .ok_or_else(|| {
+                    format!("remote cleanup sidecar v4 lacks request_effective_config for {job_id}")
+                })?;
+            validate_ssh_effective_config_fingerprint(
+                request_config,
+                "request_effective_config",
+                job_id,
+            )?;
+            let mut isolated_request_args = Vec::with_capacity(invocation.control_args.len() + 2);
+            isolated_request_args.push("-F".to_owned());
+            isolated_request_args.push(SSH_AUTOMATIC_REPLAY_DISABLED_CONFIG.to_owned());
+            isolated_request_args.extend_from_slice(&invocation.control_args);
+            let current_isolated_request =
+                ssh_effective_config_readback(&invocation.command, &isolated_request_args)?;
+            if current_isolated_request.fingerprint != *request_config {
+                return Err(format!(
+                    "remote cleanup sidecar request ssh_config fingerprint no longer matches config-isolated request argv for {job_id}: recorded={request_config:?} actual={:?}",
+                    current_isolated_request.fingerprint
+                ));
+            }
+            let cleanup_config = invocation
+                .cleanup_effective_config
+                .as_ref()
+                .ok_or_else(|| {
+                    format!("remote cleanup sidecar v4 lacks cleanup_effective_config for {job_id}")
+                })?;
+            validate_ssh_effective_config_fingerprint(
+                cleanup_config,
+                "cleanup_effective_config",
+                job_id,
+            )?;
+            let current_cleanup =
+                ssh_effective_config_readback(&invocation.command, effective_control_args)?;
+            if current_cleanup.fingerprint != *cleanup_config {
+                return Err(format!(
+                    "remote cleanup sidecar effective ssh_config fingerprint drifted for {job_id}: recorded={cleanup_config:?} actual={:?}",
+                    current_cleanup.fingerprint
+                ));
+            }
+            let ownership_token = invocation.ownership_token.as_deref().ok_or_else(|| {
+                format!("remote cleanup sidecar v4 lacks ownership_token for {job_id}")
+            })?;
+            if !valid_remote_ownership_token(ownership_token) {
+                return Err(format!(
+                    "remote cleanup sidecar v4 ownership_token is malformed for {job_id}"
+                ));
+            }
+        } else if invocation.request_effective_config.is_some()
+            || invocation.cleanup_effective_config.is_some()
+            || invocation.ownership_token.is_some()
+        {
+            return Err(format!(
+                "remote cleanup sidecar v{} unexpectedly carries v4 ssh_config fingerprints for {job_id}",
+                invocation.schema_version
+            ));
+        }
+    } else if invocation.effective_control_args.is_some()
+        || invocation.effective_args_sha256.is_some()
+        || invocation.request_effective_config.is_some()
+        || invocation.cleanup_effective_config.is_some()
+        || invocation.ownership_token.is_some()
+    {
+        return Err(format!(
+            "legacy remote cleanup sidecar unexpectedly carries v3 effective replay fields for {job_id}"
         ));
     }
     Ok(Some(invocation))
+}
+
+fn validate_ssh_effective_config_fingerprint(
+    value: &SshEffectiveConfigFingerprint,
+    field: &str,
+    job_id: &str,
+) -> Result<(), String> {
+    if value.byte_len == 0 {
+        return Err(format!(
+            "remote cleanup sidecar {field}.byte_len is zero for {job_id}"
+        ));
+    }
+    validate_lower_sha256(&value.sha256, field, job_id)
+}
+
+fn validate_lower_sha256(value: &str, field: &str, job_id: &str) -> Result<(), String> {
+    if value.len() == 64
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_hexdigit() && !ch.is_ascii_uppercase())
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "remote cleanup sidecar {field} is not a lowercase SHA-256 digest for {job_id}"
+    ))
 }
 
 fn write_pretty_json_file<T: Serialize>(
@@ -7743,21 +11588,98 @@ fn write_pretty_json_file<T: Serialize>(
             }),
         )
     })?;
-    fs::write(path, bytes).map_err(|error| {
-        shell_tool_error(
+    let tmp_path = shell_status_temp_path(path);
+    if let Err(error) = write_shell_job_status_staging(&tmp_path, &bytes) {
+        let staging_cleanup = cleanup_failed_atomic_staging_file(&tmp_path);
+        return Err(shell_tool_error(
             error_codes::STORAGE_WRITE_FAILED,
-            format!("act_run_shell failed to write shell job {role}: {error}"),
+            format!(
+                "act_run_shell failed to durably stage shell job {role}: {error}; {staging_cleanup}"
+            ),
             json!({
                 "code": error_codes::STORAGE_WRITE_FAILED,
                 "path": path,
-                "reason": "job_json_write_failed",
+                "tmp_path": tmp_path,
+                "reason": "job_json_stage_failed",
+                "role": role,
+                "staging_cleanup": staging_cleanup,
+            }),
+        ));
+    }
+    if let Err(error) = commit_shell_job_status_file(&tmp_path, path, role) {
+        let staging_cleanup = cleanup_failed_atomic_staging_file(&tmp_path);
+        return Err(shell_tool_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_run_shell failed to atomically commit shell job {role}: {error}; {staging_cleanup}"
+            ),
+            json!({
+                "code": error_codes::STORAGE_WRITE_FAILED,
+                "path": path,
+                "tmp_path": tmp_path,
+                "reason": "job_json_commit_failed",
+                "role": role,
+                "staging_cleanup": staging_cleanup,
+            }),
+        ));
+    }
+    let persisted = fs::read(path).map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("act_run_shell failed to read back shell job {role}: {error}"),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "path": path,
+                "reason": "job_json_readback_failed",
                 "role": role,
             }),
         )
-    })
+    })?;
+    if persisted != bytes {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!("act_run_shell shell job {role} readback differed after commit"),
+            json!({
+                "code": error_codes::STORAGE_WRITE_FAILED,
+                "path": path,
+                "expected_sha256": sha256_hex(&bytes),
+                "actual_sha256": sha256_hex(&persisted),
+                "reason": "job_json_readback_mismatch",
+                "role": role,
+            }),
+        ));
+    }
+    Ok(())
 }
 
 fn write_shell_job_status(path: &Path, status: &ActRunShellJobStatus) -> Result<(), ErrorData> {
+    let write_lock = shell_status_write_lock(path);
+    let _write_guard = write_lock.lock().map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_run_shell status writer lock was poisoned for {}: {error}",
+                path.display()
+            ),
+            json!({
+                "code": error_codes::STORAGE_WRITE_FAILED,
+                "job_id": status.job_id,
+                "path": path,
+                "reason": "job_status_writer_lock_poisoned",
+            }),
+        )
+    })?;
+    write_shell_job_status_locked(path, status).map(|_| ())
+}
+
+/// Commit and independently read back a status while the caller holds the
+/// destination's [`shell_status_write_lock`]. Keeping this lock outside the
+/// primitive lets reconciliation make its latest-terminal-wins decision and
+/// commit as one indivisible state transition.
+fn write_shell_job_status_locked(
+    path: &Path,
+    status: &ActRunShellJobStatus,
+) -> Result<ActRunShellJobStatus, ErrorData> {
     let safe_status = shell_job_status_with_safe_command_metadata(status);
     let bytes = serde_json::to_vec_pretty(&safe_status).map_err(|error| {
         shell_tool_error(
@@ -7783,47 +11705,97 @@ fn write_shell_job_status(path: &Path, status: &ActRunShellJobStatus) -> Result<
     // old or the new whole file — never a half-merged one. (Canonical
     // write→fsync→rename atomic-replace pattern.)
     //
-    // Serialize concurrent writers to the SAME destination for the whole
-    // stage+commit. Every writer of a given `status.json` lives in this one
-    // daemon process, so an in-process per-path lock guarantees only one
-    // `MoveFileExW(REPLACE_EXISTING)` targets a destination at a time. Without
-    // it, many writers racing the same rename can starve one another past the
-    // bounded retry window and fail a status write outright under load (#1568).
-    let write_lock = shell_status_write_lock(path);
-    let _write_guard = write_lock
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let tmp_path = shell_status_temp_path(path);
     if let Err(error) = write_shell_job_status_staging(&tmp_path, &bytes) {
         // Never leak the partial staging file on the write/fsync failure path.
-        let _ = fs::remove_file(&tmp_path);
+        let staging_cleanup = cleanup_failed_atomic_staging_file(&tmp_path);
         return Err(shell_tool_error(
             error_codes::STORAGE_WRITE_FAILED,
-            format!("act_run_shell failed to write shell job status temp file: {error}"),
+            format!(
+                "act_run_shell failed to write shell job status temp file: {error}; {staging_cleanup}"
+            ),
             json!({
                 "code": error_codes::STORAGE_WRITE_FAILED,
                 "job_id": safe_status.job_id,
                 "path": tmp_path,
                 "reason": "job_status_temp_write_failed",
+                "staging_cleanup": staging_cleanup,
             }),
         ));
     }
     if let Err(error) = commit_shell_job_status_file(&tmp_path, path, &safe_status.job_id) {
         // The rename never happened, so the staging file is orphaned — remove it.
-        let _ = fs::remove_file(&tmp_path);
+        let staging_cleanup = cleanup_failed_atomic_staging_file(&tmp_path);
         return Err(shell_tool_error(
             error_codes::STORAGE_WRITE_FAILED,
-            format!("act_run_shell failed to commit shell job status file: {error}"),
+            format!(
+                "act_run_shell failed to commit shell job status file: {error}; {staging_cleanup}"
+            ),
             json!({
                 "code": error_codes::STORAGE_WRITE_FAILED,
                 "job_id": safe_status.job_id,
                 "path": path,
                 "tmp_path": tmp_path,
                 "reason": "job_status_rename_failed",
+                "staging_cleanup": staging_cleanup,
             }),
         ));
     }
-    Ok(())
+    let persisted = fs::read(path).map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("act_run_shell failed to read back committed shell job status: {error}"),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "job_id": safe_status.job_id,
+                "path": path,
+                "reason": "job_status_commit_readback_failed",
+            }),
+        )
+    })?;
+    if persisted != bytes {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            "act_run_shell committed status bytes differed on independent readback",
+            json!({
+                "code": error_codes::STORAGE_WRITE_FAILED,
+                "job_id": safe_status.job_id,
+                "path": path,
+                "reason": "job_status_commit_bytes_mismatch",
+                "expected_sha256": sha256_hex(&bytes),
+                "actual_sha256": sha256_hex(&persisted),
+                "expected_bytes": bytes.len(),
+                "actual_bytes": persisted.len(),
+            }),
+        ));
+    }
+    let decoded: ActRunShellJobStatus = serde_json::from_slice(&persisted).map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!("act_run_shell committed status readback did not decode: {error}"),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "job_id": safe_status.job_id,
+                "path": path,
+                "reason": "job_status_commit_decode_failed",
+                "sha256": sha256_hex(&persisted),
+            }),
+        )
+    })?;
+    if decoded != safe_status {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            "act_run_shell committed status structured readback differed",
+            json!({
+                "code": error_codes::STORAGE_WRITE_FAILED,
+                "job_id": safe_status.job_id,
+                "path": path,
+                "reason": "job_status_commit_structured_mismatch",
+                "sha256": sha256_hex(&persisted),
+            }),
+        ));
+    }
+    Ok(decoded)
 }
 
 /// Write the fully-serialized status blob to `tmp_path` and flush it to stable
@@ -7836,6 +11808,19 @@ fn write_shell_job_status_staging(tmp_path: &Path, bytes: &[u8]) -> io::Result<(
     file.write_all(bytes)?;
     file.sync_all()?;
     Ok(())
+}
+
+fn cleanup_failed_atomic_staging_file(tmp_path: &Path) -> String {
+    match fs::remove_file(tmp_path) {
+        Ok(()) => format!("staging_cleanup=removed path={}", tmp_path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            format!("staging_cleanup=already_absent path={}", tmp_path.display())
+        }
+        Err(error) => format!(
+            "staging_cleanup=failed path={} error={error}",
+            tmp_path.display()
+        ),
+    }
 }
 
 /// Deterministic-prefix, per-(process, write) UNIQUE staging path for a status
@@ -7952,7 +11937,16 @@ fn path_to_nul_terminated_wide(path: &Path) -> Vec<u16> {
 
 #[cfg(not(windows))]
 fn commit_shell_job_status_file(tmp_path: &Path, path: &Path, _job_id: &str) -> io::Result<()> {
-    fs::rename(tmp_path, path)
+    fs::rename(tmp_path, path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("atomic JSON destination has no parent directory"))?;
+    sync_directory_entry_parent(parent)
+}
+
+#[cfg(not(windows))]
+fn sync_directory_entry_parent(directory: &Path) -> io::Result<()> {
+    fs::File::open(directory)?.sync_all()
 }
 
 /// Read a durable status file, tolerating the brief window in which a
@@ -7999,8 +11993,14 @@ fn read_status_file_share_delete(path: &Path) -> io::Result<Vec<u8>> {
 
 #[cfg(windows)]
 fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
-    // ERROR_ACCESS_DENIED = 5, ERROR_SHARING_VIOLATION = 32.
-    const TRANSIENT_OPEN_CODES: [i32; 2] = [5, 32];
+    read_shell_status_bytes_with_retry_observer(path, |_| {})
+}
+
+#[cfg(windows)]
+fn read_shell_status_bytes_with_retry_observer(
+    path: &Path,
+    mut before_retry: impl FnMut(u32),
+) -> io::Result<Vec<u8>> {
     // Retry by ATTEMPT COUNT, not wall-clock — the same lesson the writer's
     // `commit_shell_job_status_file` already learned (#1568) and the reader had
     // not: under heavy CPU contention (a full parallel test suite, an AV sweep)
@@ -8020,9 +12020,6 @@ fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
         match read_status_file_share_delete(path) {
             Ok(bytes) => return Ok(bytes),
             Err(error) => {
-                let transient_open = error
-                    .raw_os_error()
-                    .is_some_and(|code| TRANSIENT_OPEN_CODES.contains(&code));
                 // NOT_FOUND is overloaded: it is the legitimate "no such job"
                 // signal, but it also fires transiently mid-replace when
                 // `MoveFileExW(REPLACE_EXISTING)` has momentarily unlinked the
@@ -8035,9 +12032,46 @@ fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
                 // (its staging file already renamed away), so the very next open
                 // will succeed. A genuinely-absent job matches neither predicate
                 // and returns immediately with no added latency.
-                let mid_replace = error.kind() == io::ErrorKind::NotFound
-                    && (shell_status_replace_in_flight(path) || path.try_exists().unwrap_or(false));
-                if attempt < MAX_ATTEMPTS && (transient_open || mid_replace) {
+                let (replace_in_flight, destination_exists) = if error.kind()
+                    == io::ErrorKind::NotFound
+                {
+                    let replace_in_flight = shell_status_replace_in_flight(path).map_err(
+                            |inspection_error| {
+                                io::Error::new(
+                                    inspection_error.kind(),
+                                    format!(
+                                        "status open failed for {} ({error}); staging inspection failed: {inspection_error}",
+                                        path.display()
+                                    ),
+                                )
+                            },
+                        )?;
+                    let destination_exists = path.try_exists().map_err(|inspection_error| {
+                            io::Error::new(
+                                inspection_error.kind(),
+                                format!(
+                                    "status open failed for {} ({error}); destination existence inspection failed: {inspection_error}",
+                                    path.display()
+                                ),
+                            )
+                        })?;
+                    (replace_in_flight, destination_exists)
+                } else {
+                    (false, false)
+                };
+                let retryable = shell_status_open_error_is_retryable(
+                    error.kind(),
+                    error.raw_os_error(),
+                    replace_in_flight,
+                    destination_exists,
+                );
+                if attempt < MAX_ATTEMPTS && retryable {
+                    // Test coverage uses this synchronous observation point to
+                    // land a real atomic replacement after the reader has
+                    // classified NOT_FOUND as transient. Production supplies a
+                    // no-op observer. This keeps the behavior test independent
+                    // of thread scheduling without changing the retry contract.
+                    before_retry(attempt);
                     std::thread::sleep(Duration::from_millis(backoff_ms));
                     backoff_ms = backoff_ms.saturating_mul(2).min(BACKOFF_CAP_MS);
                     continue;
@@ -8065,21 +12099,70 @@ fn read_shell_status_bytes(path: &Path) -> io::Result<Vec<u8>> {
 /// [`shell_status_temp_path`] prefix. Used by [`read_shell_status_bytes`] to
 /// keep the NOT_FOUND retry window from ever firing for a genuinely-absent job.
 #[cfg(windows)]
-fn shell_status_replace_in_flight(path: &Path) -> bool {
-    let Some(dir) = path.parent() else {
-        return false;
-    };
-    let base = match path.file_name() {
-        Some(name) => name.to_string_lossy().into_owned(),
-        None => return false,
-    };
+fn shell_status_replace_in_flight(path: &Path) -> io::Result<bool> {
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "status path has no parent for staging inspection: {}",
+                path.display()
+            ),
+        )
+    })?;
+    let base = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "status path has no filename for staging inspection: {}",
+                path.display()
+            ),
+        )
+    })?;
+    let base = base.to_string_lossy().into_owned();
     let prefix = format!("{base}.tmp.");
-    let Ok(entries) = fs::read_dir(dir) else {
-        return false;
-    };
-    entries
-        .flatten()
-        .any(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+    let entries = fs::read_dir(dir).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "failed to enumerate status staging directory {}: {error}",
+                dir.display()
+            ),
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to read a status staging entry under {}: {error}",
+                    dir.display()
+                ),
+            )
+        })?;
+        if !entry.file_name().to_string_lossy().starts_with(&prefix) {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to classify status staging candidate {}: {error}",
+                    entry.path().display()
+                ),
+            )
+        })?;
+        if !file_type.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "status staging candidate is not a regular file: {}",
+                    entry.path().display()
+                ),
+            ));
+        }
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStatus, ErrorData> {
@@ -8117,8 +12200,66 @@ fn read_shell_job_status(path: &Path, job_id: &str) -> Result<ActRunShellJobStat
             }),
         )
     })?;
+    if job.job_id != job_id {
+        return Err(shell_tool_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "act_run_shell job status identity mismatch: requested/path job id {job_id}, persisted job id {}",
+                job.job_id
+            ),
+            json!({
+                "code": error_codes::STORAGE_READ_FAILED,
+                "job_id": job_id,
+                "persisted_job_id": job.job_id,
+                "path": path,
+                "reason": "job_status_job_id_mismatch",
+            }),
+        ));
+    }
     normalize_shell_job_remote_process_scope(&mut job);
     Ok(shell_job_status_with_safe_command_metadata(&job))
+}
+
+/// Persist a durable status and then perform a distinct store read to prove the
+/// complete record that callers will subsequently observe. The lower-level
+/// writer verifies its atomic byte commit while holding the writer lock; this
+/// second read deliberately happens after that lock is released and validates
+/// the public decode/normalization path as well.
+fn persist_and_verify_shell_job_status(
+    path: &Path,
+    status: &ActRunShellJobStatus,
+) -> Result<ActRunShellJobStatus, ShellJobStatusPersistenceFailure> {
+    write_shell_job_status(path, status).map_err(|error| ShellJobStatusPersistenceFailure {
+        error_code: error_codes::STORAGE_WRITE_FAILED,
+        reason: "job_status_write_failed",
+        detail: format!(
+            "underlying_code={}; message={}",
+            extract_error_code(&error),
+            error.message
+        ),
+    })?;
+
+    let readback = read_shell_job_status(path, &status.job_id).map_err(|error| {
+        ShellJobStatusPersistenceFailure {
+            error_code: error_codes::STORAGE_READ_FAILED,
+            reason: "job_status_independent_readback_failed",
+            detail: format!(
+                "underlying_code={}; message={}",
+                extract_error_code(&error),
+                error.message
+            ),
+        }
+    })?;
+    let mut expected = shell_job_status_with_safe_command_metadata(status);
+    normalize_shell_job_remote_process_scope(&mut expected);
+    if readback != expected {
+        return Err(ShellJobStatusPersistenceFailure {
+            error_code: error_codes::STORAGE_READ_FAILED,
+            reason: "job_status_independent_readback_mismatch",
+            detail: format!("expected={expected:?}; actual={readback:?}"),
+        });
+    }
+    Ok(readback)
 }
 
 fn normalize_shell_job_remote_process_scope(job: &mut ActRunShellJobStatus) {
@@ -8186,6 +12327,9 @@ fn ssh_remote_process_scope(
         remote_identity: shell_transfer_remote_identity(client, args),
         remote_process_id: None,
         remote_process_group_id: None,
+        remote_boot_id: None,
+        remote_process_start_time: None,
+        remote_ownership_token: None,
         remote_cleanup_error_code: None,
         remote_cleanup_message: None,
         detection_evidence,
@@ -8214,6 +12358,50 @@ fn shell_spawn_command(command: &str) -> Cow<'_, str> {
         return Cow::Owned(resolved);
     }
     Cow::Borrowed(command)
+}
+
+#[cfg(windows)]
+fn trusted_ssh_automatic_replay_executable(command: &str) -> Option<PathBuf> {
+    let mut candidates = windows_git_ssh_dir_candidates()
+        .into_iter()
+        .map(|dir| dir.join("ssh.exe"))
+        .collect::<Vec<_>>();
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        candidates.push(
+            PathBuf::from(system_root)
+                .join("System32")
+                .join("OpenSSH")
+                .join("ssh.exe"),
+        );
+    }
+    if is_bare_windows_executable_name(command)
+        && ssh_family_client_for_executable(command) == Some("ssh")
+    {
+        return candidates
+            .into_iter()
+            .find_map(|candidate| fs::canonicalize(candidate).ok());
+    }
+    let actual = fs::canonicalize(command).ok()?;
+    let actual = normalize_semicolon_path_part(&actual.to_string_lossy());
+    candidates.into_iter().find_map(|candidate| {
+        let candidate = fs::canonicalize(candidate).ok()?;
+        (normalize_semicolon_path_part(&candidate.to_string_lossy()) == actual).then_some(candidate)
+    })
+}
+
+#[cfg(not(windows))]
+fn trusted_ssh_automatic_replay_executable(command: &str) -> Option<PathBuf> {
+    let candidates = ["/usr/bin/ssh", "/bin/ssh", "/usr/local/bin/ssh"]
+        .into_iter()
+        .filter_map(|candidate| fs::canonicalize(candidate).ok())
+        .collect::<Vec<_>>();
+    if command == "ssh" {
+        return candidates.into_iter().next();
+    }
+    let actual = fs::canonicalize(command).ok()?;
+    candidates
+        .into_iter()
+        .find(|candidate| candidate == &actual)
 }
 
 #[cfg(windows)]
@@ -8329,46 +12517,83 @@ struct ShellRemoteCleanupInvocation {
     remote_identity: String,
     source_evidence: String,
     args_sha256: String,
+    #[serde(default)]
+    request_args_sha256: Option<String>,
+    #[serde(default)]
+    effective_control_args: Option<Vec<String>>,
+    #[serde(default)]
+    effective_args_sha256: Option<String>,
+    /// Effective `ssh -G` configuration observed for the caller's original
+    /// control argv after proving it is byte-identical with `-F none`. This is
+    /// evidence that the initial target did not depend on mutable implicit
+    /// ssh_config state.
+    #[serde(default)]
+    request_effective_config: Option<SshEffectiveConfigFingerprint>,
+    /// Effective `ssh -G` configuration for the exact hardened cleanup argv.
+    /// Recovery re-reads this fingerprint before it can use the sidecar.
+    #[serde(default)]
+    cleanup_effective_config: Option<SshEffectiveConfigFingerprint>,
+    /// Raw correlation token retained only in the local durable sidecar. The
+    /// remote guardian needs it in its environment for `/proc` identity
+    /// verification, but markers expose only its SHA-256 digest and the
+    /// payload environment explicitly removes it.
+    #[serde(default)]
+    ownership_token: Option<String>,
     created_at: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct SshEffectiveConfigFingerprint {
+    byte_len: u64,
+    sha256: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
+struct SshEffectiveConfigReadback {
+    fingerprint: SshEffectiveConfigFingerprint,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct SshRemoteTrackingPlan {
+    /// Historical tracker wire fixture only. Production rejects new durable
+    /// SSH promotion before this shape can be constructed.
+    command: String,
+    /// Canonical trusted executable identity used only for preflight and later
+    /// unattended read/cleanup replay.
+    cleanup_command: String,
     spawn_args: Vec<String>,
+    control_args: Vec<String>,
+    effective_control_args: Vec<String>,
     remote_identity: String,
     remote_command: String,
     marker: String,
+    ownership_token: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ShellJobSpawnPlan {
     command: String,
     args: Vec<String>,
+    remote_cleanup_invocation: Option<ShellRemoteCleanupInvocation>,
 }
 
-fn shell_job_spawn_plan(params: &ActRunShellStartParams, job_id: &str) -> ShellJobSpawnPlan {
-    if let Some(invocation) = shell_job_ssh_command_invocation(&params.command, &params.args) {
-        if let Some(plan) = ssh_remote_tracking_plan(&invocation.command, &invocation.args, job_id)
-        {
-            tracing::info!(
-                code = "M4_ACT_RUN_SHELL_SSH_REMOTE_TRACKING_ENABLED",
-                job_id,
-                remote_identity = %plan.remote_identity,
-                marker = %plan.marker,
-                source = invocation.evidence,
-                remote_command_sha256 = %sha256_hex(plan.remote_command.as_bytes()),
-                "act_run_shell_start will capture SSH remote pid/process-group metadata"
-            );
-            return ShellJobSpawnPlan {
-                command: invocation.command,
-                args: plan.spawn_args,
-            };
-        }
-    }
-    ShellJobSpawnPlan {
+fn shell_job_spawn_plan(
+    params: &ActRunShellStartParams,
+    job_id: &str,
+) -> Result<ShellJobSpawnPlan, ErrorData> {
+    reject_new_durable_ssh_promotion(
+        &params.command,
+        &params.args,
+        Some("durable_spawn_plan"),
+        Some(job_id),
+    )?;
+    Ok(ShellJobSpawnPlan {
         command: params.command.clone(),
         args: params.args.clone(),
-    }
+        remote_cleanup_invocation: None,
+    })
 }
 
 fn shell_job_ssh_command_invocation(
@@ -8383,6 +12608,93 @@ fn shell_job_ssh_command_invocation(
         });
     }
     shell_wrapped_ssh_command_invocation(command, args)
+}
+
+fn reject_new_durable_ssh_promotion(
+    command: &str,
+    args: &[String],
+    background_reason: Option<&str>,
+    requested_job_id: Option<&str>,
+) -> Result<(), ErrorData> {
+    let Some(source_evidence) = durable_ssh_promotion_evidence(command, args) else {
+        return Ok(());
+    };
+    Err(shell_tool_error(
+        error_codes::ACTION_TARGET_INVALID,
+        "durable SSH execution is refused because Synapse cannot preserve the inline SSH stdout/stderr, account-shell environment, and stdin contract while acquiring a remote cleanup handle; use bounded inline act_run_shell execution",
+        json!({
+            "code": error_codes::ACTION_TARGET_INVALID,
+            "reason": "ssh_durable_semantic_preservation_unavailable",
+            "remediation": "use_bounded_inline_execution",
+            "recommended_tool": "act_run_shell",
+            "recommended_execution_mode": "inline",
+            "maximum_inline_timeout_ms": DEFAULT_RUN_SHELL_INLINE_CLIENT_CALL_BUDGET_MS,
+            "background_reason": background_reason,
+            "requested_job_id": requested_job_id,
+            "source_evidence": source_evidence,
+            "command": command,
+            "args_sha256": shell_args_sha256(args),
+            "no_child_spawned": true,
+            "no_job_artifact_created": true,
+        }),
+    ))
+}
+
+fn durable_ssh_promotion_evidence(command: &str, args: &[String]) -> Option<String> {
+    if let Some(invocation) = shell_job_ssh_command_invocation(command, args) {
+        return Some(invocation.evidence.to_owned());
+    }
+    let shell = executable_leaf(command).to_ascii_lowercase();
+    let (script, evidence) = match shell.as_str() {
+        "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => (
+            powershell_command_script_arg(args)?,
+            "shell_wrapped_ssh:powershell_conservative_scan",
+        ),
+        "cmd" | "cmd.exe" => (
+            cmd_command_script_arg(args)?,
+            "shell_wrapped_ssh:cmd_conservative_scan",
+        ),
+        "sh" | "sh.exe" | "bash" | "bash.exe" | "zsh" | "zsh.exe" => (
+            posix_shell_command_script_arg(args)?,
+            "shell_wrapped_ssh:posix_shell_conservative_scan",
+        ),
+        _ => return None,
+    };
+    shell_script_starts_ssh_command(script).then(|| evidence.to_owned())
+}
+
+fn posix_shell_command_script_arg(args: &[String]) -> Option<&str> {
+    args.windows(2).find_map(|pair| {
+        matches!(trim_arg_quotes(&pair[0]), "-c" | "--command").then(|| pair[1].as_str())
+    })
+}
+
+fn shell_script_starts_ssh_command(script: &str) -> bool {
+    script
+        .split([';', '|', '&', '{', '}', '(', ')', '\r', '\n'])
+        .any(|segment| {
+            let segment = segment.trim();
+            let mut words = split_single_shell_command_words(segment).unwrap_or_else(|| {
+                segment
+                    .split_whitespace()
+                    .next()
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect()
+            });
+            while words.first().is_some_and(|word| {
+                matches!(
+                    word.to_ascii_lowercase().as_str(),
+                    "call" | "exec" | "command"
+                )
+            }) {
+                words.remove(0);
+            }
+            words.first().is_some_and(|token| {
+                let token = token.trim_matches(&['"', '\''][..]);
+                ssh_family_client_for_executable(token) == Some("ssh")
+            })
+        })
 }
 
 fn shell_wrapped_ssh_command_invocation(
@@ -8490,6 +12802,23 @@ fn shell_job_cleanup_invocation(
 ) -> Option<SshCommandInvocation> {
     if let Some(args) = original_args {
         if let Some(invocation) = shell_job_ssh_command_invocation(&job.command, args) {
+            if let Some(remote_cleanup) = remote_cleanup {
+                let original_parts = ssh_direct_command_parts(&invocation.args)?;
+                let request_digest = shell_args_sha256(args);
+                let canonical_original_command =
+                    trusted_ssh_automatic_replay_executable(&invocation.command)
+                        .map(|path| path.to_string_lossy().into_owned());
+                if matches!(remote_cleanup.schema_version, 3 | 4)
+                    && (remote_cleanup.request_args_sha256.as_deref()
+                        != Some(request_digest.as_str())
+                        || canonical_original_command.as_deref()
+                            != Some(remote_cleanup.command.as_str())
+                        || original_parts.control_args != remote_cleanup.control_args
+                        || original_parts.remote_identity != remote_cleanup.remote_identity)
+                {
+                    return None;
+                }
+            }
             return Some(invocation);
         }
     }
@@ -8503,60 +12832,373 @@ fn shell_job_cleanup_invocation(
     shell_job_ssh_command_invocation(&job.command, &job.args)
 }
 
+#[cfg(test)]
 fn ssh_remote_tracking_plan(
     command: &str,
     args: &[String],
     job_id: &str,
-) -> Option<SshRemoteTrackingPlan> {
+) -> Result<Option<SshRemoteTrackingPlan>, String> {
     if ssh_family_client_for_executable(command) != Some("ssh") {
-        return None;
+        return Ok(None);
     }
-    let parts = ssh_direct_command_parts(args)?;
-    if parts.tracking_unsupported_reason.is_some() {
-        return None;
-    }
-    let remote_command = parts.remote_command?;
+    let Some(parts) = ssh_direct_command_parts(args) else {
+        return Ok(None);
+    };
+    let Some(remote_command) = parts.remote_command else {
+        return Ok(None);
+    };
     if remote_command.trim().is_empty() {
-        return None;
+        return Ok(None);
+    }
+    let trusted_command = trusted_ssh_automatic_replay_executable(command).ok_or_else(|| {
+        format!("SSH executable is not a trusted automatic-replay binary: {command}")
+    })?;
+    if let Some(reason) = parts.tracking_unsupported_reason {
+        return Err(format!(
+            "SSH remote command cannot be tracked safely: {reason}"
+        ));
     }
 
     let marker = format!("{SHELL_REMOTE_PROCESS_MARKER} job_id={job_id}");
     let exit_marker = format!("{SHELL_REMOTE_EXIT_MARKER} job_id={job_id}");
-    let remote_wrapper = ssh_remote_tracking_command(&marker, &exit_marker, &remote_command);
+    let ownership_token = uuid::Uuid::new_v4().simple().to_string();
+    let remote_wrapper =
+        ssh_remote_tracking_command(&marker, &exit_marker, &ownership_token, &remote_command);
+    // The tracked durable spawn must preserve the caller's SSH connection
+    // contract exactly. The separately persisted `effective_control_args` are
+    // for unattended recovery/cleanup, where mutable ssh_config is isolated
+    // and any destination that cannot be reproduced under that policy fails
+    // closed instead of being silently retargeted. Applying the hardened
+    // replay argv to the initial command would make promotion itself observable
+    // (for example by changing StrictHostKeyChecking or ignoring ssh_config),
+    // which is the semantic split fixed by #1628.
+    let effective_control_args = hardened_ssh_automatic_replay_args(&parts.control_args)?;
     let mut spawn_args = parts.control_args.clone();
     spawn_args.push(remote_wrapper);
-    Some(SshRemoteTrackingPlan {
+    Ok(Some(SshRemoteTrackingPlan {
+        command: command.to_owned(),
+        cleanup_command: trusted_command.to_string_lossy().into_owned(),
         spawn_args,
+        control_args: parts.control_args,
+        effective_control_args,
         remote_identity: parts.remote_identity,
         remote_command,
         marker,
-    })
+        ownership_token,
+    }))
 }
 
-fn ssh_remote_tracking_command(marker: &str, exit_marker: &str, remote_command: &str) -> String {
-    const SCRIPT: &str = r#"marker=$1
+const SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY: &str = r#"import os
+import sys
+
+def live_process_ids_in_group(expected_pgid, excluded_pids=()):
+    if expected_pgid <= 1:
+        raise RuntimeError(f"invalid process group {expected_pgid}")
+    excluded = set(excluded_pids)
+    try:
+        proc_entries = os.scandir("/proc")
+    except OSError as error:
+        raise RuntimeError(f"enumerate /proc failed: {error}") from error
+    members = []
+    with proc_entries:
+        for entry in proc_entries:
+            name = entry.name
+            if not name.isascii() or not name.isdigit():
+                continue
+            candidate = int(name)
+            if candidate in excluded:
+                continue
+            try:
+                with open(f"/proc/{name}/stat", encoding="utf-8", errors="strict") as handle:
+                    stat_line = handle.read().strip()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError as error:
+                raise RuntimeError(f"read /proc/{name}/stat failed: {error}") from error
+            _comm, separator, stat_tail = stat_line.rpartition(") ")
+            if not separator:
+                raise RuntimeError(f"/proc/{name}/stat has no command terminator")
+            fields = stat_tail.split()
+            if len(fields) < 3 or not fields[2].isascii() or not fields[2].isdigit():
+                raise RuntimeError(f"/proc/{name}/stat has invalid process-group metadata")
+            if int(fields[2]) == expected_pgid:
+                members.append(candidate)
+    return sorted(members)
+
+def process_group_exists(expected_pgid):
+    if expected_pgid <= 1:
+        raise RuntimeError(f"invalid process group {expected_pgid}")
+    try:
+        os.kill(-expected_pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # The group exists even when this account cannot inspect/signal one of
+        # its members (for example after a payload changes uid under hidepid).
+        return True
+    except OSError as error:
+        raise RuntimeError(f"probe process group {expected_pgid} failed: {error}") from error
+    return True
+"#;
+
+#[cfg(test)]
+fn ssh_remote_tracking_command(
+    marker: &str,
+    exit_marker: &str,
+    ownership_token: &str,
+    remote_command: &str,
+) -> String {
+    // The group leader remains an owned guardian for the full command
+    // lifetime. Cleanup signals that guardian through a pidfd; its trap then
+    // terminates its still-anchored process group. This avoids both numeric PID
+    // reuse and the Linux <6.9 lack of PIDFD_SIGNAL_PROCESS_GROUP.
+    const GROUP_PROBE_MAIN: &str = r#"owner_pid = int(sys.argv[1])
+expected_pgid = int(sys.argv[2])
+try:
+    members = live_process_ids_in_group(expected_pgid, (owner_pid, os.getpid()))
+except Exception as error:
+    print(f"process_group_inspection_failed pgid={expected_pgid} error={error}", file=sys.stderr, flush=True)
+    raise SystemExit(2)
+raise SystemExit(0 if members else 1)
+"#;
+    const GROUP_EXISTENCE_MAIN: &str = r#"expected_pgid = int(sys.argv[1])
+try:
+    group_exists = process_group_exists(expected_pgid)
+except Exception as error:
+    print(f"process_group_inspection_failed pgid={expected_pgid} error={error}", file=sys.stderr, flush=True)
+    raise SystemExit(2)
+raise SystemExit(0 if group_exists else 1)
+"#;
+    let group_probe_script =
+        format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{GROUP_PROBE_MAIN}");
+    let group_existence_script =
+        format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{GROUP_EXISTENCE_MAIN}");
+    const GUARDIAN_SCRIPT: &str = r#"marker=$1
+ownership_token=$2
+ownership_token_sha256=$3
+cmd=$4
+account_shell=$5
+group_probe_script=$6
+pid=$$
+pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+sid=$(ps -o sid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+boot_id=$(tr -d '[:space:]' </proc/sys/kernel/random/boot_id 2>/dev/null || true)
+stat_line=$(cat "/proc/$pid/stat" 2>/dev/null || true)
+stat_tail=${stat_line##*) }
+set -f
+set -- $stat_tail
+start_time=${20:-}
+set +f
+case "$pid:$pgid:$sid:$start_time" in
+  *[!0123456789:]*|:*|*::*|*:)
+    printf '%s error=proc_identity_unavailable\n' "$marker" >&2
+    exit 127
+    ;;
+esac
+if [ "$pgid" != "$pid" ] || [ "$sid" != "$pid" ]; then
+  printf '%s error=guardian_scope_unavailable pid=%s pgid=%s sid=%s\n' \
+    "$marker" "$pid" "$pgid" "$sid" >&2
+  exit 127
+fi
+case "$boot_id" in
+  ????????-????-????-????-????????????) ;;
+  *)
+    printf '%s error=boot_identity_unavailable\n' "$marker" >&2
+    exit 127
+    ;;
+esac
+printf '%s pid=%s pgid=%s sid=%s boot_id=%s start_time=%s ownership_token_sha256=%s\n' \
+  "$marker" "$pid" "$pgid" "$sid" "$boot_id" "$start_time" "$ownership_token_sha256" >&2
+
+group_has_other_members() {
+  python3 -c "$group_probe_script" "$pid" "$pgid"
+}
+
+cleanup_failed=0
+payload_rc=
+natural_term_sent=0
+terminate_owned_group() {
+  cleanup_failed=0
+  trap '' TERM HUP INT
+  if ! kill -TERM -"$pgid" 2>/dev/null; then
+    printf '%s error=process_group_term_signal_failed pgid=%s\n' "$marker" "$pgid" >&2
+    cleanup_failed=1
+    trap terminate_owned_group TERM HUP INT
+    return
+  fi
+  i=0
+  while [ "$i" -lt __GROUP_ABSENCE_PROBE_ATTEMPTS__ ]; do
+    group_has_other_members
+    group_state=$?
+    case "$group_state" in
+      0) ;;
+      1) exit 143 ;;
+      *)
+        printf '%s error=process_group_enumeration_failed pgid=%s probe_exit=%s\n' \
+          "$marker" "$pgid" "$group_state" >&2
+        cleanup_failed=1
+        trap terminate_owned_group TERM HUP INT
+        return
+        ;;
+    esac
+    i=$((i + 1))
+    sleep __GROUP_ABSENCE_PROBE_INTERVAL_SECONDS__
+  done
+  # The guardian still anchors this PGID, so this group signal cannot target a
+  # recycled group. SIGKILL intentionally includes the guardian itself.
+  if ! kill -KILL -"$pgid" 2>/dev/null; then
+    printf '%s error=process_group_kill_signal_failed pgid=%s\n' "$marker" "$pgid" >&2
+    cleanup_failed=1
+    trap terminate_owned_group TERM HUP INT
+    return
+  fi
+  # A successful group SIGKILL includes this guardian. Reaching this statement
+  # means the destructive result is uncertain, so remain alive and retryable.
+  cleanup_failed=1
+  trap terminate_owned_group TERM HUP INT
+}
+
+trap terminate_owned_group TERM HUP INT
+# POSIX asynchronous lists may implicitly replace stdin with /dev/null. Save
+# the SSH-provided stream before backgrounding, then explicitly pass it to the
+# account shell. Remove the guardian-only ownership token from the payload.
+exec 3<&0
+env -u SYNAPSE_REMOTE_JOB_TOKEN "$account_shell" -c "$cmd" <&3 &
+payload=$!
+exec 3<&-
+while :; do
+  if [ -z "$payload_rc" ]; then
+    wait "$payload"
+    rc=$?
+    if kill -0 "$payload" 2>/dev/null; then
+      if [ "$cleanup_failed" -ne 0 ]; then
+        sleep 1
+      fi
+      continue
+    fi
+    payload_rc=$rc
+  fi
+  # The shell payload can exit after forking/backgrounding same-PGID work. Do
+  # not let that turn into a terminal marker. TERM residual owned members while
+  # this guardian still anchors the non-reusable PGID, then remain observable
+  # until enumeration proves only the guardian/probe remain.
+  if [ "$natural_term_sent" -eq 0 ]; then
+    trap '' TERM HUP INT
+    if ! kill -TERM -"$pgid" 2>/dev/null; then
+      printf '%s error=natural_completion_group_term_failed pgid=%s\n' "$marker" "$pgid" >&2
+      cleanup_failed=1
+      trap terminate_owned_group TERM HUP INT
+      sleep 1
+      continue
+    fi
+    trap terminate_owned_group TERM HUP INT
+    natural_term_sent=1
+  fi
+  group_has_other_members
+  group_state=$?
+  case "$group_state" in
+    0) sleep __GROUP_ABSENCE_PROBE_INTERVAL_SECONDS__ ;;
+    1) exit "$payload_rc" ;;
+    *)
+      printf '%s error=natural_completion_group_inspection_failed pgid=%s probe_exit=%s\n' \
+        "$marker" "$pgid" "$group_state" >&2
+      cleanup_failed=1
+      sleep 1
+      ;;
+  esac
+done
+"#;
+
+    const TRACKER_SCRIPT: &str = r#"marker=$1
 exit_marker=$2
-cmd=$3
+ownership_token=$3
+ownership_token_sha256=$4
+cmd=$5
+guardian_script=$6
+group_probe_script=$7
+group_existence_script=$8
 if ! command -v setsid >/dev/null 2>&1; then
   printf '%s error=setsid_unavailable\n' "$marker" >&2
   exit 127
 fi
-setsid sh -c "$cmd" &
+    for prerequisite in env ps tr cat python3; do
+  if ! command -v "$prerequisite" >/dev/null 2>&1; then
+    printf '%s error=remote_identity_prerequisite_unavailable prerequisite=%s\n' \
+      "$marker" "$prerequisite" >&2
+    exit 127
+  fi
+done
+if [ ! -r /proc/sys/kernel/random/boot_id ] || [ ! -r /proc/self/stat ]; then
+  printf '%s error=proc_identity_unavailable\n' "$marker" >&2
+  exit 127
+fi
+if ! python3 -c 'import os, signal; assert hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")' >/dev/null 2>&1; then
+  printf '%s error=pidfd_unavailable\n' "$marker" >&2
+  exit 127
+fi
+account_shell=$(python3 -c 'import os, pwd; shell = pwd.getpwuid(os.getuid()).pw_shell; assert shell and os.path.isabs(shell) and os.access(shell, os.X_OK); print(shell, end="")' 2>/dev/null)
+if [ -z "$account_shell" ] || [ ! -x "$account_shell" ]; then
+  printf '%s error=account_login_shell_unavailable\n' "$marker" >&2
+  exit 127
+fi
+# Preserve the caller's finite/EOF/interactive SSH stdin across the
+# asynchronous-list boundary. Without the saved descriptor, POSIX shells are
+# permitted to substitute /dev/null for the background guardian.
+exec 3<&0
+setsid env SYNAPSE_REMOTE_JOB_TOKEN="$ownership_token" \
+  sh -c "$guardian_script" synapse-remote-guardian \
+  "$marker" "$ownership_token" "$ownership_token_sha256" "$cmd" "$account_shell" "$group_probe_script" <&3 &
 child=$!
+exec 3<&-
 pgid=$child
-sid=$(ps -o sid= -p "$child" 2>/dev/null | tr -d '[:space:]' || true)
-printf '%s pid=%s pgid=%s sid=%s\n' "$marker" "$child" "$pgid" "$sid" >&2
 wait "$child"
 rc=$?
-printf '%s pid=%s pgid=%s exit_code=%s\n' "$exit_marker" "$child" "$pgid" "$rc" >&2
-exit "$rc"
+python3 -c "$group_existence_script" "$pgid"
+group_state=$?
+case "$group_state" in
+  1)
+    printf '%s pid=%s pgid=%s ownership_token_sha256=%s exit_code=%s\n' \
+      "$exit_marker" "$child" "$pgid" "$ownership_token_sha256" "$rc" >&2
+    exit "$rc"
+    ;;
+  0)
+    printf '%s error=remote_group_survived_guardian_exit pgid=%s guardian_exit_code=%s\n' \
+      "$marker" "$pgid" "$rc" >&2
+    exit 125
+    ;;
+  *)
+    printf '%s error=post_guardian_group_inspection_failed pgid=%s probe_exit=%s guardian_exit_code=%s\n' \
+      "$marker" "$pgid" "$group_state" "$rc" >&2
+    exit 126
+    ;;
+esac
 "#;
+    let group_probe_interval_seconds = format!(
+        "{}.{:03}",
+        SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS / 1_000,
+        SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS % 1_000
+    );
+    let guardian_script = GUARDIAN_SCRIPT
+        .replace(
+            "__GROUP_ABSENCE_PROBE_ATTEMPTS__",
+            &SHELL_REMOTE_GROUP_ABSENCE_PROBE_ATTEMPTS.to_string(),
+        )
+        .replace(
+            "__GROUP_ABSENCE_PROBE_INTERVAL_SECONDS__",
+            &group_probe_interval_seconds,
+        );
+    let ownership_token_sha256 = sha256_hex(ownership_token.as_bytes());
     format!(
-        "sh -c {} synapse-remote-tracker {} {} {}",
-        posix_single_quote(SCRIPT),
+        "sh -c {} synapse-remote-tracker {} {} {} {} {} {} {} {}",
+        posix_single_quote(TRACKER_SCRIPT),
         posix_single_quote(marker),
         posix_single_quote(exit_marker),
-        posix_single_quote(remote_command)
+        posix_single_quote(ownership_token),
+        posix_single_quote(&ownership_token_sha256),
+        posix_single_quote(remote_command),
+        posix_single_quote(&guardian_script),
+        posix_single_quote(&group_probe_script),
+        posix_single_quote(&group_existence_script),
     )
 }
 
@@ -8659,6 +13301,202 @@ fn ssh_option_consumes_next(arg: &str, next: Option<&String>) -> bool {
     )
 }
 
+/// SSH control arguments persisted for later automatic replay are a deliberately
+/// small allowlist. A startup probe is a new privileged execution, not a replay
+/// of arbitrary client behavior: any option that can execute local code, load
+/// mutable configuration/providers, open a forwarding/tunnel/listener, reuse a
+/// multiplexed connection, or redirect evidence must leave the job retained and
+/// unverified. Unknown options fail closed so a future OpenSSH feature cannot
+/// silently expand this boundary.
+fn ssh_control_args_unsafe_for_automatic_replay(args: &[String]) -> Option<String> {
+    let mut index = 0usize;
+    while index < args.len() {
+        let arg = trim_arg_quotes(&args[index]);
+        if arg == "--" {
+            index += 1;
+            break;
+        }
+        if !arg.starts_with('-') || arg == "-" {
+            break;
+        }
+
+        if matches!(arg, "-4" | "-6" | "-a" | "-C" | "-k" | "-n" | "-T" | "-x") {
+            index += 1;
+            continue;
+        }
+
+        if matches!(arg, "-i" | "-l" | "-p") {
+            let Some(raw_value) = args.get(index + 1) else {
+                return Some(format!("{arg}:missing_value"));
+            };
+            let value = trim_arg_quotes(raw_value);
+            let valid = match arg {
+                "-i" => {
+                    !value.is_empty()
+                        && !value.chars().any(char::is_control)
+                        && Path::new(value).is_absolute()
+                }
+                "-l" => {
+                    !value.is_empty()
+                        && value
+                            .chars()
+                            .all(|ch| !ch.is_control() && !ch.is_whitespace())
+                }
+                "-p" => value
+                    .parse::<u16>()
+                    .ok()
+                    .is_some_and(|port| port > 0 && value.chars().all(|ch| ch.is_ascii_digit())),
+                _ => false,
+            };
+            if !valid {
+                return Some(format!("{arg}:invalid_value"));
+            }
+            index += 2;
+            continue;
+        }
+
+        let (option_value, consumed) = if arg == "-o" {
+            let Some(value) = args.get(index + 1) else {
+                return Some("-o:missing_value".to_owned());
+            };
+            (trim_arg_quotes(value), 2usize)
+        } else if let Some(value) = arg.strip_prefix("-o") {
+            if value.is_empty() {
+                return Some("-o:missing_value".to_owned());
+            }
+            (value, 1usize)
+        } else {
+            return Some(format!("{arg}:not_allowlisted"));
+        };
+        let Some((key, value)) = option_value.split_once('=') else {
+            return Some("-o:expected_key_equals_value".to_owned());
+        };
+        if key.is_empty()
+            || value.is_empty()
+            || key.chars().any(char::is_whitespace)
+            || value.chars().any(char::is_whitespace)
+        {
+            return Some("-o:invalid_key_or_value".to_owned());
+        }
+        let key = key.to_ascii_lowercase();
+        let value = value.to_ascii_lowercase();
+        let explicitly_safe = matches!(
+            (key.as_str(), value.as_str()),
+            ("batchmode", "yes")
+                | ("clearallforwardings", "yes")
+                | ("permitlocalcommand", "no")
+                | ("proxycommand", "none")
+                | ("proxyjump", "none")
+                | ("controlmaster", "no")
+                | ("controlpath", "none")
+                | ("controlpersist", "no")
+                | ("forwardagent", "no")
+                | ("forwardx11", "no")
+                | ("forwardx11trusted", "no")
+                | ("tunnel", "no")
+                | ("requesttty", "no")
+                | ("forkafterauthentication", "no")
+                | ("stdinnull", "yes")
+                | ("enableescapecommandline", "no")
+                | ("addkeystoagent", "no")
+                | ("updatehostkeys", "no")
+                | ("stricthostkeychecking", "yes")
+                | ("numberofpasswordprompts", "0")
+                | ("knownhostscommand", "none")
+                | ("identitiesonly", "yes")
+        );
+        if !explicitly_safe {
+            return Some(format!("-o{key}:not_allowlisted"));
+        }
+        index += consumed;
+    }
+
+    if index + 1 != args.len() {
+        return Some(if index >= args.len() {
+            "ssh_destination:missing".to_owned()
+        } else {
+            "ssh_control_args:unexpected_remote_command_or_trailing_argv".to_owned()
+        });
+    }
+    let destination = trim_arg_quotes(&args[index]);
+    if destination.is_empty()
+        || destination
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Some("ssh_destination:invalid".to_owned());
+    }
+    None
+}
+
+// OpenSSH documents literal `none` as disabling both user and system config
+// files. Unlike an OS null-device path it is portable across Windows and Unix.
+const SSH_AUTOMATIC_REPLAY_DISABLED_CONFIG: &str = "none";
+
+fn ssh_automatic_replay_safe_baseline_args() -> Vec<String> {
+    [
+        "-F",
+        SSH_AUTOMATIC_REPLAY_DISABLED_CONFIG,
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "ProxyCommand=none",
+        "-o",
+        "ProxyJump=none",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ForwardX11=no",
+        "-o",
+        "Tunnel=no",
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "ForkAfterAuthentication=no",
+        "-o",
+        "StdinNull=yes",
+        "-o",
+        "EnableEscapeCommandline=no",
+        "-o",
+        "AddKeysToAgent=no",
+        "-o",
+        "UpdateHostKeys=no",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "NumberOfPasswordPrompts=0",
+        "-o",
+        "KnownHostsCommand=none",
+        "-a",
+        "-x",
+        "-T",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn hardened_ssh_automatic_replay_args(control_args: &[String]) -> Result<Vec<String>, String> {
+    if let Some(reason) = ssh_control_args_unsafe_for_automatic_replay(control_args) {
+        return Err(format!(
+            "SSH control argv is not safe for automatic replay: {reason}"
+        ));
+    }
+    let mut args = ssh_automatic_replay_safe_baseline_args();
+    args.extend_from_slice(control_args);
+    Ok(args)
+}
+
 fn ensure_shell_job_remote_scope_from_process_tree(job: &mut ActRunShellJobStatus) {
     if job.remote_process_scope.transport == SHELL_REMOTE_TRANSPORT_SSH {
         return;
@@ -8680,6 +13518,9 @@ fn ensure_shell_job_remote_scope_from_process_tree(job: &mut ActRunShellJobStatu
         remote_identity: None,
         remote_process_id: None,
         remote_process_group_id: None,
+        remote_boot_id: None,
+        remote_process_start_time: None,
+        remote_ownership_token: None,
         remote_cleanup_error_code: None,
         remote_cleanup_message: None,
         detection_evidence: evidence,
@@ -8830,6 +13671,23 @@ fn remote_pre_marker_terminal_evidence(stderr: &str) -> Option<RemotePreMarkerTe
             "unterminated quoted string",
         ),
         ("remote_shell_parse_error", "parse error near"),
+        ("remote_pidfd_unavailable", "error=pidfd_unavailable"),
+        (
+            "remote_proc_identity_unavailable",
+            "error=proc_identity_unavailable",
+        ),
+        (
+            "remote_boot_identity_unavailable",
+            "error=boot_identity_unavailable",
+        ),
+        (
+            "remote_identity_prerequisite_unavailable",
+            "error=remote_identity_prerequisite_unavailable",
+        ),
+        (
+            "remote_guardian_scope_unavailable",
+            "error=guardian_scope_unavailable",
+        ),
     ];
     patterns
         .iter()
@@ -8871,6 +13729,9 @@ struct RemoteProcessMetadata {
     pid: String,
     pgid: String,
     sid: Option<String>,
+    boot_id: Option<String>,
+    start_time: Option<String>,
+    ownership_token: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8879,6 +13740,14 @@ struct RemoteExitMetadata {
     pid: String,
     pgid: String,
     exit_code: i32,
+    ownership_token: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteProcessOwnershipIdentity {
+    boot_id: String,
+    start_time: String,
+    ownership_token: String,
 }
 
 fn refresh_shell_job_remote_metadata_from_outputs(
@@ -8896,8 +13765,16 @@ fn refresh_shell_job_remote_metadata_from_outputs(
     let stderr_prefix =
         read_file_prefix_lossy(&paths.stderr_path, SHELL_REMOTE_METADATA_PREFIX_BYTES)?;
     let stderr_tail = tail_file_lossy(&paths.stderr_path, SHELL_JOB_TAIL_DEFAULT_BYTES as usize)?;
-    let metadata = parse_remote_process_metadata(&stderr_prefix, &job.job_id)
-        .or_else(|| parse_remote_process_metadata(&stderr_tail, &job.job_id));
+    let ownership_token = job.remote_process_scope.remote_ownership_token.as_deref();
+    let metadata =
+        parse_remote_process_metadata_with_ownership(&stderr_prefix, &job.job_id, ownership_token)
+            .or_else(|| {
+                parse_remote_process_metadata_with_ownership(
+                    &stderr_tail,
+                    &job.job_id,
+                    ownership_token,
+                )
+            });
     let Some(metadata) = metadata else {
         return Ok(false);
     };
@@ -8927,8 +13804,16 @@ fn reconcile_shell_job_remote_exit_marker(
     let stderr_prefix =
         read_file_prefix_lossy(&paths.stderr_path, SHELL_REMOTE_METADATA_PREFIX_BYTES)?;
     let stderr_tail = tail_file_lossy(&paths.stderr_path, SHELL_JOB_TAIL_DEFAULT_BYTES as usize)?;
-    let metadata = parse_remote_exit_metadata(&stderr_prefix, &job.job_id)
-        .or_else(|| parse_remote_exit_metadata(&stderr_tail, &job.job_id));
+    let ownership_token = job.remote_process_scope.remote_ownership_token.as_deref();
+    let metadata =
+        parse_remote_exit_metadata_with_ownership(&stderr_prefix, &job.job_id, ownership_token)
+            .or_else(|| {
+                parse_remote_exit_metadata_with_ownership(
+                    &stderr_tail,
+                    &job.job_id,
+                    ownership_token,
+                )
+            });
     let Some(metadata) = metadata else {
         return Ok(false);
     };
@@ -8949,6 +13834,11 @@ fn reconcile_shell_job_remote_exit_marker(
             .remote_process_group_id
             .as_deref()
             .is_some_and(|pgid| pgid != metadata.pgid)
+        || job
+            .remote_process_scope
+            .remote_ownership_token
+            .as_deref()
+            .is_some_and(|token| metadata.ownership_token.as_deref() != Some(token))
     {
         push_unique_evidence(
             &mut job.remote_process_scope.detection_evidence,
@@ -8970,8 +13860,8 @@ fn reconcile_shell_job_remote_exit_marker(
     if !running && job.status == "ok" && job.exit_code == Some(0) {
         return Ok(false);
     }
-    let termination = if running {
-        job.pid.map(terminate_shell_job_process_tree)
+    let termination = if running && job.pid.is_some() {
+        Some(terminate_shell_job_from_status(job))
     } else {
         None
     };
@@ -9251,7 +14141,7 @@ fn reconcile_shell_job_remote_already_gone_if_local_stale(
     if remote_status != "already_gone" {
         return false;
     }
-    let termination = job.pid.map(terminate_shell_job_process_tree);
+    let termination = job.pid.map(|_| terminate_shell_job_from_status(job));
     let local_termination_status = termination
         .as_ref()
         .map(|readback| readback.status.as_str())
@@ -9293,14 +14183,16 @@ fn probe_shell_job_remote_liveness(
         );
         return None;
     };
-    let Some(parts) = ssh_direct_command_parts(&invocation.args) else {
-        push_unique_evidence(
-            &mut job.remote_process_scope.detection_evidence,
-            "remote_liveness_probe_failed:ssh_destination_unavailable".to_owned(),
-        );
-        return None;
+    let mut liveness_args = match hardened_ssh_automatic_replay_args(&invocation.args) {
+        Ok(args) => args,
+        Err(_) => {
+            push_unique_evidence(
+                &mut job.remote_process_scope.detection_evidence,
+                "remote_liveness_probe_failed:ssh_control_args_not_replay_safe".to_owned(),
+            );
+            return None;
+        }
     };
-    let mut liveness_args = parts.control_args;
     liveness_args.push(ssh_remote_liveness_command(pid, pgid));
     let readback = match run_shell_cleanup_command_with_timeout(
         &invocation.command,
@@ -9398,9 +14290,18 @@ fn mark_shell_job_remote_already_gone_local_stale(
     }
 }
 
+#[cfg(test)]
 fn parse_remote_process_metadata(
     stderr: &str,
     expected_job_id: &str,
+) -> Option<RemoteProcessMetadata> {
+    parse_remote_process_metadata_with_ownership(stderr, expected_job_id, None)
+}
+
+fn parse_remote_process_metadata_with_ownership(
+    stderr: &str,
+    expected_job_id: &str,
+    expected_ownership_token: Option<&str>,
 ) -> Option<RemoteProcessMetadata> {
     for line in stderr.lines() {
         let Some(marker_index) = line.find(SHELL_REMOTE_PROCESS_MARKER) else {
@@ -9408,12 +14309,15 @@ fn parse_remote_process_metadata(
         };
         let rest = &line[marker_index + SHELL_REMOTE_PROCESS_MARKER.len()..];
         let fields = parse_marker_fields(rest);
-        let job_id = fields.get("job_id")?;
+        let Some(job_id) = fields.get("job_id") else {
+            continue;
+        };
         if job_id != expected_job_id {
             continue;
         }
-        let pid = fields.get("pid")?;
-        let pgid = fields.get("pgid")?;
+        let (Some(pid), Some(pgid)) = (fields.get("pid"), fields.get("pgid")) else {
+            continue;
+        };
         if !valid_remote_process_number(pid) || !valid_remote_process_number(pgid) {
             continue;
         }
@@ -9421,17 +14325,69 @@ fn parse_remote_process_metadata(
             .get("sid")
             .filter(|value| valid_remote_process_number(value))
             .cloned();
+        let (boot_id, start_time, ownership_token) = match (
+            fields.get("boot_id"),
+            fields.get("start_time"),
+            fields.get("ownership_token"),
+            fields.get("ownership_token_sha256"),
+        ) {
+            (None, None, None, None) => (None, None, None),
+            (Some(boot_id), Some(start_time), Some(ownership_token), None)
+                if valid_remote_boot_id(boot_id)
+                    && valid_remote_process_start_time(start_time)
+                    && valid_remote_ownership_token(ownership_token)
+                    && expected_ownership_token
+                        .is_none_or(|expected| expected == ownership_token) =>
+            {
+                (
+                    Some(boot_id.clone()),
+                    Some(start_time.clone()),
+                    Some(ownership_token.clone()),
+                )
+            }
+            (Some(boot_id), Some(start_time), None, Some(ownership_token_sha256))
+                if valid_remote_boot_id(boot_id)
+                    && valid_remote_process_start_time(start_time)
+                    && validate_lower_sha256(
+                        ownership_token_sha256,
+                        "ownership_token_sha256 marker",
+                        expected_job_id,
+                    )
+                    .is_ok()
+                    && expected_ownership_token.is_some_and(|expected| {
+                        valid_remote_ownership_token(expected)
+                            && sha256_hex(expected.as_bytes()) == *ownership_token_sha256
+                    }) =>
+            {
+                (
+                    Some(boot_id.clone()),
+                    Some(start_time.clone()),
+                    expected_ownership_token.map(ToOwned::to_owned),
+                )
+            }
+            // Partial or malformed identity is not legacy metadata. Ignoring it
+            // prevents a truncated marker from silently downgrading into the
+            // destructive PID/PGID-only cleanup path.
+            _ => continue,
+        };
         return Some(RemoteProcessMetadata {
             job_id: job_id.clone(),
             pid: pid.clone(),
             pgid: pgid.clone(),
             sid,
+            boot_id,
+            start_time,
+            ownership_token,
         });
     }
     None
 }
 
-fn parse_remote_exit_metadata(stderr: &str, expected_job_id: &str) -> Option<RemoteExitMetadata> {
+fn parse_remote_exit_metadata_with_ownership(
+    stderr: &str,
+    expected_job_id: &str,
+    expected_ownership_token: Option<&str>,
+) -> Option<RemoteExitMetadata> {
     let mut found = None;
     for line in stderr.lines() {
         let Some(marker_index) = line.find(SHELL_REMOTE_EXIT_MARKER) else {
@@ -9439,21 +14395,57 @@ fn parse_remote_exit_metadata(stderr: &str, expected_job_id: &str) -> Option<Rem
         };
         let rest = &line[marker_index + SHELL_REMOTE_EXIT_MARKER.len()..];
         let fields = parse_marker_fields(rest);
-        let job_id = fields.get("job_id")?;
+        let Some(job_id) = fields.get("job_id") else {
+            continue;
+        };
         if job_id != expected_job_id {
             continue;
         }
-        let pid = fields.get("pid")?;
-        let pgid = fields.get("pgid")?;
-        let exit_code = fields.get("exit_code")?.parse::<i32>().ok()?;
+        let (Some(pid), Some(pgid), Some(exit_code)) = (
+            fields.get("pid"),
+            fields.get("pgid"),
+            fields
+                .get("exit_code")
+                .and_then(|value| value.parse::<i32>().ok()),
+        ) else {
+            continue;
+        };
         if !valid_remote_process_number(pid) || !valid_remote_process_number(pgid) {
             continue;
         }
+        let ownership_token = match (
+            fields.get("ownership_token"),
+            fields.get("ownership_token_sha256"),
+        ) {
+            (Some(value), None)
+                if valid_remote_ownership_token(value)
+                    && expected_ownership_token.is_none_or(|expected| expected == value) =>
+            {
+                Some(value.clone())
+            }
+            (None, Some(value))
+                if validate_lower_sha256(
+                    value,
+                    "ownership_token_sha256 marker",
+                    expected_job_id,
+                )
+                .is_ok()
+                    && expected_ownership_token.is_some_and(|expected| {
+                        valid_remote_ownership_token(expected)
+                            && sha256_hex(expected.as_bytes()) == *value
+                    }) =>
+            {
+                expected_ownership_token.map(ToOwned::to_owned)
+            }
+            (None, None) => None,
+            _ => continue,
+        };
         found = Some(RemoteExitMetadata {
             job_id: job_id.clone(),
             pid: pid.clone(),
             pgid: pgid.clone(),
             exit_code,
+            ownership_token,
         });
     }
     found
@@ -9462,6 +14454,9 @@ fn parse_remote_exit_metadata(stderr: &str, expected_job_id: &str) -> Option<Rem
 fn apply_remote_process_metadata(job: &mut ActRunShellJobStatus, metadata: RemoteProcessMetadata) {
     job.remote_process_scope.remote_process_id = Some(metadata.pid.clone());
     job.remote_process_scope.remote_process_group_id = Some(metadata.pgid.clone());
+    job.remote_process_scope.remote_boot_id = metadata.boot_id.clone();
+    job.remote_process_scope.remote_process_start_time = metadata.start_time.clone();
+    job.remote_process_scope.remote_ownership_token = metadata.ownership_token.clone();
     job.remote_process_scope.remote_cleanup_verified = false;
     job.remote_process_scope.remote_cleanup_status = SHELL_REMOTE_CLEANUP_TRACKED.to_owned();
     job.remote_process_scope.remote_cleanup_error_code = None;
@@ -9480,6 +14475,19 @@ fn apply_remote_process_metadata(job: &mut ActRunShellJobStatus, metadata: Remot
         push_unique_evidence(
             &mut job.remote_process_scope.detection_evidence,
             format!("remote_session_id:{sid}"),
+        );
+    }
+    if let (Some(boot_id), Some(start_time), Some(ownership_token)) = (
+        metadata.boot_id,
+        metadata.start_time,
+        metadata.ownership_token,
+    ) {
+        push_unique_evidence(
+            &mut job.remote_process_scope.detection_evidence,
+            format!(
+                "remote_process_ownership:boot_id={boot_id}:start_time={start_time}:token_sha256={}",
+                sha256_hex(ownership_token.as_bytes())
+            ),
         );
     }
 }
@@ -9503,6 +14511,50 @@ fn valid_remote_process_number(value: &str) -> bool {
     value
         .parse::<u32>()
         .is_ok_and(|parsed| parsed > 1 && value.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn valid_remote_boot_id(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+fn valid_remote_process_start_time(value: &str) -> bool {
+    value
+        .parse::<u64>()
+        .is_ok_and(|parsed| parsed > 0 && value.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn valid_remote_ownership_token(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+}
+
+fn remote_process_ownership_identity(
+    scope: &ActRunShellRemoteProcessScope,
+) -> Result<Option<RemoteProcessOwnershipIdentity>, String> {
+    match (
+        scope.remote_boot_id.as_deref(),
+        scope.remote_process_start_time.as_deref(),
+        scope.remote_ownership_token.as_deref(),
+    ) {
+        (None, None, None) => Ok(None),
+        (Some(boot_id), Some(start_time), Some(ownership_token))
+            if valid_remote_boot_id(boot_id)
+                && valid_remote_process_start_time(start_time)
+                && valid_remote_ownership_token(ownership_token) =>
+        {
+            Ok(Some(RemoteProcessOwnershipIdentity {
+                boot_id: boot_id.to_owned(),
+                start_time: start_time.to_owned(),
+                ownership_token: ownership_token.to_owned(),
+            }))
+        }
+        _ => Err(
+            "remote ownership metadata is partial or malformed; expected canonical boot_id, positive /proc start_time, and 32-character lowercase hexadecimal ownership token"
+                .to_owned(),
+        ),
+    }
 }
 
 fn attempt_shell_job_remote_cleanup(
@@ -9544,8 +14596,16 @@ fn attempt_shell_job_remote_cleanup(
             return Some("remote_cleanup_sidecar_unreadable".to_owned());
         }
     };
-    let Some(invocation) =
-        shell_job_cleanup_invocation(job, original_args, remote_cleanup.as_ref())
+    let Some(remote_cleanup) = remote_cleanup.as_ref() else {
+        mark_shell_job_remote_cleanup_failed(
+            job,
+            trigger,
+            "remote_cleanup_sidecar_missing",
+            "remote process metadata exists but the durable remote cleanup sidecar is absent",
+        );
+        return Some("remote_cleanup_sidecar_missing".to_owned());
+    };
+    let Some(invocation) = shell_job_cleanup_invocation(job, original_args, Some(remote_cleanup))
     else {
         mark_shell_job_remote_cleanup_failed(
             job,
@@ -9564,8 +14624,145 @@ fn attempt_shell_job_remote_cleanup(
         );
         return Some("remote_cleanup_destination_unavailable".to_owned());
     };
-    let cleanup_command = ssh_remote_cleanup_command(&pid, &pgid);
-    let mut cleanup_args = parts.control_args;
+    if let Some(reason) = ssh_control_args_unsafe_for_automatic_replay(&parts.control_args) {
+        mark_shell_job_remote_cleanup_failed(
+            job,
+            trigger,
+            "remote_cleanup_control_args_unsafe",
+            &format!(
+                "automatic SSH cleanup refused control option {reason}; replay could execute or load mutable local code"
+            ),
+        );
+        return Some("remote_cleanup_control_args_unsafe".to_owned());
+    }
+    if !matches!(remote_cleanup.schema_version, 3 | 4) {
+        let liveness = run_remote_liveness_probe(
+            &invocation.command,
+            &invocation.args,
+            &pid,
+            &pgid,
+            "legacy remote cleanup liveness probe",
+        );
+        return match liveness {
+            Ok((readback, status)) if status == "already_gone" => {
+                job.remote_process_scope.remote_cleanup_verified = true;
+                job.remote_process_scope.remote_cleanup_status =
+                    SHELL_REMOTE_CLEANUP_ALREADY_GONE.to_owned();
+                job.remote_process_scope.remote_cleanup_error_code = None;
+                job.remote_process_scope.remote_cleanup_message = Some(format!(
+                    "{trigger} verified schema-{} SSH remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
+                    remote_cleanup.schema_version, readback.stdout_sha256, readback.stderr_sha256
+                ));
+                Some("remote_cleanup_already_gone".to_owned())
+            }
+            Ok((_readback, status)) => {
+                mark_shell_job_remote_cleanup_failed(
+                    job,
+                    trigger,
+                    "remote_cleanup_sidecar_liveness_only",
+                    &format!(
+                        "schema-{} remote pid {pid}, pgid {pgid} returned liveness status={status}, but the sidecar predates exact executable/argv/config/token binding and cannot authorize a destructive signal",
+                        remote_cleanup.schema_version
+                    ),
+                );
+                Some("remote_cleanup_sidecar_liveness_only".to_owned())
+            }
+            Err(message) => {
+                mark_shell_job_remote_cleanup_failed(
+                    job,
+                    trigger,
+                    "remote_cleanup_liveness_probe_failed",
+                    &message,
+                );
+                Some("remote_cleanup_liveness_probe_failed".to_owned())
+            }
+        };
+    }
+    let ownership_identity = match remote_process_ownership_identity(&job.remote_process_scope) {
+        Ok(identity) => identity,
+        Err(message) => {
+            mark_shell_job_remote_cleanup_failed(
+                job,
+                trigger,
+                "remote_process_ownership_metadata_invalid",
+                &message,
+            );
+            return Some("remote_cleanup_ownership_metadata_invalid".to_owned());
+        }
+    };
+    let Some(ownership_identity) = ownership_identity else {
+        // Legacy records have only reusable numeric identifiers. A read-only
+        // liveness probe may prove the old process is gone, but an alive result
+        // can never authorize a signal.
+        let liveness = run_remote_liveness_probe(
+            &invocation.command,
+            &invocation.args,
+            &pid,
+            &pgid,
+            "legacy remote cleanup liveness probe",
+        );
+        return match liveness {
+            Ok((readback, status)) if status == "already_gone" => {
+                job.remote_process_scope.remote_cleanup_verified = true;
+                job.remote_process_scope.remote_cleanup_status =
+                    SHELL_REMOTE_CLEANUP_ALREADY_GONE.to_owned();
+                job.remote_process_scope.remote_cleanup_error_code = None;
+                job.remote_process_scope.remote_cleanup_message = Some(format!(
+                    "{trigger} verified legacy SSH remote pid {pid}, process group {pgid} is already gone without issuing a signal; stdout_sha256={}; stderr_sha256={}",
+                    readback.stdout_sha256, readback.stderr_sha256
+                ));
+                if job.error_code.as_deref()
+                    == Some(error_codes::ACTION_REMOTE_PROCESS_CLEANUP_UNVERIFIED)
+                {
+                    job.error_code = None;
+                    job.error_message = None;
+                }
+                Some("remote_cleanup_legacy_already_gone".to_owned())
+            }
+            Ok((_readback, status)) if status == "alive" => {
+                mark_shell_job_remote_cleanup_failed(
+                    job,
+                    trigger,
+                    "remote_process_ownership_identity_unavailable",
+                    &format!(
+                        "legacy remote pid {pid}, pgid {pgid} is alive, but the record has no boot_id/start_time/ownership_token; retained without destructive cleanup"
+                    ),
+                );
+                Some("remote_cleanup_legacy_identity_unavailable".to_owned())
+            }
+            Ok((_readback, status)) => {
+                mark_shell_job_remote_cleanup_failed(
+                    job,
+                    trigger,
+                    "remote_liveness_status_unrecognized",
+                    &format!("legacy remote liveness returned unsupported status={status}"),
+                );
+                Some("remote_cleanup_legacy_liveness_unrecognized".to_owned())
+            }
+            Err(message) => {
+                mark_shell_job_remote_cleanup_failed(
+                    job,
+                    trigger,
+                    "remote_liveness_probe_failed",
+                    &message,
+                );
+                Some("remote_cleanup_legacy_liveness_failed".to_owned())
+            }
+        };
+    };
+    let cleanup_command = ssh_remote_cleanup_command(&pid, &pgid, &ownership_identity);
+    let mut cleanup_args = match hardened_ssh_automatic_replay_args(&parts.control_args) {
+        Ok(args) => args,
+        Err(message) => {
+            mark_shell_job_remote_cleanup_failed(
+                job,
+                trigger,
+                "remote_cleanup_control_args_unsafe",
+                &message,
+            );
+            return Some("remote_cleanup_control_args_unsafe".to_owned());
+        }
+    };
     cleanup_args.push(cleanup_command);
     let output = run_shell_cleanup_command_with_timeout(
         &invocation.command,
@@ -9579,9 +14776,12 @@ fn attempt_shell_job_remote_cleanup(
             return Some("remote_cleanup_command_failed".to_owned());
         }
     };
-    let cleanup_status = parse_remote_cleanup_status(&readback.stdout, &pid, &pgid);
+    let cleanup_status =
+        parse_remote_cleanup_status(&readback.stdout, &pid, &pgid, Some(&ownership_identity));
     match cleanup_status.as_deref() {
-        Some(status @ ("already_gone" | "terminated" | "killed")) => {
+        Some(status @ ("already_gone" | "terminated" | "killed"))
+            if readback.exit_code == Some(0) =>
+        {
             job.remote_process_scope.remote_cleanup_verified = true;
             job.remote_process_scope.remote_cleanup_status =
                 SHELL_REMOTE_CLEANUP_VERIFIED.to_owned();
@@ -9612,6 +14812,17 @@ fn attempt_shell_job_remote_cleanup(
             );
             Some("remote_cleanup_still_running".to_owned())
         }
+        Some("identity_mismatch") => {
+            mark_shell_job_remote_cleanup_failed(
+                job,
+                trigger,
+                "remote_process_ownership_identity_mismatch",
+                &format!(
+                    "SSH remote cleanup refused to signal pid {pid}, pgid {pgid}: boot/start/token identity did not match the live process"
+                ),
+            );
+            Some("remote_cleanup_identity_mismatch".to_owned())
+        }
         _ => {
             mark_shell_job_remote_cleanup_failed(
                 job,
@@ -9620,8 +14831,8 @@ fn attempt_shell_job_remote_cleanup(
                 &format!(
                     "SSH remote cleanup command did not produce a verified cleanup marker; exit={:?}; stdout_sha256={}; stderr_sha256={}; stdout_excerpt={:?}; stderr_excerpt={:?}",
                     readback.exit_code,
-                    sha256_hex(readback.stdout.as_bytes()),
-                    sha256_hex(readback.stderr.as_bytes()),
+                    readback.stdout_sha256,
+                    readback.stderr_sha256,
                     shell_cleanup_output_excerpt(&readback.stdout),
                     shell_cleanup_output_excerpt(&readback.stderr)
                 ),
@@ -9668,7 +14879,306 @@ fn mark_shell_job_remote_cleanup_failed(
 struct CleanupCommandReadback {
     exit_code: Option<i32>,
     stdout: String,
+    stdout_byte_len: u64,
+    stdout_sha256: String,
     stderr: String,
+    stderr_byte_len: u64,
+    stderr_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BoundedCleanupCapture {
+    text: String,
+    byte_len: u64,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ExactChildReapReadback {
+    kill_error: Option<String>,
+    reaped: bool,
+    exit_code: Option<i32>,
+    exit_status: Option<String>,
+    timed_out: bool,
+    poll_attempts: u64,
+    poll_error_count: u64,
+    last_poll_error: Option<String>,
+    elapsed_ms: u64,
+}
+
+/// Poll one exact owned child handle until it is reaped or a hard cleanup
+/// backstop expires. Both Tokio and std children expose the same nonblocking
+/// `try_wait` contract, so all exceptional cleanup paths share this bounded
+/// state machine rather than falling back to an unbounded blocking `wait`.
+fn bounded_poll_exact_child_reap<F>(
+    mut try_wait: F,
+    kill_error: Option<String>,
+    timeout: Duration,
+) -> ExactChildReapReadback
+where
+    F: FnMut() -> io::Result<Option<std::process::ExitStatus>>,
+{
+    let started = Instant::now();
+    let mut poll_attempts = 0_u64;
+    let mut poll_error_count = 0_u64;
+    let mut last_poll_error = None;
+    loop {
+        poll_attempts = poll_attempts.saturating_add(1);
+        match try_wait() {
+            Ok(Some(status)) => {
+                return ExactChildReapReadback {
+                    kill_error,
+                    reaped: true,
+                    exit_code: status.code(),
+                    exit_status: Some(format!("{status:?}")),
+                    timed_out: false,
+                    poll_attempts,
+                    poll_error_count,
+                    last_poll_error,
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                poll_error_count = poll_error_count.saturating_add(1);
+                last_poll_error = Some(error.to_string());
+            }
+        }
+
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return ExactChildReapReadback {
+                kill_error,
+                reaped: false,
+                exit_code: None,
+                exit_status: None,
+                timed_out: true,
+                poll_attempts,
+                poll_error_count,
+                last_poll_error,
+                elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            };
+        }
+        std::thread::sleep(
+            Duration::from_millis(SHELL_CHILD_REAP_POLL_INTERVAL_MS)
+                .min(timeout.saturating_sub(elapsed)),
+        );
+    }
+}
+
+fn terminate_and_reap_tokio_child_bounded(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> ExactChildReapReadback {
+    let kill_error = child.start_kill().err().map(|error| error.to_string());
+    bounded_poll_exact_child_reap(|| child.try_wait(), kill_error, timeout)
+}
+
+async fn terminate_and_reap_tokio_child_async_bounded(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> ExactChildReapReadback {
+    let kill_error = child.start_kill().err().map(|error| error.to_string());
+    let started = Instant::now();
+    let mut poll_attempts = 0_u64;
+    let mut poll_error_count = 0_u64;
+    let mut last_poll_error = None;
+    loop {
+        poll_attempts = poll_attempts.saturating_add(1);
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return ExactChildReapReadback {
+                    kill_error,
+                    reaped: true,
+                    exit_code: status.code(),
+                    exit_status: Some(format!("{status:?}")),
+                    timed_out: false,
+                    poll_attempts,
+                    poll_error_count,
+                    last_poll_error,
+                    elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                poll_error_count = poll_error_count.saturating_add(1);
+                last_poll_error = Some(error.to_string());
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
+            return ExactChildReapReadback {
+                kill_error,
+                reaped: false,
+                exit_code: None,
+                exit_status: None,
+                timed_out: true,
+                poll_attempts,
+                poll_error_count,
+                last_poll_error,
+                elapsed_ms: u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            };
+        }
+        tokio::time::sleep(
+            Duration::from_millis(SHELL_CHILD_REAP_POLL_INTERVAL_MS)
+                .min(timeout.saturating_sub(elapsed)),
+        )
+        .await;
+    }
+}
+
+fn terminate_and_reap_std_child_only_bounded(
+    child: &mut std::process::Child,
+) -> ExactChildReapReadback {
+    let kill_error = child.kill().err().map(|error| error.to_string());
+    bounded_poll_exact_child_reap(
+        || child.try_wait(),
+        kill_error,
+        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+    )
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CleanupChildTerminationReadback {
+    owned_root_pid: u32,
+    tree_termination_attempted: bool,
+    tree_termination_status: String,
+    remaining_process_ids: Vec<u32>,
+    reap: ExactChildReapReadback,
+}
+
+impl CleanupChildTerminationReadback {
+    fn diagnostic(&self) -> String {
+        format!(
+            "owned_root_pid={}; termination_attempted={}; termination_status={}; remaining_process_ids={:?}; direct_kill_error={:?}; reaped={}; exit_code={:?}; exit_status={:?}; reap_timed_out={}; reap_poll_attempts={}; reap_poll_error_count={}; reap_last_poll_error={:?}; reap_elapsed_ms={}",
+            self.owned_root_pid,
+            self.tree_termination_attempted,
+            self.tree_termination_status,
+            self.remaining_process_ids,
+            self.reap.kill_error,
+            self.reap.reaped,
+            self.reap.exit_code,
+            self.reap.exit_status,
+            self.reap.timed_out,
+            self.reap.poll_attempts,
+            self.reap.poll_error_count,
+            self.reap.last_poll_error,
+            self.reap.elapsed_ms,
+        )
+    }
+}
+
+fn terminate_and_reap_cleanup_child_bounded(
+    child: &mut std::process::Child,
+    owned_root_identity: &ActRunShellLocalProcessIdentity,
+) -> CleanupChildTerminationReadback {
+    let termination = terminate_shell_job_process_tree(owned_root_identity);
+    let kill_error = child.kill().err().map(|error| error.to_string());
+    let reap = bounded_poll_exact_child_reap(
+        || child.try_wait(),
+        kill_error,
+        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+    );
+    CleanupChildTerminationReadback {
+        owned_root_pid: owned_root_identity.pid,
+        tree_termination_attempted: termination.attempted,
+        tree_termination_status: termination.status,
+        remaining_process_ids: termination.remaining_process_ids,
+        reap,
+    }
+}
+
+#[derive(Debug)]
+struct ContainedCleanupChildReadback {
+    initial: CleanupChildTerminationReadback,
+    job_close: Result<(), String>,
+    post_job_close_reap: Option<ExactChildReapReadback>,
+    final_identity_state: LocalProcessIdentityState,
+}
+
+impl ContainedCleanupChildReadback {
+    fn tree_cleanup_verified(&self) -> bool {
+        self.initial.remaining_process_ids.is_empty()
+            && matches!(
+                self.initial.tree_termination_status.as_str(),
+                "terminated" | "already_exited"
+            )
+    }
+
+    fn cleanup_verified(&self) -> bool {
+        let exact_child_reaped = self.initial.reap.reaped
+            || self
+                .post_job_close_reap
+                .as_ref()
+                .is_some_and(|readback| readback.reaped);
+        exact_child_reaped
+            && self.job_close.is_ok()
+            && self.tree_cleanup_verified()
+            && terminal_local_process_identity_state(&self.final_identity_state)
+    }
+
+    fn diagnostic(&self) -> String {
+        format!(
+            "{}; job_close={:?}; post_job_close_reap={:?}; final_identity_state={:?}",
+            self.initial.diagnostic(),
+            self.job_close,
+            self.post_job_close_reap,
+            self.final_identity_state,
+        )
+    }
+}
+
+fn terminate_reap_and_close_cleanup_child_bounded(
+    child: &mut std::process::Child,
+    owned_root_identity: &ActRunShellLocalProcessIdentity,
+    process_job: &mut OwnedProcessJob,
+) -> ContainedCleanupChildReadback {
+    let initial = terminate_and_reap_cleanup_child_bounded(child, owned_root_identity);
+    let job_close = process_job.close_checked();
+    let state_after_close = local_process_identity_state(owned_root_identity);
+    let post_job_close_reap = (!initial.reap.reaped
+        || matches!(
+            state_after_close,
+            LocalProcessIdentityState::Match | LocalProcessIdentityState::Unreadable(_)
+        ))
+    .then(|| terminate_and_reap_std_child_only_bounded(child));
+    let final_identity_state = local_process_identity_state(owned_root_identity);
+    ContainedCleanupChildReadback {
+        initial,
+        job_close,
+        post_job_close_reap,
+        final_identity_state,
+    }
+}
+
+fn finalize_contained_cleanup_child_failure(
+    child: std::process::Child,
+    process_job: OwnedProcessJob,
+    owned_root_identity: ActRunShellLocalProcessIdentity,
+    stage: &'static str,
+    cleanup: ContainedCleanupChildReadback,
+) -> String {
+    let cleanup_verified = cleanup.cleanup_verified();
+    let process_job_close_verified = cleanup.job_close.is_ok();
+    let tree_cleanup_verified = cleanup.tree_cleanup_verified();
+    let diagnostic = cleanup.diagnostic();
+    let retained_owner = (!cleanup_verified).then(|| {
+        retain_unresolved_shell_child_owner(RetainedShellChildOwner {
+            owner_id: new_reflex_id(),
+            pid: Some(owned_root_identity.pid),
+            stage: stage.to_owned(),
+            child: RetainedExactShellChild::Std(Box::new(child)),
+            process_job: Some(process_job),
+            process_job_acquired: true,
+            process_job_close_verified,
+            tree_cleanup_verified,
+            local_process_identity: Some(owned_root_identity),
+            durable_spawn_failure: None,
+        })
+    });
+    format!(
+        "{diagnostic}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
+    )
 }
 
 fn shell_cleanup_output_excerpt(value: &str) -> String {
@@ -9688,111 +15198,498 @@ fn run_shell_cleanup_command_with_timeout(
     args: &[String],
     timeout: Duration,
 ) -> Result<CleanupCommandReadback, String> {
-    let spawn_command = shell_spawn_command(command);
-    let mut child = StdCommand::new(spawn_command.as_ref());
+    // Opportunistically advance any earlier exact-owner cleanup without ever
+    // blocking this invocation on an unbounded wait.
+    let _ = unresolved_shell_child_owner_report();
+    let spawn_command = trusted_ssh_automatic_replay_executable(command).ok_or_else(|| {
+        format!(
+            "cleanup SSH executable is not one of the canonical trusted platform installations: {command}"
+        )
+    })?;
+    let mut stdout_capture = tempfile::tempfile()
+        .map_err(|error| format!("create cleanup ssh stdout capture failed: {error}"))?;
+    let mut stderr_capture = tempfile::tempfile()
+        .map_err(|error| format!("create cleanup ssh stderr capture failed: {error}"))?;
+    let stdout_child = stdout_capture
+        .try_clone()
+        .map_err(|error| format!("clone cleanup ssh stdout capture failed: {error}"))?;
+    let stderr_child = stderr_capture
+        .try_clone()
+        .map_err(|error| format!("clone cleanup ssh stderr capture failed: {error}"))?;
+    let mut child = StdCommand::new(&spawn_command);
     child
         .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        // Regular files cannot fill a pipe buffer and do not require EOF from
+        // inherited descendant handles. This keeps collection bounded even if
+        // an SSH proxy/descendant outlives the direct client.
+        .stdout(Stdio::from(stdout_child))
+        .stderr(Stdio::from(stderr_child));
     apply_no_window_std(&mut child);
     let mut child = child
         .spawn()
         .map_err(|error| format!("spawn cleanup ssh failed: {error}"))?;
+    let owned_root_pid = child.id();
+    // As in durable spawn, establish containment while the exact child is
+    // suspended before asking a second kernel API for creation identity.
+    let mut process_job = match assign_owned_process_job(
+        owned_root_pid,
+        "act_run_shell_remote_cleanup",
+        None,
+    ) {
+        Ok(process_job) => process_job,
+        Err(assignment_error) => {
+            let reap = terminate_and_reap_std_child_only_bounded(&mut child);
+            let tree_cleanup_verified = cfg!(windows);
+            let cleanup_verified = reap.reaped && tree_cleanup_verified;
+            let retained_owner = (!cleanup_verified).then(|| {
+                retain_unresolved_shell_child_owner(RetainedShellChildOwner {
+                    owner_id: new_reflex_id(),
+                    pid: Some(owned_root_pid),
+                    stage: "cleanup_job_object_assignment_failed".to_owned(),
+                    child: RetainedExactShellChild::Std(Box::new(child)),
+                    process_job: None,
+                    process_job_acquired: false,
+                    process_job_close_verified: true,
+                    tree_cleanup_verified,
+                    local_process_identity: None,
+                    durable_spawn_failure: None,
+                })
+            });
+            return Err(format!(
+                "cleanup ssh pid {owned_root_pid} job ownership failed before execution: {}; exact_child_cleanup={reap:?}; tree_cleanup_verified={tree_cleanup_verified}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}",
+                assignment_error.message,
+            ));
+        }
+    };
+    let owned_root_identity = match capture_local_process_identity(owned_root_pid) {
+        Ok(identity) => identity,
+        Err(identity_error) => {
+            let initial = terminate_and_reap_std_child_only_bounded(&mut child);
+            let job_close = process_job.close_checked();
+            let post =
+                (!initial.reaped).then(|| terminate_and_reap_std_child_only_bounded(&mut child));
+            let reap = merge_exact_child_reap_readbacks(initial, post);
+            let tree_cleanup_verified = cfg!(windows);
+            let cleanup_verified = reap.reaped && job_close.is_ok() && tree_cleanup_verified;
+            let retained_owner = (!cleanup_verified).then(|| {
+                retain_unresolved_shell_child_owner(RetainedShellChildOwner {
+                    owner_id: new_reflex_id(),
+                    pid: Some(owned_root_pid),
+                    stage: "cleanup_local_process_identity_capture_failed".to_owned(),
+                    child: RetainedExactShellChild::Std(Box::new(child)),
+                    process_job: Some(process_job),
+                    process_job_acquired: true,
+                    process_job_close_verified: job_close.is_ok(),
+                    tree_cleanup_verified,
+                    local_process_identity: None,
+                    durable_spawn_failure: None,
+                })
+            });
+            return Err(format!(
+                "cleanup ssh pid {owned_root_pid} identity capture failed before execution: {identity_error}; exact_child_cleanup={reap:?}; job_close={job_close:?}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
+            ));
+        }
+    };
+    if let Err(resume_error) = resume_suspended_shell_child(&owned_root_identity) {
+        let cleanup = terminate_reap_and_close_cleanup_child_bounded(
+            &mut child,
+            &owned_root_identity,
+            &mut process_job,
+        );
+        let cleanup_verified = cleanup.cleanup_verified();
+        let diagnostic = cleanup.diagnostic();
+        let retained_owner = (!cleanup_verified).then(|| {
+            retain_unresolved_shell_child_owner(RetainedShellChildOwner {
+                owner_id: new_reflex_id(),
+                pid: Some(owned_root_pid),
+                stage: "cleanup_contained_child_resume_failed".to_owned(),
+                child: RetainedExactShellChild::Std(Box::new(child)),
+                process_job: Some(process_job),
+                process_job_acquired: true,
+                process_job_close_verified: cleanup.job_close.is_ok(),
+                tree_cleanup_verified: cleanup.tree_cleanup_verified(),
+                local_process_identity: Some(owned_root_identity),
+                durable_spawn_failure: None,
+            })
+        });
+        return Err(format!(
+            "cleanup ssh pid {owned_root_pid} contained resume failed: {resume_error}; {diagnostic}; cleanup_verified={cleanup_verified}; exact_owner_retained={retained_owner:?}"
+        ));
+    }
     let started = Instant::now();
-    loop {
-        match child
-            .try_wait()
-            .map_err(|error| format!("poll cleanup ssh failed: {error}"))?
+    let exit_code = loop {
+        let (stdout_len, stderr_len) = match (stdout_capture.metadata(), stderr_capture.metadata())
         {
-            Some(_status) => {
-                let output = child
-                    .wait_with_output()
-                    .map_err(|error| format!("read cleanup ssh output failed: {error}"))?;
-                return Ok(CleanupCommandReadback {
-                    exit_code: output.status.code(),
-                    stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-                });
-            }
-            None if started.elapsed() >= timeout => {
-                let _ = child.kill();
-                let _ = child.wait();
+            (Ok(stdout_len), Ok(stderr_len)) => (stdout_len, stderr_len),
+            (stdout_result, stderr_result) => {
+                let cleanup = terminate_reap_and_close_cleanup_child_bounded(
+                    &mut child,
+                    &owned_root_identity,
+                    &mut process_job,
+                );
+                let cleanup_diagnostic = finalize_contained_cleanup_child_failure(
+                    child,
+                    process_job,
+                    owned_root_identity,
+                    "cleanup_capture_length_inspection_failed",
+                    cleanup,
+                );
                 return Err(format!(
-                    "cleanup ssh timed out after {} ms",
-                    timeout.as_millis()
+                    "cleanup ssh capture length inspection failed; stdout_error={:?}; stderr_error={:?}; {}",
+                    stdout_result.err(),
+                    stderr_result.err(),
+                    cleanup_diagnostic,
                 ));
             }
-            None => std::thread::sleep(Duration::from_millis(50)),
+        };
+        if stdout_len.len() > SHELL_CLEANUP_CAPTURE_CAP_BYTES
+            || stderr_len.len() > SHELL_CLEANUP_CAPTURE_CAP_BYTES
+        {
+            let cleanup = terminate_reap_and_close_cleanup_child_bounded(
+                &mut child,
+                &owned_root_identity,
+                &mut process_job,
+            );
+            let stdout_diagnostic = cleanup_capture_diagnostic(&mut stdout_capture, "stdout");
+            let stderr_diagnostic = cleanup_capture_diagnostic(&mut stderr_capture, "stderr");
+            let cleanup_diagnostic = finalize_contained_cleanup_child_failure(
+                child,
+                process_job,
+                owned_root_identity,
+                "cleanup_capture_cap_exceeded",
+                cleanup,
+            );
+            return Err(format!(
+                "cleanup ssh diagnostic output exceeded the {SHELL_CLEANUP_CAPTURE_CAP_BYTES}-byte per-stream cap; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
+            ));
         }
-    }
+        let poll = match child.try_wait() {
+            Ok(status) => status,
+            Err(error) => {
+                let cleanup = terminate_reap_and_close_cleanup_child_bounded(
+                    &mut child,
+                    &owned_root_identity,
+                    &mut process_job,
+                );
+                let stdout_diagnostic = cleanup_capture_diagnostic(&mut stdout_capture, "stdout");
+                let stderr_diagnostic = cleanup_capture_diagnostic(&mut stderr_capture, "stderr");
+                let cleanup_diagnostic = finalize_contained_cleanup_child_failure(
+                    child,
+                    process_job,
+                    owned_root_identity,
+                    "cleanup_exact_child_poll_failed",
+                    cleanup,
+                );
+                return Err(format!(
+                    "poll cleanup ssh failed: {error}; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
+                ));
+            }
+        };
+        match poll {
+            Some(status) => break status.code(),
+            None if started.elapsed() >= timeout => {
+                let cleanup = terminate_reap_and_close_cleanup_child_bounded(
+                    &mut child,
+                    &owned_root_identity,
+                    &mut process_job,
+                );
+                let stdout_diagnostic = cleanup_capture_diagnostic(&mut stdout_capture, "stdout");
+                let stderr_diagnostic = cleanup_capture_diagnostic(&mut stderr_capture, "stderr");
+                let cleanup_diagnostic = finalize_contained_cleanup_child_failure(
+                    child,
+                    process_job,
+                    owned_root_identity,
+                    "cleanup_command_timeout",
+                    cleanup,
+                );
+                return Err(format!(
+                    "cleanup ssh timed out after {} ms; {cleanup_diagnostic}; {stdout_diagnostic}; {stderr_diagnostic}",
+                    timeout.as_millis(),
+                ));
+            }
+            None => std::thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let stdout = match read_bounded_cleanup_capture(
+        &mut stdout_capture,
+        SHELL_CLEANUP_CAPTURE_CAP_BYTES,
+        "stdout",
+    ) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            let job_close = process_job.close_checked();
+            return Err(format!(
+                "{error}; completed cleanup ssh job close readback={job_close:?}"
+            ));
+        }
+    };
+    let stderr = match read_bounded_cleanup_capture(
+        &mut stderr_capture,
+        SHELL_CLEANUP_CAPTURE_CAP_BYTES,
+        "stderr",
+    ) {
+        Ok(stderr) => stderr,
+        Err(error) => {
+            let job_close = process_job.close_checked();
+            return Err(format!(
+                "{error}; completed cleanup ssh job close readback={job_close:?}"
+            ));
+        }
+    };
+    process_job
+        .close_checked()
+        .map_err(|error| format!("completed cleanup ssh job handle close failed: {error}"))?;
+    Ok(CleanupCommandReadback {
+        exit_code,
+        stdout: stdout.text,
+        stdout_byte_len: stdout.byte_len,
+        stdout_sha256: stdout.sha256,
+        stderr: stderr.text,
+        stderr_byte_len: stderr.byte_len,
+        stderr_sha256: stderr.sha256,
+    })
 }
 
-fn ssh_remote_cleanup_command(pid: &str, pgid: &str) -> String {
-    const SCRIPT: &str = r#"pid=$1
-pgid=$2
-case "$pid:$pgid" in
-  *[!0123456789:]*|:*|*:)
-    printf '%s pid=%s pgid=%s status=invalid_metadata\n' SYNAPSE_REMOTE_CLEANUP_V1 "$pid" "$pgid"
-    exit 2
-    ;;
-esac
-if ! kill -0 "$pid" 2>/dev/null; then
-  printf '%s pid=%s pgid=%s status=already_gone\n' SYNAPSE_REMOTE_CLEANUP_V1 "$pid" "$pgid"
-  exit 0
-fi
-kill -TERM -"$pgid" 2>/dev/null || true
-i=0
-while [ "$i" -lt 25 ]; do
-  if ! kill -0 "$pid" 2>/dev/null; then
-    printf '%s pid=%s pgid=%s status=terminated\n' SYNAPSE_REMOTE_CLEANUP_V1 "$pid" "$pgid"
-    exit 0
-  fi
-  i=$((i + 1))
-  sleep 0.2
-done
-kill -KILL -"$pgid" 2>/dev/null || true
-i=0
-while [ "$i" -lt 25 ]; do
-  if ! kill -0 "$pid" 2>/dev/null; then
-    printf '%s pid=%s pgid=%s status=killed\n' SYNAPSE_REMOTE_CLEANUP_V1 "$pid" "$pgid"
-    exit 0
-  fi
-  i=$((i + 1))
-  sleep 0.2
-done
-printf '%s pid=%s pgid=%s status=still_running\n' SYNAPSE_REMOTE_CLEANUP_V1 "$pid" "$pgid"
-exit 1
-"#;
+fn cleanup_capture_diagnostic(file: &mut fs::File, stream: &str) -> String {
+    const HASH_PREFIX_CAP_BYTES: u64 = 1024 * 1024;
+    let len = match file.metadata() {
+        Ok(metadata) => metadata.len(),
+        Err(error) => return format!("{stream}_capture_metadata_error={error:?}"),
+    };
+    if let Err(error) = file.seek(SeekFrom::Start(0)) {
+        return format!("{stream}_bytes={len}; {stream}_capture_seek_error={error:?}");
+    }
+    let mut prefix = Vec::new();
+    if let Err(error) = file.take(HASH_PREFIX_CAP_BYTES).read_to_end(&mut prefix) {
+        return format!("{stream}_bytes={len}; {stream}_capture_read_error={error:?}");
+    }
+    let text = String::from_utf8_lossy(&prefix);
     format!(
-        "sh -c {} synapse-remote-cleanup {} {}",
-        posix_single_quote(SCRIPT),
+        "{stream}_bytes={len}; {stream}_prefix_bytes={}; {stream}_prefix_sha256={}; {stream}_excerpt={:?}",
+        prefix.len(),
+        sha256_hex(&prefix),
+        shell_cleanup_output_excerpt(&text),
+    )
+}
+
+fn read_bounded_cleanup_capture(
+    file: &mut fs::File,
+    cap_bytes: u64,
+    stream: &str,
+) -> Result<BoundedCleanupCapture, String> {
+    let len = file
+        .metadata()
+        .map_err(|error| format!("read cleanup ssh {stream} capture metadata failed: {error}"))?
+        .len();
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek cleanup ssh {stream} capture failed: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(cap_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read cleanup ssh {stream} capture failed: {error}"))?;
+    let buffered_len = u64::try_from(bytes.len()).map_err(|error| {
+        format!(
+            "cleanup ssh {stream} buffered capture length cannot be represented: {error}; physical_bytes={len}"
+        )
+    })?;
+    if len > cap_bytes || buffered_len > cap_bytes {
+        return Err(format!(
+            "cleanup ssh {stream} capture exceeded the {cap_bytes}-byte diagnostic cap (actual_bytes={len})"
+        ));
+    }
+    Ok(BoundedCleanupCapture {
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        byte_len: buffered_len,
+        sha256: sha256_hex(&bytes),
+    })
+}
+
+fn ssh_remote_cleanup_command(
+    pid: &str,
+    pgid: &str,
+    identity: &RemoteProcessOwnershipIdentity,
+) -> String {
+    // A pidfd is the stable kernel reference that numeric PIDs are not. The
+    // script verifies boot/start/token both before and after pidfd_open, then
+    // signals only that pidfd. The owned guardian's TERM trap performs the
+    // process-group termination while it still anchors the original PGID.
+    const SCRIPT: &str = r#"import select
+import signal
+import time
+
+pid = int(sys.argv[1])
+pgid_text = sys.argv[2]
+expected_boot_id = sys.argv[3]
+expected_start_time = sys.argv[4]
+ownership_token = sys.argv[5]
+marker = sys.argv[6]
+
+def emit(status):
+    print(
+        f"{marker} pid={pid} pgid={pgid_text} boot_id={expected_boot_id} "
+        f"start_time={expected_start_time} ownership_token={ownership_token} status={status}",
+        flush=True,
+    )
+
+def inspect_group():
+    try:
+        expected_pgid = int(pgid_text)
+        members = live_process_ids_in_group(expected_pgid)
+        return members, process_group_exists(expected_pgid)
+    except Exception as error:
+        print(
+            f"process_group_inspection_failed pgid={pgid_text} error={error}",
+            file=sys.stderr,
+            flush=True,
+        )
+        emit("inspection_failed")
+        raise SystemExit(4)
+
+def finish_if_group_empty(success_status):
+    _members, group_exists = inspect_group()
+    if not group_exists:
+        emit(success_status)
+        raise SystemExit(0)
+    emit("still_running")
+    raise SystemExit(1)
+
+def read_identity():
+    try:
+        with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as handle:
+            boot_id = handle.read().strip()
+    except OSError as error:
+        raise RuntimeError(f"read remote boot identity failed: {error}") from error
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8", errors="strict") as handle:
+            stat_line = handle.read().strip()
+        _comm, separator, stat_tail = stat_line.rpartition(") ")
+        if not separator:
+            raise RuntimeError("/proc stat has no command terminator")
+        fields = stat_tail.split()
+        if len(fields) < 20:
+            raise RuntimeError("/proc stat has fewer than 22 fields")
+        actual_pgid = fields[2]
+        start_time = fields[19]
+        with open(f"/proc/{pid}/environ", "rb") as handle:
+            environment = handle.read().split(b"\0")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    token_entry = f"SYNAPSE_REMOTE_JOB_TOKEN={ownership_token}".encode("ascii")
+    return (actual_pgid, boot_id, start_time, token_entry in environment)
+
+if pid <= 1 or not pgid_text.isascii() or not pgid_text.isdigit() or int(pgid_text) <= 1:
+    emit("invalid_metadata")
+    raise SystemExit(2)
+
+expected = (pgid_text, expected_boot_id, expected_start_time, True)
+before = read_identity()
+if before is None:
+    finish_if_group_empty("already_gone")
+if before != expected:
+    emit("identity_mismatch")
+    raise SystemExit(3)
+
+try:
+    pidfd = os.pidfd_open(pid, 0)
+except ProcessLookupError:
+    finish_if_group_empty("already_gone")
+try:
+    after = read_identity()
+    if after is None:
+        finish_if_group_empty("already_gone")
+    if after != expected:
+        emit("identity_mismatch")
+        raise SystemExit(3)
+    try:
+        signal.pidfd_send_signal(pidfd, signal.SIGTERM, None, 0)
+    except ProcessLookupError:
+        finish_if_group_empty("already_gone")
+    poller = select.poll()
+    poller.register(pidfd, select.POLLIN | select.POLLHUP | select.POLLERR)
+    if poller.poll(__PIDFD_WAIT_MS__):
+        for _attempt in range(__GROUP_ABSENCE_PROBE_ATTEMPTS__):
+            _members, group_exists = inspect_group()
+            if not group_exists:
+                emit("terminated")
+                raise SystemExit(0)
+            time.sleep(__GROUP_ABSENCE_PROBE_INTERVAL_MS__ / 1000)
+    emit("still_running")
+    raise SystemExit(1)
+finally:
+    os.close(pidfd)
+"#;
+    let cleanup_script = SCRIPT
+        .replace(
+            "__PIDFD_WAIT_MS__",
+            &SHELL_REMOTE_CLEANUP_PIDFD_WAIT_MS.to_string(),
+        )
+        .replace(
+            "__GROUP_ABSENCE_PROBE_ATTEMPTS__",
+            &SHELL_REMOTE_GROUP_ABSENCE_PROBE_ATTEMPTS.to_string(),
+        )
+        .replace(
+            "__GROUP_ABSENCE_PROBE_INTERVAL_MS__",
+            &SHELL_REMOTE_GROUP_ABSENCE_PROBE_INTERVAL_MS.to_string(),
+        );
+    let script = format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{cleanup_script}");
+    format!(
+        "python3 -c {} {} {} {} {} {} {}",
+        posix_single_quote(&script),
         posix_single_quote(pid),
-        posix_single_quote(pgid)
+        posix_single_quote(pgid),
+        posix_single_quote(&identity.boot_id),
+        posix_single_quote(&identity.start_time),
+        posix_single_quote(&identity.ownership_token),
+        posix_single_quote(SHELL_REMOTE_CLEANUP_MARKER),
     )
 }
 
 fn ssh_remote_liveness_command(pid: &str, pgid: &str) -> String {
-    const SCRIPT: &str = r#"pid=$1
-pgid=$2
-case "$pid:$pgid" in
-  *[!0123456789:]*|:*|*:)
-    printf '%s pid=%s pgid=%s status=invalid_metadata\n' SYNAPSE_REMOTE_LIVENESS_V1 "$pid" "$pgid"
-    exit 2
-    ;;
-esac
-actual_pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
-if [ "$actual_pgid" = "$pgid" ]; then
-  printf '%s pid=%s pgid=%s status=alive\n' SYNAPSE_REMOTE_LIVENESS_V1 "$pid" "$pgid"
-else
-  printf '%s pid=%s pgid=%s status=already_gone\n' SYNAPSE_REMOTE_LIVENESS_V1 "$pid" "$pgid"
-fi
+    const SCRIPT: &str = r#"pid_text = sys.argv[1]
+pgid_text = sys.argv[2]
+marker = sys.argv[3]
+
+def emit(status, member_count=0):
+    print(
+        f"{marker} pid={pid_text} pgid={pgid_text} status={status} member_count={member_count}",
+        flush=True,
+    )
+
+if (
+    not pid_text.isascii()
+    or not pid_text.isdigit()
+    or int(pid_text) <= 1
+    or not pgid_text.isascii()
+    or not pgid_text.isdigit()
+    or int(pgid_text) <= 1
+):
+    emit("invalid_metadata")
+    raise SystemExit(2)
+try:
+    expected_pgid = int(pgid_text)
+    members = live_process_ids_in_group(expected_pgid)
+    group_exists = process_group_exists(expected_pgid)
+except Exception as error:
+    print(
+        f"process_group_inspection_failed pgid={pgid_text} error={error}",
+        file=sys.stderr,
+        flush=True,
+    )
+    emit("inspection_failed")
+    raise SystemExit(3)
+if group_exists:
+    emit("alive", len(members))
+else:
+    emit("already_gone", 0)
 "#;
+    let script = format!("{SHELL_REMOTE_GROUP_INSPECTION_FUNCTION_PY}\n{SCRIPT}");
     format!(
-        "sh -c {} synapse-remote-liveness {} {}",
-        posix_single_quote(SCRIPT),
+        "python3 -c {} {} {} {}",
+        posix_single_quote(&script),
         posix_single_quote(pid),
-        posix_single_quote(pgid)
+        posix_single_quote(pgid),
+        posix_single_quote(SHELL_REMOTE_LIVENESS_MARKER),
     )
 }
 
@@ -9800,6 +15697,7 @@ fn parse_remote_cleanup_status(
     stdout: &str,
     expected_pid: &str,
     expected_pgid: &str,
+    expected_identity: Option<&RemoteProcessOwnershipIdentity>,
 ) -> Option<String> {
     for line in stdout.lines() {
         let Some(rest) = line.strip_prefix(SHELL_REMOTE_CLEANUP_MARKER) else {
@@ -9811,6 +15709,16 @@ fn parse_remote_cleanup_status(
         }
         if fields.get("pgid").map(String::as_str) != Some(expected_pgid) {
             continue;
+        }
+        if let Some(identity) = expected_identity {
+            if fields.get("boot_id").map(String::as_str) != Some(identity.boot_id.as_str())
+                || fields.get("start_time").map(String::as_str)
+                    != Some(identity.start_time.as_str())
+                || fields.get("ownership_token").map(String::as_str)
+                    != Some(identity.ownership_token.as_str())
+            {
+                continue;
+            }
         }
         return fields.get("status").cloned();
     }
@@ -9884,6 +15792,7 @@ fn shell_job_status_record(
         session_id: context.map(|context| context.session_id().to_owned()),
         status: status.to_owned(),
         pid,
+        local_process_identity: None,
         command: params.command.clone(),
         command_metadata_policy: "legacy_raw".to_owned(),
         args: params.args.clone(),
@@ -9916,6 +15825,7 @@ fn shell_job_status_record(
         matched_pattern: authorization.matched_pattern.clone(),
         remote_process_scope: shell_job_remote_process_scope_from_start_params(params),
         diagnostics: None,
+        spawn_failure: None,
     };
     shell_job_status_with_safe_command_metadata(&status)
 }
@@ -9945,14 +15855,78 @@ fn open_shell_job_output(
         })
 }
 
+enum SpawnShellJobChildFailure {
+    BeforeSpawn(ErrorData),
+    AfterSpawn(Box<PostSpawnShellJobChildFailure>),
+}
+
+struct PostSpawnShellJobChildFailure {
+    error: ErrorData,
+    child: tokio::process::Child,
+    process_job: Option<OwnedProcessJob>,
+    pid: Option<u32>,
+    local_process_identity: Option<ActRunShellLocalProcessIdentity>,
+    readback: ActRunShellSpawnFailureReadback,
+}
+
+fn merge_exact_child_reap_readbacks(
+    initial: ExactChildReapReadback,
+    post_job_close: Option<ExactChildReapReadback>,
+) -> ExactChildReapReadback {
+    let Some(post) = post_job_close else {
+        return initial;
+    };
+    let reaped = initial.reaped || post.reaped;
+    ExactChildReapReadback {
+        kill_error: initial.kill_error.or(post.kill_error),
+        reaped,
+        exit_code: post.exit_code.or(initial.exit_code),
+        exit_status: post.exit_status.or(initial.exit_status),
+        timed_out: !reaped && (initial.timed_out || post.timed_out),
+        poll_attempts: initial.poll_attempts.saturating_add(post.poll_attempts),
+        poll_error_count: initial
+            .poll_error_count
+            .saturating_add(post.poll_error_count),
+        last_poll_error: post.last_poll_error.or(initial.last_poll_error),
+        elapsed_ms: initial.elapsed_ms.saturating_add(post.elapsed_ms),
+    }
+}
+
+fn spawn_failure_readback(
+    stage: &'static str,
+    cleanup: &ExactChildReapReadback,
+    process_job_acquired: bool,
+    process_job_close: Option<&Result<(), String>>,
+    tree_cleanup_verified: bool,
+    final_identity_state: Option<&LocalProcessIdentityState>,
+    cleanup_verified: bool,
+) -> ActRunShellSpawnFailureReadback {
+    ActRunShellSpawnFailureReadback {
+        stage: stage.to_owned(),
+        child_created: true,
+        cleanup_verified,
+        exact_child_reaped: cleanup.reaped,
+        exact_child_kill_error: cleanup.kill_error.clone(),
+        exact_child_reap_timed_out: cleanup.timed_out,
+        exact_child_reap_poll_attempts: cleanup.poll_attempts,
+        exact_child_reap_poll_error_count: cleanup.poll_error_count,
+        exact_child_reap_last_poll_error: cleanup.last_poll_error.clone(),
+        exact_child_reap_elapsed_ms: cleanup.elapsed_ms,
+        process_job_acquired,
+        process_job_close: process_job_close.map(|result| format!("{result:?}")),
+        tree_cleanup_verified,
+        final_identity_state: final_identity_state.map(|state| format!("{state:?}")),
+        exact_owner_retained: false,
+    }
+}
+
 fn spawn_shell_job_child(
     params: &ActRunShellStartParams,
-    job_id: &str,
+    spawn_plan: &ShellJobSpawnPlan,
     stdout_file: fs::File,
     stderr_file: fs::File,
     context: Option<&ShellExecutionContext>,
-) -> Result<SpawnedShellChild, ErrorData> {
-    let spawn_plan = shell_job_spawn_plan(params, job_id);
+) -> Result<SpawnedShellChild, SpawnShellJobChildFailure> {
     let spawn_command = shell_spawn_command(&spawn_plan.command);
     let mut command = TokioCommand::new(spawn_command.as_ref());
     command.args(&spawn_plan.args);
@@ -9962,7 +15936,8 @@ fn spawn_shell_job_child(
     command.env_clear();
     let mut env = child_base_environment();
     ensure_child_temp_environment(&mut env);
-    validate_child_base_environment(&env, "act_run_shell")?;
+    validate_child_base_environment(&env, "act_run_shell")
+        .map_err(SpawnShellJobChildFailure::BeforeSpawn)?;
     for (_sort_key, (key, value)) in env {
         command.env(key, value);
     }
@@ -9972,39 +15947,65 @@ fn spawn_shell_job_child(
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
-        .kill_on_drop(false);
+        // The monitor and the kill-on-close job are the intended long-lived
+        // owners. Before job assignment succeeds, however, Tokio's exact child
+        // handle is the only authority available on several error paths. Keep
+        // kill-on-drop armed so an exceptional unwind/failed bounded reap
+        // cannot detach a suspended or uncontained child.
+        .kill_on_drop(true);
     apply_no_window_tokio(&mut command);
 
-    let mut child = command.spawn().map_err(|error| {
-        let command_metadata = shell_command_metadata(&params.command, &params.args);
-        shell_tool_error(
-            error_codes::ACTION_TARGET_INVALID,
-            format!("act_run_shell_start failed to spawn command: {error}"),
-            json!({
-                "code": error_codes::ACTION_TARGET_INVALID,
-                "command": params.command,
-                "spawn_command": spawn_command.as_ref(),
-                "spawn_command_resolved": spawn_command.as_ref() != params.command.as_str(),
-                "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
-                "args": command_metadata.args,
-                "args_redacted": command_metadata.args_redacted,
-                "args_original_count": command_metadata.args_original_count,
-                "args_original_bytes": command_metadata.args_original_bytes,
-                "args_sha256": command_metadata.args_sha256,
-                "command_line": command_metadata.command_line,
-                "command_line_redacted": command_metadata.command_line_redacted,
-                "command_line_original_bytes": command_metadata.command_line_original_bytes,
-                "command_line_sha256": command_metadata.command_line_sha256,
-                "working_dir": params.working_dir,
-                "reason": "spawn_failed",
-            }),
-        )
-    })?;
+    let mut child = command
+        .spawn()
+        .map_err(|error| {
+            let command_metadata = shell_command_metadata(&params.command, &params.args);
+            shell_tool_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!("act_run_shell_start failed to spawn command: {error}"),
+                json!({
+                    "code": error_codes::ACTION_TARGET_INVALID,
+                    "command": params.command,
+                    "spawn_command": spawn_command.as_ref(),
+                    "spawn_command_resolved": spawn_command.as_ref() != params.command.as_str(),
+                    "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
+                    "args": command_metadata.args,
+                    "args_redacted": command_metadata.args_redacted,
+                    "args_original_count": command_metadata.args_original_count,
+                    "args_original_bytes": command_metadata.args_original_bytes,
+                    "args_sha256": command_metadata.args_sha256,
+                    "command_line": command_metadata.command_line,
+                    "command_line_redacted": command_metadata.command_line_redacted,
+                    "command_line_original_bytes": command_metadata.command_line_original_bytes,
+                    "command_line_sha256": command_metadata.command_line_sha256,
+                    "working_dir": params.working_dir,
+                    "reason": "spawn_failed",
+                }),
+            )
+        })
+        .map_err(SpawnShellJobChildFailure::BeforeSpawn)?;
     let Some(pid) = child.id() else {
-        let _ = child.start_kill();
-        return Err(shell_tool_error(
+        let cleanup = terminate_and_reap_tokio_child_bounded(
+            &mut child,
+            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+        );
+        let tree_cleanup_verified = cfg!(windows);
+        let cleanup_verified = cleanup.reaped && tree_cleanup_verified;
+        let readback = spawn_failure_readback(
+            "pid_unavailable",
+            &cleanup,
+            false,
+            None,
+            tree_cleanup_verified,
+            None,
+            cleanup_verified,
+        );
+        let error = shell_tool_error(
             error_codes::TOOL_INTERNAL_ERROR,
-            "act_run_shell_start spawned a child process but could not read its pid",
+            if cleanup_verified {
+                "act_run_shell_start spawned a child process without an observable pid; the exact child handle was terminated and reaped before refusing the spawn"
+            } else {
+                "act_run_shell_start spawned a child process without an observable pid and could not verify exact-child reaping before the cleanup backstop"
+            },
             json!({
                 "code": error_codes::TOOL_INTERNAL_ERROR,
                 "command": params.command,
@@ -10013,12 +16014,189 @@ fn spawn_shell_job_child(
                 "args_sha256": shell_args_sha256(&params.args),
                 "working_dir": params.working_dir,
                 "reason": "pid_unavailable",
+                "cleanup_verified": cleanup.reaped,
+                "cleanup": cleanup,
             }),
-        ));
+        );
+        return Err(SpawnShellJobChildFailure::AfterSpawn(Box::new(
+            PostSpawnShellJobChildFailure {
+                error,
+                child,
+                process_job: None,
+                pid: None,
+                local_process_identity: None,
+                readback,
+            },
+        )));
     };
-    let process_job =
-        assign_owned_process_job(pid, "act_run_shell_start", params.job_id.as_deref())?;
-    Ok(SpawnedShellChild { child, process_job })
+    // Containment only needs the exact suspended child's PID. Acquire and read
+    // back the kill-on-close job before identity capture so a GetProcessTimes
+    // failure cannot leave an uncontained suspended process behind.
+    let mut process_job = match assign_owned_process_job(
+        pid,
+        "act_run_shell_start",
+        params.job_id.as_deref(),
+    ) {
+        Ok(process_job) => process_job,
+        Err(assignment_error) => {
+            let cleanup = terminate_and_reap_tokio_child_bounded(
+                &mut child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            );
+            let tree_cleanup_verified = cfg!(windows);
+            let cleanup_verified = cleanup.reaped && tree_cleanup_verified;
+            let readback = spawn_failure_readback(
+                "job_object_assignment_failed",
+                &cleanup,
+                false,
+                None,
+                tree_cleanup_verified,
+                None,
+                cleanup_verified,
+            );
+            let error = shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "act_run_shell_start could not establish kill-on-close ownership for spawned pid {pid}; exact-child cleanup verified={}: {}",
+                    cleanup_verified, assignment_error.message
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "pid": pid,
+                    "reason": "job_object_assignment_failed",
+                    "assignment_error": assignment_error,
+                    "cleanup_verified": cleanup.reaped,
+                    "cleanup": cleanup,
+                }),
+            );
+            return Err(SpawnShellJobChildFailure::AfterSpawn(Box::new(
+                PostSpawnShellJobChildFailure {
+                    error,
+                    child,
+                    process_job: None,
+                    pid: Some(pid),
+                    local_process_identity: None,
+                    readback,
+                },
+            )));
+        }
+    };
+    let local_process_identity = match capture_local_process_identity(pid) {
+        Ok(identity) => identity,
+        Err(identity_error) => {
+            let initial_cleanup = terminate_and_reap_tokio_child_bounded(
+                &mut child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            );
+            let job_close = process_job.close_checked();
+            let post_job_close_cleanup = (!initial_cleanup.reaped).then(|| {
+                terminate_and_reap_tokio_child_bounded(
+                    &mut child,
+                    Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+                )
+            });
+            let cleanup = merge_exact_child_reap_readbacks(initial_cleanup, post_job_close_cleanup);
+            let tree_cleanup_verified = cfg!(windows);
+            let cleanup_verified = cleanup.reaped && job_close.is_ok() && tree_cleanup_verified;
+            let readback = spawn_failure_readback(
+                "local_process_identity_capture_failed",
+                &cleanup,
+                true,
+                Some(&job_close),
+                tree_cleanup_verified,
+                None,
+                cleanup_verified,
+            );
+            let error = shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "act_run_shell_start could not bind contained pid {pid} to its kernel creation identity; cleanup_verified={cleanup_verified}; identity_error={identity_error}; job_close={job_close:?}"
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "pid": pid,
+                    "reason": "local_process_identity_capture_failed",
+                    "identity_error": identity_error,
+                    "cleanup_verified": cleanup_verified,
+                    "cleanup": cleanup,
+                    "job_close": format!("{job_close:?}"),
+                }),
+            );
+            return Err(SpawnShellJobChildFailure::AfterSpawn(Box::new(
+                PostSpawnShellJobChildFailure {
+                    error,
+                    child,
+                    process_job: Some(process_job),
+                    pid: Some(pid),
+                    local_process_identity: None,
+                    readback,
+                },
+            )));
+        }
+    };
+    if let Err(resume_error) = resume_suspended_shell_child(&local_process_identity) {
+        let initial_cleanup = terminate_and_reap_tokio_child_bounded(
+            &mut child,
+            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+        );
+        let job_close = process_job.close_checked();
+        let state_after_job_close = local_process_identity_state(&local_process_identity);
+        let post_job_close_cleanup = (!initial_cleanup.reaped
+            || !terminal_local_process_identity_state(&state_after_job_close))
+        .then(|| {
+            terminate_and_reap_tokio_child_bounded(
+                &mut child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            )
+        });
+        let cleanup = merge_exact_child_reap_readbacks(initial_cleanup, post_job_close_cleanup);
+        let final_identity_state = local_process_identity_state(&local_process_identity);
+        let tree_cleanup_verified = cfg!(windows);
+        let cleanup_verified = cleanup.reaped
+            && job_close.is_ok()
+            && tree_cleanup_verified
+            && terminal_local_process_identity_state(&final_identity_state);
+        let readback = spawn_failure_readback(
+            "contained_child_resume_failed",
+            &cleanup,
+            true,
+            Some(&job_close),
+            tree_cleanup_verified,
+            Some(&final_identity_state),
+            cleanup_verified,
+        );
+        let error = shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "act_run_shell_start could not safely resume contained pid {pid}; cleanup_verified={cleanup_verified}; job_close={job_close:?}; final_identity_state={final_identity_state:?}: {resume_error}",
+            ),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "pid": pid,
+                "reason": "contained_child_resume_failed",
+                "resume_error": resume_error,
+                "job_close": format!("{job_close:?}"),
+                "cleanup_verified": cleanup_verified,
+                "cleanup": cleanup,
+                "final_identity_state": final_identity_state,
+            }),
+        );
+        return Err(SpawnShellJobChildFailure::AfterSpawn(Box::new(
+            PostSpawnShellJobChildFailure {
+                error,
+                child,
+                process_job: Some(process_job),
+                pid: Some(pid),
+                local_process_identity: Some(local_process_identity),
+                readback,
+            },
+        )));
+    }
+    Ok(SpawnedShellChild {
+        child,
+        process_job,
+        local_process_identity,
+    })
 }
 
 fn apply_shell_session_environment(
@@ -10045,14 +16223,20 @@ fn shell_session_env_keys(_context: &ShellExecutionContext) -> Vec<String> {
 
 async fn monitor_shell_job(
     mut child: tokio::process::Child,
-    _process_job: OwnedProcessJob,
+    mut process_job: OwnedProcessJob,
     mut status: ActRunShellJobStatus,
     paths: ShellJobPaths,
     started: Instant,
     original_args: Vec<String>,
 ) {
-    let (exit_code, timed_out, wait_error) =
-        wait_shell_job_child(&mut child, status.timeout_ms, started).await;
+    let local_process_identity = status.local_process_identity.clone();
+    let (exit_code, timed_out, wait_error) = wait_shell_job_child_with_identity(
+        &mut child,
+        local_process_identity.as_ref(),
+        status.timeout_ms,
+        started,
+    )
+    .await;
     if let Ok(latest) = read_shell_job_status(&paths.status_path, &status.job_id) {
         status.cancel_requested |= latest.cancel_requested;
         if latest.status == "cancel_requested" {
@@ -10125,6 +16309,22 @@ async fn monitor_shell_job(
         "act_run_shell_start_process_exit",
         Some(&original_args),
     );
+    if let Err(error) = process_job.close_checked() {
+        let prior_error = status.error_message.take();
+        status.status = "job_handle_close_failed".to_owned();
+        status.error_code = Some(error_codes::TOOL_INTERNAL_ERROR.to_owned());
+        status.error_message = Some(match prior_error {
+            Some(prior) => format!("{prior}; owned process job close failed: {error}"),
+            None => format!("owned process job close failed: {error}"),
+        });
+        tracing::error!(
+            code = "M4_ACT_RUN_SHELL_JOB_HANDLE_CLOSE_FAILED",
+            job_id = %status.job_id,
+            pid = ?status.pid,
+            error,
+            "durable shell monitor could not verify owned Windows job handle closure"
+        );
+    }
     if let Err(error) = write_shell_job_status(&paths.status_path, &status) {
         tracing::error!(
             code = "M4_ACT_RUN_SHELL_JOB_FINAL_STATUS_WRITE_FAILED",
@@ -10255,8 +16455,9 @@ impl ChildRuntimeProbe {
     }
 }
 
-async fn wait_shell_job_child(
+async fn wait_shell_job_child_with_identity(
     child: &mut tokio::process::Child,
+    local_process_identity: Option<&ActRunShellLocalProcessIdentity>,
     timeout_ms: Option<u64>,
     started: Instant,
 ) -> (Option<i32>, bool, Option<String>) {
@@ -10273,6 +16474,12 @@ async fn wait_shell_job_child(
             // wait-entry-relative timer would grant a fresh full budget. Zero
             // once the cap has already elapsed, so the timeout fires promptly.
             let budget_remaining = budget.saturating_sub(started.elapsed());
+            let child_outran_budget = || {
+                runtime_probe
+                    .as_ref()
+                    .and_then(ChildRuntimeProbe::runtime)
+                    .map_or(started.elapsed() >= budget, |runtime| runtime >= budget)
+            };
             match tokio::time::timeout(budget_remaining, child.wait()).await {
                 Ok(Ok(status)) => {
                     // SOURCE OF TRUTH: the OS-recorded process runtime
@@ -10285,55 +16492,87 @@ async fn wait_shell_job_child(
                     // whether the child truly outran its cap (#1580/#1588). Fall
                     // back to elapsed-since-spawn only if the OS probe is
                     // unavailable.
-                    let timed_out = runtime_probe
-                        .as_ref()
-                        .and_then(ChildRuntimeProbe::runtime)
-                        .map_or(started.elapsed() >= budget, |runtime| runtime >= budget);
-                    (status.code(), timed_out, None)
+                    (status.code(), child_outran_budget(), None)
                 }
                 Ok(Err(error)) => (None, false, Some(format!("wait_failed:{error}"))),
                 Err(_elapsed) => {
-                    if let Some(pid) = child.id() {
-                        // Run the blocking process-tree termination (taskkill
-                        // spawns + a std::thread::sleep exit-wait + a full-system
-                        // sysinfo scan) off the async worker: on the async thread,
-                        // concurrent shell timeouts starve the runtime and stall
-                        // one another's timers, hanging the caller far past the
-                        // per-job budget (#1589).
-                        let termination = tokio::task::spawn_blocking(move || {
-                            terminate_shell_job_process_tree(pid)
-                        })
-                        .await
-                        .unwrap_or_else(|join_error| {
+                    // A zero/past deadline may win the select even though the
+                    // exact root has already exited. Preserve that natural exit
+                    // evidence before attempting destructive cleanup. The
+                    // production monitor still owns the verified kill-on-close
+                    // job until final status persistence and explicit close, so
+                    // any descendant remains contained during this race.
+                    if let Ok(Some(status)) = child.try_wait() {
+                        return (status.code(), child_outran_budget(), None);
+                    }
+                    let termination = if let (Some(pid), Some(identity)) =
+                        (child.id(), local_process_identity)
+                    {
+                        if pid != identity.pid {
                             ShellJobTerminationReadback {
                                 attempted: false,
-                                status: format!("termination_task_join_failed:{join_error}"),
-                                remaining_process_ids: Vec::new(),
+                                status: format!(
+                                    "timeout_identity_pid_mismatch:child_pid={pid}:identity_pid={}",
+                                    identity.pid
+                                ),
+                                remaining_process_ids: vec![pid],
                             }
+                        } else {
+                            // Exact-handle termination and identity-aware tree
+                            // discovery are blocking OS work; keep them off the
+                            // async executor so parallel timeouts remain causal.
+                            let identity = identity.clone();
+                            tokio::task::spawn_blocking(move || {
+                                terminate_shell_job_process_tree(&identity)
+                            })
+                            .await
+                            .unwrap_or_else(|join_error| {
+                                ShellJobTerminationReadback {
+                                    attempted: false,
+                                    status: format!("termination_task_join_failed:{join_error}"),
+                                    remaining_process_ids: vec![pid],
+                                }
+                            })
+                        }
+                    } else {
+                        ShellJobTerminationReadback {
+                            attempted: false,
+                            status: "timeout_process_identity_unavailable".to_owned(),
+                            remaining_process_ids: child.id().into_iter().collect(),
+                        }
+                    };
+                    tracing::warn!(
+                        code = "M4_ACT_RUN_SHELL_JOB_TIMEOUT_TREE_TERMINATED",
+                        pid = ?child.id(),
+                        attempted = termination.attempted,
+                        status = %termination.status,
+                        remaining_process_ids = ?termination.remaining_process_ids,
+                        "act_run_shell_start timeout requested identity-bound process-tree termination"
+                    );
+                    let reap = terminate_and_reap_tokio_child_async_bounded(
+                        child,
+                        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+                    )
+                    .await;
+                    let termination_verified = termination.verified_terminal_tree();
+                    let cleanup_error = (!termination_verified
+                        || !reap.reaped
+                        || reap.poll_error_count > 0)
+                        .then(|| {
+                            format!(
+                                "timeout_cleanup_unverified:tree={termination:?}:exact_child_reap={reap:?}"
+                            )
                         });
-                        tracing::warn!(
-                            code = "M4_ACT_RUN_SHELL_JOB_TIMEOUT_TREE_TERMINATED",
-                            pid,
-                            attempted = termination.attempted,
-                            status = %termination.status,
-                            remaining_process_ids = ?termination.remaining_process_ids,
-                            "act_run_shell_start timeout requested process-tree termination"
-                        );
-                    } else if let Err(error) = child.start_kill() {
-                        tracing::warn!(
-                            code = "M4_ACT_RUN_SHELL_JOB_TIMEOUT_KILL_FAILED",
-                            error = %error,
-                            "act_run_shell_start timeout kill request failed because pid was unavailable"
-                        );
-                    }
-                    match child.wait().await {
-                        Ok(_status) => (None, true, None),
-                        Err(error) => (
-                            None,
-                            true,
-                            Some(format!("wait_after_timeout_failed:{error}")),
-                        ),
-                    }
+                    // `TerminateProcess(..., 1)` produces an exit status, but
+                    // that is cleanup evidence rather than a natural command
+                    // verdict. The pre-termination `try_wait` branch above is
+                    // the only timeout race that may preserve a real code.
+                    let exit_code = if termination.attempted {
+                        None
+                    } else {
+                        reap.exit_code
+                    };
+                    (exit_code, true, cleanup_error)
                 }
             }
         }
@@ -10342,6 +16581,18 @@ async fn wait_shell_job_child(
             Err(error) => (None, false, Some(format!("wait_failed:{error}"))),
         },
     }
+}
+
+#[cfg(test)]
+async fn wait_shell_job_child(
+    child: &mut tokio::process::Child,
+    timeout_ms: Option<u64>,
+    started: Instant,
+) -> (Option<i32>, bool, Option<String>) {
+    let identity = child
+        .id()
+        .and_then(|pid| capture_local_process_identity(pid).ok());
+    wait_shell_job_child_with_identity(child, identity.as_ref(), timeout_ms, started).await
 }
 
 fn terminal_shell_job_status(
@@ -10364,6 +16615,12 @@ fn reconcile_shell_job_process_state(
     mut job: ActRunShellJobStatus,
     paths: &ShellJobPaths,
 ) -> Result<ActRunShellJobStatus, ErrorData> {
+    if job.status == SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED {
+        // Only the retained exact Child owner can prove reaping and promote
+        // this record to `spawn_failed_reaped`. PID-table absence, especially
+        // without a creation identity, is not an equivalent proof.
+        return Ok(job);
+    }
     if job.status == "finalizing" {
         if let Some(terminal) =
             wait_for_shell_job_terminal_status(paths, &job.job_id, Duration::from_millis(500))?
@@ -10397,7 +16654,62 @@ fn reconcile_shell_job_process_state(
         job.error_message = Some("job status had no pid while marked live".to_owned());
         return write_shell_job_reconciliation_status(paths, job);
     };
-    if shell_job_live_process_ids(&[pid]).contains(&pid) {
+    if let Some(identity) = job.local_process_identity.as_ref() {
+        if identity.pid != pid {
+            return Err(shell_tool_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "shell job {} has inconsistent pid/creation identity: status pid={pid}, identity pid={}",
+                    job.job_id, identity.pid
+                ),
+                json!({
+                    "code": error_codes::STORAGE_READ_FAILED,
+                    "job_id": job.job_id,
+                    "reason": "job_local_process_identity_pid_mismatch",
+                    "pid": pid,
+                    "identity_pid": identity.pid,
+                }),
+            ));
+        }
+        match local_process_identity_state(identity) {
+            LocalProcessIdentityState::Match => return Ok(job),
+            LocalProcessIdentityState::Unreadable(detail) => {
+                return Err(shell_tool_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "shell job {} local process identity could not be read: {detail}",
+                        job.job_id
+                    ),
+                    json!({
+                        "code": error_codes::STORAGE_READ_FAILED,
+                        "job_id": job.job_id,
+                        "reason": "job_local_process_identity_unreadable",
+                        "pid": pid,
+                        "detail": detail,
+                    }),
+                ));
+            }
+            LocalProcessIdentityState::Mismatch(actual) => {
+                return Err(shell_tool_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "shell job {} local process identity mismatch for pid {pid}; refusing to reconcile or terminate a process whose creation identity differs from the persisted job owner",
+                        job.job_id
+                    ),
+                    json!({
+                        "code": error_codes::STORAGE_READ_FAILED,
+                        "job_id": job.job_id,
+                        "reason": "job_local_process_identity_mismatch",
+                        "pid": pid,
+                        "expected_identity": identity,
+                        "actual_identity": actual,
+                    }),
+                ));
+            }
+            LocalProcessIdentityState::Exited | LocalProcessIdentityState::Absent => {}
+        }
+    } else if shell_job_live_process_ids(&[pid]).contains(&pid) {
+        // Legacy status records have no immutable process creation identity.
         return Ok(job);
     }
     if let Some(terminal) =
@@ -10425,6 +16737,38 @@ fn write_shell_job_reconciliation_status(
     paths: &ShellJobPaths,
     candidate: ActRunShellJobStatus,
 ) -> Result<ActRunShellJobStatus, ErrorData> {
+    write_shell_job_reconciliation_status_before_lock(paths, candidate, || {})
+}
+
+/// Reconcile a status while serializing the latest-state read, preservation
+/// decision, and optional commit under the same destination writer lock.
+/// `before_lock` is a scheduling observation seam used by the concurrency
+/// regression; production passes a no-op closure.
+fn write_shell_job_reconciliation_status_before_lock<F>(
+    paths: &ShellJobPaths,
+    candidate: ActRunShellJobStatus,
+    before_lock: F,
+) -> Result<ActRunShellJobStatus, ErrorData>
+where
+    F: FnOnce(),
+{
+    before_lock();
+    let write_lock = shell_status_write_lock(&paths.status_path);
+    let _write_guard = write_lock.lock().map_err(|error| {
+        shell_tool_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "act_run_shell reconciliation writer lock was poisoned for {}: {error}",
+                paths.status_path.display()
+            ),
+            json!({
+                "code": error_codes::STORAGE_WRITE_FAILED,
+                "job_id": candidate.job_id,
+                "path": paths.status_path,
+                "reason": "job_status_reconciliation_writer_lock_poisoned",
+            }),
+        )
+    })?;
     let latest = read_shell_job_status(&paths.status_path, &candidate.job_id)?;
     if shell_job_latest_terminal_should_win(&latest, &candidate) {
         tracing::info!(
@@ -10437,8 +16781,7 @@ fn write_shell_job_reconciliation_status(
         );
         return Ok(latest);
     }
-    write_shell_job_status(&paths.status_path, &candidate)?;
-    Ok(candidate)
+    write_shell_job_status_locked(&paths.status_path, &candidate)
 }
 
 fn shell_job_latest_terminal_should_win(
@@ -10482,11 +16825,17 @@ fn wait_for_shell_job_terminal_status(
 }
 
 fn shell_job_live_status(status: &str) -> bool {
-    matches!(status, "running" | "cancel_requested")
+    matches!(
+        status,
+        "running" | "cancel_requested" | SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED
+    )
 }
 
 fn shell_job_terminal_status(status: &str) -> bool {
-    !matches!(status, "running" | "cancel_requested" | "finalizing")
+    !matches!(
+        status,
+        "running" | "cancel_requested" | "finalizing" | SHELL_JOB_STATUS_SPAWN_CLEANUP_UNVERIFIED
+    )
 }
 
 fn elapsed_ms_since_rfc3339(started_at: &str) -> Option<u64> {
@@ -10634,7 +16983,11 @@ fn path_string(path: &Path) -> String {
 
 #[cfg(windows)]
 fn apply_no_window_tokio(command: &mut TokioCommand) {
-    command.creation_flags(0x0800_0000);
+    // Prevent user code from creating descendants before immutable process
+    // identity capture and kill-on-close job ownership are verified.
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
 }
 
 #[cfg(not(windows))]
@@ -10643,16 +16996,31 @@ fn apply_no_window_tokio(_command: &mut TokioCommand) {}
 #[cfg(windows)]
 fn apply_no_window_std(command: &mut StdCommand) {
     use std::os::windows::process::CommandExt;
-    command.creation_flags(0x0800_0000);
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
 }
 
 #[cfg(not(windows))]
 fn apply_no_window_std(_command: &mut StdCommand) {}
 
+#[derive(Debug, Serialize)]
 struct ShellJobTerminationReadback {
     attempted: bool,
     status: String,
     remaining_process_ids: Vec<u32>,
+}
+
+impl ShellJobTerminationReadback {
+    fn verified_terminal_tree(&self) -> bool {
+        if !self.remaining_process_ids.is_empty() {
+            return false;
+        }
+        matches!(self.status.as_str(), "terminated" | "already_exited")
+            || (self.status.starts_with("identity_verification_failed:")
+                && (self.status.contains("root_readback=exited")
+                    || self.status.contains("root_readback=absent")))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -10699,7 +17067,20 @@ pub fn terminate_owned_process_tree(pid: u32) -> OwnedProcessTerminationReadback
         };
     }
 
-    let termination = terminate_shell_job_process_tree_platform(pid, &process_ids);
+    let expected_root = match capture_local_process_identity(pid) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return OwnedProcessTerminationReadback {
+                pid,
+                process_ids,
+                live_process_ids_before,
+                attempted: false,
+                status: format!("identity_capture_failed:{error}"),
+                remaining_process_ids: vec![pid],
+            };
+        }
+    };
+    let termination = terminate_shell_job_process_tree(&expected_root);
     OwnedProcessTerminationReadback {
         pid,
         process_ids,
@@ -10725,7 +17106,25 @@ pub(crate) fn terminate_owned_process_ids(process_ids: &[u32]) -> OwnedProcessTe
             remaining_process_ids: Vec::new(),
         };
     }
-    let termination = terminate_shell_job_process_tree_platform(0, &process_ids);
+    let mut identities = Vec::new();
+    let mut identity_failures = Vec::new();
+    for pid in &live_process_ids_before {
+        match capture_local_process_identity(*pid) {
+            Ok(identity) => identities.push(identity),
+            Err(error) => identity_failures.push(format!("pid {pid}: {error}")),
+        }
+    }
+    if !identity_failures.is_empty() {
+        return OwnedProcessTerminationReadback {
+            pid: 0,
+            process_ids,
+            live_process_ids_before: live_process_ids_before.clone(),
+            attempted: false,
+            status: format!("identity_capture_failed:{}", identity_failures.join(" | ")),
+            remaining_process_ids: live_process_ids_before,
+        };
+    }
+    let termination = terminate_shell_job_process_tree_platform(&identities);
     OwnedProcessTerminationReadback {
         pid: 0,
         process_ids,
@@ -11002,45 +17401,765 @@ fn process_tree_suspend_state_platform(process_ids: &[u32]) -> Vec<ProcessSuspen
         .collect()
 }
 
-fn terminate_shell_job_process_tree(pid: u32) -> ShellJobTerminationReadback {
-    let process_ids = shell_job_process_tree_ids(pid);
-    let initial_live_process_ids = shell_job_live_process_ids(&process_ids);
-    if initial_live_process_ids.is_empty() {
+fn terminate_shell_job_process_tree(
+    expected_root: &ActRunShellLocalProcessIdentity,
+) -> ShellJobTerminationReadback {
+    let identities = match shell_job_process_tree_identities(expected_root) {
+        Ok(identities) if identities.is_empty() => {
+            return ShellJobTerminationReadback {
+                attempted: false,
+                status: "already_exited".to_owned(),
+                remaining_process_ids: Vec::new(),
+            };
+        }
+        Ok(identities) => identities,
+        Err(error) => {
+            let (identity_readback, remaining_process_ids) =
+                match local_process_identity_state(expected_root) {
+                    LocalProcessIdentityState::Match => {
+                        ("match".to_owned(), vec![expected_root.pid])
+                    }
+                    LocalProcessIdentityState::Mismatch(actual) => {
+                        (format!("mismatch:{actual:?}"), Vec::new())
+                    }
+                    LocalProcessIdentityState::Exited => ("exited".to_owned(), Vec::new()),
+                    LocalProcessIdentityState::Absent => ("absent".to_owned(), Vec::new()),
+                    LocalProcessIdentityState::Unreadable(read_error) => {
+                        (format!("unreadable:{read_error}"), vec![expected_root.pid])
+                    }
+                };
+            return ShellJobTerminationReadback {
+                attempted: false,
+                status: format!(
+                    "identity_verification_failed:{error}; root_readback={identity_readback}"
+                ),
+                remaining_process_ids,
+            };
+        }
+    };
+    terminate_shell_job_process_tree_platform(&identities)
+}
+
+fn terminate_shell_job_from_status(job: &ActRunShellJobStatus) -> ShellJobTerminationReadback {
+    let Some(expected_root) = job.local_process_identity.as_ref() else {
         return ShellJobTerminationReadback {
             attempted: false,
-            status: "already_exited".to_owned(),
-            remaining_process_ids: Vec::new(),
+            status: "identity_unavailable_refused".to_owned(),
+            remaining_process_ids: job
+                .pid
+                .filter(|pid| shell_job_live_process_ids(&[*pid]).contains(pid))
+                .into_iter()
+                .collect(),
+        };
+    };
+    if job.pid != Some(expected_root.pid) {
+        return ShellJobTerminationReadback {
+            attempted: false,
+            status: "identity_pid_mismatch_refused".to_owned(),
+            remaining_process_ids: job.pid.into_iter().collect(),
         };
     }
+    terminate_shell_job_process_tree(expected_root)
+}
 
-    terminate_shell_job_process_tree_platform(pid, &process_ids)
+#[cfg(windows)]
+fn capture_local_process_identity(pid: u32) -> Result<ActRunShellLocalProcessIdentity, String> {
+    use windows::Win32::{
+        Foundation::{CloseHandle, FILETIME},
+        System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    let handle =
+        unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.map_err(|error| {
+            format!("OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) failed for pid {pid}: {error}")
+        })?;
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let query = unsafe {
+        GetProcessTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    }
+    .map(|()| filetime_ticks_100ns(creation))
+    .map_err(|error| format!("GetProcessTimes failed for pid {pid}: {error}"));
+    let close = unsafe { CloseHandle(handle) }
+        .map_err(|error| format!("CloseHandle(process identity pid {pid}) failed: {error}"));
+    match (query, close) {
+        (Ok(start_time), Ok(())) => Ok(ActRunShellLocalProcessIdentity {
+            pid,
+            start_time,
+            start_time_source: "windows_filetime_100ns".to_owned(),
+        }),
+        (Err(query_error), Ok(())) => Err(query_error),
+        (Ok(_), Err(close_error)) => Err(close_error),
+        (Err(query_error), Err(close_error)) => Err(format!("{query_error}; {close_error}")),
+    }
+}
+
+#[cfg(not(windows))]
+fn capture_local_process_identity(pid: u32) -> Result<ActRunShellLocalProcessIdentity, String> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let pid_value = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid_value]), true);
+    let process = system
+        .process(pid_value)
+        .ok_or_else(|| format!("process {pid} is absent while capturing its start time"))?;
+    Ok(ActRunShellLocalProcessIdentity {
+        pid,
+        start_time: process.start_time(),
+        start_time_source: "sysinfo_process_start_time".to_owned(),
+    })
+}
+
+#[cfg(windows)]
+fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> Result<(), String> {
+    use windows::Win32::{
+        Foundation::{CloseHandle, FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::{
+            Diagnostics::ToolHelp::{
+                CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
+                Thread32Next,
+            },
+            Threading::{
+                GetProcessTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
+                PROCESS_SYNCHRONIZE, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION,
+                THREAD_SUSPEND_RESUME, WaitForSingleObject,
+            },
+        },
+    };
+
+    let thread_entry_size = u32::try_from(std::mem::size_of::<THREADENTRY32>())
+        .map_err(|error| format!("THREADENTRY32 size conversion failed: {error}"))?;
+
+    let process = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            identity.pid,
+        )
+    }
+    .map_err(|error| format!("open suspended child pid {} failed: {error}", identity.pid))?;
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let identity_result = unsafe {
+        GetProcessTimes(
+            process,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    }
+    .map(|()| filetime_ticks_100ns(creation))
+    .map_err(|error| format!("GetProcessTimes before resume failed: {error}"));
+    if identity_result
+        .as_ref()
+        .is_ok_and(|start| *start != identity.start_time)
+    {
+        let actual = identity_result.unwrap_or_default();
+        let close = unsafe { CloseHandle(process) }.map_err(|error| error.to_string());
+        return Err(format!(
+            "suspended child pid {} identity changed before resume: expected={} actual={actual}; process_close={close:?}",
+            identity.pid, identity.start_time
+        ));
+    }
+    if let Err(error) = identity_result {
+        let close = unsafe { CloseHandle(process) }.map_err(|error| error.to_string());
+        return Err(format!(
+            "could not verify suspended child pid {} identity before resume: {error}; process_close={close:?}",
+            identity.pid
+        ));
+    }
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) }.map_err(|error| {
+        let process_close = unsafe { CloseHandle(process) }.map_err(|error| error.to_string());
+        format!("thread snapshot before resume failed: {error}; process_close={process_close:?}")
+    })?;
+    let mut entry = THREADENTRY32 {
+        dwSize: thread_entry_size,
+        ..Default::default()
+    };
+    let mut thread_ids = Vec::new();
+    if unsafe { Thread32First(snapshot, &mut entry) }.is_ok() {
+        loop {
+            if entry.th32OwnerProcessID == identity.pid {
+                thread_ids.push(entry.th32ThreadID);
+            }
+            if unsafe { Thread32Next(snapshot, &mut entry) }.is_err() {
+                break;
+            }
+        }
+    }
+    let snapshot_close = unsafe { CloseHandle(snapshot) }.map_err(|error| error.to_string());
+    if snapshot_close.is_err() || thread_ids.len() != 1 {
+        let process_close = unsafe { CloseHandle(process) }.map_err(|error| error.to_string());
+        return Err(format!(
+            "CREATE_SUSPENDED child pid {} must expose exactly one primary thread before resume; thread_ids={thread_ids:?}; snapshot_close={snapshot_close:?}; process_close={process_close:?}",
+            identity.pid
+        ));
+    }
+
+    let thread_id = thread_ids[0];
+    let thread = unsafe {
+        OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+            false,
+            thread_id,
+        )
+    }
+    .map_err(|error| {
+        let process_close = unsafe { CloseHandle(process) }.map_err(|error| error.to_string());
+        format!(
+            "open CREATE_SUSPENDED primary thread {thread_id} for pid {} failed: {error}; process_close={process_close:?}",
+            identity.pid
+        )
+    })?;
+    let previous_suspend_count = unsafe { ResumeThread(thread) };
+    let thread_close = unsafe { CloseHandle(thread) }.map_err(|error| error.to_string());
+    let initial_wait = unsafe { WaitForSingleObject(process, 0) };
+    let wait_error = (initial_wait == WAIT_FAILED)
+        .then(windows::core::Error::from_thread)
+        .map(|error| error.to_string());
+    let (state_valid, state_detail) = if initial_wait == WAIT_OBJECT_0 {
+        (
+            true,
+            "exact_process_handle_signaled_after_resume".to_owned(),
+        )
+    } else if initial_wait == WAIT_TIMEOUT {
+        let states = process_tree_suspend_state_platform(&[identity.pid]);
+        if states.len() == 1 && states[0].suspended_threads == 0 {
+            (true, format!("live_thread_state={states:?}"))
+        } else {
+            // The process may have exited between the initial exact-handle wait
+            // and the thread-table read. Keep the exact handle open and accept
+            // only a now-signaled readback; an empty state alone is ambiguous.
+            let post_state_wait = unsafe { WaitForSingleObject(process, 0) };
+            (
+                post_state_wait == WAIT_OBJECT_0,
+                format!(
+                    "thread_state={states:?}; post_state_exact_handle_wait={post_state_wait:?}"
+                ),
+            )
+        }
+    } else {
+        (
+            false,
+            format!("unexpected_exact_handle_wait={initial_wait:?}"),
+        )
+    };
+    let process_close = unsafe { CloseHandle(process) }.map_err(|error| error.to_string());
+    if previous_suspend_count != 1
+        || thread_close.is_err()
+        || process_close.is_err()
+        || !state_valid
+    {
+        return Err(format!(
+            "documented primary-thread resume readback failed for pid {}: previous_suspend_count={previous_suspend_count}; thread_close={thread_close:?}; initial_process_wait={initial_wait:?}; wait_error={wait_error:?}; state_detail={state_detail}; process_close={process_close:?}",
+            identity.pid
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn resume_suspended_shell_child(_identity: &ActRunShellLocalProcessIdentity) -> Result<(), String> {
+    Ok(())
+}
+
+/// Physical readback for one immutable process identity. Destructive callers
+/// must not collapse an unreadable process table/handle into "not running": an
+/// access/query failure is uncertainty, while a different creation time is a
+/// safe refusal and a genuine not-found result is the only absence proof.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+enum LocalProcessIdentityState {
+    Match,
+    Mismatch(ActRunShellLocalProcessIdentity),
+    Exited,
+    Absent,
+    Unreadable(String),
+}
+
+#[cfg(windows)]
+fn local_process_identity_state(
+    expected: &ActRunShellLocalProcessIdentity,
+) -> LocalProcessIdentityState {
+    use windows::Win32::{
+        Foundation::{
+            CloseHandle, ERROR_INVALID_PARAMETER, ERROR_NOT_FOUND, FILETIME, WAIT_FAILED,
+            WAIT_OBJECT_0, WAIT_TIMEOUT, WIN32_ERROR,
+        },
+        System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+            WaitForSingleObject,
+        },
+    };
+
+    let handle = match unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            false,
+            expected.pid,
+        )
+    } {
+        Ok(handle) => handle,
+        Err(error) => {
+            return match WIN32_ERROR::from_error(&error) {
+                Some(code) if code == ERROR_INVALID_PARAMETER || code == ERROR_NOT_FOUND => {
+                    LocalProcessIdentityState::Absent
+                }
+                _ => LocalProcessIdentityState::Unreadable(format!(
+                    "OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) failed for pid {}: {error}",
+                    expected.pid
+                )),
+            };
+        }
+    };
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let query = unsafe {
+        GetProcessTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    }
+    .map_err(|error| format!("GetProcessTimes failed for pid {}: {error}", expected.pid))
+    .and_then(|()| {
+        let wait = unsafe { WaitForSingleObject(handle, 0) };
+        if wait == WAIT_FAILED {
+            return Err(format!(
+                "WaitForSingleObject(identity pid {}) failed: {}",
+                expected.pid,
+                windows::core::Error::from_thread()
+            ));
+        }
+        if wait != WAIT_OBJECT_0 && wait != WAIT_TIMEOUT {
+            return Err(format!(
+                "WaitForSingleObject(identity pid {}) returned unexpected state {wait:?}",
+                expected.pid
+            ));
+        }
+        Ok((
+            ActRunShellLocalProcessIdentity {
+                pid: expected.pid,
+                start_time: filetime_ticks_100ns(creation),
+                start_time_source: "windows_filetime_100ns".to_owned(),
+            },
+            wait == WAIT_OBJECT_0,
+        ))
+    });
+    let close = unsafe { CloseHandle(handle) }.map_err(|error| {
+        format!(
+            "CloseHandle(identity readback pid {}) failed: {error}",
+            expected.pid
+        )
+    });
+    match (query, close) {
+        (Ok((actual, _)), Ok(())) if actual != *expected => {
+            LocalProcessIdentityState::Mismatch(actual)
+        }
+        (Ok((_actual, true)), Ok(())) => LocalProcessIdentityState::Exited,
+        (Ok((_actual, false)), Ok(())) => LocalProcessIdentityState::Match,
+        (Err(query_error), Ok(())) => LocalProcessIdentityState::Unreadable(query_error),
+        (Ok(_), Err(close_error)) => LocalProcessIdentityState::Unreadable(close_error),
+        (Err(query_error), Err(close_error)) => {
+            LocalProcessIdentityState::Unreadable(format!("{query_error}; {close_error}"))
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn local_process_identity_state(
+    expected: &ActRunShellLocalProcessIdentity,
+) -> LocalProcessIdentityState {
+    use sysinfo::{Pid, ProcessStatus, ProcessesToUpdate, System};
+
+    let pid = Pid::from_u32(expected.pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    let Some(process) = system.process(pid) else {
+        return LocalProcessIdentityState::Absent;
+    };
+    let actual = ActRunShellLocalProcessIdentity {
+        pid: expected.pid,
+        start_time: process.start_time(),
+        start_time_source: "sysinfo_process_start_time".to_owned(),
+    };
+    if actual != *expected {
+        LocalProcessIdentityState::Mismatch(actual)
+    } else if process.status() == ProcessStatus::Zombie {
+        LocalProcessIdentityState::Exited
+    } else {
+        LocalProcessIdentityState::Match
+    }
+}
+
+#[cfg(windows)]
+fn local_identity_sysinfo_start_time(
+    identity: &ActRunShellLocalProcessIdentity,
+) -> Result<u64, String> {
+    const WINDOWS_TO_UNIX_EPOCH_TICKS_100NS: u64 = 116_444_736_000_000_000;
+    if identity.start_time_source != "windows_filetime_100ns" {
+        return Err(format!(
+            "unexpected Windows process identity source {}",
+            identity.start_time_source
+        ));
+    }
+    identity
+        .start_time
+        .checked_sub(WINDOWS_TO_UNIX_EPOCH_TICKS_100NS)
+        .map(|ticks| ticks / 10_000_000)
+        .ok_or_else(|| {
+            format!(
+                "Windows process creation FILETIME {} predates Unix epoch",
+                identity.start_time
+            )
+        })
+}
+
+#[cfg(not(windows))]
+fn local_identity_sysinfo_start_time(
+    identity: &ActRunShellLocalProcessIdentity,
+) -> Result<u64, String> {
+    if identity.start_time_source != "sysinfo_process_start_time" {
+        return Err(format!(
+            "unexpected process identity source {}",
+            identity.start_time_source
+        ));
+    }
+    Ok(identity.start_time)
+}
+
+fn shell_job_process_tree_identities(
+    expected_root: &ActRunShellLocalProcessIdentity,
+) -> Result<Vec<ActRunShellLocalProcessIdentity>, String> {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    match local_process_identity_state(expected_root) {
+        LocalProcessIdentityState::Match => {}
+        LocalProcessIdentityState::Exited => return Ok(Vec::new()),
+        LocalProcessIdentityState::Absent => return Ok(Vec::new()),
+        LocalProcessIdentityState::Mismatch(actual) => {
+            return Err(format!(
+                "root pid {} identity changed: expected start={} source={}; actual start={} source={}",
+                expected_root.pid,
+                expected_root.start_time,
+                expected_root.start_time_source,
+                actual.start_time,
+                actual.start_time_source,
+            ));
+        }
+        LocalProcessIdentityState::Unreadable(error) => {
+            return Err(format!(
+                "root pid {} identity readback was unavailable: {error}",
+                expected_root.pid
+            ));
+        }
+    }
+
+    let mut system = System::new_all();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let root_pid = Pid::from_u32(expected_root.pid);
+    let root_process = system.process(root_pid).ok_or_else(|| {
+        format!(
+            "root pid {} disappeared after exact identity verification",
+            expected_root.pid
+        )
+    })?;
+    let mut process_ids = vec![expected_root.pid];
+    process_ids.extend(shell_job_descendant_process_ids(
+        &system,
+        expected_root.pid,
+        root_process.start_time(),
+    ));
+    process_ids.sort_unstable();
+    process_ids.dedup();
+    let snapshot_start_times = process_ids
+        .iter()
+        .filter_map(|pid| {
+            system
+                .process(Pid::from_u32(*pid))
+                .map(|process| (*pid, process.start_time()))
+        })
+        .collect::<Vec<_>>();
+
+    let mut identities = Vec::with_capacity(process_ids.len());
+    for pid in process_ids {
+        let identity = capture_local_process_identity(pid).map_err(|error| {
+            format!("could not bind process-tree pid {pid} before termination: {error}")
+        })?;
+        let snapshot_start_time = snapshot_start_times
+            .iter()
+            .find_map(|(snapshot_pid, start_time)| (*snapshot_pid == pid).then_some(*start_time))
+            .ok_or_else(|| format!("process-tree pid {pid} had no snapshot start time"))?;
+        let exact_start_time = local_identity_sysinfo_start_time(&identity)?;
+        if exact_start_time != snapshot_start_time {
+            return Err(format!(
+                "process-tree pid {pid} changed between ancestry snapshot and exact identity capture: snapshot_start={snapshot_start_time} exact_start={exact_start_time}"
+            ));
+        }
+        identities.push(identity);
+    }
+    if identities
+        .iter()
+        .find(|identity| identity.pid == expected_root.pid)
+        != Some(expected_root)
+    {
+        return Err(format!(
+            "root pid {} identity changed during process-tree capture",
+            expected_root.pid
+        ));
+    }
+
+    // Re-snapshot ancestry after exact identity capture. This closes the window
+    // where a descendant exits and its numeric PID is rebound between the first
+    // process-table walk and identity capture. A rebound process is authorized
+    // only if it is now still a descendant of the same verified root; otherwise
+    // the entire destructive transition fails closed.
+    let mut ancestry_readback = System::new_all();
+    ancestry_readback.refresh_processes(ProcessesToUpdate::All, true);
+    let root_process = ancestry_readback.process(root_pid).ok_or_else(|| {
+        format!(
+            "root pid {} disappeared before ancestry readback",
+            expected_root.pid
+        )
+    })?;
+    let mut verified_tree = vec![expected_root.pid];
+    verified_tree.extend(shell_job_descendant_process_ids(
+        &ancestry_readback,
+        expected_root.pid,
+        root_process.start_time(),
+    ));
+    for identity in &identities {
+        let process = ancestry_readback
+            .process(Pid::from_u32(identity.pid))
+            .ok_or_else(|| {
+                format!(
+                    "process-tree pid {} disappeared before ancestry readback",
+                    identity.pid
+                )
+            })?;
+        if !verified_tree.contains(&identity.pid)
+            || process.start_time() != local_identity_sysinfo_start_time(identity)?
+        {
+            return Err(format!(
+                "process-tree pid {} no longer has the captured identity beneath verified root {}",
+                identity.pid, expected_root.pid
+            ));
+        }
+    }
+    match local_process_identity_state(expected_root) {
+        LocalProcessIdentityState::Match => {}
+        LocalProcessIdentityState::Mismatch(actual) => {
+            return Err(format!(
+                "root pid {} identity changed before termination authorization: actual={actual:?}",
+                expected_root.pid
+            ));
+        }
+        LocalProcessIdentityState::Exited => {
+            return Err(format!(
+                "root pid {} exited before termination authorization",
+                expected_root.pid
+            ));
+        }
+        LocalProcessIdentityState::Absent => {
+            return Err(format!(
+                "root pid {} disappeared before termination authorization",
+                expected_root.pid
+            ));
+        }
+        LocalProcessIdentityState::Unreadable(error) => {
+            return Err(format!(
+                "root pid {} identity became unreadable before termination authorization: {error}",
+                expected_root.pid
+            ));
+        }
+    }
+    Ok(identities)
 }
 
 #[cfg(windows)]
 fn terminate_shell_job_process_tree_platform(
-    _pid: u32,
-    process_ids: &[u32],
+    identities: &[ActRunShellLocalProcessIdentity],
 ) -> ShellJobTerminationReadback {
-    let mut spawn_error = None;
-    for target_pid in process_ids.iter().rev() {
-        let mut command = StdCommand::new("taskkill.exe");
-        command.args(["/PID", &target_pid.to_string(), "/F"]);
-        apply_no_window_std(&mut command);
-        if let Err(error) = command.output() {
-            spawn_error = Some(error.to_string());
-            break;
+    use windows::Win32::{
+        Foundation::{CloseHandle, FILETIME, WAIT_FAILED, WAIT_OBJECT_0},
+        System::Threading::{
+            GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+            PROCESS_SYNCHRONIZE, PROCESS_TERMINATE, TerminateProcess, WaitForSingleObject,
+        },
+    };
+
+    const STILL_ACTIVE_EXIT_CODE: u32 = 259;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut attempted = false;
+    let mut failures = Vec::new();
+    for identity in identities.iter().rev() {
+        let handle = match unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE | PROCESS_TERMINATE,
+                false,
+                identity.pid,
+            )
+        } {
+            Ok(handle) => handle,
+            Err(error) => {
+                match local_process_identity_state(identity) {
+                    LocalProcessIdentityState::Match => failures.push(format!(
+                        "pid {} exact-handle open failed while identity remained live: {error}",
+                        identity.pid
+                    )),
+                    LocalProcessIdentityState::Mismatch(actual) => failures.push(format!(
+                        "pid {} changed identity after exact-handle open failure; termination refused: expected={identity:?} actual={actual:?}; open_error={error}",
+                        identity.pid
+                    )),
+                    LocalProcessIdentityState::Exited => {}
+                    LocalProcessIdentityState::Absent => {}
+                    LocalProcessIdentityState::Unreadable(read_error) => failures.push(format!(
+                        "pid {} exact-handle open failed and independent identity readback was unavailable: open_error={error}; readback_error={read_error}",
+                        identity.pid
+                    )),
+                }
+                continue;
+            }
+        };
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let actual_start = unsafe {
+            GetProcessTimes(
+                handle,
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        }
+        .map(|()| filetime_ticks_100ns(creation));
+        match actual_start {
+            Ok(actual_start) if actual_start == identity.start_time => {}
+            Ok(actual_start) => {
+                failures.push(format!(
+                    "pid {} creation identity changed at destructive boundary: expected={} actual={}; termination refused",
+                    identity.pid, identity.start_time, actual_start
+                ));
+                if let Err(error) = unsafe { CloseHandle(handle) } {
+                    failures.push(format!(
+                        "CloseHandle(mismatched pid {}) failed: {error}",
+                        identity.pid
+                    ));
+                }
+                continue;
+            }
+            Err(error) => {
+                failures.push(format!(
+                    "GetProcessTimes failed at destructive boundary for pid {}: {error}",
+                    identity.pid
+                ));
+                if let Err(error) = unsafe { CloseHandle(handle) } {
+                    failures.push(format!(
+                        "CloseHandle(unverified pid {}) failed: {error}",
+                        identity.pid
+                    ));
+                }
+                continue;
+            }
+        }
+        let mut exit_code = 0_u32;
+        let read_before = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) };
+        if let Err(error) = read_before {
+            failures.push(format!(
+                "GetExitCodeProcess before termination failed for pid {}: {error}",
+                identity.pid
+            ));
+        } else if exit_code == STILL_ACTIVE_EXIT_CODE {
+            attempted = true;
+            if let Err(error) = unsafe { TerminateProcess(handle, 1) } {
+                failures.push(format!(
+                    "TerminateProcess exact handle failed for pid {}: {error}",
+                    identity.pid
+                ));
+            }
+        }
+        let remaining_ms = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis();
+        let wait_ms = u32::try_from(remaining_ms).unwrap_or(u32::MAX);
+        let wait = unsafe { WaitForSingleObject(handle, wait_ms) };
+        if wait != WAIT_OBJECT_0 {
+            let last_error = (wait == WAIT_FAILED)
+                .then(windows::core::Error::from_thread)
+                .map_or_else(|| "not_available".to_owned(), |error| error.to_string());
+            failures.push(format!(
+                "pid {} exact handle did not signal before cleanup deadline: wait={wait:?} last_error={last_error}",
+                identity.pid
+            ));
+        }
+        let mut exit_after = 0_u32;
+        match unsafe { GetExitCodeProcess(handle, &raw mut exit_after) } {
+            Ok(()) if exit_after == STILL_ACTIVE_EXIT_CODE => failures.push(format!(
+                "pid {} remained STILL_ACTIVE after exact-handle termination",
+                identity.pid
+            )),
+            Ok(()) => {}
+            Err(error) => failures.push(format!(
+                "GetExitCodeProcess after termination failed for pid {}: {error}",
+                identity.pid
+            )),
+        }
+        if let Err(error) = unsafe { CloseHandle(handle) } {
+            failures.push(format!(
+                "CloseHandle(terminated pid {}) failed: {error}",
+                identity.pid
+            ));
         }
     }
-    let (remaining_process_ids, _waited_ms) =
-        wait_for_shell_job_process_tree_exit(process_ids, Duration::from_secs(5));
+    let mut remaining_process_ids = Vec::new();
+    for identity in identities {
+        match local_process_identity_state(identity) {
+            LocalProcessIdentityState::Match => remaining_process_ids.push(identity.pid),
+            LocalProcessIdentityState::Exited => {}
+            LocalProcessIdentityState::Absent => {}
+            LocalProcessIdentityState::Mismatch(actual) => failures.push(format!(
+                "pid {} was reused before final termination readback: expected={identity:?} actual={actual:?}",
+                identity.pid
+            )),
+            LocalProcessIdentityState::Unreadable(error) => {
+                failures.push(format!(
+                    "pid {} final identity readback was unavailable: {error}",
+                    identity.pid
+                ));
+                // Uncertainty is represented conservatively as remaining; it
+                // must never be reported as successful absence.
+                remaining_process_ids.push(identity.pid);
+            }
+        }
+    }
     ShellJobTerminationReadback {
-        attempted: true,
-        status: if remaining_process_ids.is_empty() {
-            "terminated".to_owned()
-        } else if let Some(error) = spawn_error {
-            format!("taskkill_spawn_failed:{error}")
+        attempted,
+        status: if failures.is_empty() && remaining_process_ids.is_empty() {
+            if attempted {
+                "terminated".to_owned()
+            } else {
+                "already_exited".to_owned()
+            }
         } else {
-            "termination_incomplete".to_owned()
+            format!("termination_failed:{}", failures.join(" | "))
         },
         remaining_process_ids,
     }
@@ -11048,36 +18167,141 @@ fn terminate_shell_job_process_tree_platform(
 
 #[cfg(not(windows))]
 fn terminate_shell_job_process_tree_platform(
-    _pid: u32,
-    process_ids: &[u32],
+    identities: &[ActRunShellLocalProcessIdentity],
 ) -> ShellJobTerminationReadback {
-    let mut status = "terminated".to_owned();
-    for pid in process_ids.iter().rev() {
-        let output = StdCommand::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .output();
-        if let Err(error) = output {
-            status = format!("kill_spawn_failed:{error}");
+    let mut attempted = false;
+    let mut failures = Vec::new();
+    for identity in identities.iter().rev() {
+        match local_process_identity_state(identity) {
+            LocalProcessIdentityState::Match => {
+                attempted = true;
+                match StdCommand::new("kill")
+                    .args(["-TERM", &identity.pid.to_string()])
+                    .output()
+                {
+                    Ok(output) if output.status.success() => {}
+                    Ok(output) => failures.push(format!(
+                        "kill -TERM pid {} exited {:?}: {}",
+                        identity.pid,
+                        output.status.code(),
+                        String::from_utf8_lossy(&output.stderr)
+                    )),
+                    Err(error) => failures.push(format!(
+                        "kill -TERM spawn failed for pid {}: {error}",
+                        identity.pid
+                    )),
+                }
+            }
+            LocalProcessIdentityState::Mismatch(actual) => failures.push(format!(
+                "pid {} start identity changed at destructive boundary: expected={} actual={}; TERM refused",
+                identity.pid, identity.start_time, actual.start_time
+            )),
+            LocalProcessIdentityState::Exited => {}
+            LocalProcessIdentityState::Absent => {}
+            LocalProcessIdentityState::Unreadable(error) => failures.push(format!(
+                "pid {} identity was unreadable at TERM boundary; TERM refused: {error}",
+                identity.pid
+            )),
         }
     }
-    let (mut remaining_process_ids, _waited_ms) =
-        wait_for_shell_job_process_tree_exit(process_ids, Duration::from_secs(5));
-    if !remaining_process_ids.is_empty() {
-        for pid in &remaining_process_ids {
-            let _ = StdCommand::new("kill")
-                .args(["-KILL", &pid.to_string()])
-                .output();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let mut any_match = false;
+        let mut uncertainty = None;
+        for identity in identities {
+            match local_process_identity_state(identity) {
+                LocalProcessIdentityState::Match => any_match = true,
+                LocalProcessIdentityState::Unreadable(error) => {
+                    uncertainty = Some(format!(
+                        "pid {} identity became unreadable while awaiting TERM: {error}",
+                        identity.pid
+                    ));
+                    break;
+                }
+                LocalProcessIdentityState::Mismatch(_)
+                | LocalProcessIdentityState::Exited
+                | LocalProcessIdentityState::Absent => {}
+            }
         }
-        let (remaining_after_kill, _waited_ms) =
-            wait_for_shell_job_process_tree_exit(process_ids, Duration::from_secs(5));
-        remaining_process_ids = remaining_after_kill;
-        if !remaining_process_ids.is_empty() {
-            status = "termination_failed".to_owned();
+        if let Some(error) = uncertainty {
+            failures.push(error);
+            break;
+        }
+        if !any_match {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let remaining = identities
+        .iter()
+        .filter(|identity| {
+            matches!(
+                local_process_identity_state(identity),
+                LocalProcessIdentityState::Match
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for identity in &remaining {
+        match local_process_identity_state(identity) {
+            LocalProcessIdentityState::Match => match StdCommand::new("kill")
+                .args(["-KILL", &identity.pid.to_string()])
+                .output()
+            {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => failures.push(format!(
+                    "kill -KILL pid {} exited {:?}: {}",
+                    identity.pid,
+                    output.status.code(),
+                    String::from_utf8_lossy(&output.stderr)
+                )),
+                Err(error) => failures.push(format!(
+                    "kill -KILL spawn failed for pid {}: {error}",
+                    identity.pid
+                )),
+            },
+            LocalProcessIdentityState::Mismatch(actual) => failures.push(format!(
+                "pid {} start identity changed before KILL: expected={} actual={}; KILL refused",
+                identity.pid, identity.start_time, actual.start_time
+            )),
+            LocalProcessIdentityState::Exited => {}
+            LocalProcessIdentityState::Absent => {}
+            LocalProcessIdentityState::Unreadable(error) => failures.push(format!(
+                "pid {} identity was unreadable at KILL boundary; KILL refused: {error}",
+                identity.pid
+            )),
+        }
+    }
+    let mut remaining_process_ids = Vec::new();
+    for identity in identities {
+        match local_process_identity_state(identity) {
+            LocalProcessIdentityState::Match => remaining_process_ids.push(identity.pid),
+            LocalProcessIdentityState::Exited => {}
+            LocalProcessIdentityState::Absent => {}
+            LocalProcessIdentityState::Mismatch(actual) => failures.push(format!(
+                "pid {} was reused before final termination readback: expected={identity:?} actual={actual:?}",
+                identity.pid
+            )),
+            LocalProcessIdentityState::Unreadable(error) => {
+                failures.push(format!(
+                    "pid {} final identity readback was unavailable: {error}",
+                    identity.pid
+                ));
+                remaining_process_ids.push(identity.pid);
+            }
         }
     }
     ShellJobTerminationReadback {
-        attempted: true,
-        status,
+        attempted,
+        status: if failures.is_empty() && remaining_process_ids.is_empty() {
+            if attempted {
+                "terminated".to_owned()
+            } else {
+                "already_exited".to_owned()
+            }
+        } else {
+            format!("termination_failed:{}", failures.join(" | "))
+        },
         remaining_process_ids,
     }
 }
@@ -11152,16 +18376,167 @@ fn wait_for_shell_job_process_tree_exit(process_ids: &[u32], timeout: Duration) 
     }
 }
 
-async fn run_allowlisted_shell(
+async fn run_allowlisted_shell_with_boundary(
     params: ActRunShellParams,
     inline_await_limit_ms: u64,
     context: Option<&ShellExecutionContext>,
+    boundary: &PhysicalMutationBoundary<'_>,
 ) -> Result<ActRunShellResponse, ErrorData> {
     let started = Instant::now();
+    // Arm an absolute Tokio deadline before spawning. Unlike a relative timeout
+    // constructed when `child.wait()` is first polled, this cannot grant extra
+    // runtime if the async worker is descheduled between spawn and wait.
+    let timeout_budget = inline_shell_timeout_budget(params.timeout_ms);
+    let timeout_deadline = tokio::time::Instant::now()
+        .checked_add(timeout_budget)
+        .ok_or_else(|| {
+            shell_tool_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "act_run_shell timeout_ms is outside the platform monotonic-clock range",
+                json!({
+                    "code": error_codes::TOOL_PARAMS_INVALID,
+                    "timeout_ms": params.timeout_ms,
+                    "reason": "timeout_deadline_out_of_range",
+                }),
+            )
+        })?;
     let requested_execution_mode = params.execution_mode;
+    boundary("act_run_shell_immediately_before_create_process")?;
     let mut spawned = spawn_shell_child(&params, context)?;
-    let (stdout_task, stderr_task) = spawn_capped_readers(&mut spawned.child)?;
-    let (exit_code, timed_out) = wait_shell_child(&mut spawned.child, params.timeout_ms).await?;
+    if let Err(error) = boundary("act_run_shell_immediately_after_create_process") {
+        let cleanup = cleanup_inline_shell_child_after_boundary(&mut spawned).await;
+        return Err(physical_mutation_boundary_error(
+            error,
+            "act_run_shell_immediately_after_create_process",
+            cleanup,
+        ));
+    }
+    let (stdout_task, stderr_task) = match spawn_capped_readers(&mut spawned.child) {
+        Ok(tasks) => tasks,
+        Err(reader_error) => {
+            let tree_termination =
+                terminate_shell_job_process_tree(&spawned.local_process_identity);
+            let initial_reap = terminate_and_reap_tokio_child_bounded(
+                &mut spawned.child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            );
+            let job_close = spawned.process_job.close_checked();
+            let post_job_close_reap = terminate_and_reap_tokio_child_bounded(
+                &mut spawned.child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            );
+            let final_identity_state =
+                local_process_identity_state(&spawned.local_process_identity);
+            return Err(shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "act_run_shell could not start output readers after spawning pid {}; owned cleanup followed: {}",
+                    spawned.local_process_identity.pid, reader_error.message
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "underlying_code": extract_error_code(&reader_error),
+                    "reason": "output_reader_setup_failed_after_spawn",
+                    "pid": spawned.local_process_identity.pid,
+                    "reader_error": reader_error,
+                    "tree_termination": tree_termination,
+                    "initial_reap": initial_reap,
+                    "job_close": format!("{job_close:?}"),
+                    "post_job_close_reap": post_job_close_reap,
+                    "final_identity_state": final_identity_state,
+                }),
+            ));
+        }
+    };
+    let wait_result = wait_shell_child_with_identity(
+        &mut spawned.child,
+        Some(&spawned.local_process_identity),
+        params.timeout_ms,
+        started,
+        timeout_deadline,
+        Some(boundary),
+    )
+    .await;
+    let job_close = spawned.process_job.close_checked();
+    let (exit_code, timed_out) = match wait_result {
+        Ok(result) if job_close.is_ok() => result,
+        Ok(_) => {
+            let close_error = job_close.err();
+            let final_identity_state =
+                local_process_identity_state(&spawned.local_process_identity);
+            return Err(shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "act_run_shell could not verify owned job-handle closure for pid {}: {close_error:?}",
+                    spawned.local_process_identity.pid
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "reason": "job_object_close_failed_after_inline_wait",
+                    "pid": spawned.local_process_identity.pid,
+                    "job_close_error": close_error,
+                    "final_identity_state": final_identity_state,
+                }),
+            ));
+        }
+        Err(wait_error)
+            if extract_error_code(&wait_error) == error_codes::SAFETY_OPERATOR_HOTKEY_FIRED =>
+        {
+            let post_job_close_reap = terminate_and_reap_tokio_child_bounded(
+                &mut spawned.child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            );
+            let final_identity_state =
+                local_process_identity_state(&spawned.local_process_identity);
+            let cleanup_verified = job_close.is_ok()
+                && post_job_close_reap.poll_error_count == 0
+                && matches!(
+                    final_identity_state,
+                    LocalProcessIdentityState::Exited
+                        | LocalProcessIdentityState::Absent
+                        | LocalProcessIdentityState::Mismatch(_)
+                );
+            if !cleanup_verified {
+                synapse_action::record_operator_panic_safety_incident();
+            }
+            return Err(physical_mutation_boundary_error(
+                wait_error,
+                "act_run_shell_after_operator_panic_job_close",
+                json!({
+                    "source_of_truth": "kill-on-close job + exact Tokio child + final process identity",
+                    "job_close": format!("{job_close:?}"),
+                    "post_job_close_reap": post_job_close_reap,
+                    "final_identity_state": final_identity_state,
+                    "cleanup_verified": cleanup_verified,
+                }),
+            ));
+        }
+        Err(wait_error) => {
+            let post_job_close_reap = terminate_and_reap_tokio_child_bounded(
+                &mut spawned.child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            );
+            let final_identity_state =
+                local_process_identity_state(&spawned.local_process_identity);
+            return Err(shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "act_run_shell inline wait failed after spawning pid {}; job_close={job_close:?}; post_job_close_reap={post_job_close_reap:?}; final_identity_state={final_identity_state:?}: {}",
+                    spawned.local_process_identity.pid, wait_error.message
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "underlying_code": extract_error_code(&wait_error),
+                    "reason": "inline_wait_failed_after_spawn",
+                    "pid": spawned.local_process_identity.pid,
+                    "wait_error": wait_error,
+                    "job_close": format!("{job_close:?}"),
+                    "post_job_close_reap": post_job_close_reap,
+                    "final_identity_state": final_identity_state,
+                }),
+            ));
+        }
+    };
     let stdout = join_capped_stream(stdout_task, "stdout").await?;
     let stderr = join_capped_stream(stderr_task, "stderr").await?;
     let (error_code, error_message) = shell_budget_error(
@@ -11236,15 +18611,390 @@ fn shell_budget_error(
     )
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct UnresolvedShellChildOwnerSnapshot {
+    pub(crate) owner_id: String,
+    pub(crate) pid: Option<u32>,
+    pub(crate) stage: String,
+    pub(crate) child_kind: String,
+    pub(crate) process_job_acquired: bool,
+    pub(crate) tree_cleanup_verified: bool,
+    pub(crate) durable_job_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct UnresolvedShellChildOwnerReport {
+    pub(crate) active_owner_count: usize,
+    pub(crate) owners: Vec<UnresolvedShellChildOwnerSnapshot>,
+    pub(crate) retry_attempted: usize,
+    pub(crate) reaped_owner_count: usize,
+    pub(crate) registry_poisoned: bool,
+}
+
+impl UnresolvedShellChildOwnerReport {
+    pub(crate) const fn safe_to_unlock(&self) -> bool {
+        self.active_owner_count == 0 && !self.registry_poisoned
+    }
+}
+
+enum RetainedExactShellChild {
+    Tokio(Box<tokio::process::Child>),
+    Std(Box<std::process::Child>),
+}
+
+impl RetainedExactShellChild {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Tokio(_) => "tokio",
+            Self::Std(_) => "std",
+        }
+    }
+
+    fn request_termination(&mut self) -> Option<String> {
+        match self {
+            Self::Tokio(child) => child.start_kill().err().map(|error| error.to_string()),
+            Self::Std(child) => child.kill().err().map(|error| error.to_string()),
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        match self {
+            Self::Tokio(child) => child.try_wait(),
+            Self::Std(child) => child.try_wait(),
+        }
+    }
+}
+
+struct RetainedDurableSpawnFailure {
+    status_path: PathBuf,
+    status: ActRunShellJobStatus,
+}
+
+struct RetainedShellChildOwner {
+    owner_id: String,
+    pid: Option<u32>,
+    stage: String,
+    child: RetainedExactShellChild,
+    process_job: Option<OwnedProcessJob>,
+    process_job_acquired: bool,
+    process_job_close_verified: bool,
+    tree_cleanup_verified: bool,
+    local_process_identity: Option<ActRunShellLocalProcessIdentity>,
+    durable_spawn_failure: Option<RetainedDurableSpawnFailure>,
+}
+
+static RETAINED_UNRESOLVED_SHELL_CHILD_OWNERS: OnceLock<Mutex<Vec<RetainedShellChildOwner>>> =
+    OnceLock::new();
+
+fn retained_unresolved_shell_child_owners() -> &'static Mutex<Vec<RetainedShellChildOwner>> {
+    RETAINED_UNRESOLVED_SHELL_CHILD_OWNERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn retain_unresolved_shell_child_owner(owner: RetainedShellChildOwner) -> (String, usize) {
+    let owner_id = owner.owner_id.clone();
+    let mut owners = retained_unresolved_shell_child_owners()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    owners.push(owner);
+    (owner_id, owners.len())
+}
+
+fn terminal_local_process_identity_state(state: &LocalProcessIdentityState) -> bool {
+    matches!(
+        state,
+        LocalProcessIdentityState::Exited
+            | LocalProcessIdentityState::Absent
+            | LocalProcessIdentityState::Mismatch(_)
+    )
+}
+
+fn retry_retained_shell_child_owner(owner: &mut RetainedShellChildOwner) -> bool {
+    let retry_kill_error = owner.child.request_termination();
+    if !owner.process_job_close_verified
+        && let Some(process_job) = owner.process_job.as_mut()
+        && process_job.close_checked().is_ok()
+    {
+        owner.process_job_close_verified = true;
+    }
+    let exact_child_reaped = match owner.child.try_wait() {
+        Ok(Some(_)) => true,
+        Ok(None) | Err(_) => false,
+    };
+    let final_identity_state = owner
+        .local_process_identity
+        .as_ref()
+        .map(local_process_identity_state);
+    let identity_terminal = final_identity_state
+        .as_ref()
+        .is_none_or(terminal_local_process_identity_state);
+    let cleanup_verified = exact_child_reaped
+        && owner.process_job_close_verified
+        && owner.tree_cleanup_verified
+        && identity_terminal;
+    if !cleanup_verified {
+        return false;
+    }
+
+    let Some(durable) = owner.durable_spawn_failure.as_mut() else {
+        return true;
+    };
+    durable.status.status = "spawn_failed_reaped".to_owned();
+    durable.status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    durable.status.duration_ms =
+        Some(elapsed_ms_since_rfc3339(&durable.status.started_at).unwrap_or_default());
+    if let Some(readback) = durable.status.spawn_failure.as_mut() {
+        readback.cleanup_verified = true;
+        readback.exact_child_reaped = true;
+        readback.exact_child_reap_timed_out = false;
+        readback.exact_owner_retained = false;
+        if readback.exact_child_kill_error.is_none() {
+            readback.exact_child_kill_error = retry_kill_error;
+        }
+        readback.process_job_close = Some("Ok(())".to_owned());
+        readback.final_identity_state = final_identity_state.map(|state| format!("{state:?}"));
+    }
+    match persist_and_verify_shell_job_status(&durable.status_path, &durable.status) {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::error!(
+                code = "M4_SHELL_UNRESOLVED_CHILD_TERMINAL_STATUS_PERSIST_FAILED",
+                owner_id = owner.owner_id,
+                pid = ?owner.pid,
+                job_id = %durable.status.job_id,
+                reason = error.reason,
+                detail = error.detail,
+                "exact child was reaped but its durable terminal spawn-failure status remains unverified"
+            );
+            false
+        }
+    }
+}
+
+/// Perform one nonblocking termination/reap/status retry for every retained
+/// exact owner, then return the physical registry Source of Truth. Shutdown
+/// gates use `safe_to_unlock`: an unresolved child or durable terminal commit
+/// keeps both daemon lifetime locks held until process teardown.
+pub(crate) fn unresolved_shell_child_owner_report() -> UnresolvedShellChildOwnerReport {
+    const OWNER_SAMPLE_CAP: usize = 16;
+    let lock = retained_unresolved_shell_child_owners().lock();
+    let (mut owners, registry_poisoned) = match lock {
+        Ok(owners) => (owners, false),
+        Err(poisoned) => (poisoned.into_inner(), true),
+    };
+    let retry_attempted = owners.len();
+    let before = owners.len();
+    owners.retain_mut(|owner| !retry_retained_shell_child_owner(owner));
+    let reaped_owner_count = before.saturating_sub(owners.len());
+    let snapshots = owners
+        .iter()
+        .take(OWNER_SAMPLE_CAP)
+        .map(|owner| UnresolvedShellChildOwnerSnapshot {
+            owner_id: owner.owner_id.clone(),
+            pid: owner.pid,
+            stage: owner.stage.clone(),
+            child_kind: owner.child.kind().to_owned(),
+            process_job_acquired: owner.process_job_acquired,
+            tree_cleanup_verified: owner.tree_cleanup_verified,
+            durable_job_id: owner
+                .durable_spawn_failure
+                .as_ref()
+                .map(|durable| durable.status.job_id.clone()),
+        })
+        .collect();
+    UnresolvedShellChildOwnerReport {
+        active_owner_count: owners.len(),
+        owners: snapshots,
+        retry_attempted,
+        reaped_owner_count,
+        registry_poisoned,
+    }
+}
+
 struct SpawnedShellChild {
     child: tokio::process::Child,
     process_job: OwnedProcessJob,
+    local_process_identity: ActRunShellLocalProcessIdentity,
+}
+
+async fn cleanup_inline_shell_child_after_boundary(spawned: &mut SpawnedShellChild) -> Value {
+    let tree_termination = {
+        let identity = spawned.local_process_identity.clone();
+        tokio::task::spawn_blocking(move || terminate_shell_job_process_tree(&identity))
+            .await
+            .unwrap_or_else(|join_error| ShellJobTerminationReadback {
+                attempted: false,
+                status: format!("termination_task_join_failed:{join_error}"),
+                remaining_process_ids: vec![spawned.local_process_identity.pid],
+            })
+    };
+    let initial_reap = terminate_and_reap_tokio_child_async_bounded(
+        &mut spawned.child,
+        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+    )
+    .await;
+    let state_while_job_held = local_process_identity_state(&spawned.local_process_identity);
+    let job_close = spawned.process_job.close_checked();
+    let post_job_close_reap = terminate_and_reap_tokio_child_async_bounded(
+        &mut spawned.child,
+        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+    )
+    .await;
+    let final_identity_state = local_process_identity_state(&spawned.local_process_identity);
+    let tree_verified = tree_termination.remaining_process_ids.is_empty()
+        && matches!(
+            tree_termination.status.as_str(),
+            "terminated" | "already_exited"
+        );
+    let identity_absent = matches!(
+        final_identity_state,
+        LocalProcessIdentityState::Exited
+            | LocalProcessIdentityState::Absent
+            | LocalProcessIdentityState::Mismatch(_)
+    );
+    let cleanup_verified = tree_verified
+        && (initial_reap.reaped || post_job_close_reap.reaped)
+        && initial_reap.poll_error_count == 0
+        && post_job_close_reap.poll_error_count == 0
+        && identity_absent
+        && job_close.is_ok();
+    if !cleanup_verified {
+        synapse_action::record_operator_panic_safety_incident();
+    }
+    json!({
+        "source_of_truth": "identity-bound process tree + exact Tokio child + kill-on-close job + final process identity",
+        "pid": spawned.local_process_identity.pid,
+        "tree_termination": tree_termination,
+        "initial_reap": initial_reap,
+        "state_while_job_held": state_while_job_held,
+        "job_close": format!("{job_close:?}"),
+        "post_job_close_reap": post_job_close_reap,
+        "final_identity_state": final_identity_state,
+        "cleanup_verified": cleanup_verified,
+    })
+}
+
+fn persist_running_shell_job_status_or_cleanup(
+    paths: &ShellJobPaths,
+    status: &mut ActRunShellJobStatus,
+    child: &mut tokio::process::Child,
+    local_process_identity: &ActRunShellLocalProcessIdentity,
+    process_job: &mut OwnedProcessJob,
+    started: Instant,
+) -> Result<(), ErrorData> {
+    let initial_failure = match persist_and_verify_shell_job_status(&paths.status_path, status) {
+        Ok(_) => return Ok(()),
+        Err(failure) => failure,
+    };
+
+    // A resumed child is already observable reality. A status-store failure
+    // therefore becomes an owned cleanup transaction, not an early-return `?`:
+    // terminate the identity-bound tree and reap the exact Tokio child while
+    // the verified job authority is still held, then close that job explicitly
+    // and perform an independent process-identity readback.
+    let tree_termination = terminate_shell_job_process_tree(local_process_identity);
+    let initial_reap = terminate_and_reap_tokio_child_bounded(
+        child,
+        Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+    );
+    let state_while_job_held = local_process_identity_state(local_process_identity);
+    let job_close = process_job.close_checked();
+    let state_after_job_close = local_process_identity_state(local_process_identity);
+    let post_job_close_reap = (!initial_reap.reaped
+        || matches!(
+            state_after_job_close,
+            LocalProcessIdentityState::Match | LocalProcessIdentityState::Unreadable(_)
+        ))
+    .then(|| {
+        terminate_and_reap_tokio_child_bounded(
+            child,
+            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+        )
+    });
+    let final_identity_state = local_process_identity_state(local_process_identity);
+    let exact_child_reaped = initial_reap.reaped
+        || post_job_close_reap
+            .as_ref()
+            .is_some_and(|readback| readback.reaped);
+    let identity_absent = matches!(
+        final_identity_state,
+        LocalProcessIdentityState::Exited
+            | LocalProcessIdentityState::Absent
+            | LocalProcessIdentityState::Mismatch(_)
+    );
+    let tree_verified = tree_termination.remaining_process_ids.is_empty()
+        && matches!(
+            tree_termination.status.as_str(),
+            "terminated" | "already_exited"
+        );
+    let cleanup_verified =
+        exact_child_reaped && identity_absent && tree_verified && job_close.is_ok();
+
+    status.status = if cleanup_verified {
+        "start_status_persist_failed_reaped".to_owned()
+    } else {
+        "start_status_persist_failed_cleanup_unverified".to_owned()
+    };
+    status.completed_at = Some(chrono::Utc::now().to_rfc3339());
+    status.duration_ms = Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+    status.error_code = Some(initial_failure.error_code.to_owned());
+    status.error_message = Some(format!(
+        "initial running status persistence failed: reason={} detail={}; cleanup_verified={cleanup_verified}; tree={tree_termination:?}; initial_reap={initial_reap:?}; state_while_job_held={state_while_job_held:?}; job_close={job_close:?}; post_job_close_reap={post_job_close_reap:?}; final_identity_state={final_identity_state:?}",
+        initial_failure.reason, initial_failure.detail
+    ));
+
+    // The storage fault may be transient. Preserve a truthful terminal record
+    // if it became writable after cleanup; otherwise return both the original
+    // store failure and this second durable-state failure to the caller/log.
+    let terminal_persistence = persist_and_verify_shell_job_status(&paths.status_path, status);
+    let terminal_status_persisted = terminal_persistence.is_ok();
+    let terminal_persistence_failure = terminal_persistence.err();
+    tracing::error!(
+        code = "M4_ACT_RUN_SHELL_INITIAL_STATUS_UNVERIFIED_CHILD_CLEANED",
+        job_id = %status.job_id,
+        pid = local_process_identity.pid,
+        initial_failure_reason = initial_failure.reason,
+        initial_failure_detail = initial_failure.detail,
+        cleanup_verified,
+        tree_termination = ?tree_termination,
+        initial_reap = ?initial_reap,
+        state_while_job_held = ?state_while_job_held,
+        job_close = ?job_close,
+        post_job_close_reap = ?post_job_close_reap,
+        final_identity_state = ?final_identity_state,
+        terminal_status_persisted,
+        terminal_persistence_failure = ?terminal_persistence_failure,
+        "initial durable running status failed after child resume; exact owned cleanup was attempted and independently read back"
+    );
+    Err(shell_tool_error(
+        initial_failure.error_code,
+        format!(
+            "act_run_shell_start could not verify its initial running status after resuming pid {}; cleanup_verified={cleanup_verified}; terminal_status_persisted={terminal_status_persisted}",
+            local_process_identity.pid
+        ),
+        json!({
+            "code": initial_failure.error_code,
+            "job_id": status.job_id,
+            "pid": local_process_identity.pid,
+            "reason": "initial_running_status_persistence_failed",
+            "initial_status_failure": initial_failure,
+            "cleanup_verified": cleanup_verified,
+            "tree_termination": tree_termination,
+            "initial_reap": initial_reap,
+            "state_while_job_held": state_while_job_held,
+            "job_close": format!("{job_close:?}"),
+            "post_job_close_reap": post_job_close_reap,
+            "final_identity_state": final_identity_state,
+            "terminal_status_persisted": terminal_status_persisted,
+            "terminal_persistence_failure": terminal_persistence_failure,
+            "status_path": paths.status_path,
+        }),
+    ))
 }
 
 #[cfg(windows)]
 #[derive(Debug)]
 pub(crate) struct OwnedProcessJob {
-    handle: windows::Win32::Foundation::HANDLE,
+    handle: Option<windows::Win32::Foundation::HANDLE>,
 }
 
 #[cfg(not(windows))]
@@ -11252,9 +19002,59 @@ pub(crate) struct OwnedProcessJob {
 pub(crate) struct OwnedProcessJob;
 
 #[cfg(windows)]
+static RETAINED_OWNED_PROCESS_JOB_HANDLES: OnceLock<Mutex<Vec<isize>>> = OnceLock::new();
+
+#[cfg(windows)]
+fn retry_retained_owned_process_job_handles() -> usize {
+    let retained = RETAINED_OWNED_PROCESS_JOB_HANDLES.get_or_init(|| Mutex::new(Vec::new()));
+    let mut retained = retained
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    retained.retain(|raw| {
+        let handle = windows::Win32::Foundation::HANDLE(*raw as *mut core::ffi::c_void);
+        unsafe { windows::Win32::Foundation::CloseHandle(handle) }.is_err()
+    });
+    retained.len()
+}
+
+#[cfg(windows)]
 impl Drop for OwnedProcessJob {
     fn drop(&mut self) {
-        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.handle) };
+        let _ = retry_retained_owned_process_job_handles();
+        let Some(handle) = self.handle else {
+            return;
+        };
+        match unsafe { windows::Win32::Foundation::CloseHandle(handle) } {
+            Ok(()) => self.handle = None,
+            Err(error) => {
+                // Losing the raw handle here would silently disarm the only
+                // kill-on-close ownership authority. Transfer it into a
+                // process-lifetime registry; later job drops retry, and OS
+                // process teardown remains the final close boundary.
+                let retained = RETAINED_OWNED_PROCESS_JOB_HANDLES
+                    .get_or_init(|| Mutex::new(Vec::new()))
+                    .lock()
+                    .map(|mut retained| {
+                        retained.push(handle.0 as isize);
+                        retained.len()
+                    })
+                    .unwrap_or_else(|poisoned| {
+                        let mut retained = poisoned.into_inner();
+                        retained.push(handle.0 as isize);
+                        retained.len()
+                    });
+                self.handle = None;
+                tracing::error!(
+                    code = "M4_OWNED_PROCESS_JOB_DROP_CLOSE_FAILED",
+                    error = %error,
+                    retained_handles = ?retained,
+                    "OwnedProcessJob Drop retained its unclosed Windows job handle for retry"
+                );
+                eprintln!(
+                    "M4_OWNED_PROCESS_JOB_DROP_CLOSE_FAILED: CloseHandle(job) failed and ownership was retained for retry: {error}; retained={retained:?}"
+                );
+            }
+        }
     }
 }
 
@@ -11263,6 +19063,34 @@ unsafe impl Send for OwnedProcessJob {}
 
 #[cfg(windows)]
 impl OwnedProcessJob {
+    fn handle(
+        &self,
+        tool_name: &'static str,
+        pid: u32,
+    ) -> Result<windows::Win32::Foundation::HANDLE, ErrorData> {
+        self.handle.ok_or_else(|| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("{tool_name} Windows job handle was already closed for pid {pid}"),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "pid": pid,
+                    "reason": "job_object_handle_already_closed",
+                }),
+            )
+        })
+    }
+
+    fn close_checked(&mut self) -> Result<(), String> {
+        let Some(handle) = self.handle else {
+            return Ok(());
+        };
+        unsafe { windows::Win32::Foundation::CloseHandle(handle) }
+            .map_err(|error| format!("CloseHandle(owned process job) failed: {error}"))?;
+        self.handle = None;
+        Ok(())
+    }
+
     pub(crate) fn disarm_kill_on_close(
         &mut self,
         tool_name: &'static str,
@@ -11274,6 +19102,7 @@ impl OwnedProcessJob {
             SetInformationJobObject,
         };
 
+        let handle = self.handle(tool_name, pid)?;
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
         limits.BasicLimitInformation.LimitFlags = Default::default();
         let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
@@ -11291,7 +19120,7 @@ impl OwnedProcessJob {
             })?;
         unsafe {
             SetInformationJobObject(
-                self.handle,
+                handle,
                 JobObjectExtendedLimitInformation,
                 (&raw const limits).cast(),
                 limit_size,
@@ -11308,12 +19137,31 @@ impl OwnedProcessJob {
                     "reason": "job_object_kill_on_close_disarm_failed",
                 }),
             )
+        })?;
+        query_owned_process_job_kill_on_close(handle, false).map_err(|error| {
+            shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "{tool_name} could not verify Windows job object kill-on-close disarm for pid {pid}: {error}"
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "pid": pid,
+                    "resource_id": resource_id,
+                    "reason": "job_object_kill_on_close_disarm_readback_failed",
+                    "detail": error,
+                }),
+            )
         })
     }
 }
 
 #[cfg(not(windows))]
 impl OwnedProcessJob {
+    fn close_checked(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
     pub(crate) fn disarm_kill_on_close(
         &mut self,
         _tool_name: &'static str,
@@ -11322,6 +19170,49 @@ impl OwnedProcessJob {
     ) -> Result<(), ErrorData> {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn query_owned_process_job_kill_on_close(
+    handle: windows::Win32::Foundation::HANDLE,
+    expected: bool,
+) -> Result<(), String> {
+    use windows::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    };
+
+    let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+        .map_err(|error| format!("Windows job limit size conversion failed: {error}"))?;
+    let mut readback = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    let mut returned_bytes = 0_u32;
+    unsafe {
+        QueryInformationJobObject(
+            Some(handle),
+            JobObjectExtendedLimitInformation,
+            (&raw mut readback).cast(),
+            limit_size,
+            Some(&raw mut returned_bytes),
+        )
+    }
+    .map_err(|error| format!("QueryInformationJobObject limit readback failed: {error}"))?;
+    if returned_bytes != limit_size {
+        return Err(format!(
+            "QueryInformationJobObject returned {returned_bytes} bytes; expected {limit_size}; limit_flags={:#x}",
+            readback.BasicLimitInformation.LimitFlags.0
+        ));
+    }
+    let actual = readback
+        .BasicLimitInformation
+        .LimitFlags
+        .contains(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE);
+    if actual != expected {
+        return Err(format!(
+            "Windows job kill-on-close limit readback mismatch: expected={expected} actual={actual} limit_flags={:#x}",
+            readback.BasicLimitInformation.LimitFlags.0
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -11335,14 +19226,17 @@ pub(crate) fn assign_owned_process_job(
             Foundation::CloseHandle,
             System::{
                 JobObjects::{
-                    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
-                    SetInformationJobObject,
+                    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                    JobObjectExtendedLimitInformation, SetInformationJobObject,
                 },
-                Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE},
+                Threading::{
+                    OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_QUOTA,
+                    PROCESS_TERMINATE,
+                },
             },
         },
-        core::PCWSTR,
+        core::{BOOL, PCWSTR},
     };
 
     let job = unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(|error| {
@@ -11357,73 +19251,138 @@ pub(crate) fn assign_owned_process_job(
             }),
         )
     })?;
+    let mut owner = OwnedProcessJob { handle: Some(job) };
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-    let limit_size = u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
-        .map_err(|error| {
-            let _ = unsafe { CloseHandle(job) };
-            shell_tool_error(
+    let limit_size = match u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+    {
+        Ok(size) => size,
+        Err(error) => {
+            let job_close = owner.close_checked();
+            return Err(shell_tool_error(
                 error_codes::TOOL_INTERNAL_ERROR,
-                format!("{tool_name} failed to size Windows job object limits: {error}"),
+                format!(
+                    "{tool_name} failed to size Windows job object limits: {error}; job_close={job_close:?}"
+                ),
                 json!({
                     "code": error_codes::TOOL_INTERNAL_ERROR,
                     "pid": pid,
                     "resource_id": resource_id,
                     "reason": "job_object_limit_size_failed",
+                    "job_close": format!("{job_close:?}"),
                 }),
-            )
-        })?;
-    unsafe {
+            ));
+        }
+    };
+    if let Err(error) = unsafe {
         SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
             (&raw const limits).cast(),
             limit_size,
         )
-    }
-    .map_err(|error| {
-        let _ = unsafe { CloseHandle(job) };
-        shell_tool_error(
+    } {
+        let job_close = owner.close_checked();
+        return Err(shell_tool_error(
             error_codes::TOOL_INTERNAL_ERROR,
-            format!("{tool_name} failed to set Windows job object kill-on-close: {error}"),
+            format!(
+                "{tool_name} failed to set Windows job object kill-on-close: {error}; job_close={job_close:?}"
+            ),
             json!({
                 "code": error_codes::TOOL_INTERNAL_ERROR,
                 "pid": pid,
                 "resource_id": resource_id,
                 "reason": "job_object_limit_failed",
+                "job_close": format!("{job_close:?}"),
             }),
+        ));
+    }
+    if let Err(error) = query_owned_process_job_kill_on_close(job, true) {
+        let job_close = owner.close_checked();
+        return Err(shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "{tool_name} could not verify Windows job object kill-on-close before assigning pid {pid}: {error}; job_close={job_close:?}"
+            ),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "pid": pid,
+                "resource_id": resource_id,
+                "reason": "job_object_limit_readback_failed",
+                "detail": error,
+                "job_close": format!("{job_close:?}"),
+            }),
+        ));
+    }
+    let process = match unsafe {
+        OpenProcess(
+            PROCESS_SET_QUOTA | PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            pid,
         )
-    })?;
-    let process = unsafe { OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid) }
-        .map_err(|error| {
-            let _ = unsafe { CloseHandle(job) };
-            shell_tool_error(
+    } {
+        Ok(process) => process,
+        Err(error) => {
+            let job_close = owner.close_checked();
+            return Err(shell_tool_error(
                 error_codes::TOOL_INTERNAL_ERROR,
-                format!("{tool_name} failed to open child process for job assignment: {error}"),
+                format!(
+                    "{tool_name} failed to open child process for job assignment: {error}; job_close={job_close:?}"
+                ),
                 json!({
                     "code": error_codes::TOOL_INTERNAL_ERROR,
                     "pid": pid,
                     "resource_id": resource_id,
                     "reason": "job_object_process_open_failed",
+                    "job_close": format!("{job_close:?}"),
                 }),
+            ));
+        }
+    };
+    let (assignment_error, membership) = match unsafe { AssignProcessToJobObject(job, process) } {
+        Ok(()) => {
+            let mut in_job = BOOL::default();
+            (
+                None,
+                unsafe { IsProcessInJob(process, Some(job), &raw mut in_job) }
+                    .map(|()| in_job.as_bool())
+                    .map_err(|error| error.to_string()),
             )
-        })?;
-    let assign_result = unsafe { AssignProcessToJobObject(job, process) };
-    let _ = unsafe { CloseHandle(process) };
-    assign_result.map_err(|error| {
-        let _ = unsafe { CloseHandle(job) };
-        shell_tool_error(
+        }
+        Err(error) => (
+            Some(error.to_string()),
+            Err("assignment failed; membership readback was not attempted".to_owned()),
+        ),
+    };
+    let process_close = unsafe { CloseHandle(process) }.map_err(|error| error.to_string());
+    let assignment_verified =
+        membership.as_ref().is_ok_and(|in_job| *in_job) && process_close.is_ok();
+    if !assignment_verified {
+        let membership_detail = match membership {
+            Ok(true) => "verified".to_owned(),
+            Ok(false) => "IsProcessInJob returned false".to_owned(),
+            Err(error) => format!("IsProcessInJob failed: {error}"),
+        };
+        let close_detail = process_close.err();
+        let job_close = owner.close_checked();
+        return Err(shell_tool_error(
             error_codes::TOOL_INTERNAL_ERROR,
-            format!("{tool_name} failed to assign child process to Windows job object: {error}"),
+            format!(
+                "{tool_name} could not verify child pid {pid} kill-on-close job ownership; assignment_error={assignment_error:?}; membership={membership_detail}; process_close_error={close_detail:?}; job_close={job_close:?}"
+            ),
             json!({
                 "code": error_codes::TOOL_INTERNAL_ERROR,
                 "pid": pid,
                 "resource_id": resource_id,
-                "reason": "job_object_assign_failed",
+                "reason": "job_object_membership_unverified",
+                "assignment_error": assignment_error,
+                "membership": membership_detail,
+                "process_close_error": close_detail,
+                "job_close": format!("{job_close:?}"),
             }),
-        )
-    })?;
-    Ok(OwnedProcessJob { handle: job })
+        ));
+    }
+    Ok(owner)
 }
 
 #[cfg(not(windows))]
@@ -11486,10 +19445,17 @@ fn spawn_shell_child(
         )
     })?;
     let Some(pid) = child.id() else {
-        let _ = child.start_kill();
+        let cleanup = terminate_and_reap_tokio_child_bounded(
+            &mut child,
+            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+        );
         return Err(shell_tool_error(
             error_codes::TOOL_INTERNAL_ERROR,
-            "act_run_shell spawned a child process but could not read its pid",
+            if cleanup.reaped {
+                "act_run_shell spawned a child process without an observable pid; the exact child handle was terminated and reaped before refusing the spawn"
+            } else {
+                "act_run_shell spawned a child process without an observable pid and could not verify exact-child reaping before the cleanup backstop"
+            },
             json!({
                 "code": error_codes::TOOL_INTERNAL_ERROR,
                 "command": params.command,
@@ -11498,11 +19464,83 @@ fn spawn_shell_child(
                 "args_sha256": shell_args_sha256(&params.args),
                 "working_dir": params.working_dir,
                 "reason": "pid_unavailable",
+                "cleanup_verified": cleanup.reaped,
+                "cleanup": cleanup,
             }),
         ));
     };
-    let process_job = assign_owned_process_job(pid, "act_run_shell", None)?;
-    Ok(SpawnedShellChild { child, process_job })
+    let local_process_identity = capture_local_process_identity(pid).map_err(|identity_error| {
+        let cleanup = terminate_and_reap_tokio_child_bounded(
+            &mut child,
+            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+        );
+        shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "act_run_shell could not bind spawned pid {pid} to its kernel creation identity; exact-child cleanup followed: {identity_error}"
+            ),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "pid": pid,
+                "reason": "local_process_identity_capture_failed",
+                "identity_error": identity_error,
+                "cleanup_verified": cleanup.reaped,
+                "cleanup": cleanup,
+            }),
+        )
+    })?;
+    let mut process_job = match assign_owned_process_job(pid, "act_run_shell", None) {
+        Ok(process_job) => process_job,
+        Err(assignment_error) => {
+            let cleanup = terminate_and_reap_tokio_child_bounded(
+                &mut child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            );
+            return Err(shell_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "act_run_shell could not establish kill-on-close ownership for spawned pid {pid}; exact-child cleanup verified={}: {}",
+                    cleanup.reaped, assignment_error.message
+                ),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "pid": pid,
+                    "reason": "job_object_assignment_failed",
+                    "assignment_error": assignment_error,
+                    "cleanup_verified": cleanup.reaped,
+                    "cleanup": cleanup,
+                }),
+            ));
+        }
+    };
+    if let Err(resume_error) = resume_suspended_shell_child(&local_process_identity) {
+        let job_close = process_job.close_checked();
+        let cleanup = terminate_and_reap_tokio_child_bounded(
+            &mut child,
+            Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+        );
+        return Err(shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "act_run_shell could not safely resume contained pid {pid}; job_close={job_close:?}; exact-child cleanup verified={}: {resume_error}",
+                cleanup.reaped,
+            ),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "pid": pid,
+                "reason": "contained_child_resume_failed",
+                "resume_error": resume_error,
+                "job_close": format!("{job_close:?}"),
+                "cleanup_verified": cleanup.reaped,
+                "cleanup": cleanup,
+            }),
+        ));
+    }
+    Ok(SpawnedShellChild {
+        child,
+        process_job,
+        local_process_identity,
+    })
 }
 
 type CappedStreamTask = tokio::task::JoinHandle<io::Result<CappedOutput>>;
@@ -11535,33 +19573,135 @@ fn spawn_capped_readers(
     Ok((stdout_task, stderr_task))
 }
 
-async fn wait_shell_child(
+async fn wait_shell_child_with_identity(
     child: &mut tokio::process::Child,
+    local_process_identity: Option<&ActRunShellLocalProcessIdentity>,
     timeout_ms: u64,
+    started: Instant,
+    timeout_deadline: tokio::time::Instant,
+    boundary: Option<&PhysicalMutationBoundary<'_>>,
 ) -> Result<(Option<i32>, bool), ErrorData> {
-    let budget = Duration::from_millis(timeout_ms);
+    let budget = inline_shell_timeout_budget(timeout_ms);
     // Source of truth for `timed_out`, at parity with the durable path (#1588):
     // the kernel-recorded process runtime, captured BEFORE the wait so it stays
-    // readable after tokio reaps the child. `tokio::time::timeout` polls the
+    // readable after tokio reaps the child. `tokio::time::timeout_at` polls the
     // inner future first and delivers a past-deadline self-exit as `Ok(exit)`,
     // and under runtime starvation this task may be dispatched long after both
     // the deadline and the child's exit — so neither the timer branch nor any
     // wall clock this task samples can classify correctly on its own. Only the
     // OS runtime reveals whether the child truly outran `timeout_ms`.
     let runtime_probe = ChildRuntimeProbe::capture(child);
-    let started = Instant::now();
-    let child_outran_budget = || {
-        runtime_probe
-            .as_ref()
-            .and_then(ChildRuntimeProbe::runtime)
-            .map_or(started.elapsed() >= budget, |runtime| runtime >= budget)
+    let child_outran_budget = || -> Result<bool, ErrorData> {
+        let observed_elapsed = started.elapsed();
+        if let Some(verdict) = completed_inline_timeout_verdict(
+            runtime_probe.as_ref().and_then(ChildRuntimeProbe::runtime),
+            observed_elapsed,
+            budget,
+        ) {
+            return Ok(verdict);
+        }
+        Err(shell_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "act_run_shell child exited near/past the deadline, but this platform could not provide an exact process-runtime verdict",
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "inline_timeout_runtime_verdict_unavailable",
+                "timeout_ms": timeout_ms,
+                "observed_elapsed_ms": u64::try_from(observed_elapsed.as_millis()).unwrap_or(u64::MAX),
+                "platform": std::env::consts::OS,
+            }),
+        ))
     };
-    let wait_result = tokio::time::timeout(budget, child.wait()).await;
+    // `timeout_deadline` was armed before spawn, so scheduler starvation before
+    // this future's first poll never extends a still-live child's safety cap.
+    // A child that has already exited is classified from kernel process runtime
+    // below: completed process evidence wins over total spawn/scheduling
+    // overhead, while a still-live child is terminated at the absolute deadline.
+    let wait_result = if let Some(boundary) = boundary {
+        let mut wait = Box::pin(wait_with_inline_shell_timeout_at(
+            timeout_deadline,
+            child.wait(),
+        ));
+        loop {
+            tokio::select! {
+                result = &mut wait => break Ok(result),
+                _ = tokio::time::sleep(PHYSICAL_MUTATION_BOUNDARY_POLL_INTERVAL) => {
+                    if let Err(error) = boundary("act_run_shell_while_process_live") {
+                        break Err(error);
+                    }
+                }
+            }
+        }
+    } else {
+        Ok(wait_with_inline_shell_timeout_at(timeout_deadline, child.wait()).await)
+    };
+    let wait_result = match wait_result {
+        Ok(wait_result) => wait_result,
+        Err(error) => {
+            let cleanup = if let Some(identity) = local_process_identity {
+                let termination_identity = identity.clone();
+                let termination = tokio::task::spawn_blocking(move || {
+                    terminate_shell_job_process_tree(&termination_identity)
+                })
+                .await
+                .unwrap_or_else(|join_error| ShellJobTerminationReadback {
+                    attempted: false,
+                    status: format!("termination_task_join_failed:{join_error}"),
+                    remaining_process_ids: child.id().into_iter().collect(),
+                });
+                let reap = terminate_and_reap_tokio_child_async_bounded(
+                    child,
+                    Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+                )
+                .await;
+                let final_identity_state = local_process_identity_state(identity);
+                let cleanup_verified = termination.verified_terminal_tree()
+                    && reap.reaped
+                    && reap.poll_error_count == 0
+                    && matches!(
+                        final_identity_state,
+                        LocalProcessIdentityState::Exited
+                            | LocalProcessIdentityState::Absent
+                            | LocalProcessIdentityState::Mismatch(_)
+                    );
+                if !cleanup_verified {
+                    synapse_action::record_operator_panic_safety_incident();
+                }
+                json!({
+                    "source_of_truth": "identity-bound process tree + exact Tokio child + final process identity",
+                    "termination": termination,
+                    "reap": reap,
+                    "final_identity_state": final_identity_state,
+                    "cleanup_verified": cleanup_verified,
+                })
+            } else {
+                let reap = terminate_and_reap_tokio_child_async_bounded(
+                    child,
+                    Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+                )
+                .await;
+                let cleanup_verified = reap.reaped && reap.poll_error_count == 0;
+                if !cleanup_verified {
+                    synapse_action::record_operator_panic_safety_incident();
+                }
+                json!({
+                    "source_of_truth": "exact Tokio child",
+                    "reap": reap,
+                    "cleanup_verified": cleanup_verified,
+                })
+            };
+            return Err(physical_mutation_boundary_error(
+                error,
+                "act_run_shell_while_process_live",
+                cleanup,
+            ));
+        }
+    };
     let result = match wait_result {
         // The child exited (possibly just after a late-delivered deadline).
         // Exit-evidence wins: return its real code, and flag `timed_out` only if
         // the OS runtime confirms it actually ran past the cap.
-        Ok(Ok(status)) => (status.code(), child_outran_budget()),
+        Ok(Ok(status)) => (status.code(), child_outran_budget()?),
         Ok(Err(error)) => {
             return Err(shell_tool_error(
                 error_codes::TOOL_INTERNAL_ERROR,
@@ -11578,52 +19718,141 @@ async fn wait_shell_child(
             // evidence with a non-blocking `try_wait` so a genuine exit code is
             // never discarded in favor of a manufactured timeout verdict.
             if let Ok(Some(status)) = child.try_wait() {
-                return Ok((status.code(), child_outran_budget()));
+                return Ok((status.code(), child_outran_budget()?));
             }
-            if let Some(pid) = child.id() {
-                // Off-load the blocking process-tree termination (taskkill spawns
-                // + a std::thread::sleep exit-wait + a full-system sysinfo scan)
-                // to the blocking pool: on the async worker, concurrent inline
-                // shell timeouts starve the runtime and stall each other's
-                // timers, hanging the caller for far longer than timeout_ms
-                // (root cause of the parallel-scp hang, #1589).
-                let termination =
-                    tokio::task::spawn_blocking(move || terminate_shell_job_process_tree(pid))
+            let termination = if let (Some(pid), Some(local_process_identity)) =
+                (child.id(), local_process_identity)
+            {
+                if pid != local_process_identity.pid {
+                    ShellJobTerminationReadback {
+                        attempted: false,
+                        status: format!(
+                            "timeout_identity_pid_mismatch:child_pid={pid}:identity_pid={}",
+                            local_process_identity.pid
+                        ),
+                        remaining_process_ids: vec![pid],
+                    }
+                } else {
+                    // Keep exact-handle termination and process-table reads off
+                    // the async executor (#1589).
+                    let identity = local_process_identity.clone();
+                    tokio::task::spawn_blocking(move || terminate_shell_job_process_tree(&identity))
                         .await
                         .unwrap_or_else(|join_error| ShellJobTerminationReadback {
                             attempted: false,
                             status: format!("termination_task_join_failed:{join_error}"),
-                            remaining_process_ids: Vec::new(),
-                        });
-                tracing::warn!(
-                    code = "M4_ACT_RUN_SHELL_TIMEOUT_TREE_TERMINATED",
-                    pid,
-                    attempted = termination.attempted,
-                    status = %termination.status,
-                    remaining_process_ids = ?termination.remaining_process_ids,
-                    "act_run_shell timeout requested process-tree termination"
-                );
-            } else if let Err(error) = child.start_kill() {
-                tracing::warn!(
-                    code = "M4_ACT_RUN_SHELL_KILL_FAILED",
-                    error = %error,
-                    "act_run_shell timeout kill request failed because pid was unavailable"
-                );
-            }
-            let _status = child.wait().await.map_err(|error| {
-                shell_tool_error(
+                            remaining_process_ids: vec![pid],
+                        })
+                }
+            } else {
+                ShellJobTerminationReadback {
+                    attempted: false,
+                    status: "timeout_process_identity_unavailable".to_owned(),
+                    remaining_process_ids: Vec::new(),
+                }
+            };
+            tracing::warn!(
+                code = "M4_ACT_RUN_SHELL_TIMEOUT_TREE_TERMINATED",
+                pid = ?child.id(),
+                attempted = termination.attempted,
+                status = %termination.status,
+                remaining_process_ids = ?termination.remaining_process_ids,
+                "act_run_shell timeout requested identity-bound process-tree termination"
+            );
+            let reap = terminate_and_reap_tokio_child_async_bounded(
+                child,
+                Duration::from_millis(SHELL_CHILD_REAP_BACKSTOP_MS),
+            )
+            .await;
+            let termination_verified = termination.verified_terminal_tree();
+            if !termination_verified || !reap.reaped || reap.poll_error_count > 0 {
+                return Err(shell_tool_error(
                     error_codes::TOOL_INTERNAL_ERROR,
-                    format!("act_run_shell failed while waiting after timeout kill: {error}"),
+                    "act_run_shell timeout cleanup could not be fully verified",
                     json!({
                         "code": error_codes::TOOL_INTERNAL_ERROR,
-                        "reason": "wait_after_timeout_failed",
+                        "reason": "timeout_cleanup_unverified",
+                        "tree_termination": format!("{termination:?}"),
+                        "exact_child_reap": format!("{reap:?}"),
                     }),
-                )
-            })?;
-            (None, true)
+                ));
+            }
+            // `TerminateProcess(..., 1)` produces an exit status, but that is
+            // cleanup evidence rather than a natural command verdict. Preserve
+            // a real code only for the race where the tree was already gone
+            // before any destructive action was attempted.
+            let exit_code = if termination.attempted {
+                None
+            } else {
+                reap.exit_code
+            };
+            (exit_code, true)
         }
     };
     Ok(result)
+}
+
+#[cfg(test)]
+async fn wait_shell_child(
+    child: &mut tokio::process::Child,
+    timeout_ms: u64,
+    started: Instant,
+    timeout_deadline: tokio::time::Instant,
+) -> Result<(Option<i32>, bool), ErrorData> {
+    let identity = child
+        .id()
+        .and_then(|pid| capture_local_process_identity(pid).ok());
+    wait_shell_child_with_identity(
+        child,
+        identity.as_ref(),
+        timeout_ms,
+        started,
+        timeout_deadline,
+        None,
+    )
+    .await
+}
+
+#[cfg(windows)]
+fn shell_status_open_error_is_retryable(
+    kind: io::ErrorKind,
+    raw_os_error: Option<i32>,
+    replace_in_flight: bool,
+    destination_exists: bool,
+) -> bool {
+    // ERROR_ACCESS_DENIED = 5, ERROR_SHARING_VIOLATION = 32.
+    const TRANSIENT_OPEN_CODES: [i32; 2] = [5, 32];
+    let transient_open = raw_os_error.is_some_and(|code| TRANSIENT_OPEN_CODES.contains(&code));
+    let mid_replace = kind == io::ErrorKind::NotFound && (replace_in_flight || destination_exists);
+    transient_open || mid_replace
+}
+
+fn inline_shell_timeout_budget(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms)
+}
+
+/// Classify an already-completed child without confusing scheduler delay with
+/// process runtime. `None` is deliberate: when the kernel runtime is unavailable
+/// and the host clock is already past the budget, either verdict is possible and
+/// callers must fail loud instead of inventing `timed_out`.
+fn completed_inline_timeout_verdict(
+    kernel_runtime: Option<Duration>,
+    observed_elapsed: Duration,
+    budget: Duration,
+) -> Option<bool> {
+    kernel_runtime
+        .map(|runtime| runtime >= budget)
+        .or_else(|| (observed_elapsed < budget).then_some(false))
+}
+
+async fn wait_with_inline_shell_timeout_at<F>(
+    deadline: tokio::time::Instant,
+    future: F,
+) -> Result<F::Output, tokio::time::error::Elapsed>
+where
+    F: std::future::Future,
+{
+    tokio::time::timeout_at(deadline, future).await
 }
 
 #[derive(Debug)]

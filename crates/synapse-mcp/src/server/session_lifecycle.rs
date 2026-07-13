@@ -28,7 +28,8 @@ use crate::{
 };
 
 use super::{
-    CdpTargetOwner, SessionTarget, SharedCdpTargetOwners, SharedSessionTargets, SynapseService,
+    AuthorityFinalizerDrainFailure, AuthorityFinalizerDrainReadback, CdpTargetOwner, SessionTarget,
+    SharedCdpTargetOwners, SharedSessionTargets, SynapseService,
     session_registry::{SharedSessionRegistry, unix_time_ms_now},
     target_claims::{self, SharedTargetClaims, TargetClaimCleanupReport},
     url_redaction::redact_url_for_public_readback,
@@ -174,6 +175,7 @@ impl SessionProcessResource {
 
 #[derive(Clone)]
 pub(crate) struct SessionLifecycleState {
+    authority_service: SynapseService,
     started_at: Instant,
     action_handle: ActionHandle,
     m3_state: SharedM3State,
@@ -296,6 +298,9 @@ pub struct SessionContinuityCleanupReport {
     pub lease_row_existed_before: bool,
     pub lease_row_deleted: bool,
     pub lease_row_exists_after: bool,
+    pub profile_row_existed_before: bool,
+    pub profile_row_deleted: bool,
+    pub profile_row_exists_after: bool,
     pub failed: bool,
     pub error_message: Option<String>,
 }
@@ -731,6 +736,7 @@ impl SessionTeardownReport {
 impl SynapseService {
     pub(crate) fn session_lifecycle_state(&self) -> Result<SessionLifecycleState, ErrorData> {
         Ok(SessionLifecycleState {
+            authority_service: self.clone(),
             started_at: self.started_at,
             action_handle: self.unscoped_action_handle().map_err(|error| {
                 mcp_error(
@@ -898,6 +904,31 @@ impl SynapseService {
 }
 
 impl SessionLifecycleState {
+    pub(crate) async fn drain_authority_finalizers(
+        &self,
+    ) -> Result<AuthorityFinalizerDrainReadback, AuthorityFinalizerDrainFailure> {
+        self.authority_service.drain_authority_finalizers().await
+    }
+
+    pub(crate) fn input_owner_session_ids_for_shutdown(&self) -> Result<BTreeSet<String>, String> {
+        self.action_handle
+            .session_inputs_snapshot()
+            .map(|snapshot| {
+                snapshot
+                    .sessions
+                    .into_iter()
+                    .map(|session| session.session_id)
+                    .collect()
+            })
+            .map_err(|error| {
+                format!(
+                    "read action session-input ownership before daemon shutdown: code={} detail={}",
+                    error.code(),
+                    error.detail()
+                )
+            })
+    }
+
     pub(crate) fn is_session_terminated(&self, session_id: &str) -> bool {
         self.terminated_sessions
             .lock()
@@ -911,6 +942,27 @@ impl SessionLifecycleState {
     ) -> Result<SessionTeardownReport, ErrorData> {
         self.teardown_session_with_options(session_id, reason, SessionTeardownOptions::default())
             .await
+    }
+
+    /// Teardown entry point for a caller that already owns this session's
+    /// authority gate (for example, two-session target-claim adoption).
+    pub(crate) async fn teardown_session_authority_locked(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<SessionTeardownReport, ErrorData> {
+        let report = self
+            .teardown_session_with_options_report_authority_locked(
+                session_id,
+                reason,
+                SessionTeardownOptions::default(),
+            )
+            .await?;
+        if report.failure_count == 0 {
+            Ok(report)
+        } else {
+            Err(session_teardown_error(report))
+        }
     }
 
     pub(crate) async fn teardown_session_with_options(
@@ -930,6 +982,23 @@ impl SessionLifecycleState {
     }
 
     pub(crate) async fn teardown_session_with_options_report(
+        &self,
+        session_id: &str,
+        reason: &str,
+        options: SessionTeardownOptions,
+    ) -> Result<SessionTeardownReport, ErrorData> {
+        validate_lifecycle_session_id(session_id)?;
+        // This is the normal lifecycle authority boundary. The only prelocked
+        // path is the explicit two-session target-adoption entry point above.
+        let _authority_gate = self
+            .authority_service
+            .lock_session_authority(session_id)
+            .await?;
+        self.teardown_session_with_options_report_authority_locked(session_id, reason, options)
+            .await
+    }
+
+    async fn teardown_session_with_options_report_authority_locked(
         &self,
         session_id: &str,
         reason: &str,
@@ -990,6 +1059,25 @@ impl SessionLifecycleState {
             report.error_message = Some(error.message.to_string());
             return report;
         }
+        let _authority_gate = match self
+            .authority_service
+            .lock_session_authority(session_id)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                report.failed = true;
+                report.error_message = Some(error.message.to_string());
+                tracing::error!(
+                    code = error_codes::TOOL_INTERNAL_ERROR,
+                    session_id,
+                    reason,
+                    error = ?error,
+                    "daemon-shutdown input cleanup could not acquire the session authority gate"
+                );
+                return report;
+            }
+        };
         report.browser_continuity = self.browser_continuity_for_daemon_shutdown(session_id);
         report.process_jobs =
             self.disarm_owned_process_jobs_for_daemon_shutdown(session_id, reason);
@@ -1111,6 +1199,22 @@ impl SessionLifecycleState {
         for expired in pending {
             let Some(session_id) = expired.owner_session_id.clone() else {
                 continue;
+            };
+            let _authority_gate = match self
+                .authority_service
+                .lock_session_authority(&session_id)
+                .await
+            {
+                Ok(guard) => guard,
+                Err(error) => {
+                    tracing::error!(
+                        code = error_codes::TOOL_INTERNAL_ERROR,
+                        session_id,
+                        error = ?error,
+                        "expired-lease cleanup could not acquire the session authority gate"
+                    );
+                    continue;
+                }
             };
             let before = self.action_handle.session_inputs_snapshot();
             let before_lease = synapse_action::lease::status();
@@ -1305,15 +1409,17 @@ impl SessionLifecycleState {
         candidates
     }
 
-    pub(crate) fn live_spawned_session_ids_for_shutdown(&self) -> BTreeSet<String> {
+    pub(crate) fn live_spawned_session_ids_for_shutdown(&self) -> Result<BTreeSet<String>, String> {
         let registry_reads = match self.session_registry.lock() {
             Ok(registry) => registry.reads(unix_time_ms_now()),
             Err(_poisoned) => {
+                let detail = "session registry lock poisoned during daemon-shutdown spawned-agent liveness scan; restart handoff cannot safely classify idle-evicted spawned sessions";
                 tracing::error!(
                     code = error_codes::TOOL_INTERNAL_ERROR,
-                    "session registry lock poisoned during daemon-shutdown spawned-agent liveness scan; restart handoff cannot include idle-evicted spawned sessions this pass"
+                    detail,
+                    "daemon-shutdown spawned-agent liveness Source of Truth is unavailable"
                 );
-                Vec::new()
+                return Err(detail.to_owned());
             }
         };
         let live_spawn_sessions =
@@ -1326,7 +1432,7 @@ impl SessionLifecycleState {
                 "readback=session_registry edge=daemon_shutdown before=live_spawned_process_handoff"
             );
         }
-        live_spawn_sessions
+        Ok(live_spawn_sessions)
     }
 
     fn browser_continuity_for_daemon_shutdown(
@@ -1566,7 +1672,7 @@ impl SessionLifecycleState {
     }
 
     fn cleanup_continuity(&self, session_id: &str) -> SessionContinuityCleanupReport {
-        match super::session_continuity::delete_persisted_session_continuity_rows(
+        let mut report = match super::session_continuity::delete_persisted_session_continuity_rows(
             &self.m3_state,
             session_id,
         ) {
@@ -1577,8 +1683,7 @@ impl SessionLifecycleState {
                 lease_row_existed_before: readback.lease_row_existed_before,
                 lease_row_deleted: readback.lease_row_deleted,
                 lease_row_exists_after: readback.lease_row_exists_after,
-                failed: false,
-                error_message: None,
+                ..SessionContinuityCleanupReport::default()
             },
             Err(error) => {
                 tracing::error!(
@@ -1593,7 +1698,27 @@ impl SessionLifecycleState {
                     ..SessionContinuityCleanupReport::default()
                 }
             }
+        };
+        match self
+            .authority_service
+            .delete_tool_profile_assignment_for_terminated_session(session_id)
+        {
+            Ok((existed_before, deleted)) => {
+                report.profile_row_existed_before = existed_before;
+                report.profile_row_deleted = deleted;
+                report.profile_row_exists_after = false;
+            }
+            Err(error) => {
+                report.failed = true;
+                report.profile_row_exists_after = true;
+                let detail = error.message.to_string();
+                report.error_message = Some(match report.error_message.take() {
+                    Some(existing) => format!("{existing}; profile cleanup: {detail}"),
+                    None => detail,
+                });
+            }
         }
+        report
     }
 
     fn cleanup_audit_session(&self, session_id: &str) -> SessionAuditSessionCleanupReport {

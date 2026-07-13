@@ -2,6 +2,14 @@
 
 Issue: https://github.com/ChrisRoyse/Synapse/issues/857
 
+> **Current D1 classification (2026-07-13):** The renamed script referenced
+> below is supporting diagnostic automation only; it does not perform or accept
+> FSV. Its output was not, and is not now, sufficient by itself for acceptance.
+> The historical transcript values remain evidence from the separately observed
+> manual run. Current acceptance requires an agent to use the strict production
+> MCP client and independently read each physical Source of Truth before and
+> after every manual trigger.
+
 This transcript records the manual full-state verification for the intent
 acceptance gate. The run used a fresh physical RocksDB store behind a real
 HTTP MCP daemon, direct Streamable HTTP MCP calls, a real event subscription,
@@ -9,12 +17,12 @@ and physical store readback. The shared daemon was then rebuilt and restarted
 from this checkout to verify the same Codex session can reconnect with the
 expanded normal tool profile.
 
-## Durable Script
+## Supporting Diagnostic Script
 
-The repeatable FSV script is:
+The retained supporting diagnostic is:
 
 ```powershell
-.\scripts\fsv\issue-857-intent-acceptance.ps1 `
+.\scripts\diagnostics\issue-857-intent-diagnostic.ps1 `
   -SynapseMcpExe .\target\release\synapse-mcp.exe
 ```
 
@@ -22,7 +30,7 @@ The script starts an isolated temp daemon and DB, plants a routine library and
 live activity, verifies `intent_current`, creates a real bus subscription,
 drives `intent_detect_tick` through detected/abandoned/confirmed transitions,
 records feedback outcomes, calls `session_end`, stops the daemon, and removes
-the temp root.
+the temp root. These checks are supporting diagnostics, not FSV acceptance.
 
 ## Code Surface
 
@@ -201,7 +209,7 @@ terminal.
 ## Verification Commands
 
 - PowerShell parser check for
-  `scripts/fsv/issue-857-intent-acceptance.ps1`
+  `scripts/diagnostics/issue-857-intent-diagnostic.ps1`
 - `cargo fmt --check`
 - `git diff --check`
 - `cargo test -p synapse-mcp --bin synapse-mcp tool_profiles -- --nocapture`

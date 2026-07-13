@@ -60,6 +60,7 @@ pub struct BrowserAriaSnapshotParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Optional CDP element id to scope the ARIA snapshot to a subtree.
     #[serde(default)]
@@ -152,6 +153,7 @@ pub struct BrowserDomParams {
     /// the selected operation spec's `window_hwnd`; a conflicting nested value
     /// fails closed. Defaults to the nested spec / session target window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// `operation=content`: serialized document HTML readback.
     #[serde(default)]
@@ -300,6 +302,7 @@ pub struct BrowserAssertParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     pub locator: BrowserAssertLocator,
     pub matcher: BrowserAssertMatcher,

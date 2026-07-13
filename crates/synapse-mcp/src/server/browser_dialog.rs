@@ -53,6 +53,7 @@ pub struct BrowserHandleDialogParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Operation to run. Defaults to status/readback.
     #[serde(default)]
@@ -220,6 +221,11 @@ impl SynapseService {
         cdp_target_id: &str,
         dialog: &NormalizedBrowserHandleDialogParams,
     ) -> Result<BrowserHandleDialogResponse, ErrorData> {
+        // `status` arms the persistent dialog listener with a default policy,
+        // so every operation is mutation-capable at this choke point.
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_handle_dialog_before_mutation",
+        )?;
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if cdp_target_id.starts_with("chrome-tab:") {
                 let operation = browser_dialog_operation_name(dialog.operation);
@@ -245,6 +251,9 @@ impl SynapseService {
                         ),
                     )
                 })?;
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_handle_dialog_after_bridge_mutation",
+                )?;
                 let endpoint = result
                     .extension_id
                     .as_deref()
@@ -334,6 +343,9 @@ impl SynapseService {
                 )
             }
         };
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_handle_dialog_after_raw_mutation",
+        )?;
         let read = synapse_a11y::dialog_capture_read(cdp_target_id, &read_filter);
         tracing::info!(
             code = "CDP_BACKGROUND_DIALOG_READBACK",

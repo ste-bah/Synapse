@@ -71,6 +71,7 @@ pub struct BrowserFileUploadParams {
     /// Browser HWND owning the target. Required only with an explicit target and
     /// no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Return only chooser records with `seq >= since_seq`.
     #[serde(default)]
@@ -266,6 +267,11 @@ impl SynapseService {
             ));
         }
         let operation = browser_file_upload_operation_name(upload.operation);
+        if upload.operation != BrowserFileUploadOperation::ReadChooser {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_file_upload_before_bridge_mutation",
+            )?;
+        }
         let result = crate::chrome_debugger_bridge::file_upload(
             crate::chrome_debugger_bridge::ChromeDebuggerFileUploadRequest {
                 hwnd: window_hwnd,
@@ -289,6 +295,11 @@ impl SynapseService {
                 ),
             )
         })?;
+        if upload.operation != BrowserFileUploadOperation::ReadChooser {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_file_upload_after_bridge_mutation",
+            )?;
+        }
         let endpoint = result
             .extension_id
             .as_deref()

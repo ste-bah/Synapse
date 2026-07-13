@@ -2,7 +2,10 @@
 
 use super::*;
 use rmcp::schemars::schema_for;
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, num::NonZeroUsize, path::Path};
+use tokio_util::sync::CancellationToken;
+
+use crate::{m2::M2ServiceConfig, m3::M3ServiceConfig, m4::M4ServiceConfig};
 
 fn read_action() -> TargetActParams {
     serde_json::from_value(json!({ "verb": "read" }))
@@ -24,6 +27,36 @@ fn act_error_u64(error: &ErrorData, field: &str) -> Option<u64> {
         .as_ref()
         .and_then(|data| data.get(field))
         .and_then(Value::as_u64)
+}
+
+#[test]
+fn stdio_act_invoke_owns_a_panic_authority_label_without_relaxing_raw_target_act() {
+    assert_eq!(act_operator_panic_authority_label(None), "stdio:act:invoke");
+    assert_eq!(
+        act_operator_panic_authority_label(Some("http-session-7")),
+        "http-session-7"
+    );
+}
+
+fn complete_test_operator_panic(token: synapse_action::OperatorPanicSafetyToken, reason: &str) {
+    let synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) =
+        synapse_action::complete_operator_panic_safety_generation(token)
+            .unwrap_or_else(|detail| panic!("complete test operator panic: {detail}"))
+    else {
+        panic!("isolated test panic must own its exact finalization");
+    };
+    let generation = finalization.generation();
+    let _cleared =
+        synapse_action::force_clear_operator_panic_input_lease_generation(generation, reason);
+    let lease_after = synapse_action::lease::status();
+    assert!(
+        !lease_after.held,
+        "exact test panic lease must be unheld after finalizer clear: {lease_after:?}"
+    );
+    assert!(synapse_action::finish_operator_panic_safety_finalization(
+        finalization,
+        true
+    ));
 }
 
 fn synthetic_foreground_context() -> synapse_core::ForegroundContext {
@@ -75,6 +108,111 @@ fn schema_property_names(schema: &Value) -> BTreeSet<String> {
         .keys()
         .cloned()
         .collect()
+}
+
+fn foreground_guard_test_service(path: &Path) -> SynapseService {
+    SynapseService::try_with_m2_shutdown_reason_and_m3_config(
+        CancellationToken::new(),
+        "act_foreground_authority_guard_test",
+        CancellationToken::new(),
+        &M2ServiceConfig::default(),
+        M3ServiceConfig::from_cli_parts(
+            Some(path.join("db")),
+            Some(path.to_path_buf()),
+            false,
+            "127.0.0.1:0".to_owned(),
+            NonZeroUsize::new(4).unwrap_or_else(|| panic!("four is nonzero")),
+            false,
+            true,
+            None,
+            false,
+            None,
+        ),
+        M4ServiceConfig::default(),
+    )
+    .unwrap_or_else(|error| panic!("construct authority-guard service: {error:#}"))
+}
+
+fn foreground_guard_with_new_authority(
+    service: &SynapseService,
+    session_id: &str,
+) -> ActForegroundAuthorityGuard {
+    let profile_before = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("snapshot initial profile: {error:?}"));
+    let mut guard = ActForegroundAuthorityGuard::new(
+        service,
+        session_id,
+        &profile_before,
+        synapse_action::lease::status().owner_session_id,
+        synapse_action::operator_panic_epoch(),
+    )
+    .unwrap_or_else(|error| panic!("arm authority guard: {error:?}"));
+    let lease_status = match synapse_action::lease::try_acquire(
+        session_id,
+        synapse_action::lease::ttl_from_ms(30_000),
+    ) {
+        synapse_action::LeaseOutcome::Acquired(status) => status,
+        outcome => panic!("fresh authority-guard lease must acquire: {outcome:?}"),
+    };
+    guard.acquire_outcome_was_new = true;
+    service
+        .persist_session_lease(session_id, &lease_status)
+        .unwrap_or_else(|error| panic!("persist guard lease: {error:?}"));
+    service
+        .write_tool_profile_assignment(
+            session_id,
+            crate::server::tool_profiles::ToolProfileKind::BreakGlass,
+            "forced_guard_elevation",
+            Some("exercise drop cleanup".to_owned()),
+            Some(session_id.to_owned()),
+        )
+        .unwrap_or_else(|error| panic!("persist elevated profile: {error:?}"));
+    guard
+}
+
+fn assert_foreground_guard_restored_new_authority(
+    service: &SynapseService,
+    session_id: &str,
+    expected_profile_value_sha256: &str,
+) {
+    let profile_after = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("read profile after guard cleanup: {error:?}"));
+    assert_eq!(
+        profile_after.profile,
+        crate::server::tool_profiles::ToolProfileKind::NormalAgent
+    );
+    assert_ne!(
+        profile_after
+            .policy_row
+            .as_ref()
+            .map(|row| row.record.source.as_str()),
+        Some("forced_guard_elevation")
+    );
+    assert_eq!(
+        profile_after
+            .policy_row
+            .as_ref()
+            .map(|row| row.value_sha256.as_str()),
+        Some(expected_profile_value_sha256),
+        "drop cleanup must restore the byte-exact pre-call profile assignment"
+    );
+    let lease_after = synapse_action::lease::status();
+    assert_ne!(
+        lease_after.owner_session_id.as_deref(),
+        Some(session_id),
+        "drop cleanup must revoke the newly acquired process-global lease"
+    );
+    let persisted_after = crate::server::session_continuity::snapshot_persisted_session_lease_row(
+        &service.m3_state_handle(),
+        session_id,
+    )
+    .unwrap_or_else(|error| panic!("read persisted lease after guard cleanup: {error}"));
+    assert!(
+        !persisted_after.row_exists(),
+        "drop cleanup must restore the absent pre-call durable lease row"
+    );
 }
 
 #[test]
@@ -176,6 +314,1259 @@ fn act_facade_foreground_rejects_out_of_range_ttl() {
         act_error_u64(&error, "max_ttl_ms"),
         Some(synapse_action::MAX_LEASE_TTL_MS)
     );
+}
+
+#[test]
+fn act_foreground_cleanup_postconditions_require_separate_profile_and_lease_truth() {
+    use crate::server::tool_profiles::ToolProfileKind;
+
+    let session_id = "session-cleanup-1379";
+    assert_eq!(
+        act_foreground_cleanup_postconditions(
+            session_id,
+            ToolProfileKind::NormalAgent,
+            true,
+            None,
+            Some(ToolProfileKind::NormalAgent),
+            true,
+            None,
+        ),
+        (true, true),
+        "restored profile plus no owned lease is the verified cleanup state"
+    );
+    assert_eq!(
+        act_foreground_cleanup_postconditions(
+            session_id,
+            ToolProfileKind::NormalAgent,
+            true,
+            None,
+            Some(ToolProfileKind::BreakGlass),
+            true,
+            None,
+        ),
+        (false, true),
+        "a released lease cannot hide a still-elevated profile"
+    );
+    assert_eq!(
+        act_foreground_cleanup_postconditions(
+            session_id,
+            ToolProfileKind::NormalAgent,
+            true,
+            None,
+            Some(ToolProfileKind::NormalAgent),
+            true,
+            Some(session_id),
+        ),
+        (true, false),
+        "a restored profile cannot hide a lease still owned by this session"
+    );
+    assert_eq!(
+        act_foreground_cleanup_postconditions(
+            session_id,
+            ToolProfileKind::NormalAgent,
+            true,
+            None,
+            None,
+            false,
+            None,
+        ),
+        (false, false),
+        "missing readbacks fail closed"
+    );
+    assert_eq!(
+        act_foreground_cleanup_postconditions(
+            session_id,
+            ToolProfileKind::BreakGlass,
+            false,
+            Some(session_id),
+            Some(ToolProfileKind::BreakGlass),
+            true,
+            Some(session_id),
+        ),
+        (true, true),
+        "the facade must preserve a lease the caller already held"
+    );
+    assert_eq!(
+        act_foreground_cleanup_postconditions(
+            session_id,
+            ToolProfileKind::BreakGlass,
+            false,
+            Some(session_id),
+            Some(ToolProfileKind::BreakGlass),
+            true,
+            None,
+        ),
+        (true, false),
+        "losing a caller-owned renewed lease must fail the ordinary completion verdict"
+    );
+}
+
+#[test]
+fn act_foreground_cleanup_diagnostics_preserve_delegated_action_error() {
+    let action_error = ErrorData::new(
+        ErrorCode(-32099),
+        "known delegated action failure",
+        Some(json!({
+            "code": error_codes::ACTION_POSTCONDITION_FAILED,
+            "expected": "foreground_hwnd=42",
+            "actual": "foreground_hwnd=7",
+        })),
+    );
+    let action_result: Result<Json<TargetActResponse>, ErrorData> = Err(action_error);
+
+    let diagnostics = act_foreground_action_diagnostics(Some(&action_result));
+
+    assert_eq!(diagnostics["status"], "error");
+    assert_eq!(
+        diagnostics["error"]["code"],
+        error_codes::ACTION_POSTCONDITION_FAILED
+    );
+    assert_eq!(
+        diagnostics["error"]["message"],
+        "known delegated action failure"
+    );
+    assert_eq!(
+        diagnostics["error"]["data"]["expected"],
+        "foreground_hwnd=42"
+    );
+    assert_eq!(diagnostics["error"]["data"]["actual"], "foreground_hwnd=7");
+}
+
+#[test]
+fn act_foreground_authority_guard_drop_is_storage_free_and_fail_closed() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_guard_panic_epoch_serial");
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create authority-guard tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-panic-1621";
+    let guard = foreground_guard_with_new_authority(&service, session_id);
+    let prior_profile = guard.prior_profile.clone();
+
+    drop(guard);
+
+    let drain = service.drain_state_handle().snapshot();
+    assert!(drain.draining, "an armed guard Drop must drain fail-closed");
+    assert_eq!(
+        drain.source,
+        Some("act_foreground_guard_dropped_outside_supervised_cleanup")
+    );
+    let profile_after = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("read profile after invariant Drop: {error:?}"));
+    assert_eq!(
+        profile_after.profile,
+        crate::server::tool_profiles::ToolProfileKind::BreakGlass,
+        "Drop must not perform RocksDB/profile restoration"
+    );
+    let persisted_after = crate::server::session_continuity::snapshot_persisted_session_lease_row(
+        &service.m3_state_handle(),
+        session_id,
+    )
+    .unwrap_or_else(|error| panic!("read persisted row after invariant Drop: {error}"));
+    assert!(
+        persisted_after.row_exists(),
+        "Drop must not mutate the persisted continuity row"
+    );
+    assert_eq!(
+        synapse_action::lease::status().owner_session_id.as_deref(),
+        Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID),
+        "Drop must leave bounded in-memory operator preemption visible"
+    );
+
+    let _ = synapse_action::force_clear_input_lease("guard_drop_invariant_test_cleanup");
+    service
+        .delete_persisted_session_lease(session_id)
+        .unwrap_or_else(|error| panic!("delete invariant-test lease row: {error:?}"));
+    service
+        .restore_tool_profile_assignment_exact(&prior_profile)
+        .unwrap_or_else(|error| panic!("restore invariant-test profile row: {error:?}"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tracked_authority_transaction_completes_cleanup_after_caller_cancellation() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_guard_cancel_epoch_serial");
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create authority-guard tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-cancel-1621";
+    let worker_service = service.clone();
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let task = service
+        .spawn_cooperative_authority_transaction(move |_cancellation| async move {
+            let _authority_gate = worker_service
+                .lock_session_authority(session_id)
+                .await
+                .unwrap_or_else(|error| panic!("lock tracked authority transaction: {error:?}"));
+            let mut guard = foreground_guard_with_new_authority(&worker_service, session_id);
+            let expected_profile_value_sha256 = guard.prior_profile_value_sha256.clone();
+            let _ = armed_tx.send(expected_profile_value_sha256);
+            finish_rx
+                .await
+                .unwrap_or_else(|error| panic!("finish tracked transaction: {error}"));
+            let cleanup = guard.cleanup_with_bounded_retries("caller_cancelled_join_handle");
+            assert!(
+                cleanup.is_some_and(|readback| readback.cleanup_ok),
+                "tracked cleanup must prove its physical postconditions"
+            );
+        })
+        .unwrap_or_else(|error| panic!("spawn tracked authority transaction: {error:?}"));
+    let expected_profile_value_sha256 = armed_rx
+        .await
+        .unwrap_or_else(|error| panic!("guard task dropped before arming: {error}"));
+
+    drop(task);
+    finish_tx
+        .send(())
+        .unwrap_or_else(|()| panic!("detached transaction receiver disappeared"));
+    service
+        .drain_authority_finalizers()
+        .await
+        .unwrap_or_else(|error| panic!("drain detached authority transaction: {error}"));
+    assert_foreground_guard_restored_new_authority(
+        &service,
+        session_id,
+        &expected_profile_value_sha256,
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn detached_tracked_act_transaction_writes_durable_final_audit() {
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create detached-audit tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let worker_service = service.clone();
+    let session_id = "act-detached-audit-1621";
+    let (intent_tx, intent_rx) = tokio::sync::oneshot::channel();
+    let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+    let task = service
+        .spawn_cooperative_authority_transaction(move |_cancellation| async move {
+            let _authority_gate = worker_service
+                .lock_session_authority(session_id)
+                .await
+                .unwrap_or_else(|error| panic!("lock detached audit transaction: {error:?}"));
+            let mut audit = ActCommandAuditGuard::begin(
+                &worker_service,
+                "lease_status",
+                Some(session_id.to_owned()),
+                json!({ "operation": "lease_status" }),
+                json!({ "source_of_truth": "synthetic_before" }),
+            )
+            .unwrap_or_else(|error| panic!("write detached audit intent: {error:?}"));
+            let _ = intent_tx.send(());
+            finish_rx
+                .await
+                .unwrap_or_else(|error| panic!("finish detached audit transaction: {error}"));
+            audit
+                .finalize(
+                    json!({
+                        "source_of_truth": "synthetic_after",
+                        "actual": 4,
+                        "expected": 4,
+                    }),
+                    "ok",
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("write detached audit final: {error:?}"));
+        })
+        .unwrap_or_else(|error| panic!("spawn detached audit transaction: {error:?}"));
+    intent_rx
+        .await
+        .unwrap_or_else(|error| panic!("detached transaction did not write intent: {error}"));
+
+    drop(task);
+    finish_tx
+        .send(())
+        .unwrap_or_else(|()| panic!("detached audit receiver disappeared"));
+    service
+        .drain_authority_finalizers()
+        .await
+        .unwrap_or_else(|error| panic!("drain detached audit transaction: {error}"));
+
+    let audit = service
+        .command_audit_snapshot()
+        .unwrap_or_else(|error| panic!("read CF_ACTION_LOG command audit: {error:?}"));
+    let rows = audit
+        .rows
+        .iter()
+        .filter(|row| {
+            row.tool == "act"
+                && row.verb == "lease_status"
+                && row.actor_session_id.as_deref() == Some(session_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "intent and final rows must both persist");
+    assert!(rows.iter().any(|row| row.phase == "intent"));
+    let final_row = rows
+        .iter()
+        .find(|row| row.phase == "final")
+        .unwrap_or_else(|| panic!("detached transaction final row missing"));
+    assert_eq!(final_row.outcome, "ok");
+    assert_eq!(
+        final_row.after.as_ref().map(|after| &after["actual"]),
+        Some(&json!(4))
+    );
+}
+
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shutdown_cancellation_runs_real_foreground_cleanup_before_final_command_audit() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_shutdown_cancel_epoch_serial");
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create shutdown-cancel tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let worker_service = service.clone();
+    let session_id = "act-foreground-shutdown-cancel-1631";
+    let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+    let (boundary_finish_tx, boundary_finish_rx) = tokio::sync::oneshot::channel();
+    let terminal_steps = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let worker_steps = std::sync::Arc::clone(&terminal_steps);
+    let caller = service
+        .spawn_cooperative_authority_transaction(move |cancellation| async move {
+            let _authority_gate = worker_service
+                .lock_session_authority(session_id)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("lock shutdown-cancel authority transaction: {error:?}")
+                });
+            let mut audit = ActCommandAuditGuard::begin(
+                &worker_service,
+                "foreground",
+                Some(session_id.to_owned()),
+                json!({ "operation": "foreground" }),
+                json!({ "source_of_truth": ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH }),
+            )
+            .unwrap_or_else(|error| panic!("write shutdown-cancel audit intent: {error:?}"));
+            let mut guard = foreground_guard_with_new_authority(&worker_service, session_id);
+            let expected_profile_value_sha256 = guard.prior_profile_value_sha256.clone();
+            let _ = armed_tx.send((expected_profile_value_sha256, cancellation.clone()));
+
+            // Model an already-polled profile/action boundary. Shutdown may
+            // signal while it is pending, but the exact owner must await its
+            // terminal result before touching profile/lease cleanup.
+            boundary_finish_rx
+                .await
+                .unwrap_or_else(|error| panic!("finish in-flight authority boundary: {error}"));
+            worker_steps
+                .lock()
+                .expect("record authority-boundary completion")
+                .push("boundary_completed");
+            assert!(
+                cancellation.is_cancelled(),
+                "shutdown signal must remain visible after the boundary completes"
+            );
+            let cancellation_error = cleanup_act_foreground_after_shutdown_cancellation(
+                &mut guard,
+                session_id,
+                "causal_shutdown_test",
+                None,
+            );
+            worker_steps
+                .lock()
+                .expect("record physical cleanup completion")
+                .push("cleanup_completed");
+            audit
+                .finalize(
+                    act_command_audit_error_after(ActOperation::Foreground),
+                    "error",
+                    Some(&cancellation_error),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("write shutdown-cancel terminal command audit: {error:?}")
+                });
+            worker_steps
+                .lock()
+                .expect("record terminal audit completion")
+                .push("audit_completed");
+        })
+        .unwrap_or_else(|error| panic!("spawn shutdown-cancel authority owner: {error:?}"));
+    let (expected_profile_value_sha256, cancellation) = armed_rx
+        .await
+        .unwrap_or_else(|error| panic!("shutdown-cancel authority owner did not arm: {error}"));
+
+    drop(caller);
+    let drain_service = service.clone();
+    let drain = tokio::spawn(async move { drain_service.drain_authority_finalizers().await });
+    cancellation.cancelled().await;
+
+    let profile_while_boundary_in_flight = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("read in-flight profile SoT: {error:?}"));
+    assert_eq!(
+        profile_while_boundary_in_flight.profile,
+        crate::server::tool_profiles::ToolProfileKind::BreakGlass,
+        "cancellation must not drop the boundary future and run cleanup early"
+    );
+    assert_eq!(
+        synapse_action::lease::status().owner_session_id.as_deref(),
+        Some(session_id),
+        "the exact owner must retain its lease until the boundary completes"
+    );
+    let persisted_while_boundary_in_flight =
+        crate::server::session_continuity::snapshot_persisted_session_lease_row(
+            &service.m3_state_handle(),
+            session_id,
+        )
+        .unwrap_or_else(|error| panic!("read in-flight persisted lease SoT: {error}"));
+    assert!(persisted_while_boundary_in_flight.row_exists());
+    let audit_while_boundary_in_flight = service
+        .command_audit_snapshot()
+        .unwrap_or_else(|error| panic!("read in-flight command audit: {error:?}"));
+    let in_flight_rows = audit_while_boundary_in_flight
+        .rows
+        .iter()
+        .filter(|row| {
+            row.tool == "act"
+                && row.verb == "foreground"
+                && row.actor_session_id.as_deref() == Some(session_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(in_flight_rows.len(), 1);
+    assert_eq!(in_flight_rows[0].phase, "intent");
+    assert!(
+        terminal_steps
+            .lock()
+            .expect("read in-flight authority-step ledger")
+            .is_empty(),
+        "the in-flight boundary must precede cleanup and final audit"
+    );
+
+    boundary_finish_tx
+        .send(())
+        .unwrap_or_else(|()| panic!("in-flight authority boundary owner disappeared"));
+    let drain = drain
+        .await
+        .unwrap_or_else(|error| panic!("join shutdown-cancel drain: {error}"))
+        .unwrap_or_else(|error| panic!("drain shutdown-cancel authority owner: {error}"));
+
+    assert_eq!(drain.registered_tasks_before, 1);
+    assert_eq!(drain.cancellation_signals_sent, 1);
+    assert_eq!(drain.abort_requests_sent, 0);
+    assert!(drain.safe_to_unlock());
+    assert_eq!(
+        *terminal_steps
+            .lock()
+            .expect("read terminal authority-step ledger"),
+        ["boundary_completed", "cleanup_completed", "audit_completed"],
+        "the in-flight boundary must finish before cleanup, and cleanup before final audit"
+    );
+    assert_foreground_guard_restored_new_authority(
+        &service,
+        session_id,
+        &expected_profile_value_sha256,
+    );
+    let audit = service
+        .command_audit_snapshot()
+        .unwrap_or_else(|error| panic!("read shutdown-cancel command audit: {error:?}"));
+    let rows = audit
+        .rows
+        .iter()
+        .filter(|row| {
+            row.tool == "act"
+                && row.verb == "foreground"
+                && row.actor_session_id.as_deref() == Some(session_id)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 2, "intent and terminal rows must both persist");
+    assert!(rows.iter().any(|row| row.phase == "intent"));
+    let final_row = rows
+        .iter()
+        .find(|row| row.phase == "final")
+        .unwrap_or_else(|| panic!("shutdown-cancel final command audit missing"));
+    assert_eq!(final_row.outcome, "error");
+    assert_eq!(
+        final_row.error_code.as_deref(),
+        Some(error_codes::DAEMON_RESTARTING)
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn same_session_authority_gate_serializes_without_wall_clock_assumptions() {
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create authority-gate tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "authority-gate-same-session-1379";
+    let first = service
+        .lock_session_authority(session_id)
+        .await
+        .unwrap_or_else(|error| panic!("lock first authority transaction: {error:?}"));
+    let worker_service = service.clone();
+    let (attempted_tx, attempted_rx) = tokio::sync::oneshot::channel();
+    let (acquired_tx, mut acquired_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        let _second = worker_service
+            .lock_session_authority_after_resolve(session_id, || {
+                let _ = attempted_tx.send(());
+            })
+            .await
+            .unwrap_or_else(|error| panic!("lock second authority transaction: {error:?}"));
+        let _ = acquired_tx.send(());
+    });
+    attempted_rx
+        .await
+        .unwrap_or_else(|error| panic!("second authority transaction never attempted: {error}"));
+    tokio::task::yield_now().await;
+    assert!(
+        matches!(
+            acquired_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "second same-session transaction must remain queued while the first gate is held"
+    );
+
+    drop(first);
+    acquired_rx.await.unwrap_or_else(|error| {
+        panic!("second transaction did not acquire after release: {error}")
+    });
+    waiter
+        .await
+        .unwrap_or_else(|error| panic!("join authority-gate waiter: {error}"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn same_session_act_invoke_cannot_observe_foreground_temporary_authority() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_invoke_foreground_authority_epoch_serial");
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create invoke-authority tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "act-invoke-foreground-authority-1379";
+    let foreground_gate = service
+        .lock_session_authority(session_id)
+        .await
+        .unwrap_or_else(|error| panic!("lock foreground authority transaction: {error:?}"));
+    let mut foreground_guard = foreground_guard_with_new_authority(&service, session_id);
+    let expected_profile_value_sha256 = foreground_guard.prior_profile_value_sha256.clone();
+
+    let temporary_profile = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("read temporary foreground profile: {error:?}"));
+    assert_eq!(
+        temporary_profile.profile,
+        crate::server::tool_profiles::ToolProfileKind::BreakGlass
+    );
+    assert_eq!(
+        synapse_action::lease::status().owner_session_id.as_deref(),
+        Some(session_id)
+    );
+    let temporary_persisted =
+        crate::server::session_continuity::snapshot_persisted_session_lease_row(
+            &service.m3_state_handle(),
+            session_id,
+        )
+        .unwrap_or_else(|error| panic!("read temporary persisted lease row: {error}"));
+    assert!(temporary_persisted.row_exists());
+
+    let worker_service = service.clone();
+    let (attempted_tx, attempted_rx) = tokio::sync::oneshot::channel();
+    let (evaluated_tx, mut evaluated_rx) = tokio::sync::oneshot::channel();
+    let invoke = tokio::spawn(async move {
+        let _invoke_gate = worker_service
+            .lock_act_authority_after_resolve(ActOperation::Invoke, Some(session_id), || {
+                let _ = attempted_tx.send(());
+            })
+            .await
+            .unwrap_or_else(|error| panic!("admit same-session act invoke: {error:?}"));
+        let profile = worker_service
+            .tool_profile_snapshot(Some(session_id))
+            .unwrap_or_else(|error| panic!("invoke profile evaluation: {error:?}"));
+        let lease_owner = synapse_action::lease::status().owner_session_id;
+        let persisted = crate::server::session_continuity::snapshot_persisted_session_lease_row(
+            &worker_service.m3_state_handle(),
+            session_id,
+        )
+        .unwrap_or_else(|error| panic!("invoke persisted-row evaluation: {error}"));
+        let _ = evaluated_tx.send((
+            profile.profile,
+            profile
+                .policy_row
+                .map(|row| row.value_sha256)
+                .unwrap_or_default(),
+            lease_owner,
+            persisted.row_exists(),
+        ));
+    });
+    attempted_rx
+        .await
+        .unwrap_or_else(|error| panic!("same-session invoke never reached admission: {error}"));
+    assert!(
+        matches!(
+            evaluated_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "invoke must not evaluate profile, lease, target, or claim authority while foreground owns the keyed gate"
+    );
+
+    let cleanup = foreground_guard.cleanup_with_bounded_retries("invoke_waits_for_cleanup");
+    assert!(
+        cleanup.is_some_and(|readback| readback.cleanup_ok),
+        "foreground cleanup must prove exact restoration before invoke admission"
+    );
+    assert_foreground_guard_restored_new_authority(
+        &service,
+        session_id,
+        &expected_profile_value_sha256,
+    );
+    drop(foreground_gate);
+
+    let (profile, profile_value_sha256, lease_owner, persisted_row_exists) = evaluated_rx
+        .await
+        .unwrap_or_else(|error| panic!("invoke did not evaluate restored authority: {error}"));
+    assert_eq!(
+        profile,
+        crate::server::tool_profiles::ToolProfileKind::NormalAgent
+    );
+    assert_eq!(profile_value_sha256, expected_profile_value_sha256);
+    assert_ne!(lease_owner.as_deref(), Some(session_id));
+    assert!(!persisted_row_exists);
+    invoke
+        .await
+        .unwrap_or_else(|error| panic!("join same-session invoke waiter: {error}"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn same_session_target_mutation_waits_for_authority_transaction() {
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create target-authority tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "target-mutation-authority-1379";
+    let target = SessionTarget::Window { hwnd: 0x2468 };
+    let authority_gate = service
+        .lock_session_authority(session_id)
+        .await
+        .unwrap_or_else(|error| panic!("lock target authority transaction: {error:?}"));
+    service
+        .set_session_target_authority_locked(session_id, target.clone())
+        .unwrap_or_else(|error| panic!("set synthetic target SoT: {error:?}"));
+
+    let worker_service = service.clone();
+    let (attempted_tx, attempted_rx) = tokio::sync::oneshot::channel();
+    let (mutated_tx, mut mutated_rx) = tokio::sync::oneshot::channel();
+    let mutation = tokio::spawn(async move {
+        let _mutation_gate = worker_service
+            .lock_session_authority_for_tool_after_resolve("clear_target", session_id, || {
+                let _ = attempted_tx.send(());
+            })
+            .await
+            .unwrap_or_else(|error| panic!("admit clear_target mutation: {error:?}"));
+        let previous = worker_service
+            .clear_session_target_authority_locked(session_id)
+            .unwrap_or_else(|error| panic!("clear target SoT: {error:?}"));
+        let after = worker_service
+            .session_target(Some(session_id))
+            .unwrap_or_else(|error| panic!("read target SoT after clear: {error:?}"));
+        let _ = mutated_tx.send((previous, after));
+    });
+    attempted_rx
+        .await
+        .unwrap_or_else(|error| panic!("target mutation never reached admission: {error}"));
+    assert!(
+        matches!(
+            mutated_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "target mutation must remain queued while the same authority domain is owned"
+    );
+    assert_eq!(
+        service
+            .session_target(Some(session_id))
+            .unwrap_or_else(|error| panic!("read target SoT while mutation queued: {error:?}")),
+        Some(target.clone()),
+        "queued mutation must not alter the target Source of Truth"
+    );
+
+    drop(authority_gate);
+    let (previous, after) = mutated_rx
+        .await
+        .unwrap_or_else(|error| panic!("target mutation did not complete: {error}"));
+    assert!(previous.is_some());
+    assert!(after.is_none());
+    mutation
+        .await
+        .unwrap_or_else(|error| panic!("join target mutation waiter: {error}"));
+}
+
+#[test]
+fn act_foreground_authority_guard_retries_real_cleanup_after_mid_cleanup_panic() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_guard_cleanup_panic_epoch_serial");
+    let temp =
+        tempfile::tempdir().unwrap_or_else(|error| panic!("create cleanup-panic tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-cleanup-panic-1621";
+    let mut guard = foreground_guard_with_new_authority(&service, session_id);
+    let expected_profile_value_sha256 = guard.prior_profile_value_sha256.clone();
+    guard.cleanup_panics_remaining = 1;
+
+    let cleanup = guard.cleanup_with_bounded_retries("injected_mid_cleanup_panic");
+    assert!(
+        cleanup.is_some_and(|readback| readback.cleanup_ok),
+        "bounded supervised cleanup must retry and prove restoration"
+    );
+    assert_foreground_guard_restored_new_authority(
+        &service,
+        session_id,
+        &expected_profile_value_sha256,
+    );
+}
+
+#[test]
+fn act_foreground_authority_guard_preserves_real_preexisting_renewed_lease() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_guard_renew_epoch_serial");
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create authority-guard tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-renewed-1621";
+    let profile_before = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("snapshot initial profile: {error:?}"));
+    let acquired = match synapse_action::lease::try_acquire(
+        session_id,
+        synapse_action::lease::ttl_from_ms(5_000),
+    ) {
+        synapse_action::LeaseOutcome::Acquired(status) => status,
+        outcome => panic!("preexisting lease must acquire: {outcome:?}"),
+    };
+    service
+        .persist_session_lease(session_id, &acquired)
+        .unwrap_or_else(|error| panic!("persist preexisting lease: {error:?}"));
+    let mut guard = ActForegroundAuthorityGuard::new(
+        &service,
+        session_id,
+        &profile_before,
+        Some(session_id.to_owned()),
+        synapse_action::operator_panic_epoch(),
+    )
+    .unwrap_or_else(|error| panic!("arm preexisting-lease guard: {error:?}"));
+    let renewed = match synapse_action::lease::try_acquire(
+        session_id,
+        synapse_action::lease::ttl_from_ms(30_000),
+    ) {
+        synapse_action::LeaseOutcome::Renewed(status) => status,
+        outcome => panic!("preexisting lease must renew: {outcome:?}"),
+    };
+    service
+        .persist_session_lease(session_id, &renewed)
+        .unwrap_or_else(|error| panic!("persist renewed lease: {error:?}"));
+    guard
+        .snapshot_expected_retained_persisted_lease_after_renewal()
+        .unwrap_or_else(|error| panic!("snapshot exact renewed lease row: {error}"));
+    let expected_renewed_row = guard.expected_retained_persisted_lease.clone();
+    service
+        .write_tool_profile_assignment(
+            session_id,
+            crate::server::tool_profiles::ToolProfileKind::BreakGlass,
+            "forced_guard_elevation",
+            Some("preserve caller lease".to_owned()),
+            Some(session_id.to_owned()),
+        )
+        .unwrap_or_else(|error| panic!("persist elevated profile: {error:?}"));
+
+    let cleanup = guard.cleanup_with_bounded_retries("preserve_preexisting_renewed_lease");
+    assert!(
+        cleanup.is_some_and(|readback| readback.cleanup_ok),
+        "supervised cleanup must prove the renewed caller lease was preserved"
+    );
+
+    let profile_after = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("read restored profile: {error:?}"));
+    assert_eq!(
+        profile_after.profile,
+        crate::server::tool_profiles::ToolProfileKind::NormalAgent
+    );
+    assert_eq!(
+        synapse_action::lease::status().owner_session_id.as_deref(),
+        Some(session_id),
+        "drop cleanup must not release a caller-owned renewed lease"
+    );
+    let persisted_after = crate::server::session_continuity::snapshot_persisted_session_lease_row(
+        &service.m3_state_handle(),
+        session_id,
+    )
+    .unwrap_or_else(|error| panic!("read renewed persisted lease: {error}"));
+    assert_eq!(
+        persisted_after, expected_renewed_row,
+        "renewed caller-owned lease must keep its exact continuity bytes"
+    );
+
+    assert!(synapse_action::lease::release_if_owner(session_id));
+    service
+        .delete_persisted_session_lease(session_id)
+        .unwrap_or_else(|error| panic!("clean up preexisting lease row: {error:?}"));
+}
+
+#[test]
+fn act_foreground_authority_guard_rejects_present_but_mismatched_renewed_lease_row() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_guard_mismatched_renew_epoch_serial");
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create mismatched-renew tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-mismatched-renewed-1621";
+    let profile_before = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("snapshot initial profile: {error:?}"));
+    let acquired = match synapse_action::lease::try_acquire(
+        session_id,
+        synapse_action::lease::ttl_from_ms(5_000),
+    ) {
+        synapse_action::LeaseOutcome::Acquired(status) => status,
+        outcome => panic!("preexisting lease must acquire: {outcome:?}"),
+    };
+    service
+        .persist_session_lease(session_id, &acquired)
+        .unwrap_or_else(|error| panic!("persist preexisting lease: {error:?}"));
+    let mut guard = ActForegroundAuthorityGuard::new(
+        &service,
+        session_id,
+        &profile_before,
+        Some(session_id.to_owned()),
+        synapse_action::operator_panic_epoch(),
+    )
+    .unwrap_or_else(|error| panic!("arm preexisting-lease guard: {error:?}"));
+    let renewed = match synapse_action::lease::try_acquire(
+        session_id,
+        synapse_action::lease::ttl_from_ms(30_000),
+    ) {
+        synapse_action::LeaseOutcome::Renewed(status) => status,
+        outcome => panic!("preexisting lease must renew: {outcome:?}"),
+    };
+    service
+        .persist_session_lease(session_id, &renewed)
+        .unwrap_or_else(|error| panic!("persist renewed lease: {error:?}"));
+    guard
+        .snapshot_expected_retained_persisted_lease_after_renewal()
+        .unwrap_or_else(|error| panic!("snapshot exact renewed lease row: {error}"));
+    let expected_renewed_row = guard.expected_retained_persisted_lease.clone();
+
+    let mut mismatched = renewed.clone();
+    mismatched.ttl_ms = Some(29_999);
+    service
+        .persist_session_lease(session_id, &mismatched)
+        .unwrap_or_else(|error| panic!("persist mismatched lease row: {error:?}"));
+    let mismatched_row = crate::server::session_continuity::snapshot_persisted_session_lease_row(
+        &service.m3_state_handle(),
+        session_id,
+    )
+    .unwrap_or_else(|error| panic!("read mismatched persisted lease: {error}"));
+    assert!(mismatched_row.row_exists());
+    assert_ne!(mismatched_row, expected_renewed_row);
+
+    let cleanup = guard.cleanup_now("mismatched_renewed_lease_row");
+    assert!(!cleanup.cleanup_ok, "{cleanup:?}");
+    assert!(!cleanup.persisted_lease_row_restored, "{cleanup:?}");
+    assert!(
+        cleanup
+            .persisted_lease_restore_error
+            .as_deref()
+            .is_some_and(
+                |error| error.contains("does not match its exact persisted continuity row")
+            ),
+        "{cleanup:?}"
+    );
+
+    crate::server::session_continuity::restore_persisted_session_lease_row(
+        &service.m3_state_handle(),
+        session_id,
+        &expected_renewed_row,
+    )
+    .unwrap_or_else(|error| panic!("restore expected renewed row for test cleanup: {error}"));
+    let recovered = guard.cleanup_with_bounded_retries("restore_expected_renewed_row");
+    assert!(
+        recovered.is_some_and(|readback| readback.cleanup_ok),
+        "guard must disarm after the exact renewed row is restored"
+    );
+    assert!(synapse_action::lease::release_if_owner(session_id));
+    service
+        .delete_persisted_session_lease(session_id)
+        .unwrap_or_else(|error| panic!("clean up mismatched-renew lease row: {error:?}"));
+}
+
+#[test]
+fn act_foreground_authority_guard_never_resurrects_lease_after_operator_interrupt() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_guard_operator_epoch_serial");
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create operator-interrupt tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-operator-interrupt-1622";
+    let profile_before = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("snapshot initial profile: {error:?}"));
+    let acquired = match synapse_action::lease::try_acquire(
+        session_id,
+        synapse_action::lease::ttl_from_ms(30_000),
+    ) {
+        synapse_action::LeaseOutcome::Acquired(status) => status,
+        outcome => panic!("preexisting operator-interrupt lease must acquire: {outcome:?}"),
+    };
+    service
+        .persist_session_lease(session_id, &acquired)
+        .unwrap_or_else(|error| panic!("persist preexisting lease: {error:?}"));
+    let mut guard = ActForegroundAuthorityGuard::new(
+        &service,
+        session_id,
+        &profile_before,
+        Some(session_id.to_owned()),
+        synapse_action::operator_panic_epoch(),
+    )
+    .unwrap_or_else(|error| panic!("arm operator-interrupt guard: {error:?}"));
+    service
+        .write_tool_profile_assignment(
+            session_id,
+            crate::server::tool_profiles::ToolProfileKind::BreakGlass,
+            "forced_guard_elevation",
+            Some("operator interrupt supersedes snapshot".to_owned()),
+            Some(session_id.to_owned()),
+        )
+        .unwrap_or_else(|error| panic!("persist elevated profile: {error:?}"));
+
+    let mut operator_panic_token = synapse_action::request_operator_panic_interrupt();
+    let operator_panic_generation = operator_panic_token.generation();
+    let preempted = synapse_action::force_preempt_input_lease_for_operator_panic(
+        "operator_guard_test",
+        operator_panic_generation,
+    )
+    .unwrap_or_else(|| panic!("operator preemption must observe the guarded session lease"));
+    assert_eq!(preempted.owner_session_id.as_deref(), Some(session_id));
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut operator_panic_token
+    ));
+    service
+        .delete_persisted_session_lease(session_id)
+        .unwrap_or_else(|error| panic!("delete K2 session lease row: {error:?}"));
+
+    let cleanup = guard.cleanup_with_bounded_retries("operator_interrupt");
+    assert!(
+        cleanup.is_some_and(|readback| readback.cleanup_ok),
+        "supervised cleanup must prove operator authority was preserved"
+    );
+
+    let profile_after = service
+        .tool_profile_snapshot(Some(session_id))
+        .unwrap_or_else(|error| panic!("read restored profile: {error:?}"));
+    assert_eq!(
+        profile_after.profile,
+        crate::server::tool_profiles::ToolProfileKind::NormalAgent
+    );
+    assert_eq!(
+        synapse_action::lease::status().owner_session_id.as_deref(),
+        Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID),
+        "guard cleanup must preserve the operator's lease owner"
+    );
+    let persisted_after = crate::server::session_continuity::snapshot_persisted_session_lease_row(
+        &service.m3_state_handle(),
+        session_id,
+    )
+    .unwrap_or_else(|error| panic!("read operator-interrupted persisted lease: {error}"));
+    assert!(
+        !persisted_after.row_exists(),
+        "guard cleanup must not resurrect the K2-deleted session lease row"
+    );
+
+    complete_test_operator_panic(operator_panic_token, "operator_guard_test_cleanup");
+}
+
+#[test]
+fn act_foreground_completion_disarm_rearms_on_late_operator_epoch() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_completion_epoch_serial");
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create completion-epoch tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-completion-epoch-1622";
+    let mut guard = foreground_guard_with_new_authority(&service, session_id);
+    let expected_profile_value_sha256 = guard.prior_profile_value_sha256.clone();
+    let expected_epoch = guard.operator_panic_epoch_at_arm;
+
+    let mut operator_panic_token = synapse_action::request_operator_panic_interrupt();
+    let operator_panic_generation = operator_panic_token.generation();
+    let _preempted = synapse_action::force_preempt_input_lease_for_operator_panic(
+        "completion_epoch_test",
+        operator_panic_generation,
+    );
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut operator_panic_token
+    ));
+    let observed_epoch = guard
+        .disarm_if_operator_epoch_stable(expected_epoch)
+        .expect_err("late operator panic must prevent ordinary completion disarm");
+    assert_ne!(observed_epoch, expected_epoch);
+    assert!(guard.armed, "epoch mismatch must rearm physical cleanup");
+
+    let cleanup = guard.cleanup_with_bounded_retries("late_operator_epoch_at_completion");
+    assert!(
+        cleanup.is_some_and(|readback| {
+            readback.cleanup_ok
+                && readback.operator_panic_observed
+                && readback.operator_epoch_stable_at_disarm
+        }),
+        "rearmed cleanup must handle the operator epoch and linearize a stable disarm"
+    );
+    assert_foreground_guard_restored_new_authority(
+        &service,
+        session_id,
+        &expected_profile_value_sha256,
+    );
+    complete_test_operator_panic(operator_panic_token, "completion_epoch_test_cleanup");
+}
+
+#[test]
+fn act_foreground_rejects_operator_panic_that_arrives_while_waiting_for_authority() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_prearm_operator_epoch_serial");
+    let temp = tempfile::tempdir().unwrap_or_else(|error| panic!("create prearm tempdir: {error}"));
+    let _service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-prearm-1622";
+    let armed_epoch = synapse_action::operator_panic_epoch();
+
+    let mut operator_panic_token = synapse_action::request_operator_panic_interrupt();
+    let operator_panic_generation = operator_panic_token.generation();
+    let _preempted = synapse_action::force_preempt_input_lease_for_operator_panic(
+        "prearm_epoch_test",
+        operator_panic_generation,
+    );
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut operator_panic_token
+    ));
+    let error = match ensure_act_operator_panic_not_observed(
+        ActOperation::Foreground,
+        session_id,
+        armed_epoch,
+        "after_authority_wait",
+    ) {
+        Err(error) => error,
+        Ok(()) => panic!("operator panic after entry arm must invalidate the queued transaction"),
+    };
+
+    assert_eq!(
+        act_error_field(&error, "detail_code").as_deref(),
+        Some("ACT_FOREGROUND_OPERATOR_PANIC_PREARMED")
+    );
+    assert_eq!(
+        act_error_u64(&error, "operator_panic_epoch_at_arm"),
+        Some(armed_epoch)
+    );
+    assert!(
+        act_error_u64(&error, "operator_panic_epoch_after")
+            .is_some_and(|observed| observed != armed_epoch)
+    );
+    complete_test_operator_panic(operator_panic_token, "prearm_epoch_test_cleanup");
+}
+
+#[test]
+fn act_foreground_rejects_panic_published_before_k1_preemption_ack() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_pending_k1_epoch_serial");
+    let temp =
+        tempfile::tempdir().unwrap_or_else(|error| panic!("create pending-K1 tempdir: {error}"));
+    let _service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-pending-k1-1622";
+
+    let mut operator_panic_token = synapse_action::request_operator_panic_interrupt();
+    let operator_panic_generation = operator_panic_token.generation();
+    let epoch_captured_after_publication = synapse_action::operator_panic_epoch();
+    assert!(synapse_action::operator_panic_safety_pending());
+
+    let error = ensure_act_operator_panic_not_observed(
+        ActOperation::Foreground,
+        session_id,
+        epoch_captured_after_publication,
+        "entry_after_publication_before_k1",
+    )
+    .expect_err("pending K1 must reject even when entry captured the new panic epoch");
+    assert_eq!(
+        act_error_field(&error, "detail_code").as_deref(),
+        Some("ACT_FOREGROUND_OPERATOR_PANIC_PREARMED")
+    );
+    assert_eq!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("operator_panic_safety_pending"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let invoke_error = ensure_act_operator_panic_not_observed(
+        ActOperation::Invoke,
+        session_id,
+        epoch_captured_after_publication,
+        "invoke_after_publication_before_k1",
+    )
+    .expect_err("pending panic must also reject an invoke mutation");
+    assert_eq!(
+        act_error_field(&invoke_error, "detail_code").as_deref(),
+        Some("ACT_INVOKE_OPERATOR_PANIC_PREARMED")
+    );
+    assert!(target_act_verb_requires_operator_panic_gate("focus_window"));
+    assert!(target_act_verb_requires_operator_panic_gate("press"));
+    assert!(!target_act_verb_requires_operator_panic_gate("read"));
+    assert!(
+        target_act_verb_requires_operator_panic_gate("screenshot"),
+        "screenshot activates targets and writes bytes, so it is not a pure read"
+    );
+
+    let _preempted = synapse_action::force_preempt_input_lease_for_operator_panic(
+        "pending_k1_epoch_test",
+        operator_panic_generation,
+    );
+    assert_eq!(
+        synapse_action::lease::status().owner_session_id.as_deref(),
+        Some(synapse_action::OPERATOR_LEASE_OWNER_SESSION_ID)
+    );
+    assert!(synapse_action::acknowledge_operator_panic_preemption(
+        &mut operator_panic_token
+    ));
+    assert!(
+        synapse_action::operator_panic_safety_pending(),
+        "K1 acknowledgement must not reopen admission before K2 terminal readback"
+    );
+    complete_test_operator_panic(operator_panic_token, "pending_k1_epoch_test_cleanup");
+    assert!(!synapse_action::operator_panic_safety_pending());
+}
+
+#[test]
+fn generic_release_interrupt_does_not_invalidate_foreground_authority_epoch() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_foreground_generic_release_epoch_serial");
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create generic-release tempdir: {error}"));
+    let _service = foreground_guard_test_service(temp.path());
+    let session_id = "act-foreground-generic-release-1622";
+    let armed_epoch = synapse_action::operator_panic_epoch();
+
+    synapse_action::request_release_interrupt();
+
+    ensure_act_operator_panic_not_observed(
+        ActOperation::Foreground,
+        session_id,
+        armed_epoch,
+        "after_generic_release",
+    )
+    .unwrap_or_else(|error| {
+        panic!("generic software release must not impersonate operator panic: {error:?}")
+    });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn target_act_rechecks_operator_panic_after_preparation_before_physical_boundaries() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("target_act_physical_boundary_epoch_serial");
+    synapse_action::isolate_interrupt_epochs_for_test();
+
+    for stage in [
+        "screenshot_after_activation_before_file_capture",
+        "run_shell_before_durable_process_launch",
+    ] {
+        let boundary = TargetActOperatorPanicBoundary {
+            session_id: format!("target-act-boundary-{stage}"),
+            operator_panic_epoch_at_arm: synapse_action::operator_panic_epoch(),
+        };
+        let request_boundary =
+            crate::server::operator_panic_boundary::McpOperatorPanicBoundary::capture(
+                "target_act",
+                Some(&boundary.session_id),
+            );
+        let (error, mutation_ran, mut token) =
+            crate::server::operator_panic_boundary::MCP_OPERATOR_PANIC_BOUNDARY
+                .scope(request_boundary, async move {
+                    TARGET_ACT_OPERATOR_PANIC_BOUNDARY
+                        .scope(Some(boundary), async move {
+                            let preparation_complete = true;
+                            tokio::task::yield_now().await;
+                            let token = synapse_action::request_operator_panic_interrupt();
+                            let boundary_result = ensure_target_act_operator_panic_boundary(stage);
+                            let mutation_ran = preparation_complete && boundary_result.is_ok();
+                            (
+                                boundary_result
+                                    .expect_err("panic must close the physical boundary"),
+                                mutation_ran,
+                                token,
+                            )
+                        })
+                        .await
+                })
+                .await;
+
+        assert!(
+            !mutation_ran,
+            "stage {stage} must not cross its mutation boundary"
+        );
+        assert_eq!(
+            act_error_field(&error, "detail_code").as_deref(),
+            Some("MCP_MUTATION_OPERATOR_PANIC_ADMISSION_CLOSED")
+        );
+        assert!(synapse_action::acknowledge_operator_panic_preemption(
+            &mut token
+        ));
+        match synapse_action::complete_operator_panic_safety_generation(token)
+            .unwrap_or_else(|error| panic!("complete test panic generation: {error}"))
+        {
+            synapse_action::OperatorPanicSafetyCompletion::Pending => {
+                panic!("isolated test panic generation unexpectedly remained pending")
+            }
+            synapse_action::OperatorPanicSafetyCompletion::Finalize(finalization) => assert!(
+                synapse_action::finish_operator_panic_safety_finalization(finalization, true)
+            ),
+        }
+        assert!(!synapse_action::operator_panic_safety_pending());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn act_facade_mcp_boundary_snapshot_survives_supervised_task_spawn() {
+    let _operator_epoch_serial =
+        crate::test_support::lease_serial("act_facade_mcp_boundary_snapshot_spawn_serial");
+    synapse_action::isolate_interrupt_epochs_for_test();
+
+    let session_id = "act-boundary-child-1621";
+    let request_boundary =
+        crate::server::operator_panic_boundary::McpOperatorPanicBoundary::capture(
+            "act",
+            Some(session_id),
+        );
+    let target_boundary = TargetActOperatorPanicBoundary {
+        session_id: session_id.to_owned(),
+        operator_panic_epoch_at_arm: synapse_action::operator_panic_epoch(),
+    };
+
+    let result = crate::server::operator_panic_boundary::MCP_OPERATOR_PANIC_BOUNDARY
+        .scope(request_boundary, async move {
+            let snapshot =
+                crate::server::operator_panic_boundary::reserve_and_snapshot_current_mcp_boundary(
+                    "act_before_authority_transaction_spawn",
+                )
+                .unwrap_or_else(|error| {
+                    panic!("facade must reserve and snapshot routed MCP boundary: {error:?}")
+                });
+            tokio::spawn(async move {
+                crate::server::operator_panic_boundary::scope_mcp_boundary_snapshot(
+                    Some(snapshot),
+                    async move {
+                        TARGET_ACT_OPERATOR_PANIC_BOUNDARY
+                            .scope(Some(target_boundary), async move {
+                                ensure_target_act_operator_panic_boundary(
+                                    "focus_window_before_activation",
+                                )
+                                .map_err(|error| error.message.to_string())
+                            })
+                            .await
+                    },
+                )
+                .await
+            })
+            .await
+            .unwrap_or_else(|error| panic!("spawned authority task join failed: {error}"))
+        })
+        .await;
+
+    result.unwrap_or_else(|error| {
+        panic!("spawned authority task must inherit the MCP mutation boundary: {error}")
+    });
 }
 
 #[test]
@@ -1051,6 +2442,88 @@ fn target_act_focus_window_requires_session_target() {
         Some(error_codes::TARGET_NOT_SET)
     );
     assert_eq!(target_act_error_status(&error), TARGET_ACT_STATUS_REFUSED);
+}
+
+#[test]
+fn target_act_focus_window_profile_gate_accepts_only_foreground_capability() {
+    use crate::server::tool_profiles::ToolProfileKind;
+
+    for profile in [ToolProfileKind::BreakGlass, ToolProfileKind::FullCapability] {
+        target_act_focus_window_profile_preflight("session-1379", profile)
+            .expect("foreground-capable facade profile must delegate focus");
+    }
+
+    for profile in [
+        ToolProfileKind::NormalAgent,
+        ToolProfileKind::BrowserControl,
+        ToolProfileKind::BrowserDebugger,
+    ] {
+        let error = target_act_focus_window_profile_preflight("session-1379", profile)
+            .expect_err("non-foreground profile must fail closed");
+        assert_eq!(
+            target_act_error_code(&error),
+            Some(error_codes::TOOL_PROFILE_POLICY_DENIED)
+        );
+        assert_eq!(
+            act_error_field(&error, "profile").as_deref(),
+            Some(profile.as_str())
+        );
+        assert_eq!(act_error_field(&error, "tool").as_deref(), Some("act"));
+        assert_eq!(
+            act_error_field(&error, "operation").as_deref(),
+            Some("focus_window")
+        );
+        assert_eq!(
+            act_error_field(&error, "session_id").as_deref(),
+            Some("session-1379")
+        );
+        assert_eq!(
+            act_error_field(&error, "remediation").as_deref(),
+            Some(TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION)
+        );
+    }
+}
+
+#[test]
+fn http_profile_admission_denies_raw_target_act_for_every_profile() {
+    use crate::server::tool_profiles::ToolProfileKind;
+
+    let temp = tempfile::tempdir()
+        .unwrap_or_else(|error| panic!("create target-act policy tempdir: {error}"));
+    let service = foreground_guard_test_service(temp.path());
+    let session_id = "raw-target-act-policy-1379";
+    for profile in [
+        ToolProfileKind::NormalAgent,
+        ToolProfileKind::BrowserControl,
+        ToolProfileKind::BrowserDebugger,
+        ToolProfileKind::BreakGlass,
+        ToolProfileKind::FullCapability,
+    ] {
+        service
+            .write_tool_profile_assignment(
+                session_id,
+                profile,
+                "raw_target_act_policy_test",
+                Some("prove facade-only HTTP admission".to_owned()),
+                Some(session_id.to_owned()),
+            )
+            .unwrap_or_else(|error| panic!("persist {profile:?} policy row: {error:?}"));
+        let error = service
+            .admit_tool_call_for_profile("target_act", Some(session_id))
+            .expect_err("implementation-only target_act must remain HTTP policy denied");
+        assert_eq!(
+            act_error_field(&error, "code").as_deref(),
+            Some(error_codes::TOOL_PROFILE_POLICY_DENIED)
+        );
+        assert_eq!(
+            act_error_field(&error, "profile").as_deref(),
+            Some(profile.as_str())
+        );
+        assert_eq!(
+            act_error_field(&error, "tool").as_deref(),
+            Some("target_act")
+        );
+    }
 }
 
 #[test]

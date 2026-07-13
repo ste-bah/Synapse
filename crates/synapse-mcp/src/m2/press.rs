@@ -33,11 +33,30 @@ pub(crate) struct ResolvedKeymapPress {
     pub press: ActPressParams,
 }
 
+#[cfg(test)]
 pub async fn act_press_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     connection_closed_cancel: Option<CancellationToken>,
     params: ActPressParams,
+) -> Result<ActPressResponse, ErrorData> {
+    let boundary = super::OperatorPanicActionBoundary::arm("act_press", "direct_call_entry")?;
+    act_press_with_handle_and_boundary(
+        handle,
+        recording,
+        connection_closed_cancel,
+        params,
+        boundary,
+    )
+    .await
+}
+
+pub(crate) async fn act_press_with_handle_and_boundary(
+    handle: ActionHandle,
+    recording: Option<Arc<RecordingBackend>>,
+    connection_closed_cancel: Option<CancellationToken>,
+    params: ActPressParams,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActPressResponse, ErrorData> {
     let started = Instant::now();
     let keys = keys::normalized_keys(&params.keys)?;
@@ -51,6 +70,7 @@ pub async fn act_press_with_handle(
     validate_hold_ms(params.hold_ms)?;
     let action = press_action(keys.clone(), params.hold_ms, backend);
 
+    boundary.ensure("immediately_before_press_dispatch")?;
     if let Some(recording) = recording {
         record::execute_recording(&recording, &action)?;
     } else {
@@ -60,6 +80,7 @@ pub async fn act_press_with_handle(
             params.hold_ms,
             backend,
             connection_closed_cancel,
+            boundary,
         )
         .await?;
     }
@@ -76,8 +97,8 @@ pub async fn act_press_with_handle(
 }
 
 // Test-exercised keymap helper (see m2::press::tests); production keymap
-// routing no longer calls it directly, so it is unused in the compiled bins.
-#[allow(dead_code)]
+// routing carries the request-captured boundary into the physical helper.
+#[cfg(test)]
 pub async fn act_keymap_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
@@ -86,11 +107,13 @@ pub async fn act_keymap_with_handle(
     params: ActKeymapParams,
 ) -> Result<ActKeymapResponse, ErrorData> {
     let resolved = resolve_keymap_press(profile, &params)?;
-    let response = act_press_with_handle(
+    let boundary = super::OperatorPanicActionBoundary::arm("act_keymap", "direct_call_entry")?;
+    let response = act_press_with_handle_and_boundary(
         handle,
         recording,
         connection_closed_cancel,
         resolved.press.clone(),
+        boundary,
     )
     .await?;
 
@@ -111,6 +134,7 @@ pub(crate) async fn act_press_cdp_target(
     endpoint: &str,
     cdp_target_id: &str,
     params: ActPressParams,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActPressResponse, ErrorData> {
     let started = Instant::now();
     let keys = keys::normalized_keys(&params.keys)?;
@@ -122,6 +146,7 @@ pub(crate) async fn act_press_cdp_target(
     })?;
     validate_hold_ms(params.hold_ms)?;
     let strokes = cdp_key_strokes(&keys)?;
+    boundary.ensure("immediately_before_cdp_press_key_sequence")?;
     synapse_a11y::cdp_press_key_sequence(endpoint, cdp_target_id, strokes, params.hold_ms)
         .await
         .map_err(|error| {
@@ -146,6 +171,7 @@ pub(crate) async fn act_press_cdp_target(
 pub(crate) async fn act_press_postmessage_target(
     root_hwnd: i64,
     params: ActPressParams,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActPressResponse, ErrorData> {
     let started = Instant::now();
     let keys = keys::normalized_keys(&params.keys)?;
@@ -156,7 +182,7 @@ pub(crate) async fn act_press_postmessage_target(
         )
     })?;
     validate_hold_ms(params.hold_ms)?;
-    postmessage::post_key_sequence(root_hwnd, &keys, params.hold_ms).await?;
+    postmessage::post_key_sequence(root_hwnd, &keys, params.hold_ms, boundary).await?;
     Ok(ActPressResponse {
         ok: true,
         keys_pressed: key_count,

@@ -14,7 +14,10 @@ use crate::{ActionError, ActionResult, validate_action};
 
 pub const ACTION_QUEUE_CAPACITY: usize = 256;
 
-pub type ActionMessage = (Action, oneshot::Sender<ActionResult<()>>);
+/// Emitter queue item carrying the operator-panic epoch from the enqueue edge.
+/// A normal action must still match this epoch at physical dispatch; otherwise
+/// an item queued before K1 could resume after a fully finalized K2 wave.
+pub type ActionMessage = (Action, oneshot::Sender<ActionResult<()>>, Option<u64>);
 
 pub static RELEASE_ALL_HANDLE: OnceLock<ActionHandle> = OnceLock::new();
 
@@ -25,7 +28,12 @@ pub trait ActionComboScheduler: Send + Sync {
     ///
     /// Returns an [`ActionError`] when the scheduler is unavailable or rejects
     /// the combo.
-    fn schedule_combo(&self, steps: Vec<ComboStep>, backend: Backend) -> ActionResult<()>;
+    fn schedule_combo(
+        &self,
+        steps: Vec<ComboStep>,
+        backend: Backend,
+        operator_panic_epoch_at_schedule: u64,
+    ) -> ActionResult<()>;
 }
 
 #[derive(Clone)]
@@ -147,20 +155,38 @@ impl ActionHandle {
         session_id: Option<String>,
     ) -> ActionResult<()> {
         validate_action(&action)?;
+        ensure_operator_panic_allows_action(&action)?;
         if let Action::Combo { steps, backend } = &action
             && let Some(scheduler) = self.combo_scheduler()?
         {
-            return scheduler.schedule_combo(steps.clone(), *backend);
+            let epoch_at_schedule =
+                capture_operator_panic_action_epoch(&action)?.ok_or_else(|| {
+                    ActionError::BackendUnavailable {
+                        detail: "combo scheduling unexpectedly lacked an operator-panic epoch"
+                            .to_owned(),
+                    }
+                })?;
+            scheduler.schedule_combo(steps.clone(), *backend, epoch_at_schedule)?;
+            ensure_operator_panic_allows_action_since(&action, Some(epoch_at_schedule))?;
+            return Ok(());
         }
         let (ack_tx, ack_rx) = oneshot::channel();
-        self.send_for_execution(action.clone(), ack_tx)?;
+        let epoch_at_enqueue = self.send_for_execution(action.clone(), ack_tx)?;
         let result = ack_rx
             .await
             .map_err(|_err| ActionError::BackendUnavailable {
                 detail: "action emitter dropped acknowledgement".to_owned(),
             })?;
         if result.is_ok() {
-            self.record_successful_action(session_id.as_deref(), &action)?;
+            // Do not resurrect held-input ownership after K1 released the
+            // physical state while an already-dispatched action was awaiting
+            // its emitter acknowledgement.
+            ensure_operator_panic_allows_action_since(&action, epoch_at_enqueue)?;
+            self.record_successful_action_with_panic_guard(
+                session_id.as_deref(),
+                &action,
+                epoch_at_enqueue,
+            )?;
         }
         result
     }
@@ -173,13 +199,22 @@ impl ActionHandle {
     /// `ACTION_BACKEND_UNAVAILABLE` when the emitter channel is closed.
     pub fn try_execute(&self, action: Action) -> ActionResult<()> {
         validate_action(&action)?;
+        ensure_operator_panic_allows_action(&action)?;
         if let Action::Combo { steps, backend } = &action
             && let Some(scheduler) = self.combo_scheduler()?
         {
-            return scheduler.schedule_combo(steps.clone(), *backend);
+            let epoch_at_schedule =
+                capture_operator_panic_action_epoch(&action)?.ok_or_else(|| {
+                    ActionError::BackendUnavailable {
+                        detail: "combo scheduling unexpectedly lacked an operator-panic epoch"
+                            .to_owned(),
+                    }
+                })?;
+            scheduler.schedule_combo(steps.clone(), *backend, epoch_at_schedule)?;
+            return ensure_operator_panic_allows_action_since(&action, Some(epoch_at_schedule));
         }
         let (ack_tx, _ack_rx) = oneshot::channel();
-        self.tx.try_send((action, ack_tx)).map_err(map_try_send)?;
+        let _epoch_at_enqueue = self.send_for_execution(action, ack_tx)?;
         Ok(())
     }
 
@@ -339,16 +374,23 @@ impl ActionHandle {
         &self,
         action: Action,
         ack_tx: oneshot::Sender<ActionResult<()>>,
-    ) -> ActionResult<()> {
+    ) -> ActionResult<Option<u64>> {
+        let operator_panic_epoch_at_enqueue = capture_operator_panic_action_epoch(&action)?;
         if matches!(action, Action::ReleaseAll) {
             crate::request_release_interrupt();
         }
         if is_safety_action(&action)
             && let Some(safety_tx) = &self.safety_tx
         {
-            return safety_tx.send((action, ack_tx)).map_err(map_unbounded_send);
+            safety_tx
+                .send((action, ack_tx, operator_panic_epoch_at_enqueue))
+                .map_err(map_unbounded_send)?;
+            return Ok(operator_panic_epoch_at_enqueue);
         }
-        self.tx.try_send((action, ack_tx)).map_err(map_try_send)
+        self.tx
+            .try_send((action, ack_tx, operator_panic_epoch_at_enqueue))
+            .map_err(map_try_send)?;
+        Ok(operator_panic_epoch_at_enqueue)
     }
 
     fn send_release_all(
@@ -358,9 +400,13 @@ impl ActionHandle {
     ) -> ActionResult<()> {
         crate::request_release_interrupt();
         if let Some(safety_tx) = &self.safety_tx {
-            return safety_tx.send((action, ack_tx)).map_err(map_unbounded_send);
+            return safety_tx
+                .send((action, ack_tx, None))
+                .map_err(map_unbounded_send);
         }
-        self.tx.try_send((action, ack_tx)).map_err(map_try_send)
+        self.tx
+            .try_send((action, ack_tx, None))
+            .map_err(map_try_send)
     }
 
     fn record_successful_action(
@@ -374,6 +420,30 @@ impl ActionHandle {
             .map_err(|_err| ActionError::BackendUnavailable {
                 detail: "session input ownership ledger is poisoned".to_owned(),
             })
+    }
+
+    fn record_successful_action_with_panic_guard(
+        &self,
+        session_id: Option<&str>,
+        action: &Action,
+        epoch_at_enqueue: Option<u64>,
+    ) -> ActionResult<()> {
+        self.record_successful_action(session_id, action)?;
+        if let Err(operator_panic_error) =
+            ensure_operator_panic_allows_action_since(action, epoch_at_enqueue)
+        {
+            // K1 may have raced the ledger write after the caller's first
+            // check: the physical ReleaseAll can clear ownership and then this
+            // request can otherwise restore a stale held-input owner. The
+            // caller still owns `session_input_gate`, so conservatively restore
+            // the ledger to the same all-released state before returning.
+            if let Err(cleanup_error) = self.record_successful_action(None, &Action::ReleaseAll) {
+                crate::record_operator_panic_safety_incident();
+                return Err(cleanup_error);
+            }
+            return Err(operator_panic_error);
+        }
+        Ok(())
     }
 
     fn confirm_session_release_action(
@@ -408,8 +478,56 @@ fn map_unbounded_send(error: mpsc::error::SendError<ActionMessage>) -> ActionErr
     }
 }
 
-const fn is_safety_action(action: &Action) -> bool {
-    matches!(action, Action::ReleaseAll | Action::KeyUp { .. })
+pub(crate) fn is_safety_action(action: &Action) -> bool {
+    match action {
+        Action::ReleaseAll
+        | Action::KeyUp { .. }
+        | Action::MouseButton {
+            action: ButtonAction::Up,
+            ..
+        } => true,
+        Action::PadReport { report, .. } => is_neutral_report(report),
+        _ => false,
+    }
+}
+
+pub(crate) fn ensure_operator_panic_allows_action(action: &Action) -> ActionResult<()> {
+    capture_operator_panic_action_epoch(action).map(|_epoch| ())
+}
+
+fn capture_operator_panic_action_epoch(action: &Action) -> ActionResult<Option<u64>> {
+    if is_safety_action(action) {
+        return Ok(None);
+    }
+    let epoch_at_arm = crate::operator_panic_epoch();
+    ensure_operator_panic_allows_action_since(action, Some(epoch_at_arm))?;
+    Ok(Some(epoch_at_arm))
+}
+
+pub(crate) fn ensure_operator_panic_allows_action_since(
+    action: &Action,
+    epoch_at_enqueue: Option<u64>,
+) -> ActionResult<()> {
+    if is_safety_action(action) {
+        return Ok(());
+    }
+    let readback = crate::operator_panic_safety_readback();
+    if let Some(epoch_at_enqueue) = epoch_at_enqueue
+        && !readback.pending
+        && readback.epoch == epoch_at_enqueue
+    {
+        return Ok(());
+    }
+    Err(ActionError::SafetyOperatorHotkeyFired {
+        detail: format!(
+            "operator-panic safety admission is closed for a normal action: epoch_at_enqueue={epoch_at_enqueue:?} epoch_after={} publications_in_flight={} outstanding_generations={} outstanding_finalizations={} accounting_incident={}",
+            readback.epoch,
+            readback.publications_in_flight,
+            readback.outstanding_generations,
+            readback.outstanding_finalizations,
+            readback.accounting_incident
+        ),
+    })
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -850,4 +968,120 @@ fn is_neutral_report(report: &GamepadReport) -> bool {
         && report.thumb_r == (0.0, 0.0)
         && report.lt == 0.0
         && report.rt == 0.0
+}
+
+#[cfg(test)]
+mod operator_panic_queue_tests {
+    use super::*;
+    use synapse_core::KeyCode;
+
+    #[test]
+    fn enqueued_normal_action_keeps_original_epoch_across_completed_panic_wave() {
+        crate::hotkey::isolate_interrupt_epochs_for_test();
+        let action = Action::KeyDown {
+            key: Key {
+                code: KeyCode::Named {
+                    value: "shift".to_owned(),
+                },
+                use_scancode: false,
+            },
+            backend: Backend::Software,
+        };
+        let epoch_at_enqueue = capture_operator_panic_action_epoch(&action)
+            .expect("initial action admission")
+            .expect("normal action must carry an enqueue epoch");
+
+        let mut token = crate::request_operator_panic_interrupt();
+        assert!(crate::acknowledge_operator_panic_preemption(&mut token));
+        let crate::OperatorPanicSafetyCompletion::Finalize(finalization) =
+            crate::complete_operator_panic_safety_generation(token)
+                .unwrap_or_else(|detail| panic!("complete test panic: {detail}"))
+        else {
+            panic!("isolated generation must own finalization");
+        };
+        assert!(crate::finish_operator_panic_safety_finalization(
+            finalization,
+            true
+        ));
+        assert!(!crate::operator_panic_safety_pending());
+
+        let error = ensure_operator_panic_allows_action_since(&action, Some(epoch_at_enqueue))
+            .expect_err("queued pre-panic action must remain superseded after K2 finalizes");
+        assert!(matches!(
+            error,
+            ActionError::SafetyOperatorHotkeyFired { .. }
+        ));
+    }
+
+    #[test]
+    fn normal_action_without_enqueue_epoch_fails_closed() {
+        crate::hotkey::isolate_interrupt_epochs_for_test();
+        let action = Action::KeyDown {
+            key: Key {
+                code: KeyCode::Named {
+                    value: "shift".to_owned(),
+                },
+                use_scancode: false,
+            },
+            backend: Backend::Software,
+        };
+
+        let error = ensure_operator_panic_allows_action_since(&action, None)
+            .expect_err("unattributed normal queue item must fail closed");
+        assert!(matches!(
+            error,
+            ActionError::SafetyOperatorHotkeyFired { .. }
+        ));
+    }
+
+    #[test]
+    fn panic_crossing_after_ledger_write_clears_stale_ownership() {
+        crate::hotkey::isolate_interrupt_epochs_for_test();
+        let (handle, _rx) = ActionHandle::channel();
+        let action = Action::KeyDown {
+            key: Key {
+                code: KeyCode::Named {
+                    value: "shift".to_owned(),
+                },
+                use_scancode: false,
+            },
+            backend: Backend::Software,
+        };
+        let epoch_at_enqueue = capture_operator_panic_action_epoch(&action)
+            .expect("initial action admission")
+            .expect("normal action must carry an enqueue epoch");
+        let mut token = crate::request_operator_panic_interrupt();
+        assert!(crate::acknowledge_operator_panic_preemption(&mut token));
+
+        let error = handle
+            .record_successful_action_with_panic_guard(
+                Some("stale-session"),
+                &action,
+                Some(epoch_at_enqueue),
+            )
+            .expect_err("post-ledger panic crossing must fail closed");
+        assert!(matches!(
+            error,
+            ActionError::SafetyOperatorHotkeyFired { .. }
+        ));
+        assert!(
+            handle
+                .session_inputs_snapshot()
+                .expect("ownership readback")
+                .sessions
+                .is_empty(),
+            "panic rollback must leave the held-input ownership ledger empty"
+        );
+
+        let crate::OperatorPanicSafetyCompletion::Finalize(finalization) =
+            crate::complete_operator_panic_safety_generation(token)
+                .unwrap_or_else(|detail| panic!("complete test panic: {detail}"))
+        else {
+            panic!("isolated generation must own finalization");
+        };
+        assert!(crate::finish_operator_panic_safety_finalization(
+            finalization,
+            true
+        ));
+    }
 }

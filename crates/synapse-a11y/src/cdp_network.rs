@@ -8,8 +8,11 @@
 //! that can be read by cursor without consuming entries.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chromiumoxide::cdp::browser_protocol::emulation::SetUserAgentOverrideParams as EmulationSetUserAgentOverrideParams;
@@ -45,6 +48,62 @@ pub const DEFAULT_NETWORK_BUFFER_CAPACITY: usize = 1000;
 pub const MAX_NETWORK_BUFFER_CAPACITY: usize = 10_000;
 /// Per-WebSocket frame retention cap so chatty sockets cannot grow unbounded.
 pub const MAX_WEBSOCKET_FRAMES_PER_ENTRY: usize = 1000;
+
+/// Physical readback for browser-owned background mutators that survive the
+/// MCP call which installed them.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CdpDurableBrowserMutationOwnersReadback {
+    pub enabled: bool,
+    pub disable_sequence: u64,
+    pub fetch_interception_active_count: usize,
+    pub network_override_active_count: usize,
+    pub dialog_auto_policy_active_count: usize,
+    pub clock_active_count: usize,
+    pub init_script_active_count: usize,
+    pub persisted_cdp_mutation_owner_count: usize,
+    pub persisted_cdp_input_owner_count: usize,
+    pub persisted_cdp_evaluate_owner_count: usize,
+    pub persisted_cdp_init_script_effect_owner_count: usize,
+    pub unresolved_raw_cdp_evaluate_timeout_count: u64,
+    pub unresolved_raw_cdp_input_owner_count: u64,
+    pub registry_readback_failures: Vec<String>,
+    pub registry_readback_healthy: bool,
+}
+
+/// Stop/drain verdict returned to the operator-panic K1/K2 boundary.
+/// `fully_drained` is true only when every discovered owner was stopped, its
+/// task was drained, and the independent registry readback is empty.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CdpDurableBrowserMutationOwnersDrainReadback {
+    pub fetch_interceptions_found: usize,
+    pub fetch_interceptions_stopped: usize,
+    pub fetch_listener_tasks_drained: usize,
+    pub fetch_handler_tasks_drained: usize,
+    pub network_overrides_found: usize,
+    pub network_overrides_cleared: usize,
+    pub network_override_handler_tasks_drained: usize,
+    pub dialog_auto_policies_found: usize,
+    pub dialog_listener_tasks_drained: usize,
+    pub dialog_handler_tasks_drained: usize,
+    pub clocks_found: usize,
+    pub clocks_uninstalled: usize,
+    pub init_scripts_found: usize,
+    pub init_scripts_removed: usize,
+    pub persisted_cdp_mutation_owners_found: usize,
+    pub persisted_cdp_input_owners_found: usize,
+    pub persisted_cdp_input_owners_drained: usize,
+    pub persisted_cdp_input_owners_remaining: usize,
+    pub persisted_cdp_evaluate_owners_found: usize,
+    pub persisted_cdp_evaluate_owners_drained: usize,
+    pub persisted_cdp_evaluate_owners_remaining: usize,
+    pub persisted_cdp_init_script_effect_owners_found: usize,
+    pub persisted_cdp_init_script_effect_owners_drained: usize,
+    pub persisted_cdp_init_script_effect_owners_remaining: usize,
+    pub persisted_cdp_mutation_owners_remaining: usize,
+    pub failures: Vec<String>,
+    pub readback: CdpDurableBrowserMutationOwnersReadback,
+    pub fully_drained: bool,
+}
 
 /// A response snapshot captured either as the current response or as a redirect
 /// response attached to the next `Network.requestWillBeSent` event.
@@ -775,6 +834,31 @@ fn override_registry() -> &'static NetworkOverrideRegistry {
     REGISTRY.get_or_init(NetworkOverrideRegistry::default)
 }
 
+fn durable_browser_mutation_operation_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[doc(hidden)]
+pub async fn durable_browser_mutation_operation_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    durable_browser_mutation_operation_lock().lock().await
+}
+
+static DURABLE_BROWSER_MUTATION_OWNERS_ENABLED: AtomicBool = AtomicBool::new(true);
+static DURABLE_BROWSER_MUTATION_DISABLE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn require_durable_browser_mutation_owners_enabled(operation: &str) -> A11yResult<()> {
+    if DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.load(Ordering::SeqCst) {
+        Ok(())
+    } else {
+        Err(A11yError::CdpAttachFailed {
+            detail: format!(
+                "durable browser mutation owners are disabled by operator panic; refusing {operation}"
+            ),
+        })
+    }
+}
+
 /// Arms (or re-arms) persistent CDP Network capture for `target_id`.
 ///
 /// Idempotent: a live capture is reused. Capture starts at the arm time because
@@ -1187,6 +1271,26 @@ pub async fn network_overrides_apply(
     target_id: &str,
     config: CdpNetworkOverrideConfig,
 ) -> A11yResult<CdpNetworkOverrideStatus> {
+    let endpoint = endpoint.to_owned();
+    let target_id = target_id.to_owned();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = network_overrides_apply_owned(&endpoint, &target_id, config).await;
+        let _ = result_tx.send(result);
+    });
+    result_rx.await.map_err(|_| A11yError::CdpAttachFailed {
+        detail: "owned network override install task terminated before publishing a verdict"
+            .to_owned(),
+    })?
+}
+
+async fn network_overrides_apply_owned(
+    endpoint: &str,
+    target_id: &str,
+    config: CdpNetworkOverrideConfig,
+) -> A11yResult<CdpNetworkOverrideStatus> {
+    let _operation_guard = durable_browser_mutation_operation_lock().lock().await;
+    require_durable_browser_mutation_owners_enabled("network override install")?;
     let target_id = target_id.trim();
     if target_id.is_empty() {
         return Err(A11yError::CdpAttachFailed {
@@ -1252,6 +1356,13 @@ pub fn network_overrides_status(target_id: &str) -> Option<CdpNetworkOverrideSta
 pub async fn network_overrides_clear(
     target_id: &str,
 ) -> A11yResult<Option<CdpNetworkOverrideStatus>> {
+    let _operation_guard = durable_browser_mutation_operation_lock().lock().await;
+    network_overrides_clear_locked(target_id).await
+}
+
+async fn network_overrides_clear_locked(
+    target_id: &str,
+) -> A11yResult<Option<CdpNetworkOverrideStatus>> {
     let target_id = target_id.trim();
     let slot = override_registry()
         .slots
@@ -1281,15 +1392,24 @@ pub async fn network_overrides_clear(
                 ),
             })?;
     }
-    let mut status = slot.state.lock().map_err(|_| A11yError::CdpAttachFailed {
-        detail: "network override state lock is poisoned".to_owned(),
-    })?;
-    status.newly_armed = false;
-    status.applied_at_unix_ms = now_unix_ms_u64();
-    status.header_count = 0;
-    status.headers.clear();
-    status.user_agent = None;
-    Ok(Some(status.clone()))
+    let response = {
+        let mut status = slot.state.lock().map_err(|_| A11yError::CdpAttachFailed {
+            detail: "network override state lock is poisoned".to_owned(),
+        })?;
+        status.newly_armed = false;
+        status.applied_at_unix_ms = now_unix_ms_u64();
+        status.header_count = 0;
+        status.headers.clear();
+        status.user_agent = None;
+        status.clone()
+    };
+    slot.handler_task.abort();
+    if !wait_for_aborted_task(&slot.handler_task).await {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!("network override handler task did not drain for target {target_id}"),
+        });
+    }
+    Ok(Some(response))
 }
 
 /// Enables the Fetch domain for a target and continues every paused request by
@@ -1299,6 +1419,26 @@ pub async fn fetch_interception_ensure(
     target_id: &str,
     patterns: Vec<CdpFetchInterceptionPattern>,
 ) -> A11yResult<CdpFetchInterceptionStatus> {
+    let endpoint = endpoint.to_owned();
+    let target_id = target_id.to_owned();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = fetch_interception_ensure_owned(&endpoint, &target_id, patterns).await;
+        let _ = result_tx.send(result);
+    });
+    result_rx.await.map_err(|_| A11yError::CdpAttachFailed {
+        detail: "owned Fetch interception install task terminated before publishing a verdict"
+            .to_owned(),
+    })?
+}
+
+async fn fetch_interception_ensure_owned(
+    endpoint: &str,
+    target_id: &str,
+    patterns: Vec<CdpFetchInterceptionPattern>,
+) -> A11yResult<CdpFetchInterceptionStatus> {
+    let _operation_guard = durable_browser_mutation_operation_lock().lock().await;
+    require_durable_browser_mutation_owners_enabled("Fetch interception install")?;
     let target_id = target_id.trim();
     if target_id.is_empty() {
         return Err(A11yError::CdpAttachFailed {
@@ -1310,7 +1450,7 @@ pub async fn fetch_interception_ensure(
         if slot.patterns == patterns {
             return Ok(fetch_interception_status_from_slot(&slot, false));
         }
-        let _ = fetch_interception_stop(target_id).await?;
+        let _ = fetch_interception_stop_locked(target_id).await?;
     }
 
     let fetch_patterns = fetch_patterns_to_cdp(&patterns)?;
@@ -1360,6 +1500,9 @@ pub async fn fetch_interception_ensure(
     let listener_task = tokio::spawn(async move {
         let _page = page;
         while let Some(event) = request_paused.next().await {
+            if !DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.load(Ordering::SeqCst) {
+                break;
+            }
             let event = event.as_ref();
             let request_id = fetch_request_id_string(&event.request_id);
             if let Ok(mut counters) = pump_counters.lock() {
@@ -1373,6 +1516,9 @@ pub async fn fetch_interception_ensure(
                 .and_then(|rules| fetch_route_match(event, &rules));
             if let Some(rule) = matched_rule {
                 let route_id = rule.id.clone();
+                if !DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.load(Ordering::SeqCst) {
+                    break;
+                }
                 match fetch_apply_route(&listener_page, event, &rule).await {
                     Ok(applied) => {
                         if let Ok(mut counters) = pump_counters.lock() {
@@ -1396,6 +1542,9 @@ pub async fn fetch_interception_ensure(
                         let mut last_error = format!(
                             "Fetch route {route_id} failed request_id={request_id}: {error}"
                         );
+                        if !DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let continued = listener_page
                             .execute(FetchContinueRequestParams::new(event.request_id.clone()))
                             .await;
@@ -1421,6 +1570,9 @@ pub async fn fetch_interception_ensure(
                     }
                 }
             } else {
+                if !DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.load(Ordering::SeqCst) {
+                    break;
+                }
                 let continued = listener_page
                     .execute(FetchContinueRequestParams::new(event.request_id.clone()))
                     .await;
@@ -1455,6 +1607,14 @@ pub async fn fetch_interception_ensure(
         handler_task,
         listener_task,
     });
+    if let Err(error) =
+        require_durable_browser_mutation_owners_enabled("Fetch interception registration")
+    {
+        slot.listener_task.abort();
+        let _ = slot.page.execute(FetchDisableParams::default()).await;
+        slot.handler_task.abort();
+        return Err(error);
+    }
     if let Ok(mut slots) = fetch_registry().slots.lock() {
         if let Some(existing) = slots.get(target_id)
             && !existing.listener_task.is_finished()
@@ -1485,6 +1645,7 @@ pub fn fetch_route_add(
     target_id: &str,
     rule: CdpFetchRouteRule,
 ) -> A11yResult<CdpFetchInterceptionStatus> {
+    require_durable_browser_mutation_owners_enabled("Fetch route install")?;
     let target_id = target_id.trim();
     validate_fetch_route_rule(&rule)?;
     let slot = lookup_fetch_live(target_id).ok_or_else(|| A11yError::CdpAttachFailed {
@@ -1494,6 +1655,7 @@ pub fn fetch_route_add(
         let mut rules = slot.rules.lock().map_err(|_| A11yError::CdpAttachFailed {
             detail: "Fetch route registry lock is poisoned".to_owned(),
         })?;
+        require_durable_browser_mutation_owners_enabled("Fetch route registration")?;
         if let Some(existing) = rules.iter_mut().find(|existing| existing.id == rule.id) {
             *existing = rule;
         } else {
@@ -1534,6 +1696,11 @@ pub fn fetch_route_clear(target_id: &str) -> A11yResult<usize> {
 
 /// Disables Fetch interception for a target. Returns false when no slot exists.
 pub async fn fetch_interception_stop(target_id: &str) -> A11yResult<bool> {
+    let _operation_guard = durable_browser_mutation_operation_lock().lock().await;
+    fetch_interception_stop_locked(target_id).await
+}
+
+async fn fetch_interception_stop_locked(target_id: &str) -> A11yResult<bool> {
     let target_id = target_id.trim();
     let slot = fetch_registry()
         .slots
@@ -1543,13 +1710,410 @@ pub async fn fetch_interception_stop(target_id: &str) -> A11yResult<bool> {
     let Some(slot) = slot else {
         return Ok(false);
     };
-    slot.page
-        .execute(FetchDisableParams::default())
-        .await
-        .map_err(|err| A11yError::CdpAxtreeFailed {
-            detail: format!("Fetch.disable for target {target_id}: {err}"),
-        })?;
+    let outcome = stop_fetch_interception_slot(&slot).await;
+    if !outcome.failures.is_empty() {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "Fetch stop/drain for target {target_id}: {}",
+                outcome.failures.join("; ")
+            ),
+        });
+    }
     Ok(true)
+}
+
+struct DurableOwnerStopOutcome {
+    physical_state_cleared: bool,
+    listener_task_drained: bool,
+    handler_task_drained: bool,
+    failures: Vec<String>,
+}
+
+async fn wait_for_aborted_task(handle: &JoinHandle<()>) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+async fn stop_fetch_interception_slot(slot: &FetchInterceptionSlot) -> DurableOwnerStopOutcome {
+    let mut failures = Vec::new();
+    slot.listener_task.abort();
+    let listener_task_drained = wait_for_aborted_task(&slot.listener_task).await;
+    if !listener_task_drained {
+        failures.push(format!(
+            "Fetch listener task did not drain for target {:?}",
+            slot.target_id
+        ));
+    }
+    let physical_state_cleared = match slot.page.execute(FetchDisableParams::default()).await {
+        Ok(_) => true,
+        Err(error) => {
+            failures.push(format!(
+                "Fetch.disable failed for target {:?}: {error}",
+                slot.target_id
+            ));
+            false
+        }
+    };
+    slot.handler_task.abort();
+    let handler_task_drained = wait_for_aborted_task(&slot.handler_task).await;
+    if !handler_task_drained {
+        failures.push(format!(
+            "Fetch handler task did not drain for target {:?}",
+            slot.target_id
+        ));
+    }
+    DurableOwnerStopOutcome {
+        physical_state_cleared,
+        listener_task_drained,
+        handler_task_drained,
+        failures,
+    }
+}
+
+async fn clear_network_override_slot(slot: &NetworkOverrideSlot) -> DurableOwnerStopOutcome {
+    let mut failures = Vec::new();
+    let target_id = slot
+        .state
+        .lock()
+        .ok()
+        .map(|state| state.cdp_target_id.clone())
+        .unwrap_or_else(|| "<poisoned-state>".to_owned());
+    let mut physical_state_cleared = true;
+    match network_override_headers_params(&[]) {
+        Ok(params) => {
+            if let Err(error) = slot.page.execute(params).await {
+                physical_state_cleared = false;
+                failures.push(format!(
+                    "Network.setExtraHTTPHeaders clear failed for target {target_id:?}: {error}"
+                ));
+            }
+        }
+        Err(error) => {
+            physical_state_cleared = false;
+            failures.push(format!(
+                "build empty Network.setExtraHTTPHeaders for target {target_id:?}: {error}"
+            ));
+        }
+    }
+    let original_user_agent = slot
+        .state
+        .lock()
+        .ok()
+        .and_then(|state| state.original_user_agent.clone());
+    if let Some(original) = original_user_agent.as_deref() {
+        match network_override_user_agent_params(original) {
+            Ok(params) => {
+                if let Err(error) = slot.page.execute(params).await {
+                    physical_state_cleared = false;
+                    failures.push(format!(
+                        "Emulation.setUserAgentOverride restore failed for target {target_id:?}: {error}"
+                    ));
+                }
+            }
+            Err(error) => {
+                physical_state_cleared = false;
+                failures.push(format!(
+                    "build original User-Agent restore for target {target_id:?}: {error}"
+                ));
+            }
+        }
+    }
+    if let Ok(mut status) = slot.state.lock() {
+        status.newly_armed = false;
+        status.applied_at_unix_ms = now_unix_ms_u64();
+        status.header_count = 0;
+        status.headers.clear();
+        status.user_agent = None;
+    } else {
+        failures.push(format!(
+            "network override state lock poisoned for target {target_id:?}"
+        ));
+    }
+    slot.handler_task.abort();
+    let handler_task_drained = wait_for_aborted_task(&slot.handler_task).await;
+    if !handler_task_drained {
+        failures.push(format!(
+            "network override handler task did not drain for target {target_id:?}"
+        ));
+    }
+    DurableOwnerStopOutcome {
+        physical_state_cleared,
+        listener_task_drained: true,
+        handler_task_drained,
+        failures,
+    }
+}
+
+/// Independent process-global readback for durable browser mutation owners.
+#[must_use]
+pub fn durable_browser_mutation_owners_readback() -> CdpDurableBrowserMutationOwnersReadback {
+    let mut registry_readback_failures = Vec::new();
+    let fetch_interception_active_count = match fetch_registry().slots.lock() {
+        Ok(slots) => slots.len(),
+        Err(_) => {
+            registry_readback_failures
+                .push("Fetch interception registry lock is poisoned".to_owned());
+            usize::MAX
+        }
+    };
+    let network_override_active_count = match override_registry().slots.lock() {
+        Ok(slots) => slots.len(),
+        Err(_) => {
+            registry_readback_failures
+                .push("network override registry lock is poisoned".to_owned());
+            usize::MAX
+        }
+    };
+    let dialog_auto_policy_active_count =
+        match crate::cdp_dialog::dialog_capture_active_count_readback() {
+            Ok(count) => count,
+            Err(error) => {
+                registry_readback_failures.push(error);
+                usize::MAX
+            }
+        };
+    let init_script_active_count =
+        match crate::cdp_action::durable_init_script_active_count_readback() {
+            Ok(count) => count,
+            Err(error) => {
+                registry_readback_failures.push(error);
+                usize::MAX
+            }
+        };
+    let clock_active_count = match crate::cdp_clock::durable_clock_active_count_readback() {
+        Ok(count) => count,
+        Err(error) => {
+            registry_readback_failures.push(error);
+            usize::MAX
+        }
+    };
+    let persisted = crate::cdp_action::persisted_cdp_mutation_owner_readback();
+    registry_readback_failures.extend(persisted.failures.clone());
+    let registry_readback_healthy = registry_readback_failures.is_empty();
+    CdpDurableBrowserMutationOwnersReadback {
+        enabled: DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.load(Ordering::SeqCst),
+        disable_sequence: DURABLE_BROWSER_MUTATION_DISABLE_SEQUENCE.load(Ordering::SeqCst),
+        fetch_interception_active_count,
+        network_override_active_count,
+        dialog_auto_policy_active_count,
+        clock_active_count,
+        init_script_active_count,
+        persisted_cdp_mutation_owner_count: persisted.total_count,
+        persisted_cdp_input_owner_count: persisted.input_count,
+        persisted_cdp_evaluate_owner_count: persisted.evaluate_count,
+        persisted_cdp_init_script_effect_owner_count: persisted.init_script_effect_count,
+        unresolved_raw_cdp_evaluate_timeout_count:
+            crate::cdp_action::unresolved_raw_cdp_evaluate_timeout_count(),
+        unresolved_raw_cdp_input_owner_count:
+            crate::cdp_action::unresolved_raw_cdp_input_owner_count(),
+        registry_readback_failures,
+        registry_readback_healthy,
+    }
+}
+
+/// Synchronous K1 tripwire. The process-global install/dispatch gate closes
+/// before the returned fail-closed readback inspects the local durable ledger,
+/// so no new browser mutation can cross a slow or unhealthy ledger read. The
+/// async K2 drain performs physical reconciliation afterward.
+#[must_use]
+pub fn durable_browser_mutation_owners_disable_now() -> CdpDurableBrowserMutationOwnersReadback {
+    DURABLE_BROWSER_MUTATION_DISABLE_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.store(false, Ordering::SeqCst);
+    durable_browser_mutation_owners_readback()
+}
+
+#[must_use]
+pub(crate) fn durable_browser_mutation_owners_enabled() -> bool {
+    DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.load(Ordering::SeqCst)
+}
+
+/// K1/K2 cleanup boundary for browser-owned mutators that can outlive their
+/// installing MCP call. It first closes the install gate, waits for any
+/// in-flight installer, then removes every owner from its registry, aborts and
+/// drains autonomous tasks, clears physical CDP state, and performs a separate
+/// registry readback.
+pub async fn durable_browser_mutation_owners_disable_and_drain()
+-> CdpDurableBrowserMutationOwnersDrainReadback {
+    DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.store(false, Ordering::SeqCst);
+    let _operation_guard = durable_browser_mutation_operation_lock().lock().await;
+    let mut failures = Vec::new();
+
+    let fetch_slots = match fetch_registry().slots.lock() {
+        Ok(mut slots) => std::mem::take(&mut *slots),
+        Err(_) => {
+            failures.push("Fetch interception registry lock is poisoned".to_owned());
+            HashMap::new()
+        }
+    };
+    let fetch_interceptions_found = fetch_slots.len();
+    let mut fetch_interceptions_stopped = 0usize;
+    let mut fetch_listener_tasks_drained = 0usize;
+    let mut fetch_handler_tasks_drained = 0usize;
+    for slot in fetch_slots.into_values() {
+        let outcome = stop_fetch_interception_slot(&slot).await;
+        fetch_interceptions_stopped += usize::from(outcome.physical_state_cleared);
+        fetch_listener_tasks_drained += usize::from(outcome.listener_task_drained);
+        fetch_handler_tasks_drained += usize::from(outcome.handler_task_drained);
+        failures.extend(outcome.failures);
+    }
+
+    let override_slots = match override_registry().slots.lock() {
+        Ok(mut slots) => std::mem::take(&mut *slots),
+        Err(_) => {
+            failures.push("network override registry lock is poisoned".to_owned());
+            HashMap::new()
+        }
+    };
+    let network_overrides_found = override_slots.len();
+    let mut network_overrides_cleared = 0usize;
+    let mut network_override_handler_tasks_drained = 0usize;
+    for slot in override_slots.into_values() {
+        let outcome = clear_network_override_slot(&slot).await;
+        network_overrides_cleared += usize::from(outcome.physical_state_cleared);
+        network_override_handler_tasks_drained += usize::from(outcome.handler_task_drained);
+        failures.extend(outcome.failures);
+    }
+
+    let dialog = crate::cdp_dialog::dialog_capture_disable_and_drain_all().await;
+    let dialog_auto_policies_found = dialog.found;
+    let dialog_listener_tasks_drained = dialog.listener_tasks_drained;
+    let dialog_handler_tasks_drained = dialog.handler_tasks_drained;
+    let dialog_active_after = dialog.active_after;
+    failures.extend(dialog.failures);
+
+    let clocks = crate::cdp_clock::durable_clocks_disable_and_drain_all().await;
+    let clocks_found = clocks.found;
+    let clocks_uninstalled = clocks.uninstalled;
+    let clocks_active_after = clocks.active_after;
+    failures.extend(clocks.failures);
+
+    let init_scripts = crate::cdp_action::durable_init_scripts_disable_and_drain_all().await;
+    let init_scripts_found = init_scripts.found;
+    let init_scripts_removed = init_scripts.removed;
+    let init_scripts_active_after = init_scripts.active_after;
+    failures.extend(init_scripts.failures);
+
+    let persisted = crate::cdp_action::persisted_cdp_mutation_owners_disable_and_drain().await;
+    let persisted_cdp_mutation_owners_found = persisted.total_found;
+    let persisted_cdp_input_owners_found = persisted.input_found;
+    let persisted_cdp_input_owners_drained = persisted.input_drained;
+    let persisted_cdp_input_owners_remaining = persisted.input_remaining;
+    let persisted_cdp_evaluate_owners_found = persisted.evaluate_found;
+    let persisted_cdp_evaluate_owners_drained = persisted.evaluate_drained;
+    let persisted_cdp_evaluate_owners_remaining = persisted.evaluate_remaining;
+    let persisted_cdp_init_script_effect_owners_found = persisted.init_script_effect_found;
+    let persisted_cdp_init_script_effect_owners_drained = persisted.init_script_effect_drained;
+    let persisted_cdp_init_script_effect_owners_remaining = persisted.init_script_effect_remaining;
+    let persisted_cdp_mutation_owners_remaining = persisted.total_remaining;
+    failures.extend(persisted.failures);
+
+    let readback = durable_browser_mutation_owners_readback();
+    if readback.unresolved_raw_cdp_evaluate_timeout_count != 0 {
+        failures.push(format!(
+            "{} raw CDP Runtime.evaluate timeout(s) remain permanently unresolved because CDP exposes no cancellation primitive",
+            readback.unresolved_raw_cdp_evaluate_timeout_count
+        ));
+    }
+    if readback.unresolved_raw_cdp_input_owner_count != 0 {
+        failures.push(format!(
+            "{} raw CDP input owner(s) remain unresolved because an acknowledged terminal release was not observed",
+            readback.unresolved_raw_cdp_input_owner_count
+        ));
+    }
+    let fully_drained = failures.is_empty()
+        && fetch_interceptions_stopped == fetch_interceptions_found
+        && fetch_listener_tasks_drained == fetch_interceptions_found
+        && fetch_handler_tasks_drained == fetch_interceptions_found
+        && network_overrides_cleared == network_overrides_found
+        && network_override_handler_tasks_drained == network_overrides_found
+        && dialog_listener_tasks_drained == dialog_auto_policies_found
+        && dialog_handler_tasks_drained == dialog_auto_policies_found
+        && dialog_active_after == 0
+        && clocks_uninstalled == clocks_found
+        && clocks_active_after == 0
+        && init_scripts_removed == init_scripts_found
+        && init_scripts_active_after == 0
+        && persisted_cdp_input_owners_drained == persisted_cdp_input_owners_found
+        && persisted_cdp_evaluate_owners_drained == persisted_cdp_evaluate_owners_found
+        && persisted_cdp_init_script_effect_owners_drained
+            == persisted_cdp_init_script_effect_owners_found
+        && persisted_cdp_mutation_owners_remaining == 0
+        && !readback.enabled
+        && readback.registry_readback_healthy
+        && readback.fetch_interception_active_count == 0
+        && readback.network_override_active_count == 0
+        && readback.dialog_auto_policy_active_count == 0
+        && readback.clock_active_count == 0
+        && readback.init_script_active_count == 0
+        && readback.persisted_cdp_mutation_owner_count == 0
+        && readback.persisted_cdp_input_owner_count == 0
+        && readback.persisted_cdp_evaluate_owner_count == 0
+        && readback.persisted_cdp_init_script_effect_owner_count == 0
+        && readback.unresolved_raw_cdp_evaluate_timeout_count == 0
+        && readback.unresolved_raw_cdp_input_owner_count == 0;
+    CdpDurableBrowserMutationOwnersDrainReadback {
+        fetch_interceptions_found,
+        fetch_interceptions_stopped,
+        fetch_listener_tasks_drained,
+        fetch_handler_tasks_drained,
+        network_overrides_found,
+        network_overrides_cleared,
+        network_override_handler_tasks_drained,
+        dialog_auto_policies_found,
+        dialog_listener_tasks_drained,
+        dialog_handler_tasks_drained,
+        clocks_found,
+        clocks_uninstalled,
+        init_scripts_found,
+        init_scripts_removed,
+        persisted_cdp_mutation_owners_found,
+        persisted_cdp_input_owners_found,
+        persisted_cdp_input_owners_drained,
+        persisted_cdp_input_owners_remaining,
+        persisted_cdp_evaluate_owners_found,
+        persisted_cdp_evaluate_owners_drained,
+        persisted_cdp_evaluate_owners_remaining,
+        persisted_cdp_init_script_effect_owners_found,
+        persisted_cdp_init_script_effect_owners_drained,
+        persisted_cdp_init_script_effect_owners_remaining,
+        persisted_cdp_mutation_owners_remaining,
+        failures,
+        readback,
+        fully_drained,
+    }
+}
+
+/// Re-opens the durable-owner install gate only if no newer K1 tripwire fired
+/// after the generation which the caller drained. Existing owners are never
+/// recreated implicitly, and poisoned/non-empty readback leaves the gate shut.
+pub async fn durable_browser_mutation_owners_enable_if_unchanged(
+    expected_disable_sequence: u64,
+) -> CdpDurableBrowserMutationOwnersReadback {
+    let _operation_guard = durable_browser_mutation_operation_lock().lock().await;
+    let before = durable_browser_mutation_owners_readback();
+    if before.disable_sequence == expected_disable_sequence
+        && !before.enabled
+        && before.registry_readback_healthy
+        && before.fetch_interception_active_count == 0
+        && before.network_override_active_count == 0
+        && before.dialog_auto_policy_active_count == 0
+        && before.clock_active_count == 0
+        && before.init_script_active_count == 0
+        && before.persisted_cdp_mutation_owner_count == 0
+        && before.persisted_cdp_input_owner_count == 0
+        && before.persisted_cdp_evaluate_owner_count == 0
+        && before.persisted_cdp_init_script_effect_owner_count == 0
+        && before.unresolved_raw_cdp_evaluate_timeout_count == 0
+        && before.unresolved_raw_cdp_input_owner_count == 0
+    {
+        DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.store(true, Ordering::SeqCst);
+    }
+    durable_browser_mutation_owners_readback()
 }
 
 /// Number of targets with an active Fetch interception scaffold.
@@ -1684,6 +2248,13 @@ async fn network_override_ensure(
         _browser: browser,
         handler_task,
     });
+    if let Err(error) =
+        require_durable_browser_mutation_owners_enabled("network override registration")
+    {
+        slot.handler_task.abort();
+        let _ = wait_for_aborted_task(&slot.handler_task).await;
+        return Err(error);
+    }
     if let Ok(mut slots) = override_registry().slots.lock() {
         if let Some(existing) = slots.get(target_id)
             && !existing.handler_task.is_finished()

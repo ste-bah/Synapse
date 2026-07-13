@@ -212,6 +212,29 @@ impl ReflexRuntime {
         self.disable_all_with_reason("release_all")
     }
 
+    /// Disables one exact reflex registered by the ActionHandle combo bridge
+    /// when an operator-panic epoch crosses its registration critical section.
+    /// The caller holds the runtime lock across register, epoch recheck, and
+    /// this rollback, so no later K2 sweep can miss the generated id.
+    pub(crate) fn disable_exact_for_operator_panic(
+        &mut self,
+        reflex_id: &str,
+    ) -> ReflexResult<Option<ReflexStatus>> {
+        let Some(scheduler) = self.scheduler.as_mut() else {
+            return Ok(None);
+        };
+        let mut disabled = scheduler.disable_reflexes(&[reflex_id.to_owned()]);
+        let status = disabled.pop();
+        if let Some(status) = &status {
+            self.disabled_reflex_ids.insert(status.id.clone());
+            self.write_disabled_audits_with_reason(
+                std::slice::from_ref(status),
+                "operator_hotkey",
+            )?;
+        }
+        Ok(status)
+    }
+
     fn disable_all_with_reason(&mut self, reason: &'static str) -> ReflexResult<Vec<ReflexStatus>> {
         let Some(scheduler) = self.scheduler.as_mut() else {
             return Ok(Vec::new());

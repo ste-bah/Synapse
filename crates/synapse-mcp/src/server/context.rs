@@ -9,6 +9,7 @@ use super::{
 };
 use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
@@ -37,6 +38,7 @@ type M2ReleaseAllContext = (
 
 const PROFILE_CHANGED_KIND: &str = "profile-changed";
 const SCOPE_TRANSITIONED_KIND: &str = "scope-transitioned";
+const SCOPE_TRANSITION_BUDGET: Duration = Duration::from_millis(200);
 pub(crate) const APPROVAL_REQUEST_EVENT_KIND: &str = "approval_request";
 pub(crate) const APPROVAL_DECISION_EVENT_KIND: &str = "approval_decision";
 pub(crate) const APPROVAL_TIMEOUT_EVENT_KIND: &str = "approval_timeout";
@@ -203,6 +205,28 @@ impl SynapseService {
         &self,
         tool: &'static str,
     ) -> Result<ActionPreflightReadback, ErrorData> {
+        self.ensure_supported_use_allows_action_mode(tool, true)
+    }
+
+    /// Profile/target policy preflight for the two panic-safe shell controls:
+    /// status is a read and cancel only reduces owned process authority. They
+    /// must remain callable while operator-panic K1/K2 is pending.
+    pub(super) fn ensure_supported_use_allows_shell_observe_or_cancel(
+        &self,
+    ) -> Result<ActionPreflightReadback, ErrorData> {
+        self.ensure_supported_use_allows_action_mode("act_run_shell", false)
+    }
+
+    fn ensure_supported_use_allows_action_mode(
+        &self,
+        tool: &'static str,
+        enforce_operator_panic_admission: bool,
+    ) -> Result<ActionPreflightReadback, ErrorData> {
+        let operator_panic_epoch = if enforce_operator_panic_admission {
+            crate::m2::arm_operator_panic_action_admission(tool, "action_preflight_entry")?
+        } else {
+            synapse_action::operator_panic_epoch()
+        };
         let runtime = self.profile_runtime()?;
         let active_profile_id_before = runtime
             .active_profile_id()
@@ -226,6 +250,7 @@ impl SynapseService {
                     );
                     let preflight = super::action_preflight::no_foreground_preflight(
                         tool,
+                        operator_panic_epoch,
                         active_profile_id_before,
                     );
                     ensure_profile_scope_allows_action(
@@ -234,6 +259,13 @@ impl SynapseService {
                         self.allow_unknown_profile()?,
                     )
                     .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
+                    if enforce_operator_panic_admission {
+                        crate::m2::ensure_operator_panic_action_admission(
+                            tool,
+                            "action_preflight_no_foreground_exit",
+                            operator_panic_epoch,
+                        )?;
+                    }
                     return Ok(preflight);
                 }
                 return Err(error);
@@ -241,6 +273,7 @@ impl SynapseService {
         };
         let (foreground, preflight) = self.preflight_action_foreground(
             tool,
+            operator_panic_epoch,
             &runtime,
             active_profile_id_before,
             initial_foreground,
@@ -256,6 +289,13 @@ impl SynapseService {
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
         super::target_policy::ensure_supported_use_allows(&runtime, &foreground, tool)
             .map_err(|error| attach_action_preflight_to_error(&error, &preflight))?;
+        if enforce_operator_panic_admission {
+            crate::m2::ensure_operator_panic_action_admission(
+                tool,
+                "action_preflight_exit",
+                operator_panic_epoch,
+            )?;
+        }
         Ok(preflight)
     }
 
@@ -932,12 +972,14 @@ impl SynapseService {
         &self,
         foreground: &ForegroundContext,
     ) -> Result<ForegroundProfileTransition, ErrorData> {
+        let started = Instant::now();
         let runtime = self.profile_runtime()?;
         let transition = runtime
             .reevaluate_foreground(&foreground_window(foreground))
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let event_bus = self.sse_state()?.event_bus();
         publish_profile_transition_events(&event_bus, &transition, foreground);
+        record_scope_transition_budget(started.elapsed(), &transition);
         Ok(transition)
     }
 
@@ -1183,11 +1225,13 @@ impl ReflexActionGate for ReflexScopeActionGate {
         const TOOL: &str = "reflex_dispatch";
         (|| {
             let foreground = current_reflex_action_foreground(&self.m1_state)?;
+            let started = Instant::now();
             let transition = self
                 .profile_runtime
                 .reevaluate_foreground(&foreground_window(&foreground))
                 .map_err(|error| mcp_error(error.code(), error.to_string()))?;
             publish_profile_transition_events(&self.event_bus, &transition, &foreground);
+            record_scope_transition_budget(started.elapsed(), &transition);
             ensure_profile_scope_allows_action(
                 &self.profile_runtime,
                 TOOL,
@@ -1356,6 +1400,37 @@ fn publish_profile_transition_events(
             old_scope = profile_use_scope_label(transition.effective_previous_scope),
             new_scope = profile_use_scope_label(transition.effective_active_scope),
             "scope-transitioned event published"
+        );
+    }
+}
+
+fn scope_transition_within_budget(elapsed: Duration) -> bool {
+    elapsed <= SCOPE_TRANSITION_BUDGET
+}
+
+fn record_scope_transition_budget(elapsed: Duration, transition: &ForegroundProfileTransition) {
+    let elapsed_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+    let budget_ms = u64::try_from(SCOPE_TRANSITION_BUDGET.as_millis()).unwrap_or(u64::MAX);
+    let within_budget = scope_transition_within_budget(elapsed);
+    if within_budget {
+        tracing::debug!(
+            code = "SCOPE_TRANSITION_BUDGET_OBSERVED",
+            elapsed_us,
+            budget_ms,
+            within_budget,
+            changed = transition.changed,
+            scope_changed = transition.scope_changed,
+            "profile scope transition completed within its observable policy budget"
+        );
+    } else {
+        tracing::warn!(
+            code = "SCOPE_TRANSITION_BUDGET_EXCEEDED",
+            elapsed_us,
+            budget_ms,
+            within_budget,
+            changed = transition.changed,
+            scope_changed = transition.scope_changed,
+            "profile scope transition exceeded its policy budget; state and event publication still completed before return"
         );
     }
 }
@@ -1546,7 +1621,7 @@ pub(super) fn maybe_force_panic_during_act(_tool: &'static str) {}
 
 #[cfg(test)]
 mod scope_gate_tests {
-    use std::{fs, num::NonZeroUsize, path::Path};
+    use std::{fs, num::NonZeroUsize, path::Path, time::Duration};
 
     use rmcp::{handler::server::wrapper::Parameters, model::Extensions};
     use serde_json::{Value, json};
@@ -1896,7 +1971,7 @@ mod scope_gate_tests {
             state.last_observed_foreground = Some(
                 synthetic_process_input(
                     "chrome.exe",
-                    "Synapse 751 CDP FSV - Google Chrome",
+                    "Synapse 751 CDP Regression - Google Chrome",
                     0x373137a,
                 )
                 .foreground,
@@ -2564,6 +2639,13 @@ mod scope_gate_tests {
     }
 
     #[test]
+    fn scope_transition_budget_boundary_is_deterministic() {
+        assert!(scope_transition_within_budget(Duration::from_millis(199)));
+        assert!(scope_transition_within_budget(Duration::from_millis(200)));
+        assert!(!scope_transition_within_budget(Duration::from_millis(201)));
+    }
+
+    #[test]
     fn action_scope_gate_reevaluates_foreground_and_denies_no_profile_after_transition()
     -> anyhow::Result<()> {
         let profiles = TempDir::new()?;
@@ -2764,6 +2846,7 @@ max_detections = 8
         let proof = foreground_proof_for(foreground);
         ActionPreflightReadback {
             tool: "act_type",
+            operator_panic_epoch_at_arm: synapse_action::operator_panic_epoch(),
             target_profile_id: None,
             active_profile_id_before: None,
             applied: false,

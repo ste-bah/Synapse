@@ -184,6 +184,7 @@ pub struct ObserveParams {
     /// session's active target; when both are absent, observe falls back to the
     /// global foreground (back-compat).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -224,6 +225,7 @@ pub struct FindParams {
     #[serde(default)]
     pub in_window: Option<ElementId>,
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -287,6 +289,7 @@ pub struct ReadTextParams {
     /// Explicit per-call window override (HWND). Takes precedence over the
     /// session's active target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub backend: OcrBackend,
@@ -309,6 +312,7 @@ pub struct CaptureScreenshotParams {
     /// Explicit per-call window override (HWND). Takes precedence over the
     /// session's active target. When set, `region` is client-relative.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub overwrite: bool,
@@ -392,6 +396,7 @@ pub struct ScreenshotParams {
     /// Explicit per-call window override (HWND). Takes precedence over the
     /// session's active target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub overwrite: bool,
@@ -433,6 +438,7 @@ pub struct CaptureGifParams {
     pub interval_ms: Option<u64>,
     /// Window HWND to record. Defaults to this session's bound target window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Downscale (aspect-preserving) so each frame's longest edge never exceeds
     /// this. Default 800; set 0 to disable.
@@ -472,6 +478,7 @@ pub struct BrowserScreenshotParams {
     /// Browser HWND that owns the target. Required only when passing an
     /// explicit `cdp_target_id` without an active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub scope: BrowserScreenshotScope,
@@ -608,6 +615,7 @@ pub struct BrowserPdfParams {
     /// Browser HWND that owns the target. Required only when passing an explicit
     /// `cdp_target_id` without an active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     #[serde(default)]
     pub landscape: bool,
@@ -704,6 +712,7 @@ pub struct BrowserDownloadsParams {
     /// session target is set, the current human foreground Chromium window is
     /// used only as an explicit bridge discovery source and reported back.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Chrome download id. Use this for exact save/move of a prior list/wait row.
     #[serde(default)]
@@ -841,6 +850,7 @@ pub struct HiddenDesktopPipFrameParams {
     #[serde(default)]
     pub watched_session_id: Option<String>,
     /// Hidden-desktop top-level window HWND to capture.
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: i64,
     /// Output PNG/JPEG frame path. This is the read-only viewer surface.
     pub path: String,
@@ -912,9 +922,16 @@ pub struct SetCaptureTargetParams {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureTargetParam {
     Primary,
-    Monitor { monitor_index: u32 },
-    Window { window_hwnd: i64 },
-    ElementWindow { element_id: ElementId },
+    Monitor {
+        monitor_index: u32,
+    },
+    Window {
+        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
+        window_hwnd: i64,
+    },
+    ElementWindow {
+        element_id: ElementId,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -956,9 +973,11 @@ pub struct SetPerceptionModeResponse {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SetTargetParam {
     Window {
+        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
         window_hwnd: i64,
     },
     Cdp {
+        #[schemars(range(min = 1, max = 4_294_967_295_u64))]
         window_hwnd: i64,
         cdp_target_id: String,
     },
@@ -1082,6 +1101,7 @@ pub struct CdpOpenTabParams {
     /// Browser HWND with a reachable CDP endpoint. If omitted, the caller must
     /// already have a session window/CDP target set.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Initial URL for the background tab. Empty string opens about:blank.
     pub url: String,
@@ -1148,6 +1168,7 @@ pub struct CdpTargetInfoParams {
     /// Browser HWND whose target table contains the CDP/Chrome bridge target.
     /// If omitted, the active session CDP target is used.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// CDP TargetID / Chrome bridge target id to read. If omitted, the active
     /// session CDP target is used.
@@ -1216,6 +1237,7 @@ pub struct BrowserTabsParams {
     /// target's window is used; if the session has no target, this explicit
     /// discovery behavior is available only for `list` and `select`.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Target id for `select`, `activate`, or `close`.
     #[serde(default)]
@@ -1363,6 +1385,7 @@ pub struct BrowserNavParams {
     /// Browser HWND whose target table contains the tab. If omitted, the active
     /// session CDP target or owned `cdp_target_id` is used.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Chrome bridge/CDP target id. If omitted, the active session CDP target is used.
     #[serde(default)]
@@ -1398,6 +1421,7 @@ pub struct BrowserAdoptActiveTabParams {
     /// explicit adoption tool passively uses the current human OS foreground
     /// Chromium window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -1702,6 +1726,7 @@ pub struct CdpNavigateTabParams {
     /// Browser HWND whose target table contains the CDP target. If omitted, the
     /// caller must already have an active CDP session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// CDP TargetID to navigate. If omitted, the active session CDP target is used.
     #[serde(default)]
@@ -1776,6 +1801,7 @@ pub struct CdpActivateTabParams {
     /// Browser HWND whose target table contains the CDP target. If omitted, the
     /// caller must already have an active CDP session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// CDP TargetID to activate. If omitted, the active session CDP target is used.
     #[serde(default)]
@@ -1828,6 +1854,7 @@ pub struct BrowserEvaluateParams {
     /// Browser HWND that owns the target. Required only when passing an explicit
     /// `cdp_target_id` without an active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Optional element id (from `find`/`observe`) to scope evaluation to a DOM
     /// element. When set, `expression` MUST be a function and is called
@@ -1939,6 +1966,7 @@ pub struct BrowserExposeBindingParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Optional execution context name for Runtime.addBinding, matching CDP
     /// `executionContextName` / init-script `worldName`.
@@ -2039,6 +2067,7 @@ pub struct BrowserAddInitScriptParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// JavaScript source for `operation=add`. It runs before page scripts on
     /// subsequent new documents/navigations for this page target.
@@ -2100,6 +2129,7 @@ pub struct BrowserAddScriptTagParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Remote script URL to load into a `<script src=...>`.
     #[serde(default)]
@@ -2128,6 +2158,7 @@ pub struct BrowserAddStyleTagParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Remote stylesheet URL to load into a `<link rel=stylesheet href=...>`.
     #[serde(default)]
@@ -2194,6 +2225,7 @@ pub struct BrowserWaitForParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Text to wait for. If supplied without `state`, the tool waits for it to
     /// appear. Omit text for a plain timeout wait.
@@ -2267,6 +2299,7 @@ pub struct BrowserWaitForLoadStateParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
     #[serde(default)]
@@ -2331,6 +2364,7 @@ pub struct BrowserWaitForUrlParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
     #[serde(default)]
@@ -2433,6 +2467,7 @@ pub struct BrowserWaitForRequestParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
     #[serde(default)]
@@ -2499,6 +2534,7 @@ pub struct BrowserWaitForNetworkResponseParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum wait budget in milliseconds. Defaults to 30 seconds.
     #[serde(default)]
@@ -2555,6 +2591,7 @@ pub struct BrowserWaitForFunctionParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Optional JSON arguments forwarded to function predicates.
     #[serde(default)]
@@ -2692,6 +2729,7 @@ pub struct BrowserWaitForSelectorParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND that owns the target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum matches to inspect per poll (default 50, capped at 500).
     #[serde(default)]
@@ -2829,6 +2867,7 @@ pub struct BrowserContentParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum HTML bytes to return (UTF-16 length cap, default 2 MiB). The HTML
     /// is truncated in-page; `truncated`/`html_len` report the original size.
@@ -2873,6 +2912,7 @@ pub struct BrowserSetContentParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Full replacement HTML for the target's main frame.
     pub html: String,
@@ -2926,6 +2966,7 @@ pub struct BrowserConsoleMessagesParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Return only entries with `seq >= since_seq` (delta semantics). Pass the
     /// prior response's `next_cursor` to receive only entries added since.
@@ -3020,6 +3061,7 @@ pub struct BrowserInspectParams {
     /// Browser HWND that owns the target. Required only when the active session
     /// target is absent.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum bytes per HTML/text field (UTF-16 length cap, default 256 KiB).
     #[serde(default)]
@@ -3104,6 +3146,7 @@ pub struct BrowserScrollIntoViewParams {
     /// Browser HWND that owns the target. Required only when the active session
     /// target is absent.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -3259,6 +3302,7 @@ pub struct BrowserLocateParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Maximum element ids to return (default 50, capped at 500). `match_count`
     /// always reports the full number of matches.
@@ -3367,6 +3411,8 @@ pub fn set_target_input_schema() -> Arc<JsonObject> {
                             },
                             "window_hwnd": {
                                 "type": "integer",
+                                "minimum": 1,
+                                "maximum": 4294967295_u64,
                                 "description": "Native top-level window HWND to bind to this MCP session."
                             }
                         }
@@ -3383,6 +3429,8 @@ pub fn set_target_input_schema() -> Arc<JsonObject> {
                             },
                             "window_hwnd": {
                                 "type": "integer",
+                                "minimum": 1,
+                                "maximum": 4294967295_u64,
                                 "description": "Native browser window HWND whose CDP endpoint owns the target."
                             },
                             "cdp_target_id": {
@@ -4645,6 +4693,60 @@ pub fn mcp_error(code: &'static str, message: impl Into<String>) -> ErrorData {
     )
 }
 
+/// Rejects malformed native window handles before target resolution or any
+/// hidden-desktop worker dispatch. This deliberately validates only the handle
+/// shape: a canonical HWND owned by another Windows desktop must be checked for
+/// liveness inside that desktop's worker.
+pub(crate) fn validate_window_hwnd_shape(tool: &str, hwnd: i64) -> Result<i64, ErrorData> {
+    validate_hwnd_shape(tool, "window_hwnd", hwnd)
+}
+
+/// Validates the canonical Win32 USER-handle wire representation for an HWND
+/// field whose public name may differ (for example `act_focus_window.hwnd`).
+pub(crate) fn validate_hwnd_shape(
+    tool: &str,
+    field: &'static str,
+    hwnd: i64,
+) -> Result<i64, ErrorData> {
+    if window_hwnd_shape_is_canonical(hwnd) {
+        return Ok(hwnd);
+    }
+
+    let source_of_truth = "resolved MCP window target before desktop-worker dispatch";
+    let remediation = "pass a canonical 1..=u32::MAX HWND from the relevant target/window/session-launch readback; for normal windows use target operation=list, or omit window_hwnd when the tool documents session-target/foreground resolution";
+    tracing::warn!(
+        code = error_codes::TOOL_PARAMS_INVALID,
+        tool,
+        field,
+        actual_value = hwnd,
+        accepted_range = "1..=u32::MAX",
+        source_of_truth,
+        remediation,
+        "window HWND shape validation failed before target resolution or worker dispatch"
+    );
+
+    Err(ErrorData::new(
+        rmcp::model::ErrorCode(-32099),
+        format!(
+            "{tool} {field} must be an integer in the canonical Windows USER-handle range 1..=4294967295; got {hwnd}"
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "tool": tool,
+            "field": field,
+            "accepted_range": "1..=u32::MAX",
+            "actual_value": hwnd,
+            "source_of_truth": source_of_truth,
+            "remediation": remediation,
+        })),
+    ))
+}
+
+#[must_use]
+pub(crate) fn window_hwnd_shape_is_canonical(hwnd: i64) -> bool {
+    synapse_core::win32_hwnd::hwnd_from_wire(hwnd).is_some()
+}
+
 fn default_observation_capture_config() -> ObservationCaptureConfig {
     observation_capture_from_capture_config(&CaptureConfig::default(), 0, "default".to_owned())
 }
@@ -4746,7 +4848,8 @@ fn capture_target_from_param(param: CaptureTargetParam) -> Result<CaptureTarget,
             Ok(CaptureTarget::Monitor { monitor_index })
         }
         CaptureTargetParam::Window { window_hwnd } => {
-            Ok(CaptureTarget::Window { hwnd: window_hwnd })
+            validate_window_hwnd_shape("set_capture_target", window_hwnd)
+                .map(|hwnd| CaptureTarget::Window { hwnd })
         }
         CaptureTargetParam::ElementWindow { element_id } => {
             let rect = synapse_a11y::element_bounding_rect(&element_id).map_err(|err| {
@@ -4823,6 +4926,100 @@ mod tests {
     };
     use synapse_perception::TextRegion;
 
+    #[test]
+    fn window_hwnd_shape_enforces_canonical_windows_user_handle_range() {
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let error = validate_window_hwnd_shape("observe", hwnd)
+                .expect_err("noncanonical HWND must fail before target resolution");
+            let data = error.data.expect("structured HWND validation data");
+            assert_eq!(
+                data.get("code").and_then(Value::as_str),
+                Some(error_codes::TOOL_PARAMS_INVALID)
+            );
+            assert_eq!(data.get("tool").and_then(Value::as_str), Some("observe"));
+            assert_eq!(
+                data.get("field").and_then(Value::as_str),
+                Some("window_hwnd")
+            );
+            assert_eq!(
+                data.get("accepted_range").and_then(Value::as_str),
+                Some("1..=u32::MAX")
+            );
+            assert_eq!(data.get("actual_value").and_then(Value::as_i64), Some(hwnd));
+            assert!(
+                data.get("remediation")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value.contains("canonical"))
+            );
+        }
+
+        assert_eq!(validate_window_hwnd_shape("observe", 1).unwrap(), 1);
+        assert_eq!(
+            validate_window_hwnd_shape("observe", i64::from(u32::MAX)).unwrap(),
+            i64::from(u32::MAX)
+        );
+    }
+
+    #[test]
+    fn capture_target_rejects_noncanonical_window_before_runtime_switch() {
+        for window_hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let error = capture_target_from_param(CaptureTargetParam::Window { window_hwnd })
+                .expect_err("noncanonical capture target must fail before controller mutation");
+            let data = error.data.expect("structured HWND validation data");
+            assert_eq!(
+                data.get("code").and_then(Value::as_str),
+                Some(error_codes::TOOL_PARAMS_INVALID)
+            );
+            assert_eq!(
+                data.get("tool").and_then(Value::as_str),
+                Some("set_capture_target")
+            );
+            assert_eq!(
+                data.get("actual_value").and_then(Value::as_i64),
+                Some(window_hwnd)
+            );
+        }
+    }
+
+    #[test]
+    fn hwnd_request_schemas_advertise_canonical_user_handle_range() {
+        fn assert_range<T: JsonSchema + 'static>(name: &str) {
+            let schema = common::schema_for_type::<T>();
+            let schema = Value::Object((*schema).clone());
+            assert_eq!(
+                schema["properties"]["window_hwnd"]["minimum"],
+                json!(1),
+                "{name} window_hwnd schema must fail closed for nonpositive values"
+            );
+            assert_eq!(
+                schema["properties"]["window_hwnd"]["maximum"],
+                json!(u32::MAX),
+                "{name} window_hwnd schema must reject noncanonical high bits"
+            );
+        }
+
+        assert_range::<ObserveParams>("observe");
+        assert_range::<FindParams>("find");
+        assert_range::<ReadTextParams>("read_text");
+        assert_range::<CaptureScreenshotParams>("capture_screenshot");
+        assert_range::<ScreenshotParams>("screenshot");
+        assert_range::<CaptureGifParams>("capture_gif");
+        assert_range::<HiddenDesktopPipFrameParams>("hidden_desktop_pip_frame");
+
+        let set_target = Value::Object((*set_target_input_schema()).clone());
+        let variants = set_target["properties"]["target"]["oneOf"]
+            .as_array()
+            .expect("set_target target variants");
+        assert_eq!(variants.len(), 2);
+        for variant in variants {
+            assert_eq!(variant["properties"]["window_hwnd"]["minimum"], json!(1));
+            assert_eq!(
+                variant["properties"]["window_hwnd"]["maximum"],
+                json!(u32::MAX)
+            );
+        }
+    }
+
     /// #882: `include:["interactable"]` implies elements, flips the semantic
     /// filter on, and raises the default gather depth to the maximum; an
     /// explicit `depth` always wins.
@@ -4897,8 +5094,9 @@ mod tests {
         assert!(missing_kind_error.contains("\"kind\":\"cdp\""));
     }
 
-    /// Real-window Full-State-Verification for per-agent target perception
-    /// (#736/#737): bind a BACKGROUND window as the target and prove `observe`
+    /// Supporting real-window integration evidence for per-agent target
+    /// perception (#736/#737); manual FSV remains separate. Bind a BACKGROUND
+    /// window as the target and verify `observe`
     /// returns that window's content WITHOUT stealing the foreground. Source of
     /// truth = `synapse_a11y::current_foreground_context()` (the real OS
     /// foreground) read separately before/after. Spawns real Notepad + mspaint,

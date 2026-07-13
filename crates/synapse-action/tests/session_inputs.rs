@@ -298,7 +298,7 @@ async fn session_release_serializes_new_owner_until_release_action_ack() {
     let release_handle = handle.clone();
     let release_task =
         tokio::spawn(async move { release_handle.release_session_inputs("session-a").await });
-    let (release_action, release_ack) = action_rx
+    let (release_action, release_ack, _operator_panic_epoch_at_enqueue) = action_rx
         .recv()
         .await
         .unwrap_or_else(|| panic!("expected queued session-a release action"));
@@ -513,7 +513,7 @@ async fn ack_next_action(
     expected: Action,
     result: Result<(), ActionError>,
 ) {
-    let (actual, ack) = action_rx
+    let (actual, ack, _operator_panic_epoch_at_enqueue) = action_rx
         .recv()
         .await
         .unwrap_or_else(|| panic!("expected queued action {expected:?}"));

@@ -76,6 +76,7 @@ pub struct ActTypeParams {
     #[serde(default)]
     #[schemars(
         default,
+        range(min = 1, max = 4_294_967_295_u64),
         description = "Optional top-level HWND that foreground act_type visual verification must use as its physical Source of Truth when semantic text readback is unavailable. Requires verify_delta=true and no into_element or expected_browser_url_regex."
     )]
     pub verify_target_window_hwnd: Option<i64>,
@@ -144,6 +145,7 @@ async fn cdp_type_into_element(
     started: Instant,
     verify_delta: bool,
     verify_timeout_ms: u32,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActTypeResponse, ErrorData> {
     use synapse_core::error_codes;
 
@@ -181,6 +183,7 @@ async fn cdp_type_into_element(
     } else {
         None
     };
+    boundary.ensure("immediately_before_cdp_type_node")?;
     cdp_or_extension_type_node(
         endpoint.as_deref(),
         hwnd,
@@ -316,10 +319,21 @@ async fn cdp_or_extension_type_node(
     .map_err(CdpTypeTransportError::Extension)
 }
 
+#[cfg(test)]
 pub async fn act_type_with_handle(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActTypeParams,
+) -> Result<ActTypeResponse, ErrorData> {
+    let boundary = super::OperatorPanicActionBoundary::arm("act_type", "direct_call_entry")?;
+    act_type_with_handle_and_boundary(handle, recording, params, boundary).await
+}
+
+pub(crate) async fn act_type_with_handle_and_boundary(
+    handle: ActionHandle,
+    recording: Option<Arc<RecordingBackend>>,
+    params: ActTypeParams,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActTypeResponse, ErrorData> {
     let started = Instant::now();
     validate_type_params(&params)?;
@@ -338,13 +352,16 @@ pub async fn act_type_with_handle(
                 started,
                 params.verify_delta,
                 params.verify_timeout_ms,
+                boundary,
             )
             .await;
         }
         ensure_value_pattern_target_safe_for_act_type(element_id)?;
         let readback = if params.verify_delta {
-            verified_set_element_value(element_id, &emitted, params.verify_timeout_ms).await?
+            verified_set_element_value(element_id, &emitted, params.verify_timeout_ms, boundary)
+                .await?
         } else {
+            boundary.ensure("immediately_before_uia_set_element_value")?;
             synapse_a11y::set_element_value(element_id, &emitted).map_err(a11y_error_to_mcp)?
         };
         let readback_matches = uia_readback_matches_emitted(&readback, &emitted);
@@ -400,6 +417,7 @@ pub async fn act_type_with_handle(
 
     let action = action_from_type_params(&params)?;
 
+    boundary.ensure("immediately_before_foreground_type_dispatch")?;
     if let Some(recording) = recording {
         execute_recording(&recording, &action)?;
     } else {
@@ -444,8 +462,10 @@ async fn verified_set_element_value(
     element_id: &ElementId,
     emitted: &str,
     verify_timeout_ms: u32,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<synapse_a11y::ElementValueSetReadback, ErrorData> {
     let before = synapse_a11y::element_value(element_id).map_err(a11y_error_to_mcp)?;
+    boundary.ensure("immediately_before_verified_uia_set_element_value")?;
     match synapse_a11y::set_element_value(element_id, emitted) {
         Ok(dispatch_readback) => {
             tokio::time::sleep(std::time::Duration::from_millis(u64::from(

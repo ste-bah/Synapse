@@ -1385,6 +1385,8 @@ impl SynapseService {
         params: TaskDispatchOnceParams,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<TaskDispatchOnceResponse, ErrorData> {
+        let dispatch_activity =
+            super::m4_tools::AgentSpawnInFlightGuard::enter("mcp_task_dispatch_outer")?;
         let db = self.agent_task_db()?;
         Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
@@ -1440,7 +1442,11 @@ impl SynapseService {
             "readback=agent_tasks edge=dispatch_spawn_begin"
         );
 
-        let response = match self.spawn_agent_journaled(request, request_context).await {
+        let spawn_result = match dispatch_activity.ensure("mcp_task_dispatch_before_spawn") {
+            Ok(()) => self.spawn_agent_journaled(request, request_context).await,
+            Err(error) => Err(error),
+        };
+        let response = match spawn_result {
             Ok(response) => response,
             Err(spawn_error) => {
                 let error_code = error_code_str(&spawn_error);
@@ -1459,6 +1465,21 @@ impl SynapseService {
                 return Err(spawn_error);
             }
         };
+        if let Err(error) = dispatch_activity.ensure("mcp_task_dispatch_after_spawn") {
+            let cleanup = self
+                .cleanup_spawn_response_after_operator_panic(
+                    &response,
+                    "mcp_task_dispatch_after_spawn",
+                )
+                .await;
+            let reason = format!(
+                "dispatch spawn superseded by operator panic [{}]: {}; cleanup={cleanup}",
+                error_code_str(&error),
+                error.message
+            );
+            Self::record_failed_attempt_internal(&db, &task_id, reason)?;
+            return Err(error);
+        }
 
         let claimed = match Self::claim_internal(
             &db,
@@ -1586,6 +1607,8 @@ impl SynapseService {
         &self,
         params: TaskDispatchOnceParams,
     ) -> Result<TaskDispatchOnceResponse, ErrorData> {
+        let dispatch_activity =
+            super::m4_tools::AgentSpawnInFlightGuard::enter("dashboard_task_dispatch_outer")?;
         let db = self.agent_task_db()?;
         Self::prune_terminal_tasks(&db, unix_time_ms_now())?;
         self.reconcile_tasks(&db)?;
@@ -1640,7 +1663,11 @@ impl SynapseService {
             "readback=agent_tasks edge=dashboard_dispatch_spawn_begin"
         );
 
-        let response = match self.dashboard_spawn_agent_request(request).await {
+        let spawn_result = match dispatch_activity.ensure("dashboard_task_dispatch_before_spawn") {
+            Ok(()) => self.dashboard_spawn_agent_request(request).await,
+            Err(error) => Err(error),
+        };
+        let response = match spawn_result {
             Ok(response) => response,
             Err(spawn_error) => {
                 let error_code = error_code_str(&spawn_error);
@@ -1659,6 +1686,21 @@ impl SynapseService {
                 return Err(spawn_error);
             }
         };
+        if let Err(error) = dispatch_activity.ensure("dashboard_task_dispatch_after_spawn") {
+            let cleanup = self
+                .cleanup_spawn_response_after_operator_panic(
+                    &response,
+                    "dashboard_task_dispatch_after_spawn",
+                )
+                .await;
+            let reason = format!(
+                "dashboard dispatch spawn superseded by operator panic [{}]: {}; cleanup={cleanup}",
+                error_code_str(&error),
+                error.message
+            );
+            Self::record_failed_attempt_internal(&db, &task_id, reason)?;
+            return Err(error);
+        }
 
         let claimed = match Self::claim_internal(
             &db,

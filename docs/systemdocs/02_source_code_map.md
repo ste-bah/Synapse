@@ -620,7 +620,7 @@ add-defender-exclusions.ps1          # add Defender real-time-scan exclusions fo
 repo-maintenance.ps1                 # prune merged/stale git worktrees + cargo-sweep stale build artifacts (disk-buildup control)
 install-maintenance-task.ps1         # register/remove a Windows Scheduled Task running repo-maintenance.ps1
 run-daemon-with-secrets.ps1          # start shared daemon with cloud model API keys injected from Infisical (no secret on disk)
-run-issue-daemon.ps1                 # start manual/issue FSV daemon from a copied dev synapse-mcp.exe so target\debug stays relinkable
+run-issue-daemon.ps1                 # start an issue-diagnostic daemon from a copied dev synapse-mcp.exe so target\debug stays relinkable
 start-local-model-endpoint.ps1       # serve a local model as an OpenAI-compatible endpoint (vLLM)
 check_doc_paths.ps1                  # validate documentation file paths
 local-model-openai-chat.py           # serve a cached HF chat model as OpenAI chat-completions (operational helper)

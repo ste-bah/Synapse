@@ -43,7 +43,7 @@ const LOCAL_MODEL_STREAM: &str = r#"{"type":"local.thread.started","conversation
 /// Byte-for-byte rows captured from live local-agent `stdout.jsonl` files on
 /// this host after #900. These are current writer events that are not in the
 /// older synthetic `LOCAL_MODEL_STREAM` above.
-const LOCAL_MODEL_CURRENT_LIFECYCLE_STREAM: &str = r#"{"attributed_arguments":{"context":"Expected operator response is token-73. This verifies local-agent spawn attribution.","notify":false,"question":"FSV-1028-ATTRIBUTED-HAPPY: What synthetic token should be recorded?","spawn_id":"agent-spawn-019efe12-18d6-7c90-b25d-31733fdb8793","suppress_popup":true,"timeout_ms":120000},"conversation_id":"local-model-019efe121f90712289b5524225272ad3","model":"deepseek-v4-flash","reason_code":"local_agent_spawn_id_attribution","routed_tool_name":null,"spawn_id":"agent-spawn-019efe12-18d6-7c90-b25d-31733fdb8793","tool_call_id":"call_00_Ct1SfrCZn4ajLQhBRKk28151","tool_exposure":"routed","tool_name":"agent_ask_operator","turn_index":1,"type":"local.tool_call.arguments_normalized"}
+const LOCAL_MODEL_CURRENT_LIFECYCLE_STREAM: &str = r#"{"attributed_arguments":{"context":"Expected operator response is token-73. This verifies local-agent spawn attribution.","notify":false,"question":"REGRESSION-1028-ATTRIBUTED-HAPPY: What synthetic token should be recorded?","spawn_id":"agent-spawn-019efe12-18d6-7c90-b25d-31733fdb8793","suppress_popup":true,"timeout_ms":120000},"conversation_id":"local-model-019efe121f90712289b5524225272ad3","model":"deepseek-v4-flash","reason_code":"local_agent_spawn_id_attribution","routed_tool_name":null,"spawn_id":"agent-spawn-019efe12-18d6-7c90-b25d-31733fdb8793","tool_call_id":"call_00_Ct1SfrCZn4ajLQhBRKk28151","tool_exposure":"routed","tool_name":"agent_ask_operator","turn_index":1,"type":"local.tool_call.arguments_normalized"}
 {"completed_task_tool_sources":{"workspace_get":"workspace_put_post_write_readback","workspace_put":"model_tool_call"},"completed_task_tools":["workspace_get","workspace_put"],"conversation_id":"local-model-019ee30871017472b4dbc33c51abc9a7","final_message":"{\"case\":\"happy\",\"expected\":\"workspace row exists\",\"ok\":true}","model":"qwen8v2-tool","reason_code":"task_tool_contract_verified","type":"local.agent.completed"}
 {"conversation_id":"local-model-019ee575212b7931950ac7002a8dea93","hold_open_ms":60000,"model":"qwen8v2-tool","session_id":"b93d7034-9d5c-4711-aabb-c7b72d23a15e","source":"local_agent_mcp_session","started_at_unix_ms":1781966127405,"type":"local.hold_open.started"}
 {"conversation_id":"local-model-019ee575212b7931950ac7002a8dea93","finished_at_unix_ms":1781966187409,"hold_open_ms":60000,"model":"qwen8v2-tool","session_id":"b93d7034-9d5c-4711-aabb-c7b72d23a15e","source":"local_agent_mcp_session","started_at_unix_ms":1781966127405,"type":"local.hold_open.finished"}
@@ -604,7 +604,7 @@ fn local_model_current_lifecycle_events_parse_from_real_rows() {
             .arguments
             .as_deref()
             .expect("normalized arguments")
-            .contains("FSV-1028-ATTRIBUTED-HAPPY")
+            .contains("REGRESSION-1028-ATTRIBUTED-HAPPY")
     );
 
     let completed = rows
@@ -893,7 +893,7 @@ fn reingest_after_cursor_loss_is_idempotent() {
 
 #[test]
 fn crlf_line_endings_hash_identically_to_lf() {
-    // The spawn wrapper writes CRLF on Windows (verified live, FSV #900):
+    // The spawn wrapper writes CRLF on Windows (verified during manual FSV #900):
     // the CR is part of the line terminator, so hashes and byte counts must
     // match the logical line exactly as an LF-terminated stream would.
     let (_temp, db) = open_temp_db();
@@ -937,7 +937,7 @@ fn claude_model_fallback_block_parses() {
     // Byte-for-byte real line captured 2026-06-12 from
     // agent-spawn-019ebe1f-f63c-75e3-b895-ccefdcb97c56: the CLI emitted a
     // `fallback` content block when claude-fable-5 fell back to
-    // claude-opus-4-8. Found live by the FSV invalid-row counter (#900).
+    // claude-opus-4-8. Found live by the manual FSV invalid-row counter (#900).
     let real_fallback_line = r#"{"type":"assistant","message":{"model":"claude-opus-4-8","id":"msg_01WkRP6miebFSLdz1rLkAbXa","type":"message","role":"assistant","content":[{"type":"fallback","from":{"model":"claude-fable-5"},"to":{"model":"claude-opus-4-8"}}],"stop_reason":null,"stop_sequence":null,"stop_details":null,"usage":{"input_tokens":3684,"cache_creation_input_tokens":4558,"cache_read_input_tokens":20866,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":4558},"output_tokens":3,"service_tier":"standard","inference_geo":"not_available"},"diagnostics":null,"context_management":null},"parent_tool_use_id":null,"session_id":"a2432ee1-03e2-42c2-be5a-d2e462581d1e","uuid":"05c2a484-d658-40fb-b682-b5f6360b8224","request_id":"req_011CbzDe9nyHAK7DsQjgKNc9"}"#;
     let (_temp, db) = open_temp_db();
     let root = tempfile::tempdir().expect("spawn root");

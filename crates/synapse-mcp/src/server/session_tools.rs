@@ -2533,7 +2533,7 @@ mod tests {
         assert!(readback.target_live.stale_orphan);
         assert_eq!(
             readback.target_live.read_error_code.as_deref(),
-            Some(error_codes::TARGET_WINDOW_NOT_FOUND)
+            Some(error_codes::TOOL_PARAMS_INVALID)
         );
         assert!(
             readback

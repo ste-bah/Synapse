@@ -82,6 +82,7 @@ pub struct BrowserDndParams {
     /// Browser HWND owning the target. Required only with explicit cdp_target_id
     /// and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Page/action readback wait budget in milliseconds. Defaults to 5000.
     #[serde(default)]
@@ -252,6 +253,9 @@ impl SynapseService {
         cdp_target_id: &str,
         dnd: &NormalizedBrowserDndParams,
     ) -> Result<BrowserDndResponse, ErrorData> {
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_drag_drop_before_bridge_input",
+        )?;
         let result = crate::chrome_debugger_bridge::cdp_input(
             crate::chrome_debugger_bridge::ChromeDebuggerCdpInputRequest {
                 hwnd: window_hwnd,
@@ -293,6 +297,9 @@ impl SynapseService {
                 ),
             )
         })?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_drag_drop_after_bridge_input",
+        )?;
 
         Ok(BrowserDndResponse {
             ok: true,

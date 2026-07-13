@@ -110,6 +110,37 @@ const BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH: &str =
     "browser_wait_for condition response plus daemon-tool-events.jsonl";
 const BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS: u64 = 3_000;
 
+type OperatorPanicCdpTargetOwnerRows = (
+    Vec<(String, CdpTargetOwner)>,
+    Vec<(String, PersistedCdpTargetOwner)>,
+);
+
+fn operator_panic_rollback_failed(
+    stage: &'static str,
+    panic_error: ErrorData,
+    cleanup_error: impl Into<String>,
+) -> ErrorData {
+    synapse_action::record_operator_panic_safety_incident();
+    let cleanup_error = cleanup_error.into();
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "operator panic crossed {stage}, and exact rollback could not be verified: {cleanup_error}"
+        ),
+        Some(json!({
+            "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            "detail_code": "MCP_MUTATION_OPERATOR_PANIC_ROLLBACK_FAILED",
+            "stage": stage,
+            "operator_panic_error": {
+                "message": panic_error.message,
+                "data": panic_error.data,
+            },
+            "cleanup_error": cleanup_error,
+            "source_of_truth": "exact browser target identity plus backend cleanup readback",
+        })),
+    )
+}
+
 #[derive(Clone, Debug)]
 struct BrowserTabsWindowResolution {
     context: ForegroundContext,
@@ -172,6 +203,7 @@ struct BrowserWaitFacadeParams {
     /// Envelope-level target alias (#1551/#1593). Browser HWND that owns the
     /// target; folded into the selected `wait.<condition>` spec's `window_hwnd`.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     window_hwnd: Option<i64>,
 }
 
@@ -291,7 +323,11 @@ impl SynapseService {
         target: Option<SessionTarget>,
         mcp_session_id: Option<&str>,
     ) -> Result<Json<synapse_core::Observation>, ErrorData> {
-        let explicit_hwnd = params.0.window_hwnd;
+        let explicit_hwnd = params
+            .0
+            .window_hwnd
+            .map(|hwnd| crate::m1::validate_window_hwnd_shape("observe", hwnd))
+            .transpose()?;
         // A subtree_root drill-down is element/window perception even when the
         // include set looks global, so it always takes the window path.
         let needs_window = include.requires_window_perception() || params.0.subtree_root.is_some();
@@ -537,6 +573,9 @@ impl SynapseService {
             kind = "read_text",
             "tool.invocation kind=read_text"
         );
+        if let Some(hwnd) = params.0.window_hwnd {
+            crate::m1::validate_window_hwnd_shape("read_text", hwnd)?;
+        }
         // #703: a web element id (cdcd sentinel) is not a UIA element, so the
         // element-bounds path cannot resolve it. OCR it from a CDP
         // element-clipped screenshot instead of failing with a stale-UIA error.
@@ -1000,6 +1039,7 @@ impl SynapseService {
             kind = "hidden_desktop_pip_frame",
             "tool.invocation kind=hidden_desktop_pip_frame"
         );
+        crate::m1::validate_window_hwnd_shape("hidden_desktop_pip_frame", params.0.window_hwnd)?;
         let current_session_id = super::context::mcp_session_id_from_request_context(
             &request_context,
         )?
@@ -1029,8 +1069,34 @@ impl SynapseService {
             kind = "set_capture_target",
             "tool.invocation kind=set_capture_target"
         );
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "set_capture_target_before_controller_switch",
+        )?;
         let mut state = self.m1_state()?;
-        set_capture_target_in_state(&mut state, params.0).map(Json)
+        let prior_config = state.capture_config.clone();
+        let prior_active_capture_config = state.active_capture_config.clone();
+        let response = set_capture_target_in_state(&mut state, params.0)?;
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "set_capture_target_after_controller_switch",
+        ) {
+            let rollback_generation = match state.capture_controller.switch_to(prior_config.clone())
+            {
+                Ok(generation) => generation,
+                Err(cleanup_error) => {
+                    return Err(operator_panic_rollback_failed(
+                        "set_capture_target_after_controller_switch",
+                        panic_error,
+                        cleanup_error.to_string(),
+                    ));
+                }
+            };
+            state.capture_config = prior_config;
+            state.capture_generation = rollback_generation;
+            state.active_capture_config = prior_active_capture_config;
+            state.active_capture_config.generation = rollback_generation;
+            return Err(panic_error);
+        }
+        Ok(Json(response))
     }
 
     #[tool(description = "Set the active perception mode")]
@@ -1043,8 +1109,21 @@ impl SynapseService {
             kind = "set_perception_mode",
             "tool.invocation kind=set_perception_mode"
         );
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "set_perception_mode_before_state_write",
+        )?;
         let mut state = self.m1_state()?;
-        set_perception_mode_in_state(&mut state, &params.0).map(Json)
+        let prior_mode = state.perception_mode;
+        let prior_manual_mode = state.manual_perception_mode;
+        let response = set_perception_mode_in_state(&mut state, &params.0)?;
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "set_perception_mode_after_state_write",
+        ) {
+            state.perception_mode = prior_mode;
+            state.manual_perception_mode = prior_manual_mode;
+            return Err(panic_error);
+        }
+        Ok(Json(response))
     }
 
     #[tool(
@@ -1062,6 +1141,9 @@ impl SynapseService {
             "tool.invocation kind=set_target"
         );
         let session_id = require_target_session_id(&request_context)?;
+        let _authority_gate = self
+            .lock_session_authority_for_tool("set_target", &session_id)
+            .await?;
         let (target, wire, window_title, process_name) = match params.0.target {
             SetTargetParam::Window { window_hwnd } => {
                 let (title, process) =
@@ -1100,7 +1182,24 @@ impl SynapseService {
                 )
             }
         };
-        let previous = self.set_session_target(&session_id, target)?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "set_target_before_session_target_write",
+        )?;
+        let previous = self.set_session_target_authority_locked(&session_id, target)?;
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "set_target_after_session_target_write",
+        ) {
+            if let Err(cleanup_error) =
+                self.restore_session_target_wire(&session_id, previous.as_ref())
+            {
+                return Err(operator_panic_rollback_failed(
+                    "set_target_after_session_target_write",
+                    panic_error,
+                    cleanup_error.message.to_string(),
+                ));
+            }
+            return Err(panic_error);
+        }
         tracing::info!(
             code = "SESSION_TARGET_SET",
             session_id = %session_id,
@@ -1131,6 +1230,9 @@ impl SynapseService {
             "tool.invocation kind=get_target"
         );
         let session_id = require_target_session_id(&request_context)?;
+        let _authority_gate = self
+            .lock_session_authority_for_tool("get_target", &session_id)
+            .await?;
         let current = self.get_session_target_wire(&session_id)?;
         Ok(Json(TargetResponse {
             session_id,
@@ -1155,7 +1257,27 @@ impl SynapseService {
             "tool.invocation kind=clear_target"
         );
         let session_id = require_target_session_id(&request_context)?;
-        let previous = self.clear_session_target(&session_id)?;
+        let _authority_gate = self
+            .lock_session_authority_for_tool("clear_target", &session_id)
+            .await?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "clear_target_before_session_target_delete",
+        )?;
+        let previous = self.clear_session_target_authority_locked(&session_id)?;
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "clear_target_after_session_target_delete",
+        ) {
+            if let Err(cleanup_error) =
+                self.restore_session_target_wire(&session_id, previous.as_ref())
+            {
+                return Err(operator_panic_rollback_failed(
+                    "clear_target_after_session_target_delete",
+                    panic_error,
+                    cleanup_error.message.to_string(),
+                ));
+            }
+            return Err(panic_error);
+        }
         tracing::info!(
             code = "SESSION_TARGET_CLEARED",
             session_id = %session_id,
@@ -1423,6 +1545,7 @@ impl SynapseService {
         session_id: &str,
         hwnd: i64,
     ) -> Result<(String, String), ErrorData> {
+        crate::m1::validate_window_hwnd_shape("set_target", hwnd)?;
         match validate_target_window(hwnd) {
             Ok(target) => Ok(target),
             Err(error) => {
@@ -1773,37 +1896,67 @@ impl SynapseService {
         // re-steal focus from an actively-used human window). The lock only
         // makes concurrent agent captures queue.
         let _foreground_serialization = BROWSER_SCREENSHOT_FOREGROUND_LOCK.lock().await;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_screenshot_before_foreground_activation",
+        )?;
         let foreground_guard = prepare_browser_screenshot_foreground(window_hwnd)?;
-        let mut captured_result = crate::chrome_debugger_bridge::page_screenshot(
-            window_hwnd,
-            cdp_target_id,
-            bridge_payload.clone(),
-        )
-        .await
-        .map_err(|error| {
-            mcp_error(
-                error.code(),
-                format!(
-                    "browser_screenshot Chrome bridge capture failed: {}",
-                    error.detail()
-                ),
-            )
-        });
-        if let Err(error) = &captured_result
-            && browser_screenshot_bridge_disconnected(error)
-        {
-            captured_result = browser_screenshot_retry_after_bridge_disconnect(
+        let mut captured_result = match super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_screenshot_before_bridge_capture",
+        ) {
+            Ok(()) => crate::chrome_debugger_bridge::page_screenshot(
                 window_hwnd,
                 cdp_target_id,
                 bridge_payload.clone(),
-                error,
             )
-            .await;
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "browser_screenshot Chrome bridge capture failed: {}",
+                        error.detail()
+                    ),
+                )
+            }),
+            Err(panic_error) => Err(panic_error),
+        };
+        if let Err(error) = &captured_result
+            && browser_screenshot_bridge_disconnected(error)
+        {
+            match super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_screenshot_before_bridge_retry",
+            ) {
+                Ok(()) => {
+                    captured_result = browser_screenshot_retry_after_bridge_disconnect(
+                        window_hwnd,
+                        cdp_target_id,
+                        bridge_payload.clone(),
+                        error,
+                    )
+                    .await;
+                }
+                Err(panic_error) => captured_result = Err(panic_error),
+            }
         }
-        let foreground_readback = finish_browser_screenshot_foreground(
+        let foreground_readback = match finish_browser_screenshot_foreground(
             window_hwnd,
             foreground_guard,
             captured_result.as_ref().err(),
+        ) {
+            Ok(readback) => readback,
+            Err(cleanup_error) => {
+                if let Err(panic_error) = captured_result {
+                    return Err(operator_panic_rollback_failed(
+                        "browser_screenshot_foreground_restore",
+                        panic_error,
+                        cleanup_error.message.to_string(),
+                    ));
+                }
+                return Err(cleanup_error);
+            }
+        };
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_screenshot_after_bridge_capture_and_restore",
         )?;
         let captured = match captured_result {
             Ok(captured) => captured,
@@ -1850,6 +2003,9 @@ impl SynapseService {
             max_pixels: params.max_pixels,
             max_long_edge: params.max_long_edge,
         };
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_screenshot_before_output_write",
+        )?;
         let screenshot = write_screenshot_bitmap_with_quality(
             &write_params,
             validation.output_path.clone(),
@@ -1860,6 +2016,9 @@ impl SynapseService {
             None,
             params.quality,
             None,
+        )?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_screenshot_after_output_write",
         )?;
         let page_region = browser_screenshot_page_region(captured.clip_css)?;
         Ok(BrowserScreenshotResponse {
@@ -1920,6 +2079,7 @@ impl SynapseService {
         }
         ensure_screenshot_path_available(&validation.output_path, params.overwrite)?;
         let bridge_payload = browser_pdf_bridge_payload(params);
+        super::operator_panic_boundary::ensure_mcp_mutation("browser_pdf_before_print_to_pdf")?;
         let captured =
             crate::chrome_debugger_bridge::page_pdf(window_hwnd, cdp_target_id, bridge_payload)
                 .await
@@ -1956,7 +2116,9 @@ impl SynapseService {
             ));
         }
         let pdf_sha256 = sha256_hex(&pdf_bytes);
+        super::operator_panic_boundary::ensure_mcp_mutation("browser_pdf_before_output_write")?;
         let bytes_written = write_pdf_bytes(&validation.output_path, &pdf_bytes, params.overwrite)?;
+        super::operator_panic_boundary::ensure_mcp_mutation("browser_pdf_after_output_write")?;
         Ok(BrowserPdfResponse {
             path: validation.output_path.to_string_lossy().into_owned(),
             bytes_written,
@@ -2097,11 +2259,17 @@ impl SynapseService {
             }
             let source_path = browser_download_source_path(selected)?;
             let moved = validation.params.operation == BrowserDownloadsOperation::Move;
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_downloads_before_save_or_move",
+            )?;
             let (saved_bytes, saved_sha256) = copy_or_move_download_file(
                 &source_path,
                 output_path,
                 validation.params.overwrite,
                 moved,
+            )?;
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_downloads_after_save_or_move",
             )?;
             response.saved_path = Some(output_path.to_string_lossy().into_owned());
             response.saved_bytes = Some(saved_bytes);
@@ -2325,6 +2493,9 @@ impl SynapseService {
             "tool.invocation kind=cdp_open_tab"
         );
         let session_id = require_target_session_id(&request_context)?;
+        let _authority_gate = self
+            .lock_session_authority_for_tool(TOOL, &session_id)
+            .await?;
         self.cdp_open_tab_for_session(params.0, &session_id)
             .await
             .map(Json)
@@ -2381,6 +2552,9 @@ impl SynapseService {
             "tool.invocation kind=cdp_close_tab"
         );
         let session_id = require_target_session_id(&request_context)?;
+        let _authority_gate = self
+            .lock_session_authority_for_tool(TOOL, &session_id)
+            .await?;
         let request_details = json!({
             "session_id": &session_id,
             "cdp_target_id": &params.0.cdp_target_id,
@@ -2487,10 +2661,20 @@ impl SynapseService {
             "trigger": "chrome.runtime.reload",
         });
         self.audit_action_started_with_details_for_session(TOOL, &request_details, &session_id)?;
-        let result = crate::chrome_debugger_bridge::reload_bridge(wait_timeout_ms)
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_bridge_reload_before_runtime_reload",
+        )?;
+        let mut result = crate::chrome_debugger_bridge::reload_bridge(wait_timeout_ms)
             .await
             .map(|reload| chrome_bridge_reload_response(&session_id, wait_timeout_ms, reload))
             .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
+        if result.is_ok()
+            && let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                "cdp_bridge_reload_after_runtime_reload",
+            )
+        {
+            result = Err(panic_error);
+        }
         self.audit_action_result_for_session(TOOL, &result, &session_id)?;
         result.map(Json)
     }
@@ -2510,6 +2694,9 @@ impl SynapseService {
             "tool.invocation kind=browser_tabs"
         );
         let session_id = require_target_session_id(&request_context)?;
+        let _authority_gate = self
+            .lock_session_authority_for_tool(TOOL, &session_id)
+            .await?;
         let params = validate_browser_tabs_params(params.0)?;
         // Using the human's *foreground* Chromium window as an implicit target is
         // only permitted for read-style ops (list/select). Mutating ops
@@ -2662,6 +2849,9 @@ impl SynapseService {
             "tool.invocation kind=browser_adopt_active_tab"
         );
         let session_id = require_target_session_id(&request_context)?;
+        let _authority_gate = self
+            .lock_session_authority_for_tool(TOOL, &session_id)
+            .await?;
         let window_resolution = self.resolve_browser_tabs_window_context(
             TOOL,
             &session_id,
@@ -4394,12 +4584,46 @@ pub(super) fn require_target_session_id(
     })
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorPanicCdpTargetOwnerTargetReadback {
+    pub tab_id: i64,
+    pub target_id: String,
+    pub physical_close_succeeded: bool,
+    pub memory_owner_keys_before: Vec<String>,
+    pub persisted_owner_keys_before: Vec<String>,
+    pub memory_owner_keys_after: Vec<String>,
+    pub persisted_owner_keys_after: Vec<String>,
+    pub failures: Vec<String>,
+    pub terminal: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorPanicCdpTargetOwnerReconciliationReadback {
+    pub successful_physical_closes: usize,
+    pub targets: Vec<OperatorPanicCdpTargetOwnerTargetReadback>,
+    pub remaining_extension_memory_owner_keys: Vec<String>,
+    pub remaining_extension_persisted_owner_keys: Vec<String>,
+    pub remaining_owner_readback_error: Option<String>,
+    pub failures: Vec<String>,
+    pub terminal: bool,
+}
+
 impl SynapseService {
-    fn set_session_target(
+    pub(crate) fn set_session_target_authority_locked(
         &self,
         session_id: &str,
         target: SessionTarget,
     ) -> Result<Option<TargetWire>, ErrorData> {
+        match &target {
+            SessionTarget::Window { hwnd } => {
+                crate::m1::validate_window_hwnd_shape("set_target", *hwnd)?;
+            }
+            SessionTarget::Cdp { window_hwnd, .. } => {
+                crate::m1::validate_window_hwnd_shape("set_target", *window_hwnd)?;
+            }
+        }
         let previous = self
             .memory_session_target(session_id)?
             .as_ref()
@@ -4415,7 +4639,41 @@ impl SynapseService {
             .map(|target| target.as_ref().map(target_wire))
     }
 
-    fn clear_session_target(&self, session_id: &str) -> Result<Option<TargetWire>, ErrorData> {
+    fn restore_session_target_wire(
+        &self,
+        session_id: &str,
+        prior: Option<&TargetWire>,
+    ) -> Result<(), ErrorData> {
+        match prior {
+            Some(TargetWire::Window { window_hwnd }) => {
+                self.set_session_target_authority_locked(
+                    session_id,
+                    SessionTarget::Window { hwnd: *window_hwnd },
+                )?;
+            }
+            Some(TargetWire::Cdp {
+                window_hwnd,
+                cdp_target_id,
+            }) => {
+                self.set_session_target_authority_locked(
+                    session_id,
+                    SessionTarget::Cdp {
+                        window_hwnd: *window_hwnd,
+                        cdp_target_id: cdp_target_id.clone(),
+                    },
+                )?;
+            }
+            None => {
+                self.clear_session_target_authority_locked(session_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_session_target_authority_locked(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<TargetWire>, ErrorData> {
         let previous = self
             .memory_session_target(session_id)?
             .as_ref()
@@ -4526,23 +4784,34 @@ impl SynapseService {
         session_id: &str,
         explicit_window_hwnd: Option<i64>,
     ) -> Result<i64, ErrorData> {
-        if let Some(window_hwnd) = explicit_window_hwnd {
-            return Ok(window_hwnd);
-        }
-        match self.session_target(Some(session_id))? {
-            Some(SessionTarget::Window { hwnd }) => Ok(hwnd),
-            Some(SessionTarget::Cdp { window_hwnd, .. }) => Ok(window_hwnd),
-            None => Err(mcp_error(
-                error_codes::TARGET_NOT_SET,
-                "cdp_open_tab requires window_hwnd or an existing session target; refusing to use the human foreground as an implicit browser",
-            )),
-        }
+        let window_hwnd = match explicit_window_hwnd {
+            Some(window_hwnd) => window_hwnd,
+            None => match self.session_target(Some(session_id))? {
+                Some(SessionTarget::Window { hwnd }) => hwnd,
+                Some(SessionTarget::Cdp { window_hwnd, .. }) => window_hwnd,
+                None => {
+                    return Err(mcp_error(
+                        error_codes::TARGET_NOT_SET,
+                        "cdp_open_tab requires window_hwnd or an existing session target; refusing to use the human foreground as an implicit browser",
+                    ));
+                }
+            },
+        };
+        crate::m1::validate_window_hwnd_shape("cdp_open_tab", window_hwnd)
     }
 
     pub(super) fn register_cdp_target_owner(
         &self,
         owner: CdpTargetOwner,
     ) -> Result<String, ErrorData> {
+        crate::m1::validate_window_hwnd_shape("cdp_target_owner_registration", owner.window_hwnd)?;
+        if let Some(capture_window_hwnd) = owner.capture_window_hwnd {
+            crate::m1::validate_hwnd_shape(
+                "cdp_target_owner_registration",
+                "capture_window_hwnd",
+                capture_window_hwnd,
+            )?;
+        }
         let owner_key =
             cdp_target_owner_key(owner.window_hwnd, &owner.endpoint, &owner.cdp_target_id);
         {
@@ -4593,6 +4862,414 @@ impl SynapseService {
         Ok(removed)
     }
 
+    pub(super) async fn reconcile_operator_panic_extension_target_owners(
+        &self,
+        expected_disable_sequence: u64,
+        closed_targets: &[(i64, String)],
+    ) -> OperatorPanicCdpTargetOwnerReconciliationReadback {
+        let mut targets = Vec::with_capacity(closed_targets.len());
+        let mut failures = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (tab_id, target_id) in closed_targets {
+            if !seen.insert((*tab_id, target_id.clone())) {
+                failures.push(format!(
+                    "duplicate physically closed extension target pair tab_id={tab_id} target_id={target_id:?}"
+                ));
+            }
+            let readback =
+                self.reconcile_operator_panic_closed_cdp_target(*tab_id, target_id, true);
+            failures.extend(
+                readback
+                    .failures
+                    .iter()
+                    .map(|failure| format!("closed target {target_id:?}: {failure}")),
+            );
+            targets.push(readback);
+        }
+
+        if let Err(error) = self
+            .reconcile_operator_panic_remaining_extension_target_owners(
+                expected_disable_sequence,
+                &mut targets,
+                &mut failures,
+            )
+            .await
+        {
+            failures.push(error);
+        }
+
+        let (
+            remaining_extension_memory_owner_keys,
+            remaining_extension_persisted_owner_keys,
+            remaining_owner_readback_error,
+        ) = match self.operator_panic_remaining_extension_target_owner_keys() {
+            Ok((memory, persisted)) => (memory, persisted, None),
+            Err(error) => (Vec::new(), Vec::new(), Some(error)),
+        };
+        if !remaining_extension_memory_owner_keys.is_empty()
+            || !remaining_extension_persisted_owner_keys.is_empty()
+        {
+            failures.push(format!(
+                "extension-owned CDP target rows remain after physical close cleanup: memory={remaining_extension_memory_owner_keys:?} persisted={remaining_extension_persisted_owner_keys:?}"
+            ));
+        }
+        if let Some(error) = remaining_owner_readback_error.as_ref() {
+            failures.push(format!(
+                "read remaining extension-owned CDP target rows: {error}"
+            ));
+        }
+        let terminal = failures.is_empty() && targets.iter().all(|readback| readback.terminal);
+        OperatorPanicCdpTargetOwnerReconciliationReadback {
+            successful_physical_closes: closed_targets.len(),
+            targets,
+            remaining_extension_memory_owner_keys,
+            remaining_extension_persisted_owner_keys,
+            remaining_owner_readback_error,
+            failures,
+            terminal,
+        }
+    }
+
+    fn reconcile_operator_panic_closed_cdp_target(
+        &self,
+        tab_id: i64,
+        target_id: &str,
+        physical_close_succeeded: bool,
+    ) -> OperatorPanicCdpTargetOwnerTargetReadback {
+        let mut readback = OperatorPanicCdpTargetOwnerTargetReadback {
+            tab_id,
+            target_id: target_id.to_owned(),
+            physical_close_succeeded,
+            memory_owner_keys_before: Vec::new(),
+            persisted_owner_keys_before: Vec::new(),
+            memory_owner_keys_after: Vec::new(),
+            persisted_owner_keys_after: Vec::new(),
+            failures: Vec::new(),
+            terminal: false,
+        };
+        if target_id != format!("chrome-tab:{tab_id}") {
+            readback.failures.push(format!(
+                "physical close pair was structurally inconsistent: tab_id={tab_id} target_id={target_id:?}"
+            ));
+            return readback;
+        }
+        let (memory_before, persisted_before) =
+            match self.operator_panic_cdp_target_owner_rows(target_id) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    readback.failures.push(error);
+                    return readback;
+                }
+            };
+        readback.memory_owner_keys_before = memory_before
+            .iter()
+            .map(|(key, _owner)| key.clone())
+            .collect();
+        readback.persisted_owner_keys_before = persisted_before
+            .iter()
+            .map(|(key, _owner)| key.clone())
+            .collect();
+
+        let mut owners_by_key = std::collections::BTreeMap::new();
+        for (owner_key, owner) in &memory_before {
+            owners_by_key.insert(owner_key.clone(), owner.clone());
+        }
+        for (owner_key, row) in &persisted_before {
+            owners_by_key
+                .entry(owner_key.clone())
+                .or_insert_with(|| row.owner.clone());
+        }
+        let memory_keys = memory_before
+            .iter()
+            .map(|(key, _owner)| key.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (owner_key, owner) in owners_by_key {
+            if memory_keys.contains(owner_key.as_str()) {
+                match self.remove_cdp_target_owner(&owner_key) {
+                    Ok(Some(_removed)) => {}
+                    Ok(None) => readback.failures.push(format!(
+                        "in-memory owner {owner_key:?} disappeared before exact removal"
+                    )),
+                    Err(error) => readback
+                        .failures
+                        .push(format!("remove owner {owner_key:?}: {}", error.message)),
+                }
+            } else {
+                match self.delete_persisted_cdp_target_owner(&owner_key, &owner.cdp_target_id) {
+                    Ok(true) => {}
+                    Ok(false) => readback.failures.push(format!(
+                        "persisted owner {owner_key:?} disappeared before exact removal"
+                    )),
+                    Err(error) => readback.failures.push(format!(
+                        "delete persisted owner {owner_key:?}: {}",
+                        error.message
+                    )),
+                }
+            }
+            if let Err(error) =
+                self.clear_session_cdp_target_if_matches(&owner.session_id, target_id)
+            {
+                readback.failures.push(format!(
+                    "clear session target for {:?}: {}",
+                    owner.session_id, error.message
+                ));
+            }
+            if let Err(error) = self.release_closed_cdp_target_claim(
+                &owner.session_id,
+                owner.window_hwnd,
+                target_id,
+            ) {
+                readback.failures.push(format!(
+                    "release target claim for {:?}: {}",
+                    owner.session_id, error.message
+                ));
+            }
+        }
+
+        match self.operator_panic_cdp_target_owner_rows(target_id) {
+            Ok((memory_after, persisted_after)) => {
+                readback.memory_owner_keys_after =
+                    memory_after.into_iter().map(|(key, _owner)| key).collect();
+                readback.persisted_owner_keys_after = persisted_after
+                    .into_iter()
+                    .map(|(key, _owner)| key)
+                    .collect();
+            }
+            Err(error) => readback.failures.push(error),
+        }
+        if !readback.memory_owner_keys_after.is_empty()
+            || !readback.persisted_owner_keys_after.is_empty()
+        {
+            readback.failures.push(format!(
+                "owner rows remain after physical close: memory={:?} persisted={:?}",
+                readback.memory_owner_keys_after, readback.persisted_owner_keys_after
+            ));
+        }
+        readback.terminal = readback.failures.is_empty();
+        readback
+    }
+
+    async fn reconcile_operator_panic_remaining_extension_target_owners(
+        &self,
+        expected_disable_sequence: u64,
+        targets: &mut Vec<OperatorPanicCdpTargetOwnerTargetReadback>,
+        failures: &mut Vec<String>,
+    ) -> Result<(), String> {
+        let remaining = self.operator_panic_remaining_extension_target_owner_rows()?;
+        let mut targets_seen = targets
+            .iter()
+            .map(|readback| readback.target_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut rows_by_target =
+            std::collections::BTreeMap::<String, (String, CdpTargetOwner)>::new();
+        for (owner_key, owner) in remaining {
+            if targets_seen.contains(&owner.cdp_target_id) {
+                continue;
+            }
+            rows_by_target
+                .entry(owner.cdp_target_id.clone())
+                .or_insert((owner_key, owner));
+        }
+
+        let configured_extension_endpoint = chrome_debugger_default_endpoint();
+        for (target_id, (owner_key, owner)) in rows_by_target {
+            targets_seen.insert(target_id.clone());
+            let Some(tab_id) = Self::chrome_bridge_tab_id_from_target_id(&target_id) else {
+                failures.push(format!(
+                    "remaining extension-owned CDP target row {owner_key:?} has invalid target id {target_id:?}; leaving owner row visible"
+                ));
+                continue;
+            };
+            if owner.endpoint != configured_extension_endpoint {
+                failures.push(format!(
+                    "remaining extension-owned CDP target row {owner_key:?} uses nonconfigured endpoint {:?}; expected {:?}; leaving owner row visible",
+                    owner.endpoint, configured_extension_endpoint
+                ));
+                continue;
+            }
+
+            match crate::chrome_debugger_bridge::operator_panic_close_tab(
+                owner.window_hwnd,
+                &target_id,
+                expected_disable_sequence,
+            )
+            .await
+            {
+                Ok(closed) => {
+                    let readback = self.reconcile_operator_panic_closed_cdp_target(
+                        i64::from(closed.tab_id),
+                        &closed.target_id,
+                        true,
+                    );
+                    failures.extend(
+                        readback
+                            .failures
+                            .iter()
+                            .map(|failure| format!("remaining target {target_id:?}: {failure}")),
+                    );
+                    targets.push(readback);
+                }
+                Err(close_error)
+                    if Self::chrome_bridge_close_target_already_absent(
+                        close_error.detail(),
+                        &target_id,
+                    ) =>
+                {
+                    let listed = crate::chrome_debugger_bridge::list_tabs(
+                        owner.window_hwnd,
+                        owner.chrome_window_id,
+                        None,
+                        None,
+                    )
+                    .await
+                    .map_err(|readback_error| {
+                        format!(
+                            "remaining extension-owned CDP target {target_id:?} was reported absent, but chrome.tabs.query/readback failed; leaving owner row {owner_key:?} visible: close_error={}; readback_error={}: {}",
+                            close_error.detail(),
+                            readback_error.code(),
+                            readback_error.detail()
+                        )
+                    })?;
+                    if listed
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.target_id.eq_ignore_ascii_case(&target_id))
+                    {
+                        failures.push(format!(
+                            "remaining extension-owned CDP target {target_id:?} was reported absent, but chrome.tabs.query still returned it in window {:#x}; leaving owner row {owner_key:?} visible",
+                            owner.window_hwnd
+                        ));
+                        continue;
+                    }
+                    let readback =
+                        self.reconcile_operator_panic_closed_cdp_target(tab_id, &target_id, false);
+                    failures.extend(
+                        readback
+                            .failures
+                            .iter()
+                            .map(|failure| format!("remaining target {target_id:?}: {failure}")),
+                    );
+                    targets.push(readback);
+                }
+                Err(close_error) => {
+                    failures.push(format!(
+                        "remaining extension-owned CDP target {target_id:?} close/readback failed; leaving owner row {owner_key:?} visible: {}: {}",
+                        close_error.code(),
+                        close_error.detail()
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn operator_panic_cdp_target_owner_rows(
+        &self,
+        target_id: &str,
+    ) -> Result<OperatorPanicCdpTargetOwnerRows, String> {
+        let memory = self
+            .cdp_target_owners_for_target_id(target_id)
+            .map_err(|error| {
+                format!(
+                    "read in-memory CDP target owners for {target_id:?}: {}",
+                    error.message
+                )
+            })?;
+        let persisted = self
+            .read_persisted_cdp_target_owners_for_target_id(target_id)
+            .map_err(|error| {
+                format!(
+                    "read persisted CF_SESSIONS CDP target owners for {target_id:?}: {}",
+                    error.message
+                )
+            })?;
+        Ok((memory, persisted))
+    }
+
+    fn operator_panic_remaining_extension_target_owner_keys(
+        &self,
+    ) -> Result<(Vec<String>, Vec<String>), String> {
+        let mut memory = {
+            let guard = self.lock_cdp_target_owners().map_err(|error| {
+                format!(
+                    "read in-memory extension CDP target owners: {}",
+                    error.message
+                )
+            })?;
+            guard
+                .iter()
+                .filter(|(_key, owner)| {
+                    owner.cdp_target_id.starts_with("chrome-tab:")
+                        && owner.endpoint.starts_with("chrome-extension:")
+                })
+                .map(|(key, _owner)| key.clone())
+                .collect::<Vec<_>>()
+        };
+        memory.sort();
+
+        let m3_state = self.m3_state_handle();
+        let session_ids =
+            super::session_continuity::persisted_cdp_target_owner_session_ids(&m3_state)?;
+        let mut persisted = Vec::new();
+        for session_id in session_ids {
+            for (owner_key, row) in
+                super::session_continuity::read_persisted_cdp_target_owners_for_session(
+                    &m3_state,
+                    &session_id,
+                )?
+            {
+                if row.owner.cdp_target_id.starts_with("chrome-tab:")
+                    && row.owner.endpoint.starts_with("chrome-extension:")
+                {
+                    persisted.push(owner_key);
+                }
+            }
+        }
+        persisted.sort();
+        persisted.dedup();
+        Ok((memory, persisted))
+    }
+
+    fn operator_panic_remaining_extension_target_owner_rows(
+        &self,
+    ) -> Result<Vec<(String, CdpTargetOwner)>, String> {
+        let mut rows = std::collections::BTreeMap::<String, CdpTargetOwner>::new();
+        {
+            let guard = self.lock_cdp_target_owners().map_err(|error| {
+                format!(
+                    "read in-memory extension CDP target owners: {}",
+                    error.message
+                )
+            })?;
+            for (key, owner) in guard.iter().filter(|(_key, owner)| {
+                owner.cdp_target_id.starts_with("chrome-tab:")
+                    && owner.endpoint.starts_with("chrome-extension:")
+            }) {
+                rows.insert(key.clone(), owner.clone());
+            }
+        }
+
+        let m3_state = self.m3_state_handle();
+        let session_ids =
+            super::session_continuity::persisted_cdp_target_owner_session_ids(&m3_state)?;
+        for session_id in session_ids {
+            for (owner_key, row) in
+                super::session_continuity::read_persisted_cdp_target_owners_for_session(
+                    &m3_state,
+                    &session_id,
+                )?
+            {
+                if row.owner.cdp_target_id.starts_with("chrome-tab:")
+                    && row.owner.endpoint.starts_with("chrome-extension:")
+                {
+                    rows.entry(owner_key).or_insert(row.owner);
+                }
+            }
+        }
+        Ok(rows.into_iter().collect())
+    }
+
     fn release_closed_cdp_target_claim(
         &self,
         session_id: &str,
@@ -4617,6 +5294,61 @@ impl SynapseService {
                 );
                 Ok(false)
             }
+        }
+    }
+
+    fn reconcile_closed_cdp_target_ledgers(
+        &self,
+        session_id: &str,
+        owner_key: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+    ) -> Result<(Option<TargetWire>, Option<TargetWire>, bool), ErrorData> {
+        let mut failures = Vec::new();
+        if let Err(error) = self.remove_cdp_target_owner(owner_key) {
+            failures.push(format!("remove owner row {owner_key:?}: {}", error.message));
+        }
+        let previous = match self.clear_session_cdp_target_if_matches(session_id, cdp_target_id) {
+            Ok(previous) => previous,
+            Err(error) => {
+                failures.push(format!(
+                    "clear session target for {session_id:?}: {}",
+                    error.message
+                ));
+                None
+            }
+        };
+        let current = match self.get_session_target_wire(session_id) {
+            Ok(current) => current,
+            Err(error) => {
+                failures.push(format!(
+                    "read session target for {session_id:?}: {}",
+                    error.message
+                ));
+                None
+            }
+        };
+        let claim_released =
+            match self.release_closed_cdp_target_claim(session_id, window_hwnd, cdp_target_id) {
+                Ok(released) => released,
+                Err(error) => {
+                    failures.push(format!(
+                        "release target claim for {cdp_target_id:?}: {}",
+                        error.message
+                    ));
+                    false
+                }
+            };
+        if failures.is_empty() {
+            Ok((previous, current, claim_released))
+        } else {
+            Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "physical CDP target {cdp_target_id:?} is absent but ledger reconciliation failed: {}",
+                    failures.join("; ")
+                ),
+            ))
         }
     }
 
@@ -4976,6 +5708,9 @@ impl SynapseService {
         window_hwnd_param: Option<i64>,
         cdp_target_id_param: Option<&str>,
     ) -> Result<(i64, String), ErrorData> {
+        if let Some(window_hwnd) = window_hwnd_param {
+            crate::m1::validate_window_hwnd_shape(tool, window_hwnd)?;
+        }
         if let Some(target_id) = cdp_target_id_param {
             validate_cdp_target_id(target_id)?;
         }
@@ -5011,6 +5746,7 @@ impl SynapseService {
                     ),
                 )
             })?;
+        let window_hwnd = crate::m1::validate_window_hwnd_shape(tool, window_hwnd)?;
         let active_matches = matches!(
             active_target.as_ref(),
             Some(SessionTarget::Cdp {
@@ -5045,6 +5781,9 @@ impl SynapseService {
         session_id: &str,
         params: &CdpTargetInfoParams,
     ) -> Result<(i64, String), ErrorData> {
+        if let Some(window_hwnd) = params.window_hwnd {
+            crate::m1::validate_window_hwnd_shape("cdp_target_info", window_hwnd)?;
+        }
         if let Some(target_id) = params.cdp_target_id.as_deref() {
             validate_cdp_target_id(target_id)?;
         }
@@ -5081,6 +5820,7 @@ impl SynapseService {
                     "cdp_target_info requires window_hwnd when using an explicit target id without an active session target",
                 )
             })?;
+        let window_hwnd = crate::m1::validate_window_hwnd_shape("cdp_target_info", window_hwnd)?;
         let active_matches = matches!(
             active_target.as_ref(),
             Some(SessionTarget::Cdp {
@@ -5459,6 +6199,9 @@ impl SynapseService {
         let expected_chrome_window_id = self
             .active_cdp_target_owner_for_window("cdp_open_tab", session_id, window_hwnd)?
             .and_then(|owner| owner.chrome_window_id);
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_open_tab_before_bridge_create_target",
+        )?;
         let opened = crate::chrome_debugger_bridge::open_tab(
             window_hwnd,
             requested_url,
@@ -5477,6 +6220,32 @@ impl SynapseService {
                 ),
             )
         })?;
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_open_tab_after_bridge_create_target",
+        ) {
+            match crate::chrome_debugger_bridge::close_tab(window_hwnd, &opened.target_id).await {
+                Ok(closed) if closed.target_id.eq_ignore_ascii_case(&opened.target_id) => {
+                    return Err(panic_error);
+                }
+                Ok(closed) => {
+                    return Err(operator_panic_rollback_failed(
+                        "cdp_open_tab_after_bridge_create_target",
+                        panic_error,
+                        format!(
+                            "bridge close readback targeted {:?}, expected {:?}",
+                            closed.target_id, opened.target_id
+                        ),
+                    ));
+                }
+                Err(cleanup_error) => {
+                    return Err(operator_panic_rollback_failed(
+                        "cdp_open_tab_after_bridge_create_target",
+                        panic_error,
+                        cleanup_error.detail().to_owned(),
+                    ));
+                }
+            }
+        }
         let endpoint = opened
             .extension_id
             .as_deref()
@@ -5536,7 +6305,7 @@ impl SynapseService {
             window_hwnd,
             cdp_target_id: cdp_target_id.clone(),
         };
-        let previous = self.set_session_target(
+        let previous = self.set_session_target_authority_locked(
             session_id,
             SessionTarget::Cdp {
                 window_hwnd,
@@ -5964,13 +6733,30 @@ impl SynapseService {
                     window_hwnd: response.window_hwnd,
                     cdp_target_id: selected.cdp_target_id.clone(),
                 };
-                let previous = self.set_session_target(
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_tabs_select_before_session_target_write",
+                )?;
+                let previous = self.set_session_target_authority_locked(
                     session_id,
                     SessionTarget::Cdp {
                         window_hwnd: response.window_hwnd,
                         cdp_target_id: selected.cdp_target_id.clone(),
                     },
                 )?;
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_tabs_select_after_session_target_write",
+                ) {
+                    if let Err(cleanup_error) =
+                        self.restore_session_target_wire(session_id, previous.as_ref())
+                    {
+                        return Err(operator_panic_rollback_failed(
+                            "browser_tabs_select_after_session_target_write",
+                            panic_error,
+                            cleanup_error.message.to_string(),
+                        ));
+                    }
+                    return Err(panic_error);
+                }
                 response.mutation = Some(BrowserTabsMutation {
                     operation: BrowserTabsOperation::Select,
                     requested_cdp_target_id: Some(requested.to_owned()),
@@ -6039,6 +6825,9 @@ impl SynapseService {
                     )?)
                 };
                 let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_tabs_activate_before_bridge_dispatch",
+                )?;
                 let activated = crate::chrome_debugger_bridge::activate_tab(
                     window_context.hwnd,
                     requested,
@@ -6054,6 +6843,9 @@ impl SynapseService {
                         ),
                     )
                 })?;
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_tabs_activate_after_bridge_dispatch",
+                )?;
                 let human_os_foreground_after_hwnd = current_human_os_foreground_hwnd();
                 if background_tab_activation_foregrounded_requested_window(
                     human_os_foreground_before_hwnd,
@@ -6468,13 +7260,30 @@ impl SynapseService {
             window_hwnd: tabs.window_hwnd,
             cdp_target_id: active_tab.cdp_target_id.clone(),
         };
-        let previous = self.set_session_target(
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_adopt_active_tab_before_session_target_write",
+        )?;
+        let previous = self.set_session_target_authority_locked(
             session_id,
             SessionTarget::Cdp {
                 window_hwnd: tabs.window_hwnd,
                 cdp_target_id: active_tab.cdp_target_id.clone(),
             },
         )?;
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_adopt_active_tab_after_session_target_write",
+        ) {
+            if let Err(cleanup_error) =
+                self.restore_session_target_wire(session_id, previous.as_ref())
+            {
+                return Err(operator_panic_rollback_failed(
+                    "browser_adopt_active_tab_after_session_target_write",
+                    panic_error,
+                    cleanup_error.message.to_string(),
+                ));
+            }
+            return Err(panic_error);
+        }
         tracing::info!(
             code = "BROWSER_ACTIVE_TAB_ADOPTED",
             session_id = %session_id,
@@ -6540,6 +7349,11 @@ impl SynapseService {
         return_by_value: bool,
         timeout_ms: u64,
     ) -> Result<BrowserEvaluateResponse, ErrorData> {
+        // Runtime evaluation is always mutation-capable even when callers use
+        // it as a read: arbitrary JavaScript may change DOM/storage/network.
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_evaluate_before_runtime_dispatch",
+        )?;
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if backend_node_id.is_some() {
                 return Err(mcp_error(
@@ -6560,6 +7374,9 @@ impl SynapseService {
             )
             .await
             .map_err(|error| classify_browser_evaluate_bridge_error(&error, "page", timeout_ms))?;
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_evaluate_after_bridge_runtime_dispatch",
+            )?;
             let endpoint = evaluated
                 .extension_id
                 .as_deref()
@@ -6683,6 +7500,9 @@ impl SynapseService {
             })?;
             (evaluated, "page", "Runtime.evaluate")
         };
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_evaluate_after_raw_runtime_dispatch",
+        )?;
         tracing::info!(
             code = "CDP_BACKGROUND_EVALUATE",
             session_id = %session_id,
@@ -6753,6 +7573,11 @@ impl SynapseService {
         params: &BrowserExposeBindingParams,
         max_calls: usize,
     ) -> Result<BrowserExposeBindingResponse, ErrorData> {
+        if params.operation != BrowserExposeBindingOperation::Read {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_expose_binding_before_add_or_remove",
+            )?;
+        }
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if cdp_target_id.starts_with("chrome-tab:") {
                 let operation = browser_expose_binding_operation_name(params.operation);
@@ -6775,6 +7600,45 @@ impl SynapseService {
                         ),
                     )
                 })?;
+                if params.operation != BrowserExposeBindingOperation::Read
+                    && let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                        "browser_expose_binding_after_bridge_mutation",
+                    )
+                {
+                    if params.operation == BrowserExposeBindingOperation::Add {
+                        match crate::chrome_debugger_bridge::expose_binding(
+                            window_hwnd,
+                            cdp_target_id,
+                            "remove",
+                            &params.name,
+                            params.execution_context_name.as_deref(),
+                            None,
+                            max_calls,
+                        )
+                        .await
+                        {
+                            Ok(cleanup) if !cleanup.binding_active => return Err(panic_error),
+                            Ok(cleanup) => {
+                                return Err(operator_panic_rollback_failed(
+                                    "browser_expose_binding_after_bridge_mutation",
+                                    panic_error,
+                                    format!(
+                                        "binding {:?} remained active after exact remove readback",
+                                        cleanup.name
+                                    ),
+                                ));
+                            }
+                            Err(cleanup_error) => {
+                                return Err(operator_panic_rollback_failed(
+                                    "browser_expose_binding_after_bridge_mutation",
+                                    panic_error,
+                                    cleanup_error.detail().to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    return Err(panic_error);
+                }
                 let endpoint = result
                     .extension_id
                     .as_deref()
@@ -6889,6 +7753,38 @@ impl SynapseService {
             }
         }
 
+        if params.operation != BrowserExposeBindingOperation::Read
+            && let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_expose_binding_after_raw_mutation",
+            )
+        {
+            if params.operation == BrowserExposeBindingOperation::Add {
+                match synapse_a11y::binding_capture_remove(&endpoint, cdp_target_id, &params.name)
+                    .await
+                {
+                    Ok(cleanup) if !cleanup.binding_active => return Err(panic_error),
+                    Ok(_) => {
+                        return Err(operator_panic_rollback_failed(
+                            "browser_expose_binding_after_raw_mutation",
+                            panic_error,
+                            format!(
+                                "binding {:?} remained active after exact remove readback",
+                                params.name
+                            ),
+                        ));
+                    }
+                    Err(cleanup_error) => {
+                        return Err(operator_panic_rollback_failed(
+                            "browser_expose_binding_after_raw_mutation",
+                            panic_error,
+                            cleanup_error.to_string(),
+                        ));
+                    }
+                }
+            }
+            return Err(panic_error);
+        }
+
         let state =
             synapse_a11y::cdp_evaluate_expression(&endpoint, cdp_target_id, "null", false, true)
                 .await
@@ -7001,6 +7897,9 @@ impl SynapseService {
         cdp_target_id: &str,
         params: &BrowserAddInitScriptParams,
     ) -> Result<BrowserAddInitScriptResponse, ErrorData> {
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_add_init_script_before_page_command",
+        )?;
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if cdp_target_id.starts_with("chrome-tab:") {
                 let operation = browser_init_script_operation_name(params.operation);
@@ -7024,6 +7923,34 @@ impl SynapseService {
                         ),
                     )
                 })?;
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_add_init_script_after_bridge_page_command",
+                ) {
+                    if params.operation == BrowserInitScriptOperation::Add {
+                        match crate::chrome_debugger_bridge::init_script(
+                            window_hwnd,
+                            cdp_target_id,
+                            "remove",
+                            None,
+                            Some(&result.identifier),
+                            params.world_name.as_deref(),
+                            false,
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(_) => return Err(panic_error),
+                            Err(cleanup_error) => {
+                                return Err(operator_panic_rollback_failed(
+                                    "browser_add_init_script_after_bridge_page_command",
+                                    panic_error,
+                                    cleanup_error.detail().to_owned(),
+                                ));
+                            }
+                        }
+                    }
+                    return Err(panic_error);
+                }
                 tracing::info!(
                     code = "CHROME_BRIDGE_BACKGROUND_INIT_SCRIPT",
                     session_id = %session_id,
@@ -7119,6 +8046,29 @@ impl SynapseService {
                 })?
             }
         };
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_add_init_script_after_raw_page_command",
+        ) {
+            if params.operation == BrowserInitScriptOperation::Add {
+                match synapse_a11y::cdp_remove_init_script_target(
+                    &endpoint,
+                    cdp_target_id,
+                    &result.identifier,
+                )
+                .await
+                {
+                    Ok(_) => return Err(panic_error),
+                    Err(cleanup_error) => {
+                        return Err(operator_panic_rollback_failed(
+                            "browser_add_init_script_after_raw_page_command",
+                            panic_error,
+                            cleanup_error.to_string(),
+                        ));
+                    }
+                }
+            }
+            return Err(panic_error);
+        }
         tracing::info!(
             code = "CDP_BACKGROUND_INIT_SCRIPT",
             session_id = %session_id,
@@ -7181,6 +8131,9 @@ impl SynapseService {
         source: &ResolvedBrowserTagSource,
         script_type: Option<&str>,
     ) -> Result<BrowserAddTagResponse, ErrorData> {
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_add_tag_before_runtime_dispatch",
+        )?;
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if cdp_target_id.starts_with("chrome-tab:") {
                 let marker = browser_tag_marker(tool, cdp_target_id);
@@ -7205,6 +8158,47 @@ impl SynapseService {
                         ),
                     )
                 })?;
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_add_tag_after_bridge_runtime_dispatch",
+                ) {
+                    let cleanup_expression = build_browser_remove_tag_expression(tool, &marker)
+                        .map_err(|cleanup_error| {
+                            operator_panic_rollback_failed(
+                                "browser_add_tag_after_bridge_runtime_dispatch",
+                                panic_error.clone(),
+                                cleanup_error.message.to_string(),
+                            )
+                        })?;
+                    match crate::chrome_debugger_bridge::evaluate_script(
+                        window_hwnd,
+                        cdp_target_id,
+                        &cleanup_expression,
+                        &[],
+                        true,
+                        true,
+                        synapse_a11y::DEFAULT_EVALUATE_TIMEOUT_MS,
+                    )
+                    .await
+                    {
+                        Ok(cleanup) => match verify_browser_remove_tag_payload(cleanup.value) {
+                            Ok(()) => return Err(panic_error),
+                            Err(cleanup_error) => {
+                                return Err(operator_panic_rollback_failed(
+                                    "browser_add_tag_after_bridge_runtime_dispatch",
+                                    panic_error,
+                                    cleanup_error,
+                                ));
+                            }
+                        },
+                        Err(cleanup_error) => {
+                            return Err(operator_panic_rollback_failed(
+                                "browser_add_tag_after_bridge_runtime_dispatch",
+                                panic_error,
+                                cleanup_error.detail().to_owned(),
+                            ));
+                        }
+                    }
+                }
                 let payload: BrowserAddTagPayload = serde_json::from_value(evaluated.value.clone())
                     .map_err(|error| {
                         mcp_error(
@@ -7270,6 +8264,45 @@ impl SynapseService {
                 format!("{tool} raw CDP Runtime.evaluate failed: {error}"),
             )
         })?;
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_add_tag_after_raw_runtime_dispatch",
+        ) {
+            let cleanup_expression =
+                build_browser_remove_tag_expression(tool, &marker).map_err(|cleanup_error| {
+                    operator_panic_rollback_failed(
+                        "browser_add_tag_after_raw_runtime_dispatch",
+                        panic_error.clone(),
+                        cleanup_error.message.to_string(),
+                    )
+                })?;
+            match synapse_a11y::cdp_evaluate_expression(
+                &endpoint,
+                cdp_target_id,
+                &cleanup_expression,
+                true,
+                true,
+            )
+            .await
+            {
+                Ok(cleanup) => match verify_browser_remove_tag_payload(cleanup.value) {
+                    Ok(()) => return Err(panic_error),
+                    Err(cleanup_error) => {
+                        return Err(operator_panic_rollback_failed(
+                            "browser_add_tag_after_raw_runtime_dispatch",
+                            panic_error,
+                            cleanup_error,
+                        ));
+                    }
+                },
+                Err(cleanup_error) => {
+                    return Err(operator_panic_rollback_failed(
+                        "browser_add_tag_after_raw_runtime_dispatch",
+                        panic_error,
+                        cleanup_error.to_string(),
+                    ));
+                }
+            }
+        }
         let payload: BrowserAddTagPayload = serde_json::from_value(evaluated.value.clone())
             .map_err(|error| {
                 mcp_error(
@@ -7360,6 +8393,9 @@ impl SynapseService {
                         ),
                     )
                 })?;
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_wait_for_function_after_bridge_runtime_dispatch",
+                )?;
                 if waited.timed_out {
                     return Err(mcp_error(
                         error_codes::BROWSER_WAIT_TIMEOUT,
@@ -8375,6 +9411,10 @@ impl SynapseService {
         wait: &NormalizedBrowserWaitForFunctionParams,
     ) -> Result<BrowserWaitForFunctionResponse, ErrorData> {
         const TOOL: &str = "browser_wait_for_function";
+        // A predicate is caller-supplied JavaScript and can have side effects.
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_wait_for_function_before_runtime_dispatch",
+        )?;
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if cdp_target_id.starts_with("chrome-tab:") {
                 let waited = crate::chrome_debugger_bridge::wait_for_function(
@@ -8470,6 +9510,9 @@ impl SynapseService {
                 format!("browser_wait_for_function raw CDP Runtime.evaluate failed: {error}"),
             )
         })?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_wait_for_function_after_raw_runtime_dispatch",
+        )?;
         let payload: BrowserWaitForFunctionPayload =
             serde_json::from_value(evaluated.value.clone()).map_err(|error| {
                 mcp_error(
@@ -8683,6 +9726,9 @@ impl SynapseService {
         html: &str,
         wait_timeout_ms: u64,
     ) -> Result<BrowserSetContentResponse, ErrorData> {
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_set_content_before_document_replace",
+        )?;
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if cdp_target_id.starts_with("chrome-tab:") {
                 let set =
@@ -8703,6 +9749,9 @@ impl SynapseService {
                             ),
                         )
                     })?;
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_set_content_after_bridge_document_replace",
+                )?;
                 tracing::info!(
                     code = "CHROME_BRIDGE_BACKGROUND_SET_CONTENT",
                     session_id = %session_id,
@@ -8853,7 +9902,7 @@ impl SynapseService {
                 format!("browser_console_messages capture arm failed: {error}"),
             )
         })?;
-        // Independent page-context read-back (FSV source-of-truth correlation):
+        // Independent page-context read-back (manual FSV source correlation):
         // the url/title/readyState the messages were captured against.
         let state =
             synapse_a11y::cdp_evaluate_expression(&endpoint, cdp_target_id, "null", false, true)
@@ -9049,6 +10098,9 @@ impl SynapseService {
                     format!("browser_inspect normal bridge payload decode failed: {error}"),
                 )
             })?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_set_content_after_raw_document_replace",
+        )?;
         tracing::info!(
             code = "CHROME_BRIDGE_BACKGROUND_INSPECT",
             session_id = %session_id,
@@ -9128,6 +10180,9 @@ impl SynapseService {
         element_id: &str,
         backend_node_id: i64,
     ) -> Result<BrowserScrollIntoViewResponse, ErrorData> {
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_scroll_into_view_before_raw_scroll",
+        )?;
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             return Err(browser_raw_cdp_required_error(
                 "browser_scroll_into_view",
@@ -9143,6 +10198,9 @@ impl SynapseService {
                         format!("browser_scroll_into_view raw CDP scroll failed: {error}"),
                     )
                 })?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_scroll_into_view_after_raw_scroll",
+        )?;
         tracing::info!(
             code = "CDP_BACKGROUND_SCROLL_INTO_VIEW",
             session_id = %session_id,
@@ -9182,6 +10240,9 @@ impl SynapseService {
         cdp_target_id: &str,
         element_id: &str,
     ) -> Result<BrowserScrollIntoViewResponse, ErrorData> {
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_scroll_into_view_before_bridge_scroll",
+        )?;
         let scrolled =
             crate::chrome_debugger_bridge::scroll_into_view(window_hwnd, cdp_target_id, element_id)
                 .await
@@ -9194,6 +10255,9 @@ impl SynapseService {
                         ),
                     )
                 })?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_scroll_into_view_after_bridge_scroll",
+        )?;
         tracing::info!(
             code = "CHROME_BRIDGE_BACKGROUND_SCROLL_INTO_VIEW",
             session_id = %session_id,
@@ -9453,6 +10517,9 @@ impl SynapseService {
         process_name: &str,
     ) -> Result<CdpOpenTabResponse, ErrorData> {
         let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_open_tab_before_raw_create_target",
+        )?;
         let opened = synapse_a11y::cdp_open_background_tab(endpoint, requested_url)
             .await
             .map_err(|error| {
@@ -9461,6 +10528,36 @@ impl SynapseService {
                     format!("cdp_open_tab Target.createTarget/readback failed: {error}"),
                 )
             })?;
+        if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_open_tab_after_raw_create_target",
+        ) {
+            match synapse_a11y::cdp_close_target(endpoint, &opened.target.target_id).await {
+                Ok(closed)
+                    if closed
+                        .target_id
+                        .eq_ignore_ascii_case(&opened.target.target_id) =>
+                {
+                    return Err(panic_error);
+                }
+                Ok(closed) => {
+                    return Err(operator_panic_rollback_failed(
+                        "cdp_open_tab_after_raw_create_target",
+                        panic_error,
+                        format!(
+                            "raw close readback targeted {:?}, expected {:?}",
+                            closed.target_id, opened.target.target_id
+                        ),
+                    ));
+                }
+                Err(cleanup_error) => {
+                    return Err(operator_panic_rollback_failed(
+                        "cdp_open_tab_after_raw_create_target",
+                        panic_error,
+                        cleanup_error.to_string(),
+                    ));
+                }
+            }
+        }
         let human_os_foreground_after_hwnd = current_human_os_foreground_hwnd();
         let cdp_target_id = opened.target.target_id.clone();
         let owner_key = self.register_cdp_target_owner(CdpTargetOwner {
@@ -9478,7 +10575,7 @@ impl SynapseService {
             window_hwnd,
             cdp_target_id: cdp_target_id.clone(),
         };
-        let previous = self.set_session_target(
+        let previous = self.set_session_target_authority_locked(
             session_id,
             SessionTarget::Cdp {
                 window_hwnd,
@@ -9585,6 +10682,9 @@ impl SynapseService {
         owner: CdpTargetOwner,
     ) -> Result<CdpCloseTabResponse, ErrorData> {
         if is_chrome_debugger_endpoint(&owner.endpoint) {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "cdp_close_tab_before_bridge_close_target",
+            )?;
             let closed = match crate::chrome_debugger_bridge::close_tab(
                 owner.window_hwnd,
                 cdp_target_id,
@@ -9628,15 +10728,32 @@ impl SynapseService {
                             ),
                         ));
                     }
-                    let _removed = self.remove_cdp_target_owner(owner_key)?;
-                    let previous =
-                        self.clear_session_cdp_target_if_matches(session_id, cdp_target_id)?;
-                    let current = self.get_session_target_wire(session_id)?;
-                    let claim_released = self.release_closed_cdp_target_claim(
+                    let panic_error = super::operator_panic_boundary::ensure_mcp_mutation(
+                        "cdp_close_tab_after_bridge_already_absent_readback",
+                    )
+                    .err();
+                    let reconciliation = self.reconcile_closed_cdp_target_ledgers(
                         session_id,
+                        owner_key,
                         owner.window_hwnd,
                         cdp_target_id,
-                    )?;
+                    );
+                    let (previous, current, claim_released) = match reconciliation {
+                        Ok(readback) => readback,
+                        Err(reconciliation_error) => {
+                            if let Some(panic_error) = panic_error {
+                                return Err(operator_panic_rollback_failed(
+                                    "cdp_close_tab_after_bridge_already_absent_readback",
+                                    panic_error,
+                                    reconciliation_error.message.to_string(),
+                                ));
+                            }
+                            return Err(reconciliation_error);
+                        }
+                    };
+                    if let Some(panic_error) = panic_error {
+                        return Err(panic_error);
+                    }
                     tracing::info!(
                         code = "CDP_BACKGROUND_TAB_OWNER_RECLAIMED_ALREADY_ABSENT",
                         session_id = %session_id,
@@ -9675,11 +10792,32 @@ impl SynapseService {
                     ));
                 }
             };
-            let _removed = self.remove_cdp_target_owner(owner_key)?;
-            let previous = self.clear_session_cdp_target_if_matches(session_id, cdp_target_id)?;
-            let current = self.get_session_target_wire(session_id)?;
-            let claim_released =
-                self.release_closed_cdp_target_claim(session_id, owner.window_hwnd, cdp_target_id)?;
+            let panic_error = super::operator_panic_boundary::ensure_mcp_mutation(
+                "cdp_close_tab_after_bridge_close_target",
+            )
+            .err();
+            let reconciliation = self.reconcile_closed_cdp_target_ledgers(
+                session_id,
+                owner_key,
+                owner.window_hwnd,
+                cdp_target_id,
+            );
+            let (previous, current, claim_released) = match reconciliation {
+                Ok(readback) => readback,
+                Err(reconciliation_error) => {
+                    if let Some(panic_error) = panic_error {
+                        return Err(operator_panic_rollback_failed(
+                            "cdp_close_tab_after_bridge_close_target",
+                            panic_error,
+                            reconciliation_error.message.to_string(),
+                        ));
+                    }
+                    return Err(reconciliation_error);
+                }
+            };
+            if let Some(panic_error) = panic_error {
+                return Err(panic_error);
+            }
             tracing::info!(
                 code = "CDP_BACKGROUND_TAB_CLOSED",
                 session_id = %session_id,
@@ -9709,6 +10847,9 @@ impl SynapseService {
             });
         }
 
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_close_tab_before_raw_close_target",
+        )?;
         let closed = synapse_a11y::cdp_close_target(&owner.endpoint, cdp_target_id)
             .await
             .map_err(|error| {
@@ -9717,11 +10858,32 @@ impl SynapseService {
                     format!("cdp_close_tab Target.closeTarget/readback failed: {error}"),
                 )
             })?;
-        let _removed = self.remove_cdp_target_owner(owner_key)?;
-        let previous = self.clear_session_cdp_target_if_matches(session_id, cdp_target_id)?;
-        let current = self.get_session_target_wire(session_id)?;
-        let claim_released =
-            self.release_closed_cdp_target_claim(session_id, owner.window_hwnd, cdp_target_id)?;
+        let panic_error = super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_close_tab_after_raw_close_target",
+        )
+        .err();
+        let reconciliation = self.reconcile_closed_cdp_target_ledgers(
+            session_id,
+            owner_key,
+            owner.window_hwnd,
+            cdp_target_id,
+        );
+        let (previous, current, claim_released) = match reconciliation {
+            Ok(readback) => readback,
+            Err(reconciliation_error) => {
+                if let Some(panic_error) = panic_error {
+                    return Err(operator_panic_rollback_failed(
+                        "cdp_close_tab_after_raw_close_target",
+                        panic_error,
+                        reconciliation_error.message.to_string(),
+                    ));
+                }
+                return Err(reconciliation_error);
+            }
+        };
+        if let Some(panic_error) = panic_error {
+            return Err(panic_error);
+        }
         tracing::info!(
             code = "CDP_BACKGROUND_TAB_CLOSED",
             session_id = %session_id,
@@ -9748,11 +10910,18 @@ impl SynapseService {
         })
     }
 
-    #[cfg(windows)]
     fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> bool {
         detail.contains("targetIdHint")
             && detail.contains(target_id)
             && detail.contains("did not match any chrome.tabs tab id")
+    }
+
+    fn chrome_bridge_tab_id_from_target_id(target_id: &str) -> Option<i64> {
+        let tab_id = target_id.strip_prefix("chrome-tab:")?;
+        if tab_id.is_empty() || !tab_id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        tab_id.parse::<i64>().ok()
     }
 
     #[cfg(windows)]
@@ -9769,6 +10938,9 @@ impl SynapseService {
     ) -> Result<CdpNavigateTabResponse, ErrorData> {
         if let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) {
             let raw_action = raw_cdp_navigation_action(action);
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "cdp_navigate_tab_before_raw_page_command",
+            )?;
             let navigated = synapse_a11y::cdp_navigate_page_target(
                 &endpoint,
                 cdp_target_id,
@@ -9784,6 +10956,9 @@ impl SynapseService {
                     format!("cdp_navigate_tab raw Page command/readback failed: {error}"),
                 )
             })?;
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "cdp_navigate_tab_after_raw_page_command",
+            )?;
             tracing::info!(
                 code = "CDP_BACKGROUND_TAB_NAVIGATED",
                 session_id = %session_id,
@@ -9856,6 +11031,9 @@ impl SynapseService {
         }
 
         let action_wire = cdp_navigate_action_wire(action);
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_navigate_tab_before_bridge_page_command",
+        )?;
         let navigated = crate::chrome_debugger_bridge::navigate_tab(
             window_hwnd,
             cdp_target_id,
@@ -9875,6 +11053,9 @@ impl SynapseService {
                 ),
             )
         })?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_navigate_tab_after_bridge_page_command",
+        )?;
         let endpoint = navigated
             .extension_id
             .as_deref()
@@ -9965,6 +11146,9 @@ impl SynapseService {
         wait_timeout_ms: u64,
     ) -> Result<CdpActivateTabResponse, ErrorData> {
         if let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "cdp_activate_tab_before_raw_activate_target",
+            )?;
             let activated = synapse_a11y::cdp_activate_target(&endpoint, cdp_target_id)
                 .await
                 .map_err(|error| {
@@ -9975,6 +11159,9 @@ impl SynapseService {
                         ),
                     )
                 })?;
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "cdp_activate_tab_after_raw_activate_target",
+            )?;
             tracing::info!(
                 code = "CDP_BACKGROUND_TAB_ACTIVATED",
                 session_id = %session_id,
@@ -10003,6 +11190,9 @@ impl SynapseService {
         }
 
         let human_os_foreground_before_hwnd = current_human_os_foreground_hwnd();
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_activate_tab_before_bridge_activate_target",
+        )?;
         let activated = crate::chrome_debugger_bridge::activate_tab(
             window_hwnd,
             cdp_target_id,
@@ -10018,6 +11208,9 @@ impl SynapseService {
                 ),
             )
         })?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "cdp_activate_tab_after_bridge_activate_target",
+        )?;
         let human_os_foreground_after_hwnd = current_human_os_foreground_hwnd();
         if background_tab_activation_foregrounded_requested_window(
             human_os_foreground_before_hwnd,
@@ -10118,19 +11311,24 @@ fn perception_window_hwnd(
     target: &Option<SessionTarget>,
     explicit_hwnd: Option<i64>,
 ) -> Result<Option<i64>, ErrorData> {
-    if explicit_hwnd.is_some() {
-        return Ok(explicit_hwnd);
+    if let Some(hwnd) = explicit_hwnd {
+        return crate::m1::validate_window_hwnd_shape(tool, hwnd).map(Some);
     }
     match target {
-        Some(SessionTarget::Window { hwnd }) => Ok(Some(*hwnd)),
+        Some(SessionTarget::Window { hwnd }) => {
+            crate::m1::validate_window_hwnd_shape(tool, *hwnd).map(Some)
+        }
         Some(SessionTarget::Cdp {
             window_hwnd,
             cdp_target_id,
-        }) => Err(cdp_target_perception_error(
-            tool,
-            *window_hwnd,
-            cdp_target_id,
-        )),
+        }) => {
+            let window_hwnd = crate::m1::validate_window_hwnd_shape(tool, *window_hwnd)?;
+            Err(cdp_target_perception_error(
+                tool,
+                window_hwnd,
+                cdp_target_id,
+            ))
+        }
         None => Ok(None),
     }
 }
@@ -11030,6 +12228,13 @@ struct BrowserAddTagPayload {
     resolved_url: Option<String>,
     content_len: usize,
     element_marker: String,
+}
+
+#[cfg(windows)]
+#[derive(Deserialize)]
+struct BrowserRemoveTagPayload {
+    removed: usize,
+    remaining: usize,
 }
 
 const DEFAULT_BROWSER_WAIT_TIMEOUT_MS: u64 = 30_000;
@@ -12752,6 +13957,36 @@ fn build_browser_add_tag_expression(
     Ok(expression)
 }
 
+#[cfg(windows)]
+fn build_browser_remove_tag_expression(tool: &str, marker: &str) -> Result<String, ErrorData> {
+    let marker_json = browser_tag_json_string(tool, "element marker", marker)?;
+    Ok(format!(
+        r#"(() => {{
+            const marker = {marker_json};
+            const matches = Array.from(document.querySelectorAll('[data-synapse-tag-id]'))
+                .filter((el) => el.getAttribute('data-synapse-tag-id') === marker);
+            for (const el of matches) el.remove();
+            const remaining = Array.from(document.querySelectorAll('[data-synapse-tag-id]'))
+                .filter((el) => el.getAttribute('data-synapse-tag-id') === marker).length;
+            return {{ removed: matches.length, remaining }};
+        }})()"#
+    ))
+}
+
+#[cfg(windows)]
+fn verify_browser_remove_tag_payload(value: Value) -> Result<(), String> {
+    let payload: BrowserRemoveTagPayload = serde_json::from_value(value)
+        .map_err(|error| format!("decode rollback payload: {error}"))?;
+    if payload.removed == 1 && payload.remaining == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "exact tag rollback readback removed={} remaining={}, expected removed=1 remaining=0",
+            payload.removed, payload.remaining
+        ))
+    }
+}
+
 fn validate_browser_add_init_script_params(
     params: &BrowserAddInitScriptParams,
 ) -> Result<(), ErrorData> {
@@ -13947,19 +15182,34 @@ fn passive_chromium_selection_invariant_error(
     owned_count: usize,
 ) -> ErrorData {
     const CODE: &str = "M1_PASSIVE_CHROMIUM_SELECTION_INVARIANT_BROKEN";
+    const SOURCE_OF_TRUTH: &str =
+        "in-memory passive Chromium candidate and session-ownership vectors at selection";
+    const REMEDIATION: &str = "retry after target operation=list; if this repeats, inspect concurrent window/session-target updates in daemon logs using code=M1_PASSIVE_CHROMIUM_SELECTION_INVARIANT_BROKEN";
     tracing::error!(
         code = CODE,
         tool,
         stage,
         candidate_count,
         owned_count,
+        source_of_truth = SOURCE_OF_TRUTH,
+        remediation = REMEDIATION,
         "passive Chromium discovery cardinality changed before selection"
     );
-    mcp_error(
-        error_codes::TOOL_INTERNAL_ERROR,
+    ErrorData::new(
+        ErrorCode(-32099),
         format!(
-            "{CODE}: {tool} could not select a passive Chromium window because the {stage} cardinality invariant changed; candidate_count={candidate_count} owned_count={owned_count}. remediation=retry after target operation=list; if this repeats, inspect concurrent window/session-target updates in daemon logs using code={CODE}."
+            "{CODE}: {tool} could not select a passive Chromium window because the {stage} cardinality invariant changed; candidate_count={candidate_count} owned_count={owned_count}"
         ),
+        Some(json!({
+            "code": error_codes::TOOL_INTERNAL_ERROR,
+            "detail_code": CODE,
+            "tool": tool,
+            "stage": stage,
+            "candidate_count": candidate_count,
+            "owned_count": owned_count,
+            "source_of_truth": SOURCE_OF_TRUTH,
+            "remediation": REMEDIATION,
+        })),
     )
 }
 
@@ -14394,7 +15644,26 @@ fn prepare_browser_screenshot_foreground(
         })?;
     }
 
-    let capture_foreground = read_browser_screenshot_current_foreground("capture_ready")?;
+    let capture_foreground = match read_browser_screenshot_current_foreground("capture_ready") {
+        Ok(capture_foreground) => capture_foreground,
+        Err(error) => {
+            let guard = BrowserScreenshotForegroundGuard {
+                readback: BrowserScreenshotForegroundReadback {
+                    required_foreground,
+                    before_hwnd: Some(before.hwnd),
+                    capture_hwnd: None,
+                    after_restore_hwnd: None,
+                    restored_human_os_foreground: !required_foreground,
+                },
+                before,
+            };
+            return Err(browser_screenshot_prepare_failure_with_restore(
+                window_hwnd,
+                guard,
+                error,
+            ));
+        }
+    };
     if capture_foreground.hwnd != window_hwnd {
         tracing::error!(
             code = error_codes::ACTION_POSTCONDITION_FAILED,
@@ -14409,12 +15678,27 @@ fn prepare_browser_screenshot_foreground(
             required_foreground,
             "browser_screenshot foreground precondition failed after explicit activation"
         );
-        return Err(mcp_error(
+        let error = mcp_error(
             error_codes::ACTION_POSTCONDITION_FAILED,
             format!(
                 "browser_screenshot refused captureVisibleTab because Chrome HWND {window_hwnd:#x} was not the physical OS foreground after activation; actual foreground was {}",
                 browser_screenshot_foreground_summary(&capture_foreground)
             ),
+        );
+        let guard = BrowserScreenshotForegroundGuard {
+            readback: BrowserScreenshotForegroundReadback {
+                required_foreground,
+                before_hwnd: Some(before.hwnd),
+                capture_hwnd: Some(capture_foreground.hwnd),
+                after_restore_hwnd: None,
+                restored_human_os_foreground: !required_foreground,
+            },
+            before,
+        };
+        return Err(browser_screenshot_prepare_failure_with_restore(
+            window_hwnd,
+            guard,
+            error,
         ));
     }
 
@@ -14605,6 +15889,27 @@ fn finish_browser_screenshot_foreground(
     }
 }
 
+#[cfg(windows)]
+fn browser_screenshot_prepare_failure_with_restore(
+    window_hwnd: i64,
+    guard: BrowserScreenshotForegroundGuard,
+    prepare_error: ErrorData,
+) -> ErrorData {
+    match finish_browser_screenshot_foreground(window_hwnd, guard, Some(&prepare_error)) {
+        Ok(_) => prepare_error,
+        Err(cleanup_error) => {
+            synapse_action::record_operator_panic_safety_incident();
+            tracing::error!(
+                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                prepare_error = %prepare_error.message,
+                cleanup_error = %cleanup_error.message,
+                "browser_screenshot foreground acquisition failed and exact restore could not be verified"
+            );
+            cleanup_error
+        }
+    }
+}
+
 #[cfg(not(windows))]
 fn finish_browser_screenshot_foreground(
     _window_hwnd: i64,
@@ -14638,13 +15943,19 @@ fn browser_screenshot_foreground_summary(context: &ForegroundContext) -> String 
 
 /// Validates a `set_target` window HWND is live and snapshottable, returning its
 /// (title, process_name) so the response confirms exactly which window was bound.
-/// Fail-loud: a dead/invalid/unresolvable HWND is `TARGET_WINDOW_NOT_FOUND`.
+/// Fail-loud: a nonpositive HWND is `TOOL_PARAMS_INVALID`; a positive but
+/// dead/unresolvable HWND is `TARGET_WINDOW_NOT_FOUND`.
 pub(crate) fn validate_target_window(hwnd: i64) -> Result<(String, String), ErrorData> {
     let context = validate_target_window_context(hwnd)?;
     Ok((context.window_title, context.process_name))
 }
 
 fn validate_target_window_context(hwnd: i64) -> Result<ForegroundContext, ErrorData> {
+    // Keep the shape contract at the lowest shared window-validation seam so
+    // session recovery, agent spawning, facade calls, and future internal
+    // callers all classify nonpositive HWNDs identically before touching the
+    // capture/UIA backends.
+    crate::m1::validate_window_hwnd_shape("window_target_validation", hwnd)?;
     synapse_capture::validate_hwnd(hwnd).map_err(|error| {
         mcp_error(
             error_codes::TARGET_WINDOW_NOT_FOUND,

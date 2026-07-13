@@ -97,7 +97,9 @@ fn spawn_action_drain_thread(
     thread::Builder::new()
         .name("synapse-reflex-bench-action-drain".to_owned())
         .spawn(move || {
-            while let Some((_action, ack)) = action_rx.blocking_recv() {
+            while let Some((_action, ack, _operator_panic_epoch_at_enqueue)) =
+                action_rx.blocking_recv()
+            {
                 let _ = ack.send(Ok(()));
             }
         })

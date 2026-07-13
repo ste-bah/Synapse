@@ -253,8 +253,8 @@ impl ActionEmitter {
         loop {
             tokio::select! {
                 biased;
-                Some((action, ack)) = self.safety_rx.recv() => {
-                    self.execute_actor_message(action, ack).await;
+                Some((action, ack, operator_panic_epoch_at_enqueue)) = self.safety_rx.recv() => {
+                    self.execute_actor_message(action, ack, operator_panic_epoch_at_enqueue).await;
                 },
                 Some(auto_release) = self.auto_release_rx.recv() => {
                     if let Some(emitted_action) = self.auto_release_held_key(&auto_release) {
@@ -272,8 +272,8 @@ impl ActionEmitter {
                     self.release_all("connection_closed").await;
                     return self.snapshot();
                 },
-                Some((action, ack)) = self.rx.recv() => {
-                    self.execute_actor_message(action, ack).await;
+                Some((action, ack, operator_panic_epoch_at_enqueue)) = self.rx.recv() => {
+                    self.execute_actor_message(action, ack, operator_panic_epoch_at_enqueue).await;
                 },
                 else => {
                     self.release_all("connection_closed").await;
@@ -296,9 +296,16 @@ impl ActionEmitter {
         &mut self,
         action: Action,
         ack: tokio::sync::oneshot::Sender<ActionResult<()>>,
+        operator_panic_epoch_at_enqueue: Option<u64>,
     ) {
         let is_release_all = matches!(action, Action::ReleaseAll);
-        let result = self.execute(action).await;
+        let result = match crate::handle::ensure_operator_panic_allows_action_since(
+            &action,
+            operator_panic_epoch_at_enqueue,
+        ) {
+            Ok(()) => self.execute(action).await,
+            Err(error) => Err(error),
+        };
         let _send_result = ack.send(result);
         if is_release_all {
             self.reject_pending_normal_actions_after_release_all();
@@ -307,7 +314,7 @@ impl ActionEmitter {
 
     fn reject_pending_normal_actions_after_release_all(&mut self) {
         let mut rejected = 0_u32;
-        while let Ok((action, ack)) = self.rx.try_recv() {
+        while let Ok((action, ack, _operator_panic_epoch_at_enqueue)) = self.rx.try_recv() {
             rejected = rejected.saturating_add(1);
             let kind = super::routing::action_kind(&action);
             let _send_result = ack.send(Err(ActionError::SafetyReleaseAllFired {

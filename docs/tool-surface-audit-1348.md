@@ -13,7 +13,7 @@ Every claim cites `file:line` under the repo root. This document is the analysis
 1. **Web `click`/`dblclick`/`press` is synthetic-`dispatchEvent`-only, with no activation postcondition.** A `target_act` click on a *DOM locator* (selector/role/name) routes to `target_act_browser_dom_action(…, "click", …)` (`background_router.rs:608`, `:633`), running in-page `performClick` (`service_worker.js:17161`) firing forged `PointerEvent`/`MouseEvent` (`:17349`, `:17361`) — `isTrusted=false`, so default actions / isTrusted-guarded handlers ignore them, yet the function returns `ok` with only a before/after summary (`:16613`). A **real** CDP mouse path (`cdpInput` → `Input.dispatchMouseEvent`) already exists and is used by `tap`/`hover`/`drag` — but `click` never routes there.
 2. **`verb=press` with no key chord silently becomes a synthetic mouse click** (`background_router.rs:711-716` → DOM `"press"` → `performClick`).
 3. **`typeActiveElement` uses the plain `.value=` setter + synchronous readback** (`service_worker.js:15555`, `:15467`). Controlled React/Vue/Angular inputs revert this on next render; the sync readback passes before the async revert → false success. The correct native-setter path already exists in `setFieldValue` (`:16002`, comment `:15648`).
-4. **Test/FSV scaffolding shipped as live tools:** `storage_put_probe_rows` (`m3_tools.rs:2111`), `storage_pressure_sample` (`m3_tools.rs:2153`), `action_diagnostic_rate_limit_override` (`m2_tools.rs:1644`), `action_diagnostic_queue_full_setup` (`m2_tools.rs:1726`).
+4. **Supporting test/diagnostic scaffolding shipped as live tools:** `storage_put_probe_rows` (`m3_tools.rs:2111`), `storage_pressure_sample` (`m3_tools.rs:2153`), `action_diagnostic_rate_limit_override` (`m2_tools.rs:1644`), `action_diagnostic_queue_full_setup` (`m2_tools.rs:1726`). These tools do not perform or accept FSV.
 
 ---
 
@@ -68,7 +68,7 @@ Read side (`browser_network_requests`/`_request`/`_websockets`) read one shared 
 `workspace_subscribe` ⊂ generic `subscribe` (workspace filter) → fold. Naming collision: session `tool_profile_*` vs learned `profile_*`/`profile_authoring_*` — rename one.
 
 ## (a) Prioritized LOW-RISK first cuts (candidate child issues)
-1. Delete/hide FSV/test-harness tools from the live surface — `storage_put_probe_rows`, `storage_pressure_sample`, `action_diagnostic_rate_limit_override`, `action_diagnostic_queue_full_setup`. (-4, zero capability loss)
+1. Delete/hide supporting diagnostic/test-harness tools from the live surface — `storage_put_probe_rows`, `storage_pressure_sample`, `action_diagnostic_rate_limit_override`, `action_diagnostic_queue_full_setup`. (-4, zero capability loss)
 2. Delete dead code — `act_click_with_handle` (`click.rs:103`), `applyTextToEditable`/`dispatchSyntheticInputEvent` (`service_worker.js`).
 3. Collapse 7 `browser_wait_for_*` → one `browser_wait_for {condition}`. (-6)
 4. Fold `browser_resize/device/geolocation/locale/media` + `browser_network_conditions` → `browser_emulate`. (-6)
@@ -81,8 +81,8 @@ Read side (`browser_network_requests`/`_request`/`_websockets`) read one shared 
 
 Net of items 1-7: roughly **-30 tools** with no real capability loss (245 → ~215).
 
-## (b) HIGH-RISK items (plan + FSV individually)
-1. Rewire web `click`/`dblclick`/`press` off synthetic `performClick` onto real CDP `Input.dispatchMouseEvent` + activation postcondition (hot path, needs real-Chrome FSV across guarded sites).
+## (b) HIGH-RISK items (plan + manual FSV individually)
+1. Rewire web `click`/`dblclick`/`press` off synthetic `performClick` onto real CDP `Input.dispatchMouseEvent` + activation postcondition (hot path, needs manual real-Chrome FSV across guarded sites).
 2. Fix/remove `verb=press`→synthetic-mouse-click mapping.
 3. Converge field-text tools into `act_set_field_text` tiers (large #882/#1000/#1299 refactor; keep per-tier fail-closed contract).
 4. Fix `typeActiveElement` plain-setter revert (native setter / `Input.insertText` + deferred re-read).

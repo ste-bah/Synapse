@@ -27,7 +27,7 @@
 use std::{
     collections::BTreeSet,
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock, Weak,
         atomic::{AtomicU32, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -41,7 +41,7 @@ use synapse_storage::{
 };
 
 use super::ErrorData;
-use super::session_registry::{SharedSessionRegistry, unix_time_ms_now};
+use super::session_registry::{SessionRegistry, SharedSessionRegistry, unix_time_ms_now};
 
 /// Hard cap on one encoded journal row. Agent events are bounded metadata;
 /// anything larger indicates a writer leaking content into the journal.
@@ -51,7 +51,7 @@ pub(crate) const MAX_AGENT_EVENT_VALUE_BYTES: usize = 16 * 1024;
 /// within one clock tick; wraps harmlessly because `ts_ns` dominates the key.
 static NEXT_AGENT_EVENT_SEQ: AtomicU32 = AtomicU32::new(0);
 
-static SESSION_REGISTRY_ACTIVITY_SINK: OnceLock<Mutex<Option<SharedSessionRegistry>>> =
+static SESSION_REGISTRY_ACTIVITY_SINK: OnceLock<Mutex<Option<Weak<Mutex<SessionRegistry>>>>> =
     OnceLock::new();
 
 /// Physical readback of one persisted journal row.
@@ -77,7 +77,10 @@ pub(crate) fn install_session_registry_activity_sink(registry: SharedSessionRegi
     let slot = SESSION_REGISTRY_ACTIVITY_SINK.get_or_init(|| Mutex::new(None));
     match slot.lock() {
         Ok(mut guard) => {
-            *guard = Some(registry);
+            // The process-global projection hook must not keep a failed or
+            // stopped daemon's session/service graph alive. Each event upgrades
+            // the current generation only while applying its refresh.
+            *guard = Some(Arc::downgrade(&registry));
             tracing::info!(
                 code = "AGENT_EVENT_SESSION_REGISTRY_ACTIVITY_SINK_INSTALLED",
                 "agent activity rows will refresh SessionRegistry last_seen"
@@ -151,7 +154,7 @@ fn refresh_installed_session_registry_activity(records: &[AgentEventRecord]) {
 fn installed_session_registry_activity_sink() -> Option<SharedSessionRegistry> {
     let slot = SESSION_REGISTRY_ACTIVITY_SINK.get()?;
     match slot.lock() {
-        Ok(guard) => guard.clone(),
+        Ok(guard) => guard.as_ref().and_then(Weak::upgrade),
         Err(_poisoned) => {
             tracing::error!(
                 code = "AGENT_EVENT_SESSION_LAST_SEEN_REFRESH_FAILED",

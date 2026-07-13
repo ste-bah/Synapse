@@ -18,7 +18,7 @@
 //! — the single source of truth — never maintained as a second incrementally
 //! updated copy. That eliminates dual-write drift by construction: a counter
 //! *is* the priced sum of the rows it reports, so it reconciles with them
-//! exactly (the #901 FSV requirement) with no reconciliation job to run.
+//! exactly (the #901 manual FSV requirement) with no reconciliation job to run.
 //!
 //! ## Determining one authoritative usage total per session
 //!
@@ -453,7 +453,7 @@ pub struct AgentFleetCost {
 /// per-spawn costs to the template/task identity recorded at spawn time, then
 /// summing. The sum of every group's `computed_micro_usd` (including the
 /// `(unattributed)` bucket) equals `fleet.computed_micro_usd` exactly — the
-/// reconciliation invariant the FSV asserts.
+/// reconciliation invariant manual FSV asserts.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentGroupCost {
@@ -488,7 +488,7 @@ pub struct AgentGroupCost {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unpriced_models: Vec<String>,
     /// The spawn ids folded into this group, so a caller can verify the join
-    /// against the physical `SpawnRequested`/task rows (FSV).
+    /// against the physical `SpawnRequested`/task rows during manual FSV.
     pub spawn_ids: Vec<String>,
 }
 

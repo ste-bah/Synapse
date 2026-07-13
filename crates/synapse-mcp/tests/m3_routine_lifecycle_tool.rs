@@ -261,7 +261,7 @@ async fn routine_lifecycle_survives_mining_and_audits_transitions() -> anyhow::R
             .tools_call(
                 "routine_update",
                 json!({"routine_id": routine_id.clone(), "action": "confirm",
-                       "note": "fsv: confirmed after review"}),
+                       "note": "review: confirmed for regression"}),
             )
             .await?,
     )?;
@@ -331,7 +331,7 @@ async fn routine_lifecycle_survives_mining_and_audits_transitions() -> anyhow::R
             .tools_call(
                 "routine_update",
                 json!({"routine_id": routine_id.clone(), "action": "disable",
-                       "note": "fsv: disabling before re-mine"}),
+                       "note": "review: disabling before re-mine"}),
             )
             .await?,
     )?;
@@ -564,7 +564,7 @@ async fn routine_lifecycle_survives_mining_and_audits_transitions() -> anyhow::R
     assert_eq!(state.transitions[0].by, "miner");
     assert_eq!(
         state.transitions[3].note.as_deref(),
-        Some("fsv: disabling before re-mine"),
+        Some("review: disabling before re-mine"),
         "operator notes must persist in the audit trail"
     );
     assert!(

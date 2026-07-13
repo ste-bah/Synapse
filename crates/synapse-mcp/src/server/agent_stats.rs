@@ -12,7 +12,7 @@
 //! The counters are derived on read by scanning the journal rows, never
 //! maintained as a second incrementally-updated copy. A counter *is* the
 //! folded sum of the rows it reports, so it reconciles with them exactly
-//! (the #903 FSV requirement) with no reconciliation job to run. The honesty
+//! (the #903 manual FSV requirement) with no reconciliation job to run. The honesty
 //! figure `scanned_rows` is returned so a caller can confirm the rollup was
 //! not truncated, and the scan errors loudly when its row budget is exhausted
 //! — a truncated stat is silently wrong, so it is refused, never returned.
@@ -711,7 +711,7 @@ impl ScopeAccumulator {
 /// calls, not a histogram approximation. Uses the nearest-rank method: for a
 /// sorted ascending sample of `n` values and percentile `p`, the rank is
 /// `ceil(p/100 * n)` and the result is the value at that 1-based rank. The
-/// method is exact, deterministic, and hand-verifiable for FSV.
+/// method is exact, deterministic, and hand-verifiable during manual FSV.
 fn latency_stats(durations_ms: &[u64]) -> LatencyStats {
     if durations_ms.is_empty() {
         return LatencyStats {

@@ -3,7 +3,7 @@
 //!
 //! Usage (Windows only): `cargo run -p synapse-a11y --example cdp_action_probe -- <http://127.0.0.1:9222>`
 //!
-//! Known input → known output: a page (title `FSVPAGE`) with a button whose
+//! Known input → known output: a page (title `PROBEPAGE`) with a button whose
 //! onclick sets `body[data-clicked]=yes`, and a text input. We CDP-click the
 //! button and CDP-type into the input, then read the attribute and the input
 //! value back to prove the actions landed.
@@ -28,8 +28,8 @@ mod windows_impl {
     use futures_util::StreamExt as _;
     use synapse_a11y::CdpMouseButton;
 
-    const PAGE_TITLE: &str = "FSVPAGE";
-    const KNOWN_PAGE: &str = "data:text/html,<html><head><title>FSVPAGE</title></head><body>\
+    const PAGE_TITLE: &str = "PROBEPAGE";
+    const KNOWN_PAGE: &str = "data:text/html,<html><head><title>PROBEPAGE</title></head><body>\
 <button onclick=\"document.body.setAttribute('data-clicked','yes')\">Go</button>\
 <input id='t' aria-label='field'></body></html>";
 
@@ -64,7 +64,7 @@ mod windows_impl {
         );
 
         // The button onclick sets body[data-clicked]; the page title stays stable
-        // ("FSVPAGE") so page-by-title selection works through the whole run.
+        // ("PROBEPAGE") so page-by-title selection works through the whole run.
         let _ = page
             .evaluate("document.body.setAttribute('data-clicked','no')")
             .await;
@@ -91,11 +91,11 @@ mod windows_impl {
 
         // --- TYPE: insert text into the input, read value back ---
         let input = input_backend.ok_or("input not found in AX tree")?;
-        synapse_a11y::cdp_type_node(&endpoint, PAGE_TITLE, None, input, "hello fsv").await?;
+        synapse_a11y::cdp_type_node(&endpoint, PAGE_TITLE, None, input, "hello probe").await?;
         let value = eval_string(&page, "document.getElementById('t').value").await?;
         println!("readback=cdp_type after=input_value:{value:?}");
         assert_eq!(
-            value, "hello fsv",
+            value, "hello probe",
             "CDP type did not enter the expected text"
         );
 

@@ -15,13 +15,13 @@ implemented and unit/integration-gated, awaiting the human-active acceptance run
 
 | Invariant | Tool/code | SoT proof |
 |---|---|---|
-| Default surface preserves foreground-equivalent capability through routes (#1219) | `normal_agent` profile | `tool_profile_status` -> `foreground_capability.profile_preserves_capability=true`, `hidden_tool_routes` names the preferred `target_act`/browser/CDP/session-lane route for raw `act_*`; CF_SESSIONS `mcp/tool-profile/v1/<sid>` row |
+| Default surface preserves foreground-equivalent capability through routes (#1219) | `normal_agent` profile | `profile operation=status` -> `foreground_capability.profile_preserves_capability=true`, `hidden_tool_routes` names the preferred public `act`/browser/session-lane route for each raw implementation primitive; CF_SESSIONS `mcp/tool-profile/v1/<sid>` row |
 | Hidden raw tool fails closed with route proof (#1002/#1004/#1219) | tool-profile policy gate | calling `act_type` from `normal_agent` -> error `TOOL_PROFILE_POLICY_DENIED` carrying the CF_SESSIONS `policy_row` plus `capability_route` |
-| Break-glass needs lease + reason + confirm (#999) | `validate_profile_set_policy` | `tool_profile_set break_glass` rejected unless `control_lease` held, `confirm_break_glass=true`, non-empty `reason` |
-| Break-glass has a stable Codex callable route (#1261) | `target_act verb=focus_window` | after `set_target`/`target_claim` + lease + `tool_profile_set break_glass`, the always-visible `target_act` schema can delegate to `act_focus_window`; normal profiles get `TOOL_PROFILE_POLICY_DENIED` |
-| Profile change is visible **in-session** (#1020) | `tool_profile_set` -> `peer.notify_tool_list_changed()` | `notifications/tools/list_changed` frame on the standalone GET SSE stream; `tools/list` changes in the same session with **no reconnect** for clients that honor the MCP notification |
-| Agent target distinct from human foreground (#994) | `window_list` / `set_target` | `window_list.human_os_foreground_hwnd` reported separately; per-entry `is_foreground`; `GetForegroundWindow()` cross-check matches |
-| Passive target discovery without shelling out (#1021) | `window_list` | HWND+PID rows match Win32 `Get-Process MainWindowHandle`; round-trips through `set_target` with no activation |
+| Break-glass needs lease + reason + confirm (#999) | `validate_profile_set_policy` | `profile operation=set profile=break_glass` is rejected unless this session owns the lease and passes confirmation plus a non-empty reason |
+| Break-glass has a stable Codex callable route (#1261/#1379/#1621/#1622) | `act operation=foreground` | after `target operation=set/claim`, the always-visible facade runs as one daemon-tracked, session-keyed authority transaction through lease acquisition, temporary profile escalation, internal focus delegation, independently verified cleanup, and final audit; caller cancellation detaches rather than aborts that transaction, while a newer physical `operator_panic_epoch` supersedes every agent lease snapshot |
+| Profile changes preserve a stable schema (#1020/#1379) | `profile operation=set` | every production profile retains the same <=40 facade names/hash; the CF_SESSIONS row changes operation-level authority without exposing raw implementation tools |
+| Agent target distinct from human foreground (#994) | `target operation=list/set` | `target operation=list` reports the human OS foreground separately; per-entry `is_foreground`; `GetForegroundWindow()` cross-check matches |
+| Passive target discovery without shelling out (#1021) | `target operation=list` | HWND+PID rows match Win32 `Get-Process MainWindowHandle`; round-trips through `target operation=set` with no activation |
 
 ### Manual readback checklist
 
@@ -29,17 +29,17 @@ Use the real wired Synapse MCP client for the trigger, then read the SoT with a
 separate operation. Do not use any script, helper client, or harness as
 acceptance.
 Supporting tests may exercise notifications/tool-list mechanics, but issue
-closure still requires manual `tool_profile_status`, `session_list`,
-`target_claim_status`, `storage_inspect`/read-only CF row, and physical
+closure still requires manual `profile operation=status`, `session operation=list`,
+`target operation=status`, `storage operation=inspect`/read-only CF row, and physical
 window/DOM/UIA readbacks.
 
-Cross-check `window_list` against Win32 when the manual scenario needs the
+Cross-check `target operation=list` against Win32 when the manual scenario needs the
 human OS foreground SoT:
 
 ```powershell
 Add-Type 'using System;using System.Runtime.InteropServices;
   public class Fg{ [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); }'
-[int64][Fg]::GetForegroundWindow()        # == window_list.human_os_foreground_hwnd
+[int64][Fg]::GetForegroundWindow()        # == target operation=list human_os_foreground_hwnd
 Get-Process | ? {$_.MainWindowHandle -ne 0} | % { "{0} {1} {2}" -f [int64]$_.MainWindowHandle,$_.Id,$_.ProcessName }
 ```
 
@@ -98,8 +98,8 @@ windows, typing, moving the mouse) the entire time.
 Setup:
 - Start the target 50+ Synapse MCP sessions, or the maximum locally supported
   count plus a filed capacity issue if a hard local limit remains after all
-  reversible setup. Each session binds a different owned target/lane via
-  `window_list`/`cdp_open_tab` -> `set_target` -> `target_claim`.
+  reversible setup. Each session opens or discovers a different target through
+  `browser_tabs`/`target`, then uses `target operation=set` and `target operation=claim`.
 - Each session must have an `agent_logical_foreground` / `foreground_lane`
   readback. None claims the window you (the human) are using.
 - Keep a third shell open to sample SoT.
@@ -107,16 +107,16 @@ Setup:
 During the run, while the human keeps working:
 1. Mix browser navigation/eval, click, type/set_field, read, screenshot, and
    shell tasks across separate agent lanes/targets.
-2. Routine work uses `target_act`, browser/CDP tools, or the session's
+2. Routine work uses `act operation=invoke`, browser facades, or the session's
    foreground lane. No routine task may fall back to the human OS foreground.
 3. Exactly one edge may test explicit real OS foreground break-glass with an
    owned lease and audit proof.
 
 SoT samples to capture **before / during / after** (paste into the #1220 close
 comment):
-- `session_list` - all live sessions, distinct `agent_logical_foreground` /
+- `session operation=list` - all live sessions, distinct `agent_logical_foreground` /
   `foreground_lane` readbacks, and no implicit human OS foreground fallback.
-- `target_claim_status` - each window/tab target owned by exactly one session;
+- `target operation=status` - each window/tab target owned by exactly one session;
   no overlap.
 - `GetForegroundWindow()` / `GetCursorPos()` - the human's foreground/cursor are
   whatever the human set; **no agent action changed them** (sample repeatedly).
@@ -140,25 +140,29 @@ Compare these `tools/list` profiles via real spawned agents / the wired client:
 
 | Profile | How to get it | Expected surface |
 |---|---|---|
-| raw/full legacy | `SYNAPSE_DEBUG_TOOLS=1` | full implementation surface |
-| normal capability-preserving | default `normal_agent` | visible count from `tool_profile_status`; no raw `act_*` foreground primitives and no raw-CDP/`chrome.debugger` browser instrumentation tools; `target_act`, debugger-free `browser_*`, stable `browser_debugger` facade, `window_list`, `set_target`, legacy `cdp_*` tab-lifecycle wrappers, and route readbacks present |
-| browser-control task | `tool_profile_set browser_control` | narrower; debugger-free browser/perception + target tools only |
-| browser-debugger task | `tool_profile_set browser_debugger` with confirm + reason | browser-only raw-CDP/`chrome.debugger` instrumentation visible and stable `browser_debugger` facade operations admitted; raw OS foreground, shell, and spawn surfaces stay hidden |
-| break-glass/admin | lease + `tool_profile_set break_glass` | full raw surface incl. `act_*` |
+| trusted unscoped admin/diagnostic | unscoped stdio, or `SYNAPSE_DEBUG_TOOLS=1` | full implementation surface; never the scoped HTTP profile contract |
+| normal capability-preserving | default `normal_agent` | the <=40 public facade surface; raw implementation primitives stay hidden and ordinary target/browser operations are admitted |
+| browser-control task | `profile operation=set profile=browser_control` | the same stable facade names; browser-control authority is enforced inside facade operations |
+| browser-debugger task | `profile operation=set profile=browser_debugger` with confirm + reason | the same stable facade names; debugger-backed `browser_debugger` operations are admitted while raw implementation tools remain hidden |
+| break-glass/admin | `act operation=foreground` for one action, or lease + `profile operation=set profile=break_glass` | the same stable facade names; foreground-capable facade operations are admitted while raw `act_*` implementation primitives remain hidden |
 
 Codex/client compatibility note (#1261/#1445): some clients keep a static callable
 tool namespace even after the server sends `notifications/tools/list_changed`.
-For deliberate real-foreground activation, bind the exact window first with
-`window_list` -> `set_target` -> `target_claim`, acquire the foreground input
-lease, set `profile=break_glass`, then call the already-visible
-`target_act {"verb":"focus_window"}` route. The route delegates to
-`act_focus_window` only after the profile gate passes and still uses the normal
-foreground lease plus `GetForegroundWindow` readback.
+For deliberate real-foreground activation, bind and claim the exact window with
+the public `target` facade, then call
+`act {"operation":"foreground","reason":"<why>","action":{"verb":"focus_window"}}`.
+The facade acquires the foreground lease, temporarily transitions the profile,
+delegates internally, byte-restores the prior CF_SESSIONS profile row, releases
+a newly acquired lease, and verifies both cleanup Sources of Truth before
+returning. The entire operation is daemon-tracked, so request cancellation
+detaches while cleanup and final audit continue under the same session gate;
+panic is caught while the rollback guard remains live. A newer physical
+`operator_panic_epoch` deletes the guarded session lease row, preserves the
+operator owner, and returns a structured safety interruption.
 For browser debugger work, use the already-visible `browser_debugger` facade
-after setting `profile=browser_debugger`; raw debugger implementation tools may
-still appear only for clients that refresh `tools/list`, but the stable facade is
-the Codex-safe route and fails closed with `TOOL_PROFILE_POLICY_DENIED` until
-the CF_SESSIONS profile row is updated.
+after setting `profile=browser_debugger`; raw debugger implementation tools stay
+hidden, while debugger-backed facade operations fail closed with
+`TOOL_PROFILE_POLICY_DENIED` until the CF_SESSIONS profile row is updated.
 
 For each, give the same synthetic task with a known target/lane solution
 ("read the title of the LinkedIn tab", "type into the dashboard search box",
@@ -166,12 +170,13 @@ For each, give the same synthetic task with a known target/lane solution
 - first tool attempted, any rejected tool attempts, selected target semantics,
   whether any foreground-tier tool was attempted.
 
-Expected: normal/browser-control agents pick `window_list` -> `set_target` ->
-`target_act`/`cdp_*`/`read_text`/browser tools and can still complete valid
+Expected: normal/browser-control agents pick `target` -> `act`/`read_text`/browser
+facades and can still complete valid
 foreground-equivalent work through the session lane. Any attempt at a hidden raw
 tool returns `TOOL_PROFILE_POLICY_DENIED` with the CF_SESSIONS policy row,
-`capability_route`, and a physical audit row. Break-glass agents may use `act_*`
-only after the lease.
+`capability_route`, and a physical audit row. Break-glass authority is exercised
+through the same public facade names, never by rediscovering raw implementation
+tools.
 Feed the table into the #1007 matrix (`docs/multi-agent-capability-matrix.md`,
 already kept in sync by `multi_agent_capability_matrix.rs`).
 

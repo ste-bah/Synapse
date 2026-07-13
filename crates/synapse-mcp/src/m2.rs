@@ -36,10 +36,7 @@ pub(crate) const FOREGROUND_CONTEXT_RESTORE_STABILITY_MS: u64 =
     FOREGROUND_RESTORE_STABILITY_INTERVAL_MS * FOREGROUND_RESTORE_STABILITY_SAMPLES as u64;
 
 pub(crate) use click::ForegroundClickPolicy;
-#[allow(unused_imports)]
-pub use click::{
-    ActClickParams, ActClickPostcondition, ActClickResponse, ActClickTarget, act_click_with_handle,
-};
+pub use click::{ActClickParams, ActClickPostcondition, ActClickResponse, ActClickTarget};
 pub(crate) use click::{
     ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA, CLICK_TIER_FOREGROUND,
     CLICK_TIER_POSTMESSAGE, act_click_postmessage_with_params, act_click_with_handle_and_lease,
@@ -54,24 +51,27 @@ pub(crate) use clipboard::{
     SharedSessionClipboardBuffers, act_clipboard_session_buffer, new_session_clipboards,
 };
 pub use config::M2ServiceConfig;
+pub(crate) use focus_window::act_focus_window_with_boundary;
 pub use focus_window::{
-    ActFocusWindowParams, ActFocusWindowResponse, act_focus_window,
-    act_focus_window_request_details, act_focus_window_target_hwnd,
+    ActFocusWindowParams, ActFocusWindowResponse, act_focus_window_request_details,
+    act_focus_window_target_hwnd,
 };
-pub use pad::{ActPadParams, ActPadResponse, act_pad_with_handle};
+pub(crate) use pad::act_pad_with_handle_and_boundary;
+pub use pad::{ActPadParams, ActPadResponse};
 pub use postcondition::default_verify_timeout_ms;
 pub use press::action_from_press_params;
 pub use press::{
     ActKeymapParams, ActKeymapResponse, ActPressParams, ActPressResponse, PressBackend,
-    act_press_with_handle,
 };
 pub(crate) use press::{
     HwndKeyboardTargetState, ResolvedKeymapPress, act_keymap_response_from_press,
     act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
-    delete_key_action, hwnd_keyboard_target_state, resolve_keymap_press, select_all_chord_action,
+    act_press_with_handle_and_boundary, delete_key_action, hwnd_keyboard_target_state,
+    resolve_keymap_press, select_all_chord_action,
 };
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
-pub use scroll::{ActScrollParams, ActScrollPoint, ActScrollResponse, act_scroll_with_handle};
+pub(crate) use scroll::act_scroll_with_handle_and_boundary;
+pub use scroll::{ActScrollParams, ActScrollPoint, ActScrollResponse};
 #[cfg(windows)]
 pub(crate) use set_field_text::act_set_field_text_web;
 pub use set_field_text::{
@@ -84,17 +84,18 @@ pub(crate) use set_field_text::{
     finish_replace_response, params_with_resolved_element, required_element_id,
     set_field_text_route, validate_set_field_text_params,
 };
-pub use set_value::{
-    ActSetValueParams, ActSetValueResponse, act_set_value, act_set_value_request_details,
-};
+pub(crate) use set_value::act_set_value_with_boundary;
+pub use set_value::{ActSetValueParams, ActSetValueResponse, act_set_value_request_details};
 pub use stroke::{
     ActStrokeParams, ActStrokeResponse, act_stroke_error_details, act_stroke_request_details,
-    act_stroke_validation_failure_details, act_stroke_with_handle, validate_act_stroke_params,
+    act_stroke_validation_failure_details, validate_act_stroke_params,
 };
-pub(crate) use stroke::{ActStrokePlan, act_stroke_cdp_target};
+pub(crate) use stroke::{
+    ActStrokePlan, act_stroke_cdp_target, act_stroke_with_handle_and_boundary,
+};
 pub use type_text::action_from_type_params;
-pub(crate) use type_text::emitted_text;
-pub use type_text::{ActTypeParams, ActTypeResponse, TypeBackend, act_type_with_handle};
+pub use type_text::{ActTypeParams, ActTypeResponse, TypeBackend};
+pub(crate) use type_text::{act_type_with_handle_and_boundary, emitted_text};
 
 pub(crate) use auto_wait::{default_auto_wait_timeout_ms, validate_auto_wait_timeout};
 use config::RECORDING_BACKEND_ENV;
@@ -408,6 +409,11 @@ impl ForegroundInputContextSnapshot {
                 actual_process_started_at_100ns = ?readiness.actual_process_started_at_100ns,
                 exit_code = ?readiness.exit_code,
                 wait_status = ?readiness.wait_status,
+                wait_result = ?readiness.wait_result,
+                identity_read_error = ?readiness.identity_read_error,
+                wait_error = ?readiness.wait_error,
+                exit_code_read_error = ?readiness.exit_code_read_error,
+                handle_close_error = ?readiness.handle_close_error,
                 foreground_title = ?self.foreground_title,
                 "foreground window restore skipped because prior HWND/PID is not restorable"
             );
@@ -427,6 +433,11 @@ impl ForegroundInputContextSnapshot {
                     "actual_process_started_at_100ns": readiness.actual_process_started_at_100ns,
                     "exit_code": readiness.exit_code,
                     "wait_status": readiness.wait_status,
+                    "wait_result": readiness.wait_result,
+                    "identity_read_error": readiness.identity_read_error,
+                    "wait_error": readiness.wait_error,
+                    "exit_code_read_error": readiness.exit_code_read_error,
+                    "handle_close_error": readiness.handle_close_error,
                     "prior_title": self.foreground_title,
                 }),
             );
@@ -560,6 +571,11 @@ struct ForegroundWindowRestoreReadiness {
     actual_process_started_at_100ns: Option<u64>,
     exit_code: Option<u32>,
     wait_status: Option<&'static str>,
+    wait_result: Option<u32>,
+    identity_read_error: Option<String>,
+    wait_error: Option<String>,
+    exit_code_read_error: Option<String>,
+    handle_close_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -661,7 +677,7 @@ fn foreground_window_restore_readiness(
     use std::ffi::c_void;
 
     use windows::Win32::{
-        Foundation::{CloseHandle, FILETIME, HWND, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{CloseHandle, FILETIME, HWND, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
         System::Threading::{
             GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
             PROCESS_SYNCHRONIZE, WaitForSingleObject,
@@ -669,7 +685,22 @@ fn foreground_window_restore_readiness(
         UI::WindowsAndMessaging::{GetWindowThreadProcessId, IsWindow},
     };
 
-    let hwnd = HWND(hwnd as *mut c_void);
+    let Some(native_hwnd) = synapse_core::win32_hwnd::hwnd_from_wire(hwnd) else {
+        return ForegroundWindowRestoreReadiness {
+            alive: false,
+            reason_code: "prior_foreground_hwnd_noncanonical",
+            actual_pid: None,
+            actual_process_started_at_100ns: None,
+            exit_code: None,
+            wait_status: None,
+            wait_result: None,
+            identity_read_error: None,
+            wait_error: None,
+            exit_code_read_error: None,
+            handle_close_error: None,
+        };
+    };
+    let hwnd = HWND(native_hwnd as *mut c_void);
     if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         return ForegroundWindowRestoreReadiness {
             alive: false,
@@ -678,6 +709,11 @@ fn foreground_window_restore_readiness(
             actual_process_started_at_100ns: None,
             exit_code: None,
             wait_status: None,
+            wait_result: None,
+            identity_read_error: None,
+            wait_error: None,
+            exit_code_read_error: None,
+            handle_close_error: None,
         };
     }
 
@@ -691,6 +727,11 @@ fn foreground_window_restore_readiness(
             actual_process_started_at_100ns: None,
             exit_code: None,
             wait_status: None,
+            wait_result: None,
+            identity_read_error: None,
+            wait_error: None,
+            exit_code_read_error: None,
+            handle_close_error: None,
         };
     }
     if process_id != expected_pid {
@@ -701,30 +742,42 @@ fn foreground_window_restore_readiness(
             actual_process_started_at_100ns: None,
             exit_code: None,
             wait_status: None,
+            wait_result: None,
+            identity_read_error: None,
+            wait_error: None,
+            exit_code_read_error: None,
+            handle_close_error: None,
         };
     }
-    let Ok(handle) = (unsafe {
+    let handle = match unsafe {
         OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
             false,
             process_id,
         )
-    }) else {
-        return ForegroundWindowRestoreReadiness {
-            alive: false,
-            reason_code: "prior_foreground_process_unavailable",
-            actual_pid: Some(process_id),
-            actual_process_started_at_100ns: None,
-            exit_code: None,
-            wait_status: None,
-        };
+    } {
+        Ok(handle) => handle,
+        Err(error) => {
+            return ForegroundWindowRestoreReadiness {
+                alive: false,
+                reason_code: "prior_foreground_process_unavailable",
+                actual_pid: Some(process_id),
+                actual_process_started_at_100ns: None,
+                exit_code: None,
+                wait_status: None,
+                wait_result: None,
+                identity_read_error: Some(error.to_string()),
+                wait_error: None,
+                exit_code_read_error: None,
+                handle_close_error: None,
+            };
+        }
     };
-    let mut exit_code = 0_u32;
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
-    let actual_process_started_at_100ns = unsafe {
+    let (actual_process_started_at_100ns, identity_read_error) = match unsafe {
         GetProcessTimes(
             handle,
             std::ptr::addr_of_mut!(creation),
@@ -732,14 +785,27 @@ fn foreground_window_restore_readiness(
             std::ptr::addr_of_mut!(kernel),
             std::ptr::addr_of_mut!(user),
         )
-    }
-    .is_ok()
-    .then_some(filetime_ticks(creation));
+    } {
+        Ok(()) => (Some(filetime_ticks(creation)), None),
+        Err(error) => (None, Some(error.to_string())),
+    };
     let wait_result = unsafe { WaitForSingleObject(handle, 0) };
-    let exit_code = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) }
-        .is_ok()
-        .then_some(exit_code);
-    let _ = unsafe { CloseHandle(handle) };
+    // GetLastError is thread-local but is overwritten by later Win32 calls, so
+    // capture WAIT_FAILED diagnostics immediately at the destructive boundary.
+    let wait_error =
+        (wait_result == WAIT_FAILED).then(|| windows::core::Error::from_thread().to_string());
+    let (exit_code, exit_code_read_error) = if wait_result == WAIT_OBJECT_0 {
+        let mut exit_code = 0_u32;
+        match unsafe { GetExitCodeProcess(handle, &raw mut exit_code) } {
+            Ok(()) => (Some(exit_code), None),
+            Err(error) => (None, Some(error.to_string())),
+        }
+    } else {
+        (None, None)
+    };
+    let handle_close_error = unsafe { CloseHandle(handle) }
+        .err()
+        .map(|error| error.to_string());
 
     let (alive, reason_code, wait_status) = if actual_process_started_at_100ns.is_none() {
         (
@@ -753,18 +819,30 @@ fn foreground_window_restore_readiness(
             "prior_foreground_process_identity_changed",
             Some("identity_mismatch"),
         )
-    } else if wait_result == WAIT_TIMEOUT {
+    } else if wait_result == WAIT_TIMEOUT && handle_close_error.is_none() {
         (true, "prior_foreground_alive", Some("timeout_nonsignaled"))
+    } else if wait_result == WAIT_TIMEOUT {
+        (
+            false,
+            "prior_foreground_process_handle_close_failed",
+            Some("timeout_nonsignaled_handle_close_failed"),
+        )
     } else if wait_result == WAIT_OBJECT_0 {
         (
             false,
             "prior_foreground_process_exited",
             Some("object_signaled"),
         )
-    } else {
+    } else if wait_result == WAIT_FAILED {
         (
             false,
             "prior_foreground_process_wait_failed",
+            Some("win32_wait_failed"),
+        )
+    } else {
+        (
+            false,
+            "prior_foreground_process_wait_unexpected",
             Some("unexpected_wait_result"),
         )
     };
@@ -775,6 +853,11 @@ fn foreground_window_restore_readiness(
         actual_process_started_at_100ns,
         exit_code,
         wait_status,
+        wait_result: Some(wait_result.0),
+        identity_read_error,
+        wait_error,
+        exit_code_read_error,
+        handle_close_error,
     }
 }
 
@@ -785,12 +868,24 @@ fn process_started_at_100ns(pid: u32) -> Option<u64> {
         System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
 
-    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => handle,
+        Err(error) => {
+            tracing::warn!(
+                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                reason_code = "foreground_process_identity_open_failed",
+                pid,
+                detail = %error,
+                "foreground process identity capture could not open the prior owner"
+            );
+            return None;
+        }
+    };
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
     let mut user = FILETIME::default();
-    let started_at_100ns = unsafe {
+    let started_at_100ns = match unsafe {
         GetProcessTimes(
             handle,
             std::ptr::addr_of_mut!(creation),
@@ -798,10 +893,29 @@ fn process_started_at_100ns(pid: u32) -> Option<u64> {
             std::ptr::addr_of_mut!(kernel),
             std::ptr::addr_of_mut!(user),
         )
+    } {
+        Ok(()) => Some(filetime_ticks(creation)),
+        Err(error) => {
+            tracing::warn!(
+                code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_SKIPPED,
+                reason_code = "foreground_process_identity_read_failed",
+                pid,
+                detail = %error,
+                "foreground process identity capture could not read process times"
+            );
+            None
+        }
+    };
+    if let Err(error) = unsafe { CloseHandle(handle) } {
+        tracing::error!(
+            code = error_codes::TOOL_INTERNAL_ERROR,
+            detail_code = "FOREGROUND_PROCESS_IDENTITY_HANDLE_CLOSE_FAILED",
+            pid,
+            detail = %error,
+            "foreground process identity capture failed to close its process handle"
+        );
+        return None;
     }
-    .is_ok()
-    .then_some(filetime_ticks(creation));
-    let _ = unsafe { CloseHandle(handle) };
     started_at_100ns
 }
 
@@ -823,6 +937,11 @@ fn foreground_window_restore_readiness(
         actual_process_started_at_100ns: None,
         exit_code: None,
         wait_status: None,
+        wait_result: None,
+        identity_read_error: None,
+        wait_error: None,
+        exit_code_read_error: None,
+        handle_close_error: None,
     }
 }
 
@@ -846,6 +965,9 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
     session_id: Option<&str>,
     ttl_ms: u64,
 ) -> Result<ForegroundInputLeaseGuard, ErrorData> {
+    let mcp_request_guarded = crate::server::operator_panic_boundary::is_mcp_request_guarded();
+    let operator_panic_epoch =
+        arm_operator_panic_action_admission(tool, "before_lease_validation")?;
     validate_foreground_input_lease_ttl_ms(tool, ttl_ms)?;
     let session_id = session_id.ok_or_else(|| {
         crate::m1::mcp_error(
@@ -853,8 +975,45 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
             format!("{tool} requires an MCP session id before using the foreground input tier"),
         )
     })?;
+    ensure_operator_panic_action_admission(
+        tool,
+        "immediately_before_lease_acquire",
+        operator_panic_epoch,
+    )?;
+    if mcp_request_guarded {
+        crate::server::operator_panic_boundary::ensure_mcp_mutation(
+            "immediately_before_foreground_lease_acquire",
+        )?;
+    }
     match lease::try_acquire(session_id, lease::ttl_from_ms(ttl_ms)) {
         LeaseOutcome::Acquired(status) => {
+            let boundary_result = ensure_operator_panic_action_admission(
+                tool,
+                "immediately_after_lease_acquire",
+                operator_panic_epoch,
+            )
+            .and_then(|()| {
+                if mcp_request_guarded {
+                    crate::server::operator_panic_boundary::ensure_mcp_mutation(
+                        "immediately_after_foreground_lease_acquire",
+                    )
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = boundary_result {
+                let released = lease::release_if_owner(session_id);
+                let lease_after_cleanup = lease::status();
+                tracing::warn!(
+                    code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                    tool,
+                    session_id,
+                    released,
+                    lease_after_cleanup = ?lease_after_cleanup,
+                    "operator panic superseded a newly acquired foreground lease; exact owner cleanup ran"
+                );
+                return Err(error);
+            }
             tracing::info!(
                 code = "INPUT_LEASE_ACTION_ACQUIRED",
                 tool,
@@ -869,6 +1028,33 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
             ))
         }
         LeaseOutcome::Renewed(status) => {
+            let boundary_result = ensure_operator_panic_action_admission(
+                tool,
+                "immediately_after_lease_renew",
+                operator_panic_epoch,
+            )
+            .and_then(|()| {
+                if mcp_request_guarded {
+                    crate::server::operator_panic_boundary::ensure_mcp_mutation(
+                        "immediately_after_foreground_lease_renew",
+                    )
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = boundary_result {
+                let released = lease::release_if_owner(session_id);
+                let lease_after_cleanup = lease::status();
+                tracing::warn!(
+                    code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                    tool,
+                    session_id,
+                    released,
+                    lease_after_cleanup = ?lease_after_cleanup,
+                    "operator panic superseded a renewed foreground lease; exact owner cleanup ran"
+                );
+                return Err(error);
+            }
             tracing::info!(
                 code = "INPUT_LEASE_ACTION_RENEWED",
                 tool,
@@ -928,6 +1114,102 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
                 retry_after_ms,
             }))
         }
+    }
+}
+
+/// Arms an action mutation against the physical operator-panic generation.
+/// A sticky K1/K2 accounting incident keeps this gate closed even when no
+/// generation counter is currently changing.
+pub(crate) fn arm_operator_panic_action_admission(
+    tool: &'static str,
+    stage: &'static str,
+) -> Result<u64, ErrorData> {
+    let epoch = synapse_action::operator_panic_epoch();
+    ensure_operator_panic_action_admission(tool, stage, epoch)?;
+    Ok(epoch)
+}
+
+/// Rechecks a previously armed action immediately before or after a mutation
+/// boundary. Both epoch supersession and sticky pending state are terminal.
+pub(crate) fn ensure_operator_panic_action_admission(
+    tool: &'static str,
+    stage: &'static str,
+    epoch_at_arm: u64,
+) -> Result<(), ErrorData> {
+    let readback = synapse_action::operator_panic_safety_readback();
+    if !readback.pending && readback.epoch == epoch_at_arm {
+        return Ok(());
+    }
+    tracing::warn!(
+        code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+        detail_code = "ACTION_OPERATOR_PANIC_ADMISSION_CLOSED",
+        tool,
+        stage,
+        epoch_at_arm,
+        epoch_after = readback.epoch,
+        outstanding_generations = readback.outstanding_generations,
+        outstanding_finalizations = readback.outstanding_finalizations,
+        accounting_incident = readback.accounting_incident,
+        "physical operator panic closed action mutation admission"
+    );
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!("{tool} was superseded by the physical operator panic control"),
+        Some(json!({
+            "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            "detail_code": "ACTION_OPERATOR_PANIC_ADMISSION_CLOSED",
+            "tool": tool,
+            "stage": stage,
+            "operator_panic_epoch_at_arm": epoch_at_arm,
+            "operator_panic": readback,
+            "source_of_truth": "synapse_action::operator_panic_safety_readback",
+            "remediation": "inspect the operator-panic K1/K2 audit and physical lease/input readbacks; action admission remains closed while safety is pending or accounting is unresolved",
+        })),
+    ))
+}
+
+/// Copyable permit carried from raw-action preflight to the last reversible
+/// point before a physical M2 mutation. Unlike a pending-only check, the armed
+/// epoch also rejects a panic wave that began and fully finalized while the
+/// request was awaiting actionability, target resolution, or readback prep.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OperatorPanicActionBoundary {
+    tool: &'static str,
+    epoch_at_arm: u64,
+    require_mcp_boundary: bool,
+}
+
+impl OperatorPanicActionBoundary {
+    pub(crate) const fn from_armed(tool: &'static str, epoch_at_arm: u64) -> Self {
+        Self {
+            tool,
+            epoch_at_arm,
+            require_mcp_boundary: true,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm(tool: &'static str, stage: &'static str) -> Result<Self, ErrorData> {
+        arm_operator_panic_action_admission(tool, stage).map(|epoch_at_arm| Self {
+            tool,
+            epoch_at_arm,
+            // Production callers, including forgotten direct-helper seams,
+            // inherit the task-local epoch captured by handler::call_tool.
+            // Truly unscoped module/unit calls have no outer MCP request.
+            require_mcp_boundary: crate::server::operator_panic_boundary::is_mcp_request_guarded(),
+        })
+    }
+
+    pub(crate) fn ensure(self, stage: &'static str) -> Result<(), ErrorData> {
+        if self.require_mcp_boundary {
+            crate::server::operator_panic_boundary::ensure_mcp_mutation(stage)?;
+        }
+        ensure_operator_panic_action_admission(self.tool, stage, self.epoch_at_arm)
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn epoch_at_arm(self) -> u64 {
+        self.epoch_at_arm
     }
 }
 
@@ -1002,6 +1284,7 @@ pub struct M2State {
     retained_emitter: Option<ActionEmitter>,
     emitter_cancel: Option<CancellationToken>,
     emitter_task: Option<JoinHandle<ActionStateSnapshot>>,
+    emitter_task_externally_owned: bool,
     emitter_done: Option<watch::Receiver<Option<ActionStateSnapshot>>>,
 }
 
@@ -1178,6 +1461,7 @@ impl M2State {
                 retained_emitter: None,
                 emitter_cancel: None,
                 emitter_task: Some(emitter_task),
+                emitter_task_externally_owned: false,
                 emitter_done: Some(done_rx),
             };
         }
@@ -1193,6 +1477,7 @@ impl M2State {
             retained_emitter: Some(emitter),
             emitter_cancel: None,
             emitter_task: None,
+            emitter_task_externally_owned: false,
             emitter_done: None,
         }
     }
@@ -1212,6 +1497,11 @@ impl M2State {
         self.emitter_task
             .as_ref()
             .is_some_and(|task| !task.is_finished())
+            || (self.emitter_task_externally_owned
+                && self
+                    .emitter_done
+                    .as_ref()
+                    .is_some_and(|done| done.borrow().is_none()))
     }
 
     #[must_use]
@@ -1222,6 +1512,14 @@ impl M2State {
     #[must_use]
     pub fn emitter_done_receiver(&self) -> Option<watch::Receiver<Option<ActionStateSnapshot>>> {
         self.emitter_done.clone()
+    }
+
+    pub(crate) fn take_emitter_task(&mut self) -> Option<JoinHandle<ActionStateSnapshot>> {
+        let task = self.emitter_task.take();
+        if task.is_some() {
+            self.emitter_task_externally_owned = true;
+        }
+        task
     }
 
     #[must_use]
@@ -1282,6 +1580,10 @@ impl fmt::Debug for M2State {
             .field("retained_emitter", &self.emitter_retained())
             .field("emitter_cancel", &self.emitter_cancel.is_some())
             .field("emitter_task", &self.emitter_running())
+            .field(
+                "emitter_task_externally_owned",
+                &self.emitter_task_externally_owned,
+            )
             .field("emitter_done", &self.emitter_done.is_some())
             .field("emitter_available", &self.emitter_available())
             .finish()

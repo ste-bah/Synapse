@@ -1,9 +1,9 @@
-//! Dev/FSV utility: dump `CF_ACTION_LOG` rows as JSON lines.
+//! Developer readback utility: dump `CF_ACTION_LOG` rows as JSON lines.
 //!
-//! Physical readback of the action-audit log (including the #1006 foreground-tier
-//! policy block) for Full State Verification: run it against a *stopped* daemon's
-//! `--db` directory and diff what the log actually holds against what the live
-//! tools reported.
+//! Its output is supporting storage evidence only; manual FSV remains separate.
+//! Run it against a *stopped* daemon's `--db` directory and diff the physical
+//! action-audit log (including the #1006 foreground-tier policy block) against
+//! what the live tools reported.
 //!
 //! ```text
 //! cargo run -p synapse-mcp --example dump_action_log -- <db-path>

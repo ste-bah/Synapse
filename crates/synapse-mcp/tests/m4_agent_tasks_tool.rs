@@ -1,4 +1,5 @@
-//! Full State Verification for the durable agent task queue (#910).
+//! Supporting storage-backed integration evidence for the durable agent task
+//! queue (#910); manual FSV remains separate.
 //!
 //! Source of truth: the daemon's `RocksDB` `CF_KV` column family. We drive the
 //! real MCP daemon over stdio and verify every outcome two ways — through a
@@ -40,7 +41,7 @@ fn db_path_under(dir: &Path) -> PathBuf {
 #[tokio::test]
 async fn agent_tasks_lifecycle_round_trips_against_physical_cf_rows() -> anyhow::Result<()> {
     let db_dir = tempfile::Builder::new()
-        .prefix("synapse-agent-tasks-fsv")
+        .prefix("synapse-agent-tasks-regression")
         .tempdir()?;
     let db_path = db_path_under(db_dir.path());
     let db_path_str = db_path.to_string_lossy().into_owned();

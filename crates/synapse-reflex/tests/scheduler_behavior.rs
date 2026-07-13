@@ -1388,7 +1388,7 @@ const fn point_value(x: i32, y: i32) -> Point {
 
 fn drain_actions(action_rx: &mut tokio::sync::mpsc::Receiver<ActionMessage>) -> Vec<Action> {
     let mut actions = Vec::new();
-    while let Ok((action, _ack)) = action_rx.try_recv() {
+    while let Ok((action, _ack, _operator_panic_epoch_at_enqueue)) = action_rx.try_recv() {
         actions.push(action);
     }
     actions

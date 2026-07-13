@@ -189,15 +189,16 @@ struct CdpAimTarget {
     backend_node_id: i64,
 }
 
-pub async fn act_stroke_with_handle(
+pub(crate) async fn act_stroke_with_handle_and_boundary(
     handle: ActionHandle,
     recording: Option<Arc<RecordingBackend>>,
     params: ActStrokeParams,
     plan: ActStrokePlan,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActStrokeResponse, ErrorData> {
     let started = Instant::now();
     if let Some(cdp_aim) = &plan.cdp_aim {
-        return execute_cdp_aim(&params, cdp_aim, started).await;
+        return execute_cdp_aim(&params, cdp_aim, started, boundary).await;
     }
     let path = plan.path.clone().ok_or_else(|| {
         params_invalid_detail(
@@ -228,9 +229,9 @@ pub async fn act_stroke_with_handle(
         .collect();
 
     if let Some(recording) = recording {
-        execute_recording(&recording, &modifier_keys, &action, backend)?;
+        execute_recording(&recording, &modifier_keys, &action, backend, boundary)?;
     } else {
-        execute_with_modifiers(&handle, &modifier_keys, action, backend).await?;
+        execute_with_modifiers(&handle, &modifier_keys, action, backend, boundary).await?;
     }
 
     Ok(response(&params, &path, &stroke_plan, started, backend))
@@ -241,6 +242,7 @@ pub(crate) async fn act_stroke_cdp_target(
     cdp_target_id: &str,
     params: ActStrokeParams,
     plan: ActStrokePlan,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActStrokeResponse, ErrorData> {
     #[cfg(windows)]
     {
@@ -277,6 +279,7 @@ pub(crate) async fn act_stroke_cdp_target(
         })?;
         let points = cdp_dispatch_points_from_stroke_plan(&stroke_plan);
         let button = cdp_mouse_button(params.button)?;
+        boundary.ensure("immediately_before_cdp_mouse_stroke_target")?;
         let dispatch = tokio::time::timeout(
             CDP_STROKE_ROUTE_TIMEOUT,
             synapse_a11y::cdp_mouse_stroke_target(endpoint, cdp_target_id, points, button),
@@ -299,6 +302,7 @@ pub(crate) async fn act_stroke_cdp_target(
                 ),
             )
         })?;
+        boundary.ensure("after_cdp_mouse_stroke_target")?;
         tracing::info!(
             code = "M2_ACT_STROKE_CDP_TARGET_DISPATCHED",
             cdp_target_id = %dispatch.target_id,
@@ -870,9 +874,16 @@ async fn execute_with_modifiers(
     modifier_keys: &[synapse_core::Key],
     stroke_action: Action,
     backend: Backend,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let mut pressed = Vec::with_capacity(modifier_keys.len());
     for key in modifier_keys {
+        if let Err(error) = boundary.ensure("immediately_before_stroke_modifier_key_down") {
+            let _release_result =
+                release_pressed_modifiers(handle, &pressed, backend, "operator_panic_cleanup")
+                    .await;
+            return Err(error);
+        }
         if let Err(error) = handle
             .execute(Action::KeyDown {
                 key: key.clone(),
@@ -888,7 +899,15 @@ async fn execute_with_modifiers(
         pressed.push(key.clone());
     }
 
+    if let Err(error) = boundary.ensure("immediately_before_foreground_stroke_dispatch") {
+        let _release_result =
+            release_pressed_modifiers(handle, &pressed, backend, "operator_panic_cleanup").await;
+        return Err(error);
+    }
     let stroke_result = handle.execute(stroke_action).await;
+    let boundary_error = boundary
+        .ensure("after_foreground_stroke_before_modifier_release")
+        .err();
     if stroke_result.is_ok() && !pressed.is_empty() {
         tokio::time::sleep(Duration::from_millis(MODIFIER_RELEASE_SETTLE_MS)).await;
     }
@@ -902,6 +921,17 @@ async fn execute_with_modifiers(
     if let Err(error) = stroke_result {
         return Err(action_error_to_mcp(&error));
     }
+    if let Some(error) = boundary_error {
+        if let Err(release_error) = &release_result {
+            tracing::error!(
+                code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                detail_code = "STROKE_MODIFIER_RELEASE_AFTER_OPERATOR_PANIC_FAILED",
+                detail = %release_error,
+                "operator panic superseded a stroke and best-effort modifier cleanup failed"
+            );
+        }
+        return Err(error);
+    }
     if let Err(error) = release_result {
         return Err(action_error_to_mcp(&error));
     }
@@ -912,6 +942,7 @@ async fn execute_cdp_aim(
     params: &ActStrokeParams,
     cdp_aim: &CdpAimTarget,
     started: Instant,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<ActStrokeResponse, ErrorData> {
     #[cfg(windows)]
     {
@@ -938,6 +969,7 @@ async fn execute_cdp_aim(
             .map(|context| context.window_title)
             .unwrap_or_default();
         let target_id_hint = synapse_a11y::cdp_target_from_element_id(&cdp_aim.element_id);
+        boundary.ensure("immediately_before_cdp_aim_node")?;
         let landed = synapse_a11y::cdp_aim_node(
             &endpoint,
             &title_hint,
@@ -946,6 +978,7 @@ async fn execute_cdp_aim(
         )
         .await
         .map_err(|err| mcp_error(err.code(), err.to_string()))?;
+        boundary.ensure("after_cdp_aim_node")?;
         tracing::info!(
             code = "M2_ACT_STROKE_CDP_AIM_MOVED",
             element_id = %cdp_aim.element_id,
@@ -1018,11 +1051,13 @@ fn execute_recording(
     modifier_keys: &[synapse_core::Key],
     stroke_action: &Action,
     backend: Backend,
+    boundary: super::OperatorPanicActionBoundary,
 ) -> Result<(), ErrorData> {
     let before_events = recording.events();
     let before_event_count = before_events.len();
     let mut emit_state = EmitState::new();
     for key in modifier_keys {
+        boundary.ensure("immediately_before_recorded_stroke_modifier_key_down")?;
         recording
             .execute(
                 &Action::KeyDown {
@@ -1033,6 +1068,7 @@ fn execute_recording(
             )
             .map_err(|error| action_error_to_mcp(&error))?;
     }
+    boundary.ensure("immediately_before_recorded_stroke_dispatch")?;
     recording
         .execute(stroke_action, &mut emit_state)
         .map_err(|error| action_error_to_mcp(&error))?;

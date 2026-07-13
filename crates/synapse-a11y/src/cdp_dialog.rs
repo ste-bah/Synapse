@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use chromiumoxide::cdp::browser_protocol::page::{
     DialogType, EnableParams as PageEnableParams, EventJavascriptDialogClosed,
@@ -22,6 +22,15 @@ use crate::{A11yError, A11yResult};
 
 pub const DEFAULT_DIALOG_BUFFER_CAPACITY: usize = 128;
 pub const MAX_DIALOG_BUFFER_CAPACITY: usize = 1000;
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub(crate) struct CdpDialogDurableDrainReadback {
+    pub found: usize,
+    pub listener_tasks_drained: usize,
+    pub handler_tasks_drained: usize,
+    pub failures: Vec<String>,
+    pub active_after: usize,
+}
 
 /// Default action applied when a JavaScript dialog opens and no explicit handler
 /// is waiting on it. `Dismiss` is conservative and avoids approving confirms or
@@ -318,6 +327,32 @@ pub async fn dialog_capture_ensure(
     default_policy: CdpDialogDefaultPolicy,
     capacity: usize,
 ) -> A11yResult<CdpDialogCaptureStatus> {
+    let endpoint = endpoint.to_owned();
+    let target_id = target_id.to_owned();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result =
+            dialog_capture_ensure_owned(&endpoint, &target_id, default_policy, capacity).await;
+        let _ = result_tx.send(result);
+    });
+    result_rx.await.map_err(|_| A11yError::CdpAttachFailed {
+        detail: "owned dialog policy install task terminated before publishing a verdict"
+            .to_owned(),
+    })?
+}
+
+async fn dialog_capture_ensure_owned(
+    endpoint: &str,
+    target_id: &str,
+    default_policy: CdpDialogDefaultPolicy,
+    capacity: usize,
+) -> A11yResult<CdpDialogCaptureStatus> {
+    let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "durable browser mutation owners are disabled by operator panic; refusing dialog capture/policy install".to_owned(),
+        });
+    }
     let target_id = target_id.trim();
     if target_id.is_empty() {
         return Err(A11yError::CdpAttachFailed {
@@ -379,6 +414,9 @@ pub async fn dialog_capture_ensure(
     let listener_task = tokio::spawn(async move {
         let _page = page;
         loop {
+            if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
+                break;
+            }
             tokio::select! {
                 Some(event) = openings.next() => {
                     let event = event.as_ref();
@@ -386,6 +424,9 @@ pub async fn dialog_capture_ensure(
                     let Some(action) = policy.auto_action() else {
                         continue;
                     };
+                    if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
+                        break;
+                    }
                     match dialog_handle_params(policy, event.default_prompt.as_deref()) {
                         Ok(params) => {
                             match listener_page.execute(params).await {
@@ -423,6 +464,13 @@ pub async fn dialog_capture_ensure(
         listener_task,
     });
     if let Ok(mut slots) = registry().slots.lock() {
+        if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
+            slot.listener_task.abort();
+            slot.handler_task.abort();
+            return Err(A11yError::CdpAttachFailed {
+                detail: "operator panic crossed during dialog capture registration".to_owned(),
+            });
+        }
         if let Some(existing) = slots.get(target_id)
             && !existing.listener_task.is_finished()
         {
@@ -612,12 +660,74 @@ pub fn dialog_capture_stop(target_id: &str) -> bool {
 /// Number of currently live dialog capture slots.
 #[must_use]
 pub fn dialog_capture_active_count() -> usize {
-    registry().slots.lock().map_or(0, |slots| {
-        slots
-            .values()
-            .filter(|slot| !slot.listener_task.is_finished())
-            .count()
-    })
+    dialog_capture_active_count_readback().unwrap_or(usize::MAX)
+}
+
+pub(crate) fn dialog_capture_active_count_readback() -> Result<usize, String> {
+    registry()
+        .slots
+        .lock()
+        .map(|slots| {
+            slots
+                .values()
+                .filter(|slot| !slot.listener_task.is_finished())
+                .count()
+        })
+        .map_err(|_| "dialog capture registry lock is poisoned".to_owned())
+}
+
+pub(crate) async fn dialog_capture_disable_and_drain_all() -> CdpDialogDurableDrainReadback {
+    let slots = match registry().slots.lock() {
+        Ok(mut slots) => std::mem::take(&mut *slots),
+        Err(_) => {
+            return CdpDialogDurableDrainReadback {
+                failures: vec!["dialog capture registry lock is poisoned".to_owned()],
+                active_after: dialog_capture_active_count(),
+                ..Default::default()
+            };
+        }
+    };
+    let found = slots.len();
+    let mut listener_tasks_drained = 0usize;
+    let mut handler_tasks_drained = 0usize;
+    let mut failures = Vec::new();
+    for (target_id, slot) in slots {
+        slot.listener_task.abort();
+        let listener_drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while !slot.listener_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        listener_tasks_drained += usize::from(listener_drained);
+        if !listener_drained {
+            failures.push(format!(
+                "dialog listener task did not drain for target {target_id:?}"
+            ));
+        }
+        slot.handler_task.abort();
+        let handler_drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while !slot.handler_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        handler_tasks_drained += usize::from(handler_drained);
+        if !handler_drained {
+            failures.push(format!(
+                "dialog handler task did not drain for target {target_id:?}"
+            ));
+        }
+    }
+    CdpDialogDurableDrainReadback {
+        found,
+        listener_tasks_drained,
+        handler_tasks_drained,
+        failures,
+        active_after: dialog_capture_active_count(),
+    }
 }
 
 fn lookup_live(target_id: &str) -> Option<Arc<DialogCaptureSlot>> {

@@ -84,7 +84,7 @@ async fn execute_waits_for_actor_ack_happy_path() {
     );
 
     let actor = tokio::spawn(async move {
-        let Some((action, ack)) = rx.recv().await else {
+        let Some((action, ack, _operator_panic_epoch_at_enqueue)) = rx.recv().await else {
             panic!("handle should enqueue one action");
         };
         assert!(matches!(action, Action::ReleaseAll));
@@ -147,7 +147,7 @@ async fn execute_release_all_requests_hold_interrupt_before_actor_ack() {
     println!("readback=release_interrupt edge=execute_release_all before_epoch={before_epoch}");
 
     let pending = tokio::spawn(async move { handle.execute(Action::ReleaseAll).await });
-    let Some((action, ack)) = rx.recv().await else {
+    let Some((action, ack, _operator_panic_epoch_at_enqueue)) = rx.recv().await else {
         panic!("release_all action should be enqueued");
     };
 

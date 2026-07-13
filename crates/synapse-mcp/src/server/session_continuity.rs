@@ -82,6 +82,11 @@ impl SynapseService {
         session_id: &str,
         target: &SessionTarget,
     ) -> Result<(), ErrorData> {
+        let hwnd = match target {
+            SessionTarget::Window { hwnd } => *hwnd,
+            SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
+        };
+        crate::m1::validate_window_hwnd_shape("persist_session_target", hwnd)?;
         let row = PersistedSessionTarget {
             schema_version: 1,
             session_id: session_id.to_owned(),
@@ -187,6 +192,14 @@ impl SynapseService {
         owner_key: &str,
         owner: &CdpTargetOwner,
     ) -> Result<(), ErrorData> {
+        crate::m1::validate_window_hwnd_shape("persist_cdp_target_owner", owner.window_hwnd)?;
+        if let Some(capture_window_hwnd) = owner.capture_window_hwnd {
+            crate::m1::validate_hwnd_shape(
+                "persist_cdp_target_owner",
+                "capture_window_hwnd",
+                capture_window_hwnd,
+            )?;
+        }
         let owner_read = self.session_registry_read_for_persistence(&owner.session_id)?;
         let row = PersistedCdpTargetOwner {
             schema_version: 1,
@@ -607,6 +620,7 @@ impl SynapseService {
                 ),
             ));
         }
+        validate_persisted_session_target_hwnd(session_id, &persisted.target)?;
         Ok(Some(persisted))
     }
 
@@ -746,6 +760,8 @@ fn read_persisted_session_target_from_db(
             persisted.schema_version, persisted.session_id
         ));
     }
+    validate_persisted_session_target_hwnd(session_id, &persisted.target)
+        .map_err(|error| error.message.to_string())?;
     Ok(Some(persisted))
 }
 
@@ -755,6 +771,76 @@ pub(crate) fn delete_persisted_session_lease_row(
 ) -> Result<LeaseContinuityCleanupReadback, String> {
     let db = session_continuity_db_from_state(m3_state)?;
     delete_persisted_session_lease_row_from_db(&db, session_id)
+}
+
+/// Exact durable-lease row snapshot used by cancellation-safe authority
+/// guards. Keeping the encoded bytes lets a guard restore the pre-call row
+/// without reconstructing or extending its expiry metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PersistedSessionLeaseRowSnapshot {
+    value: Option<Vec<u8>>,
+}
+
+impl PersistedSessionLeaseRowSnapshot {
+    pub(crate) const fn row_exists(&self) -> bool {
+        self.value.is_some()
+    }
+}
+
+pub(crate) fn snapshot_persisted_session_lease_row(
+    m3_state: &SharedM3State,
+    session_id: &str,
+) -> Result<PersistedSessionLeaseRowSnapshot, String> {
+    let db = session_continuity_db_from_state(m3_state)?;
+    snapshot_persisted_session_lease_row_from_db(&db, session_id)
+}
+
+fn snapshot_persisted_session_lease_row_from_db(
+    db: &Db,
+    session_id: &str,
+) -> Result<PersistedSessionLeaseRowSnapshot, String> {
+    let key = session_lease_key(session_id);
+    let value = db
+        .scan_cf_prefix(cf::CF_SESSIONS, &key)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find_map(|(row_key, value)| (row_key == key).then_some(value));
+    Ok(PersistedSessionLeaseRowSnapshot { value })
+}
+
+/// Restore an exact pre-call durable-lease row and immediately read it back.
+/// This is synchronous by design so an async future's `Drop` path can revoke a
+/// partially acquired foreground lease even during cancellation or unwind.
+pub(crate) fn restore_persisted_session_lease_row(
+    m3_state: &SharedM3State,
+    session_id: &str,
+    before: &PersistedSessionLeaseRowSnapshot,
+) -> Result<PersistedSessionLeaseRowSnapshot, String> {
+    let db = session_continuity_db_from_state(m3_state)?;
+    let key = session_lease_key(session_id);
+    match before.value.as_ref() {
+        Some(value) => db
+            .put_batch_pressure_bypass(cf::CF_SESSIONS, [(key, value.clone())])
+            .map_err(|error| error.to_string())?,
+        None => db
+            .delete_batch(cf::CF_SESSIONS, [key])
+            .map_err(|error| error.to_string())?,
+    }
+    let after = snapshot_persisted_session_lease_row_from_db(&db, session_id)?;
+    if &after != before {
+        return Err(format!(
+            "persisted session lease row mismatch after authority-guard restore for {session_id}: expected_present={} actual_present={}",
+            before.value.is_some(),
+            after.value.is_some()
+        ));
+    }
+    tracing::info!(
+        code = "MCP_SESSION_LEASE_AUTHORITY_GUARD_RESTORED",
+        session_id,
+        row_present = after.value.is_some(),
+        "readback=CF_SESSIONS after=authority_guard_lease_row_restored"
+    );
+    Ok(after)
 }
 
 pub(crate) fn delete_persisted_session_lease_row_from_db(
@@ -932,6 +1018,8 @@ fn read_persisted_session_target_session_ids_from_db(db: &Db) -> Result<BTreeSet
                 row.session_id
             ));
         }
+        validate_persisted_session_target_hwnd(&key_session_id, &row.target)
+            .map_err(|error| error.message.to_string())?;
         session_ids.insert(key_session_id);
     }
     Ok(session_ids)
@@ -1009,6 +1097,25 @@ fn validate_persisted_cdp_target_owner(
             ),
         ));
     }
+    if !crate::m1::window_hwnd_shape_is_canonical(row.owner.window_hwnd) {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "persisted CDP target owner row has noncanonical window_hwnd={}; expected 1..=4294967295",
+                row.owner.window_hwnd
+            ),
+        ));
+    }
+    if let Some(capture_window_hwnd) = row.owner.capture_window_hwnd
+        && !crate::m1::window_hwnd_shape_is_canonical(capture_window_hwnd)
+    {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "persisted CDP target owner row has noncanonical capture_window_hwnd={capture_window_hwnd}; expected 1..=4294967295"
+            ),
+        ));
+    }
     if normalize_cdp_target_id(&row.owner.cdp_target_id)
         != normalize_cdp_target_id(requested_cdp_target_id)
     {
@@ -1021,6 +1128,35 @@ fn validate_persisted_cdp_target_owner(
         ));
     }
     Ok(())
+}
+
+fn validate_persisted_session_target_hwnd(
+    session_id: &str,
+    target: &SessionTarget,
+) -> Result<(), ErrorData> {
+    let (field, hwnd) = match target {
+        SessionTarget::Window { hwnd } => ("hwnd", *hwnd),
+        SessionTarget::Cdp { window_hwnd, .. } => ("window_hwnd", *window_hwnd),
+    };
+    if crate::m1::window_hwnd_shape_is_canonical(hwnd) {
+        return Ok(());
+    }
+    tracing::error!(
+        code = error_codes::STORAGE_CORRUPTED,
+        source_of_truth = "CF_SESSIONS persisted session target row",
+        session_id,
+        field,
+        actual_value = hwnd,
+        accepted_range = "1..=u32::MAX",
+        remediation = "delete or repair the corrupt session-target row, then bind a canonical target through the target facade",
+        "persisted session target contains a noncanonical HWND"
+    );
+    Err(mcp_error(
+        error_codes::STORAGE_CORRUPTED,
+        format!(
+            "persisted session target row for {session_id} has noncanonical {field}={hwnd}; expected 1..=4294967295"
+        ),
+    ))
 }
 
 fn cdp_target_owner_target_prefix(cdp_target_id: &str) -> Vec<u8> {
@@ -1182,6 +1318,62 @@ mod tests {
         assert_eq!(decoded.session_id, neighbor_session_id);
         assert_eq!(decoded.target, SessionTarget::Window { hwnd: 0x5678 });
         Ok(())
+    }
+
+    #[test]
+    fn persisted_cdp_owner_validation_rejects_noncanonical_window_handles() {
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let row = persisted_owner_row("shape-session", "chrome-tab:shape", hwnd);
+            let error = validate_persisted_cdp_target_owner("chrome-tab:shape", &row)
+                .expect_err("noncanonical persisted HWND must be classified as corruption");
+            assert_eq!(
+                error.data.as_ref().and_then(|data| data.get("code")),
+                Some(&serde_json::json!(error_codes::STORAGE_CORRUPTED))
+            );
+        }
+        let mut invalid_capture = persisted_owner_row("shape-session", "chrome-tab:shape", 0x1234);
+        invalid_capture.owner.capture_window_hwnd = Some(i64::from(u32::MAX) + 1);
+        let error = validate_persisted_cdp_target_owner("chrome-tab:shape", &invalid_capture)
+            .expect_err("noncanonical persisted capture HWND must be corruption");
+        assert_eq!(
+            error.data.as_ref().and_then(|data| data.get("code")),
+            Some(&serde_json::json!(error_codes::STORAGE_CORRUPTED))
+        );
+        let row = persisted_owner_row("shape-session", "chrome-tab:shape", i64::from(u32::MAX));
+        validate_persisted_cdp_target_owner("chrome-tab:shape", &row)
+            .expect("maximum canonical persisted HWND must remain valid");
+    }
+
+    #[test]
+    fn persisted_session_target_validation_rejects_noncanonical_window_handles() {
+        for hwnd in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            for target in [
+                SessionTarget::Window { hwnd },
+                SessionTarget::Cdp {
+                    window_hwnd: hwnd,
+                    cdp_target_id: "chrome-tab:shape".to_owned(),
+                },
+            ] {
+                let error = validate_persisted_session_target_hwnd("shape-session", &target)
+                    .expect_err("noncanonical persisted HWND must be classified as corruption");
+                assert_eq!(
+                    error.data.as_ref().and_then(|data| data.get("code")),
+                    Some(&serde_json::json!(error_codes::STORAGE_CORRUPTED))
+                );
+            }
+        }
+        for target in [
+            SessionTarget::Window {
+                hwnd: i64::from(u32::MAX),
+            },
+            SessionTarget::Cdp {
+                window_hwnd: i64::from(u32::MAX),
+                cdp_target_id: "chrome-tab:shape".to_owned(),
+            },
+        ] {
+            validate_persisted_session_target_hwnd("shape-session", &target)
+                .expect("maximum canonical persisted HWND must remain valid");
+        }
     }
 
     #[test]

@@ -58,8 +58,8 @@ fn panic_hook_timeout_keeps_release_all_in_queue_and_preserves_previous_hook() {
     assert!(log_line.contains("timed out after 10ms"));
 
     let action_label = match action_rx.try_recv() {
-        Ok((Action::ReleaseAll, _ack)) => "release_all",
-        Ok((_action, _ack)) => "unexpected",
+        Ok((Action::ReleaseAll, _ack, _operator_panic_epoch_at_enqueue)) => "release_all",
+        Ok((_action, _ack, _operator_panic_epoch_at_enqueue)) => "unexpected",
         Err(error) => panic!("release_all action should remain queued after timeout: {error:?}"),
     };
     assert_eq!(action_label, "release_all");

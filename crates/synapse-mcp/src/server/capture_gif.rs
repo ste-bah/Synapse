@@ -24,7 +24,7 @@ use super::{
     CaptureGifParams, CaptureGifResponse, ErrorData, Json, Parameters, SessionTarget,
     SynapseService, tool, tool_router,
 };
-use crate::m1::mcp_error;
+use crate::m1::{mcp_error, validate_window_hwnd_shape};
 
 const DEFAULT_DURATION_MS: u64 = 3_000;
 const MAX_DURATION_MS: u64 = 60_000;
@@ -208,18 +208,19 @@ impl SynapseService {
         request_context: &RequestContext<RoleServer>,
     ) -> Result<i64, ErrorData> {
         if let Some(hwnd) = explicit {
-            return Ok(hwnd);
+            return validate_window_hwnd_shape("capture_gif", hwnd);
         }
         let session_id = super::context::mcp_session_id_from_request_context(request_context)?;
         let target = self.session_target(session_id.as_deref())?;
-        match target {
-            Some(SessionTarget::Window { hwnd }) => Ok(hwnd),
-            Some(SessionTarget::Cdp { window_hwnd, .. }) => Ok(window_hwnd),
+        let hwnd = match target {
+            Some(SessionTarget::Window { hwnd }) => hwnd,
+            Some(SessionTarget::Cdp { window_hwnd, .. }) => window_hwnd,
             None => Err(mcp_error(
                 synapse_core::error_codes::TARGET_NOT_SET,
                 "capture_gif requires a window_hwnd or a bound session target (set_target)",
-            )),
-        }
+            ))?,
+        };
+        validate_window_hwnd_shape("capture_gif", hwnd)
     }
 }
 

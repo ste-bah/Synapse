@@ -46,6 +46,7 @@ pub struct ActClickParams {
     #[serde(default)]
     #[schemars(
         default,
+        range(min = 1, max = 4_294_967_295_u64),
         description = "Optional target top-level HWND that verify_delta must use as the physical Source of Truth for point clicks. Intended for target-scoped routers that already validated and bound the native window; stale or conflicting HWNDs fail closed before input."
     )]
     pub verify_target_window_hwnd: Option<i64>,

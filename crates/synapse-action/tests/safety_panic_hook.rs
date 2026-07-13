@@ -28,7 +28,8 @@ fn panic_hook_releases_before_prior_hook_and_installs_once() -> Result<(), Box<d
 
     let release_count_for_actor = Arc::clone(&release_count);
     let _actor = thread::spawn(move || {
-        while let Some((action, ack)) = action_rx.blocking_recv() {
+        while let Some((action, ack, _operator_panic_epoch_at_enqueue)) = action_rx.blocking_recv()
+        {
             let ordinal = release_count_for_actor.fetch_add(1, Ordering::SeqCst) + 1;
             let action_label = if matches!(action, Action::ReleaseAll) {
                 "release_all"

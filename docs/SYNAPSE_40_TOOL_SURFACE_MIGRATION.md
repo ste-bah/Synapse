@@ -15,13 +15,13 @@ The default production MCP surface is facade-first:
 - Facade contract source of truth: `FACADE_TOOL_CONTRACTS`.
 - Live profile row source of truth: `CF_SESSIONS mcp/tool-profile/v1/<session_id>`.
 
-The current normal-agent profile exposes 39 tools. The public registry contains 40 tools because `browser_debugger` is a public facade, but it is intentionally hidden from `normal_agent` until the session switches to `browser_debugger` with `profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why raw CDP is required>`.
+The current normal-agent profile exposes all 40 stable public facade names. Every scoped production HTTP profile advertises the same facade surface so strict/static MCP clients never need a schema refresh to gain a capability route. Profiles gate operation-level authority: debugger-backed `browser_debugger` operations require `profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why debugger authority is required>`, and real-foreground actions use the audited `act operation=foreground` route. Raw implementation tools remain hidden for scoped HTTP profiles. Trusted unscoped stdio intentionally retains the full raw admin surface, and `SYNAPSE_DEBUG_TOOLS=1` explicitly enables the diagnostic implementation surface.
 
 Default normal-agent tools:
 
-`health`, `profile`, `session`, `subscribe`, `observe`, `find`, `read_text`, `screenshot`, `target`, `act`, `shell`, `process`, `browser_tabs`, `browser_nav`, `browser_dom`, `browser_form`, `browser_wait`, `browser_capture`, `browser_storage`, `workspace`, `agent`, `task`, `approval`, `escalation`, `timeline`, `episode`, `routine`, `assist`, `reality`, `verification`, `storage`, `model`, `cost`, `hygiene`, `audit`, `replay`, `privacy`, `setup`, `telemetry`.
+`health`, `profile`, `session`, `subscribe`, `observe`, `find`, `read_text`, `screenshot`, `target`, `act`, `shell`, `process`, `browser_tabs`, `browser_nav`, `browser_dom`, `browser_form`, `browser_wait`, `browser_capture`, `browser_storage`, `browser_debugger`, `workspace`, `agent`, `task`, `approval`, `escalation`, `timeline`, `episode`, `routine`, `assist`, `reality`, `verification`, `storage`, `model`, `cost`, `hygiene`, `audit`, `replay`, `privacy`, `setup`, `telemetry`.
 
-Public but profile-gated:
+Public facade with profile-gated operations:
 
 `browser_debugger`.
 
@@ -169,7 +169,7 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 | `set_capture_target`, `set_perception_mode` | `target operation=set` plus per-call `observe`/`screenshot` parameters | Removed as normal public global mutators. |
 | `target_claim`, `target_claim_status`, `target_claim_adopt`, `target_release` | `target operation=claim/status/adopt/release` | Condensed. |
 | `target_act` | `act operation=invoke` | Condensed through action facade. |
-| `act_foreground` | `act operation=foreground` | Condensed; explicit reason required. |
+| `act_foreground` | `act operation=foreground` | Condensed; explicit reason required; the whole keyed authority transaction remains supervised through exact profile/lease cleanup and final audit after caller cancellation, and the dedicated physical operator-panic epoch supersedes stored agent lease snapshots. |
 | `control_lease_acquire`, `control_lease_handoff`, `control_lease_release`, `control_lease_status` | `act operation=foreground`, `target operation=claim/status/release`, or explicit `break_glass` profile | Removed from normal public surface as standalone lease tools. |
 | `act_run_shell`, `act_run_shell_start`, `act_run_shell_status`, `act_run_shell_cancel` | `shell operation=run/start/status/cancel` | Condensed. |
 | `act_launch` | `process operation=launch` | Condensed. |

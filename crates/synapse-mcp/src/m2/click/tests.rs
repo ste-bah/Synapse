@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     ForegroundClickPolicy, act_click_with_handle, act_click_with_handle_and_lease,
+    click_target_root_hwnd,
     schema::{
         ActClickParams, ActClickPointTarget, ActClickTarget, ClickVelocityProfile,
         default_click_backend, default_click_button, default_click_count,
@@ -14,6 +15,29 @@ use super::{
         default_coordinate_fallback_on_unsupported, default_use_invoke_pattern,
     },
 };
+
+#[test]
+fn click_visual_verification_rejects_noncanonical_hwnd_before_window_lookup() {
+    for invalid in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+        let params: ActClickParams = serde_json::from_value(json!({
+            "target": {"x": 12, "y": 34},
+            "verify_delta": true,
+            "verify_target_window_hwnd": invalid,
+        }))
+        .expect("synthetic click params deserialize");
+        let error = click_target_root_hwnd(&params)
+            .expect_err("noncanonical HWND must fail before native liveness lookup");
+        let data = error.data.as_ref().expect("structured HWND error data");
+        assert_eq!(
+            data.get("field").and_then(serde_json::Value::as_str),
+            Some("verify_target_window_hwnd")
+        );
+        assert_eq!(
+            data.get("actual_value").and_then(serde_json::Value::as_i64),
+            Some(invalid)
+        );
+    }
+}
 
 #[tokio::test]
 async fn coordinate_click_leaves_actor_held_state_empty() {
@@ -52,6 +76,8 @@ async fn coordinate_click_leaves_actor_held_state_empty() {
             deprecated_curve_alias_used: false,
         },
         ForegroundClickPolicy::allowed(Some("test-click-coordinate-session".to_owned())),
+        crate::m2::OperatorPanicActionBoundary::arm("act_click", "test_direct_call")
+            .expect("operator panic admission should be open for coordinate click test"),
     )
     .await
     {

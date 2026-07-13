@@ -40,9 +40,10 @@ const NATIVE_HOST_NAME: &str = "com.synapse.chrome_debugger";
 const EXTENSION_ORIGIN: &str = "chrome-extension://leoocgnkjnplbfdbklajepahofecgfbk";
 const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-07-12-evaluate-timeout-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str =
+    "synapse-chrome-bridge-2026-07-13-operator-panic-continuity-v3";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "25af9fe2d52245ee4d52ab89e580914ca65a0a8564c9696ff6c7b964d9cb165c";
+    "4a095150e0cec67ef71fff0d5f28cf17754f9a42d1e1ac34e51ef0df1105b8fb";
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
 const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "alarmReconnect",
@@ -83,6 +84,11 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "exposeBinding",
     "handleDialog",
     "fileUpload",
+    "operatorPanicDisable",
+    "operatorPanicCleanup",
+    "operatorPanicCloseTab",
+    "operatorPanicReadback",
+    "operatorPanicEnable",
     "cdpInput",
     "viewportEmulation",
     "deviceEmulation",
@@ -4524,7 +4530,184 @@ pub struct ChromeDebuggerBrowserNavigationEvent {
 struct PendingResponse {
     host_id: String,
     kind: String,
-    sender: oneshot::Sender<ChromeResponse>,
+    sender: Option<oneshot::Sender<ChromeResponse>>,
+    mutation_capable: bool,
+    delivered: bool,
+    caller_timed_out: bool,
+    transport_lost: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct ChromeDebuggerMutationOwnersReadback {
+    pub queued_mutation_count: usize,
+    pub delivered_mutation_count: usize,
+    pub delivered_caller_timed_out_count: usize,
+    pub delivered_transport_lost_count: usize,
+    pub delivered_command_ids: Vec<String>,
+    pub registry_readback_healthy: bool,
+    pub registry_readback_failure: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+pub struct ChromeDebuggerMutationOwnersDrainReadback {
+    pub queued_mutations_canceled: usize,
+    pub terminal_acks_observed: usize,
+    pub failures: Vec<String>,
+    pub readback: ChromeDebuggerMutationOwnersReadback,
+    pub fully_drained: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChromeDebuggerExtensionOwnerCounts {
+    pub opened_tab_count: usize,
+    pub init_script_count: usize,
+    pub binding_count: usize,
+    pub debugger_attached_tab_count: usize,
+    pub unresolved_debugger_command_timeout_count: usize,
+    pub executed_init_script_effect_unresolved_count: usize,
+    pub dialog_policy_count: usize,
+    pub dialog_auto_handle_in_flight_count: usize,
+    pub file_chooser_interception_count: usize,
+    pub clock_count: usize,
+    pub viewport_override_count: usize,
+    pub device_override_count: usize,
+    pub geolocation_override_count: usize,
+    pub locale_override_count: usize,
+    pub media_override_count: usize,
+    pub network_override_count: usize,
+    pub mutation_handler_in_flight_count: usize,
+}
+
+impl ChromeDebuggerExtensionOwnerCounts {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.opened_tab_count == 0
+            && self.init_script_count == 0
+            && self.binding_count == 0
+            && self.debugger_attached_tab_count == 0
+            && self.unresolved_debugger_command_timeout_count == 0
+            && self.executed_init_script_effect_unresolved_count == 0
+            && self.dialog_policy_count == 0
+            && self.dialog_auto_handle_in_flight_count == 0
+            && self.file_chooser_interception_count == 0
+            && self.clock_count == 0
+            && self.viewport_override_count == 0
+            && self.device_override_count == 0
+            && self.geolocation_override_count == 0
+            && self.locale_override_count == 0
+            && self.media_override_count == 0
+            && self.network_override_count == 0
+            && self.mutation_handler_in_flight_count == 0
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChromeDebuggerExtensionOwnerReadback {
+    pub enabled: bool,
+    pub disable_sequence: u64,
+    pub command_activity_sequence: u64,
+    pub command_last_completed_sequence: u64,
+    pub command_in_flight_count: usize,
+    pub mutation_handlers_started_count: u64,
+    pub mutation_handlers_completed_count: u64,
+    pub worker_boot_id: String,
+    pub browser_session_id: Option<String>,
+    pub ledger_browser_session_id: String,
+    pub browser_session_continuity_matched: bool,
+    pub stale_browser_session_owner_count: usize,
+    pub storage_state_loaded: bool,
+    pub storage_state_load_error: Option<String>,
+    pub persisted_state_revision: u64,
+    pub persisted_in_flight_mutation: Option<serde_json::Value>,
+    pub unresolved_debugger_command_timeouts:
+        Vec<ChromeDebuggerExtensionUnresolvedDebuggerCommandTimeout>,
+    pub unresolved_worker_restart_mutation_count: usize,
+    pub owner_continuity_healthy: bool,
+    pub active_after: ChromeDebuggerExtensionOwnerCounts,
+    pub fully_drained: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChromeDebuggerExtensionUnresolvedDebuggerCommandTimeout {
+    pub id: String,
+    pub tab_id: i64,
+    pub method: String,
+    pub activity_sequence: u64,
+    pub worker_boot_id: String,
+    pub timed_out_at_unix_ms: u64,
+    pub neutralization_method: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChromeDebuggerExtensionClosedOpenedTab {
+    pub tab_id: i64,
+    pub target_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChromeDebuggerExtensionReloadedInitScriptEffectTab {
+    pub tab_id: i64,
+    pub before_document_id: String,
+    pub after_document_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChromeDebuggerExtensionCleanupReadback {
+    #[serde(flatten)]
+    pub owner: ChromeDebuggerExtensionOwnerReadback,
+    pub expected_disable_sequence: u64,
+    #[serde(default)]
+    pub opened_tabs_found: usize,
+    #[serde(default)]
+    pub opened_tabs_closed: usize,
+    #[serde(default)]
+    pub closed_opened_tabs: Vec<ChromeDebuggerExtensionClosedOpenedTab>,
+    #[serde(default)]
+    pub remaining_opened_tabs: Vec<ChromeDebuggerExtensionClosedOpenedTab>,
+    #[serde(default)]
+    pub init_scripts_found: usize,
+    #[serde(default)]
+    pub init_scripts_removed: usize,
+    #[serde(default)]
+    pub init_script_effects_found: usize,
+    #[serde(default)]
+    pub init_script_effects_cleared: usize,
+    #[serde(default)]
+    pub reloaded_init_script_effect_tabs: Vec<ChromeDebuggerExtensionReloadedInitScriptEffectTab>,
+    #[serde(default)]
+    pub bindings_found: usize,
+    #[serde(default)]
+    pub bindings_removed: usize,
+    #[serde(default)]
+    pub debugger_tabs_found: usize,
+    #[serde(default)]
+    pub debugger_tabs_detached: usize,
+    #[serde(default)]
+    pub detached_debugger_tabs: Vec<i64>,
+    #[serde(default)]
+    pub dialog_policies_found: usize,
+    #[serde(default)]
+    pub dialog_policies_disabled: usize,
+    #[serde(default)]
+    pub file_chooser_interceptions_found: usize,
+    #[serde(default)]
+    pub file_chooser_interceptions_disabled: usize,
+    #[serde(default)]
+    pub clocks_found: usize,
+    #[serde(default)]
+    pub clocks_uninstalled: usize,
+    #[serde(default)]
+    pub failures: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ChromeDebuggerExtensionEnableReadback {
+    #[serde(flatten)]
+    pub owner: ChromeDebuggerExtensionOwnerReadback,
+    pub expected_disable_sequence: u64,
+    pub generation_matched: bool,
+    pub owners_were_empty: bool,
+    pub enable_applied: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -4593,9 +4776,84 @@ struct QueuedCommand {
 #[derive(Default)]
 struct BridgeInner {
     active_host_id: Option<String>,
+    host_lineage_sequence: u64,
     hosts: HashMap<String, HostRecord>,
     commands: VecDeque<QueuedCommand>,
     pending: HashMap<String, PendingResponse>,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+struct TransportLossPendingStats {
+    queued_removed: usize,
+    pending_failed_before_delivery: usize,
+    delivered_mutations_preserved: usize,
+}
+
+fn preserve_delivered_mutations_on_transport_loss(
+    inner: &mut BridgeInner,
+    host_id: &str,
+    detail: &str,
+) -> TransportLossPendingStats {
+    let queued_before = inner.commands.len();
+    inner.commands.retain(|queued| queued.host_id != host_id);
+    let queued_removed = queued_before.saturating_sub(inner.commands.len());
+    let pending_ids = inner
+        .pending
+        .iter()
+        .filter(|(_id, pending)| pending.host_id == host_id)
+        .map(|(id, _pending)| id.clone())
+        .collect::<Vec<_>>();
+    let mut pending_failed_before_delivery = 0usize;
+    let mut delivered_mutations_preserved = 0usize;
+    for id in pending_ids {
+        let preserve = inner
+            .pending
+            .get(&id)
+            .is_some_and(|pending| pending.delivered && pending.mutation_capable);
+        if preserve {
+            if let Some(pending) = inner.pending.get_mut(&id) {
+                pending.transport_lost = true;
+                if let Some(sender) = pending.sender.take() {
+                    let _ = sender.send(ChromeResponse {
+                        id: id.clone(),
+                        ok: false,
+                        result: None,
+                        error: Some(ChromeResponseError {
+                            code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
+                            detail: Some(detail.to_owned()),
+                        }),
+                    });
+                }
+                delivered_mutations_preserved = delivered_mutations_preserved.saturating_add(1);
+                tracing::error!(
+                    code = "CHROME_DEBUGGER_DELIVERED_MUTATION_TRANSPORT_LOST",
+                    host_id = %host_id,
+                    command_id = %id,
+                    command_kind = %pending.kind,
+                    detail = %detail,
+                    "delivered Chrome mutation remains owned until daemon owner-registry teardown; extension cleanup/readback cannot reconcile a lost transport lineage"
+                );
+            }
+        } else if let Some(pending) = inner.pending.remove(&id) {
+            if let Some(sender) = pending.sender {
+                let _ = sender.send(ChromeResponse {
+                    id: id.clone(),
+                    ok: false,
+                    result: None,
+                    error: Some(ChromeResponseError {
+                        code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
+                        detail: Some(detail.to_owned()),
+                    }),
+                });
+            }
+            pending_failed_before_delivery = pending_failed_before_delivery.saturating_add(1);
+        }
+    }
+    TransportLossPendingStats {
+        queued_removed,
+        pending_failed_before_delivery,
+        delivered_mutations_preserved,
+    }
 }
 
 struct ChromeDebuggerBridge {
@@ -5047,6 +5305,7 @@ impl ChromeDebuggerBridge {
         if is_direct_http {
             replace_active_direct_http_host(&mut inner, &host_id);
         }
+        inner.host_lineage_sequence = inner.host_lineage_sequence.saturating_add(1);
         inner.active_host_id = Some(host_id.clone());
         inner.hosts.insert(host_id.clone(), record);
         tracing::info!(
@@ -5216,7 +5475,9 @@ impl ChromeDebuggerBridge {
                     readback = %readback_summary.as_deref().unwrap_or(""),
                     "Chrome debugger response accepted"
                 );
-                let _ = pending.sender.send(response);
+                if let Some(sender) = pending.sender {
+                    let _ = sender.send(response);
+                }
             }
             "event" => {
                 let event = request
@@ -5247,42 +5508,24 @@ impl ChromeDebuggerBridge {
                     let _ = host;
                     if inner.active_host_id.as_deref() == Some(request.host_id.as_str()) {
                         inner.active_host_id = None;
+                        inner.host_lineage_sequence = inner.host_lineage_sequence.saturating_add(1);
                     }
-                    inner
-                        .commands
-                        .retain(|queued| queued.host_id != request.host_id);
-                    let pending_ids = inner
-                        .pending
-                        .iter()
-                        .filter_map(|(id, pending)| {
-                            if pending.host_id == request.host_id {
-                                Some(id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    for id in pending_ids {
-                        if let Some(pending) = inner.pending.remove(&id) {
-                            let _ = pending.sender.send(ChromeResponse {
-                                id,
-                                ok: false,
-                                result: None,
-                                error: Some(ChromeResponseError {
-                                    code: Some(
-                                        error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned(),
-                                    ),
-                                    detail: Some(detail.clone().unwrap_or_else(|| {
-                                        "Chrome debugger native port disconnected".to_owned()
-                                    })),
-                                }),
-                            });
-                        }
-                    }
+                    let terminal_detail = detail.clone().unwrap_or_else(|| {
+                        "Chrome debugger native port disconnected before command response"
+                            .to_owned()
+                    });
+                    let stats = preserve_delivered_mutations_on_transport_loss(
+                        &mut inner,
+                        &request.host_id,
+                        &terminal_detail,
+                    );
                     tracing::warn!(
                         code = "CHROME_DEBUGGER_NATIVE_PORT_DISCONNECTED",
                         host_id = %request.host_id,
                         detail = %detail_for_log,
+                        queued_removed = stats.queued_removed,
+                        pending_failed_before_delivery = stats.pending_failed_before_delivery,
+                        delivered_mutations_preserved = stats.delivered_mutations_preserved,
                         "Chrome debugger native port disconnected"
                     );
                 } else if event == "tabNavigation" {
@@ -5545,6 +5788,9 @@ impl ChromeDebuggerBridge {
                         .commands
                         .remove(index)
                         .ok_or_else(|| "queued command disappeared".to_owned())?;
+                    if let Some(pending) = inner.pending.get_mut(&queued.command.id) {
+                        pending.delivered = true;
+                    }
                     tracing::info!(
                         code = "CHROME_DEBUGGER_COMMAND_DELIVERED",
                         host_id = %host_id,
@@ -5610,6 +5856,7 @@ impl ChromeDebuggerBridge {
             };
             if !inner.hosts.contains_key(&host_id) {
                 inner.active_host_id = None;
+                inner.host_lineage_sequence = inner.host_lineage_sequence.saturating_add(1);
                 return Err(ChromeDebuggerBridgeError::unavailable());
             }
             let host = inner
@@ -5637,7 +5884,11 @@ impl ChromeDebuggerBridge {
                 PendingResponse {
                     host_id: host_id.clone(),
                     kind: kind.to_owned(),
-                    sender,
+                    sender: Some(sender),
+                    mutation_capable: true,
+                    delivered: false,
+                    caller_timed_out: false,
+                    transport_lost: false,
                 },
             );
             inner.commands.push_back(QueuedCommand {
@@ -5659,13 +5910,13 @@ impl ChromeDebuggerBridge {
         let response = match timeout(command_timeout, receiver).await {
             Ok(Ok(response)) => response,
             Ok(Err(_closed)) => {
-                self.drop_pending(&id);
+                self.abandon_pending_caller(&id, "response_channel_closed");
                 return Err(ChromeDebuggerBridgeError::protocol(format!(
                     "Chrome debugger command {kind:?} response channel closed"
                 )));
             }
             Err(_elapsed) => {
-                self.drop_pending(&id);
+                self.abandon_pending_caller(&id, "caller_timeout");
                 return Err(ChromeDebuggerBridgeError::timeout(kind));
             }
         };
@@ -5685,15 +5936,37 @@ impl ChromeDebuggerBridge {
         ))
     }
 
-    fn drop_pending(&self, id: &str) {
-        if let Ok(mut inner) = self.inner.lock()
-            && let Some(pending) = inner.pending.remove(id)
-        {
+    fn abandon_pending_caller(&self, id: &str, reason: &'static str) {
+        let Ok(mut inner) = self.inner.lock() else {
+            synapse_action::record_operator_panic_safety_incident();
+            return;
+        };
+        let keep_delivered_mutation = inner
+            .pending
+            .get(id)
+            .is_some_and(|pending| pending.delivered && pending.mutation_capable);
+        if keep_delivered_mutation {
+            if let Some(pending) = inner.pending.get_mut(id) {
+                pending.sender = None;
+                pending.caller_timed_out = true;
+                tracing::error!(
+                    code = "CHROME_DEBUGGER_DELIVERED_MUTATION_UNRESOLVED",
+                    command_id = %id,
+                    command_kind = %pending.kind,
+                    reason,
+                    "delivered Chrome mutation remains owned until terminal extension acknowledgement"
+                );
+            }
+            return;
+        }
+        inner.commands.retain(|queued| queued.command.id != id);
+        if let Some(pending) = inner.pending.remove(id) {
             tracing::warn!(
-                code = "CHROME_DEBUGGER_PENDING_DROPPED",
+                code = "CHROME_DEBUGGER_PENDING_DROPPED_BEFORE_DELIVERY",
                 command_id = %id,
                 command_kind = %pending.kind,
-                "Chrome debugger pending command removed"
+                reason,
+                "Chrome debugger command ownership ended before delivery"
             );
         }
     }
@@ -5770,43 +6043,21 @@ impl ChromeDebuggerBridge {
         }
         if inner.active_host_id.as_deref() == Some(host_id) {
             inner.active_host_id = None;
+            inner.host_lineage_sequence = inner.host_lineage_sequence.saturating_add(1);
         }
-        let queued_before = inner.commands.len();
-        inner.commands.retain(|queued| queued.host_id != host_id);
-        let queued_removed = queued_before.saturating_sub(inner.commands.len());
-        let pending_ids = inner
-            .pending
-            .iter()
-            .filter_map(|(id, pending)| {
-                if pending.host_id == host_id {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
-        for id in &pending_ids {
-            if let Some(pending) = inner.pending.remove(id) {
-                let _ = pending.sender.send(ChromeResponse {
-                    id: id.clone(),
-                    ok: false,
-                    result: None,
-                    error: Some(ChromeResponseError {
-                        code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
-                        detail: Some(format!(
-                            "Chrome debugger direct HTTP bridge host {host_id} disconnected before command response: {detail}"
-                        )),
-                    }),
-                });
-            }
-        }
+        let terminal_detail = format!(
+            "Chrome debugger direct HTTP bridge host {host_id} disconnected before command response: {detail}"
+        );
+        let stats =
+            preserve_delivered_mutations_on_transport_loss(&mut inner, host_id, &terminal_detail);
         inner.hosts.remove(host_id);
         tracing::warn!(
             code = "CHROME_DEBUGGER_DIRECT_HTTP_WS_DISCONNECTED",
             host_id = %host_id,
             detail = %detail,
-            queued_removed,
-            pending_failed = pending_ids.len(),
+            queued_removed = stats.queued_removed,
+            pending_failed_before_delivery = stats.pending_failed_before_delivery,
+            delivered_mutations_preserved = stats.delivered_mutations_preserved,
             "Chrome debugger direct HTTP WebSocket disconnected"
         );
         self.notify.notify_waiters();
@@ -5820,6 +6071,244 @@ fn bridge() -> &'static ChromeDebuggerBridge {
         notify: Notify::new(),
         command_seq: AtomicU64::new(1),
     })
+}
+
+#[must_use]
+pub fn mutation_command_owners_readback() -> ChromeDebuggerMutationOwnersReadback {
+    let inner = match bridge().inner.lock() {
+        Ok(inner) => inner,
+        Err(_) => {
+            synapse_action::record_operator_panic_safety_incident();
+            return ChromeDebuggerMutationOwnersReadback {
+                queued_mutation_count: usize::MAX,
+                delivered_mutation_count: usize::MAX,
+                delivered_caller_timed_out_count: usize::MAX,
+                delivered_transport_lost_count: usize::MAX,
+                registry_readback_healthy: false,
+                registry_readback_failure: Some(
+                    "Chrome debugger mutation-owner registry lock is poisoned".to_owned(),
+                ),
+                ..Default::default()
+            };
+        }
+    };
+    let queued_mutation_count = inner
+        .pending
+        .values()
+        .filter(|pending| pending.mutation_capable && !pending.delivered)
+        .count();
+    let mut delivered = inner
+        .pending
+        .iter()
+        .filter(|(_, pending)| pending.mutation_capable && pending.delivered)
+        .map(|(id, pending)| (id.clone(), pending.caller_timed_out, pending.transport_lost))
+        .collect::<Vec<_>>();
+    delivered.sort_by(|left, right| left.0.cmp(&right.0));
+    ChromeDebuggerMutationOwnersReadback {
+        queued_mutation_count,
+        delivered_mutation_count: delivered.len(),
+        delivered_caller_timed_out_count: delivered
+            .iter()
+            .filter(|(_, caller_timed_out, _)| *caller_timed_out)
+            .count(),
+        delivered_transport_lost_count: delivered
+            .iter()
+            .filter(|(_, _, transport_lost)| *transport_lost)
+            .count(),
+        delivered_command_ids: delivered.into_iter().map(|(id, _, _)| id).collect(),
+        registry_readback_healthy: true,
+        registry_readback_failure: None,
+    }
+}
+
+fn resolve_abandoned_delivered_mutations_after_extension_empty_readback(
+    readback: &ChromeDebuggerExtensionOwnerReadback,
+    authoritative_host_id: &str,
+) -> Result<usize, ChromeDebuggerBridgeError> {
+    if !extension_owner_readback_is_authoritative_empty(readback) {
+        return Ok(0);
+    }
+    let mut inner = bridge().inner.lock().map_err(|_| {
+        synapse_action::record_operator_panic_safety_incident();
+        ChromeDebuggerBridgeError::protocol(
+            "Chrome debugger mutation-owner registry lock poisoned while reconciling authoritative extension readback",
+        )
+    })?;
+    let resolved_ids = inner
+        .pending
+        .iter()
+        .filter(|(_id, pending)| {
+            pending.mutation_capable
+                && pending.delivered
+                && pending.sender.is_none()
+                && pending.caller_timed_out
+                && !pending.transport_lost
+                && pending.host_id == authoritative_host_id
+        })
+        .map(|(id, _pending)| id.clone())
+        .collect::<Vec<_>>();
+    for id in &resolved_ids {
+        inner.pending.remove(id);
+    }
+    if !resolved_ids.is_empty() {
+        tracing::warn!(
+            code = "CHROME_DEBUGGER_ABANDONED_MUTATIONS_RESOLVED_BY_EXTENSION_READBACK",
+            disable_sequence = readback.disable_sequence,
+            resolved_count = resolved_ids.len(),
+            resolved_command_ids = ?resolved_ids,
+            "authoritative serialized extension cleanup/readback proved abandoned delivered mutations terminal"
+        );
+    }
+    Ok(resolved_ids.len())
+}
+
+fn extension_owner_readback_is_authoritative_empty(
+    readback: &ChromeDebuggerExtensionOwnerReadback,
+) -> bool {
+    !readback.enabled
+        && readback.fully_drained
+        && readback.command_in_flight_count == 1
+        && readback.command_activity_sequence
+            == readback.command_last_completed_sequence.saturating_add(1)
+        && readback.mutation_handlers_started_count == readback.mutation_handlers_completed_count
+        && readback.storage_state_loaded
+        && readback.storage_state_load_error.is_none()
+        && readback.browser_session_continuity_matched
+        && readback.stale_browser_session_owner_count == 0
+        && readback
+            .browser_session_id
+            .as_deref()
+            .is_some_and(|session| !session.is_empty())
+        && readback.browser_session_id.as_deref()
+            == Some(readback.ledger_browser_session_id.as_str())
+        && readback.persisted_in_flight_mutation.is_none()
+        && readback.unresolved_debugger_command_timeouts.is_empty()
+        && readback.unresolved_worker_restart_mutation_count == 0
+        && readback.owner_continuity_healthy
+        && readback.active_after.is_empty()
+}
+
+fn active_bridge_host_lineage_snapshot() -> Result<(Option<String>, u64), ChromeDebuggerBridgeError>
+{
+    bridge()
+        .inner
+        .lock()
+        .map(|inner| (inner.active_host_id.clone(), inner.host_lineage_sequence))
+        .map_err(|_| {
+            synapse_action::record_operator_panic_safety_incident();
+            ChromeDebuggerBridgeError::protocol(
+                "Chrome debugger bridge lock poisoned while reading active host lineage",
+            )
+        })
+}
+
+/// Cancels commands which have not crossed the extension delivery boundary,
+/// then waits for every delivered mutation to publish a terminal response.
+/// Transport teardown deliberately preserves delivered ownership until daemon
+/// owner-registry teardown; a replacement transport lineage cannot reconcile
+/// it. Only caller-timeout ownership on the same continuous host lineage may be
+/// reconciled by serialized cleanup plus an independent empty readback. A
+/// timeout is a fail-closed unresolved verdict, never terminal ownership.
+pub async fn drain_mutation_command_owners(
+    wait_timeout: Duration,
+) -> ChromeDebuggerMutationOwnersDrainReadback {
+    let before = mutation_command_owners_readback();
+    if !before.registry_readback_healthy {
+        return ChromeDebuggerMutationOwnersDrainReadback {
+            failures: before
+                .registry_readback_failure
+                .clone()
+                .into_iter()
+                .collect(),
+            readback: before,
+            fully_drained: false,
+            ..Default::default()
+        };
+    }
+    let queued_mutations_canceled = {
+        let mut inner = match bridge().inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => {
+                synapse_action::record_operator_panic_safety_incident();
+                return ChromeDebuggerMutationOwnersDrainReadback {
+                    failures: vec![
+                        "Chrome debugger mutation-owner registry lock poisoned during drain"
+                            .to_owned(),
+                    ],
+                    readback: mutation_command_owners_readback(),
+                    fully_drained: false,
+                    ..Default::default()
+                };
+            }
+        };
+        let queued_ids = inner
+            .pending
+            .iter()
+            .filter(|(_id, pending)| pending.mutation_capable && !pending.delivered)
+            .map(|(id, _pending)| id.clone())
+            .collect::<Vec<_>>();
+        inner
+            .commands
+            .retain(|queued| !queued_ids.iter().any(|id| id == &queued.command.id));
+        for id in &queued_ids {
+            if let Some(pending) = inner.pending.remove(id)
+                && let Some(sender) = pending.sender
+            {
+                let _ = sender.send(ChromeResponse {
+                    id: id.clone(),
+                    ok: false,
+                    result: None,
+                    error: Some(ChromeResponseError {
+                        code: Some(error_codes::SAFETY_OPERATOR_HOTKEY_FIRED.to_owned()),
+                        detail: Some(
+                            "operator panic canceled Chrome command before extension delivery"
+                                .to_owned(),
+                        ),
+                    }),
+                });
+            }
+        }
+        queued_ids.len()
+    };
+
+    let started = Instant::now();
+    loop {
+        let readback = mutation_command_owners_readback();
+        if !readback.registry_readback_healthy
+            || readback.delivered_mutation_count == 0
+            || started.elapsed() >= wait_timeout
+        {
+            let terminal_acks_observed = before
+                .delivered_mutation_count
+                .saturating_sub(readback.delivered_mutation_count);
+            let mut failures = Vec::new();
+            if !readback.registry_readback_healthy {
+                failures.extend(readback.registry_readback_failure.clone());
+            }
+            if readback.delivered_mutation_count != 0 {
+                failures.push(format!(
+                    "{} delivered Chrome mutation command(s) remain unresolved after {} ms: {:?}",
+                    readback.delivered_mutation_count,
+                    started.elapsed().as_millis(),
+                    readback.delivered_command_ids
+                ));
+            }
+            let fully_drained = failures.is_empty()
+                && readback.queued_mutation_count == 0
+                && readback.delivered_mutation_count == 0;
+            if !fully_drained {
+                synapse_action::record_operator_panic_safety_incident();
+            }
+            return ChromeDebuggerMutationOwnersDrainReadback {
+                queued_mutations_canceled,
+                terminal_acks_observed,
+                failures,
+                readback,
+                fully_drained,
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 pub fn health_subsystem() -> SubsystemHealth {
@@ -6250,6 +6739,29 @@ pub async fn close_tab(
     serde_json::from_value::<ChromeDebuggerCloseTabResult>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger close tab response: {error}"
+        ))
+    })
+}
+
+pub async fn operator_panic_close_tab(
+    hwnd: i64,
+    target_id: &str,
+    expected_disable_sequence: u64,
+) -> Result<ChromeDebuggerCloseTabResult, ChromeDebuggerBridgeError> {
+    ensure_normal_bridge_external_popup_suppressed(hwnd, "operatorPanicCloseTab")?;
+    let result = bridge()
+        .send_command(
+            "operatorPanicCloseTab",
+            json!({
+                "hwnd": hwnd,
+                "targetIdHint": target_id,
+                "expectedDisableSequence": expected_disable_sequence,
+            }),
+        )
+        .await?;
+    serde_json::from_value::<ChromeDebuggerCloseTabResult>(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger operator panic close tab response: {error}"
         ))
     })
 }
@@ -7653,6 +8165,90 @@ pub async fn file_upload(
     })
 }
 
+/// Closes the extension mutation-admission gate immediately on receipt, ahead
+/// of its normal command FIFO, durably records the transition, and returns its
+/// monotonic disable generation. K2 must call this before draining daemon-side
+/// delivered owners; cleanup/readback then serialize behind earlier handlers.
+pub async fn operator_panic_disable()
+-> Result<ChromeDebuggerExtensionOwnerReadback, ChromeDebuggerBridgeError> {
+    let result = bridge()
+        .send_command_with_timeout("operatorPanicDisable", json!({}), Duration::from_secs(30))
+        .await?;
+    serde_json::from_value(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger operatorPanicDisable response: {error}"
+        ))
+    })
+}
+
+/// Removes every extension-owned durable mutator for the exact disable
+/// generation returned by [`operator_panic_disable`]. A newer disable event
+/// makes the cleanup generation mismatch fail closed.
+pub async fn operator_panic_cleanup(
+    expected_disable_sequence: u64,
+) -> Result<ChromeDebuggerExtensionCleanupReadback, ChromeDebuggerBridgeError> {
+    let result = bridge()
+        .send_command_with_timeout(
+            "operatorPanicCleanup",
+            json!({ "expectedDisableSequence": expected_disable_sequence }),
+            Duration::from_secs(30),
+        )
+        .await?;
+    serde_json::from_value(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger operatorPanicCleanup response: {error}"
+        ))
+    })
+}
+
+/// Independent extension owner readback, serialized after every earlier
+/// extension command. It may reconcile caller-timeout owners only when the
+/// same host remained active throughout; transport-loss owners deliberately
+/// remain fail-closed until daemon teardown because a replacement host is not
+/// authoritative for the old Chrome profile/worker.
+pub async fn operator_panic_readback()
+-> Result<ChromeDebuggerExtensionOwnerReadback, ChromeDebuggerBridgeError> {
+    let host_before = active_bridge_host_lineage_snapshot()?;
+    let result = bridge()
+        .send_command_with_timeout("operatorPanicReadback", json!({}), Duration::from_secs(30))
+        .await?;
+    let host_after = active_bridge_host_lineage_snapshot()?;
+    let readback: ChromeDebuggerExtensionOwnerReadback =
+        serde_json::from_value(result).map_err(|error| {
+            ChromeDebuggerBridgeError::protocol(format!(
+                "decode Chrome debugger operatorPanicReadback response: {error}"
+            ))
+        })?;
+    if let ((Some(before), before_sequence), (Some(after), after_sequence)) =
+        (host_before, host_after)
+        && before == after
+        && before_sequence == after_sequence
+    {
+        resolve_abandoned_delivered_mutations_after_extension_empty_readback(&readback, &before)?;
+    }
+    Ok(readback)
+}
+
+/// Reopens extension mutation admission only when no newer disable generation
+/// superseded `expected_disable_sequence` and independent owner readback is
+/// empty. The extension never recreates prior durable owners on reset.
+pub async fn operator_panic_enable_if_unchanged(
+    expected_disable_sequence: u64,
+) -> Result<ChromeDebuggerExtensionEnableReadback, ChromeDebuggerBridgeError> {
+    let result = bridge()
+        .send_command_with_timeout(
+            "operatorPanicEnable",
+            json!({ "expectedDisableSequence": expected_disable_sequence }),
+            Duration::from_secs(30),
+        )
+        .await?;
+    serde_json::from_value(result).map_err(|error| {
+        ChromeDebuggerBridgeError::protocol(format!(
+            "decode Chrome debugger operatorPanicEnable response: {error}"
+        ))
+    })
+}
+
 pub struct ChromeDebuggerDomActionRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
@@ -8585,12 +9181,14 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "target_count_after": result.get("target_count_after"),
             "extension_id": result.get("extension_id"),
         }),
-        "closeTab" => json!({
+        "closeTab" | "operatorPanicCloseTab" => json!({
             "target_id": result.get("target_id"),
             "tab_id": result.get("tab_id"),
             "target_count_before": result.get("target_count_before"),
             "target_count_after": result.get("target_count_after"),
             "extension_id": result.get("extension_id"),
+            "operator_panic_cleanup": result.get("operator_panic_cleanup"),
+            "expected_disable_sequence": result.get("expected_disable_sequence"),
         }),
         "navigateTab" => json!({
             "target_id": result.get("target_id"),
@@ -9255,43 +9853,18 @@ fn replace_active_direct_http_host(inner: &mut BridgeInner, new_host_id: &str) {
     if old_host.transport.as_deref() != Some("direct_http") {
         return;
     }
-    let queued_before = inner.commands.len();
-    inner
-        .commands
-        .retain(|queued| queued.host_id != old_host_id);
-    let queued_removed = queued_before.saturating_sub(inner.commands.len());
-    let pending_ids = inner
-        .pending
-        .iter()
-        .filter_map(|(id, pending)| {
-            if pending.host_id == old_host_id {
-                Some(id.clone())
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-    for id in &pending_ids {
-        if let Some(pending) = inner.pending.remove(id) {
-            let _ = pending.sender.send(ChromeResponse {
-                id: id.clone(),
-                ok: false,
-                result: None,
-                error: Some(ChromeResponseError {
-                    code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
-                    detail: Some(format!(
-                        "Chrome debugger direct HTTP bridge host {old_host_id} was replaced by {new_host_id} before command response"
-                    )),
-                }),
-            });
-        }
-    }
+    let terminal_detail = format!(
+        "Chrome debugger direct HTTP bridge host {old_host_id} was replaced by {new_host_id} before command response"
+    );
+    let stats =
+        preserve_delivered_mutations_on_transport_loss(inner, &old_host_id, &terminal_detail);
     tracing::warn!(
         code = "CHROME_DEBUGGER_DIRECT_HTTP_HOST_REPLACED",
         old_host_id = %old_host_id,
         new_host_id = %new_host_id,
-        queued_removed,
-        pending_failed = pending_ids.len(),
+        queued_removed = stats.queued_removed,
+        pending_failed_before_delivery = stats.pending_failed_before_delivery,
+        delivered_mutations_preserved = stats.delivered_mutations_preserved,
         "Chrome debugger direct HTTP bridge host replaced"
     );
 }

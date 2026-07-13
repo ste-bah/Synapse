@@ -1,3 +1,8 @@
+# Supporting diagnostic only. Its output is supporting diagnostic evidence only.
+# This script does not perform or accept Full State Verification (FSV). Under
+# AGENTS.md D1, an agent must perform FSV manually
+# through the strict production MCP client and independently read each physical
+# Source of Truth before and after the trigger.
 param(
     [string]$SynapseMcpExe = (Join-Path $PSScriptRoot '..\..\target\release\synapse-mcp.exe'),
     [string]$ProfileDir = "$env:USERPROFILE\.cargo\bin\profiles",
@@ -8,7 +13,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Die($Message) { throw "[issue852-fsv] $Message" }
+function Die($Message) { throw "[issue852-diagnostic] $Message" }
 
 function Assert-True {
     param(
@@ -171,7 +176,7 @@ function Open-McpSession {
     $initParams = [ordered]@{
         protocolVersion = '2025-06-18'
         capabilities = @{}
-        clientInfo = [ordered]@{ name = 'issue852-fsv'; version = '1' }
+        clientInfo = [ordered]@{ name = 'issue852-diagnostic'; version = '1' }
     }
     $initResponse = Invoke-McpHttpPost -Bind $Bind -Token $Token -Method 'initialize' -Params $initParams -Id 1
     $sessionId = @($initResponse.Headers['Mcp-Session-Id'])[0]
@@ -291,8 +296,8 @@ function New-FocusRow {
             title = $Title
             pid = 852
             hwnd = 852
-            source = 'issue852-fsv'
-            fsv_marker = $Marker
+            source = 'issue852-diagnostic'
+            diagnostic_marker = $Marker
         }
     }
 }
@@ -306,8 +311,8 @@ function New-IdleRow {
         payload = @{
             idle_ms_at_detection = 180000
             idle_timeout_ms = 180000
-            source = 'issue852-fsv'
-            fsv_marker = $Marker
+            source = 'issue852-diagnostic'
+            diagnostic_marker = $Marker
         }
     }
 }
@@ -331,9 +336,9 @@ Assert-True ($token.Length -ge 16) "token too short at $TokenPath"
 $env:SYNAPSE_BEARER_TOKEN = $token
 
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$marker = "issue852-fsv-$stamp"
+$marker = "issue852-diagnostic-$stamp"
 $bind = Get-FreeLoopbackBind
-$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "synapse-issue852-fsv-$stamp"
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) "synapse-issue852-diagnostic-$stamp"
 $dbPath = Join-Path $tempRoot 'db'
 $logPath = Join-Path $tempRoot 'daemon.log'
 $errPath = Join-Path $tempRoot 'daemon.err.log'
@@ -454,16 +459,16 @@ try {
     $confirm = Invoke-McpTool -Bind $bind -Token $token -SessionId $sessionId -NextId ([ref]$nextId) -Name 'routine_update' -Arguments @{
         routine_id = $routineId
         action = 'confirm'
-        note = 'issue852 FSV confirm lifecycle readback'
+        note = 'issue852 diagnostic confirm lifecycle readback'
     }
     Assert-True ([string]$confirm.lifecycle_after -eq 'confirmed') "confirm lifecycle_after=$($confirm.lifecycle_after)"
 
-    $label = 'Morning report handoff FSV'
+    $label = 'Morning report handoff diagnostic'
     $rename = Invoke-McpTool -Bind $bind -Token $token -SessionId $sessionId -NextId ([ref]$nextId) -Name 'routine_update' -Arguments @{
         routine_id = $routineId
         action = 'rename'
         label = $label
-        note = 'issue852 FSV labeling readback'
+        note = 'issue852 diagnostic labeling readback'
     }
     Assert-True ([string]$rename.label_after -eq $label) "rename label_after=$($rename.label_after)"
 

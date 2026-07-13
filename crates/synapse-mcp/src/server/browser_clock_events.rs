@@ -74,6 +74,7 @@ pub struct BrowserClockParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Clock operation. Defaults to status/readback.
     #[serde(default)]
@@ -148,6 +149,7 @@ pub struct BrowserPageEventsParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Return only records with `seq >= since_seq`.
     #[serde(default)]
@@ -423,6 +425,9 @@ impl SynapseService {
         cdp_target_id: &str,
         params: &NormalizedBrowserClockParams,
     ) -> Result<BrowserClockResponse, ErrorData> {
+        if params.operation != BrowserClockOperation::Status {
+            super::operator_panic_boundary::ensure_mcp_mutation("browser_clock_before_mutation")?;
+        }
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             if cdp_target_id.starts_with("chrome-tab:") {
                 let result = crate::chrome_debugger_bridge::clock(
@@ -442,6 +447,11 @@ impl SynapseService {
                         ),
                     )
                 })?;
+                if params.operation != BrowserClockOperation::Status {
+                    super::operator_panic_boundary::ensure_mcp_mutation(
+                        "browser_clock_after_bridge_mutation",
+                    )?;
+                }
                 tracing::info!(
                     code = "CHROME_BRIDGE_BACKGROUND_CLOCK_READBACK",
                     session_id = %session_id,
@@ -487,6 +497,11 @@ impl SynapseService {
                 format!("{CLOCK_TOOL} raw CDP clock operation failed: {error}"),
             )
         })?;
+        if params.operation != BrowserClockOperation::Status {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_clock_after_raw_mutation",
+            )?;
+        }
         tracing::info!(
             code = "CDP_BACKGROUND_CLOCK_READBACK",
             session_id = %session_id,

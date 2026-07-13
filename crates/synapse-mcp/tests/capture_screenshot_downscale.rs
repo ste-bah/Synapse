@@ -1,4 +1,5 @@
-//! Reality FSV for #1336 — screenshot pixel-budget downscaling.
+//! Supporting real-process integration evidence for #1336 screenshot
+//! pixel-budget downscaling; manual FSV remains separate.
 //!
 //! Drives the real `synapse-mcp` binary over the stdio MCP protocol, captures a
 //! real screen region with a downscale budget, and then INDEPENDENTLY decodes the

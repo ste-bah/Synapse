@@ -26,6 +26,7 @@ windows.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+synapse-action = { version = "0.1.0", path = "../synapse-action", features = ["test-support"] }
 tempfile.workspace = true
 tokio-util.workspace = true
 

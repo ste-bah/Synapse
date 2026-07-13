@@ -1573,7 +1573,7 @@ mod tests {
 
     #[test]
     fn rect_from_quad_computes_axis_aligned_bounds() {
-        // The real Apply-button quad observed against Chrome 149 in FSV.
+        // The real Apply-button quad observed against Chrome 149 during manual FSV.
         let quad = [
             16.0, 69.4375, 49.359, 69.4375, 49.359, 84.4375, 16.0, 84.4375,
         ];

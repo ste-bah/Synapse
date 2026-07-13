@@ -202,6 +202,8 @@ mod tests {
 
     #[tokio::test]
     async fn release_all_counts_and_drains_actor_state() {
+        let _operator_epoch_serial =
+            crate::test_support::lease_serial("release_all_counts_epoch_serial");
         let cancel = CancellationToken::new();
         let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
         let (handle, snapshot_handle, join) =
@@ -282,6 +284,8 @@ mod tests {
 
     #[tokio::test]
     async fn release_all_disables_reflexes_before_draining_actor_state() {
+        let _operator_epoch_serial =
+            crate::test_support::lease_serial("release_all_reflex_epoch_serial");
         let cancel = CancellationToken::new();
         let backend: Arc<dyn ActionBackend> = Arc::new(RecordingBackend::new());
         let (handle, snapshot_handle, join) =
@@ -375,6 +379,8 @@ mod tests {
 
     #[tokio::test]
     async fn release_all_interrupts_in_flight_hold_before_snapshot_read() {
+        let _operator_epoch_serial =
+            crate::test_support::lease_serial("release_all_interrupt_epoch_serial");
         let cancel = CancellationToken::new();
         let backend = Arc::new(InterruptibleHoldBackend::default());
         let (handle, snapshot_handle, join) =
@@ -392,12 +398,11 @@ mod tests {
                     .await
             }
         });
-        for _attempt in 0..100 {
-            if backend.hold_started.load(Ordering::Acquire) {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        // Wait on the backend's causal readiness event. The timeout is only a
+        // deadlock diagnostic; readiness state—not elapsed time—is the verdict.
+        tokio::time::timeout(Duration::from_secs(10), backend.hold_ready.notified())
+            .await
+            .unwrap_or_else(|_| panic!("interruptible hold backend did not publish readiness"));
         assert!(backend.hold_started.load(Ordering::Acquire));
 
         let response = release_all_with_handles(
@@ -422,7 +427,7 @@ mod tests {
             backend.release_observed.load(Ordering::Acquire)
         );
         // `release_observed` is set only when the backend sees the operator
-        // release epoch change before its 1 s hold deadline. It directly proves
+        // release epoch change after its readiness snapshot. It directly proves
         // interruption; a test-side stopwatch only measures scheduler load.
         assert!(backend.release_observed.load(Ordering::Acquire));
         assert!(after.held_keys.is_empty());
@@ -472,20 +477,40 @@ mod tests {
     #[derive(Default)]
     struct InterruptibleHoldBackend {
         hold_started: AtomicBool,
+        hold_ready: tokio::sync::Notify,
         release_observed: AtomicBool,
     }
 
     impl ActionBackend for InterruptibleHoldBackend {
         fn execute(&self, action: &Action, _state: &mut EmitState) -> Result<(), ActionError> {
             match action {
-                Action::KeyPress { hold_ms, .. } => {
-                    self.hold_started.store(true, Ordering::Release);
+                Action::KeyPress { .. } => {
                     let epoch = operator_release_epoch();
-                    let deadline = Instant::now() + Duration::from_millis(u64::from(*hold_ms));
-                    while Instant::now() < deadline {
+                    // Publish readiness only after the exact epoch baseline is
+                    // captured. The test's release_all trigger may run as soon
+                    // as hold_started becomes visible; publishing first would
+                    // allow that release to land before this snapshot and make
+                    // a real interruption look unobserved.
+                    self.hold_started.store(true, Ordering::Release);
+                    self.hold_ready.notify_one();
+                    // This backend models an in-flight hold that cannot expire
+                    // before the test's release trigger. The 30 s deadline is
+                    // only a fail-loud deadlock backstop; an epoch transition is
+                    // the sole successful completion condition.
+                    let deadlock_deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        // The epoch is the causal verdict. Check it before the
+                        // synthetic hold deadline so scheduler starvation after
+                        // `hold_started` cannot hide a release that already
+                        // happened while this backend was descheduled.
                         if operator_release_requested_since(epoch) {
                             self.release_observed.store(true, Ordering::Release);
                             break;
+                        }
+                        if Instant::now() >= deadlock_deadline {
+                            return Err(ActionError::BackendUnavailable {
+                                detail: "interruptible hold backend did not observe the operator release epoch within the 30 s deadlock backstop".to_owned(),
+                            });
                         }
                         std::thread::sleep(Duration::from_millis(1));
                     }

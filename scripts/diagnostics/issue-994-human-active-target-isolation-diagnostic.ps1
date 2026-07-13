@@ -1,3 +1,8 @@
+# Supporting diagnostic only. Its output is supporting diagnostic evidence only.
+# This script does not perform or accept Full State Verification (FSV). Under
+# AGENTS.md D1, an agent must perform FSV manually
+# through the strict production MCP client and independently read each physical
+# Source of Truth before and after the trigger.
 param(
     [string]$Bind = '127.0.0.1:7700',
     [string]$TokenPath = "$env:APPDATA\synapse\token.txt"
@@ -6,7 +11,7 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-function Die($Message) { throw "[issue994-fsv] $Message" }
+function Die($Message) { throw "[issue994-diagnostic] $Message" }
 
 function Assert-True {
     param([bool]$Condition, [string]$Message)
@@ -310,9 +315,9 @@ try {
     $markerA = "$marker-A"
     $markerB = "$marker-B"
 
-    $observer = Open-McpSession -Bind $Bind -Token $token -Name 'issue994-fsv-observer'
-    $sessionA = Open-McpSession -Bind $Bind -Token $token -Name 'issue994-fsv-session-a'
-    $sessionB = Open-McpSession -Bind $Bind -Token $token -Name 'issue994-fsv-session-b'
+    $observer = Open-McpSession -Bind $Bind -Token $token -Name 'issue994-diagnostic-observer'
+    $sessionA = Open-McpSession -Bind $Bind -Token $token -Name 'issue994-diagnostic-session-a'
+    $sessionB = Open-McpSession -Bind $Bind -Token $token -Name 'issue994-diagnostic-session-b'
 
     $health = Invoke-McpTool -Bind $Bind -Token $token -SessionId $observer -NextId ([ref]$nextO) -Name 'health' -Arguments @{} -TimeoutSec 30
     Assert-True ([bool]$health.ok) 'health not ok'

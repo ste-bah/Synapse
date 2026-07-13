@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-12-evaluate-timeout-v1";
-const BRIDGE_DECLARED_BUILD_SHA256 = "25af9fe2d52245ee4d52ab89e580914ca65a0a8564c9696ff6c7b964d9cb165c";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-13-operator-panic-continuity-v3";
+const BRIDGE_DECLARED_BUILD_SHA256 = "4a095150e0cec67ef71fff0d5f28cf17754f9a42d1e1ac34e51ef0df1105b8fb";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -51,6 +51,11 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "exposeBinding",
   "handleDialog",
   "fileUpload",
+  "operatorPanicDisable",
+  "operatorPanicCleanup",
+  "operatorPanicCloseTab",
+  "operatorPanicReadback",
+  "operatorPanicEnable",
   "cdpInput",
   "viewportEmulation",
   "deviceEmulation",
@@ -122,6 +127,7 @@ const EXTERNAL_POPUP_RISK_PERMISSIONS = Object.freeze(["debugger", "nativeMessag
 const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
 const VIEWPORT_BASELINE_BY_TAB = new Map();
 const DEVICE_BASELINE_BY_TAB = new Map();
+const GEOLOCATION_OVERRIDE_BY_TAB = new Map();
 const LOCALE_BASELINE_BY_TAB = new Map();
 const MEDIA_BASELINE_BY_TAB = new Map();
 const NETWORK_BASELINE_BY_TAB = new Map();
@@ -129,6 +135,38 @@ const INIT_SCRIPT_DEBUGGER_SESSIONS = new Map();
 const BINDING_DEBUGGER_SESSIONS = new Map();
 const DIALOG_DEBUGGER_SESSIONS = new Map();
 const FILE_CHOOSER_DEBUGGER_SESSIONS = new Map();
+const CLOCK_INSTALLED_TABS = new Set();
+const DIALOG_AUTO_HANDLE_IN_FLIGHT = new Set();
+let DURABLE_MUTATION_OWNERS_ENABLED = true;
+let DURABLE_MUTATION_DISABLE_SEQUENCE = 0;
+let COMMAND_EXECUTION_TAIL = Promise.resolve();
+let COMMAND_ACTIVITY_SEQUENCE = 0;
+let BACKGROUND_MUTATION_SEQUENCE = 0;
+let COMMAND_LAST_COMPLETED_SEQUENCE = 0;
+let COMMAND_IN_FLIGHT_COUNT = 0;
+let MUTATION_HANDLER_IN_FLIGHT_COUNT = 0;
+let MUTATION_HANDLER_STARTED_COUNT = 0;
+let MUTATION_HANDLER_COMPLETED_COUNT = 0;
+let DEBUGGER_COMMAND_TIMEOUT_SEQUENCE = 0;
+let ACTIVE_COMMAND_MUTATION_CONTEXT = null;
+let IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT = 0;
+let OPERATOR_PANIC_DISABLE_ADMISSION_TAIL = Promise.resolve();
+let DURABLE_OWNER_PERSIST_TAIL = Promise.resolve();
+const DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV2";
+const LEGACY_DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV1";
+const DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY =
+  "synapseOperatorPanicBrowserSessionTokenV1";
+const DURABLE_OWNER_WORKER_BOOT_ID = typeof globalThis.crypto?.randomUUID === "function"
+  ? globalThis.crypto.randomUUID()
+  : `worker-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+let DURABLE_OWNER_STATE_LOADED = false;
+let DURABLE_OWNER_STATE_LOAD_ERROR = null;
+let DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = null;
+let DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
+let STALE_BROWSER_SESSION_OWNER_COUNT = 0;
+let UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
+let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
+const DURABLE_OWNER_STATE_READY = restoreDurableOwnerLedger();
 
 let hostId = null;
 let bridgeToken = null;
@@ -779,7 +817,754 @@ async function handleWebSocketMessage(raw) {
     throw new Error(`daemon websocket refused command delivery: ${JSON.stringify(message)}`);
   }
   if (message?.command) {
-    await handleCommand(message.command);
+    await enqueueCommand(message.command);
+  }
+}
+
+function enqueueCommand(command) {
+  if (String(command?.kind || "") === "operatorPanicDisable") {
+    return enqueueImmediateOperatorPanicDisable(command);
+  }
+  const queued = COMMAND_EXECUTION_TAIL.then(
+    () => handleTrackedCommand(command),
+    () => handleTrackedCommand(command)
+  );
+  // Keep the queue usable after a command-level failure. handleCommand normally
+  // converts failures into responses, but this also covers postResponse errors.
+  COMMAND_EXECUTION_TAIL = queued.catch(() => undefined);
+  return queued;
+}
+
+function enqueueImmediateOperatorPanicDisable(command) {
+  IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT += 1;
+  DURABLE_MUTATION_OWNERS_ENABLED = false;
+  const admit = async () => {
+    try {
+      await DURABLE_OWNER_STATE_READY;
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      DURABLE_MUTATION_DISABLE_SEQUENCE += 1;
+      try {
+        await persistDurableOwnerLedger({ mergeLiveOwners: true });
+      } catch (error) {
+        DURABLE_OWNER_STATE_LOAD_ERROR =
+          `persist immediate operator panic disable failed: ${errorMessage(error)}`;
+        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+      }
+      return DURABLE_MUTATION_DISABLE_SEQUENCE;
+    } finally {
+      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT = Math.max(
+        0,
+        IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT - 1
+      );
+    }
+  };
+  const admission = OPERATOR_PANIC_DISABLE_ADMISSION_TAIL.then(admit, admit);
+  OPERATOR_PANIC_DISABLE_ADMISSION_TAIL = admission.catch(() => undefined);
+  command.__operatorPanicDisableAdmission = admission;
+  return admission.then(
+    () => handleCommand(command),
+    () => handleCommand(command)
+  );
+}
+
+function emptyDurableOwnerLedger() {
+  return {
+    version: 2,
+    revision: 0,
+    browserSessionId: "",
+    enabled: true,
+    disableSequence: 0,
+    inFlightMutation: null,
+    openedTabs: [],
+    initScripts: [],
+    bindings: [],
+    debuggerTabs: [],
+    unresolvedDebuggerCommandTimeouts: [],
+    dialogTabs: [],
+    fileChooserTabs: [],
+    clockTabs: [],
+    executedInitScriptEffects: [],
+    viewportOverrides: [],
+    deviceOverrides: [],
+    geolocationOverrides: [],
+    localeOverrides: [],
+    mediaOverrides: [],
+    networkOverrides: []
+  };
+}
+
+function normalizeStoredTabId(value) {
+  const tabId = Number(value);
+  return Number.isSafeInteger(tabId) && tabId >= 0 ? tabId : null;
+}
+
+function normalizeDurableOwnerLedger(value) {
+  if (value === undefined) {
+    return emptyDurableOwnerLedger();
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("durable owner ledger is not an object");
+  }
+  const source = value;
+  if (source.version !== 2) {
+    throw new Error(`durable owner ledger version is unsupported: ${String(source.version)}`);
+  }
+  if (typeof source.enabled !== "boolean") {
+    throw new Error("durable owner ledger enabled flag is not boolean");
+  }
+  if (!Number.isSafeInteger(source.revision) || source.revision < 0) {
+    throw new Error("durable owner ledger revision is not a non-negative safe integer");
+  }
+  if (!Number.isSafeInteger(source.disableSequence) || source.disableSequence < 0) {
+    throw new Error("durable owner ledger disable sequence is not a non-negative safe integer");
+  }
+  if (typeof source.browserSessionId !== "string" || !source.browserSessionId.trim()) {
+    throw new Error("durable owner ledger browser session id is missing");
+  }
+  for (const field of [
+    "initScripts",
+    "openedTabs",
+    "bindings",
+    "debuggerTabs",
+    "unresolvedDebuggerCommandTimeouts",
+    "dialogTabs",
+    "fileChooserTabs",
+    "clockTabs",
+    "executedInitScriptEffects",
+    "viewportOverrides",
+    "deviceOverrides",
+    "geolocationOverrides",
+    "localeOverrides",
+    "mediaOverrides",
+    "networkOverrides"
+  ]) {
+    if (!Array.isArray(source[field])) {
+      throw new Error(`durable owner ledger ${field} is not an array`);
+    }
+  }
+  if (source.inFlightMutation !== null &&
+      (!source.inFlightMutation || typeof source.inFlightMutation !== "object" ||
+       Array.isArray(source.inFlightMutation))) {
+    throw new Error("durable owner ledger in-flight mutation is malformed");
+  }
+  const ledger = emptyDurableOwnerLedger();
+  ledger.revision = source.revision;
+  ledger.browserSessionId = source.browserSessionId.trim();
+  ledger.enabled = source.enabled;
+  ledger.disableSequence = source.disableSequence;
+  if (source.inFlightMutation) {
+    const activitySequence = source.inFlightMutation.activitySequence;
+    const id = String(source.inFlightMutation.id || "").trim();
+    const kind = String(source.inFlightMutation.kind || "").trim();
+    const workerBootId = String(source.inFlightMutation.workerBootId || "").trim();
+    if (!id || !kind || !workerBootId ||
+        !Number.isSafeInteger(activitySequence) || activitySequence <= 0) {
+      throw new Error("durable owner ledger in-flight mutation fields are malformed");
+    }
+    ledger.inFlightMutation = { id, kind, activitySequence, workerBootId };
+  }
+  const initKeys = new Set();
+  for (const entry of source.initScripts) {
+    const tabId = normalizeStoredTabId(entry?.tabId);
+    const identifier = String(entry?.identifier || "").trim();
+    if (tabId === null || !identifier) {
+      throw new Error("durable owner ledger init-script row is malformed");
+    }
+    const key = `${tabId}\n${identifier}`;
+    if (!initKeys.has(key)) {
+      initKeys.add(key);
+      ledger.initScripts.push({ tabId, identifier });
+    }
+  }
+  const bindingKeys = new Set();
+  for (const entry of source.bindings) {
+    const tabId = normalizeStoredTabId(entry?.tabId);
+    const name = String(entry?.name || "").trim();
+    if (tabId === null || !name) {
+      throw new Error("durable owner ledger binding row is malformed");
+    }
+    const key = `${tabId}\n${name}`;
+    if (!bindingKeys.has(key)) {
+      bindingKeys.add(key);
+      ledger.bindings.push({ tabId, name });
+    }
+  }
+  const debuggerTabIds = source.debuggerTabs.map(normalizeStoredTabId);
+  if (debuggerTabIds.some((tabId) => tabId === null)) {
+    throw new Error("durable owner ledger debuggerTabs contains an invalid tab id");
+  }
+  ledger.debuggerTabs = Array.from(new Set(debuggerTabIds));
+  const timeoutIds = new Set();
+  for (const entry of source.unresolvedDebuggerCommandTimeouts) {
+    const id = String(entry?.id || "").trim();
+    const tabId = normalizeStoredTabId(entry?.tabId);
+    const method = String(entry?.method || "").trim();
+    const workerBootId = String(entry?.workerBootId || "").trim();
+    const activitySequence = entry?.activitySequence;
+    const timedOutAtUnixMs = entry?.timedOutAtUnixMs;
+    if (!id || tabId === null || !method || !workerBootId ||
+        !Number.isSafeInteger(activitySequence) || activitySequence <= 0 ||
+        !Number.isSafeInteger(timedOutAtUnixMs) || timedOutAtUnixMs <= 0) {
+      throw new Error("durable owner ledger debugger-command timeout row is malformed");
+    }
+    if (!timeoutIds.has(id)) {
+      timeoutIds.add(id);
+      ledger.unresolvedDebuggerCommandTimeouts.push({
+        id,
+        tabId,
+        method,
+        activitySequence,
+        workerBootId,
+        timedOutAtUnixMs,
+        neutralizationMethod: typeof entry?.neutralizationMethod === "string"
+          ? entry.neutralizationMethod
+          : null
+      });
+    }
+  }
+  const openedTabsById = new Map();
+  for (const entry of source.openedTabs) {
+    const tabId = normalizeStoredTabId(entry?.tabId);
+    const targetId = String(entry?.targetId || "").trim();
+    const expectedTargetId = tabId === null ? "" : targetIdForTabId(tabId);
+    if (tabId === null || targetId !== expectedTargetId) {
+      throw new Error("durable owner ledger opened-tab row is malformed");
+    }
+    openedTabsById.set(tabId, {
+      tabId,
+      targetId,
+      chromeWindowId: Number.isSafeInteger(entry?.chromeWindowId)
+        ? entry.chromeWindowId
+        : null,
+      openedAtUnixMs: Number.isSafeInteger(entry?.openedAtUnixMs)
+        ? Math.max(0, entry.openedAtUnixMs)
+        : 0
+    });
+  }
+  ledger.openedTabs = Array.from(openedTabsById.values());
+  for (const field of ["dialogTabs", "fileChooserTabs", "clockTabs"]) {
+    const normalized = source[field].map(normalizeStoredTabId);
+    if (normalized.some((tabId) => tabId === null)) {
+      throw new Error(`durable owner ledger ${field} contains an invalid tab id`);
+    }
+    ledger[field] = Array.from(new Set(normalized));
+  }
+  for (const field of [
+    "viewportOverrides",
+    "deviceOverrides",
+    "geolocationOverrides",
+    "localeOverrides",
+    "mediaOverrides",
+    "networkOverrides"
+  ]) {
+    const byTab = new Map();
+    for (const entry of source[field]) {
+      const tabId = normalizeStoredTabId(entry?.tabId);
+      if (tabId === null) {
+        throw new Error(`durable owner ledger ${field} contains a malformed row`);
+      }
+      byTab.set(tabId, { ...entry, tabId });
+    }
+    ledger[field] = Array.from(byTab.values());
+  }
+  const effectKeys = new Set();
+  for (const entry of source.executedInitScriptEffects) {
+    const tabId = normalizeStoredTabId(entry?.tabId);
+    const identifier = String(entry?.identifier || "").trim();
+    if (tabId === null || !identifier) {
+      throw new Error("durable owner ledger executed init-script row is malformed");
+    }
+    const key = `${tabId}\n${identifier}`;
+    if (!effectKeys.has(key)) {
+      effectKeys.add(key);
+      ledger.executedInitScriptEffects.push({ tabId, identifier });
+    }
+  }
+  return ledger;
+}
+
+function durableOwnerRowCount(ledger = DURABLE_OWNER_LEDGER) {
+  return [
+    "openedTabs",
+    "initScripts",
+    "bindings",
+    "debuggerTabs",
+    "unresolvedDebuggerCommandTimeouts",
+    "dialogTabs",
+    "fileChooserTabs",
+    "clockTabs",
+    "executedInitScriptEffects",
+    "viewportOverrides",
+    "deviceOverrides",
+    "geolocationOverrides",
+    "localeOverrides",
+    "mediaOverrides",
+    "networkOverrides"
+  ].reduce((count, field) => count + ledger[field].length, 0);
+}
+
+function newDurableOwnerBrowserSessionId() {
+  return typeof globalThis.crypto?.randomUUID === "function"
+    ? globalThis.crypto.randomUUID()
+    : `browser-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function restoreDurableOwnerLedger() {
+  try {
+    if (!chrome.storage?.local || !chrome.storage?.session) {
+      throw new Error("chrome.storage.local/session are required for durable owner continuity");
+    }
+    const [localStored, sessionStored] = await Promise.all([
+      chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY),
+      chrome.storage.session.get([
+        DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY,
+        LEGACY_DURABLE_OWNER_STORAGE_KEY
+      ])
+    ]);
+    const hasLocalLedger = Object.prototype.hasOwnProperty.call(
+      localStored || {},
+      DURABLE_OWNER_STORAGE_KEY
+    );
+    const storedBrowserSessionId = typeof sessionStored?.[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]
+      === "string"
+      ? sessionStored[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY].trim()
+      : "";
+    if (!hasLocalLedger && sessionStored?.[LEGACY_DURABLE_OWNER_STORAGE_KEY] !== undefined) {
+      throw new Error(
+        "legacy session-only durable owner ledger is present; refusing to claim continuity after storage migration"
+      );
+    }
+    if (!hasLocalLedger) {
+      if (storedBrowserSessionId) {
+        throw new Error(
+          "durable local owner ledger is missing while the current browser-session token exists"
+        );
+      }
+      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
+      DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
+      DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
+      await chrome.storage.session.set({
+        [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
+          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
+      });
+      await persistDurableOwnerLedger();
+    } else {
+      DURABLE_OWNER_LEDGER = normalizeDurableOwnerLedger(
+        localStored[DURABLE_OWNER_STORAGE_KEY]
+      );
+      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID =
+        storedBrowserSessionId || newDurableOwnerBrowserSessionId();
+      if (!storedBrowserSessionId) {
+        await chrome.storage.session.set({
+          [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
+            DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
+        });
+      }
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED =
+        DURABLE_OWNER_LEDGER.browserSessionId ===
+          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+      const staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
+        (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
+      if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED && staleOwners === 0) {
+        DURABLE_OWNER_LEDGER.browserSessionId =
+          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
+        DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
+        await persistDurableOwnerLedger();
+      } else if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
+        STALE_BROWSER_SESSION_OWNER_COUNT = staleOwners;
+        DURABLE_MUTATION_OWNERS_ENABLED = false;
+        DURABLE_OWNER_LEDGER.enabled = false;
+        DURABLE_OWNER_STATE_LOAD_ERROR =
+          "durable owners belong to a prior browser session; stale tab ids will not be mutated";
+      }
+    }
+    DURABLE_MUTATION_OWNERS_ENABLED = DURABLE_OWNER_LEDGER.enabled &&
+      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0;
+    DURABLE_MUTATION_DISABLE_SEQUENCE = DURABLE_OWNER_LEDGER.disableSequence;
+    if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
+      for (const tabId of DURABLE_OWNER_LEDGER.clockTabs) {
+        CLOCK_INSTALLED_TABS.add(tabId);
+      }
+    }
+    if (DURABLE_OWNER_LEDGER.inFlightMutation) {
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      DURABLE_OWNER_LEDGER.enabled = false;
+      if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
+        await persistDurableOwnerLedger({ mergeLiveOwners: true });
+      }
+    }
+    DURABLE_OWNER_STATE_LOADED = true;
+  } catch (error) {
+    DURABLE_OWNER_STATE_LOAD_ERROR = errorMessage(error);
+    DURABLE_MUTATION_OWNERS_ENABLED = false;
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+  }
+}
+
+function mergeLiveOwnersIntoDurableLedger() {
+  const initScripts = new Map(
+    DURABLE_OWNER_LEDGER.initScripts.map((entry) => [`${entry.tabId}\n${entry.identifier}`, entry])
+  );
+  for (const [tabId, session] of INIT_SCRIPT_DEBUGGER_SESSIONS.entries()) {
+    for (const identifier of Array.from(session?.identifiers || [])) {
+      initScripts.set(`${tabId}\n${identifier}`, { tabId, identifier: String(identifier) });
+    }
+  }
+  DURABLE_OWNER_LEDGER.initScripts = Array.from(initScripts.values());
+  const bindings = new Map(
+    DURABLE_OWNER_LEDGER.bindings.map((entry) => [`${entry.tabId}\n${entry.name}`, entry])
+  );
+  for (const [tabId, session] of BINDING_DEBUGGER_SESSIONS.entries()) {
+    for (const name of Array.from(session?.activeNames || [])) {
+      bindings.set(`${tabId}\n${name}`, { tabId, name: String(name) });
+    }
+  }
+  DURABLE_OWNER_LEDGER.bindings = Array.from(bindings.values());
+  DURABLE_OWNER_LEDGER.debuggerTabs = Array.from(new Set([
+    ...DURABLE_OWNER_LEDGER.debuggerTabs,
+    ...Array.from(INIT_SCRIPT_DEBUGGER_SESSIONS.keys()),
+    ...Array.from(BINDING_DEBUGGER_SESSIONS.entries())
+      .filter(([, session]) => session?.attached)
+      .map(([tabId]) => tabId),
+    ...Array.from(DIALOG_DEBUGGER_SESSIONS.entries())
+      .filter(([, session]) => session?.attached)
+      .map(([tabId]) => tabId),
+    ...Array.from(FILE_CHOOSER_DEBUGGER_SESSIONS.entries())
+      .filter(([, session]) => session?.attached)
+      .map(([tabId]) => tabId)
+  ]));
+  DURABLE_OWNER_LEDGER.dialogTabs = Array.from(new Set([
+    ...DURABLE_OWNER_LEDGER.dialogTabs,
+    ...Array.from(DIALOG_DEBUGGER_SESSIONS.entries())
+      .filter(([, session]) => session?.defaultPolicy !== "manual")
+      .map(([tabId]) => tabId)
+  ]));
+  DURABLE_OWNER_LEDGER.fileChooserTabs = Array.from(new Set([
+    ...DURABLE_OWNER_LEDGER.fileChooserTabs,
+    ...Array.from(FILE_CHOOSER_DEBUGGER_SESSIONS.entries())
+      .filter(([, session]) => session?.interceptEnabled)
+      .map(([tabId]) => tabId)
+  ]));
+  DURABLE_OWNER_LEDGER.clockTabs = Array.from(new Set([
+    ...DURABLE_OWNER_LEDGER.clockTabs,
+    ...CLOCK_INSTALLED_TABS
+  ]));
+  const mergeOverrideMap = (field, map, valueName = "baseline") => {
+    const byTab = new Map(DURABLE_OWNER_LEDGER[field].map((entry) => [entry.tabId, entry]));
+    for (const [tabId, value] of map.entries()) {
+      byTab.set(tabId, { tabId, [valueName]: value });
+    }
+    DURABLE_OWNER_LEDGER[field] = Array.from(byTab.values());
+  };
+  mergeOverrideMap("viewportOverrides", VIEWPORT_BASELINE_BY_TAB);
+  mergeOverrideMap("deviceOverrides", DEVICE_BASELINE_BY_TAB);
+  mergeOverrideMap("geolocationOverrides", GEOLOCATION_OVERRIDE_BY_TAB, "origin");
+  mergeOverrideMap("localeOverrides", LOCALE_BASELINE_BY_TAB);
+  mergeOverrideMap("mediaOverrides", MEDIA_BASELINE_BY_TAB);
+  mergeOverrideMap("networkOverrides", NETWORK_BASELINE_BY_TAB);
+  const effectKeys = new Set(
+    DURABLE_OWNER_LEDGER.executedInitScriptEffects
+      .map((entry) => `${entry.tabId}\n${entry.identifier}`)
+  );
+  for (const entry of DURABLE_OWNER_LEDGER.initScripts) {
+    const key = `${entry.tabId}\n${entry.identifier}`;
+    if (!effectKeys.has(key)) {
+      effectKeys.add(key);
+      DURABLE_OWNER_LEDGER.executedInitScriptEffects.push({ ...entry });
+    }
+  }
+}
+
+async function persistDurableOwnerLedger({ mergeLiveOwners = false } = {}) {
+  if (mergeLiveOwners) {
+    mergeLiveOwnersIntoDurableLedger();
+  }
+  DURABLE_OWNER_LEDGER.enabled = DURABLE_MUTATION_OWNERS_ENABLED;
+  DURABLE_OWNER_LEDGER.disableSequence = DURABLE_MUTATION_DISABLE_SEQUENCE;
+  DURABLE_OWNER_LEDGER.revision += 1;
+  const snapshot = typeof globalThis.structuredClone === "function"
+    ? globalThis.structuredClone(DURABLE_OWNER_LEDGER)
+    : JSON.parse(JSON.stringify(DURABLE_OWNER_LEDGER));
+  const write = () => chrome.storage.local.set({
+    [DURABLE_OWNER_STORAGE_KEY]: snapshot
+  });
+  const persisted = DURABLE_OWNER_PERSIST_TAIL.then(write, write);
+  DURABLE_OWNER_PERSIST_TAIL = persisted.catch(() => undefined);
+  await persisted;
+}
+
+async function beginPersistedMutationCommand(command, activitySequence) {
+  DURABLE_OWNER_LEDGER.inFlightMutation = {
+    id: String(command?.id || ""),
+    kind: String(command?.kind || ""),
+    activitySequence,
+    workerBootId: DURABLE_OWNER_WORKER_BOOT_ID
+  };
+  await persistDurableOwnerLedger({ mergeLiveOwners: true });
+}
+
+async function finishPersistedMutationCommand() {
+  DURABLE_OWNER_LEDGER.inFlightMutation = null;
+  await persistDurableOwnerLedger({ mergeLiveOwners: true });
+}
+
+function upsertLedgerOpenedTab(tab) {
+  DURABLE_OWNER_LEDGER.openedTabs = DURABLE_OWNER_LEDGER.openedTabs
+    .filter((entry) => entry.tabId !== tab.tabId);
+  DURABLE_OWNER_LEDGER.openedTabs.push(tab);
+}
+
+function removeLedgerOpenedTab(tabId) {
+  DURABLE_OWNER_LEDGER.openedTabs = DURABLE_OWNER_LEDGER.openedTabs
+    .filter((entry) => entry.tabId !== tabId);
+}
+
+async function recordLedgerDebuggerTab(tabId) {
+  if (DURABLE_OWNER_LEDGER.debuggerTabs.includes(tabId)) {
+    return;
+  }
+  DURABLE_OWNER_LEDGER.debuggerTabs.push(tabId);
+  await persistDurableOwnerLedger({ mergeLiveOwners: true });
+}
+
+function removeLedgerBinding(tabId, name) {
+  DURABLE_OWNER_LEDGER.bindings = DURABLE_OWNER_LEDGER.bindings.filter(
+    (entry) => entry.tabId !== tabId || entry.name !== name
+  );
+}
+
+function pruneDurableOwnerLedgerForClosedTab(tabId) {
+  INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
+  BINDING_DEBUGGER_SESSIONS.delete(tabId);
+  DIALOG_DEBUGGER_SESSIONS.delete(tabId);
+  FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
+  CLOCK_INSTALLED_TABS.delete(tabId);
+  VIEWPORT_BASELINE_BY_TAB.delete(tabId);
+  DEVICE_BASELINE_BY_TAB.delete(tabId);
+  GEOLOCATION_OVERRIDE_BY_TAB.delete(tabId);
+  LOCALE_BASELINE_BY_TAB.delete(tabId);
+  MEDIA_BASELINE_BY_TAB.delete(tabId);
+  NETWORK_BASELINE_BY_TAB.delete(tabId);
+  removeLedgerOpenedTab(tabId);
+  DURABLE_OWNER_LEDGER.initScripts = DURABLE_OWNER_LEDGER.initScripts
+    .filter((entry) => entry.tabId !== tabId);
+  DURABLE_OWNER_LEDGER.bindings = DURABLE_OWNER_LEDGER.bindings
+    .filter((entry) => entry.tabId !== tabId);
+  DURABLE_OWNER_LEDGER.debuggerTabs = DURABLE_OWNER_LEDGER.debuggerTabs
+    .filter((candidate) => candidate !== tabId);
+  DURABLE_OWNER_LEDGER.executedInitScriptEffects =
+    DURABLE_OWNER_LEDGER.executedInitScriptEffects.filter((entry) => entry.tabId !== tabId);
+  DURABLE_OWNER_LEDGER.dialogTabs = DURABLE_OWNER_LEDGER.dialogTabs
+    .filter((candidate) => candidate !== tabId);
+  DURABLE_OWNER_LEDGER.fileChooserTabs = DURABLE_OWNER_LEDGER.fileChooserTabs
+    .filter((candidate) => candidate !== tabId);
+  DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
+    .filter((candidate) => candidate !== tabId);
+  for (const field of [
+    "viewportOverrides",
+    "deviceOverrides",
+    "geolocationOverrides",
+    "localeOverrides",
+    "mediaOverrides",
+    "networkOverrides"
+  ]) {
+    removeLedgerOverride(field, tabId);
+  }
+}
+
+function enqueueClosedTabLedgerPrune(tabId) {
+  const queued = COMMAND_EXECUTION_TAIL.then(async () => {
+    await DURABLE_OWNER_STATE_READY;
+    pruneDurableOwnerLedgerForClosedTab(tabId);
+    try {
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    } catch (error) {
+      DURABLE_OWNER_STATE_LOAD_ERROR = `persist closed-tab owner prune failed: ${errorMessage(error)}`;
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+    }
+  });
+  COMMAND_EXECUTION_TAIL = queued.catch(() => undefined);
+}
+
+function enqueueInitScriptEffectNavigationReconcile(tabId) {
+  const queued = COMMAND_EXECUTION_TAIL.then(async () => {
+    await DURABLE_OWNER_STATE_READY;
+    mergeLiveOwnersIntoDurableLedger();
+    const registered = new Set(
+      DURABLE_OWNER_LEDGER.initScripts
+        .filter((entry) => entry.tabId === tabId)
+        .map((entry) => entry.identifier)
+    );
+    DURABLE_OWNER_LEDGER.executedInitScriptEffects =
+      DURABLE_OWNER_LEDGER.executedInitScriptEffects.filter(
+        (entry) => entry.tabId !== tabId || registered.has(entry.identifier)
+      );
+    try {
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    } catch (error) {
+      DURABLE_OWNER_STATE_LOAD_ERROR =
+        `persist init-script navigation reconciliation failed: ${errorMessage(error)}`;
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+    }
+  });
+  COMMAND_EXECUTION_TAIL = queued.catch(() => undefined);
+}
+
+function enqueuePersistedBackgroundMutation(kind, operation) {
+  const backgroundSequence = ++BACKGROUND_MUTATION_SEQUENCE;
+  const command = {
+    id: `background:${String(kind)}:${DURABLE_OWNER_WORKER_BOOT_ID}:${backgroundSequence}`,
+    kind: String(kind)
+  };
+  const run = async () => {
+    await DURABLE_OWNER_STATE_READY;
+    const activitySequence = ++COMMAND_ACTIVITY_SEQUENCE;
+    let persistedMutationMarker = false;
+    COMMAND_IN_FLIGHT_COUNT += 1;
+    MUTATION_HANDLER_IN_FLIGHT_COUNT += 1;
+    MUTATION_HANDLER_STARTED_COUNT += 1;
+    try {
+      if (!DURABLE_MUTATION_OWNERS_ENABLED || !DURABLE_OWNER_STATE_LOADED) {
+        throw bridgeError(
+          ERROR_ACTION_TARGET_INVALID,
+          `operator panic disabled background mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; refusing ${String(kind)}`
+        );
+      }
+      try {
+        await beginPersistedMutationCommand(command, activitySequence);
+        persistedMutationMarker = true;
+      } catch (error) {
+        DURABLE_OWNER_STATE_LOAD_ERROR =
+          `persist background mutation admission failed: ${errorMessage(error)}`;
+        DURABLE_MUTATION_OWNERS_ENABLED = false;
+        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+        throw bridgeError(ERROR_ACTION_TARGET_INVALID, DURABLE_OWNER_STATE_LOAD_ERROR);
+      }
+      const previousContext = ACTIVE_COMMAND_MUTATION_CONTEXT;
+      ACTIVE_COMMAND_MUTATION_CONTEXT = {
+        kind: String(kind),
+        disableSequence: DURABLE_MUTATION_DISABLE_SEQUENCE,
+        activitySequence
+      };
+      try {
+        return await operation();
+      } finally {
+        ACTIVE_COMMAND_MUTATION_CONTEXT = previousContext;
+      }
+    } finally {
+      if (persistedMutationMarker) {
+        try {
+          await finishPersistedMutationCommand();
+        } catch (error) {
+          DURABLE_OWNER_STATE_LOAD_ERROR =
+            `persist background mutation completion failed: ${errorMessage(error)}`;
+          DURABLE_MUTATION_OWNERS_ENABLED = false;
+          UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+        }
+      }
+      MUTATION_HANDLER_IN_FLIGHT_COUNT = Math.max(0, MUTATION_HANDLER_IN_FLIGHT_COUNT - 1);
+      MUTATION_HANDLER_COMPLETED_COUNT += 1;
+      COMMAND_IN_FLIGHT_COUNT = Math.max(0, COMMAND_IN_FLIGHT_COUNT - 1);
+      COMMAND_LAST_COMPLETED_SEQUENCE = Math.max(COMMAND_LAST_COMPLETED_SEQUENCE, activitySequence);
+    }
+  };
+  const queued = COMMAND_EXECUTION_TAIL.then(run, run);
+  COMMAND_EXECUTION_TAIL = queued.catch(() => undefined);
+  return queued;
+}
+
+function isMutationCapableCommand(kind) {
+  return ![
+    "operatorPanicDisable",
+    "operatorPanicCleanup",
+    "operatorPanicCloseTab",
+    "operatorPanicReadback",
+    "operatorPanicEnable",
+    "listTabs"
+  ].includes(String(kind || ""));
+}
+
+function assertPhysicalMutationAdmission(boundary) {
+  const context = ACTIVE_COMMAND_MUTATION_CONTEXT;
+  if (context?.kind === "operatorPanicCleanup" || context?.kind === "operatorPanicCloseTab") {
+    return;
+  }
+  if (!context) {
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      `physical mutation boundary ${boundary} has no serialized command admission context`
+    );
+  }
+  if (!DURABLE_MUTATION_OWNERS_ENABLED ||
+      context.disableSequence !== DURABLE_MUTATION_DISABLE_SEQUENCE) {
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      `operator panic crossed physical mutation boundary ${boundary}: ` +
+        `admitted_disable_sequence=${context.disableSequence} ` +
+        `current_disable_sequence=${DURABLE_MUTATION_DISABLE_SEQUENCE}`
+    );
+  }
+}
+
+async function executeScriptMutation(details, boundary) {
+  assertPhysicalMutationAdmission(`chrome.scripting.executeScript:${boundary}`);
+  return chrome.scripting.executeScript(details);
+}
+
+async function handleTrackedCommand(command) {
+  await DURABLE_OWNER_STATE_READY;
+  const kind = String(command?.kind || "");
+  const mutationCapable = isMutationCapableCommand(kind);
+  const activitySequence = ++COMMAND_ACTIVITY_SEQUENCE;
+  const admittedDisableSequence = DURABLE_MUTATION_DISABLE_SEQUENCE;
+  let persistedMutationMarker = false;
+  COMMAND_IN_FLIGHT_COUNT += 1;
+  if (mutationCapable) {
+    MUTATION_HANDLER_IN_FLIGHT_COUNT += 1;
+    MUTATION_HANDLER_STARTED_COUNT += 1;
+    if (DURABLE_MUTATION_OWNERS_ENABLED && DURABLE_OWNER_STATE_LOADED) {
+      try {
+        await beginPersistedMutationCommand(command, activitySequence);
+        persistedMutationMarker = true;
+      } catch (error) {
+        DURABLE_OWNER_STATE_LOAD_ERROR = `persist mutation admission failed: ${errorMessage(error)}`;
+        DURABLE_MUTATION_OWNERS_ENABLED = false;
+        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+      }
+    }
+  }
+  try {
+    const previousContext = ACTIVE_COMMAND_MUTATION_CONTEXT;
+    ACTIVE_COMMAND_MUTATION_CONTEXT = {
+      kind,
+      disableSequence: admittedDisableSequence,
+      activitySequence
+    };
+    try {
+      await handleCommand(command);
+    } finally {
+      ACTIVE_COMMAND_MUTATION_CONTEXT = previousContext;
+    }
+  } finally {
+    if (persistedMutationMarker) {
+      try {
+        await finishPersistedMutationCommand();
+      } catch (error) {
+        DURABLE_OWNER_STATE_LOAD_ERROR = `persist mutation completion failed: ${errorMessage(error)}`;
+        DURABLE_MUTATION_OWNERS_ENABLED = false;
+        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+      }
+    }
+    if (mutationCapable) {
+      MUTATION_HANDLER_IN_FLIGHT_COUNT = Math.max(0, MUTATION_HANDLER_IN_FLIGHT_COUNT - 1);
+      MUTATION_HANDLER_COMPLETED_COUNT += 1;
+    }
+    COMMAND_IN_FLIGHT_COUNT = Math.max(0, COMMAND_IN_FLIGHT_COUNT - 1);
+    COMMAND_LAST_COMPLETED_SEQUENCE = Math.max(COMMAND_LAST_COMPLETED_SEQUENCE, activitySequence);
   }
 }
 
@@ -969,6 +1754,9 @@ if (chrome.management?.onDisabled?.addListener) {
   chrome.management.onDisabled.addListener(handleManagementStateChanged);
 }
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo?.status === "loading") {
+    enqueueInitScriptEffectNavigationReconcile(tabId);
+  }
   if (!changeInfo?.url && !changeInfo?.title && changeInfo?.status !== "complete") {
     return;
   }
@@ -986,6 +1774,14 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   BINDING_DEBUGGER_SESSIONS.delete(tabId);
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
+  CLOCK_INSTALLED_TABS.delete(tabId);
+  VIEWPORT_BASELINE_BY_TAB.delete(tabId);
+  DEVICE_BASELINE_BY_TAB.delete(tabId);
+  GEOLOCATION_OVERRIDE_BY_TAB.delete(tabId);
+  LOCALE_BASELINE_BY_TAB.delete(tabId);
+  MEDIA_BASELINE_BY_TAB.delete(tabId);
+  NETWORK_BASELINE_BY_TAB.delete(tabId);
+  enqueueClosedTabLedgerPrune(tabId);
 });
 if (chrome.debugger?.onDetach?.addListener) {
   chrome.debugger.onDetach.addListener((source, reason) => {
@@ -1105,7 +1901,16 @@ async function handleCommand(command) {
     let result;
     let reloadAfterResponse = false;
     let closeWebSocketAfterResponse = null;
-    await requireExternalPopupRisksSuppressed(kind, params);
+    if (isMutationCapableCommand(kind) && !DURABLE_MUTATION_OWNERS_ENABLED) {
+      throw bridgeError(
+        ERROR_ACTION_TARGET_INVALID,
+        `operator panic disabled extension mutation admission at sequence ${DURABLE_MUTATION_DISABLE_SEQUENCE}; refusing ${String(kind)}`
+      );
+    }
+    if (!["operatorPanicDisable", "operatorPanicCleanup", "operatorPanicCloseTab", "operatorPanicReadback", "operatorPanicEnable"]
+      .includes(String(kind || ""))) {
+      await requireExternalPopupRisksSuppressed(kind, params);
+    }
     if (kind === "snapshot") {
       result = rejectAttachCommand(kind, params);
     } else if (kind === "clickNode") {
@@ -1201,6 +2006,18 @@ async function handleCommand(command) {
       result = await handleDialog(params);
     } else if (kind === "fileUpload") {
       result = await handleFileUpload(params);
+    } else if (kind === "operatorPanicDisable") {
+      result = await handleOperatorPanicDisable(
+        command.__operatorPanicDisableAdmission
+      );
+    } else if (kind === "operatorPanicCleanup") {
+      result = await handleOperatorPanicCleanup(params);
+    } else if (kind === "operatorPanicCloseTab") {
+      result = await handleOperatorPanicCloseTab(params);
+    } else if (kind === "operatorPanicReadback") {
+      result = operatorPanicOwnerReadback();
+    } else if (kind === "operatorPanicEnable") {
+      result = await handleOperatorPanicEnable(params);
     } else if (kind === "pageVitals") {
       result = await handlePageVitals(params);
     } else if (kind === "navigateTab") {
@@ -1350,6 +2167,7 @@ async function handleOpenTab(params) {
     createParams.windowId = openWindow.windowId;
   }
   try {
+    assertPhysicalMutationAdmission("chrome.tabs.create:openTab");
     tab = await chrome.tabs.create(createParams);
   } catch (error) {
     throw bridgeError(ERROR_AXTREE_FAILED, `chrome.tabs.create(active=false): ${errorMessage(error)}`);
@@ -1357,57 +2175,95 @@ async function handleOpenTab(params) {
   if (!tab || typeof tab.id !== "number") {
     throw bridgeError(ERROR_AXTREE_FAILED, "chrome.tabs.create returned no numeric tab id");
   }
-  markAgentNavigation(tab.id, {
-    action: "open",
-    requestedUrl: requestedUrl || "about:blank",
-    sessionId: agentSessionId
-  });
-  const target = await waitForTabTarget(tab.id, 10000);
-  const state = await tabPageState(tab.id, target);
-  if (
-    Number.isInteger(openWindow?.windowId) &&
-    Number.isInteger(state.chrome_window_id) &&
-    state.chrome_window_id !== openWindow.windowId
-  ) {
+  const openedOwner = {
+    tabId: tab.id,
+    targetId: targetIdForTabId(tab.id),
+    chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
+    openedAtUnixMs: Date.now()
+  };
+  upsertLedgerOpenedTab(openedOwner);
+  try {
+    // Persist the exact tab identity immediately after chrome.tabs.create. The
+    // command's provisional marker is still present, so worker termination at
+    // any later await leaves both the mutation-in-flight marker and, once this
+    // write completes, the concrete tab owner available to panic cleanup.
+    await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    markAgentNavigation(tab.id, {
+      action: "open",
+      requestedUrl: requestedUrl || "about:blank",
+      sessionId: agentSessionId
+    });
+    const target = await waitForTabTarget(tab.id, 10000);
+    const state = await tabPageState(tab.id, target);
+    if (
+      Number.isInteger(openWindow?.windowId) &&
+      Number.isInteger(state.chrome_window_id) &&
+      state.chrome_window_id !== openWindow.windowId
+    ) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `chrome.tabs.create returned tab in Chrome window ${state.chrome_window_id}, expected ${openWindow.windowId}`
+      );
+    }
+    const openedWindow = Number.isInteger(state.chrome_window_id)
+      ? await chromeWindowState(state.chrome_window_id)
+      : null;
+    const afterPages = await tabTargets();
+    return {
+      extension_id: chrome.runtime.id,
+      target_id: target.id,
+      tab_id: tab.id,
+      chrome_window_id: state.chrome_window_id,
+      chrome_window_focused: typeof openedWindow?.focused === "boolean" ? openedWindow.focused : null,
+      chrome_window_state: typeof openedWindow?.state === "string" ? openedWindow.state : "",
+      chrome_window_selection_reason: openWindow?.selectionReason || "default_chrome_tabs_create",
+      chrome_window_candidate_count: openWindow?.candidateCount || 0,
+      chrome_window_non_focused_count: openWindow?.nonFocusedCount || 0,
+      target_active: Boolean(state.active),
+      target_highlighted: Boolean(state.highlighted),
+      target_type: target.type || "page",
+      url: state.url || target.url || tab.url || requestedUrl || "about:blank",
+      title: state.title || target.title || tab.title || "",
+      target_attached: Boolean(target.attached),
+      target_count_before: beforePages.length,
+      target_count_after: afterPages.length
+    };
+  } catch (error) {
+    let rollbackFailure = null;
+    try {
+      try {
+        await chrome.tabs.remove(tab.id);
+      } catch (removeError) {
+        if (!operatorPanicTargetAbsent(removeError)) throw removeError;
+      }
+      await waitForTargetAbsent(openedOwner.targetId, 10000);
+      pruneDurableOwnerLedgerForClosedTab(tab.id);
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    } catch (rollbackError) {
+      rollbackFailure = errorMessage(rollbackError);
+    }
+    if (!rollbackFailure && error?.code) {
+      throw error;
+    }
     throw bridgeError(
       ERROR_AXTREE_FAILED,
-      `chrome.tabs.create returned tab in Chrome window ${state.chrome_window_id}, expected ${openWindow.windowId}`
+      `chrome.tabs.create postcondition failed for owned ${openedOwner.targetId}: ${errorMessage(error)}; ` +
+        `rollback=${rollbackFailure ? `failed: ${rollbackFailure}; durable owner retained for panic cleanup` : "closed and separately read back absent"}`
     );
   }
-  const openedWindow = Number.isInteger(state.chrome_window_id)
-    ? await chromeWindowState(state.chrome_window_id)
-    : null;
-  const afterPages = await tabTargets();
-  return {
-    extension_id: chrome.runtime.id,
-    target_id: target.id,
-    tab_id: tab.id,
-    chrome_window_id: state.chrome_window_id,
-    chrome_window_focused: typeof openedWindow?.focused === "boolean" ? openedWindow.focused : null,
-    chrome_window_state: typeof openedWindow?.state === "string" ? openedWindow.state : "",
-    chrome_window_selection_reason: openWindow?.selectionReason || "default_chrome_tabs_create",
-    chrome_window_candidate_count: openWindow?.candidateCount || 0,
-    chrome_window_non_focused_count: openWindow?.nonFocusedCount || 0,
-    target_active: Boolean(state.active),
-    target_highlighted: Boolean(state.highlighted),
-    target_type: target.type || "page",
-    url: state.url || target.url || tab.url || requestedUrl || "about:blank",
-    title: state.title || target.title || tab.title || "",
-    target_attached: Boolean(target.attached),
-    target_count_before: beforePages.length,
-    target_count_after: afterPages.length
-  };
 }
 
 async function handleCloseTab(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const beforePages = await tabTargets();
   try {
+    assertPhysicalMutationAdmission(`chrome.tabs.remove:closeTab:tab=${selected.tabId}`);
     await chrome.tabs.remove(selected.tabId);
   } catch (error) {
     throw bridgeError(ERROR_AXTREE_FAILED, `chrome.tabs.remove(${selected.tabId}): ${errorMessage(error)}`);
   }
   const afterPages = await waitForTargetAbsent(selected.target.id, 10000);
+  pruneDurableOwnerLedgerForClosedTab(selected.tabId);
   return {
     extension_id: chrome.runtime.id,
     target_id: selected.target.id,
@@ -1555,6 +2411,9 @@ async function handleEvaluateScript(params) {
 async function handleInitScript(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const operation = normalizeInitScriptOperation(params.operation);
+  if (operation === "add" && !DURABLE_MUTATION_OWNERS_ENABLED) {
+    throw bridgeError(ERROR_ACTION_TARGET_INVALID, "operator panic disabled durable init-script installation");
+  }
   const protocolVersion = "1.3";
   let identifier = "";
   let addAttachment = null;
@@ -1590,6 +2449,7 @@ async function handleInitScript(params) {
         throw new Error("Page.addScriptToEvaluateOnNewDocument returned no identifier");
       }
       addAttachment.session.identifiers.add(identifier);
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
     } else {
       identifier = normalizeOptionalNonEmptyString(params.identifier, "identifier");
       if (!identifier) {
@@ -1607,6 +2467,7 @@ async function handleInitScript(params) {
       await sendDebuggerCommand(debuggee, "Page.removeScriptToEvaluateOnNewDocument", {
         identifier
       });
+      removeLedgerInitScript(selected.tabId, identifier);
       if (persistentSession) {
         detachedAfterRemove = await maybeDetachInitScriptDebuggerSession(selected.tabId, debuggee, identifier);
       }
@@ -1695,6 +2556,7 @@ async function handleExposeBinding(params) {
         session = ensured.session;
         await sendDebuggerCommand(ensured.debuggee, "Runtime.removeBinding", { name });
         session.activeNames.delete(name);
+        removeLedgerBinding(selected.tabId, name);
         bindingRemoved = true;
         if (session.activeNames.size === 0 && !hasActiveInitScriptDebuggerSession(selected.tabId)) {
           await detachBindingDebuggerSession(selected.tabId, ensured.debuggee, session);
@@ -1755,6 +2617,9 @@ async function handleDialog(params) {
   const sinceSeq = normalizeOptionalNonNegativeInteger(params.sinceSeq, "sinceSeq");
   const limit = normalizeDialogLimit(params.limit);
   const promptText = normalizeDialogPromptText(params.promptText);
+  if ((operation === "status" || operation === "set_policy") && !DURABLE_MUTATION_OWNERS_ENABLED) {
+    throw bridgeError(ERROR_ACTION_TARGET_INVALID, "operator panic disabled durable dialog policy installation");
+  }
   if (operation === "set_policy" && !policy) {
     throw bridgeError(
       ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
@@ -1779,6 +2644,10 @@ async function handleDialog(params) {
       const ensured = await ensureDialogDebuggerSession(selected.tabId, defaultPolicy);
       session = ensured.session;
       captureNewlyArmed = ensured.newlyArmed;
+      if (session.defaultPolicy === "manual") {
+        DURABLE_OWNER_LEDGER.dialogTabs = DURABLE_OWNER_LEDGER.dialogTabs
+          .filter((tabId) => tabId !== selected.tabId);
+      }
     } else {
       if (!session?.attached) {
         throw bridgeError(
@@ -1993,6 +2862,7 @@ async function handleCookies(params) {
   } else if (operation === "set") {
     const setDetails = cookieSetDetails(params, url);
     try {
+      assertPhysicalMutationAdmission("chrome.cookies.set:cookies");
       const cookie = await chrome.cookies.set(setDetails);
       if (!cookie) {
         throw new Error("chrome.cookies.set returned null");
@@ -2012,6 +2882,7 @@ async function handleCookies(params) {
     const candidates = await chrome.cookies.getAll(details);
     for (const cookie of candidates) {
       try {
+        assertPhysicalMutationAdmission("chrome.cookies.remove:cookies");
         const removed = await chrome.cookies.remove({
           url: cookieRemovalUrl(cookie, url),
           name: cookie.name,
@@ -2101,6 +2972,7 @@ async function handleStorageState(params) {
       for (const cookie of cookies) {
         try {
           const setDetails = cookieSetDetailsFromState(cookie);
+          assertPhysicalMutationAdmission("chrome.cookies.set:storageState");
           const setCookie = await chrome.cookies.set(setDetails);
           if (!setCookie) {
             throw new Error("chrome.cookies.set returned null");
@@ -2116,11 +2988,11 @@ async function handleStorageState(params) {
         }
       }
     }
-    const injected = await chrome.scripting.executeScript({
+    const injected = await executeScriptMutation({
       target: { tabId: selected.tabId },
       func: applyStorageStateInPage,
       args: [stateValue, includeSessionStorage, Boolean(params.clearBeforeLoad)]
-    });
+    }, "storageState:load_state");
     frameResults = frameExecutionResults(injected);
     const first = frameResults.find((frame) => frame.result) || null;
     result = first?.result || null;
@@ -2142,7 +3014,7 @@ async function handleStorageState(params) {
     result.cookie_result = cookieResult;
     result.ok = result.ok && cookieFailures.length === 0;
   } else {
-    const injected = await chrome.scripting.executeScript({
+    const injected = await executeScriptMutation({
       target: { tabId: selected.tabId },
       func: runStorageCommandInPage,
       args: [{
@@ -2281,12 +3153,12 @@ async function executeSetContentScript(selected, html, waitTimeoutMs, agentSessi
 }
 
 async function runSetContentScript(tabId, html, waitTimeoutMs) {
-  return chrome.scripting.executeScript({
+  return executeScriptMutation({
     target: { tabId },
     world: "MAIN",
     func: setContentInPage,
     args: [{ html, waitTimeoutMs }]
-  });
+  }, "setContent");
 }
 
 async function seedTabForSetContent(selected, waitTimeoutMs, agentSessionId, before, cause) {
@@ -2297,6 +3169,7 @@ async function seedTabForSetContent(selected, waitTimeoutMs, agentSessionId, bef
     sessionId: agentSessionId
   });
   try {
+    assertPhysicalMutationAdmission(`chrome.tabs.update:setContentSeed:tab=${selected.tabId}`);
     await chrome.tabs.update(selected.tabId, { url: seedUrl });
   } catch (error) {
     throw bridgeError(
@@ -3014,6 +3887,9 @@ async function handleWaitForSelector(params) {
 async function handleClock(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const operation = normalizeClockOperation(params.operation);
+  if (operation !== "status" && operation !== "uninstall" && !DURABLE_MUTATION_OWNERS_ENABLED) {
+    throw bridgeError(ERROR_ACTION_TARGET_INVALID, "operator panic disabled durable browser clock mutation");
+  }
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_AXTREE_FAILED,
@@ -3023,7 +3899,7 @@ async function handleClock(params) {
   const state = await tabPageState(selected.tabId, selected.target);
   let injected;
   try {
-    injected = await chrome.scripting.executeScript({
+    injected = await executeScriptMutation({
       target: { tabId: selected.tabId },
       world: "MAIN",
       func: runClockInPage,
@@ -3033,7 +3909,7 @@ async function handleClock(params) {
         deltaMs: params.deltaMs ?? null,
         loopLimit: 10000
       }]
-    });
+    }, `clock:${operation}`);
   } catch (error) {
     throw bridgeError(
       ERROR_AXTREE_FAILED,
@@ -3051,6 +3927,13 @@ async function handleClock(params) {
       String(result.error_code || ERROR_AXTREE_FAILED),
       `clock failed: ${String(result.error_detail || "")}`
     );
+  }
+  if (operation === "install") {
+    CLOCK_INSTALLED_TABS.add(selected.tabId);
+  } else if (operation === "uninstall") {
+    CLOCK_INSTALLED_TABS.delete(selected.tabId);
+    DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
+      .filter((tabId) => tabId !== selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -4484,6 +5367,7 @@ async function createDomActionPopupTabs(selected, beforeState, actionResult) {
     }
     let tab;
     try {
+      assertPhysicalMutationAdmission("chrome.tabs.create:domActionPopup");
       tab = await chrome.tabs.create(createParams);
     } catch (error) {
       throw bridgeError(
@@ -4497,34 +5381,65 @@ async function createDomActionPopupTabs(selected, beforeState, actionResult) {
         `domAction popup intent create returned no numeric tab id kind=${intent.kind} opener_tab_id=${selected.tabId}`
       );
     }
-    const target = await waitForTabTarget(tab.id, 10000);
-    const state = await tabPageState(tab.id, target);
-    pushPageEvent(selected.tabId, {
-      event_kind: "page_created",
-      target_id: selected.target.id,
-      target_type: "page",
-      target_attached: false,
-      page_target_id: target.id,
-      opener_id: selected.target.id,
-      can_access_opener: true,
-      url: state.url || target.url || tab.url || createParams.url,
-      title: state.title || target.title || tab.title || "",
-      observed_at_unix_ms: Date.now()
-    });
-    created.push({
-      kind: intent.kind,
-      opener_tab_id: selected.tabId,
-      tab_id: tab.id,
-      target_id: target.id,
-      chrome_window_id: state.chrome_window_id,
-      url: state.url || target.url || tab.url || createParams.url,
-      title: state.title || target.title || tab.title || "",
-      target_attached: Boolean(target.attached),
-      active: Boolean(state.active),
-      highlighted: Boolean(state.highlighted),
-      source_opened_by_browser: Boolean(intent.opened),
-      source_was_blocked: intent.opened === false
-    });
+    const openedOwner = {
+      tabId: tab.id,
+      targetId: targetIdForTabId(tab.id),
+      chromeWindowId: Number.isInteger(tab.windowId) ? tab.windowId : null,
+      openedAtUnixMs: Date.now()
+    };
+    upsertLedgerOpenedTab(openedOwner);
+    try {
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+      const target = await waitForTabTarget(tab.id, 10000);
+      const state = await tabPageState(tab.id, target);
+      pushPageEvent(selected.tabId, {
+        event_kind: "page_created",
+        target_id: selected.target.id,
+        target_type: "page",
+        target_attached: false,
+        page_target_id: target.id,
+        opener_id: selected.target.id,
+        can_access_opener: true,
+        url: state.url || target.url || tab.url || createParams.url,
+        title: state.title || target.title || tab.title || "",
+        observed_at_unix_ms: Date.now()
+      });
+      created.push({
+        kind: intent.kind,
+        opener_tab_id: selected.tabId,
+        tab_id: tab.id,
+        target_id: target.id,
+        chrome_window_id: state.chrome_window_id,
+        url: state.url || target.url || tab.url || createParams.url,
+        title: state.title || target.title || tab.title || "",
+        target_attached: Boolean(target.attached),
+        active: Boolean(state.active),
+        highlighted: Boolean(state.highlighted),
+        source_opened_by_browser: Boolean(intent.opened),
+        source_was_blocked: intent.opened === false
+      });
+    } catch (error) {
+      let rollbackFailure = null;
+      try {
+        try {
+          await chrome.tabs.remove(tab.id);
+        } catch (removeError) {
+          if (!operatorPanicTargetAbsent(removeError)) throw removeError;
+        }
+        await waitForTargetAbsent(openedOwner.targetId, 10000);
+        pruneDurableOwnerLedgerForClosedTab(tab.id);
+        await persistDurableOwnerLedger({ mergeLiveOwners: true });
+      } catch (rollbackError) {
+        rollbackFailure = errorMessage(rollbackError);
+      }
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `domAction popup postcondition failed for owned ${openedOwner.targetId}: ` +
+          `${errorMessage(error)}; rollback=${rollbackFailure
+            ? `failed: ${rollbackFailure}; durable owner retained for panic cleanup`
+            : "closed and separately read back absent"}`
+      );
+    }
   }
   return created;
 }
@@ -4551,6 +5466,7 @@ async function handleNavigateTab(params) {
         sessionId: agentSessionId
       });
       downloadSeqBefore = downloadEventSeq;
+      assertPhysicalMutationAdmission(`chrome.tabs.update:navigate:tab=${selected.tabId}`);
       await chrome.tabs.update(selected.tabId, { url: requestedUrl });
       if (requestedUrl !== before.url) {
         readbackExpectation = {
@@ -4564,6 +5480,7 @@ async function handleNavigateTab(params) {
         requestedUrl: before.url,
         sessionId: agentSessionId
       });
+      assertPhysicalMutationAdmission(`chrome.tabs.reload:navigate:tab=${selected.tabId}`);
       await chrome.tabs.reload(selected.tabId, { bypassCache: ignoreCache });
     } else if (action === "back") {
       markAgentNavigation(selected.tabId, {
@@ -4571,6 +5488,7 @@ async function handleNavigateTab(params) {
         requestedUrl: null,
         sessionId: agentSessionId
       });
+      assertPhysicalMutationAdmission(`chrome.tabs.goBack:tab=${selected.tabId}`);
       await chrome.tabs.goBack(selected.tabId);
       readbackExpectation = {
         description: `tab url to change after chrome.tabs.goBack from ${JSON.stringify(before.url)}`,
@@ -4582,6 +5500,7 @@ async function handleNavigateTab(params) {
         requestedUrl: null,
         sessionId: agentSessionId
       });
+      assertPhysicalMutationAdmission(`chrome.tabs.goForward:tab=${selected.tabId}`);
       await chrome.tabs.goForward(selected.tabId);
       readbackExpectation = {
         description: `tab url to change after chrome.tabs.goForward from ${JSON.stringify(before.url)}`,
@@ -4786,6 +5705,7 @@ async function handleActivateTab(params) {
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
   const before = await tabPageState(selected.tabId, selected.target);
   try {
+    assertPhysicalMutationAdmission(`chrome.tabs.update:activate:tab=${selected.tabId}`);
     await chrome.tabs.update(selected.tabId, { active: true });
   } catch (error) {
     throw bridgeError(
@@ -5957,6 +6877,7 @@ async function handleViewportEmulation(params) {
       }
     }
     VIEWPORT_BASELINE_BY_TAB.delete(selected.tabId);
+    removeLedgerOverride("viewportOverrides", selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -6046,6 +6967,7 @@ async function handleDeviceEmulation(params) {
       }
     }
     DEVICE_BASELINE_BY_TAB.delete(selected.tabId);
+    removeLedgerOverride("deviceOverrides", selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -6085,6 +7007,7 @@ async function handleGeolocationEmulation(params) {
   if (operation === "set") {
     requested = normalizeGeolocationOverride(params);
     permissionSetting = normalizeGeolocationPermissionSetting(params.grantPermission);
+    GEOLOCATION_OVERRIDE_BY_TAB.set(selected.tabId, origin);
     dispatch = await dispatchGeolocationEmulationSet(selected.tabId, origin, requested, permissionSetting);
     await applyGeolocationEmulationShim(selected.tabId, {
       requested,
@@ -6101,6 +7024,8 @@ async function handleGeolocationEmulation(params) {
     rejectGeolocationResetField(params.grantPermission, "grantPermission");
     dispatch = await dispatchGeolocationEmulationReset(selected.tabId, origin);
     await clearGeolocationEmulationShim(selected.tabId);
+    GEOLOCATION_OVERRIDE_BY_TAB.delete(selected.tabId);
+    removeLedgerOverride("geolocationOverrides", selected.tabId);
   }
   const after = await waitForGeolocationReadback(
     selected.tabId,
@@ -6166,6 +7091,7 @@ async function handleLocaleEmulation(params) {
     );
   if (!requested) {
     LOCALE_BASELINE_BY_TAB.delete(selected.tabId);
+    removeLedgerOverride("localeOverrides", selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -6224,6 +7150,7 @@ async function handleMediaEmulation(params) {
     );
   if (!requested) {
     MEDIA_BASELINE_BY_TAB.delete(selected.tabId);
+    removeLedgerOverride("mediaOverrides", selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -6284,6 +7211,7 @@ async function handleNetworkConditions(params) {
     );
   if (!requested) {
     NETWORK_BASELINE_BY_TAB.delete(selected.tabId);
+    removeLedgerOverride("networkOverrides", selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -7797,6 +8725,7 @@ function optionalNumberSame(left, right) {
 }
 
 async function applyViewportDprShim(tabId, deviceScaleFactor) {
+  assertPhysicalMutationAdmission(`viewportDprShim:apply:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -7819,6 +8748,7 @@ async function applyViewportDprShim(tabId, deviceScaleFactor) {
 }
 
 async function applyDeviceEmulationShim(tabId, descriptor) {
+  assertPhysicalMutationAdmission(`deviceEmulationShim:apply:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -7841,6 +8771,7 @@ async function applyDeviceEmulationShim(tabId, descriptor) {
 }
 
 async function clearDeviceEmulationShim(tabId) {
+  assertPhysicalMutationAdmission(`deviceEmulationShim:clear:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -7862,6 +8793,7 @@ async function clearDeviceEmulationShim(tabId) {
 }
 
 async function applyGeolocationEmulationShim(tabId, state) {
+  assertPhysicalMutationAdmission(`geolocationEmulationShim:apply:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -7884,6 +8816,7 @@ async function applyGeolocationEmulationShim(tabId, state) {
 }
 
 async function clearGeolocationEmulationShim(tabId) {
+  assertPhysicalMutationAdmission(`geolocationEmulationShim:clear:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -7905,6 +8838,7 @@ async function clearGeolocationEmulationShim(tabId) {
 }
 
 async function applyLocaleEmulationShim(tabId, requested) {
+  assertPhysicalMutationAdmission(`localeEmulationShim:apply:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -7927,6 +8861,7 @@ async function applyLocaleEmulationShim(tabId, requested) {
 }
 
 async function clearLocaleEmulationShim(tabId) {
+  assertPhysicalMutationAdmission(`localeEmulationShim:clear:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -7948,6 +8883,7 @@ async function clearLocaleEmulationShim(tabId) {
 }
 
 async function applyMediaEmulationShim(tabId, requested) {
+  assertPhysicalMutationAdmission(`mediaEmulationShim:apply:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -7970,6 +8906,7 @@ async function applyMediaEmulationShim(tabId, requested) {
 }
 
 async function clearMediaEmulationShim(tabId) {
+  assertPhysicalMutationAdmission(`mediaEmulationShim:clear:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -7991,6 +8928,7 @@ async function clearMediaEmulationShim(tabId) {
 }
 
 async function applyNetworkConditionsShim(tabId, requested) {
+  assertPhysicalMutationAdmission(`networkConditionsShim:apply:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -8013,6 +8951,7 @@ async function applyNetworkConditionsShim(tabId, requested) {
 }
 
 async function clearNetworkConditionsShim(tabId) {
+  assertPhysicalMutationAdmission(`networkConditionsShim:clear:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -8034,6 +8973,7 @@ async function clearNetworkConditionsShim(tabId) {
 }
 
 async function clearViewportDprShim(tabId) {
+  assertPhysicalMutationAdmission(`viewportDprShim:clear:tab=${tabId}`);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
@@ -10152,6 +11092,7 @@ async function activateTabForCdpTouch(tabId, beforeState, action = "tap") {
 }
 
 async function sendDebuggerCommand(debuggee, method, params, timeoutMs = DEBUGGER_COMMAND_TIMEOUT_MS) {
+  assertPhysicalMutationAdmission(`chrome.debugger.sendCommand:${String(method)}`);
   try {
     return await promiseWithTimeout(
       chrome.debugger.sendCommand(debuggee, method, params),
@@ -10159,7 +11100,129 @@ async function sendDebuggerCommand(debuggee, method, params, timeoutMs = DEBUGGE
       `${method} timed out after ${timeoutMs}ms`
     );
   } catch (error) {
+    if (errorMessage(error).includes(`timed out after ${timeoutMs}ms`)) {
+      await recordUnresolvedDebuggerCommandTimeout(
+        debuggee,
+        String(method),
+        params || {},
+        timeoutMs
+      );
+    }
     throw new Error(`${method}: ${errorMessage(error)}`);
+  }
+}
+
+function neutralizingInputCommand(method, params) {
+  if (method === "Input.dispatchMouseEvent") {
+    const type = String(params?.type || "");
+    if (type === "mousePressed" || type === "mouseReleased" ||
+        Number(params?.buttons || 0) !== 0) {
+      return {
+        method,
+        params: {
+          type: "mouseReleased",
+          x: Number(params?.x || 0),
+          y: Number(params?.y || 0),
+          button: String(params?.button || "left"),
+          buttons: 0,
+          clickCount: Math.max(1, Number(params?.clickCount || 1)),
+          modifiers: 0
+        }
+      };
+    }
+  }
+  if (method === "Input.dispatchTouchEvent") {
+    const type = String(params?.type || "");
+    if (["touchStart", "touchMove", "touchEnd"].includes(type)) {
+      return {
+        method,
+        params: { type: "touchEnd", touchPoints: [], modifiers: 0 }
+      };
+    }
+  }
+  if (method === "Input.dispatchKeyEvent") {
+    const type = String(params?.type || "");
+    if (["keyDown", "rawKeyDown", "char", "keyUp"].includes(type)) {
+      const release = {
+        type: "keyUp",
+        modifiers: 0,
+        key: params?.key,
+        code: params?.code,
+        windowsVirtualKeyCode: params?.windowsVirtualKeyCode,
+        nativeVirtualKeyCode: params?.nativeVirtualKeyCode
+      };
+      for (const key of Object.keys(release)) {
+        if (release[key] === undefined) delete release[key];
+      }
+      return { method, params: release };
+    }
+  }
+  return null;
+}
+
+async function recordUnresolvedDebuggerCommandTimeout(
+  debuggee,
+  method,
+  params,
+  timeoutMs
+) {
+  const tabId = normalizeStoredTabId(debuggee?.tabId);
+  const context = ACTIVE_COMMAND_MUTATION_CONTEXT;
+  if (tabId === null || !context?.activitySequence) {
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      `unresolved debugger timeout lacks exact tab/activity identity: method=${method}`;
+    DURABLE_MUTATION_OWNERS_ENABLED = false;
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+    return;
+  }
+  const timeoutSequence = ++DEBUGGER_COMMAND_TIMEOUT_SEQUENCE;
+  const row = {
+    id: `${DURABLE_OWNER_WORKER_BOOT_ID}:${context.activitySequence}:${timeoutSequence}`,
+    tabId,
+    method,
+    activitySequence: context.activitySequence,
+    workerBootId: DURABLE_OWNER_WORKER_BOOT_ID,
+    timedOutAtUnixMs: Date.now(),
+    neutralizationMethod: null
+  };
+  DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.push(row);
+  try {
+    await persistDurableOwnerLedger({ mergeLiveOwners: true });
+  } catch (error) {
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      `persist unresolved debugger timeout failed: ${errorMessage(error)}`;
+    DURABLE_MUTATION_OWNERS_ENABLED = false;
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+    return;
+  }
+  const neutralization = neutralizingInputCommand(method, params);
+  if (!neutralization) return;
+  row.neutralizationMethod = neutralization.method;
+  try {
+    await promiseWithTimeout(
+      chrome.debugger.sendCommand(
+        { tabId },
+        neutralization.method,
+        neutralization.params
+      ),
+      timeoutMs,
+      `${neutralization.method} neutralizing release timed out after ${timeoutMs}ms`
+    );
+    DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts =
+      DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts
+        .filter((entry) => entry.id !== row.id);
+    await persistDurableOwnerLedger({ mergeLiveOwners: true });
+  } catch (error) {
+    row.neutralizationMethod =
+      `${neutralization.method}:failed:${errorMessage(error)}`;
+    try {
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    } catch (persistError) {
+      DURABLE_OWNER_STATE_LOAD_ERROR =
+        `persist failed input neutralization owner failed: ${errorMessage(persistError)}`;
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+    }
   }
 }
 
@@ -10168,6 +11231,13 @@ async function attachDebuggerForCommand(tabId, protocolVersion = "1.3") {
   if (persistentDebuggerSessionIsAttached(tabId)) {
     return { debuggee, shouldDetach: false, persistent: true, protocolVersion };
   }
+  if (DURABLE_OWNER_LEDGER.debuggerTabs.includes(tabId)) {
+    const attachment = await debuggerAttachmentReadback(tabId);
+    if (attachment.attached) {
+      return { debuggee, shouldDetach: false, persistent: true, protocolVersion };
+    }
+  }
+  assertPhysicalMutationAdmission(`chrome.debugger.attach:tab=${tabId}`);
   await chrome.debugger.attach(debuggee, protocolVersion);
   return { debuggee, shouldDetach: true, persistent: false, protocolVersion };
 }
@@ -10180,6 +11250,7 @@ async function ensureInitScriptDebuggerSession(tabId, protocolVersion = "1.3") {
   }
   const reusePersistentDebugger = persistentDebuggerSessionIsAttached(tabId);
   if (!reusePersistentDebugger) {
+    assertPhysicalMutationAdmission(`chrome.debugger.attach:initScript:tab=${tabId}`);
     await chrome.debugger.attach(debuggee, protocolVersion);
   }
   session = {
@@ -10190,6 +11261,7 @@ async function ensureInitScriptDebuggerSession(tabId, protocolVersion = "1.3") {
     attachedAtUnixMs: Date.now()
   };
   INIT_SCRIPT_DEBUGGER_SESSIONS.set(tabId, session);
+  await recordLedgerDebuggerTab(tabId);
   return { debuggee, session, newlyAttached: !reusePersistentDebugger, newlyCreated: true, protocolVersion };
 }
 
@@ -10288,12 +11360,14 @@ async function ensureBindingDebuggerSession(tabId, protocolVersion = "1.3") {
   let newlyArmed = false;
   if (!session.attached) {
     if (!persistentDebuggerSessionIsAttached(tabId)) {
+      assertPhysicalMutationAdmission(`chrome.debugger.attach:binding:tab=${tabId}`);
       await chrome.debugger.attach(debuggee, protocolVersion);
     }
     session.attached = true;
     session.protocolVersion = protocolVersion;
     session.armedAtUnixMs = Date.now();
     newlyArmed = true;
+    await recordLedgerDebuggerTab(tabId);
   }
   if (!session.runtimeEnabled) {
     await sendDebuggerCommand(debuggee, "Runtime.enable", {});
@@ -10312,6 +11386,7 @@ async function addBindingToSession(debuggee, session, name, executionContextName
   }
   await sendDebuggerCommand(debuggee, "Runtime.addBinding", params);
   session.activeNames.add(name);
+  await persistDurableOwnerLedger({ mergeLiveOwners: true });
   return true;
 }
 
@@ -10461,12 +11536,14 @@ async function ensureDialogDebuggerSession(tabId, defaultPolicy, protocolVersion
   let newlyArmed = false;
   if (!session.attached) {
     if (!persistentDebuggerSessionIsAttached(tabId)) {
+      assertPhysicalMutationAdmission(`chrome.debugger.attach:dialog:tab=${tabId}`);
       await chrome.debugger.attach(debuggee, protocolVersion);
     }
     session.attached = true;
     session.protocolVersion = protocolVersion;
     session.armedAtUnixMs = Date.now();
     newlyArmed = true;
+    await recordLedgerDebuggerTab(tabId);
   }
   if (!session.pageEnabled) {
     await sendDebuggerCommand(debuggee, "Page.enable", {});
@@ -10489,7 +11566,7 @@ function markDialogDebuggerDetached(tabId, clearPending = true) {
 
 function recordDialogOpeningEvent(tabId, params) {
   const session = DIALOG_DEBUGGER_SESSIONS.get(tabId);
-  if (!session?.attached) {
+  if (!session?.attached || !DURABLE_MUTATION_OWNERS_ENABLED) {
     return;
   }
   const defaultPrompt = params?.defaultPrompt === undefined || params?.defaultPrompt === null
@@ -10531,14 +11608,23 @@ function recordDialogOpeningEvent(tabId, params) {
   if (!action) {
     return;
   }
-  sendDebuggerCommand({ tabId }, "Page.handleJavaScriptDialog", dialogAutoHandleParams(policy, defaultPrompt))
+  const autoHandle = enqueuePersistedBackgroundMutation(
+    "dialogAutoHandle",
+    () => sendDebuggerCommand(
+      { tabId },
+      "Page.handleJavaScriptDialog",
+      dialogAutoHandleParams(policy, defaultPrompt)
+    )
+  )
     .then(() => markDialogAutoHandled(session, entry.seq, action))
     .catch((error) => markDialogAutoError(
       session,
       entry.seq,
       action,
       `Page.handleJavaScriptDialog default policy failed: ${errorMessage(error)}`
-    ));
+    ))
+    .finally(() => DIALOG_AUTO_HANDLE_IN_FLIGHT.delete(autoHandle));
+  DIALOG_AUTO_HANDLE_IN_FLIGHT.add(autoHandle);
 }
 
 function recordDialogClosedEvent(tabId, params) {
@@ -10666,6 +11752,9 @@ async function handleFileUpload(params) {
   const limit = normalizeFileChooserLimit(params.limit);
   const sinceSeq = normalizeOptionalNonNegativeInteger(params.sinceSeq, "sinceSeq");
   const files = normalizeFileUploadPaths(params.files, operation);
+  if (["arm_chooser", "set_chooser"].includes(operation) && !DURABLE_MUTATION_OWNERS_ENABLED) {
+    throw bridgeError(ERROR_ACTION_TARGET_INVALID, "operator panic disabled durable file-chooser interception");
+  }
   let session = FILE_CHOOSER_DEBUGGER_SESSIONS.get(selected.tabId) || null;
   let captureNewlyArmed = false;
   let inputReadback = null;
@@ -10758,6 +11847,649 @@ async function handleFileUpload(params) {
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
+  };
+}
+
+function normalizeOperatorPanicSequence(value, fieldName) {
+  const sequence = Number(value);
+  if (!Number.isSafeInteger(sequence) || sequence < 0) {
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      `${fieldName} must be a non-negative safe integer`
+    );
+  }
+  return sequence;
+}
+
+function operatorPanicActiveOwners() {
+  mergeLiveOwnersIntoDurableLedger();
+  return {
+    opened_tab_count: DURABLE_OWNER_LEDGER.openedTabs.length,
+    init_script_count: DURABLE_OWNER_LEDGER.initScripts.length,
+    binding_count: DURABLE_OWNER_LEDGER.bindings.length,
+    debugger_attached_tab_count: DURABLE_OWNER_LEDGER.debuggerTabs.length,
+    unresolved_debugger_command_timeout_count:
+      DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length,
+    executed_init_script_effect_unresolved_count:
+      DURABLE_OWNER_LEDGER.executedInitScriptEffects.length,
+    dialog_policy_count: DURABLE_OWNER_LEDGER.dialogTabs.length,
+    dialog_auto_handle_in_flight_count: DIALOG_AUTO_HANDLE_IN_FLIGHT.size,
+    file_chooser_interception_count: DURABLE_OWNER_LEDGER.fileChooserTabs.length,
+    clock_count: DURABLE_OWNER_LEDGER.clockTabs.length,
+    viewport_override_count: DURABLE_OWNER_LEDGER.viewportOverrides.length,
+    device_override_count: DURABLE_OWNER_LEDGER.deviceOverrides.length,
+    geolocation_override_count: DURABLE_OWNER_LEDGER.geolocationOverrides.length,
+    locale_override_count: DURABLE_OWNER_LEDGER.localeOverrides.length,
+    media_override_count: DURABLE_OWNER_LEDGER.mediaOverrides.length,
+    network_override_count: DURABLE_OWNER_LEDGER.networkOverrides.length,
+    mutation_handler_in_flight_count: MUTATION_HANDLER_IN_FLIGHT_COUNT
+  };
+}
+
+function operatorPanicOwnerReadback() {
+  const activeAfter = operatorPanicActiveOwners();
+  return {
+    enabled: DURABLE_MUTATION_OWNERS_ENABLED,
+    disable_sequence: DURABLE_MUTATION_DISABLE_SEQUENCE,
+    command_activity_sequence: COMMAND_ACTIVITY_SEQUENCE,
+    command_last_completed_sequence: COMMAND_LAST_COMPLETED_SEQUENCE,
+    command_in_flight_count: COMMAND_IN_FLIGHT_COUNT,
+    mutation_handlers_started_count: MUTATION_HANDLER_STARTED_COUNT,
+    mutation_handlers_completed_count: MUTATION_HANDLER_COMPLETED_COUNT,
+    worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
+    browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
+    ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId,
+    browser_session_continuity_matched:
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED,
+    stale_browser_session_owner_count: STALE_BROWSER_SESSION_OWNER_COUNT,
+    storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
+    storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
+    persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
+    persisted_in_flight_mutation: DURABLE_OWNER_LEDGER.inFlightMutation,
+    unresolved_debugger_command_timeouts:
+      DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.map((entry) => ({
+        id: entry.id,
+        tab_id: entry.tabId,
+        method: entry.method,
+        activity_sequence: entry.activitySequence,
+        worker_boot_id: entry.workerBootId,
+        timed_out_at_unix_ms: entry.timedOutAtUnixMs,
+        neutralization_method: entry.neutralizationMethod
+      })),
+    unresolved_worker_restart_mutation_count: UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
+    owner_continuity_healthy: DURABLE_OWNER_STATE_LOADED &&
+      !DURABLE_OWNER_STATE_LOAD_ERROR &&
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+      STALE_BROWSER_SESSION_OWNER_COUNT === 0 &&
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0,
+    active_after: activeAfter,
+    fully_drained: !DURABLE_MUTATION_OWNERS_ENABLED &&
+      DURABLE_OWNER_STATE_LOADED &&
+      !DURABLE_OWNER_STATE_LOAD_ERROR &&
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+      STALE_BROWSER_SESSION_OWNER_COUNT === 0 &&
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0 &&
+      Object.values(activeAfter).every((count) => count === 0)
+  };
+}
+
+async function handleOperatorPanicDisable(admission) {
+  DURABLE_MUTATION_OWNERS_ENABLED = false;
+  if (!admission || typeof admission.then !== "function") {
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      "operator panic disable reached dispatch without receipt-time persisted admission";
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+  } else {
+    await admission;
+  }
+  return operatorPanicOwnerReadback();
+}
+
+function operatorPanicTargetAbsent(error) {
+  const detail = errorMessage(error).toLowerCase();
+  return detail.includes("no tab with id") ||
+    detail.includes("target closed") ||
+    detail.includes("no target with given id") ||
+    detail.includes("the tab was closed");
+}
+
+async function operatorPanicConfirmTabAbsent(tabId) {
+  try {
+    await chrome.tabs.get(tabId);
+    return false;
+  } catch (error) {
+    if (operatorPanicTargetAbsent(error)) return true;
+    throw error;
+  }
+}
+
+async function operatorPanicTargetAbsentAfterReadback(error, tabId) {
+  if (!operatorPanicTargetAbsent(error)) return false;
+  return operatorPanicConfirmTabAbsent(tabId);
+}
+
+async function debuggerAttachmentReadback(tabId) {
+  const targets = await chrome.debugger.getTargets();
+  const target = targets.find((candidate) => candidate?.tabId === tabId) || null;
+  return {
+    tab_id: tabId,
+    target_present: Boolean(target),
+    attached: Boolean(target?.attached)
+  };
+}
+
+function removeLedgerDebuggerTab(tabId) {
+  DURABLE_OWNER_LEDGER.debuggerTabs = DURABLE_OWNER_LEDGER.debuggerTabs
+    .filter((candidate) => candidate !== tabId);
+}
+
+async function operatorPanicWithDebugger(tabId, operation) {
+  let attachment = null;
+  try {
+    attachment = await attachDebuggerForCommand(tabId);
+    return await operation(attachment.debuggee);
+  } finally {
+    if (attachment?.shouldDetach) {
+      try {
+        await chrome.debugger.detach(attachment.debuggee);
+      } catch (_) {
+        // The command readback is the verdict; detach is host hygiene only.
+      }
+    }
+  }
+}
+
+function removeLedgerInitScript(tabId, identifier) {
+  DURABLE_OWNER_LEDGER.initScripts = DURABLE_OWNER_LEDGER.initScripts.filter(
+    (entry) => entry.tabId !== tabId || entry.identifier !== identifier
+  );
+}
+
+function removeLedgerOverride(field, tabId) {
+  DURABLE_OWNER_LEDGER[field] = DURABLE_OWNER_LEDGER[field]
+    .filter((entry) => entry.tabId !== tabId);
+}
+
+async function mainFrameDocumentReadback(tabId) {
+  const [frame, tab] = await Promise.all([
+    chrome.webNavigation.getFrame({ tabId, frameId: 0 }),
+    chrome.tabs.get(tabId)
+  ]);
+  const documentId = String(frame?.documentId || "").trim();
+  if (!documentId) {
+    throw new Error(
+      `chrome.webNavigation.getFrame returned no main-frame documentId for tab ${tabId}`
+    );
+  }
+  return {
+    tab_id: tabId,
+    document_id: documentId,
+    url: String(frame?.url || tab?.url || ""),
+    status: String(tab?.status || "")
+  };
+}
+
+async function reloadTabForInitScriptEffectCleanup(tabId) {
+  const before = await mainFrameDocumentReadback(tabId);
+  assertPhysicalMutationAdmission(`chrome.tabs.reload:initScriptEffect:tab=${tabId}`);
+  await chrome.tabs.reload(tabId, { bypassCache: true });
+  const startedAt = Date.now();
+  let after = null;
+  while (Date.now() - startedAt <= 15000) {
+    try {
+      after = await mainFrameDocumentReadback(tabId);
+      if (after.document_id !== before.document_id && after.status === "complete") {
+        return { before, after };
+      }
+    } catch (error) {
+      if (await operatorPanicTargetAbsentAfterReadback(error, tabId)) throw error;
+    }
+    await sleep(50);
+  }
+  throw new Error(
+    `init-script effect reload did not produce a new complete main-frame document within 15000ms; ` +
+      `tab=${tabId} before_document=${before.document_id} ` +
+      `after_document=${String(after?.document_id || "missing")} ` +
+      `after_status=${String(after?.status || "missing")}`
+  );
+}
+
+async function cleanupOperatorPanicEmulationOverrides(failures) {
+  const cleanup = async (field, label, reset) => {
+    for (const entry of Array.from(DURABLE_OWNER_LEDGER[field])) {
+      try {
+        await reset(entry);
+        removeLedgerOverride(field, entry.tabId);
+      } catch (error) {
+        if (await operatorPanicTargetAbsentAfterReadback(error, entry.tabId)) {
+          removeLedgerOverride(field, entry.tabId);
+        } else {
+          failures.push(`${label} tab=${entry.tabId}: ${errorMessage(error)}`);
+        }
+      }
+    }
+  };
+  await cleanup("viewportOverrides", "viewportOverride", async (entry) => {
+    await dispatchViewportEmulationReset(entry.tabId);
+    await clearViewportDprShim(entry.tabId);
+    const baselineRequest = viewportRequestFromBaseline(entry.baseline);
+    if (baselineRequest) await dispatchViewportBaselineRestore(entry.tabId, baselineRequest);
+    VIEWPORT_BASELINE_BY_TAB.delete(entry.tabId);
+  });
+  await cleanup("deviceOverrides", "deviceOverride", async (entry) => {
+    const userAgent = typeof entry.baseline?.user_agent === "string"
+      ? entry.baseline.user_agent
+      : null;
+    await dispatchDeviceEmulationReset(entry.tabId, userAgent);
+    await clearDeviceEmulationShim(entry.tabId);
+    const baselineRequest = viewportRequestFromBaseline(entry.baseline?.viewport);
+    if (baselineRequest) await dispatchViewportBaselineRestore(entry.tabId, baselineRequest);
+    DEVICE_BASELINE_BY_TAB.delete(entry.tabId);
+  });
+  await cleanup("geolocationOverrides", "geolocationOverride", async (entry) => {
+    await dispatchGeolocationEmulationReset(entry.tabId, String(entry.origin || ""));
+    await clearGeolocationEmulationShim(entry.tabId);
+    GEOLOCATION_OVERRIDE_BY_TAB.delete(entry.tabId);
+  });
+  await cleanup("localeOverrides", "localeOverride", async (entry) => {
+    await dispatchLocaleEmulationReset(entry.tabId);
+    await clearLocaleEmulationShim(entry.tabId);
+    LOCALE_BASELINE_BY_TAB.delete(entry.tabId);
+  });
+  await cleanup("mediaOverrides", "mediaOverride", async (entry) => {
+    await dispatchMediaEmulationReset(entry.tabId);
+    await clearMediaEmulationShim(entry.tabId);
+    MEDIA_BASELINE_BY_TAB.delete(entry.tabId);
+  });
+  await cleanup("networkOverrides", "networkOverride", async (entry) => {
+    await dispatchNetworkConditionsReset(entry.tabId);
+    await clearNetworkConditionsShim(entry.tabId);
+    NETWORK_BASELINE_BY_TAB.delete(entry.tabId);
+  });
+}
+
+async function handleOperatorPanicCleanup(params) {
+  const expectedDisableSequence = normalizeOperatorPanicSequence(
+    params?.expectedDisableSequence,
+    "operatorPanicCleanup expectedDisableSequence"
+  );
+  DURABLE_MUTATION_OWNERS_ENABLED = false;
+  if (expectedDisableSequence !== DURABLE_MUTATION_DISABLE_SEQUENCE) {
+    return {
+      ...operatorPanicOwnerReadback(),
+      expected_disable_sequence: expectedDisableSequence,
+      failures: [
+        `operator panic cleanup generation mismatch: expected=${expectedDisableSequence} actual=${DURABLE_MUTATION_DISABLE_SEQUENCE}`
+      ],
+      fully_drained: false
+    };
+  }
+  if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED ||
+      STALE_BROWSER_SESSION_OWNER_COUNT !== 0) {
+    return {
+      ...operatorPanicOwnerReadback(),
+      expected_disable_sequence: expectedDisableSequence,
+      failures: [
+        "operator panic cleanup refused stale browser-session owner ids; " +
+          `current_session=${String(DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID || "missing")} ` +
+          `ledger_session=${String(DURABLE_OWNER_LEDGER.browserSessionId || "missing")} ` +
+          `stale_owner_count=${STALE_BROWSER_SESSION_OWNER_COUNT}`
+      ],
+      remaining_opened_tabs: DURABLE_OWNER_LEDGER.openedTabs.map((entry) => ({
+        tab_id: entry.tabId,
+        target_id: entry.targetId
+      })),
+      fully_drained: false
+    };
+  }
+  const failures = [];
+
+  mergeLiveOwnersIntoDurableLedger();
+  const openedTabsFound = DURABLE_OWNER_LEDGER.openedTabs.length;
+  let openedTabsClosed = 0;
+  const closedOpenedTabs = [];
+  for (const entry of Array.from(DURABLE_OWNER_LEDGER.openedTabs)) {
+    try {
+      try {
+        await chrome.tabs.remove(entry.tabId);
+      } catch (error) {
+        if (!operatorPanicTargetAbsent(error)) throw error;
+      }
+      await waitForTargetAbsent(entry.targetId, 10000);
+      pruneDurableOwnerLedgerForClosedTab(entry.tabId);
+      openedTabsClosed += 1;
+      closedOpenedTabs.push({
+        tab_id: entry.tabId,
+        target_id: entry.targetId
+      });
+    } catch (error) {
+      failures.push(
+        `openedTab tab=${entry.tabId} target=${entry.targetId}: ${errorMessage(error)}`
+      );
+    }
+  }
+
+  const initScriptsFound = DURABLE_OWNER_LEDGER.initScripts.length;
+  let initScriptsRemoved = 0;
+  for (const { tabId, identifier } of Array.from(DURABLE_OWNER_LEDGER.initScripts)) {
+    try {
+      await operatorPanicWithDebugger(tabId, async (debuggee) => {
+        await sendDebuggerCommand(debuggee, "Page.enable", {});
+        await sendDebuggerCommand(debuggee, "Page.removeScriptToEvaluateOnNewDocument", {
+          identifier
+        });
+      });
+      INIT_SCRIPT_DEBUGGER_SESSIONS.get(tabId)?.identifiers?.delete(identifier);
+      removeLedgerInitScript(tabId, identifier);
+      initScriptsRemoved += 1;
+    } catch (error) {
+      if (await operatorPanicTargetAbsentAfterReadback(error, tabId)) {
+        INIT_SCRIPT_DEBUGGER_SESSIONS.get(tabId)?.identifiers?.delete(identifier);
+        removeLedgerInitScript(tabId, identifier);
+        initScriptsRemoved += 1;
+      } else {
+        failures.push(`initScript tab=${tabId} identifier=${identifier}: ${errorMessage(error)}`);
+      }
+    }
+  }
+  for (const [tabId, session] of Array.from(INIT_SCRIPT_DEBUGGER_SESSIONS.entries())) {
+    if (!session.identifiers?.size) {
+      INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
+    }
+  }
+
+  const initScriptEffectsFound =
+    DURABLE_OWNER_LEDGER.executedInitScriptEffects.length;
+  let initScriptEffectsCleared = 0;
+  const reloadedInitScriptEffectTabs = [];
+  const effectTabIds = Array.from(new Set(
+    DURABLE_OWNER_LEDGER.executedInitScriptEffects.map((entry) => entry.tabId)
+  ));
+  for (const tabId of effectTabIds) {
+    const effectCount = DURABLE_OWNER_LEDGER.executedInitScriptEffects
+      .filter((entry) => entry.tabId === tabId).length;
+    if (DURABLE_OWNER_LEDGER.initScripts.some((entry) => entry.tabId === tabId)) {
+      failures.push(
+        `initScriptEffect tab=${tabId}: registration removal failed; refusing reload that could execute it again`
+      );
+      continue;
+    }
+    try {
+      const reload = await reloadTabForInitScriptEffectCleanup(tabId);
+      DURABLE_OWNER_LEDGER.executedInitScriptEffects =
+        DURABLE_OWNER_LEDGER.executedInitScriptEffects
+          .filter((entry) => entry.tabId !== tabId);
+      initScriptEffectsCleared += effectCount;
+      reloadedInitScriptEffectTabs.push({
+        tab_id: tabId,
+        before_document_id: reload.before.document_id,
+        after_document_id: reload.after.document_id
+      });
+    } catch (error) {
+      if (await operatorPanicTargetAbsentAfterReadback(error, tabId)) {
+        pruneDurableOwnerLedgerForClosedTab(tabId);
+        initScriptEffectsCleared += effectCount;
+      } else {
+        failures.push(`initScriptEffect tab=${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+
+  const bindingsFound = DURABLE_OWNER_LEDGER.bindings.length;
+  let bindingsRemoved = 0;
+  for (const { tabId, name } of Array.from(DURABLE_OWNER_LEDGER.bindings)) {
+    try {
+      await operatorPanicWithDebugger(tabId, async (debuggee) => {
+        await sendDebuggerCommand(debuggee, "Runtime.enable", {});
+        await sendDebuggerCommand(debuggee, "Runtime.removeBinding", { name });
+      });
+      BINDING_DEBUGGER_SESSIONS.get(tabId)?.activeNames?.delete(name);
+      removeLedgerBinding(tabId, name);
+      bindingsRemoved += 1;
+    } catch (error) {
+      if (await operatorPanicTargetAbsentAfterReadback(error, tabId)) {
+        BINDING_DEBUGGER_SESSIONS.get(tabId)?.activeNames?.delete(name);
+        removeLedgerBinding(tabId, name);
+        bindingsRemoved += 1;
+      } else {
+        failures.push(`binding tab=${tabId} name=${name}: ${errorMessage(error)}`);
+      }
+    }
+  }
+
+  const dialogPoliciesFound = DURABLE_OWNER_LEDGER.dialogTabs.length;
+  for (const session of DIALOG_DEBUGGER_SESSIONS.values()) {
+    session.defaultPolicy = "manual";
+    session.attached = false;
+    session.pendingSeq = null;
+  }
+  DIALOG_DEBUGGER_SESSIONS.clear();
+  if (DIALOG_AUTO_HANDLE_IN_FLIGHT.size) {
+    await Promise.allSettled(Array.from(DIALOG_AUTO_HANDLE_IN_FLIGHT));
+  }
+  DURABLE_OWNER_LEDGER.dialogTabs = [];
+
+  const fileChooserInterceptionsFound = DURABLE_OWNER_LEDGER.fileChooserTabs.length;
+  let fileChooserInterceptionsDisabled = 0;
+  for (const tabId of Array.from(DURABLE_OWNER_LEDGER.fileChooserTabs)) {
+    const session = FILE_CHOOSER_DEBUGGER_SESSIONS.get(tabId);
+    if (session) {
+      session.attached = false;
+      session.pendingSeq = null;
+    }
+    try {
+      await operatorPanicWithDebugger(tabId, (debuggee) =>
+        sendDebuggerCommand(debuggee, "Page.setInterceptFileChooserDialog", { enabled: false })
+      );
+      if (session) session.interceptEnabled = false;
+      FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
+      DURABLE_OWNER_LEDGER.fileChooserTabs = DURABLE_OWNER_LEDGER.fileChooserTabs
+        .filter((candidate) => candidate !== tabId);
+      fileChooserInterceptionsDisabled += 1;
+    } catch (error) {
+      if (await operatorPanicTargetAbsentAfterReadback(error, tabId)) {
+        FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
+        DURABLE_OWNER_LEDGER.fileChooserTabs = DURABLE_OWNER_LEDGER.fileChooserTabs
+          .filter((candidate) => candidate !== tabId);
+        fileChooserInterceptionsDisabled += 1;
+      } else {
+        failures.push(`fileChooser tab=${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+
+  const clocksFound = DURABLE_OWNER_LEDGER.clockTabs.length;
+  let clocksUninstalled = 0;
+  for (const tabId of Array.from(DURABLE_OWNER_LEDGER.clockTabs)) {
+    try {
+      const injected = await executeScriptMutation({
+        target: { tabId },
+        world: "MAIN",
+        func: runClockInPage,
+        args: [{ operation: "uninstall", timeMs: null, deltaMs: null, loopLimit: 10000 }]
+      }, "operatorPanicCleanup:clockUninstall");
+      const result = frameExecutionResults(injected).find((frame) => frame.result)?.result;
+      if (!result?.ok || result?.readback?.installed !== false) {
+        throw new Error(`clock uninstall returned ${JSON.stringify(result || null)}`);
+      }
+      CLOCK_INSTALLED_TABS.delete(tabId);
+      DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
+        .filter((candidate) => candidate !== tabId);
+      clocksUninstalled += 1;
+    } catch (error) {
+      if (await operatorPanicTargetAbsentAfterReadback(error, tabId)) {
+        CLOCK_INSTALLED_TABS.delete(tabId);
+        DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
+          .filter((candidate) => candidate !== tabId);
+        clocksUninstalled += 1;
+      } else {
+        failures.push(`clock tab=${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
+
+  await cleanupOperatorPanicEmulationOverrides(failures);
+
+  const debuggerTabsFound = DURABLE_OWNER_LEDGER.debuggerTabs.length;
+  let debuggerTabsDetached = 0;
+  const detachedDebuggerTabs = [];
+  for (const tabId of Array.from(DURABLE_OWNER_LEDGER.debuggerTabs)) {
+    try {
+      try {
+        await chrome.debugger.detach({ tabId });
+      } catch (error) {
+        const detail = errorMessage(error).toLowerCase();
+        if (!detail.includes("not attached") &&
+            !await operatorPanicTargetAbsentAfterReadback(error, tabId)) {
+          throw error;
+        }
+      }
+      const attachment = await debuggerAttachmentReadback(tabId);
+      if (attachment.attached) {
+        throw new Error(
+          `chrome.debugger.getTargets still reports attached=true for tab ${tabId}`
+        );
+      }
+      removeLedgerDebuggerTab(tabId);
+      INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
+      BINDING_DEBUGGER_SESSIONS.delete(tabId);
+      DIALOG_DEBUGGER_SESSIONS.delete(tabId);
+      FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
+      debuggerTabsDetached += 1;
+      detachedDebuggerTabs.push(tabId);
+    } catch (error) {
+      failures.push(`debuggerAttachment tab=${tabId}: ${errorMessage(error)}`);
+    }
+  }
+  try {
+    await persistDurableOwnerLedger({ mergeLiveOwners: true });
+  } catch (error) {
+    DURABLE_OWNER_STATE_LOAD_ERROR = `persist operator panic cleanup failed: ${errorMessage(error)}`;
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+    failures.push(DURABLE_OWNER_STATE_LOAD_ERROR);
+  }
+
+  const activeAfter = operatorPanicActiveOwners();
+  const continuityHealthy = DURABLE_OWNER_STATE_LOADED &&
+    !DURABLE_OWNER_STATE_LOAD_ERROR &&
+    DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+    STALE_BROWSER_SESSION_OWNER_COUNT === 0 &&
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0;
+  const fullyDrained = failures.length === 0 && continuityHealthy &&
+    Object.values(activeAfter).every((count) => count === 0);
+  return {
+    enabled: DURABLE_MUTATION_OWNERS_ENABLED,
+    disable_sequence: DURABLE_MUTATION_DISABLE_SEQUENCE,
+    expected_disable_sequence: expectedDisableSequence,
+    command_activity_sequence: COMMAND_ACTIVITY_SEQUENCE,
+    command_last_completed_sequence: COMMAND_LAST_COMPLETED_SEQUENCE,
+    command_in_flight_count: COMMAND_IN_FLIGHT_COUNT,
+    mutation_handlers_started_count: MUTATION_HANDLER_STARTED_COUNT,
+    mutation_handlers_completed_count: MUTATION_HANDLER_COMPLETED_COUNT,
+    worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
+    browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
+    ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId,
+    browser_session_continuity_matched:
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED,
+    stale_browser_session_owner_count: STALE_BROWSER_SESSION_OWNER_COUNT,
+    storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
+    storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
+    persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
+    persisted_in_flight_mutation: DURABLE_OWNER_LEDGER.inFlightMutation,
+    unresolved_debugger_command_timeouts:
+      DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.map((entry) => ({
+        id: entry.id,
+        tab_id: entry.tabId,
+        method: entry.method,
+        activity_sequence: entry.activitySequence,
+        worker_boot_id: entry.workerBootId,
+        timed_out_at_unix_ms: entry.timedOutAtUnixMs,
+        neutralization_method: entry.neutralizationMethod
+      })),
+    unresolved_worker_restart_mutation_count: UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
+    owner_continuity_healthy: continuityHealthy,
+    opened_tabs_found: openedTabsFound,
+    opened_tabs_closed: openedTabsClosed,
+    closed_opened_tabs: closedOpenedTabs,
+    remaining_opened_tabs: DURABLE_OWNER_LEDGER.openedTabs.map((entry) => ({
+      tab_id: entry.tabId,
+      target_id: entry.targetId
+    })),
+    init_scripts_found: initScriptsFound,
+    init_scripts_removed: initScriptsRemoved,
+    init_script_effects_found: initScriptEffectsFound,
+    init_script_effects_cleared: initScriptEffectsCleared,
+    reloaded_init_script_effect_tabs: reloadedInitScriptEffectTabs,
+    bindings_found: bindingsFound,
+    bindings_removed: bindingsRemoved,
+    debugger_tabs_found: debuggerTabsFound,
+    debugger_tabs_detached: debuggerTabsDetached,
+    detached_debugger_tabs: detachedDebuggerTabs,
+    dialog_policies_found: dialogPoliciesFound,
+    dialog_policies_disabled: dialogPoliciesFound,
+    file_chooser_interceptions_found: fileChooserInterceptionsFound,
+    file_chooser_interceptions_disabled: fileChooserInterceptionsDisabled,
+    clocks_found: clocksFound,
+    clocks_uninstalled: clocksUninstalled,
+    failures,
+    active_after: activeAfter,
+    fully_drained: fullyDrained
+  };
+}
+
+async function handleOperatorPanicCloseTab(params) {
+  const expectedDisableSequence = normalizeOperatorPanicSequence(
+    params?.expectedDisableSequence,
+    "operatorPanicCloseTab expectedDisableSequence"
+  );
+  DURABLE_MUTATION_OWNERS_ENABLED = false;
+  if (expectedDisableSequence !== DURABLE_MUTATION_DISABLE_SEQUENCE) {
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      `operator panic closeTab generation mismatch: expected=${expectedDisableSequence} actual=${DURABLE_MUTATION_DISABLE_SEQUENCE}`
+    );
+  }
+  const closed = await handleCloseTab(params);
+  return {
+    ...closed,
+    expected_disable_sequence: expectedDisableSequence,
+    operator_panic_cleanup: true
+  };
+}
+
+async function handleOperatorPanicEnable(params) {
+  const expectedDisableSequence = normalizeOperatorPanicSequence(
+    params?.expectedDisableSequence,
+    "operatorPanicEnable expectedDisableSequence"
+  );
+  const before = operatorPanicOwnerReadback();
+  const ownersEmpty = Object.values(before.active_after).every((count) => count === 0);
+  let enabled = !before.enabled &&
+    before.disable_sequence === expectedDisableSequence &&
+    ownersEmpty &&
+    before.owner_continuity_healthy;
+  if (enabled) {
+    DURABLE_MUTATION_OWNERS_ENABLED = true;
+    try {
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    } catch (error) {
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      enabled = false;
+      DURABLE_OWNER_STATE_LOAD_ERROR = `persist operator panic enable failed: ${errorMessage(error)}`;
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+      try {
+        await persistDurableOwnerLedger({ mergeLiveOwners: true });
+      } catch (_) {
+        // The failed persistence write is already represented fail closed.
+      }
+    }
+  }
+  return {
+    ...operatorPanicOwnerReadback(),
+    expected_disable_sequence: expectedDisableSequence,
+    generation_matched: before.disable_sequence === expectedDisableSequence,
+    owners_were_empty: ownersEmpty,
+    enable_applied: enabled
   };
 }
 
@@ -10954,12 +12686,14 @@ async function ensureFileChooserDebuggerSession(tabId, intercept, protocolVersio
   let newlyArmed = false;
   if (!session.attached) {
     if (!persistentDebuggerSessionIsAttached(tabId)) {
+      assertPhysicalMutationAdmission(`chrome.debugger.attach:fileChooser:tab=${tabId}`);
       await chrome.debugger.attach(debuggee, protocolVersion);
     }
     session.attached = true;
     session.protocolVersion = protocolVersion;
     session.armedAtUnixMs = Date.now();
     newlyArmed = true;
+    await recordLedgerDebuggerTab(tabId);
   }
   if (!session.pageEnabled) {
     await sendDebuggerCommand(debuggee, "Page.enable", {});
@@ -16044,6 +17778,8 @@ function runClockInPage(request) {
       readback = clock.call("fastForward", { deltaMs });
     } else if (operation === "pauseAt") {
       readback = clock.call("pauseAt", { timeMs });
+    } else if (operation === "uninstall") {
+      readback = clock.call("uninstall", {});
     } else {
       throw new Error("Unknown Synapse browser clock method: " + operation);
     }
@@ -16071,6 +17807,13 @@ function runClockInPage(request) {
     }
 
     const NativeDate = globalThis.Date;
+    const nativeGlobalDescriptors = new Map();
+    for (const name of ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame"]) {
+      nativeGlobalDescriptors.set(name, Object.getOwnPropertyDescriptor(globalThis, name));
+    }
+    const nativePerformanceNowDescriptor = globalThis.performance
+      ? Object.getOwnPropertyDescriptor(globalThis.performance, "now")
+      : undefined;
     const nativePerformanceNow = globalThis.performance && globalThis.performance.now
       ? globalThis.performance.now.bind(globalThis.performance)
       : () => 0;
@@ -16248,6 +17991,38 @@ function runClockInPage(request) {
       return status();
     }
 
+    function uninstall() {
+      state.timers.clear();
+      for (const [name, descriptor] of nativeGlobalDescriptors.entries()) {
+        try {
+          if (descriptor) {
+            Object.defineProperty(globalThis, name, descriptor);
+          } else {
+            delete globalThis[name];
+          }
+        } catch (error) {
+          recordError(error);
+        }
+      }
+      if (globalThis.performance) {
+        try {
+          if (nativePerformanceNowDescriptor) {
+            Object.defineProperty(globalThis.performance, "now", nativePerformanceNowDescriptor);
+          } else {
+            delete globalThis.performance.now;
+          }
+        } catch (error) {
+          recordError(error);
+        }
+      }
+      state.installed = false;
+      const readback = status();
+      try {
+        delete globalThis.__synapseClock;
+      } catch (_) {}
+      return readback;
+    }
+
     function fastForward(args) {
       if (!state.installed) {
         throw new Error("Synapse browser clock is not installed");
@@ -16292,6 +18067,10 @@ function runClockInPage(request) {
         if (method === "pauseAt") {
           api.lastInstallNewlyAdded = false;
           return pauseAt(args || {});
+        }
+        if (method === "uninstall") {
+          api.lastInstallNewlyAdded = false;
+          return uninstall();
         }
         throw new Error("Unknown Synapse browser clock method: " + method);
       }
@@ -21351,7 +23130,7 @@ function normalizeDomActionAutoWaitTimeout(value, enabled) {
 
 function normalizeClockOperation(value) {
   const operation = String(value || "status");
-  if (["status", "install", "setFixedTime", "fastForward", "pauseAt"].includes(operation)) {
+  if (["status", "install", "setFixedTime", "fastForward", "pauseAt", "uninstall"].includes(operation)) {
     return operation;
   }
   throw bridgeError(ERROR_ATTACH_FAILED, `unsupported clock operation ${JSON.stringify(operation)}`);

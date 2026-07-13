@@ -227,6 +227,7 @@ pub struct ArmedRoutineTickParams {
     /// an MCP session. Periodic daemon ticks have no session, so browser steps
     /// refuse rather than using the human foreground implicitly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub browser_window_hwnd: Option<i64>,
     /// Timeout applied to launch-window/postcondition waits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1588,6 +1589,13 @@ fn load_all_armed_routines(db: &Arc<Db>) -> Result<Vec<ArmedRoutineRecord>, Erro
 }
 
 fn validate_tick_params(params: &ArmedRoutineTickParams) -> Result<(), ErrorData> {
+    if let Some(browser_window_hwnd) = params.browser_window_hwnd {
+        crate::m1::validate_hwnd_shape(
+            "armed_routine_tick",
+            "browser_window_hwnd",
+            browser_window_hwnd,
+        )?;
+    }
     if let Some(routine_id) = &params.routine_id {
         validate_routine_id_param("armed_routine_tick", routine_id)?;
     }
@@ -1780,6 +1788,29 @@ mod tests {
     use synapse_storage::routines as routine_codec;
 
     use crate::m3::profile_authoring::RoutineAutomationRecord;
+
+    #[test]
+    fn tick_params_enforce_canonical_browser_hwnd_before_plan_execution() {
+        for invalid in [-1, 0, i64::from(u32::MAX) + 1, i64::MAX] {
+            let params = ArmedRoutineTickParams {
+                browser_window_hwnd: Some(invalid),
+                ..ArmedRoutineTickParams::default()
+            };
+            let error = validate_tick_params(&params)
+                .expect_err("noncanonical browser HWND must fail before plan execution");
+            let data = error.data.as_ref().expect("structured HWND error data");
+            assert_eq!(
+                data.get("field").and_then(serde_json::Value::as_str),
+                Some("browser_window_hwnd")
+            );
+        }
+
+        let params = ArmedRoutineTickParams {
+            browser_window_hwnd: Some(i64::from(u32::MAX)),
+            ..ArmedRoutineTickParams::default()
+        };
+        validate_tick_params(&params).expect("u32::MAX is a canonical HWND wire value");
+    }
 
     fn temp_db() -> (tempfile::TempDir, Arc<Db>) {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -167,5 +167,5 @@ See [14_core_telemetry_overlay.md](14_core_telemetry_overlay.md) for the full co
 
 - **Non-Windows runtime.** Real capture, action, accessibility, and audio are Windows-only; non-Windows builds compile but the corresponding subsystems fail loud (`CAPTURE_GRAPHICS_API_UNSUPPORTED`, `A11Y_NOT_AVAILABLE`). See [05](05_capture_subsystem.md), [06](06_accessibility_and_cdp_subsystem.md).
 - **Automated model download.** Disabled in the current milestone; models must be side-loaded manually. See [13](13_models_subsystem.md).
-- **CI test execution.** No GitHub Actions/Makefile/justfile/nextest; the only automated gate is a `.githooks/pre-push` clippy run, and the shipping gate ("FSV" = manual Full State Verification) is performed by a human on Windows. See [17_test_suite.md](17_test_suite.md).
+- **CI test execution.** No GitHub Actions/Makefile/justfile/nextest; the only automated gate is a `.githooks/pre-push` clippy run, and the shipping gate ("FSV" = manual Full State Verification) is performed by the agent on the configured Windows host and is never automated. See [17_test_suite.md](17_test_suite.md).
 - **Multi-language OCR confidence.** Per-word OCR confidence is hardcoded to 1.0. See [07](07_perception_subsystem.md).

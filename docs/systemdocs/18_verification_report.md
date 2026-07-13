@@ -80,7 +80,7 @@
 | Test run executed in this pass | No — tests were not executed (building requires `libclang.dll` on PATH per project memory; Windows-gated tests require an interactive desktop). |
 | Pass/fail | Not determined from source. |
 | Run command | `cargo test --workspace` (Windows-only tests are `#[ignore]`d; run with `-- --ignored`). |
-| Shipping gate | Manual Full State Verification ("FSV") performed by a human on Windows; surfaces in code only as `minimum_manual_fsv` manifest metadata. |
+| Shipping gate | Manual Full State Verification ("FSV") performed by the agent on the configured Windows host; surfaces in code only as `minimum_manual_fsv` manifest metadata. It is never automated. |
 
 See [17_test_suite.md](17_test_suite.md) for the test inventory and categories.
 

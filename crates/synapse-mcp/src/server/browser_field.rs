@@ -64,6 +64,7 @@ pub struct BrowserFormParams {
     /// the selected operation spec's `window_hwnd`; a conflicting nested value
     /// fails closed. Defaults to the nested spec / session target window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// `operation=set_value`: replace one field value with dual readback.
     #[serde(default)]
@@ -112,6 +113,7 @@ pub struct BrowserSetValueParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Defaults to the session target's window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
 }
 
@@ -161,6 +163,7 @@ pub struct BrowserFillFormParams {
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Defaults to the session target's window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Per-action DOM wait budget in milliseconds. Defaults to 5000.
     #[serde(default)]
@@ -527,6 +530,9 @@ impl SynapseService {
         }
         let expected_chrome_window_id = owner.as_ref().and_then(|owner| owner.chrome_window_id);
 
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_set_value_before_bridge_field_replace",
+        )?;
         let result = crate::chrome_debugger_bridge::set_field_value(
             window_hwnd,
             cdp_target_id,
@@ -546,6 +552,9 @@ impl SynapseService {
                 ),
             )
         })?;
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_set_value_after_bridge_field_replace",
+        )?;
 
         let before_value = result.before_value.clone().unwrap_or_default();
         let after_value = result.after_value.clone().ok_or_else(|| {
@@ -886,6 +895,11 @@ impl SynapseService {
         wait_timeout_ms: u64,
     ) -> BrowserFillFormFieldOutcome {
         let option = field.option.as_deref().or(field.value.as_deref());
+        if let Err(error) = super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_fill_form_before_bridge_dom_action",
+        ) {
+            return fill_form_error_data(index, field, "operator_panic_boundary", error);
+        }
         match crate::chrome_debugger_bridge::dom_action(
             crate::chrome_debugger_bridge::ChromeDebuggerDomActionRequest {
                 hwnd: window_hwnd,
@@ -916,6 +930,11 @@ impl SynapseService {
         .await
         {
             Ok(result) => {
+                if let Err(error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_fill_form_after_bridge_dom_action",
+                ) {
+                    return fill_form_error_data(index, field, "operator_panic_boundary", error);
+                }
                 fill_form_success(index, field, "chrome_debugger_bridge.domAction", result)
             }
             Err(error) => {
@@ -955,6 +974,7 @@ impl SynapseService {
                     format!("{TOOL} requires window_hwnd when no active session target is set"),
                 )
             })?;
+        let window_hwnd = crate::m1::validate_window_hwnd_shape(TOOL, window_hwnd)?;
         // Ownership: an explicit target must match this session's active CDP
         // target. This keeps the tool from acting on another session's tab.
         if let Some(explicit) = params.cdp_target_id.as_ref() {

@@ -13,7 +13,7 @@
 //! `episode_list` returns — read through the identical
 //! [`crate::m3::episodes::list_episodes`] scan, never a parallel cache. The
 //! digest therefore reconciles with `CF_EPISODES` by construction (the #850
-//! FSV requirement):
+//! manual FSV requirement):
 //!
 //! - `active_ms` == Σ episode `duration_ms`
 //! - `active_ms` == Σ(`by_app[*].active_ms`) + `by_app_other.active_ms`
@@ -119,7 +119,7 @@ pub struct GroupUsage {
     pub keystroke_count: u64,
     pub click_count: u64,
     /// Share of `active_ms` in parts-per-thousand (0..=1000); integer so the
-    /// row stays exactly comparable and carries no float rounding into FSV.
+    /// row stays exactly comparable and carries no float rounding into manual FSV.
     pub active_share_permille: u32,
 }
 

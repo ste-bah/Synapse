@@ -23,7 +23,7 @@ use crate::server::url_redaction::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{DateTime, Utc};
-use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
+use rmcp::{RoleServer, model::ErrorCode, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use synapse_core::error_codes;
@@ -52,6 +52,57 @@ const MAX_HAR_REPLAY_ENTRIES: usize = 1000;
 const MAX_HAR_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const HAR_REPLAY_ROUTE_PREFIX: &str = "har-replay-";
 const HAR_REPLAY_MISS_ROUTE_ID: &str = "har-replay-missing";
+
+fn operator_panic_route_rollback_failed(
+    stage: &'static str,
+    panic_error: ErrorData,
+    cleanup_error: String,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "operator panic crossed {stage}, and exact Fetch-route rollback failed: {cleanup_error}"
+        ),
+        Some(json!({
+            "code": error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+            "detail_code": "MCP_MUTATION_OPERATOR_PANIC_ROLLBACK_FAILED",
+            "stage": stage,
+            "operator_panic_error": {
+                "message": panic_error.message,
+                "data": panic_error.data,
+            },
+            "cleanup_error": cleanup_error,
+            "source_of_truth": "target-scoped Fetch route registry and interception status",
+        })),
+    )
+}
+
+fn operator_panic_route_snapshot_missing(
+    service: &SynapseService,
+    stage: &'static str,
+    panic_error: ErrorData,
+    cdp_target_id: &str,
+) -> ErrorData {
+    synapse_action::record_operator_panic_safety_incident();
+    let drain = service
+        .drain_state_handle()
+        .mark_draining("operator_panic_route_snapshot_missing");
+    tracing::error!(
+        code = error_codes::ACTION_POSTCONDITION_FAILED,
+        detail_code = "MCP_MUTATION_OPERATOR_PANIC_ROLLBACK_SNAPSHOT_MISSING",
+        stage,
+        cdp_target_id,
+        drain = ?drain,
+        "operator-panic Fetch-route rollback could not recover its required pre-mutation snapshot"
+    );
+    operator_panic_route_rollback_failed(
+        stage,
+        panic_error,
+        format!(
+            "normalized add-route snapshot was missing after physical Fetch mutation; daemon drain engaged: {drain:?}"
+        ),
+    )
+}
 
 /// Which captured-network read the unified `browser_network` tool returns
 /// (#1348). Supply the matching nested spec under [`BrowserNetworkParams`].
@@ -87,6 +138,7 @@ pub struct BrowserNetworkParams {
     /// the selected `mode` spec's `window_hwnd`; a conflicting nested value fails
     /// closed. Defaults to the nested spec / session target window.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// `mode=requests`: filtered request-record list.
     #[serde(default)]
@@ -126,6 +178,7 @@ pub struct BrowserNetworkRequestsParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Return only records whose latest update sequence is >= this cursor.
     #[serde(default)]
@@ -201,6 +254,7 @@ pub struct BrowserNetworkWebSocketsParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Return only sockets whose latest update sequence is >= this cursor.
     #[serde(default)]
@@ -263,6 +317,7 @@ pub struct BrowserNetworkRequestParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Include `Network.getResponseBody` readback. Defaults to true.
     #[serde(default = "default_true")]
@@ -506,6 +561,7 @@ pub struct BrowserNetworkHarParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// HAR operation. Defaults to `record`.
     #[serde(default)]
@@ -622,6 +678,7 @@ pub struct BrowserNetworkOverridesParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Operation. Defaults to `set`.
     #[serde(default)]
@@ -751,6 +808,7 @@ pub struct BrowserRouteParams {
     /// Browser HWND that owns the target. Required only with an explicit
     /// `cdp_target_id` and no active session target.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
     /// Route operation. Defaults to `add_fulfill`.
     #[serde(default)]
@@ -1603,13 +1661,26 @@ impl SynapseService {
                         format!("{HAR_TOOL} record path was not normalized"),
                     )
                 })?;
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_network_har_before_record_write",
+                )?;
                 let record =
                     write_har_record(cdp_target_id, path, &entries, har.include_bodies).await?;
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_network_har_after_record_write",
+                )?;
                 recorded_entry_count = record.entry_count;
                 skipped_entry_count = record.skipped_count;
                 har_bytes = record.bytes_written;
             }
             BrowserNetworkHarOperation::Replay => {
+                let prior_fetch_armed =
+                    synapse_a11y::fetch_interception_status(cdp_target_id).is_some();
+                let prior_replay_rules = synapse_a11y::fetch_route_rules(cdp_target_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|rule| rule.id.starts_with(HAR_REPLAY_ROUTE_PREFIX))
+                    .collect::<Vec<_>>();
                 let path = har.path.as_ref().ok_or_else(|| {
                     mcp_error(
                         error_codes::TOOL_INTERNAL_ERROR,
@@ -1617,7 +1688,30 @@ impl SynapseService {
                     )
                 })?;
                 if har.clear_existing_replay {
+                    super::operator_panic_boundary::ensure_mcp_mutation(
+                        "browser_network_har_before_clear_existing_replay",
+                    )?;
                     cleared_replay_route_count = clear_har_replay_routes(cdp_target_id)?;
+                    if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                        "browser_network_har_after_clear_existing_replay",
+                    ) {
+                        return match rollback_har_replay_snapshot(
+                            &endpoint,
+                            cdp_target_id,
+                            &prior_replay_rules,
+                            &[],
+                            prior_fetch_armed,
+                        )
+                        .await
+                        {
+                            Ok(()) => Err(panic_error),
+                            Err(cleanup_error) => Err(operator_panic_route_rollback_failed(
+                                "browser_network_har_after_clear_existing_replay",
+                                panic_error,
+                                cleanup_error,
+                            )),
+                        };
+                    }
                 }
                 let replay = load_har_replay(path, har.filters.limit, har.missing_policy)?;
                 har_bytes = replay.source_bytes;
@@ -1626,6 +1720,9 @@ impl SynapseService {
                 replay_route_count = replay.rules.len();
                 missing_abort_route_installed = replay.missing_abort_route_installed;
 
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_network_har_before_fetch_interception",
+                )?;
                 let ensure =
                     synapse_a11y::fetch_interception_ensure(&endpoint, cdp_target_id, Vec::new())
                         .await
@@ -1635,7 +1732,49 @@ impl SynapseService {
                                 format!("{HAR_TOOL} raw CDP Fetch interception failed: {error}"),
                             )
                         })?;
+                let mut installed_route_ids = Vec::new();
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_network_har_after_fetch_interception",
+                ) {
+                    return match rollback_har_replay_snapshot(
+                        &endpoint,
+                        cdp_target_id,
+                        &prior_replay_rules,
+                        &installed_route_ids,
+                        prior_fetch_armed,
+                    )
+                    .await
+                    {
+                        Ok(()) => Err(panic_error),
+                        Err(cleanup_error) => Err(operator_panic_route_rollback_failed(
+                            "browser_network_har_after_fetch_interception",
+                            panic_error,
+                            cleanup_error,
+                        )),
+                    };
+                }
                 for rule in replay.rules {
+                    if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                        "browser_network_har_before_replay_route_add",
+                    ) {
+                        return match rollback_har_replay_snapshot(
+                            &endpoint,
+                            cdp_target_id,
+                            &prior_replay_rules,
+                            &installed_route_ids,
+                            prior_fetch_armed,
+                        )
+                        .await
+                        {
+                            Ok(()) => Err(panic_error),
+                            Err(cleanup_error) => Err(operator_panic_route_rollback_failed(
+                                "browser_network_har_before_replay_route_add",
+                                panic_error,
+                                cleanup_error,
+                            )),
+                        };
+                    }
+                    let route_id = rule.id.clone();
                     let mut status =
                         synapse_a11y::fetch_route_add(cdp_target_id, rule).map_err(|error| {
                             mcp_error(
@@ -1643,12 +1782,83 @@ impl SynapseService {
                                 format!("{HAR_TOOL} raw CDP Fetch route add failed: {error}"),
                             )
                         })?;
+                    installed_route_ids.push(route_id);
                     status.newly_armed = ensure.newly_armed;
+                    if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                        "browser_network_har_after_replay_route_add",
+                    ) {
+                        return match rollback_har_replay_snapshot(
+                            &endpoint,
+                            cdp_target_id,
+                            &prior_replay_rules,
+                            &installed_route_ids,
+                            prior_fetch_armed,
+                        )
+                        .await
+                        {
+                            Ok(()) => Err(panic_error),
+                            Err(cleanup_error) => Err(operator_panic_route_rollback_failed(
+                                "browser_network_har_after_replay_route_add",
+                                panic_error,
+                                cleanup_error,
+                            )),
+                        };
+                    }
                 }
             }
             BrowserNetworkHarOperation::ClearReplay => {
+                let prior_fetch_armed =
+                    synapse_a11y::fetch_interception_status(cdp_target_id).is_some();
+                let prior_replay_rules = synapse_a11y::fetch_route_rules(cdp_target_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|rule| rule.id.starts_with(HAR_REPLAY_ROUTE_PREFIX))
+                    .collect::<Vec<_>>();
+                super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_network_har_before_clear_replay",
+                )?;
                 cleared_replay_route_count = clear_har_replay_routes(cdp_target_id)?;
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_network_har_after_clear_replay_routes",
+                ) {
+                    return match rollback_har_replay_snapshot(
+                        &endpoint,
+                        cdp_target_id,
+                        &prior_replay_rules,
+                        &[],
+                        prior_fetch_armed,
+                    )
+                    .await
+                    {
+                        Ok(()) => Err(panic_error),
+                        Err(cleanup_error) => Err(operator_panic_route_rollback_failed(
+                            "browser_network_har_after_clear_replay_routes",
+                            panic_error,
+                            cleanup_error,
+                        )),
+                    };
+                }
                 stop_fetch_if_no_routes(cdp_target_id).await?;
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_network_har_after_clear_replay",
+                ) {
+                    return match rollback_har_replay_snapshot(
+                        &endpoint,
+                        cdp_target_id,
+                        &prior_replay_rules,
+                        &[],
+                        prior_fetch_armed,
+                    )
+                    .await
+                    {
+                        Ok(()) => Err(panic_error),
+                        Err(cleanup_error) => Err(operator_panic_route_rollback_failed(
+                            "browser_network_har_after_clear_replay",
+                            panic_error,
+                            cleanup_error,
+                        )),
+                    };
+                }
             }
         }
 
@@ -1844,6 +2054,11 @@ impl SynapseService {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
             return Err(browser_raw_cdp_required_error(OVERRIDES_TOOL, window_hwnd));
         };
+        if overrides.operation != BrowserNetworkOverridesOperation::Get {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_network_overrides_before_mutation",
+            )?;
+        }
         let (status, cleared) = match overrides.operation {
             BrowserNetworkOverridesOperation::Set => {
                 let status = synapse_a11y::network_overrides_apply(
@@ -1879,6 +2094,11 @@ impl SynapseService {
                 (status, cleared)
             }
         };
+        if overrides.operation != BrowserNetworkOverridesOperation::Get {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_network_overrides_after_mutation",
+            )?;
+        }
         tracing::info!(
             code = "CDP_BACKGROUND_NETWORK_OVERRIDES",
             session_id = %session_id,
@@ -1928,6 +2148,33 @@ impl SynapseService {
         };
         let mut route_removed = false;
         let mut cleared_count = 0usize;
+        let route_add_snapshot = match route.operation {
+            BrowserRouteOperation::AddFulfill
+            | BrowserRouteOperation::AddAbort
+            | BrowserRouteOperation::AddContinue => {
+                let new_rule = route.route.as_ref().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("{ROUTE_TOOL} add route was not normalized"),
+                    )
+                })?;
+                let prior_rule = synapse_a11y::fetch_route_rules(cdp_target_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|rule| rule.id == new_rule.id);
+                Some((
+                    new_rule.id.clone(),
+                    prior_rule,
+                    synapse_a11y::fetch_interception_status(cdp_target_id).is_some(),
+                ))
+            }
+            BrowserRouteOperation::Remove
+            | BrowserRouteOperation::Clear
+            | BrowserRouteOperation::List => None,
+        };
+        if route.operation != BrowserRouteOperation::List {
+            super::operator_panic_boundary::ensure_mcp_mutation("browser_route_before_mutation")?;
+        }
         let fetch_status = match route.operation {
             BrowserRouteOperation::AddFulfill
             | BrowserRouteOperation::AddAbort
@@ -1941,6 +2188,30 @@ impl SynapseService {
                                 format!("{ROUTE_TOOL} raw CDP Fetch interception failed: {error}"),
                             )
                         })?;
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_route_after_fetch_interception",
+                ) {
+                    let Some((route_id, prior_rule, prior_fetch_armed)) =
+                        route_add_snapshot.as_ref()
+                    else {
+                        return Err(operator_panic_route_snapshot_missing(
+                            self,
+                            "browser_route_after_fetch_interception",
+                            panic_error,
+                            cdp_target_id,
+                        ));
+                    };
+                    return Err(rollback_single_fetch_route_after_operator_panic(
+                        "browser_route_after_fetch_interception",
+                        panic_error,
+                        &endpoint,
+                        cdp_target_id,
+                        route_id,
+                        prior_rule.as_ref(),
+                        *prior_fetch_armed,
+                    )
+                    .await);
+                }
                 let normalized_route = route.route.clone().ok_or_else(|| {
                     mcp_error(
                         error_codes::TOOL_INTERNAL_ERROR,
@@ -1954,6 +2225,30 @@ impl SynapseService {
                             format!("{ROUTE_TOOL} raw CDP Fetch route add failed: {error}"),
                         )
                     })?;
+                if let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
+                    "browser_route_after_route_add",
+                ) {
+                    let Some((route_id, prior_rule, prior_fetch_armed)) =
+                        route_add_snapshot.as_ref()
+                    else {
+                        return Err(operator_panic_route_snapshot_missing(
+                            self,
+                            "browser_route_after_route_add",
+                            panic_error,
+                            cdp_target_id,
+                        ));
+                    };
+                    return Err(rollback_single_fetch_route_after_operator_panic(
+                        "browser_route_after_route_add",
+                        panic_error,
+                        &endpoint,
+                        cdp_target_id,
+                        route_id,
+                        prior_rule.as_ref(),
+                        *prior_fetch_armed,
+                    )
+                    .await);
+                }
                 status.newly_armed = ensure.newly_armed;
                 browser_route_fetch_status_from_a11y(Some(status), true)
             }
@@ -2009,6 +2304,26 @@ impl SynapseService {
                 browser_route_fetch_status_from_a11y(status, fetch_armed)
             }
         };
+        if route.operation != BrowserRouteOperation::List {
+            if let Err(panic_error) =
+                super::operator_panic_boundary::ensure_mcp_mutation("browser_route_after_mutation")
+            {
+                if let Some((route_id, prior_rule, prior_fetch_armed)) = route_add_snapshot.as_ref()
+                {
+                    return Err(rollback_single_fetch_route_after_operator_panic(
+                        "browser_route_after_mutation",
+                        panic_error,
+                        &endpoint,
+                        cdp_target_id,
+                        route_id,
+                        prior_rule.as_ref(),
+                        *prior_fetch_armed,
+                    )
+                    .await);
+                }
+                return Err(panic_error);
+            }
+        }
         let routes = synapse_a11y::fetch_route_rules(cdp_target_id)
             .unwrap_or_default()
             .iter()
@@ -3630,6 +3945,163 @@ fn clear_har_replay_routes(cdp_target_id: &str) -> Result<usize, ErrorData> {
         }
     }
     Ok(removed)
+}
+
+async fn rollback_fetch_route_ids(
+    cdp_target_id: &str,
+    route_ids: &[String],
+    stop_if_empty: bool,
+) -> Result<(), String> {
+    let mut failures = Vec::new();
+    for route_id in route_ids.iter().rev() {
+        match synapse_a11y::fetch_route_remove(cdp_target_id, route_id) {
+            Ok(true) => {}
+            Ok(false) => failures.push(format!("route {route_id:?} was absent during rollback")),
+            Err(error) => failures.push(format!("remove route {route_id:?}: {error}")),
+        }
+    }
+    if stop_if_empty
+        && synapse_a11y::fetch_route_rules(cdp_target_id)
+            .unwrap_or_default()
+            .is_empty()
+        && synapse_a11y::fetch_interception_status(cdp_target_id).is_some()
+        && let Err(error) = synapse_a11y::fetch_interception_stop(cdp_target_id).await
+    {
+        failures.push(format!("disable empty Fetch interception: {error}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+async fn rollback_single_fetch_route_snapshot(
+    endpoint: &str,
+    cdp_target_id: &str,
+    route_id: &str,
+    prior_rule: Option<&synapse_a11y::CdpFetchRouteRule>,
+    prior_fetch_armed: bool,
+) -> Result<(), String> {
+    if synapse_a11y::fetch_route_rules(cdp_target_id)
+        .unwrap_or_default()
+        .iter()
+        .any(|rule| rule.id == route_id)
+    {
+        synapse_a11y::fetch_route_remove(cdp_target_id, route_id)
+            .map_err(|error| format!("remove added route {route_id:?}: {error}"))?;
+    }
+    if let Some(prior_rule) = prior_rule {
+        synapse_a11y::fetch_interception_ensure(endpoint, cdp_target_id, Vec::new())
+            .await
+            .map_err(|error| format!("restore Fetch interception: {error}"))?;
+        synapse_a11y::fetch_route_add(cdp_target_id, prior_rule.clone())
+            .map_err(|error| format!("restore route {route_id:?}: {error}"))?;
+    }
+    let restored = synapse_a11y::fetch_route_rules(cdp_target_id)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|rule| rule.id == route_id);
+    if restored.is_some() != prior_rule.is_some() {
+        return Err(format!(
+            "route {route_id:?} presence mismatch after rollback: expected_prior={} actual={}",
+            prior_rule.is_some(),
+            restored.is_some()
+        ));
+    }
+    let fetch_armed = synapse_a11y::fetch_interception_status(cdp_target_id).is_some();
+    if prior_fetch_armed && !fetch_armed {
+        synapse_a11y::fetch_interception_ensure(endpoint, cdp_target_id, Vec::new())
+            .await
+            .map_err(|error| format!("re-arm prior Fetch interception: {error}"))?;
+    } else if !prior_fetch_armed && fetch_armed {
+        synapse_a11y::fetch_interception_stop(cdp_target_id)
+            .await
+            .map_err(|error| format!("restore prior disabled Fetch interception: {error}"))?;
+    }
+    let restored_fetch_armed = synapse_a11y::fetch_interception_status(cdp_target_id).is_some();
+    if restored_fetch_armed != prior_fetch_armed {
+        return Err(format!(
+            "Fetch interception readback mismatch after rollback: expected_prior={prior_fetch_armed} actual={restored_fetch_armed}"
+        ));
+    }
+    Ok(())
+}
+
+async fn rollback_single_fetch_route_after_operator_panic(
+    stage: &'static str,
+    panic_error: ErrorData,
+    endpoint: &str,
+    cdp_target_id: &str,
+    route_id: &str,
+    prior_rule: Option<&synapse_a11y::CdpFetchRouteRule>,
+    prior_fetch_armed: bool,
+) -> ErrorData {
+    match rollback_single_fetch_route_snapshot(
+        endpoint,
+        cdp_target_id,
+        route_id,
+        prior_rule,
+        prior_fetch_armed,
+    )
+    .await
+    {
+        Ok(()) => panic_error,
+        Err(cleanup_error) => {
+            operator_panic_route_rollback_failed(stage, panic_error, cleanup_error)
+        }
+    }
+}
+
+async fn rollback_har_replay_snapshot(
+    endpoint: &str,
+    cdp_target_id: &str,
+    prior_rules: &[synapse_a11y::CdpFetchRouteRule],
+    installed_route_ids: &[String],
+    prior_fetch_armed: bool,
+) -> Result<(), String> {
+    rollback_fetch_route_ids(cdp_target_id, installed_route_ids, false).await?;
+    if !prior_rules.is_empty() {
+        synapse_a11y::fetch_interception_ensure(endpoint, cdp_target_id, Vec::new())
+            .await
+            .map_err(|error| format!("restore Fetch interception: {error}"))?;
+        for rule in prior_rules {
+            synapse_a11y::fetch_route_add(cdp_target_id, rule.clone())
+                .map_err(|error| format!("restore route {:?}: {error}", rule.id))?;
+        }
+    }
+    let expected_ids = prior_rules
+        .iter()
+        .map(|rule| rule.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual_rules = synapse_a11y::fetch_route_rules(cdp_target_id).unwrap_or_default();
+    let actual_ids = actual_rules
+        .iter()
+        .filter(|rule| rule.id.starts_with(HAR_REPLAY_ROUTE_PREFIX))
+        .map(|rule| rule.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual_ids != expected_ids {
+        return Err(format!(
+            "HAR route-id readback mismatch after rollback: expected={expected_ids:?} actual={actual_ids:?}"
+        ));
+    }
+    let fetch_armed = synapse_a11y::fetch_interception_status(cdp_target_id).is_some();
+    if prior_fetch_armed && !fetch_armed {
+        synapse_a11y::fetch_interception_ensure(endpoint, cdp_target_id, Vec::new())
+            .await
+            .map_err(|error| format!("re-arm prior Fetch interception: {error}"))?;
+    } else if !prior_fetch_armed && fetch_armed {
+        synapse_a11y::fetch_interception_stop(cdp_target_id)
+            .await
+            .map_err(|error| format!("restore prior disabled Fetch interception: {error}"))?;
+    }
+    let restored_fetch_armed = synapse_a11y::fetch_interception_status(cdp_target_id).is_some();
+    if restored_fetch_armed != prior_fetch_armed {
+        return Err(format!(
+            "Fetch interception readback mismatch after HAR rollback: expected_prior={prior_fetch_armed} actual={restored_fetch_armed}"
+        ));
+    }
+    Ok(())
 }
 
 async fn stop_fetch_if_no_routes(cdp_target_id: &str) -> Result<(), ErrorData> {

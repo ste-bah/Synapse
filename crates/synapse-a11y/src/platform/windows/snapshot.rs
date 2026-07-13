@@ -6,7 +6,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use synapse_core::{AccessibleNode, AccessibleSubtree, ElementId, Point, UiaPattern, element_id};
+use synapse_core::{
+    AccessibleNode, AccessibleSubtree, ElementId, Point, UiaPattern, element_id,
+    win32_hwnd::{hwnd_from_wire, hwnd_to_wire, native_hwnds_equal},
+};
 use uiautomation::{
     UIAutomation, UIElement,
     core::{UICacheRequest, UICondition, UITreeWalker},
@@ -79,14 +82,7 @@ pub fn snapshot(root: &UIElement, depth: u32) -> A11yResult<AccessibleSubtree> {
 }
 
 pub fn snapshot_window_from_hwnd(hwnd: i64, depth: u32) -> A11yResult<AccessibleSubtree> {
-    if hwnd == 0 {
-        return Err(A11yError::NoForeground {
-            detail: "HWND was null".to_owned(),
-        });
-    }
-    let hwnd = isize::try_from(hwnd).map_err(|err| A11yError::InvalidElementId {
-        detail: err.to_string(),
-    })?;
+    let hwnd = native_hwnd_value(hwnd)?;
     with_automation_operation(
         format!("snapshot_window_from_hwnd hwnd=0x{hwnd:x} depth={depth}"),
         SNAPSHOT_WORKER_REPLY_TIMEOUT,
@@ -148,7 +144,7 @@ pub fn focused_element_node() -> A11yResult<AccessibleNode> {
         let foreground_hwnd = unsafe { GetForegroundWindow() };
         let root_hwnd = cached_hwnd(&element)
             .filter(|value| *value != 0)
-            .unwrap_or(foreground_hwnd.0 as isize as i64);
+            .unwrap_or_else(|| hwnd_to_wire(foreground_hwnd.0 as isize));
         node_from_cached_element(&element, None, 0, root_hwnd, 0)
     })
 }
@@ -201,7 +197,7 @@ pub fn focused_element_node_in_window(hwnd: i64) -> A11yResult<Option<Accessible
     }
 
     let focus_raw = focus.0 as isize;
-    let target_raw = target.0 as isize as i64;
+    let target_raw = hwnd_to_wire(target.0 as isize);
     with_automation_operation(
         format!(
             "focused_element_node_in_window target=0x{:x} focus=0x{focus_raw:x}",
@@ -255,14 +251,7 @@ pub fn find_by_name_and_pattern_in_window(
     pattern: UiaPattern,
     scope: ElementSearchScope,
 ) -> A11yResult<Option<AccessibleNode>> {
-    if hwnd == 0 {
-        return Err(A11yError::NoForeground {
-            detail: "HWND was null".to_owned(),
-        });
-    }
-    let hwnd = isize::try_from(hwnd).map_err(|err| A11yError::InvalidElementId {
-        detail: err.to_string(),
-    })?;
+    let hwnd = native_hwnd_value(hwnd)?;
     with_automation_operation(
         format!(
             "find_by_name_and_pattern_in_window hwnd=0x{hwnd:x} scope={scope:?} pattern={pattern:?}"
@@ -282,12 +271,10 @@ pub fn chromium_renderer_accessibility_nodes_from_window(
     depth: u32,
     max_nodes: usize,
 ) -> A11yResult<Vec<AccessibleNode>> {
-    if hwnd == 0 || max_nodes == 0 {
+    if max_nodes == 0 {
         return Ok(Vec::new());
     }
-    let hwnd = isize::try_from(hwnd).map_err(|err| A11yError::InvalidElementId {
-        detail: err.to_string(),
-    })?;
+    let hwnd = native_hwnd_value(hwnd)?;
     with_automation_operation(
         format!(
             "chromium_renderer_accessibility_nodes_from_window hwnd=0x{hwnd:x} depth={depth} max_nodes={max_nodes}"
@@ -410,12 +397,8 @@ fn find_by_name_and_pattern_from_root(
 }
 
 fn valid_hwnd(hwnd: i64) -> A11yResult<HWND> {
-    let hwnd = HWND(hwnd as *mut c_void);
-    if hwnd.0.is_null() {
-        return Err(A11yError::NoForeground {
-            detail: "HWND was null".to_owned(),
-        });
-    }
+    let native = native_hwnd_value(hwnd)?;
+    let hwnd = HWND(native as *mut c_void);
     if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
         Ok(hwnd)
     } else {
@@ -425,20 +408,32 @@ fn valid_hwnd(hwnd: i64) -> A11yResult<HWND> {
     }
 }
 
+fn native_hwnd_value(hwnd: i64) -> A11yResult<isize> {
+    hwnd_from_wire(hwnd).ok_or_else(|| A11yError::NoForeground {
+        detail: format!(
+            "HWND wire value {hwnd} is outside the canonical Win32 USER-handle range 1..=4294967295"
+        ),
+    })
+}
+
 fn focus_belongs_to_target(target: HWND, focus: HWND) -> bool {
-    if target.0 == focus.0 {
+    if same_native_hwnd(target, focus) {
         return true;
     }
     let target_root = ancestor_or_self(target, GA_ROOT);
     let focus_root = ancestor_or_self(focus, GA_ROOT);
-    if focus_root.0 == target_root.0 {
+    if same_native_hwnd(focus_root, target_root) {
         return true;
     }
     let target_owner = ancestor_or_self(target, GA_ROOTOWNER);
     let focus_owner = ancestor_or_self(focus, GA_ROOTOWNER);
-    focus_owner.0 == target_root.0
-        || focus_owner.0 == target_owner.0
+    same_native_hwnd(focus_owner, target_root)
+        || same_native_hwnd(focus_owner, target_owner)
         || owner_chain_contains(focus_root, target_root, target_owner)
+}
+
+fn same_native_hwnd(left: HWND, right: HWND) -> bool {
+    native_hwnds_equal(left.0 as isize, right.0 as isize)
 }
 
 fn ancestor_or_self(
@@ -458,11 +453,11 @@ fn owner_chain_contains(mut hwnd: HWND, target_root: HWND, target_owner: HWND) -
         if owner.0.is_null() {
             return false;
         }
-        if owner.0 == target_root.0 || owner.0 == target_owner.0 {
+        if same_native_hwnd(owner, target_root) || same_native_hwnd(owner, target_owner) {
             return true;
         }
         let owner_root = ancestor_or_self(owner, GA_ROOT);
-        if owner_root.0 == target_root.0 || owner_root.0 == target_owner.0 {
+        if same_native_hwnd(owner_root, target_root) || same_native_hwnd(owner_root, target_owner) {
             return true;
         }
         hwnd = owner;

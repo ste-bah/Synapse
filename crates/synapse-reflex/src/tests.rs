@@ -28,7 +28,7 @@ fn spawn_retains_runtime_inputs_and_action_handle() -> Result<(), Box<dyn Error>
 
     let runtime = ReflexRuntime::spawn(Arc::clone(&db), action_handle, EventBus::default())?;
     runtime.action_handle().try_execute(Action::ReleaseAll)?;
-    let (queued_action, _ack) = action_rx.try_recv()?;
+    let (queued_action, _ack, _operator_panic_epoch_at_enqueue) = action_rx.try_recv()?;
 
     assert_eq!(runtime.schema_version(), TEST_SCHEMA_VERSION);
     assert_eq!(queued_action, Action::ReleaseAll);

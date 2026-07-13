@@ -48,9 +48,15 @@ struct InputLease {
     acquired_at: Instant,
     renewed_at: Instant,
     ttl: Duration,
+    operator_panic_generation: Option<u64>,
 }
 
 impl InputLease {
+    fn is_tagged_operator_panic(&self) -> bool {
+        self.owner_session_id == OPERATOR_LEASE_OWNER_SESSION_ID
+            && self.operator_panic_generation.is_some()
+    }
+
     fn is_expired(&self, now: Instant) -> bool {
         now.duration_since(self.renewed_at) >= self.ttl
     }
@@ -84,6 +90,17 @@ pub struct LeaseStatus {
     pub renewed_at_ms_ago: Option<u64>,
     pub ttl_ms: Option<u64>,
     pub expires_in_ms: Option<u64>,
+}
+
+/// One-lock safety readback of the visible lease plus its private physical
+/// panic-generation tag. Consumers must use this instead of composing
+/// [`status`] and [`operator_panic_lease_generation`] across two lock
+/// acquisitions, because a concurrent exact finalizer can change the lease
+/// between those reads.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct LeaseSafetySnapshot {
+    pub status: LeaseStatus,
+    pub operator_panic_generation: Option<u64>,
 }
 
 impl LeaseStatus {
@@ -234,15 +251,20 @@ pub fn ttl_from_ms(ms: u64) -> Duration {
 /// Drops the stored lease if its TTL has lapsed and records the expired owner
 /// until its held-input ledger has been drained. Caller holds the lease lock.
 fn expire_if_lapsed(guard: &mut Option<InputLease>, now: Instant) -> Option<LeaseStatus> {
+    let operator_panic_safety_pending = crate::hotkey::operator_panic_safety_pending();
     let expired = guard
         .as_ref()
-        .filter(|lease| lease.is_expired(now))
+        .filter(|lease| lease_can_expire(lease, now, operator_panic_safety_pending))
         .map(|lease| lease.status(now));
     if let Some(status) = expired.clone() {
         *guard = None;
         remember_expired_cleanup(&status);
     }
     expired
+}
+
+fn lease_can_expire(lease: &InputLease, now: Instant, operator_panic_safety_pending: bool) -> bool {
+    lease.is_expired(now) && !(lease.is_tagged_operator_panic() && operator_panic_safety_pending)
 }
 
 fn remember_expired_cleanup(status: &LeaseStatus) {
@@ -308,7 +330,9 @@ pub fn try_acquire(session_id: &str, ttl: Duration) -> LeaseOutcome {
         };
     }
     let outcome = match guard.as_mut() {
-        Some(lease) if lease.owner_session_id == session_id => {
+        Some(lease)
+            if lease.owner_session_id == session_id && !lease.is_tagged_operator_panic() =>
+        {
             lease.renewed_at = now;
             lease.ttl = ttl;
             LeaseOutcome::Renewed(lease.status(now))
@@ -327,6 +351,7 @@ pub fn try_acquire(session_id: &str, ttl: Duration) -> LeaseOutcome {
                 acquired_at: now,
                 renewed_at: now,
                 ttl,
+                operator_panic_generation: None,
             };
             let status = lease.status(now);
             *guard = Some(lease);
@@ -348,7 +373,9 @@ pub fn renew(session_id: &str, ttl: Option<Duration>) -> Result<LeaseStatus, Lea
     let mut guard = lock();
     let _expired = expire_if_lapsed(&mut guard, now);
     match guard.as_mut() {
-        Some(lease) if lease.owner_session_id == session_id => {
+        Some(lease)
+            if lease.owner_session_id == session_id && !lease.is_tagged_operator_panic() =>
+        {
             lease.renewed_at = now;
             if let Some(ttl) = ttl {
                 lease.ttl = ttl;
@@ -372,7 +399,9 @@ pub fn release(session_id: &str) -> Result<LeaseStatus, LeaseError> {
     let mut guard = lock();
     let _expired = expire_if_lapsed(&mut guard, now);
     let result = match guard.as_ref() {
-        Some(lease) if lease.owner_session_id == session_id => {
+        Some(lease)
+            if lease.owner_session_id == session_id && !lease.is_tagged_operator_panic() =>
+        {
             *guard = None;
             Ok(LeaseStatus::unheld())
         }
@@ -402,12 +431,15 @@ pub fn handoff(
     let mut guard = lock();
     let _expired = expire_if_lapsed(&mut guard, now);
     match guard.as_mut() {
-        Some(lease) if lease.owner_session_id == from_session_id => {
+        Some(lease)
+            if lease.owner_session_id == from_session_id && !lease.is_tagged_operator_panic() =>
+        {
             let prior = lease.status(now);
             to_session_id.clone_into(&mut lease.owner_session_id);
             lease.acquired_at = now;
             lease.renewed_at = now;
             lease.ttl = ttl;
+            lease.operator_panic_generation = None;
             let current = lease.status(now);
             Ok(LeaseHandoff { prior, current })
         }
@@ -425,9 +457,9 @@ pub fn handoff(
 #[must_use]
 pub fn release_if_owner(session_id: &str) -> bool {
     let mut guard = lock();
-    let released = guard
-        .as_ref()
-        .is_some_and(|lease| lease.owner_session_id == session_id);
+    let released = guard.as_ref().is_some_and(|lease| {
+        lease.owner_session_id == session_id && !lease.is_tagged_operator_panic()
+    });
     if released {
         *guard = None;
     }
@@ -438,10 +470,57 @@ pub fn release_if_owner(session_id: &str) -> bool {
 /// Operator override: transfers the lease to the operator (e.g. panic hotkey).
 ///
 /// Returns the prior holder's snapshot, if any, so the preemption can be logged.
+#[must_use]
 pub fn force_preempt(reason: &str) -> Option<LeaseStatus> {
+    force_preempt_with_generation(reason, None)
+}
+
+/// Physical operator-panic override tagged with its exact published
+/// generation. K2 completion uses that tag so an older task can never clear a
+/// newer panic generation's operator lease.
+#[must_use]
+pub fn force_preempt_operator_panic(reason: &str, generation: u64) -> Option<LeaseStatus> {
+    force_preempt_with_generation(reason, Some(generation))
+}
+
+fn force_preempt_with_generation(
+    reason: &str,
+    operator_panic_generation: Option<u64>,
+) -> Option<LeaseStatus> {
     let now = Instant::now();
     let mut guard = lock();
     let prior = guard.as_ref().map(|lease| lease.status(now));
+    if let Some(requested_generation) = operator_panic_generation
+        && let Some(retained_generation) = guard
+            .as_ref()
+            .filter(|lease| lease.is_tagged_operator_panic())
+            .and_then(|lease| lease.operator_panic_generation)
+        && retained_generation > requested_generation
+    {
+        tracing::warn!(
+            reason,
+            requested_operator_panic_generation = requested_generation,
+            retained_operator_panic_generation = retained_generation,
+            "stale operator-panic preemption refused to overwrite a newer tagged lease"
+        );
+        drop(guard);
+        return prior;
+    }
+    if operator_panic_generation.is_none()
+        && guard
+            .as_ref()
+            .is_some_and(InputLease::is_tagged_operator_panic)
+    {
+        tracing::warn!(
+            reason,
+            retained_operator_panic_generation = ?guard
+                .as_ref()
+                .and_then(|lease| lease.operator_panic_generation),
+            "generic fail-closed preemption retained the exact operator-panic lease tag"
+        );
+        drop(guard);
+        return prior;
+    }
     if let Some(prior) = &prior {
         tracing::warn!(
             code = error_codes::ACTION_FOREGROUND_LEASE_BUSY,
@@ -455,18 +534,90 @@ pub fn force_preempt(reason: &str) -> Option<LeaseStatus> {
         acquired_at: now,
         renewed_at: now,
         ttl: ttl_from_ms(OPERATOR_PREEMPT_LEASE_TTL_MS),
+        operator_panic_generation,
     });
     prior
 }
 
-/// Unconditionally clears the process-global lease.
+/// Separate exact readback of the generation tag on the current physical
+/// operator-panic lease. Returns `None` for an unheld, expired, agent-owned, or
+/// generic fail-closed operator lease.
+#[must_use]
+pub fn operator_panic_lease_generation() -> Option<u64> {
+    safety_snapshot().operator_panic_generation
+}
+
+/// Reads lease ownership and the exact operator-panic tag under one lock.
+#[must_use]
+pub fn safety_snapshot() -> LeaseSafetySnapshot {
+    let now = Instant::now();
+    let mut guard = lock();
+    let _expired = expire_if_lapsed(&mut guard, now);
+    let operator_panic_generation = guard.as_ref().and_then(|lease| {
+        (lease.owner_session_id == OPERATOR_LEASE_OWNER_SESSION_ID)
+            .then_some(lease.operator_panic_generation)
+            .flatten()
+    });
+    let status = guard
+        .as_ref()
+        .map_or_else(LeaseStatus::unheld, |lease| lease.status(now));
+    drop(guard);
+    LeaseSafetySnapshot {
+        status,
+        operator_panic_generation,
+    }
+}
+
+/// Clears only the operator lease installed by the named panic generation.
+/// A newer K1 generation is therefore immune to an older K2 completion.
+pub fn force_clear_operator_panic_generation(generation: u64, reason: &str) -> Option<LeaseStatus> {
+    let now = Instant::now();
+    let mut guard = lock();
+    let _expired = expire_if_lapsed(&mut guard, now);
+    let prior = guard
+        .as_ref()
+        .filter(|lease| {
+            lease.owner_session_id == OPERATOR_LEASE_OWNER_SESSION_ID
+                && lease.operator_panic_generation == Some(generation)
+        })
+        .map(|lease| lease.status(now));
+    if prior.is_some() {
+        *guard = None;
+    }
+    drop(guard);
+    if prior.is_some() {
+        tracing::warn!(
+            reason,
+            operator_panic_generation = generation,
+            "exact operator panic generation lease cleared"
+        );
+    }
+    prior
+}
+
+/// Clears the process-global lease unless it is owned by an exact physical
+/// operator-panic generation.
 ///
 /// This is intentionally separate from [`force_preempt`]: operator preemption
 /// must leave a visible, bounded operator holder so agents fail closed instead
-/// of immediately reacquiring the foreground resource.
+/// of immediately reacquiring the foreground resource. A tagged panic lease
+/// can only be cleared through [`force_clear_operator_panic_generation`].
 pub fn force_clear(reason: &str) -> Option<LeaseStatus> {
     let now = Instant::now();
     let mut guard = lock();
+    if guard
+        .as_ref()
+        .is_some_and(InputLease::is_tagged_operator_panic)
+    {
+        tracing::warn!(
+            reason,
+            retained_operator_panic_generation = ?guard
+                .as_ref()
+                .and_then(|lease| lease.operator_panic_generation),
+            "generic force-clear refused to clear an exact operator-panic lease"
+        );
+        return None;
+    }
     let prior = guard.as_ref().map(|lease| lease.status(now));
     *guard = None;
     drop(guard);
@@ -491,7 +642,7 @@ pub fn force_clear_if_owner(session_id: &str, reason: &str) -> Option<LeaseStatu
     let _expired = expire_if_lapsed(&mut guard, now);
     let prior = guard
         .as_ref()
-        .filter(|lease| lease.owner_session_id == session_id)
+        .filter(|lease| lease.owner_session_id == session_id && !lease.is_tagged_operator_panic())
         .map(|lease| lease.status(now));
     if prior.is_some() {
         *guard = None;
@@ -534,18 +685,22 @@ mod tests {
 
     fn serial() -> MutexGuard<'static, ()> {
         let guard = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
-        let _prior = force_clear("test_reset");
+        reset();
         guard
     }
 
     fn reset() {
+        if let Some(generation) = operator_panic_lease_generation() {
+            let _prior =
+                force_clear_operator_panic_generation(generation, "test_exact_panic_reset");
+        }
         let _prior = force_clear("test_reset");
     }
 
     #[test]
     fn acquire_then_status_reports_holder() {
         let _serial = serial();
-        let session = "fsv-acquire";
+        let session = "regression-acquire";
         let outcome = try_acquire(session, ttl_from_ms(5_000));
         assert!(matches!(outcome, LeaseOutcome::Acquired(_)));
         let status = status();
@@ -557,7 +712,7 @@ mod tests {
     #[test]
     fn same_session_renews_not_busy() {
         let _serial = serial();
-        let session = "fsv-renew";
+        let session = "regression-renew";
         let _first = try_acquire(session, ttl_from_ms(5_000));
         let second = try_acquire(session, ttl_from_ms(5_000));
         assert!(matches!(second, LeaseOutcome::Renewed(_)));
@@ -569,8 +724,8 @@ mod tests {
     #[test]
     fn contended_acquire_returns_busy_with_holder() {
         let _serial = serial();
-        let owner = "fsv-busy-owner";
-        let contender = "fsv-busy-contender";
+        let owner = "regression-busy-owner";
+        let contender = "regression-busy-contender";
         let _held = try_acquire(owner, ttl_from_ms(5_000));
         match try_acquire(contender, ttl_from_ms(5_000)) {
             LeaseOutcome::Busy { holder, .. } => {
@@ -584,8 +739,8 @@ mod tests {
     #[test]
     fn owner_release_frees_lease_for_others() {
         let _serial = serial();
-        let owner = "fsv-rel-owner";
-        let next = "fsv-rel-next";
+        let owner = "regression-rel-owner";
+        let next = "regression-rel-next";
         let _held = try_acquire(owner, ttl_from_ms(5_000));
         assert!(release(owner).is_ok());
         assert!(!status().held);
@@ -599,8 +754,8 @@ mod tests {
     #[test]
     fn handoff_transfers_without_unheld_gap() {
         let _serial = serial();
-        let owner = "fsv-handoff-owner";
-        let recipient = "fsv-handoff-recipient";
+        let owner = "regression-handoff-owner";
+        let recipient = "regression-handoff-recipient";
         let _held = try_acquire(owner, ttl_from_ms(5_000));
 
         let handoff = handoff(owner, recipient, ttl_from_ms(7_000)).unwrap();
@@ -627,9 +782,9 @@ mod tests {
     #[test]
     fn handoff_requires_current_owner() {
         let _serial = serial();
-        let owner = "fsv-handoff-owner";
-        let intruder = "fsv-handoff-intruder";
-        let recipient = "fsv-handoff-recipient";
+        let owner = "regression-handoff-owner";
+        let intruder = "regression-handoff-intruder";
+        let recipient = "regression-handoff-recipient";
         let _held = try_acquire(owner, ttl_from_ms(5_000));
 
         assert!(matches!(
@@ -644,8 +799,8 @@ mod tests {
     #[test]
     fn non_owner_release_and_renew_error() {
         let _serial = serial();
-        let owner = "fsv-nonowner-owner";
-        let intruder = "fsv-nonowner-intruder";
+        let owner = "regression-nonowner-owner";
+        let intruder = "regression-nonowner-intruder";
         let _held = try_acquire(owner, ttl_from_ms(5_000));
         assert!(matches!(release(intruder), Err(LeaseError::NotHeld { .. })));
         assert!(matches!(
@@ -660,8 +815,8 @@ mod tests {
     #[test]
     fn ttl_lapse_auto_releases() {
         let _serial = serial();
-        let owner = "fsv-ttl-owner";
-        let next = "fsv-ttl-next";
+        let owner = "regression-ttl-owner";
+        let next = "regression-ttl-next";
         let _held = try_acquire(owner, ttl_from_ms(MIN_LEASE_TTL_MS));
         std::thread::sleep(Duration::from_millis(MIN_LEASE_TTL_MS + 50));
         // Lazy expiry clears the holder but refuses a new owner until the
@@ -687,8 +842,8 @@ mod tests {
     #[test]
     fn release_if_owner_is_owner_scoped() {
         let _serial = serial();
-        let owner = "fsv-rio-owner";
-        let other = "fsv-rio-other";
+        let owner = "regression-rio-owner";
+        let other = "regression-rio-other";
         let _held = try_acquire(owner, ttl_from_ms(5_000));
         assert!(!release_if_owner(other));
         assert!(status().held);
@@ -722,7 +877,7 @@ mod tests {
     #[test]
     fn operator_preempt_transfers_lease_to_operator_holder() {
         let _serial = serial();
-        let owner = "fsv-operator-owner";
+        let owner = "regression-operator-owner";
         let _held = try_acquire(owner, ttl_from_ms(5_000));
 
         let prior = force_preempt("operator_preempt_test");
@@ -749,9 +904,186 @@ mod tests {
     }
 
     #[test]
+    fn older_panic_generation_cannot_clear_newer_operator_lease() {
+        let _serial = serial();
+        let owner = "generation-guard-owner";
+        let _held = try_acquire(owner, ttl_from_ms(5_000));
+        let _first = force_preempt_operator_panic("panic_generation_1", 1);
+        let _second = force_preempt_operator_panic("panic_generation_2", 2);
+
+        assert_eq!(operator_panic_lease_generation(), Some(2));
+        assert!(
+            force_clear_operator_panic_generation(1, "stale_k2_completion").is_none(),
+            "an older K2 owner must not clear the newer K1 lease"
+        );
+        assert_eq!(operator_panic_lease_generation(), Some(2));
+        assert_eq!(
+            status().owner_session_id.as_deref(),
+            Some(OPERATOR_LEASE_OWNER_SESSION_ID)
+        );
+
+        assert!(force_clear_operator_panic_generation(2, "current_k2_completion").is_some());
+        assert!(!status().held);
+        reset();
+    }
+
+    #[test]
+    fn stale_panic_preemption_cannot_overwrite_newer_operator_lease() {
+        let _serial = serial();
+        let _first = force_preempt_operator_panic("panic_generation_41", 41);
+
+        let stale_prior = force_preempt_operator_panic("late_generation_40_fallback", 40);
+        assert_eq!(
+            stale_prior
+                .as_ref()
+                .and_then(|status| status.owner_session_id.as_deref()),
+            Some(OPERATOR_LEASE_OWNER_SESSION_ID)
+        );
+        assert_eq!(operator_panic_lease_generation(), Some(41));
+
+        let _same_generation = force_preempt_operator_panic("same_generation_reassertion", 41);
+        assert_eq!(operator_panic_lease_generation(), Some(41));
+
+        let _new_generation = force_preempt_operator_panic("new_generation_42", 42);
+        assert_eq!(operator_panic_lease_generation(), Some(42));
+        assert!(force_clear_operator_panic_generation(42, "exact_finalizer").is_some());
+        reset();
+    }
+
+    #[test]
+    fn safety_snapshot_never_tears_status_from_generation_during_exact_clear() {
+        let _serial = serial();
+        for generation in 1..=64 {
+            let _prior = force_preempt_operator_panic("coherent_snapshot_setup", generation);
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let clear_barrier = std::sync::Arc::clone(&barrier);
+            let clear = std::thread::spawn(move || {
+                clear_barrier.wait();
+                let _cleared = force_clear_operator_panic_generation(
+                    generation,
+                    "coherent_snapshot_concurrent_clear",
+                );
+            });
+            barrier.wait();
+            let snapshot = safety_snapshot();
+            clear
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+
+            if snapshot.status.held {
+                assert_eq!(
+                    snapshot.status.owner_session_id.as_deref(),
+                    Some(OPERATOR_LEASE_OWNER_SESSION_ID)
+                );
+                assert_eq!(snapshot.operator_panic_generation, Some(generation));
+            } else {
+                assert_eq!(snapshot.operator_panic_generation, None);
+            }
+            let _cleanup =
+                force_clear_operator_panic_generation(generation, "coherent_snapshot_cleanup");
+        }
+        reset();
+    }
+
+    #[test]
+    fn generic_owner_string_mutations_cannot_erase_tagged_panic_lease() {
+        let _serial = serial();
+        let generation = 73;
+        let _panic = force_preempt_operator_panic("physical_panic", generation);
+
+        assert!(matches!(
+            try_acquire(
+                OPERATOR_LEASE_OWNER_SESSION_ID,
+                ttl_from_ms(DEFAULT_LEASE_TTL_MS)
+            ),
+            LeaseOutcome::Busy { .. }
+        ));
+        assert!(matches!(
+            renew(OPERATOR_LEASE_OWNER_SESSION_ID, None),
+            Err(LeaseError::NotHeld { .. })
+        ));
+        assert!(matches!(
+            release(OPERATOR_LEASE_OWNER_SESSION_ID),
+            Err(LeaseError::NotHeld { .. })
+        ));
+        assert!(matches!(
+            handoff(
+                OPERATOR_LEASE_OWNER_SESSION_ID,
+                "stale-dashboard-recipient",
+                ttl_from_ms(DEFAULT_LEASE_TTL_MS)
+            ),
+            Err(LeaseError::NotHeld { .. })
+        ));
+        assert!(!release_if_owner(OPERATOR_LEASE_OWNER_SESSION_ID));
+        assert!(
+            force_clear_if_owner(
+                OPERATOR_LEASE_OWNER_SESSION_ID,
+                "stale_dashboard_confirmation"
+            )
+            .is_none()
+        );
+        assert!(force_clear("generic_shutdown_cleanup").is_none());
+
+        assert_eq!(operator_panic_lease_generation(), Some(generation));
+        assert_eq!(
+            status().owner_session_id.as_deref(),
+            Some(OPERATOR_LEASE_OWNER_SESSION_ID)
+        );
+        assert!(
+            force_clear_operator_panic_generation(generation, "exact_generation_finalizer")
+                .is_some()
+        );
+        assert!(!status().held);
+        reset();
+    }
+
+    #[test]
+    fn tagged_panic_lease_cannot_ttl_expire_while_safety_transaction_is_pending() {
+        let now = Instant::now();
+        let tagged = InputLease {
+            owner_session_id: OPERATOR_LEASE_OWNER_SESSION_ID.to_owned(),
+            acquired_at: now - Duration::from_secs(60),
+            renewed_at: now - Duration::from_secs(60),
+            ttl: ttl_from_ms(OPERATOR_PREEMPT_LEASE_TTL_MS),
+            operator_panic_generation: Some(91),
+        };
+
+        assert!(tagged.is_expired(now));
+        assert!(
+            !lease_can_expire(&tagged, now, true),
+            "sticky/outstanding panic accounting must retain its exact lease beyond the TTL"
+        );
+        assert!(
+            lease_can_expire(&tagged, now, false),
+            "a terminal safety transaction may use the bounded lease TTL as a final fallback"
+        );
+    }
+
+    #[test]
+    fn generic_fail_closed_preempt_preserves_tagged_panic_generation() {
+        let _serial = serial();
+        let owner = "tag-preservation-owner";
+        let _held = try_acquire(owner, ttl_from_ms(5_000));
+        let _prior = force_preempt_operator_panic("physical_panic", 17);
+
+        let retained = force_preempt("generic_fail_closed_followup");
+
+        assert_eq!(
+            retained
+                .as_ref()
+                .and_then(|status| status.owner_session_id.as_deref()),
+            Some(OPERATOR_LEASE_OWNER_SESSION_ID)
+        );
+        assert_eq!(operator_panic_lease_generation(), Some(17));
+        assert!(force_clear_operator_panic_generation(17, "exact_finalizer").is_some());
+        assert!(!status().held);
+        reset();
+    }
+
+    #[test]
     fn operator_preempt_refuses_prior_owner_until_operator_ttl_lapses() {
         let _serial = serial();
-        let owner = "fsv-operator-prior";
+        let owner = "regression-operator-prior";
         let _held = try_acquire(owner, ttl_from_ms(5_000));
         let _prior = force_preempt("operator_preempt_test");
 
