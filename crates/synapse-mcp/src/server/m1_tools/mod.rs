@@ -13939,6 +13939,30 @@ struct SessionOwnedChromiumWindow {
     created_at_unix_ms: u64,
 }
 
+#[cfg(windows)]
+fn passive_chromium_selection_invariant_error(
+    tool: &str,
+    stage: &'static str,
+    candidate_count: usize,
+    owned_count: usize,
+) -> ErrorData {
+    const CODE: &str = "M1_PASSIVE_CHROMIUM_SELECTION_INVARIANT_BROKEN";
+    tracing::error!(
+        code = CODE,
+        tool,
+        stage,
+        candidate_count,
+        owned_count,
+        "passive Chromium discovery cardinality changed before selection"
+    );
+    mcp_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        format!(
+            "{CODE}: {tool} could not select a passive Chromium window because the {stage} cardinality invariant changed; candidate_count={candidate_count} owned_count={owned_count}. remediation=retry after target operation=list; if this repeats, inspect concurrent window/session-target updates in daemon logs using code={CODE}."
+        ),
+    )
+}
+
 /// Chooses a single Chromium window from passive discovery for a request whose
 /// human OS foreground is a non-Chromium app (e.g. VS Code) and that has no
 /// explicit `window_hwnd` / session target (#1592).
@@ -13971,10 +13995,15 @@ fn decide_passive_chromium_window(
         ));
     }
     if candidates.len() == 1 {
-        let selected = candidates
-            .into_iter()
-            .next()
-            .expect("candidates length checked == 1");
+        let candidate_len = candidates.len();
+        let Some(selected) = candidates.into_iter().next() else {
+            return Err(passive_chromium_selection_invariant_error(
+                tool,
+                "single_candidate",
+                candidate_len,
+                0,
+            ));
+        };
         return Ok((selected, "passive_single_chromium_window", 1));
     }
     // 2+ visible Chromium windows: disambiguate by this session's ownership
@@ -13990,7 +14019,8 @@ fn decide_passive_chromium_window(
                 .map(|created_at_unix_ms| (candidate.clone(), created_at_unix_ms))
         })
         .collect::<Vec<_>>();
-    match owned.len() {
+    let owned_count = owned.len();
+    match owned_count {
         0 => Err(mcp_error(
             error_codes::ACTION_TARGET_INVALID,
             format!(
@@ -14003,8 +14033,14 @@ fn decide_passive_chromium_window(
             ),
         )),
         1 => {
-            let (selected, _created_at) =
-                owned.into_iter().next().expect("owned length checked == 1");
+            let Some((selected, _created_at)) = owned.into_iter().next() else {
+                return Err(passive_chromium_selection_invariant_error(
+                    tool,
+                    "single_owned_candidate",
+                    candidates.len(),
+                    owned_count,
+                ));
+            };
             Ok((
                 selected,
                 "passive_session_owned_chromium_window",
@@ -14018,8 +14054,14 @@ fn decide_passive_chromium_window(
                     .cmp(&left.1)
                     .then_with(|| left.0.hwnd.cmp(&right.0.hwnd))
             });
-            let (selected, _created_at) =
-                owned.into_iter().next().expect("owned length checked > 1");
+            let Some((selected, _created_at)) = owned.into_iter().next() else {
+                return Err(passive_chromium_selection_invariant_error(
+                    tool,
+                    "multiple_owned_candidates",
+                    candidates.len(),
+                    owned_count,
+                ));
+            };
             Ok((
                 selected,
                 "passive_most_recent_session_chromium_window",
