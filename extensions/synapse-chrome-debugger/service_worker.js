@@ -1744,6 +1744,15 @@ chrome.runtime.onStartup.addListener(startBridgeFromEvent);
 if (chrome.alarms?.onAlarm?.addListener) {
   chrome.alarms.onAlarm.addListener(handleReconnectWakeAlarm);
 }
+// MV3 service workers are (re)started for reasons that do NOT fire onInstalled or
+// onStartup: a chrome://extensions "Reload", a browser respawn of an idle worker,
+// or any non-bridge event listener firing. Without a top-level bootstrap the worker
+// would sit idle after such a restart and never register a bridge host (host_count=0),
+// because connectDaemon() is only reachable from those two events and the reconnect
+// alarm. Kicking off startBridge() here runs on every worker instantiation and is
+// idempotent (ensureReconnectWakeAlarm + connectDaemon both guard against duplicates),
+// so a reloaded worker reconnects immediately instead of waiting for an event.
+startBridgeFromEvent();
 if (chrome.management?.onEnabled?.addListener) {
   chrome.management.onEnabled.addListener(handleManagementStateChanged);
 }
