@@ -25,6 +25,7 @@ const COMMAND_AUDIT_QUERY_MAX_LIMIT: usize = 250;
 const COMMAND_AUDIT_QUERY_DEFAULT_SCAN_LIMIT: usize = 1000;
 const COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT: usize = 5000;
 const COMMAND_AUDIT_QUERY_BATCH_ROWS: usize = 256;
+const COMMAND_AUDIT_KEY_LEN: usize = 12;
 
 static COMMAND_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
 
@@ -119,6 +120,7 @@ pub(crate) struct CommandAuditQueryResponse {
     pub matched_rows: usize,
     pub returned_count: usize,
     pub corrupt_row_count: usize,
+    pub noncanonical_key_count: usize,
     pub partial: bool,
     pub exhausted: bool,
     pub start_key_hex: Option<String>,
@@ -329,6 +331,7 @@ impl SynapseService {
         let mut scanned_rows = 0_usize;
         let mut matched_rows = 0_usize;
         let mut corrupt_row_count = 0_usize;
+        let mut noncanonical_key_count = 0_usize;
         let mut returned = Vec::new();
         let mut next_start_key_hex = None;
         let mut more_after_window = false;
@@ -360,7 +363,15 @@ impl SynapseService {
                         continue;
                     }
                 };
+                let Some((key_ts_ns, _key_seq)) = decode_command_audit_key(&key) else {
+                    noncanonical_key_count = noncanonical_key_count.saturating_add(1);
+                    continue;
+                };
                 let ts_ns = audit_row_ts_ns(&row);
+                if ts_ns != key_ts_ns {
+                    corrupt_row_count = corrupt_row_count.saturating_add(1);
+                    continue;
+                }
                 if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
                     stopped_at_end_ts = true;
                     break;
@@ -408,6 +419,7 @@ impl SynapseService {
             matched_rows,
             returned_count,
             corrupt_row_count,
+            noncanonical_key_count,
             partial,
             exhausted: !partial,
             start_key_hex,
@@ -448,10 +460,9 @@ impl SynapseService {
         let mut scanned_rows = 0_usize;
         let mut matched_rows = 0_usize;
         let mut corrupt_row_count = 0_usize;
+        let mut noncanonical_key_count = 0_usize;
         let mut returned = Vec::new();
         let mut has_older = false;
-        let mut newest_start_key_hex = None;
-        let mut oldest_returned_ts_ns = None;
 
         for (key, value) in tail.into_iter().rev() {
             scanned_rows = scanned_rows.saturating_add(1);
@@ -462,7 +473,15 @@ impl SynapseService {
                     continue;
                 }
             };
+            let Some((key_ts_ns, key_seq)) = decode_command_audit_key(&key) else {
+                noncanonical_key_count = noncanonical_key_count.saturating_add(1);
+                continue;
+            };
             let ts_ns = audit_row_ts_ns(&row);
+            if ts_ns != key_ts_ns {
+                corrupt_row_count = corrupt_row_count.saturating_add(1);
+                continue;
+            }
             // In newest-first mode end_ts_ns is an upper bound: skip rows newer
             // than it (they are outside the requested window), keep scanning down.
             if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
@@ -475,13 +494,18 @@ impl SynapseService {
                 has_older = true;
                 break;
             }
-            if newest_start_key_hex.is_none() {
-                newest_start_key_hex = Some(hex_encode(&key));
-            }
             matched_rows = matched_rows.saturating_add(1);
-            oldest_returned_ts_ns = Some(ts_ns);
-            returned.push(command_audit_query_row(&key, &value, row));
+            returned.push((ts_ns, key_seq, command_audit_query_row(&key, &value, row)));
         }
+        returned.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
+        let newest_start_key_hex = returned
+            .first()
+            .map(|(_ts_ns, _seq, row)| row.key_hex.clone());
+        let oldest_returned_ts_ns = returned.last().map(|(ts_ns, _seq, _row)| *ts_ns);
+        let returned: Vec<CommandAuditQueryRow> = returned
+            .into_iter()
+            .map(|(_ts_ns, _seq, row)| row)
+            .collect();
 
         // If we consumed the whole scan window without filling `limit` but the
         // window itself was capped, older matches may still exist beyond it.
@@ -499,6 +523,7 @@ impl SynapseService {
             matched_rows,
             returned_count,
             corrupt_row_count,
+            noncanonical_key_count,
             partial: false,
             exhausted: !has_older,
             start_key_hex: newest_start_key_hex,
@@ -998,10 +1023,21 @@ fn next_command_audit_key_parts() -> (u64, u32) {
 }
 
 fn command_audit_key(ts_ns: u64, seq: u32) -> Vec<u8> {
-    let mut key = Vec::with_capacity(12);
+    let mut key = Vec::with_capacity(COMMAND_AUDIT_KEY_LEN);
     key.extend_from_slice(&ts_ns.to_be_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
     key
+}
+
+fn decode_command_audit_key(key: &[u8]) -> Option<(u64, u32)> {
+    if key.len() != COMMAND_AUDIT_KEY_LEN {
+        return None;
+    }
+    let mut ts_ns = [0_u8; 8];
+    ts_ns.copy_from_slice(&key[..8]);
+    let mut seq = [0_u8; 4];
+    seq.copy_from_slice(&key[8..]);
+    Some((u64::from_be_bytes(ts_ns), u32::from_be_bytes(seq)))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1075,6 +1111,15 @@ mod tests {
                 ))
                 .expect("write command audit row");
         }
+    }
+
+    fn seed_action_log_row(service: &SynapseService, key: Vec<u8>, row: Value) {
+        let encoded = synapse_storage::encode_json(&row).expect("encode seeded audit row");
+        service
+            .m3_storage()
+            .expect("storage")
+            .put_batch(cf::CF_ACTION_LOG, vec![(key, encoded)])
+            .expect("seed audit row");
     }
 
     #[test]
@@ -1217,5 +1262,63 @@ mod tests {
         assert!(response.has_older);
         assert!(!response.exhausted);
         assert_eq!(response.scan_order, "newest_first");
+    }
+
+    #[test]
+    fn command_audit_query_newest_first_skips_noncanonical_tail_keys() {
+        let dir = TempDir::new().expect("tmp");
+        let service = service_with_db(dir.path());
+        let old_tool = "issue1550_old_synthetic";
+        let new_tool = "issue1550_new_real";
+        let newer_ts = 1_783_983_154_070_087_400_u64;
+
+        seed_action_log_row(
+            &service,
+            b"issue1540-final-redaction-sorts-after-canonical".to_vec(),
+            json!({
+                "schema_version": 1,
+                "row_kind": COMMAND_AUDIT_ROW_KIND,
+                "audit_id": "issue1540-synthetic",
+                "ts_ns": 0,
+                "tool": old_tool,
+                "phase": "final",
+                "outcome": "error",
+                "error_code": "ISSUE1540_SYNTHETIC"
+            }),
+        );
+        seed_action_log_row(
+            &service,
+            command_audit_key(newer_ts, 7),
+            json!({
+                "schema_version": 1,
+                "row_kind": COMMAND_AUDIT_ROW_KIND,
+                "audit_id": "issue1550-real-current",
+                "ts_ns": newer_ts,
+                "tool": new_tool,
+                "phase": "final",
+                "outcome": "ok"
+            }),
+        );
+
+        let response = service
+            .command_audit_query(CommandAuditQueryParams {
+                limit: Some(10),
+                scan_limit: Some(10),
+                ..Default::default()
+            })
+            .expect("mixed canonical/noncanonical tail should query");
+
+        assert_eq!(response.scan_order, AUDIT_SCAN_ORDER_NEWEST_FIRST);
+        assert_eq!(response.noncanonical_key_count, 1);
+        assert_eq!(response.corrupt_row_count, 0);
+        assert_eq!(response.returned_count, 1);
+        assert_eq!(response.rows[0].tool, new_tool);
+        assert_eq!(response.rows[0].ts_ns, newer_ts);
+        assert_ne!(response.rows[0].tool, old_tool);
+        let expected_key_hex = hex_encode(&command_audit_key(newer_ts, 7));
+        assert_eq!(
+            response.start_key_hex.as_deref(),
+            Some(expected_key_hex.as_str())
+        );
     }
 }

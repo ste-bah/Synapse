@@ -287,6 +287,7 @@ pub struct AuditCommandQueryResponse {
     pub matched_rows: usize,
     pub returned_count: usize,
     pub corrupt_row_count: usize,
+    pub noncanonical_key_count: usize,
     pub complete: bool,
     /// Iteration direction applied: `"newest_first"` (unwindowed default) or
     /// `"oldest_first"` (explicit forward paging). #1550.
