@@ -14,10 +14,6 @@ path = "src/main.rs"
 name = "synapse-chrome-native-host"
 path = "src/bin/synapse-chrome-native-host.rs"
 
-[[bin]]
-name = "synapse-fsv-toast-history"
-path = "src/bin/synapse-fsv-toast-history.rs"
-
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true

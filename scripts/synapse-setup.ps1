@@ -5867,6 +5867,42 @@ $ver = (& $ExePath --version) 2>&1
 Info "Installed binary reports: $ver"
 Info "Installed binary verified path=$ExePath sha256=$installedHash previous_sha256=$oldInstalledHash"
 
+$installDir = Split-Path -Parent $ExePath
+$retiredSetupOwnedExecutables = @(
+    'synapse-fsv-toast-history.exe'
+)
+foreach ($retiredExeName in $retiredSetupOwnedExecutables) {
+    $retiredPath = Join-Path $installDir $retiredExeName
+    if (-not (Test-Path -LiteralPath $retiredPath)) { continue }
+
+    $resolvedRetiredPath = [System.IO.Path]::GetFullPath($retiredPath)
+    $resolvedInstallDir = [System.IO.Path]::GetFullPath($installDir).TrimEnd('\')
+    if ((Split-Path -Parent $resolvedRetiredPath).TrimEnd('\') -ine $resolvedInstallDir) {
+        Die "SYNAPSE_RETIRED_EXECUTABLE_SCOPE_MISMATCH path=$resolvedRetiredPath install_dir=$resolvedInstallDir remediation=setup only prunes retired executables inside the installed Synapse binary directory"
+    }
+
+    $retiredOwners = @(Get-CimInstance Win32_Process -Filter "Name='$retiredExeName'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            try {
+                $candidatePath = [System.IO.Path]::GetFullPath([string]$_.ExecutablePath)
+                $candidatePath -ieq $resolvedRetiredPath
+            } catch {
+                $false
+            }
+        })
+    if ($retiredOwners.Count -gt 0) {
+        $ownerPids = ($retiredOwners | ForEach-Object { $_.ProcessId }) -join ','
+        Die "SYNAPSE_RETIRED_EXECUTABLE_STILL_RUNNING path=$resolvedRetiredPath pids=$ownerPids remediation=close the retired helper process before setup can prune its installed executable"
+    }
+
+    $retiredHash = Get-SynapseFileSha256 -Path $resolvedRetiredPath
+    Remove-Item -LiteralPath $resolvedRetiredPath -Force
+    if (Test-Path -LiteralPath $resolvedRetiredPath) {
+        Die "SYNAPSE_RETIRED_EXECUTABLE_PRUNE_FAILED path=$resolvedRetiredPath sha256=$retiredHash remediation=setup removed the retired helper but the file still exists; inspect file permissions/locks and retry"
+    }
+    Info "Pruned retired setup-owned executable path=$resolvedRetiredPath sha256=$retiredHash"
+}
+
 if ($script:SynapsePostExitStartOnly) {
     Info "SYNAPSE_POST_EXIT_SKIP_CHROME_BRIDGE_VERIFY reason=$PostExitContinuationReason bind=$Bind remediation=post-exit continuation avoids creating bridge peers while the dead-owner bind is still draining; daemon /health after start verifies the active Chrome bridge."
 } else {

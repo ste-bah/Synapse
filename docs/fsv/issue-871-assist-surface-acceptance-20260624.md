@@ -26,7 +26,8 @@ Branch: `main`
 
 ## Code and tool changes verified
 
-- The former automation is now retained as `scripts/diagnostics/issue-871-assist-surface-diagnostic.ps1`, a supporting diagnostic that:
+- Historical note: the former #871 diagnostic automation was retired by #1644. During
+  this archived run it:
   - opens two independent HTTP MCP sessions,
   - uses only an already-open Chrome window,
   - verifies physical Action Center toast XML and accept URI,
@@ -34,7 +35,12 @@ Branch: `main`
   - compares dashboard panels to MCP/HTTP storage, timeline, and daemon state,
   - toggles the tray recorder control through `synapse-overlay --toggle-once`,
   - blocks a live `approval_gate`, accepts it from the dashboard endpoint, and verifies the gate returns `allow`.
-- Added `synapse-fsv-toast-history`, a Windows-only helper that reads/removes `Synapse.Daemon` Action Center history rows and extracts approval action URIs from physical toast XML. Its name is retained as a public compatibility identity; it is not an automated FSV claim.
+- Historical note: the retired `synapse-fsv-toast-history` helper was used during
+  this 2026-06-24 acceptance run to read/remove `Synapse.Daemon` Action Center
+  history rows and extract approval action URIs from physical toast XML. It is no
+  longer a package binary or supported diagnostic entry point; current
+  verification must use the production Synapse surfaces and manual SoT readback
+  required by D1.
 - Added `synapse-overlay --toggle-once` so the real tray pause/resume control path is testable without synthetic Win32 tray clicks.
 - Hardened `approval_protocol` parsing for Windows ShellExecute handoff variants (`"synapse-approval://..."` and `synapse-approval://decide/?...`).
 - Changed dashboard storage summary to use exact row counts (`storage_cf_row_counts`) so dashboard storage SoT matches `storage_inspect`.
@@ -46,11 +52,9 @@ Branch: `main`
 
 ## Manual FSV transcript
 
-Command:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\diagnostics\issue-871-assist-surface-diagnostic.ps1
-```
+Historical command: this run used the now-retired #871 diagnostic script. The
+script path is intentionally omitted so this archive does not provide a current
+executable verification instruction.
 
 Result:
 
@@ -124,7 +128,9 @@ Note: `browser_screenshot` failed in the Chrome bridge image readback path, but 
 ## Verification commands
 
 - `cargo test -p synapse-mcp --bin synapse-mcp approval_protocol -- --nocapture`
-- `cargo build -p synapse-mcp --bin synapse-fsv-toast-history`
 - `cargo build -p synapse-overlay`
-- PowerShell parser check for `scripts/diagnostics/issue-871-assist-surface-diagnostic.ps1`
+- Historical PowerShell parser check for the now-retired #871 diagnostic script.
+
+The closed #871 diagnostic script referenced by this archived document was
+retired by #1644 and is no longer a current verification command.
 
