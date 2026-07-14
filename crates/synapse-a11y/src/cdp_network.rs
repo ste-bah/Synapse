@@ -1853,21 +1853,17 @@ async fn clear_network_override_slot(slot: &NetworkOverrideSlot) -> DurableOwner
 #[must_use]
 pub fn durable_browser_mutation_owners_readback() -> CdpDurableBrowserMutationOwnersReadback {
     let mut registry_readback_failures = Vec::new();
-    let fetch_interception_active_count = match fetch_registry().slots.lock() {
-        Ok(slots) => slots.len(),
-        Err(_) => {
-            registry_readback_failures
-                .push("Fetch interception registry lock is poisoned".to_owned());
-            usize::MAX
-        }
+    let fetch_interception_active_count = if let Ok(slots) = fetch_registry().slots.lock() {
+        slots.len()
+    } else {
+        registry_readback_failures.push("Fetch interception registry lock is poisoned".to_owned());
+        usize::MAX
     };
-    let network_override_active_count = match override_registry().slots.lock() {
-        Ok(slots) => slots.len(),
-        Err(_) => {
-            registry_readback_failures
-                .push("network override registry lock is poisoned".to_owned());
-            usize::MAX
-        }
+    let network_override_active_count = if let Ok(slots) = override_registry().slots.lock() {
+        slots.len()
+    } else {
+        registry_readback_failures.push("network override registry lock is poisoned".to_owned());
+        usize::MAX
     };
     let dialog_auto_policy_active_count =
         match crate::cdp_dialog::dialog_capture_active_count_readback() {
@@ -1928,7 +1924,7 @@ pub fn durable_browser_mutation_owners_disable_now() -> CdpDurableBrowserMutatio
 }
 
 #[must_use]
-pub(crate) fn durable_browser_mutation_owners_enabled() -> bool {
+pub fn durable_browser_mutation_owners_enabled() -> bool {
     DURABLE_BROWSER_MUTATION_OWNERS_ENABLED.load(Ordering::SeqCst)
 }
 
@@ -1943,12 +1939,11 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
     let _operation_guard = durable_browser_mutation_operation_lock().lock().await;
     let mut failures = Vec::new();
 
-    let fetch_slots = match fetch_registry().slots.lock() {
-        Ok(mut slots) => std::mem::take(&mut *slots),
-        Err(_) => {
-            failures.push("Fetch interception registry lock is poisoned".to_owned());
-            HashMap::new()
-        }
+    let fetch_slots = if let Ok(mut slots) = fetch_registry().slots.lock() {
+        std::mem::take(&mut *slots)
+    } else {
+        failures.push("Fetch interception registry lock is poisoned".to_owned());
+        HashMap::new()
     };
     let fetch_interceptions_found = fetch_slots.len();
     let mut fetch_interceptions_stopped = 0usize;
@@ -1962,12 +1957,11 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
         failures.extend(outcome.failures);
     }
 
-    let override_slots = match override_registry().slots.lock() {
-        Ok(mut slots) => std::mem::take(&mut *slots),
-        Err(_) => {
-            failures.push("network override registry lock is poisoned".to_owned());
-            HashMap::new()
-        }
+    let override_slots = if let Ok(mut slots) = override_registry().slots.lock() {
+        std::mem::take(&mut *slots)
+    } else {
+        failures.push("network override registry lock is poisoned".to_owned());
+        HashMap::new()
     };
     let network_overrides_found = override_slots.len();
     let mut network_overrides_cleared = 0usize;

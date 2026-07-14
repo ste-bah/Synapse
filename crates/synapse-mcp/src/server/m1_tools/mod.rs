@@ -62,6 +62,7 @@ use std::{
     collections::HashMap,
     io::Read as _,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -75,7 +76,7 @@ use image::{DynamicImage, ImageFormat, RgbaImage, codecs::jpeg::JpegEncoder};
 use image::{GrayImage, Luma};
 #[cfg(windows)]
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 use synapse_action::{BackendResolutionPolicy, ResolvedBackend, VigemBackend};
 use synapse_core::{
@@ -214,6 +215,54 @@ struct BrowserWaitFacadeResponse {
     source_of_truth: String,
     readback_source_of_truth: String,
     wait: BrowserWaitResponse,
+}
+
+fn browser_wait_input_schema() -> Arc<Map<String, Value>> {
+    let spec_schema = json!({
+        "type": "object",
+        "description": "Unified wait spec. Set condition to text/load_state/url/selector/function/request/response and provide exactly that nested spec object; server validators reject missing, extra, or malformed specs.",
+        "additionalProperties": true,
+        "properties": {
+            "condition": {
+                "type": "string",
+                "enum": ["text", "load_state", "url", "selector", "function", "request", "response"]
+            },
+            "text": { "type": "object", "additionalProperties": true },
+            "load_state": { "type": "object", "additionalProperties": true },
+            "url": { "type": "object", "additionalProperties": true },
+            "selector": { "type": "object", "additionalProperties": true },
+            "function": { "type": "object", "additionalProperties": true },
+            "request": { "type": "object", "additionalProperties": true },
+            "response": { "type": "object", "additionalProperties": true }
+        }
+    });
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["operation", "wait"],
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["for_condition"],
+                "description": "Only for_condition is supported."
+            },
+            "wait": spec_schema,
+            "cdp_target_id": {
+                "type": "string",
+                "description": "Optional top-level target alias folded into the selected nested condition spec."
+            },
+            "window_hwnd": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 4_294_967_295_u64,
+                "description": "Optional browser HWND folded into the selected nested condition spec."
+            }
+        }
+    });
+    match schema {
+        Value::Object(map) => Arc::new(map),
+        _ => Arc::new(Map::new()),
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -3346,7 +3395,8 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Public wait facade for the calling session's owned browser tab. operation=for_condition requires the nested wait spec and evaluates one typed condition: text, load_state, url, selector, function, request, or response. The facade rejects missing or extra operation fields before polling, delegates to the same target-scoped browser_wait_for runtime path, returns the full condition readback, and never activates Chrome, uses OS foreground input, or falls back to the human foreground tab."
+        description = "Wait in the calling session's owned browser tab. operation=for_condition uses one typed condition: text, load_state, url, selector, function, request, or response. Target-scoped; never activates Chrome or falls back to the human foreground tab.",
+        input_schema = browser_wait_input_schema()
     )]
     pub async fn browser_wait(
         &self,
@@ -13961,7 +14011,7 @@ fn build_browser_add_tag_expression(
 fn build_browser_remove_tag_expression(tool: &str, marker: &str) -> Result<String, ErrorData> {
     let marker_json = browser_tag_json_string(tool, "element marker", marker)?;
     Ok(format!(
-        r#"(() => {{
+        r"(() => {{
             const marker = {marker_json};
             const matches = Array.from(document.querySelectorAll('[data-synapse-tag-id]'))
                 .filter((el) => el.getAttribute('data-synapse-tag-id') === marker);
@@ -13969,7 +14019,7 @@ fn build_browser_remove_tag_expression(tool: &str, marker: &str) -> Result<Strin
             const remaining = Array.from(document.querySelectorAll('[data-synapse-tag-id]'))
                 .filter((el) => el.getAttribute('data-synapse-tag-id') === marker).length;
             return {{ removed: matches.length, remaining }};
-        }})()"#
+        }})()"
     ))
 }
 

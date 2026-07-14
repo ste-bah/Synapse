@@ -57,7 +57,10 @@ use synapse_core::{
     TranscriptParseStatus, TranscriptRole, TranscriptSource, TranscriptToolCall, TranscriptUsage,
 };
 use synapse_storage::{
-    Db, agent_transcripts::agent_transcript_key, agent_transcripts::agent_transcript_spawn_prefix,
+    Db,
+    agent_transcripts::{
+        agent_transcript_key, agent_transcript_spawn_prefix, agent_transcript_ts_index_key,
+    },
     cf, decode_json, encode_json,
 };
 use tokio_util::sync::CancellationToken;
@@ -526,6 +529,7 @@ pub(crate) fn ingest_spawn_dir_once(
     }
 
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
+    let mut ts_index_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
     let mut new_parsed = 0_u64;
     let mut new_invalid = 0_u64;
     for raw_line in &lines {
@@ -561,15 +565,25 @@ pub(crate) fn ingest_spawn_dir_once(
                 ),
             ));
         }
-        rows.push((agent_transcript_key(spawn_id, line_no), encoded));
+        let transcript_key = agent_transcript_key(spawn_id, line_no);
+        ts_index_rows.push((
+            agent_transcript_ts_index_key(record.ts_ns, &transcript_key),
+            transcript_key.clone(),
+        ));
+        rows.push((transcript_key, encoded));
         cursor.lines_ingested = line_no;
     }
 
     if !rows.is_empty() {
-        db.put_batch_pressure_bypass(cf::CF_AGENT_TRANSCRIPTS, rows)
-            .map_err(|error| {
-                format!("TRANSCRIPT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines will re-ingest)")
-            })?;
+        db.put_cf_batches_pressure_bypass(vec![
+            (cf::CF_AGENT_TRANSCRIPTS, rows),
+            (cf::CF_KV, ts_index_rows),
+        ])
+        .map_err(|error| {
+            format!(
+                "TRANSCRIPT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines will re-ingest)"
+            )
+        })?;
     }
 
     cursor.offset_bytes += consumed_bytes as u64;

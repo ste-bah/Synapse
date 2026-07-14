@@ -2876,7 +2876,17 @@ impl SynapseService {
             session_teardown_error.as_deref(),
             session_teardown.as_ref().map(|report| report.failure_count),
         );
-        if !cleanup_verified {
+        if cleanup_verified {
+            tracing::warn!(
+                code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                detail_code = "AGENT_SPAWN_OPERATOR_PANIC_CLEANUP_VERIFIED",
+                spawn_id,
+                launcher_process_id,
+                session_id,
+                stage,
+                "operator panic raced a spawned agent launch; exact process/session cleanup was verified"
+            );
+        } else {
             AGENT_SPAWN_CLEANUP_INCIDENT.store(true, Ordering::SeqCst);
             let drain = self
                 .drain_state_handle()
@@ -2893,16 +2903,6 @@ impl SynapseService {
                 session_teardown_error = ?session_teardown_error,
                 drain = ?drain,
                 "operator panic raced a spawned agent launch and exact cleanup did not reach a terminal postcondition"
-            );
-        } else {
-            tracing::warn!(
-                code = error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
-                detail_code = "AGENT_SPAWN_OPERATOR_PANIC_CLEANUP_VERIFIED",
-                spawn_id,
-                launcher_process_id,
-                session_id,
-                stage,
-                "operator panic raced a spawned agent launch; exact process/session cleanup was verified"
             );
         }
         json!({

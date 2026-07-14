@@ -64,7 +64,7 @@ pub struct CdpClockResult {
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
-pub(crate) struct CdpClockDurableDrainReadback {
+pub struct CdpClockDurableDrainReadback {
     pub found: usize,
     pub uninstalled: usize,
     pub failures: Vec<String>,
@@ -281,14 +281,14 @@ const fn clock_init_script() -> &'static str {
     CLOCK_INIT_SCRIPT
 }
 
-pub(crate) fn durable_clock_active_count_readback() -> Result<usize, String> {
+pub fn durable_clock_active_count_readback() -> Result<usize, String> {
     registry()
         .lock()
         .map(|slots| slots.len())
         .map_err(|_| "browser clock registry lock is poisoned".to_owned())
 }
 
-pub(crate) async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadback {
+pub async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadback {
     let slots = match registry().lock() {
         Ok(mut slots) => std::mem::take(&mut *slots),
         Err(_) => {

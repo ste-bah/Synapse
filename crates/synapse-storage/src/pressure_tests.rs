@@ -199,9 +199,24 @@ async fn disk_pressure_periodic_task_runs_tick() -> Result<(), Box<dyn Error>> {
     tokio::time::sleep(Duration::from_millis(40)).await;
     let after_level = db.pressure_level();
     let after_codes = db.pressure.transition_codes()?;
+    let readback = db.pressure.probe_readback()?;
     println!(
-        "regression_state=pressure_state case=periodic_task after_level={after_level:?} after_codes={after_codes:?} observed=level:{after_level:?}"
+        "regression_state=pressure_state case=periodic_task task_running={} observed={} last_free_bytes={:?} last_level={:?} last_started={:?} last_completed={:?} last_error={:?} after_level={after_level:?} after_codes={after_codes:?}",
+        task.running(),
+        readback.observed,
+        readback.last_free_bytes,
+        readback.last_level,
+        readback.last_started_unix_ms,
+        readback.last_completed_unix_ms,
+        readback.last_error
     );
+    assert!(task.running());
+    assert!(readback.observed);
+    assert_eq!(readback.last_free_bytes, Some(350));
+    assert_eq!(readback.last_level, Some(DiskPressureLevel::Level1));
+    assert!(readback.last_started_unix_ms.is_some());
+    assert!(readback.last_completed_unix_ms.is_some());
+    assert_eq!(readback.last_error, None);
     drop(task);
     assert_eq!(after_level, DiskPressureLevel::Level1);
     assert_eq!(

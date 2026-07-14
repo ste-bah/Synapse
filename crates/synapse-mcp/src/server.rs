@@ -601,6 +601,21 @@ impl std::fmt::Debug for AuthorityFinalizerSupervisor {
                     .lock()
                     .map_or(usize::MAX, |tasks| tasks.len()),
             )
+            .field(
+                "admission_closed",
+                &self
+                    .admission_closed
+                    .lock()
+                    .map_or(None, |closed| Some(*closed)),
+            )
+            .field(
+                "join_failure_count",
+                &self
+                    .join_failures
+                    .lock()
+                    .map_or(usize::MAX, |failures| failures.len()),
+            )
+            .field("next_task_id", &self.next_task_id.load(Ordering::SeqCst))
             .field("closed", &self.tasks.is_closed())
             .finish()
     }

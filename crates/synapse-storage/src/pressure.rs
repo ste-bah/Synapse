@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use rocksdb::DB;
@@ -71,6 +71,17 @@ pub struct PressureReport {
     pub gc_advised: bool,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct PressureProbeReadback {
+    pub observed: bool,
+    pub last_free_bytes: Option<u64>,
+    pub last_level: Option<DiskPressureLevel>,
+    pub last_started_unix_ms: Option<u64>,
+    pub last_completed_unix_ms: Option<u64>,
+    pub last_duration_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
 /// Handle for the periodic disk-pressure task.
 #[derive(Debug)]
 pub struct PressureTask {
@@ -84,6 +95,13 @@ impl Drop for PressureTask {
             let _ = shutdown.send(());
         }
         self.handle.abort();
+    }
+}
+
+impl PressureTask {
+    #[must_use]
+    pub fn running(&self) -> bool {
+        !self.handle.is_finished()
     }
 }
 
@@ -156,6 +174,7 @@ impl PressureThresholds {
 pub struct PressureState {
     level: AtomicU8,
     emitted_codes: Mutex<Vec<&'static str>>,
+    probe_readback: Mutex<PressureProbeReadback>,
 }
 
 impl PressureState {
@@ -170,6 +189,13 @@ impl PressureState {
             .lock()
             .map(|codes| codes.clone())
             .map_err(|error| read_failed(format!("pressure code lock poisoned: {error}")))
+    }
+
+    pub fn probe_readback(&self) -> StorageResult<PressureProbeReadback> {
+        self.probe_readback
+            .lock()
+            .map(|readback| readback.clone())
+            .map_err(|error| read_failed(format!("pressure probe lock poisoned: {error}")))
     }
 
     /// Whether a new write to `cf_name` is accepted at the current level.
@@ -209,8 +235,12 @@ pub fn run_once(
     path: &Path,
     config: &PressureConfig,
 ) -> StorageResult<PressureReport> {
-    let free_bytes = Fs2DiskProbe.available_space(path)?;
-    apply_free_bytes(db, state, config, free_bytes)
+    let started = mark_pressure_probe_started(state);
+    let result = Fs2DiskProbe
+        .available_space(path)
+        .and_then(|free_bytes| apply_free_bytes(db, state, config, free_bytes));
+    mark_pressure_probe_completed(state, started, result.as_ref());
+    result
 }
 
 pub fn run_once_with_free_bytes(
@@ -219,7 +249,10 @@ pub fn run_once_with_free_bytes(
     config: &PressureConfig,
     free_bytes: u64,
 ) -> StorageResult<PressureReport> {
-    apply_free_bytes(db, state, config, free_bytes)
+    let started = mark_pressure_probe_started(state);
+    let result = apply_free_bytes(db, state, config, free_bytes);
+    mark_pressure_probe_completed(state, started, result.as_ref());
+    result
 }
 
 #[cfg(test)]
@@ -261,13 +294,14 @@ fn spawn_with_probe(
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    match probe.available_space(&path) {
-                        Ok(free_bytes) => {
-                            if let Err(error) = apply_free_bytes(&db, &state, &config, free_bytes) {
-                                tracing::warn!(error = %error, "storage disk-pressure tick failed");
-                            }
-                        }
-                        Err(error) => tracing::warn!(error = %error, "storage disk-pressure probe failed"),
+                    let started = mark_pressure_probe_started(&state);
+                    let result = match probe.available_space(&path) {
+                        Ok(free_bytes) => apply_free_bytes(&db, &state, &config, free_bytes),
+                        Err(error) => Err(error),
+                    };
+                    mark_pressure_probe_completed(&state, started, result.as_ref());
+                    if let Err(error) = result {
+                        tracing::warn!(error = %error, "storage disk-pressure tick failed");
                     }
                 }
                 _ = &mut shutdown_rx => break,
@@ -362,6 +396,56 @@ fn permits_write_at(level: DiskPressureLevel, cf_name: &str) -> bool {
         ),
         DiskPressureLevel::Level4 => matches!(cf_name, cf::CF_REFLEX_AUDIT | cf::CF_SESSIONS),
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProbeStarted {
+    unix_ms: u64,
+    instant: Instant,
+}
+
+fn mark_pressure_probe_started(state: &PressureState) -> ProbeStarted {
+    let started = ProbeStarted {
+        unix_ms: unix_time_ms_now(),
+        instant: Instant::now(),
+    };
+    if let Ok(mut readback) = state.probe_readback.lock() {
+        readback.last_started_unix_ms = Some(started.unix_ms);
+    }
+    started
+}
+
+fn mark_pressure_probe_completed(
+    state: &PressureState,
+    started: ProbeStarted,
+    result: Result<&PressureReport, &StorageError>,
+) {
+    if let Ok(mut readback) = state.probe_readback.lock() {
+        readback.last_completed_unix_ms = Some(unix_time_ms_now());
+        readback.last_duration_ms = Some(duration_millis_u64(started.instant.elapsed()));
+        match result {
+            Ok(report) => {
+                readback.observed = true;
+                readback.last_free_bytes = Some(report.free_bytes);
+                readback.last_level = Some(report.current_level);
+                readback.last_error = None;
+            }
+            Err(error) => {
+                readback.last_error = Some(error.to_string());
+            }
+        }
+    }
+}
+
+fn unix_time_ms_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or_default()
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 trait DiskProbe: Send + Sync {

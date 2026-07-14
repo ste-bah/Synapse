@@ -5484,7 +5484,7 @@ impl ChromeDebuggerBridge {
                         inner.active_host_id = None;
                         inner.host_lineage_sequence = inner.host_lineage_sequence.saturating_add(1);
                     }
-                    let terminal_detail = detail.clone().unwrap_or_else(|| {
+                    let terminal_detail = detail.unwrap_or_else(|| {
                         "Chrome debugger native port disconnected before command response"
                             .to_owned()
                     });
@@ -6049,22 +6049,19 @@ fn bridge() -> &'static ChromeDebuggerBridge {
 
 #[must_use]
 pub fn mutation_command_owners_readback() -> ChromeDebuggerMutationOwnersReadback {
-    let inner = match bridge().inner.lock() {
-        Ok(inner) => inner,
-        Err(_) => {
-            synapse_action::record_operator_panic_safety_incident();
-            return ChromeDebuggerMutationOwnersReadback {
-                queued_mutation_count: usize::MAX,
-                delivered_mutation_count: usize::MAX,
-                delivered_caller_timed_out_count: usize::MAX,
-                delivered_transport_lost_count: usize::MAX,
-                registry_readback_healthy: false,
-                registry_readback_failure: Some(
-                    "Chrome debugger mutation-owner registry lock is poisoned".to_owned(),
-                ),
-                ..Default::default()
-            };
-        }
+    let Ok(inner) = bridge().inner.lock() else {
+        synapse_action::record_operator_panic_safety_incident();
+        return ChromeDebuggerMutationOwnersReadback {
+            queued_mutation_count: usize::MAX,
+            delivered_mutation_count: usize::MAX,
+            delivered_caller_timed_out_count: usize::MAX,
+            delivered_transport_lost_count: usize::MAX,
+            registry_readback_healthy: false,
+            registry_readback_failure: Some(
+                "Chrome debugger mutation-owner registry lock is poisoned".to_owned(),
+            ),
+            ..Default::default()
+        };
     };
     let queued_mutation_count = inner
         .pending
@@ -6200,20 +6197,16 @@ pub async fn drain_mutation_command_owners(
         };
     }
     let queued_mutations_canceled = {
-        let mut inner = match bridge().inner.lock() {
-            Ok(inner) => inner,
-            Err(_) => {
-                synapse_action::record_operator_panic_safety_incident();
-                return ChromeDebuggerMutationOwnersDrainReadback {
-                    failures: vec![
-                        "Chrome debugger mutation-owner registry lock poisoned during drain"
-                            .to_owned(),
-                    ],
-                    readback: mutation_command_owners_readback(),
-                    fully_drained: false,
-                    ..Default::default()
-                };
-            }
+        let Ok(mut inner) = bridge().inner.lock() else {
+            synapse_action::record_operator_panic_safety_incident();
+            return ChromeDebuggerMutationOwnersDrainReadback {
+                failures: vec![
+                    "Chrome debugger mutation-owner registry lock poisoned during drain".to_owned(),
+                ],
+                readback: mutation_command_owners_readback(),
+                fully_drained: false,
+                ..Default::default()
+            };
         };
         let queued_ids = inner
             .pending

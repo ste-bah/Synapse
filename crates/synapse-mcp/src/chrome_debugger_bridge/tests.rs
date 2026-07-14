@@ -1476,7 +1476,7 @@ fn extension_owner_readback_requires_persisted_browser_session_continuity() {
         &storage_failure
     ));
 
-    let mut unstable_command_snapshot = healthy.clone();
+    let mut unstable_command_snapshot = healthy;
     unstable_command_snapshot.command_in_flight_count = 2;
     assert!(!extension_owner_readback_is_authoritative_empty(
         &unstable_command_snapshot

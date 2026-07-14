@@ -41,6 +41,34 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cf_sizes: Option<BTreeMap<String, u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_task_running: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_pressure_task_running: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_pressure_probe_observed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_pressure_last_free_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_pressure_last_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_started_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_completed_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage_gc_last_unsupported_policy_skips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_pressure_last_started_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_pressure_last_completed_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_pressure_last_duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_pressure_last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_count: Option<usize>,

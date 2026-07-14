@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{self, Write as _},
+    io::{self, BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -35,9 +35,14 @@ const MAX_LEDGER_SEGMENT_BYTES: u64 = 8 * 1024 * 1024;
 /// are pruned during rotation, so total retained ledger bytes are bounded by
 /// roughly `MAX_LEDGER_SEGMENT_BYTES * (MAX_LEDGER_SEGMENTS + 1)`.
 const MAX_LEDGER_SEGMENTS: usize = 5;
+const MAX_RETAINED_LEDGER_FILES: usize = MAX_LEDGER_SEGMENTS + 1;
 
 static STATE: OnceLock<Mutex<Option<DaemonLifecycleState>>> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+
+#[cfg(test)]
+static TEST_MAX_LEDGER_SEGMENT_BYTES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 #[derive(Clone, Debug)]
 pub(crate) struct DaemonLifecycleConfig {
@@ -75,6 +80,11 @@ struct RunRecord {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ToolCallStart {
     pub tool: String,
+    pub operation: Option<String>,
+    pub route_id: Option<String>,
+    pub profile: Option<String>,
+    pub tool_surface_sha256: Option<String>,
+    pub tool_profile_read_error: Option<Value>,
     pub mcp_session_id: Option<String>,
     pub audit_context: Option<Value>,
     pub audit_context_read_error: Option<Value>,
@@ -94,6 +104,37 @@ pub struct InFlightToolCallRead {
     pub status: String,
 }
 
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolUsageAggregate {
+    pub tool: String,
+    pub operation: Option<String>,
+    pub route_id: Option<String>,
+    pub profile: Option<String>,
+    pub tool_surface_sha256: Option<String>,
+    pub calls_total: u64,
+    pub ok_total: u64,
+    pub error_total: u64,
+    pub panic_total: u64,
+    pub total_duration_ms: u64,
+    pub max_duration_ms: u64,
+    pub latest_status: String,
+    pub latest_error_code: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolUsageTelemetry {
+    pub source_of_truth: String,
+    pub max_rows: usize,
+    pub rows_scanned: usize,
+    pub segment_count: usize,
+    pub aggregates: Vec<ToolUsageAggregate>,
+    pub read_error: Option<String>,
+}
+
+type ToolUsageKey = (String, Option<String>, Option<String>, Option<String>);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ToolEvent {
     schema_version: u32,
@@ -102,20 +143,43 @@ struct ToolEvent {
     seq: u64,
     event_kind: String,
     tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    route_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_surface_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_profile_read_error: Option<Value>,
     status: String,
     started_at_unix_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     finished_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     duration_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     mcp_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     audit_context: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     audit_context_read_error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     foreground: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     foreground_read_error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     session_target: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     session_target_read_error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     effective_target: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     panic: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<Value>,
 }
 
@@ -146,10 +210,36 @@ struct DaemonLifecycleState {
     /// from the existing file size at [`configure`] and updated after each
     /// append and reset to zero on rotation.
     tool_events_bytes: u64,
+    /// Current byte size of the active `daemon-exit.jsonl` segment. Exit events
+    /// share the same bounded JSONL ledger implementation as tool events so
+    /// daemon lifecycle diagnostics cannot grow without retention.
+    exit_events_bytes: u64,
     /// Size cap the active tool-event segment may reach before rotation. Seeded
     /// from [`MAX_LEDGER_SEGMENT_BYTES`]; overridable only in tests via
     /// [`set_max_segment_bytes_for_test`] to force rotation without writing MiB.
     max_segment_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct LedgerSource {
+    path: PathBuf,
+    suffix: Option<usize>,
+}
+
+#[derive(Clone, Debug)]
+struct StagedLedgerSegment {
+    path: PathBuf,
+    bytes: u64,
+    records: u64,
+    oversized_records: u64,
+}
+
+#[derive(Debug)]
+struct LedgerRewrite {
+    segments: Vec<StagedLedgerSegment>,
+    source_bytes: u64,
+    source_records: u64,
+    missing_newline_repairs: u64,
 }
 
 #[derive(Debug)]
@@ -307,21 +397,44 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         ended_at_unix_ms: None,
         ended_reason: None,
     };
-    with_lifecycle_ledger_lock(&config.db_path, "configure daemon lifecycle", || {
-        let previous_run = read_optional_json::<RunRecord>(Path::new(&paths.run_current_path))
+    let max_segment_bytes = configured_max_segment_bytes();
+    let (tool_events_bytes, exit_events_bytes) = with_lifecycle_ledger_lock(
+        &config.db_path,
+        "configure daemon lifecycle",
+        || {
+            let tool_events_bytes = reconcile_jsonl_ledger(
+                Path::new(&paths.tool_events_path),
+                max_segment_bytes,
+                "tool_events",
+            )
             .with_context(|| {
                 format!(
-                    "read daemon lifecycle current run {}",
-                    paths.run_current_path
+                    "reconcile daemon tool-event ledger {}",
+                    paths.tool_events_path
                 )
             })?;
-        let previous_last_tool = read_optional_json::<ToolEvent>(Path::new(&paths.tool_last_path))
+            let mut exit_events_bytes = reconcile_jsonl_ledger(
+                Path::new(&paths.exit_events_path),
+                max_segment_bytes,
+                "exit_events",
+            )
+            .with_context(|| format!("reconcile daemon exit ledger {}", paths.exit_events_path))?;
+            let previous_run = read_optional_json::<RunRecord>(Path::new(&paths.run_current_path))
+                .with_context(|| {
+                    format!(
+                        "read daemon lifecycle current run {}",
+                        paths.run_current_path
+                    )
+                })?;
+            let previous_last_tool = read_optional_json::<ToolEvent>(Path::new(
+                &paths.tool_last_path,
+            ))
             .with_context(|| format!("read daemon lifecycle last tool {}", paths.tool_last_path))?;
 
-        if let Some(previous) = previous_run.as_ref()
-            && previous.ended_at_unix_ms.is_none()
-        {
-            append_json_line(
+            if let Some(previous) = previous_run.as_ref()
+                && previous.ended_at_unix_ms.is_none()
+            {
+                append_bounded_json_line(
                 Path::new(&paths.exit_events_path),
                 &ExitEvent {
                     schema_version: SCHEMA_VERSION,
@@ -331,7 +444,7 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                     cause: "process_missing_on_startup".to_owned(),
                     detail: json!({
                         "new_pid": std::process::id(),
-                        "new_run_id": run.run_id,
+                        "new_run_id": run.run_id.clone(),
                         "reason": "daemon-run-current had no ended_at_unix_ms when this daemon acquired the DB lock",
                     }),
                     recorded_at_unix_ms: now_unix_ms(),
@@ -344,6 +457,9 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                         .collect(),
                     paths: paths.clone(),
                 },
+                &mut exit_events_bytes,
+                max_segment_bytes,
+                "exit_events",
             )
             .with_context(|| {
                 format!(
@@ -351,22 +467,13 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                     paths.exit_events_path
                 )
             })?;
-        }
+            }
 
-        write_json_atomic(Path::new(&paths.run_current_path), &run)
-            .with_context(|| format!("write daemon current run {}", paths.run_current_path))
-    })?;
-    // Seed the in-memory ledger size from the file that survives across daemon
-    // restarts, so the very first append after startup rotates when the active
-    // segment was already at the cap. A missing file simply starts at zero.
-    let tool_events_bytes = match fs::metadata(&paths.tool_events_path) {
-        Ok(metadata) => metadata.len(),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("stat daemon tool events {}", paths.tool_events_path));
-        }
-    };
+            write_json_atomic(Path::new(&paths.run_current_path), &run)
+                .with_context(|| format!("write daemon current run {}", paths.run_current_path))?;
+            Ok((tool_events_bytes, exit_events_bytes))
+        },
+    )?;
     let state = DaemonLifecycleState {
         run,
         paths: paths.clone(),
@@ -374,7 +481,8 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         seq: 0,
         last_error: None,
         tool_events_bytes,
-        max_segment_bytes: MAX_LEDGER_SEGMENT_BYTES,
+        exit_events_bytes,
+        max_segment_bytes,
     };
     let slot = state_slot();
     let mut guard = slot
@@ -421,6 +529,11 @@ pub(crate) fn begin_tool_call(start: ToolCallStart) -> anyhow::Result<ToolCallGu
         seq,
         event_kind: "tool_call".to_owned(),
         tool: start.tool,
+        operation: start.operation,
+        route_id: start.route_id,
+        profile: start.profile,
+        tool_surface_sha256: start.tool_surface_sha256,
+        tool_profile_read_error: start.tool_profile_read_error,
         status: "started".to_owned(),
         started_at_unix_ms: now_unix_ms(),
         finished_at_unix_ms: None,
@@ -437,7 +550,14 @@ pub(crate) fn begin_tool_call(start: ToolCallStart) -> anyhow::Result<ToolCallGu
         panic: None,
         detail: None,
     };
-    write_tool_event(state, &event)?;
+    let mut started_event = event.clone();
+    started_event.audit_context = None;
+    started_event.audit_context_read_error = None;
+    started_event.foreground = None;
+    started_event.foreground_read_error = None;
+    started_event.session_target = None;
+    started_event.session_target_read_error = None;
+    write_tool_event(state, &started_event)?;
     state.in_flight.insert(seq, event);
     Ok(ToolCallGuard {
         run_id: state.run.run_id.clone(),
@@ -463,6 +583,11 @@ pub(crate) fn record_context_event(input: ContextEvent) -> anyhow::Result<u64> {
         seq,
         event_kind: input.event_kind.to_owned(),
         tool: input.tool.to_owned(),
+        operation: None,
+        route_id: None,
+        profile: None,
+        tool_surface_sha256: None,
+        tool_profile_read_error: None,
         status: input.status.to_owned(),
         started_at_unix_ms: recorded_at_unix_ms,
         finished_at_unix_ms: Some(recorded_at_unix_ms),
@@ -681,14 +806,30 @@ pub(crate) fn diagnostic_value() -> Value {
         });
     };
     match guard.as_ref() {
-        Some(state) => json!({
-            "status": if state.last_error.is_some() { "error" } else { "ok" },
-            "run_id": state.run.run_id,
-            "pid": state.run.pid,
-            "paths": state.paths,
-            "last_error": state.last_error,
-            "in_flight_count": state.in_flight.len(),
-        }),
+        Some(state) => {
+            let tool_ledger = ledger_diagnostic_value(
+                Path::new(&state.paths.tool_events_path),
+                state.max_segment_bytes,
+                "tool_events",
+            );
+            let exit_ledger = ledger_diagnostic_value(
+                Path::new(&state.paths.exit_events_path),
+                state.max_segment_bytes,
+                "exit_events",
+            );
+            json!({
+                "status": if state.last_error.is_some() { "error" } else { "ok" },
+                "run_id": state.run.run_id,
+                "pid": state.run.pid,
+                "paths": state.paths,
+                "last_error": state.last_error,
+                "in_flight_count": state.in_flight.len(),
+                "ledgers": {
+                    "tool_events": tool_ledger,
+                    "exit_events": exit_ledger,
+                },
+            })
+        }
         None => json!({
             "status": "not_configured",
             "detail": "daemon lifecycle ledger not configured in this process",
@@ -706,6 +847,132 @@ pub(crate) fn current_run_id() -> Option<String> {
     let slot = state_slot();
     let guard = slot.lock().ok()?;
     guard.as_ref().map(|state| state.run.run_id.clone())
+}
+
+pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolUsageTelemetry {
+    let Some(paths) = current_paths() else {
+        return ToolUsageTelemetry {
+            source_of_truth: "daemon lifecycle ledger not configured".to_owned(),
+            max_rows,
+            rows_scanned: 0,
+            segment_count: 0,
+            aggregates: Vec::new(),
+            read_error: Some("daemon lifecycle ledger not configured".to_owned()),
+        };
+    };
+    let active = PathBuf::from(&paths.tool_events_path);
+    let ledger_paths = match lifecycle_ledger_paths_oldest_first(&active) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return ToolUsageTelemetry {
+                source_of_truth: active.display().to_string(),
+                max_rows,
+                rows_scanned: 0,
+                segment_count: 0,
+                aggregates: Vec::new(),
+                read_error: Some(format!("{error:#}")),
+            };
+        }
+    };
+    let mut rows_scanned = 0_usize;
+    let mut aggregates: BTreeMap<ToolUsageKey, ToolUsageAggregate> = BTreeMap::new();
+    for path in ledger_paths.iter().rev() {
+        if rows_scanned >= max_rows {
+            break;
+        }
+        let lines = match File::open(path).map(BufReader::new) {
+            Ok(reader) => reader.lines().collect::<Result<Vec<_>, _>>(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(error),
+        };
+        let lines = match lines {
+            Ok(lines) => lines,
+            Err(error) => {
+                return ToolUsageTelemetry {
+                    source_of_truth: active.display().to_string(),
+                    max_rows,
+                    rows_scanned,
+                    segment_count: ledger_paths.len(),
+                    aggregates: aggregates.into_values().collect(),
+                    read_error: Some(format!("read {}: {error}", path.display())),
+                };
+            }
+        };
+        for line in lines.into_iter().rev() {
+            if rows_scanned >= max_rows {
+                break;
+            }
+            let Ok(event) = serde_json::from_str::<ToolEvent>(&line) else {
+                rows_scanned = rows_scanned.saturating_add(1);
+                continue;
+            };
+            rows_scanned = rows_scanned.saturating_add(1);
+            if event.event_kind != "tool_call" || event.status == "started" {
+                continue;
+            }
+            let key = (
+                event.tool.clone(),
+                event.operation.clone(),
+                event.route_id.clone(),
+                event.profile.clone(),
+            );
+            let error_code = event
+                .error
+                .as_ref()
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .or_else(|| {
+                    event
+                        .error
+                        .as_ref()
+                        .and_then(|error| error.get("detail_code"))
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                });
+            let entry = aggregates.entry(key).or_insert_with(|| ToolUsageAggregate {
+                tool: event.tool.clone(),
+                operation: event.operation.clone(),
+                route_id: event.route_id.clone(),
+                profile: event.profile.clone(),
+                tool_surface_sha256: event.tool_surface_sha256.clone(),
+                calls_total: 0,
+                ok_total: 0,
+                error_total: 0,
+                panic_total: 0,
+                total_duration_ms: 0,
+                max_duration_ms: 0,
+                latest_status: event.status.clone(),
+                latest_error_code: error_code.clone(),
+            });
+            entry.calls_total = entry.calls_total.saturating_add(1);
+            match event.status.as_str() {
+                "ok" => entry.ok_total = entry.ok_total.saturating_add(1),
+                "panic" => entry.panic_total = entry.panic_total.saturating_add(1),
+                _ => entry.error_total = entry.error_total.saturating_add(1),
+            }
+            let duration_ms = event.duration_ms.unwrap_or(0);
+            entry.total_duration_ms = entry.total_duration_ms.saturating_add(duration_ms);
+            entry.max_duration_ms = entry.max_duration_ms.max(duration_ms);
+        }
+    }
+    let mut values = aggregates.into_values().collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .calls_total
+            .cmp(&left.calls_total)
+            .then(left.tool.cmp(&right.tool))
+            .then(left.operation.cmp(&right.operation))
+    });
+    values.truncate(max_aggregates);
+    ToolUsageTelemetry {
+        source_of_truth: active.display().to_string(),
+        max_rows,
+        rows_scanned,
+        segment_count: ledger_paths.len(),
+        aggregates: values,
+        read_error: None,
+    }
 }
 
 pub(crate) fn in_flight_tool_calls_for_session(
@@ -853,10 +1120,10 @@ fn append_diagnostic_event(
     detail: Value,
 ) -> anyhow::Result<()> {
     let slot = state_slot();
-    let guard = slot
+    let mut guard = slot
         .lock()
         .map_err(|_error| anyhow::anyhow!("daemon lifecycle state lock poisoned"))?;
-    let Some(state) = guard.as_ref() else {
+    let Some(state) = guard.as_mut() else {
         bail!("daemon lifecycle ledger is not configured");
     };
     let event = ExitEvent {
@@ -873,18 +1140,12 @@ fn append_diagnostic_event(
         in_flight_tool_events: state.in_flight.values().cloned().collect(),
         paths: state.paths.clone(),
     };
-    with_lifecycle_ledger_lock(
-        Path::new(&state.paths.db_path),
-        "append daemon diagnostic event",
-        || {
-            append_json_line(Path::new(&state.paths.exit_events_path), &event).with_context(|| {
-                format!(
-                    "append daemon diagnostic event {}",
-                    state.paths.exit_events_path
-                )
-            })
-        },
-    )
+    let db_path = PathBuf::from(&state.paths.db_path);
+    let exit_events_path = state.paths.exit_events_path.clone();
+    with_lifecycle_ledger_lock(&db_path, "append daemon diagnostic event", || {
+        append_exit_event(state, &event)
+            .with_context(|| format!("append daemon diagnostic event {exit_events_path}"))
+    })
 }
 
 fn record_exit(event_kind: &'static str, cause: &'static str, detail: Value) -> anyhow::Result<()> {
@@ -947,7 +1208,7 @@ fn record_exit_for_state_locked(
             )
         })?;
     let owns_run_current = current.run_id == state.run.run_id;
-    append_json_line(Path::new(&state.paths.exit_events_path), &event)
+    append_exit_event(state, &event)
         .with_context(|| format!("append daemon exit event {}", state.paths.exit_events_path))?;
     if owns_run_current {
         write_json_atomic(Path::new(&state.paths.run_current_path), &run).with_context(|| {
@@ -1009,48 +1270,106 @@ fn write_tool_event_inner(
         .with_context(|| format!("write daemon last tool {tool_last_path}"))
 }
 
-/// Append one JSON line to the active `daemon-tool-events.jsonl`, rotating the
+fn append_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> anyhow::Result<()> {
+    let tool_events_path = state.paths.tool_events_path.clone();
+    append_bounded_json_line(
+        Path::new(&tool_events_path),
+        event,
+        &mut state.tool_events_bytes,
+        state.max_segment_bytes,
+        "tool_events",
+    )
+    .with_context(|| format!("append daemon tool event {tool_events_path}"))
+}
+
+fn append_exit_event(state: &mut DaemonLifecycleState, event: &ExitEvent) -> anyhow::Result<()> {
+    let exit_events_path = state.paths.exit_events_path.clone();
+    match append_bounded_json_line(
+        Path::new(&exit_events_path),
+        event,
+        &mut state.exit_events_bytes,
+        state.max_segment_bytes,
+        "exit_events",
+    ) {
+        Ok(()) => {
+            state.last_error = None;
+            tracing::info!(
+                code = "MCP_DAEMON_LIFECYCLE_EXIT_EVENT_RECORDED",
+                cause = %event.cause,
+                event_kind = %event.event_kind,
+                "daemon lifecycle exit event recorded"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            state.last_error = Some(detail.clone());
+            tracing::error!(
+                code = "MCP_DAEMON_LIFECYCLE_EXIT_WRITE_FAILED",
+                cause = %event.cause,
+                event_kind = %event.event_kind,
+                detail = %detail,
+                "daemon lifecycle exit event write failed"
+            );
+            Err(error)
+        }
+    }
+}
+
+/// Append one JSON line to a bounded lifecycle ledger, rotating the active
 /// segment first when this record would push it past the size cap.
 ///
-/// Size is tracked with the in-memory [`DaemonLifecycleState::tool_events_bytes`]
-/// counter, so the hot path performs no per-write stat. The rotation runs before
-/// any handle to the active file is opened; because appends reopen and close the
-/// handle per call, the active file is guaranteed to have no open write handle at
-/// rename time, which Windows requires. An empty active file is never rotated, so
-/// a single record larger than the cap is still written (to an empty segment)
-/// rather than lost.
-fn append_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> anyhow::Result<()> {
-    let events_path = state.paths.tool_events_path.clone();
-    let path = Path::new(&events_path);
-
-    let mut line =
-        serde_json::to_vec(event).with_context(|| format!("encode JSON line {events_path}"))?;
+/// The active byte counter is tracked in memory so the append hot path never
+/// stats the file. Rotation runs before the active file is opened, so Windows
+/// never has to rename a file with an open append handle. If a single record is
+/// larger than the cap, it is written to an empty segment and reported as an
+/// explicit oversize exception instead of being dropped.
+fn append_bounded_json_line<T: Serialize>(
+    path: &Path,
+    value: &T,
+    active_bytes: &mut u64,
+    max_segment_bytes: u64,
+    ledger_name: &'static str,
+) -> anyhow::Result<()> {
+    let mut line = serde_json::to_vec(value)
+        .with_context(|| format!("encode JSON line {}", path.display()))?;
     line.push(b'\n');
     let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
 
-    if state.tool_events_bytes > 0
-        && state.tool_events_bytes.saturating_add(line_len) > state.max_segment_bytes
-    {
-        if let Err(error) = rotate_tool_events(path) {
+    if *active_bytes > 0 && active_bytes.saturating_add(line_len) > max_segment_bytes {
+        if let Err(error) = rotate_ledger(path, ledger_name) {
             let detail = format!("{error:#}");
             tracing::error!(
                 code = "DAEMON_LEDGER_ROTATE_FAILED",
-                tool_events_path = %events_path,
-                active_bytes = state.tool_events_bytes,
+                ledger = ledger_name,
+                path = %path.display(),
+                active_bytes = *active_bytes,
                 next_record_bytes = line_len,
-                max_segment_bytes = state.max_segment_bytes,
+                max_segment_bytes,
                 detail = %detail,
-                "daemon lifecycle tool-event ledger rotation failed"
+                "daemon lifecycle ledger rotation failed"
             );
             return Err(error);
         }
-        state.tool_events_bytes = 0;
+        *active_bytes = 0;
         tracing::info!(
             code = "MCP_DAEMON_LIFECYCLE_LEDGER_ROTATED",
-            tool_events_path = %events_path,
-            max_segment_bytes = state.max_segment_bytes,
+            ledger = ledger_name,
+            path = %path.display(),
+            max_segment_bytes,
             max_segments = MAX_LEDGER_SEGMENTS,
-            "daemon lifecycle tool-event ledger rotated"
+            "daemon lifecycle ledger rotated"
+        );
+    }
+
+    if line_len > max_segment_bytes {
+        tracing::warn!(
+            code = "MCP_DAEMON_LIFECYCLE_LEDGER_OVERSIZED_RECORD",
+            ledger = ledger_name,
+            path = %path.display(),
+            record_bytes = line_len,
+            max_segment_bytes,
+            "daemon lifecycle ledger record exceeds the segment cap and is retained as an explicit oversize exception"
         );
     }
 
@@ -1061,42 +1380,381 @@ fn append_tool_event(state: &mut DaemonLifecycleState, event: &ToolEvent) -> any
         .create(true)
         .append(true)
         .open(path)
-        .with_context(|| format!("open append {events_path}"))?;
+        .with_context(|| format!("open append {}", path.display()))?;
     file.write_all(&line)
-        .with_context(|| format!("write daemon tool event {events_path}"))?;
+        .with_context(|| format!("write daemon lifecycle ledger {}", path.display()))?;
     file.flush()
-        .with_context(|| format!("flush {events_path}"))?;
+        .with_context(|| format!("flush {}", path.display()))?;
     file.sync_data()
-        .with_context(|| format!("sync {events_path}"))?;
-    state.tool_events_bytes = state.tool_events_bytes.saturating_add(line_len);
+        .with_context(|| format!("sync {}", path.display()))?;
+    *active_bytes = active_bytes.saturating_add(line_len);
     Ok(())
 }
 
-/// Rotate the active daemon tool-event ledger using a fixed shift scheme.
-///
-/// `daemon-tool-events.jsonl.1` is always the most recently rotated segment and
-/// `daemon-tool-events.jsonl.{MAX_LEDGER_SEGMENTS}` the oldest. On each rotation
-/// the oldest slot is pruned first, remaining segments shift up by one
-/// (`.1`->`.2`, ...), and the active file is renamed into `.1`. That bounds the
-/// number of rotated files at [`MAX_LEDGER_SEGMENTS`]. Every step runs with no
-/// open handle on the files involved (required on Windows). All failures are
-/// propagated so the caller never keeps appending to an oversized ledger.
-fn rotate_tool_events(active: &Path) -> anyhow::Result<()> {
-    // Prune the oldest retained segment so the shift below cannot exceed the cap.
-    let oldest = segment_path(active, MAX_LEDGER_SEGMENTS);
-    match fs::remove_file(&oldest) {
+fn reconcile_jsonl_ledger(
+    active: &Path,
+    max_segment_bytes: u64,
+    ledger_name: &'static str,
+) -> anyhow::Result<u64> {
+    let sources = discover_ledger_sources(active)?;
+    if sources.is_empty() {
+        return Ok(0);
+    }
+    let parent = ledger_parent(active)?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    let staging_dir = unique_ledger_dir(active, "rewrite")?;
+    fs::create_dir(&staging_dir).with_context(|| {
+        format!(
+            "create ledger rewrite staging dir {}",
+            staging_dir.display()
+        )
+    })?;
+
+    let rewrite =
+        match stage_rewritten_ledger(&sources, &staging_dir, max_segment_bytes, ledger_name) {
+            Ok(rewrite) => rewrite,
+            Err(error) => {
+                remove_dir_all_best_effort(&staging_dir, "rewrite staging", ledger_name);
+                return Err(error);
+            }
+        };
+
+    let retained_start = rewrite
+        .segments
+        .len()
+        .saturating_sub(MAX_RETAINED_LEDGER_FILES);
+    let pruned = &rewrite.segments[..retained_start];
+    let pruned_bytes: u64 = pruned.iter().map(|segment| segment.bytes).sum();
+    let pruned_records: u64 = pruned.iter().map(|segment| segment.records).sum();
+    let pruned_oversized_records: u64 =
+        pruned.iter().map(|segment| segment.oversized_records).sum();
+    let retained = &rewrite.segments[retained_start..];
+    let retained_oversized_records: u64 = retained
+        .iter()
+        .map(|segment| segment.oversized_records)
+        .sum();
+    let active_bytes = install_reconciled_ledger(active, &sources, retained, ledger_name)
+        .with_context(|| {
+            format!(
+                "install reconciled daemon lifecycle {ledger_name} ledger {}",
+                active.display()
+            )
+        })?;
+    remove_dir_all_best_effort(&staging_dir, "rewrite staging", ledger_name);
+
+    if pruned_records > 0 || pruned_bytes > 0 {
+        tracing::warn!(
+            code = "MCP_DAEMON_LIFECYCLE_LEDGER_RETENTION_PRUNED",
+            ledger = ledger_name,
+            active_path = %active.display(),
+            pruned_records,
+            pruned_bytes,
+            pruned_oversized_records,
+            retained_files = retained.len(),
+            max_retained_files = MAX_RETAINED_LEDGER_FILES,
+            "daemon lifecycle ledger startup reconciliation pruned records outside retention"
+        );
+    }
+    if rewrite.missing_newline_repairs > 0 {
+        tracing::warn!(
+            code = "MCP_DAEMON_LIFECYCLE_LEDGER_MISSING_NEWLINE_REPAIRED",
+            ledger = ledger_name,
+            active_path = %active.display(),
+            repaired_lines = rewrite.missing_newline_repairs,
+            "daemon lifecycle ledger startup reconciliation repaired unterminated JSONL records before future appends"
+        );
+    }
+    tracing::info!(
+        code = "MCP_DAEMON_LIFECYCLE_LEDGER_RECONCILED",
+        ledger = ledger_name,
+        active_path = %active.display(),
+        source_files = sources.len(),
+        source_records = rewrite.source_records,
+        source_bytes = rewrite.source_bytes,
+        retained_files = retained.len(),
+        retained_oversized_records,
+        active_bytes,
+        max_segment_bytes,
+        max_retained_files = MAX_RETAINED_LEDGER_FILES,
+        "daemon lifecycle ledger startup reconciliation complete"
+    );
+    Ok(active_bytes)
+}
+
+fn stage_rewritten_ledger(
+    sources: &[LedgerSource],
+    staging_dir: &Path,
+    max_segment_bytes: u64,
+    ledger_name: &'static str,
+) -> anyhow::Result<LedgerRewrite> {
+    let mut writer = LedgerRewriteWriter::new(staging_dir, max_segment_bytes, ledger_name);
+    let mut source_bytes = 0_u64;
+    let mut source_records = 0_u64;
+    let mut missing_newline_repairs = 0_u64;
+
+    for source in sources {
+        let file = File::open(&source.path)
+            .with_context(|| format!("open lifecycle ledger segment {}", source.path.display()))?;
+        let mut reader = BufReader::new(file);
+        loop {
+            let mut line = Vec::new();
+            let read = reader.read_until(b'\n', &mut line).with_context(|| {
+                format!("read lifecycle ledger segment {}", source.path.display())
+            })?;
+            if read == 0 {
+                break;
+            }
+            source_records = source_records.saturating_add(1);
+            source_bytes = source_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            if !line.ends_with(b"\n") {
+                line.push(b'\n');
+                missing_newline_repairs = missing_newline_repairs.saturating_add(1);
+            }
+            writer.append_line(&line)?;
+        }
+    }
+
+    Ok(LedgerRewrite {
+        segments: writer.finish()?,
+        source_bytes,
+        source_records,
+        missing_newline_repairs,
+    })
+}
+
+struct LedgerRewriteWriter<'a> {
+    dir: &'a Path,
+    max_segment_bytes: u64,
+    ledger_name: &'static str,
+    next_index: usize,
+    current_file: Option<File>,
+    current_path: PathBuf,
+    current_bytes: u64,
+    current_records: u64,
+    current_oversized_records: u64,
+    segments: Vec<StagedLedgerSegment>,
+}
+
+impl<'a> LedgerRewriteWriter<'a> {
+    fn new(dir: &'a Path, max_segment_bytes: u64, ledger_name: &'static str) -> Self {
+        Self {
+            dir,
+            max_segment_bytes,
+            ledger_name,
+            next_index: 0,
+            current_file: None,
+            current_path: PathBuf::new(),
+            current_bytes: 0,
+            current_records: 0,
+            current_oversized_records: 0,
+            segments: Vec::new(),
+        }
+    }
+
+    fn append_line(&mut self, line: &[u8]) -> anyhow::Result<()> {
+        let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
+        if self.current_bytes > 0
+            && self.current_bytes.saturating_add(line_len) > self.max_segment_bytes
+        {
+            self.finish_current()?;
+        }
+        if self.current_file.is_none() {
+            self.start_segment()?;
+        }
+        let file = self
+            .current_file
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("ledger rewrite segment was not opened"))?;
+        file.write_all(line).with_context(|| {
+            format!(
+                "write staged lifecycle ledger {}",
+                self.current_path.display()
+            )
+        })?;
+        self.current_bytes = self.current_bytes.saturating_add(line_len);
+        self.current_records = self.current_records.saturating_add(1);
+        if line_len > self.max_segment_bytes {
+            self.current_oversized_records = self.current_oversized_records.saturating_add(1);
+            tracing::warn!(
+                code = "MCP_DAEMON_LIFECYCLE_LEDGER_OVERSIZED_RECORD",
+                ledger = self.ledger_name,
+                staged_path = %self.current_path.display(),
+                record_bytes = line_len,
+                max_segment_bytes = self.max_segment_bytes,
+                "daemon lifecycle ledger reconciliation retained a single record larger than the segment cap"
+            );
+            self.finish_current()?;
+        }
+        Ok(())
+    }
+
+    fn start_segment(&mut self) -> anyhow::Result<()> {
+        let path = self.dir.join(format!(
+            "segment-{index:020}.jsonl",
+            index = self.next_index
+        ));
+        self.next_index = self.next_index.saturating_add(1);
+        let file = File::create(&path)
+            .with_context(|| format!("create staged ledger {}", path.display()))?;
+        self.current_file = Some(file);
+        self.current_path = path;
+        self.current_bytes = 0;
+        self.current_records = 0;
+        self.current_oversized_records = 0;
+        Ok(())
+    }
+
+    fn finish_current(&mut self) -> anyhow::Result<()> {
+        let Some(mut file) = self.current_file.take() else {
+            return Ok(());
+        };
+        file.flush()
+            .with_context(|| format!("flush staged ledger {}", self.current_path.display()))?;
+        file.sync_data()
+            .with_context(|| format!("sync staged ledger {}", self.current_path.display()))?;
+        self.segments.push(StagedLedgerSegment {
+            path: self.current_path.clone(),
+            bytes: self.current_bytes,
+            records: self.current_records,
+            oversized_records: self.current_oversized_records,
+        });
+        self.current_path = PathBuf::new();
+        self.current_bytes = 0;
+        self.current_records = 0;
+        self.current_oversized_records = 0;
+        Ok(())
+    }
+
+    fn finish(mut self) -> anyhow::Result<Vec<StagedLedgerSegment>> {
+        self.finish_current()?;
+        Ok(self.segments)
+    }
+}
+
+fn install_reconciled_ledger(
+    active: &Path,
+    sources: &[LedgerSource],
+    retained: &[StagedLedgerSegment],
+    ledger_name: &'static str,
+) -> anyhow::Result<u64> {
+    let backup_dir = unique_ledger_dir(active, "backup")?;
+    fs::create_dir(&backup_dir)
+        .with_context(|| format!("create ledger rewrite backup dir {}", backup_dir.display()))?;
+    for source in sources {
+        let backup_path = backup_dir.join(source.path.file_name().ok_or_else(|| {
+            anyhow::anyhow!("ledger source has no file name: {}", source.path.display())
+        })?);
+        fs::rename(&source.path, &backup_path).with_context(|| {
+            format!(
+                "move existing daemon lifecycle {ledger_name} ledger segment {} to backup {}",
+                source.path.display(),
+                backup_path.display()
+            )
+        })?;
+    }
+
+    for (newest_offset, segment) in retained.iter().rev().enumerate() {
+        let destination = if newest_offset == 0 {
+            active.to_path_buf()
+        } else {
+            segment_path(active, newest_offset)
+        };
+        fs::rename(&segment.path, &destination).with_context(|| {
+            format!(
+                "install daemon lifecycle {ledger_name} ledger segment {} to {}",
+                segment.path.display(),
+                destination.display()
+            )
+        })?;
+    }
+    let active_bytes = retained.last().map_or(0, |segment| segment.bytes);
+
+    match fs::remove_dir_all(&backup_dir) {
         Ok(()) => {}
+        Err(error) => {
+            tracing::warn!(
+                code = "MCP_DAEMON_LIFECYCLE_LEDGER_BACKUP_CLEANUP_FAILED",
+                ledger = ledger_name,
+                backup_dir = %backup_dir.display(),
+                error = %error,
+                "daemon lifecycle ledger rewrite succeeded but backup cleanup failed"
+            );
+        }
+    }
+    Ok(active_bytes)
+}
+
+fn remove_dir_all_best_effort(path: &Path, role: &'static str, ledger_name: &'static str) {
+    match fs::remove_dir_all(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(
+                code = "MCP_DAEMON_LIFECYCLE_LEDGER_TEMP_CLEANUP_FAILED",
+                ledger = ledger_name,
+                role,
+                path = %path.display(),
+                error = %error,
+                "daemon lifecycle ledger temporary directory cleanup failed"
+            );
+        }
+    }
+}
+
+fn unique_ledger_dir(active: &Path, role: &str) -> anyhow::Result<PathBuf> {
+    let parent = ledger_parent(active)?;
+    let file_name = active
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("ledger path has no file name: {}", active.display()))?
+        .to_string_lossy();
+    Ok(parent.join(format!(
+        ".{file_name}.{role}.{}.{}",
+        std::process::id(),
+        uuid::Uuid::now_v7().simple()
+    )))
+}
+
+fn ledger_parent(active: &Path) -> anyhow::Result<&Path> {
+    active
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("ledger path has no parent: {}", active.display()))
+}
+
+/// Rotate an active lifecycle ledger using a fixed shift scheme.
+///
+/// `<ledger>.1` is always the most recently rotated segment and
+/// `<ledger>.{MAX_LEDGER_SEGMENTS}` the oldest. The oldest slot is pruned before
+/// shifting so the file count cannot exceed the retention cap. Every error is
+/// propagated so callers never continue appending into an oversized active file.
+fn rotate_ledger(active: &Path, ledger_name: &'static str) -> anyhow::Result<()> {
+    let oldest = segment_path(active, MAX_LEDGER_SEGMENTS);
+    match fs::metadata(&oldest) {
+        Ok(metadata) => {
+            fs::remove_file(&oldest).with_context(|| {
+                format!(
+                    "prune oldest daemon lifecycle {ledger_name} segment {}",
+                    oldest.display()
+                )
+            })?;
+            tracing::warn!(
+                code = "MCP_DAEMON_LIFECYCLE_LEDGER_RETENTION_PRUNED",
+                ledger = ledger_name,
+                path = %oldest.display(),
+                pruned_bytes = metadata.len(),
+                max_segments = MAX_LEDGER_SEGMENTS,
+                "daemon lifecycle ledger rotation pruned oldest retained segment"
+            );
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => {
             return Err(error).with_context(|| {
                 format!(
-                    "prune oldest daemon tool-event segment {}",
+                    "stat oldest daemon lifecycle {ledger_name} segment {}",
                     oldest.display()
                 )
             });
         }
     }
-    // Shift existing segments up: .(MAX-1)->.MAX, ..., .1->.2.
     for index in (1..MAX_LEDGER_SEGMENTS).rev() {
         let from = segment_path(active, index);
         let to = segment_path(active, index + 1);
@@ -1106,7 +1764,7 @@ fn rotate_tool_events(active: &Path) -> anyhow::Result<()> {
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!(
-                        "shift daemon tool-event segment {} to {}",
+                        "shift daemon lifecycle {ledger_name} segment {} to {}",
                         from.display(),
                         to.display()
                     )
@@ -1114,15 +1772,152 @@ fn rotate_tool_events(active: &Path) -> anyhow::Result<()> {
             }
         }
     }
-    // Move the (closed) active file into the newest rotated slot.
     let newest = segment_path(active, 1);
     fs::rename(active, &newest).with_context(|| {
         format!(
-            "rotate active daemon tool-event ledger {} to {}",
+            "rotate active daemon lifecycle {ledger_name} ledger {} to {}",
             active.display(),
             newest.display()
         )
     })
+}
+
+fn discover_ledger_sources(active: &Path) -> anyhow::Result<Vec<LedgerSource>> {
+    let parent = ledger_parent(active)?;
+    let file_name = active
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("ledger path has no file name: {}", active.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let rotated_prefix = format!("{file_name}.");
+    let mut sources = Vec::new();
+    match fs::read_dir(parent) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.with_context(|| format!("read entry in {}", parent.display()))?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == file_name {
+                    sources.push(LedgerSource {
+                        path: entry.path(),
+                        suffix: None,
+                    });
+                } else if let Some(suffix) = name.strip_prefix(&rotated_prefix)
+                    && let Ok(index) = suffix.parse::<usize>()
+                    && index > 0
+                {
+                    sources.push(LedgerSource {
+                        path: entry.path(),
+                        suffix: Some(index),
+                    });
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error).with_context(|| format!("read {}", parent.display())),
+    }
+    sources.sort_by(|left, right| match (left.suffix, right.suffix) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+    Ok(sources)
+}
+
+pub(crate) fn lifecycle_ledger_paths_oldest_first(active: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    discover_ledger_sources(active)
+        .map(|sources| sources.into_iter().map(|source| source.path).collect())
+}
+
+fn ledger_diagnostic_value(
+    active: &Path,
+    max_segment_bytes: u64,
+    ledger_name: &'static str,
+) -> Value {
+    match ledger_segment_values(active, max_segment_bytes) {
+        Ok((segments, total_bytes, oversized_segment_count)) => json!({
+            "status": "ok",
+            "ledger": ledger_name,
+            "active_path": active.display().to_string(),
+            "max_segment_bytes": max_segment_bytes,
+            "max_segments": MAX_LEDGER_SEGMENTS,
+            "max_retained_files": MAX_RETAINED_LEDGER_FILES,
+            "active_bytes": segments
+                .iter()
+                .find(|segment| segment.get("suffix").is_none_or(Value::is_null))
+                .and_then(|segment| segment.get("bytes"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            "rotated_segment_count": segments
+                .iter()
+                .filter(|segment| !segment.get("suffix").is_none_or(Value::is_null))
+                .count(),
+            "segment_count": segments.len(),
+            "total_bytes": total_bytes,
+            "oversized_segment_count": oversized_segment_count,
+            "segments": segments,
+        }),
+        Err(error) => json!({
+            "status": "error",
+            "ledger": ledger_name,
+            "active_path": active.display().to_string(),
+            "max_segment_bytes": max_segment_bytes,
+            "detail": format!("{error:#}"),
+        }),
+    }
+}
+
+fn ledger_summary_for_health(active: &Path, max_segment_bytes: u64) -> String {
+    match ledger_segment_values(active, max_segment_bytes) {
+        Ok((segments, total_bytes, oversized_segment_count)) => {
+            let active_bytes = segments
+                .iter()
+                .find(|segment| segment.get("suffix").is_none_or(Value::is_null))
+                .and_then(|segment| segment.get("bytes"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            format!(
+                "active_bytes:{active_bytes},segments:{},total_bytes:{total_bytes},oversized_segments:{oversized_segment_count},max_segment_bytes:{max_segment_bytes}",
+                segments.len()
+            )
+        }
+        Err(error) => format!("error:{error:#}"),
+    }
+}
+
+fn ledger_segment_values(
+    active: &Path,
+    max_segment_bytes: u64,
+) -> anyhow::Result<(Vec<Value>, u64, usize)> {
+    let mut sources = discover_ledger_sources(active)?;
+    sources.sort_by(|left, right| match (left.suffix, right.suffix) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (Some(left), Some(right)) => left.cmp(&right),
+    });
+    let mut total_bytes = 0_u64;
+    let mut oversized_segment_count = 0_usize;
+    let mut values = Vec::with_capacity(sources.len());
+    for source in sources {
+        let bytes = fs::metadata(&source.path)
+            .with_context(|| format!("stat lifecycle ledger segment {}", source.path.display()))?
+            .len();
+        total_bytes = total_bytes.saturating_add(bytes);
+        let oversized = bytes > max_segment_bytes;
+        if oversized {
+            oversized_segment_count = oversized_segment_count.saturating_add(1);
+        }
+        values.push(json!({
+            "path": source.path.display().to_string(),
+            "role": if source.suffix.is_some() { "rotated" } else { "active" },
+            "suffix": source.suffix,
+            "bytes": bytes,
+            "oversized": oversized,
+        }));
+    }
+    Ok((values, total_bytes, oversized_segment_count))
 }
 
 /// Build the path of rotated segment `index` for `active` by appending
@@ -1136,8 +1931,21 @@ fn segment_path(active: &Path, index: usize) -> PathBuf {
     active.with_file_name(name)
 }
 
+fn configured_max_segment_bytes() -> u64 {
+    #[cfg(test)]
+    {
+        let override_bytes =
+            TEST_MAX_LEDGER_SEGMENT_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        if override_bytes > 0 {
+            return override_bytes;
+        }
+    }
+    MAX_LEDGER_SEGMENT_BYTES
+}
+
 #[cfg(test)]
 pub(crate) fn set_max_segment_bytes_for_test(bytes: u64) {
+    TEST_MAX_LEDGER_SEGMENT_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
     let slot = state_slot();
     let mut guard = slot
         .lock()
@@ -1153,6 +1961,7 @@ fn state_slot() -> &'static Mutex<Option<DaemonLifecycleState>> {
 
 #[cfg(test)]
 pub(crate) fn reset_for_test() {
+    TEST_MAX_LEDGER_SEGMENT_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
     if let Some(slot) = STATE.get() {
         let mut guard = slot
             .lock()
@@ -1166,8 +1975,16 @@ fn health_detail_for_state(state: &DaemonLifecycleState) -> String {
         .last_error
         .as_deref()
         .map_or_else(|| "none".to_owned(), ToOwned::to_owned);
+    let tool_ledger = ledger_summary_for_health(
+        Path::new(&state.paths.tool_events_path),
+        state.max_segment_bytes,
+    );
+    let exit_ledger = ledger_summary_for_health(
+        Path::new(&state.paths.exit_events_path),
+        state.max_segment_bytes,
+    );
     format!(
-        "run_id={} pid={} run_current_path={} tool_last_path={} tool_events_path={} exit_events_path={} in_flight_count={} last_error={}",
+        "run_id={} pid={} run_current_path={} tool_last_path={} tool_events_path={} exit_events_path={} in_flight_count={} tool_ledger={} exit_ledger={} last_error={}",
         state.run.run_id,
         state.run.pid,
         state.paths.run_current_path,
@@ -1175,6 +1992,8 @@ fn health_detail_for_state(state: &DaemonLifecycleState) -> String {
         state.paths.tool_events_path,
         state.paths.exit_events_path,
         state.in_flight.len(),
+        tool_ledger,
+        exit_ledger,
         last_error
     )
 }
@@ -1208,25 +2027,6 @@ fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()>
     }
     fs::rename(&temp, path)
         .with_context(|| format!("rename {} to {}", temp.display(), path.display()))
-}
-
-fn append_json_line<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("open append {}", path.display()))?;
-    serde_json::to_writer(&mut file, value)
-        .with_context(|| format!("encode JSON line {}", path.display()))?;
-    file.write_all(b"\n")
-        .with_context(|| format!("write newline {}", path.display()))?;
-    file.flush()
-        .with_context(|| format!("flush {}", path.display()))?;
-    file.sync_data()
-        .with_context(|| format!("sync {}", path.display()))
 }
 
 fn now_unix_ms() -> u64 {
@@ -1309,6 +2109,11 @@ mod tests {
 
         let guard = begin_tool_call(ToolCallStart {
             tool: "health".to_owned(),
+            operation: Some("compact".to_owned()),
+            route_id: Some("health.compact".to_owned()),
+            profile: Some("normal_agent".to_owned()),
+            tool_surface_sha256: Some("synthetic-surface".to_owned()),
+            tool_profile_read_error: None,
             mcp_session_id: Some("session-a".to_owned()),
             audit_context: Some(json!({"profile_id": "synthetic"})),
             audit_context_read_error: None,
@@ -1332,6 +2137,39 @@ mod tests {
         assert_eq!(events.lines().count(), 2);
         assert!(events.contains("\"status\":\"started\""));
         assert!(events.contains("\"status\":\"ok\""));
+        let rows = events
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows[0].get("status").and_then(Value::as_str),
+            Some("started")
+        );
+        assert!(
+            rows[0].get("audit_context").is_none(),
+            "started rows must not duplicate full audit context"
+        );
+        assert!(
+            rows[0].get("foreground").is_none(),
+            "started rows must not duplicate foreground snapshots"
+        );
+        assert!(
+            rows[0].get("session_target").is_none(),
+            "started rows must not duplicate session target snapshots"
+        );
+        assert_eq!(rows[1].get("status").and_then(Value::as_str), Some("ok"));
+        assert!(
+            rows[1].get("audit_context").is_some(),
+            "completion row keeps the full audit context once"
+        );
+        assert!(
+            rows[1].get("foreground").is_some(),
+            "completion row keeps the foreground snapshot once"
+        );
+        assert!(
+            rows[1].get("session_target").is_some(),
+            "completion row keeps the session target once"
+        );
     }
 
     #[test]
@@ -1347,6 +2185,11 @@ mod tests {
 
         let guard = begin_tool_call(ToolCallStart {
             tool: "observe".to_owned(),
+            operation: None,
+            route_id: Some("observe".to_owned()),
+            profile: None,
+            tool_surface_sha256: None,
+            tool_profile_read_error: None,
             mcp_session_id: Some("session-cancelled".to_owned()),
             audit_context: None,
             audit_context_read_error: None,
@@ -1390,6 +2233,11 @@ mod tests {
 
         let guard = begin_tool_call(ToolCallStart {
             tool: "browser_dom".to_owned(),
+            operation: Some("inspect".to_owned()),
+            route_id: Some("browser_dom.inspect".to_owned()),
+            profile: Some("browser_control".to_owned()),
+            tool_surface_sha256: Some("synthetic-surface".to_owned()),
+            tool_profile_read_error: None,
             mcp_session_id: Some("session-a".to_owned()),
             audit_context: None,
             audit_context_read_error: None,
@@ -1494,6 +2342,11 @@ mod tests {
         .unwrap();
         let guard = begin_tool_call(ToolCallStart {
             tool: "observe".to_owned(),
+            operation: None,
+            route_id: Some("observe".to_owned()),
+            profile: None,
+            tool_surface_sha256: None,
+            tool_profile_read_error: None,
             mcp_session_id: Some("session-crash".to_owned()),
             audit_context: None,
             audit_context_read_error: None,
@@ -1710,6 +2563,13 @@ mod tests {
         all
     }
 
+    fn legacy_line(idx: usize) -> String {
+        format!(
+            "{{\"event_kind\":\"legacy_probe\",\"tool\":\"legacy_tool\",\"status\":\"ok\",\"idx\":{idx},\"pad\":\"{}\"}}\n",
+            "x".repeat(48)
+        )
+    }
+
     #[test]
     fn rotates_active_ledger_when_size_cap_exceeded() {
         let _serial = crate::test_support::daemon_lifecycle_serial();
@@ -1811,5 +2671,164 @@ mod tests {
             "newest record retained within the cap"
         );
         println!("readback=noloss total_records={total}");
+    }
+
+    #[test]
+    fn startup_reconciles_sparse_legacy_tool_segments_to_size_and_retention_cap() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join(TOOL_EVENTS_FILE);
+        fs::write(
+            segment_path(&active, 3),
+            (0..10).map(legacy_line).collect::<String>(),
+        )
+        .unwrap();
+        fs::write(&active, (10..50).map(legacy_line).collect::<String>()).unwrap();
+        set_max_segment_bytes_for_test(512);
+
+        let paths = configure_temp(&temp);
+        let active = PathBuf::from(&paths.tool_events_path);
+
+        assert!(
+            !segment_path(&active, MAX_LEDGER_SEGMENTS + 1).exists(),
+            "startup reconciliation must remove suffixes beyond retention"
+        );
+        let mut retained_files = 0;
+        for index in 0..=MAX_LEDGER_SEGMENTS {
+            let path = if index == 0 {
+                active.clone()
+            } else {
+                segment_path(&active, index)
+            };
+            if path.exists() {
+                retained_files += 1;
+                let bytes = fs::metadata(&path).unwrap().len();
+                assert!(
+                    bytes <= 512,
+                    "retained split segment {} exceeded cap with {bytes} bytes",
+                    path.display()
+                );
+            }
+        }
+        assert!(
+            retained_files <= MAX_RETAINED_LEDGER_FILES,
+            "retained file count must be bounded"
+        );
+        let all = read_all_segments_concat(&active);
+        assert!(
+            !all.contains("\"idx\":0"),
+            "oldest legacy records outside retention must be pruned"
+        );
+        assert!(
+            all.contains("\"idx\":49"),
+            "newest legacy record must survive startup reconciliation"
+        );
+        let diagnostic = diagnostic_value();
+        assert_eq!(
+            diagnostic
+                .pointer("/ledgers/tool_events/oversized_segment_count")
+                .and_then(Value::as_u64),
+            Some(0)
+        );
+        println!(
+            "readback=startup_reconcile retained_files={retained_files} total_records={}",
+            total_records(&active)
+        );
+    }
+
+    #[test]
+    fn rotates_exit_ledger_and_retains_newest_segments() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure_temp(&temp);
+        set_max_segment_bytes_for_test(1);
+        let active = PathBuf::from(&paths.exit_events_path);
+
+        for idx in 0..9 {
+            record_startup_exit(
+                "synthetic_exit",
+                json!({
+                    "idx": idx,
+                    "pad": "x".repeat(128),
+                }),
+            )
+            .unwrap();
+        }
+
+        let mut rotated = 0;
+        for index in 1..=(MAX_LEDGER_SEGMENTS + 3) {
+            if segment_path(&active, index).exists() {
+                rotated += 1;
+            }
+        }
+        assert_eq!(
+            rotated, MAX_LEDGER_SEGMENTS,
+            "exit ledger rotation must enforce the segment cap"
+        );
+        assert!(
+            !segment_path(&active, MAX_LEDGER_SEGMENTS + 1).exists(),
+            "exit ledger suffixes beyond the cap must be pruned"
+        );
+        let all = read_all_segments_concat(&active);
+        assert!(!all.contains("\"idx\":0"), "oldest exit event pruned");
+        assert!(all.contains("\"idx\":8"), "newest exit event retained");
+        let diagnostic = diagnostic_value();
+        assert_eq!(
+            diagnostic
+                .pointer("/ledgers/exit_events/rotated_segment_count")
+                .and_then(Value::as_u64),
+            Some(MAX_LEDGER_SEGMENTS as u64)
+        );
+        println!(
+            "readback=exit_rotation rotated={rotated} total_records={}",
+            total_records(&active)
+        );
+    }
+
+    #[test]
+    fn rotation_failure_preserves_existing_active_bytes_and_reports_error() {
+        let _serial = crate::test_support::daemon_lifecycle_serial();
+        let temp = tempfile::tempdir().unwrap();
+        let paths = configure_temp(&temp);
+        set_max_segment_bytes_for_test(1);
+        let active = PathBuf::from(&paths.tool_events_path);
+        write_synthetic_events(1);
+        let before = fs::read_to_string(&active).unwrap();
+        fs::create_dir(segment_path(&active, MAX_LEDGER_SEGMENTS)).unwrap();
+
+        let result = record_context_event(ContextEvent {
+            event_kind: "synthetic_rotation_failure",
+            tool: "rotation_test",
+            status: "recorded",
+            mcp_session_id: Some("session-failure".to_owned()),
+            foreground: None,
+            foreground_read_error: None,
+            detail: json!({ "idx": 999, "code": "SYNTHETIC_ROTATION_FAILURE" }),
+        });
+
+        assert!(result.is_err(), "rotation failure must fail the append");
+        let after = fs::read_to_string(&active).unwrap();
+        assert_eq!(
+            after, before,
+            "failed rotation must not append into the oversized active file"
+        );
+        let diagnostic = diagnostic_value();
+        assert_eq!(
+            diagnostic.get("status").and_then(Value::as_str),
+            Some("error")
+        );
+        assert!(
+            diagnostic
+                .get("last_error")
+                .and_then(Value::as_str)
+                .is_some_and(
+                    |error| error.contains("prune oldest daemon lifecycle tool_events segment")
+                ),
+            "last_error must name the failed rotation step"
+        );
+        println!(
+            "readback=rotation_failure preserved_active_bytes={}",
+            after.len()
+        );
     }
 }

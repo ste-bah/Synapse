@@ -1781,9 +1781,11 @@ impl SynapseService {
                     operator_panic_epoch_at_entry,
                     cancellation,
                 );
-                crate::server::operator_panic_boundary::scope_mcp_boundary_snapshot(
-                    mcp_boundary_snapshot,
-                    transaction,
+                Box::pin(
+                    crate::server::operator_panic_boundary::scope_mcp_boundary_snapshot(
+                        mcp_boundary_snapshot,
+                        transaction,
+                    ),
                 )
                 .await
             })?;
@@ -1893,7 +1895,7 @@ impl SynapseService {
             }
         };
 
-        let transaction = std::panic::AssertUnwindSafe(async {
+        let transaction = std::panic::AssertUnwindSafe(Box::pin(async {
             if let Some(operator_panic_epoch) = operator_panic_epoch_at_entry {
                 let authority_label =
                     act_operator_panic_authority_label(authority_session_id.as_deref());
@@ -1948,7 +1950,7 @@ impl SynapseService {
                             "act foreground authority session disappeared inside its tracked transaction",
                         )
                     })?;
-                    let response = self
+                    let response = Box::pin(self
                         .act_foreground_authority_locked(
                             ActForegroundParams {
                                 reason,
@@ -1964,7 +1966,7 @@ impl SynapseService {
                                 )
                             })?,
                             cancellation.clone(),
-                        )
+                        ))
                         .await?
                         .0;
                     Ok(ActResponse {
@@ -2041,7 +2043,7 @@ impl SynapseService {
                     })
                 }
             }
-        })
+        }))
         .catch_unwind()
         .await;
         let result = match transaction {
@@ -2842,19 +2844,20 @@ impl SynapseService {
                         gate = service.lock_session_authority(&session_id) => gate?,
                     };
                     service.reject_terminated_session_tool_call("act_foreground", &session_id)?;
-                    service
-                        .act_foreground_authority_locked(
-                            params.0,
-                            session_id,
-                            request_context,
-                            operator_panic_epoch_at_entry,
-                            cancellation,
-                        )
-                        .await
+                    Box::pin(service.act_foreground_authority_locked(
+                        params.0,
+                        session_id,
+                        request_context,
+                        operator_panic_epoch_at_entry,
+                        cancellation,
+                    ))
+                    .await
                 };
-                crate::server::operator_panic_boundary::scope_mcp_boundary_snapshot(
-                    Some(mcp_boundary_snapshot),
-                    transaction,
+                Box::pin(
+                    crate::server::operator_panic_boundary::scope_mcp_boundary_snapshot(
+                        Some(mcp_boundary_snapshot),
+                        transaction,
+                    ),
                 )
                 .await
             })?;

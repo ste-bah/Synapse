@@ -13,6 +13,7 @@ use tokio::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const SYNAPSE_SHELL_JOB_ROOT: &str = "SYNAPSE_SHELL_JOB_ROOT";
 const TEST_M3_PERMISSIONS_NON_AUDIO: &str = concat!(
     "READ_EVENTS,WRITE_REFLEX,READ_REFLEX,READ_PROFILE,",
     "WRITE_PROFILE_ACTIVE,WRITE_REPLAY,READ_STORAGE,WRITE_STORAGE,",
@@ -32,6 +33,8 @@ pub struct StdioMcpClient {
     stderr_task: Option<tokio::task::JoinHandle<Vec<u8>>>,
     stderr_buffer: Arc<Mutex<Vec<u8>>>,
     _temp_db_dir: Option<tempfile::TempDir>,
+    _temp_shell_job_root_dir: tempfile::TempDir,
+    shell_job_root: PathBuf,
     next_id: u64,
     raw_rx: Vec<String>,
     raw_tx: Vec<String>,
@@ -80,6 +83,15 @@ impl StdioMcpClient {
     }
 
     pub fn launch_with_env(log_dir: Option<&Path>, envs: &[(&str, &str)]) -> anyhow::Result<Self> {
+        if envs
+            .iter()
+            .any(|(key, _value)| key.eq_ignore_ascii_case(SYNAPSE_SHELL_JOB_ROOT))
+        {
+            bail!(
+                "StdioMcpClient owns {SYNAPSE_SHELL_JOB_ROOT} isolation; \
+                 remove the caller-supplied value so each stdio test daemon gets a unique root"
+            );
+        }
         let bin = mcp_binary_path()?;
         let caller_supplied_db = envs
             .iter()
@@ -90,9 +102,29 @@ impl StdioMcpClient {
             Some(
                 tempfile::Builder::new()
                     .prefix("synapse-stdio-db-")
-                    .tempdir()?,
+                    .tempdir()
+                    .context("create unique SYNAPSE_DB temp directory for stdio MCP test daemon")?,
             )
         };
+        let temp_shell_job_root_dir = tempfile::Builder::new()
+            .prefix("synapse-stdio-shell-jobs-")
+            .tempdir()
+            .context(
+                "create unique SYNAPSE_SHELL_JOB_ROOT temp directory for stdio MCP test daemon",
+            )?;
+        let shell_job_root = temp_shell_job_root_dir.path().to_path_buf();
+        // Each stdio integration-test daemon owns a real, durable shell-job
+        // root for its lifetime. This keeps the daemon's startup lock and any
+        // durable job artifacts disjoint from the long-lived HTTP daemon and
+        // from sibling tests running in parallel. Parent-process
+        // SYNAPSE_SHELL_JOB_ROOT is intentionally ignored here; relying on a
+        // shared process env var is the bug class fixed by #1648.
+        if !shell_job_root.is_dir() {
+            bail!(
+                "unique {SYNAPSE_SHELL_JOB_ROOT} was not created as a directory: {}",
+                shell_job_root.display()
+            );
+        }
         // Default a deterministic synthetic foreground for every stdio MCP test.
         //
         // Action-gated tools (reflex_register, act_spawn_agent, task_dispatch_once,
@@ -143,6 +175,7 @@ impl StdioMcpClient {
         for (key, value) in envs {
             command.env(key, value);
         }
+        command.env(SYNAPSE_SHELL_JOB_ROOT, &shell_job_root);
 
         let mut child = command.spawn().context("spawn synapse-mcp")?;
         let stdin = child.stdin.take().context("child stdin missing")?;
@@ -159,6 +192,8 @@ impl StdioMcpClient {
             ))),
             stderr_buffer,
             _temp_db_dir: temp_db_dir,
+            _temp_shell_job_root_dir: temp_shell_job_root_dir,
+            shell_job_root,
             next_id: 0,
             raw_rx: Vec::new(),
             raw_tx: Vec::new(),
@@ -306,6 +341,11 @@ impl StdioMcpClient {
     #[must_use]
     pub fn child_id(&self) -> Option<u32> {
         self.child.as_ref().and_then(Child::id)
+    }
+
+    #[must_use]
+    pub fn shell_job_root(&self) -> &Path {
+        &self.shell_job_root
     }
 
     async fn write_message(&mut self, value: &Value) -> anyhow::Result<()> {

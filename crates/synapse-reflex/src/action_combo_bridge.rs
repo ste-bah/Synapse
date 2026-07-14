@@ -198,6 +198,7 @@ mod tests {
         let runtime = runtime.lock().expect("reflex runtime readback");
         assert_eq!(runtime.active_count(), 0);
         let statuses = runtime.statuses();
+        drop(runtime);
         assert_eq!(statuses.len(), 1);
         assert_eq!(statuses[0].state, ReflexState::Disabled);
     }

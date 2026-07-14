@@ -70,7 +70,11 @@ use synapse_core::{
     AgentTranscriptRecord, GenAiOperationName, TranscriptParseStatus, TranscriptRole,
     TranscriptSource, TranscriptToolCall, TranscriptUsage,
 };
-use synapse_storage::{Db, agent_transcripts::agent_transcript_key, cf, decode_json, encode_json};
+use synapse_storage::{
+    Db,
+    agent_transcripts::{agent_transcript_key, agent_transcript_ts_index_key},
+    cf, decode_json, encode_json,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::agent_events::{provider_for_agent_kind, record_agent_events, unix_time_ns_now};
@@ -610,6 +614,7 @@ fn ingest_session_file(
     }
 
     let mut rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
+    let mut ts_index_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(lines.len());
     let mut new_parsed = 0_u64;
     let mut new_invalid = 0_u64;
     let mut last_lifecycle: Option<Lifecycle> = None;
@@ -644,7 +649,12 @@ fn ingest_session_file(
                 ),
             ));
         }
-        rows.push((agent_transcript_key(&spawn_id, line_no), encoded));
+        let transcript_key = agent_transcript_key(&spawn_id, line_no);
+        ts_index_rows.push((
+            agent_transcript_ts_index_key(record.ts_ns, &transcript_key),
+            transcript_key.clone(),
+        ));
+        rows.push((transcript_key, encoded));
         cursor.lines_ingested = line_no;
         if let Some(signal) = lifecycle {
             last_lifecycle = Some(signal);
@@ -652,10 +662,13 @@ fn ingest_session_file(
     }
 
     if !rows.is_empty() {
-        db.put_batch_pressure_bypass(cf::CF_AGENT_TRANSCRIPTS, rows)
-            .map_err(|error| {
-                format!("AMBIENT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines re-ingest)")
-            })?;
+        db.put_cf_batches_pressure_bypass(vec![
+            (cf::CF_AGENT_TRANSCRIPTS, rows),
+            (cf::CF_KV, ts_index_rows),
+        ])
+        .map_err(|error| {
+            format!("AMBIENT_ROWS_WRITE_FAILED: {error} (cursor not advanced; lines re-ingest)")
+        })?;
     }
 
     cursor.offset_bytes += consumed_bytes as u64;

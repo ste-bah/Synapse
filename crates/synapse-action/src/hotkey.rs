@@ -7,11 +7,12 @@ use serde::Serialize;
 
 use crate::ActionResult;
 
-/// Interrupt generations are deliberately split. `release` wakes any
-/// interrupt-aware software input path for ordinary release-all/foreground
-/// loss as well as the operator hotkey. `operator_panic` advances only for the
-/// physical operator panic control and is therefore safe to use as an
-/// authority-supersession signal.
+/// Interrupt generations are deliberately split.
+///
+/// `release` wakes any interrupt-aware software input path for ordinary
+/// release-all/foreground loss as well as the operator hotkey.
+/// `operator_panic` advances only for the physical operator panic control and
+/// is therefore safe to use as an authority-supersession signal.
 #[derive(Debug)]
 struct InterruptEpochs {
     release: AtomicU64,
@@ -133,16 +134,47 @@ pub struct OperatorHotkeyShutdownReport {
     pub reason: &'static str,
     pub owner_id: u64,
     pub timeout_ms: u64,
+    #[serde(flatten)]
+    pub stop: OperatorHotkeyStopReport,
+    #[serde(flatten)]
+    pub wake_observation: OperatorHotkeyWakeObservationReport,
+    #[serde(flatten)]
+    pub wake_message: OperatorHotkeyWakeMessageReport,
+    #[serde(flatten)]
+    pub kernel: OperatorHotkeyKernelReport,
+    #[serde(flatten)]
+    pub threads: OperatorHotkeyThreadOwnersReport,
+    pub failures: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorHotkeyStopReport {
     pub stop_requested: bool,
-    pub hook_owner_observed_live_before_wake: bool,
-    pub hook_owner_observed_live_after_wake: bool,
-    pub wake_message_attempted: bool,
-    pub wake_message_sent: bool,
     pub signal_sender_cleared: bool,
     /// True only after the exact installation reservation was released. The
     /// sender is disconnected first so the worker can stop, but that alone
     /// must never admit a replacement while either old thread remains live.
     pub install_slot_released: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorHotkeyWakeObservationReport {
+    pub hook_owner_observed_live_before_wake: bool,
+    pub hook_owner_observed_live_after_wake: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorHotkeyWakeMessageReport {
+    pub wake_message_attempted: bool,
+    pub wake_message_sent: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorHotkeyKernelReport {
     pub low_level_hook_was_installed: Option<bool>,
     pub low_level_hook_unregistered: Option<bool>,
     pub register_hotkey_backup_was_registered: Option<bool>,
@@ -150,11 +182,29 @@ pub struct OperatorHotkeyShutdownReport {
     /// False when any installed kernel registration could not be proven
     /// released, including a hook-thread panic with unobservable cleanup.
     pub kernel_owners_released: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorHotkeyThreadOwnersReport {
+    #[serde(flatten)]
+    pub hook: OperatorHotkeyHookThreadReport,
+    #[serde(flatten)]
+    pub worker: OperatorHotkeyWorkerThreadReport,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorHotkeyHookThreadReport {
     pub hook_thread_terminal: bool,
     pub hook_thread_joined: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperatorHotkeyWorkerThreadReport {
     pub worker_thread_terminal: bool,
     pub worker_thread_joined: bool,
-    pub failures: Vec<String>,
 }
 
 impl OperatorHotkeyShutdownReport {
@@ -164,12 +214,12 @@ impl OperatorHotkeyShutdownReport {
     /// satisfies this verdict when join or unregister state is unproven.
     #[must_use]
     pub const fn owners_quiescent(&self) -> bool {
-        self.hook_thread_terminal
-            && self.hook_thread_joined
-            && self.worker_thread_terminal
-            && self.worker_thread_joined
-            && self.kernel_owners_released
-            && self.install_slot_released
+        self.threads.hook.hook_thread_terminal
+            && self.threads.hook.hook_thread_joined
+            && self.threads.worker.worker_thread_terminal
+            && self.threads.worker.worker_thread_joined
+            && self.kernel.kernel_owners_released
+            && self.stop.install_slot_released
     }
 
     /// Converts every cleanup failure into the action-layer error contract.
@@ -203,22 +253,36 @@ mod shutdown_report_tests {
             reason: "unresolved_kernel_owner_test",
             owner_id: 1,
             timeout_ms: 0,
-            stop_requested: true,
-            hook_owner_observed_live_before_wake: true,
-            hook_owner_observed_live_after_wake: false,
-            wake_message_attempted: true,
-            wake_message_sent: true,
-            signal_sender_cleared: true,
-            install_slot_released: true,
-            low_level_hook_was_installed: Some(true),
-            low_level_hook_unregistered: Some(false),
-            register_hotkey_backup_was_registered: Some(false),
-            register_hotkey_backup_unregistered: None,
-            kernel_owners_released: false,
-            hook_thread_terminal: true,
-            hook_thread_joined: true,
-            worker_thread_terminal: true,
-            worker_thread_joined: true,
+            stop: OperatorHotkeyStopReport {
+                stop_requested: true,
+                signal_sender_cleared: true,
+                install_slot_released: true,
+            },
+            wake_observation: OperatorHotkeyWakeObservationReport {
+                hook_owner_observed_live_before_wake: true,
+                hook_owner_observed_live_after_wake: false,
+            },
+            wake_message: OperatorHotkeyWakeMessageReport {
+                wake_message_attempted: true,
+                wake_message_sent: true,
+            },
+            kernel: OperatorHotkeyKernelReport {
+                low_level_hook_was_installed: Some(true),
+                low_level_hook_unregistered: Some(false),
+                register_hotkey_backup_was_registered: Some(false),
+                register_hotkey_backup_unregistered: None,
+                kernel_owners_released: false,
+            },
+            threads: OperatorHotkeyThreadOwnersReport {
+                hook: OperatorHotkeyHookThreadReport {
+                    hook_thread_terminal: true,
+                    hook_thread_joined: true,
+                },
+                worker: OperatorHotkeyWorkerThreadReport {
+                    worker_thread_terminal: true,
+                    worker_thread_joined: true,
+                },
+            },
             failures: vec!["synthetic unregister failure".to_owned()],
         };
 
@@ -232,22 +296,36 @@ mod shutdown_report_tests {
             reason: "terminal_without_join_test",
             owner_id: 1,
             timeout_ms: 0,
-            stop_requested: true,
-            hook_owner_observed_live_before_wake: true,
-            hook_owner_observed_live_after_wake: false,
-            wake_message_attempted: false,
-            wake_message_sent: false,
-            signal_sender_cleared: true,
-            install_slot_released: true,
-            low_level_hook_was_installed: Some(true),
-            low_level_hook_unregistered: Some(true),
-            register_hotkey_backup_was_registered: Some(false),
-            register_hotkey_backup_unregistered: None,
-            kernel_owners_released: true,
-            hook_thread_terminal: true,
-            hook_thread_joined: false,
-            worker_thread_terminal: true,
-            worker_thread_joined: true,
+            stop: OperatorHotkeyStopReport {
+                stop_requested: true,
+                signal_sender_cleared: true,
+                install_slot_released: true,
+            },
+            wake_observation: OperatorHotkeyWakeObservationReport {
+                hook_owner_observed_live_before_wake: true,
+                hook_owner_observed_live_after_wake: false,
+            },
+            wake_message: OperatorHotkeyWakeMessageReport {
+                wake_message_attempted: false,
+                wake_message_sent: false,
+            },
+            kernel: OperatorHotkeyKernelReport {
+                low_level_hook_was_installed: Some(true),
+                low_level_hook_unregistered: Some(true),
+                register_hotkey_backup_was_registered: Some(false),
+                register_hotkey_backup_unregistered: None,
+                kernel_owners_released: true,
+            },
+            threads: OperatorHotkeyThreadOwnersReport {
+                hook: OperatorHotkeyHookThreadReport {
+                    hook_thread_terminal: true,
+                    hook_thread_joined: false,
+                },
+                worker: OperatorHotkeyWorkerThreadReport {
+                    worker_thread_terminal: true,
+                    worker_thread_joined: true,
+                },
+            },
             failures: Vec::new(),
         };
 
@@ -261,22 +339,36 @@ mod shutdown_report_tests {
             reason: "reserved_install_slot_test",
             owner_id: 7,
             timeout_ms: 0,
-            stop_requested: true,
-            hook_owner_observed_live_before_wake: true,
-            hook_owner_observed_live_after_wake: false,
-            wake_message_attempted: false,
-            wake_message_sent: false,
-            signal_sender_cleared: true,
-            install_slot_released: false,
-            low_level_hook_was_installed: Some(true),
-            low_level_hook_unregistered: Some(true),
-            register_hotkey_backup_was_registered: Some(false),
-            register_hotkey_backup_unregistered: None,
-            kernel_owners_released: true,
-            hook_thread_terminal: true,
-            hook_thread_joined: true,
-            worker_thread_terminal: true,
-            worker_thread_joined: true,
+            stop: OperatorHotkeyStopReport {
+                stop_requested: true,
+                signal_sender_cleared: true,
+                install_slot_released: false,
+            },
+            wake_observation: OperatorHotkeyWakeObservationReport {
+                hook_owner_observed_live_before_wake: true,
+                hook_owner_observed_live_after_wake: false,
+            },
+            wake_message: OperatorHotkeyWakeMessageReport {
+                wake_message_attempted: false,
+                wake_message_sent: false,
+            },
+            kernel: OperatorHotkeyKernelReport {
+                low_level_hook_was_installed: Some(true),
+                low_level_hook_unregistered: Some(true),
+                register_hotkey_backup_was_registered: Some(false),
+                register_hotkey_backup_unregistered: None,
+                kernel_owners_released: true,
+            },
+            threads: OperatorHotkeyThreadOwnersReport {
+                hook: OperatorHotkeyHookThreadReport {
+                    hook_thread_terminal: true,
+                    hook_thread_joined: true,
+                },
+                worker: OperatorHotkeyWorkerThreadReport {
+                    worker_thread_terminal: true,
+                    worker_thread_joined: true,
+                },
+            },
             failures: Vec::new(),
         };
 
@@ -923,7 +1015,7 @@ mod platform {
     }
 
     impl HookThreadTerminal {
-        fn before_hook_install() -> Self {
+        const fn before_hook_install() -> Self {
             Self {
                 low_level_hook_was_installed: Some(false),
                 low_level_hook_unregistered: None,
@@ -952,11 +1044,21 @@ mod platform {
 
     #[derive(Clone, Debug, Default)]
     struct HookWakeObservation {
-        owner_live_before_wake: bool,
-        owner_live_after_wake: bool,
-        message_attempted: bool,
-        message_sent: bool,
+        owner: HookWakeOwnerObservation,
+        message: HookWakeMessageObservation,
         failure: Option<String>,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct HookWakeOwnerObservation {
+        live_before_wake: bool,
+        live_after_wake: bool,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct HookWakeMessageObservation {
+        attempted: bool,
+        sent: bool,
     }
 
     pub fn install_operator_hotkey<F>(handler: F) -> ActionResult<OperatorHotkeyGuard>
@@ -974,50 +1076,119 @@ mod platform {
     where
         F: Fn(super::OperatorPanicSafetyToken) + Send + 'static,
     {
+        reject_retained_install_unwind()?;
+        store_install_unwind_report(None);
+        let owner_id = allocate_hotkey_owner_id()?;
+        let (signal_tx, signal_rx) = mpsc::channel::<HotkeySignal>();
+        reserve_install_state(owner_id, signal_tx.clone())?;
+        reset_hotkey_signal_state(config.key_vk);
+
+        let worker_join = spawn_hotkey_worker(owner_id, signal_rx, handler)?;
+        let stop_requested = Arc::new(AtomicBool::new(false));
+        let hook_thread_id = Arc::new(AtomicU32::new(0));
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<HookReady, String>>();
+        let (hook_terminal_tx, hook_terminal_rx) = mpsc::channel::<HookThreadTerminal>();
+        let hook_join = match spawn_hotkey_hook_thread(
+            config,
+            &stop_requested,
+            &hook_thread_id,
+            ready_tx,
+            hook_terminal_tx,
+        ) {
+            Ok(join) => join,
+            Err(error) => {
+                drop(signal_tx);
+                let guard = operator_hotkey_guard(
+                    owner_id,
+                    hook_thread_id,
+                    stop_requested,
+                    hook_terminal_rx,
+                    Some(HookThreadTerminal::before_hook_install()),
+                    None,
+                    Some(worker_join),
+                );
+                return Err(install_unwind_error(
+                    &format!("operator hotkey thread spawn failed: {error}"),
+                    guard,
+                ));
+            }
+        };
+
+        let guard = operator_hotkey_guard(
+            owner_id,
+            hook_thread_id,
+            stop_requested,
+            hook_terminal_rx,
+            None,
+            Some(hook_join),
+            Some(worker_join),
+        );
+        finish_hotkey_install_ready(&ready_rx, signal_tx, guard)
+    }
+
+    fn reject_retained_install_unwind() -> ActionResult<()> {
         if install_unwind_retained_live_owner() {
             return Err(ActionError::BackendUnavailable {
                 detail: "a prior operator-hotkey installation unwind retained an exact live thread owner or reported unresolved kernel ownership until process teardown"
                     .to_owned(),
             });
         }
-        store_install_unwind_report(None);
+        Ok(())
+    }
+
+    fn allocate_hotkey_owner_id() -> ActionResult<u64> {
         let owner_id = NEXT_HOTKEY_OWNER_ID.fetch_add(1, Ordering::Relaxed);
         if owner_id == 0 {
             return Err(ActionError::BackendUnavailable {
                 detail: "operator hotkey owner identity space exhausted".to_owned(),
             });
         }
-        let (signal_tx, signal_rx) = mpsc::channel::<HotkeySignal>();
-        reserve_install_state(owner_id, signal_tx.clone())?;
-        HOTKEY_KEY_VK.store(config.key_vk, Ordering::Release);
+        Ok(owner_id)
+    }
+
+    fn reset_hotkey_signal_state(key_vk: u32) {
+        HOTKEY_KEY_VK.store(key_vk, Ordering::Release);
         CHORD_DOWN.store(false, Ordering::Release);
         LAST_SIGNAL_TICK_MS.store(0, Ordering::Release);
+    }
 
-        let worker_join = match thread::Builder::new()
+    fn spawn_hotkey_worker<F>(
+        owner_id: u64,
+        signal_rx: mpsc::Receiver<HotkeySignal>,
+        handler: F,
+    ) -> ActionResult<JoinHandle<()>>
+    where
+        F: Fn(super::OperatorPanicSafetyToken) + Send + 'static,
+    {
+        match thread::Builder::new()
             .name("synapse-operator-hotkey-worker".to_owned())
             .spawn(move || run_hotkey_worker(signal_rx, handler))
         {
-            Ok(join) => join,
+            Ok(join) => Ok(join),
             Err(error) => {
                 let release = disconnect_and_release_unstarted_owner(owner_id);
                 if release.is_err() {
                     INSTALL_UNWIND_RETAINED_LIVE_OWNER.store(true, Ordering::Release);
                 }
-                return Err(ActionError::BackendUnavailable {
+                Err(ActionError::BackendUnavailable {
                     detail: format!(
                         "operator hotkey worker thread spawn failed: {error}; installation_slot_cleanup={release:?}"
                     ),
-                });
+                })
             }
-        };
+        }
+    }
 
-        let stop_requested = Arc::new(AtomicBool::new(false));
-        let hook_thread_id = Arc::new(AtomicU32::new(0));
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<HookReady, String>>();
-        let (hook_terminal_tx, hook_terminal_rx) = mpsc::channel::<HookThreadTerminal>();
-        let thread_stop_requested = Arc::clone(&stop_requested);
-        let published_thread_id = Arc::clone(&hook_thread_id);
-        let hook_join = match thread::Builder::new()
+    fn spawn_hotkey_hook_thread(
+        config: HotkeyConfig,
+        stop_requested: &Arc<AtomicBool>,
+        hook_thread_id: &Arc<AtomicU32>,
+        ready_tx: mpsc::Sender<Result<HookReady, String>>,
+        hook_terminal_tx: mpsc::Sender<HookThreadTerminal>,
+    ) -> std::io::Result<JoinHandle<()>> {
+        let thread_stop_requested = Arc::clone(stop_requested);
+        let published_thread_id = Arc::clone(hook_thread_id);
+        thread::Builder::new()
             .name("synapse-operator-hotkey".to_owned())
             .spawn(move || {
                 let terminal = catch_unwind(AssertUnwindSafe(|| {
@@ -1029,9 +1200,6 @@ mod platform {
                     )
                 }))
                 .unwrap_or_else(|_panic| HookThreadTerminal::panic());
-                // Clear the TID before publishing terminal state. Shutdown
-                // never posts a TID-keyed wake after this exact owner has
-                // declared that it can no longer receive one.
                 published_thread_id.store(0, Ordering::Release);
                 if hook_terminal_tx.send(terminal).is_err() {
                     tracing::error!(
@@ -1039,80 +1207,56 @@ mod platform {
                         "operator hotkey hook terminal report receiver disappeared"
                     );
                 }
-            }) {
-            Ok(join) => join,
-            Err(error) => {
-                drop(signal_tx);
-                let guard = OperatorHotkeyGuard {
-                    owner_id,
-                    hook_thread_id,
-                    stop_requested,
-                    hook_terminal_rx,
-                    hook_terminal_report: Some(HookThreadTerminal::before_hook_install()),
-                    hook_join: None,
-                    worker_join: Some(worker_join),
-                    shutdown_started: false,
-                    shutdown_report: None,
-                };
-                return Err(install_unwind_error(
-                    format!("operator hotkey thread spawn failed: {error}"),
-                    guard,
-                ));
-            }
-        };
+            })
+    }
 
+    const fn operator_hotkey_guard(
+        owner_id: u64,
+        hook_thread_id: Arc<AtomicU32>,
+        stop_requested: Arc<AtomicBool>,
+        hook_terminal_rx: mpsc::Receiver<HookThreadTerminal>,
+        hook_terminal_report: Option<HookThreadTerminal>,
+        hook_join: Option<JoinHandle<()>>,
+        worker_join: Option<JoinHandle<()>>,
+    ) -> OperatorHotkeyGuard {
+        OperatorHotkeyGuard {
+            owner_id,
+            hook_thread_id,
+            stop_requested,
+            hook_terminal_rx,
+            hook_terminal_report,
+            hook_join,
+            worker_join,
+            shutdown_started: false,
+            shutdown_report: None,
+        }
+    }
+
+    fn finish_hotkey_install_ready(
+        ready_rx: &mpsc::Receiver<Result<HookReady, String>>,
+        signal_tx: mpsc::Sender<HotkeySignal>,
+        guard: OperatorHotkeyGuard,
+    ) -> ActionResult<OperatorHotkeyGuard> {
         match ready_rx.recv_timeout(STARTUP_TIMEOUT) {
             Ok(Ok(ready)) => {
-                hook_thread_id.store(ready.thread_id, Ordering::Release);
-                Ok(OperatorHotkeyGuard {
-                    owner_id,
-                    hook_thread_id,
-                    stop_requested,
-                    hook_terminal_rx,
-                    hook_terminal_report: None,
-                    hook_join: Some(hook_join),
-                    worker_join: Some(worker_join),
-                    shutdown_started: false,
-                    shutdown_report: None,
-                })
+                guard
+                    .hook_thread_id
+                    .store(ready.thread_id, Ordering::Release);
+                Ok(guard)
             }
             Ok(Err(detail)) => {
                 drop(signal_tx);
-                let guard = OperatorHotkeyGuard {
-                    owner_id,
-                    hook_thread_id,
-                    stop_requested,
-                    hook_terminal_rx,
-                    hook_terminal_report: None,
-                    hook_join: Some(hook_join),
-                    worker_join: Some(worker_join),
-                    shutdown_started: false,
-                    shutdown_report: None,
-                };
-                Err(install_unwind_error(detail, guard))
+                Err(install_unwind_error(&detail, guard))
             }
             Err(error) => {
                 drop(signal_tx);
-                let guard = OperatorHotkeyGuard {
-                    owner_id,
-                    hook_thread_id,
-                    stop_requested,
-                    hook_terminal_rx,
-                    hook_terminal_report: None,
-                    hook_join: Some(hook_join),
-                    worker_join: Some(worker_join),
-                    shutdown_started: false,
-                    shutdown_report: None,
-                };
-                Err(install_unwind_error(
-                    format!("operator hotkey registration readiness failed: {error}"),
-                    guard,
-                ))
+                let detail = format!("operator hotkey registration readiness failed: {error}");
+                Err(install_unwind_error(&detail, guard))
             }
         }
     }
 
-    fn install_unwind_error(primary: String, mut guard: OperatorHotkeyGuard) -> ActionError {
+    fn install_unwind_error(primary: &str, mut guard: OperatorHotkeyGuard) -> ActionError {
         let cleanup = guard.shutdown_checked(INSTALL_UNWIND_TIMEOUT, "installation_unwind");
         store_install_unwind_report(Some(cleanup.clone()));
         if !cleanup.owners_quiescent() {
@@ -1452,6 +1596,27 @@ mod platform {
         stop_requested: &AtomicBool,
         published_thread_id: &AtomicU32,
     ) -> HookThreadTerminal {
+        let startup =
+            match prepare_hotkey_thread(config, ready, stop_requested, published_thread_id) {
+                Ok(startup) => startup,
+                Err(terminal) => return terminal,
+            };
+        run_hotkey_message_loop(config, stop_requested, startup)
+    }
+
+    struct HotkeyThreadStartup {
+        module: windows::Win32::Foundation::HMODULE,
+        hook_guard: HookGuard,
+        registered_hotkey_guard: Option<RegisteredHotkeyGuard>,
+        priority_high: bool,
+    }
+
+    fn prepare_hotkey_thread(
+        config: &HotkeyConfig,
+        ready: &mpsc::Sender<Result<HookReady, String>>,
+        stop_requested: &AtomicBool,
+        published_thread_id: &AtomicU32,
+    ) -> Result<HotkeyThreadStartup, HookThreadTerminal> {
         let thread_id = unsafe { GetCurrentThreadId() };
         published_thread_id.store(thread_id, Ordering::Release);
         let priority_high = set_current_thread_high_priority("hook");
@@ -1466,7 +1631,7 @@ mod platform {
             let _send_result = ready.send(Err(detail.clone()));
             let mut terminal = HookThreadTerminal::before_hook_install();
             terminal.failures.push(detail);
-            return terminal;
+            return Err(terminal);
         }
 
         let module = match unsafe { GetModuleHandleW(None) } {
@@ -1476,16 +1641,16 @@ mod platform {
                 let _send_result = ready.send(Err(detail.clone()));
                 let mut terminal = HookThreadTerminal::before_hook_install();
                 terminal.failures.push(detail);
-                return terminal;
+                return Err(terminal);
             }
         };
-        let mut hook_guard = match install_keyboard_hook(module, config) {
+        let hook_guard = match install_keyboard_hook(module, config) {
             Ok(hook_guard) => hook_guard,
             Err(error) => {
                 let _send_result = ready.send(Err(error.clone()));
                 let mut terminal = HookThreadTerminal::before_hook_install();
                 terminal.failures.push(error);
-                return terminal;
+                return Err(terminal);
             }
         };
 
@@ -1510,18 +1675,18 @@ mod platform {
         };
 
         let mut failures = Vec::new();
-        let mut kernel_owners_released = true;
+        let kernel_owners_released = true;
         if ready.send(Ok(HookReady { thread_id })).is_err() {
             failures.push(
                 "operator hotkey readiness receiver disappeared after kernel registration"
                     .to_owned(),
             );
-            return finish_hook_thread(
+            return Err(finish_hook_thread(
                 hook_guard,
                 registered_hotkey_guard,
                 kernel_owners_released,
                 failures,
-            );
+            ));
         }
         tracing::info!(
             component = "operator_hotkey",
@@ -1532,7 +1697,28 @@ mod platform {
             hook_thread_priority_high = priority_high,
             "operator panic hotkey armed"
         );
+        Ok(HotkeyThreadStartup {
+            module,
+            hook_guard,
+            registered_hotkey_guard,
+            priority_high,
+        })
+    }
 
+    fn run_hotkey_message_loop(
+        config: &HotkeyConfig,
+        stop_requested: &AtomicBool,
+        startup: HotkeyThreadStartup,
+    ) -> HookThreadTerminal {
+        let HotkeyThreadStartup {
+            module,
+            mut hook_guard,
+            registered_hotkey_guard,
+            priority_high: _priority_high,
+        } = startup;
+        let mut msg = MSG::default();
+        let mut failures = Vec::new();
+        let mut kernel_owners_released = true;
         let mut last_rearm_ms = unsafe { GetTickCount64() };
         'run: loop {
             if stop_requested.load(Ordering::Acquire) {
@@ -1693,10 +1879,10 @@ mod platform {
                     code = "ACTION_OPERATOR_HOTKEY_UNCHECKED_DROP",
                     component = "operator_hotkey",
                     hook_thread_id = self.hook_thread_id.load(Ordering::Acquire),
-                    hook_owner_observed_live_before_wake = wake.owner_live_before_wake,
-                    hook_owner_observed_live_after_wake = wake.owner_live_after_wake,
-                    wake_message_attempted = wake.message_attempted,
-                    wake_message_sent = wake.message_sent,
+                    hook_owner_observed_live_before_wake = wake.owner.live_before_wake,
+                    hook_owner_observed_live_after_wake = wake.owner.live_after_wake,
+                    wake_message_attempted = wake.message.attempted,
+                    wake_message_sent = wake.message.sent,
                     wake_failure = ?wake.failure,
                     "operator hotkey guard dropped without checked shutdown; exact owners will be retained after the non-TID atomic stop request"
                 );
@@ -1727,10 +1913,11 @@ mod platform {
             };
             let owner_live_before_wake = !hook_owner.is_finished();
             HookWakeObservation {
-                owner_live_before_wake,
-                owner_live_after_wake: !hook_owner.is_finished(),
-                message_attempted: false,
-                message_sent: false,
+                owner: HookWakeOwnerObservation {
+                    live_before_wake: owner_live_before_wake,
+                    live_after_wake: !hook_owner.is_finished(),
+                },
+                message: HookWakeMessageObservation::default(),
                 failure: None,
             }
         }
@@ -1750,63 +1937,10 @@ mod platform {
             }
             self.shutdown_started = true;
             let mut failures = Vec::new();
-            let wake = self.observe_hook_owner_for_atomic_stop();
-            // The non-TID stop primitive is the atomic itself. The hook loop
-            // never blocks in GetMessageW and polls this flag every 25 ms.
-            self.stop_requested.store(true, Ordering::Release);
-            if let Err(error) = disconnect_install_sender_checked(self.owner_id) {
-                failures.push(error);
-            }
-            let signal_sender_cleared = match signal_sender_cleared_readback(self.owner_id) {
-                Ok(cleared) => {
-                    if !cleared {
-                        failures.push(
-                            "operator hotkey signal sender remained installed after clear"
-                                .to_owned(),
-                        );
-                    }
-                    cleared
-                }
-                Err(error) => {
-                    failures.push(error);
-                    false
-                }
-            };
+            let stop_readback = self.request_stop_and_read_sender(&mut failures);
             let hook_owner_present = self.hook_join.is_some();
             let worker_owner_present = self.worker_join.is_some();
-            let deadline = Instant::now().checked_add(timeout);
-            loop {
-                if self.hook_terminal_report.is_none()
-                    && let Ok(report) = self.hook_terminal_rx.try_recv()
-                {
-                    self.hook_terminal_report = Some(report);
-                }
-                let hook_terminal = self.hook_join.as_ref().is_none_or(JoinHandle::is_finished);
-                let worker_terminal = self
-                    .worker_join
-                    .as_ref()
-                    .is_none_or(JoinHandle::is_finished);
-                if hook_terminal && worker_terminal {
-                    break;
-                }
-                let Some(deadline) = deadline else {
-                    break;
-                };
-                let now = Instant::now();
-                if now >= deadline {
-                    break;
-                }
-                thread::sleep(
-                    deadline
-                        .saturating_duration_since(now)
-                        .min(THREAD_TERMINAL_POLL_INTERVAL),
-                );
-            }
-            if self.hook_terminal_report.is_none()
-                && let Ok(report) = self.hook_terminal_rx.try_recv()
-            {
-                self.hook_terminal_report = Some(report);
-            }
+            self.wait_for_thread_terminals(timeout);
             let (hook_thread_terminal, hook_thread_joined) = join_if_terminal(
                 "hook",
                 hook_owner_present,
@@ -1837,68 +1971,206 @@ mod platform {
                     timeout.as_millis()
                 ));
             }
-            let (
-                low_level_hook_was_installed,
-                low_level_hook_unregistered,
-                register_hotkey_backup_was_registered,
-                register_hotkey_backup_unregistered,
-                kernel_owners_released,
-            ) = self.hook_terminal_report.as_ref().map_or(
-                (None, None, None, None, false),
-                |terminal| {
-                    failures.extend(terminal.failures.iter().cloned());
-                    (
-                        terminal.low_level_hook_was_installed,
-                        terminal.low_level_hook_unregistered,
-                        terminal.register_hotkey_backup_was_registered,
-                        terminal.register_hotkey_backup_unregistered,
-                        terminal.kernel_owners_released,
-                    )
+            let kernel_report = self.kernel_report(&mut failures);
+            let install_slot_released = release_install_slot_if_quiescent(
+                self.owner_id,
+                stop_readback.signal_sender_cleared,
+                &kernel_report,
+                &super::OperatorHotkeyThreadOwnersReport {
+                    hook: super::OperatorHotkeyHookThreadReport {
+                        hook_thread_terminal,
+                        hook_thread_joined,
+                    },
+                    worker: super::OperatorHotkeyWorkerThreadReport {
+                        worker_thread_terminal,
+                        worker_thread_joined,
+                    },
                 },
+                &mut failures,
             );
-            let physical_owners_quiescent = hook_thread_terminal
-                && hook_thread_joined
-                && worker_thread_terminal
-                && worker_thread_joined
-                && kernel_owners_released;
-            let install_slot_released = if physical_owners_quiescent && signal_sender_cleared {
-                match release_install_slot_checked(self.owner_id) {
-                    Ok(()) => true,
-                    Err(error) => {
-                        failures.push(error);
-                        false
-                    }
-                }
-            } else {
-                false
-            };
             super::set_operator_hotkey_status(super::OperatorHotkeyStatus::Unknown);
-            let report = super::OperatorHotkeyShutdownReport {
+            let report = build_shutdown_report(ShutdownReportParts {
                 reason,
                 owner_id: self.owner_id,
-                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                stop_requested: true,
-                hook_owner_observed_live_before_wake: wake.owner_live_before_wake,
-                hook_owner_observed_live_after_wake: wake.owner_live_after_wake,
-                wake_message_attempted: wake.message_attempted,
-                wake_message_sent: wake.message_sent,
-                signal_sender_cleared,
+                timeout,
+                stop_readback: &stop_readback,
+                kernel: kernel_report,
+                threads: super::OperatorHotkeyThreadOwnersReport {
+                    hook: super::OperatorHotkeyHookThreadReport {
+                        hook_thread_terminal,
+                        hook_thread_joined,
+                    },
+                    worker: super::OperatorHotkeyWorkerThreadReport {
+                        worker_thread_terminal,
+                        worker_thread_joined,
+                    },
+                },
                 install_slot_released,
-                low_level_hook_was_installed,
-                low_level_hook_unregistered,
-                register_hotkey_backup_was_registered,
-                register_hotkey_backup_unregistered,
-                kernel_owners_released,
-                hook_thread_terminal,
-                hook_thread_joined,
-                worker_thread_terminal,
-                worker_thread_joined,
                 failures,
-            };
+            });
             if report.owners_quiescent() {
                 self.shutdown_report = Some(report.clone());
             }
             report
+        }
+
+        fn request_stop_and_read_sender(&self, failures: &mut Vec<String>) -> HotkeyStopReadback {
+            let wake = self.observe_hook_owner_for_atomic_stop();
+            // The non-TID stop primitive is the atomic itself. The hook loop
+            // never blocks in GetMessageW and polls this flag every 25 ms.
+            self.stop_requested.store(true, Ordering::Release);
+            if let Err(error) = disconnect_install_sender_checked(self.owner_id) {
+                failures.push(error);
+            }
+            let signal_sender_cleared = match signal_sender_cleared_readback(self.owner_id) {
+                Ok(cleared) => {
+                    if !cleared {
+                        failures.push(
+                            "operator hotkey signal sender remained installed after clear"
+                                .to_owned(),
+                        );
+                    }
+                    cleared
+                }
+                Err(error) => {
+                    failures.push(error);
+                    false
+                }
+            };
+            HotkeyStopReadback {
+                wake,
+                signal_sender_cleared,
+            }
+        }
+
+        fn wait_for_thread_terminals(&mut self, timeout: Duration) {
+            let deadline = Instant::now().checked_add(timeout);
+            loop {
+                self.try_recv_hook_terminal_report();
+                let hook_terminal = self.hook_join.as_ref().is_none_or(JoinHandle::is_finished);
+                let worker_terminal = self
+                    .worker_join
+                    .as_ref()
+                    .is_none_or(JoinHandle::is_finished);
+                if hook_terminal && worker_terminal {
+                    break;
+                }
+                let Some(deadline) = deadline else {
+                    break;
+                };
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                thread::sleep(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(THREAD_TERMINAL_POLL_INTERVAL),
+                );
+            }
+            self.try_recv_hook_terminal_report();
+        }
+
+        fn try_recv_hook_terminal_report(&mut self) {
+            if self.hook_terminal_report.is_none()
+                && let Ok(report) = self.hook_terminal_rx.try_recv()
+            {
+                self.hook_terminal_report = Some(report);
+            }
+        }
+
+        fn kernel_report(&self, failures: &mut Vec<String>) -> super::OperatorHotkeyKernelReport {
+            self.hook_terminal_report.as_ref().map_or(
+                super::OperatorHotkeyKernelReport {
+                    low_level_hook_was_installed: None,
+                    low_level_hook_unregistered: None,
+                    register_hotkey_backup_was_registered: None,
+                    register_hotkey_backup_unregistered: None,
+                    kernel_owners_released: false,
+                },
+                |terminal| {
+                    failures.extend(terminal.failures.iter().cloned());
+                    super::OperatorHotkeyKernelReport {
+                        low_level_hook_was_installed: terminal.low_level_hook_was_installed,
+                        low_level_hook_unregistered: terminal.low_level_hook_unregistered,
+                        register_hotkey_backup_was_registered: terminal
+                            .register_hotkey_backup_was_registered,
+                        register_hotkey_backup_unregistered: terminal
+                            .register_hotkey_backup_unregistered,
+                        kernel_owners_released: terminal.kernel_owners_released,
+                    }
+                },
+            )
+        }
+    }
+
+    struct HotkeyStopReadback {
+        wake: HookWakeObservation,
+        signal_sender_cleared: bool,
+    }
+
+    fn release_install_slot_if_quiescent(
+        owner_id: u64,
+        signal_sender_cleared: bool,
+        kernel: &super::OperatorHotkeyKernelReport,
+        threads: &super::OperatorHotkeyThreadOwnersReport,
+        failures: &mut Vec<String>,
+    ) -> bool {
+        let physical_owners_quiescent = threads.hook.hook_thread_terminal
+            && threads.hook.hook_thread_joined
+            && threads.worker.worker_thread_terminal
+            && threads.worker.worker_thread_joined
+            && kernel.kernel_owners_released;
+        if !physical_owners_quiescent || !signal_sender_cleared {
+            return false;
+        }
+        match release_install_slot_checked(owner_id) {
+            Ok(()) => true,
+            Err(error) => {
+                failures.push(error);
+                false
+            }
+        }
+    }
+
+    struct ShutdownReportParts<'a> {
+        reason: &'static str,
+        owner_id: u64,
+        timeout: Duration,
+        stop_readback: &'a HotkeyStopReadback,
+        kernel: super::OperatorHotkeyKernelReport,
+        threads: super::OperatorHotkeyThreadOwnersReport,
+        install_slot_released: bool,
+        failures: Vec<String>,
+    }
+
+    fn build_shutdown_report(
+        parts: ShutdownReportParts<'_>,
+    ) -> super::OperatorHotkeyShutdownReport {
+        super::OperatorHotkeyShutdownReport {
+            reason: parts.reason,
+            owner_id: parts.owner_id,
+            timeout_ms: u64::try_from(parts.timeout.as_millis()).unwrap_or(u64::MAX),
+            stop: super::OperatorHotkeyStopReport {
+                stop_requested: true,
+                signal_sender_cleared: parts.stop_readback.signal_sender_cleared,
+                install_slot_released: parts.install_slot_released,
+            },
+            wake_observation: super::OperatorHotkeyWakeObservationReport {
+                hook_owner_observed_live_before_wake: parts
+                    .stop_readback
+                    .wake
+                    .owner
+                    .live_before_wake,
+                hook_owner_observed_live_after_wake: parts.stop_readback.wake.owner.live_after_wake,
+            },
+            wake_message: super::OperatorHotkeyWakeMessageReport {
+                wake_message_attempted: parts.stop_readback.wake.message.attempted,
+                wake_message_sent: parts.stop_readback.wake.message.sent,
+            },
+            kernel: parts.kernel,
+            threads: parts.threads,
+            failures: parts.failures,
         }
     }
 
@@ -2066,16 +2338,17 @@ mod platform {
                     },
                 })?;
         if state.owner_id.is_some() || state.sender.is_some() {
-            return Err(ActionError::BackendUnavailable {
-                detail: format!(
-                    "operator hotkey is already installed or retained in this process: owner_id={:?} sender_present={}",
-                    state.owner_id,
-                    state.sender.is_some()
-                ),
-            });
+            let detail = format!(
+                "operator hotkey is already installed or retained in this process: owner_id={:?} sender_present={}",
+                state.owner_id,
+                state.sender.is_some()
+            );
+            drop(state);
+            return Err(ActionError::BackendUnavailable { detail });
         }
         state.owner_id = Some(owner_id);
         state.sender = Some(sender);
+        drop(state);
         Ok(())
     }
 
@@ -2106,11 +2379,14 @@ mod platform {
             && state.last_released_owner_id == Some(owner_id)
             && state.sender.is_none())
         {
-            return Err(format!(
+            let detail = format!(
                 "operator hotkey sender disconnect owner mismatch: expected={owner_id} actual={:?}",
                 state.owner_id
-            ));
+            );
+            drop(state);
+            return Err(detail);
         }
+        drop(state);
         HOTKEY_KEY_VK.store(0, Ordering::Release);
         CHORD_DOWN.store(false, Ordering::Release);
         LAST_SIGNAL_TICK_MS.store(0, Ordering::Release);
@@ -2160,24 +2436,30 @@ mod platform {
         };
         if state.owner_id == Some(owner_id) {
             if state.sender.is_some() {
-                return Err(format!(
+                let detail = format!(
                     "operator hotkey installation slot for owner {owner_id} still owns a worker sender"
-                ));
+                );
+                drop(state);
+                return Err(detail);
             }
             state.owner_id = None;
             state.last_released_owner_id = Some(owner_id);
+            drop(state);
             return Ok(());
         }
         if state.owner_id.is_none()
             && state.last_released_owner_id == Some(owner_id)
             && state.sender.is_none()
         {
+            drop(state);
             return Ok(());
         }
-        Err(format!(
+        let detail = format!(
             "operator hotkey installation-slot release owner mismatch: expected={owner_id} actual={:?} last_released={:?}",
             state.owner_id, state.last_released_owner_id
-        ))
+        );
+        drop(state);
+        Err(detail)
     }
 
     fn set_current_thread_high_priority(role: &'static str) -> bool {
@@ -2231,6 +2513,7 @@ mod platform {
                 Err(poisoned) => poisoned.into_inner(),
             };
             *state = HotkeyInstallState::empty();
+            drop(state);
             HOTKEY_KEY_VK.store(0, Ordering::Release);
             CHORD_DOWN.store(false, Ordering::Release);
             LAST_SIGNAL_TICK_MS.store(0, Ordering::Release);
@@ -2322,16 +2605,19 @@ mod platform {
                 guard.shutdown_checked(Duration::from_secs(10), "real_windows_hotkey_thread_test");
 
             assert!(report.owners_quiescent(), "{report:?}");
-            assert!(report.hook_thread_joined, "{report:?}");
-            assert!(report.worker_thread_joined, "{report:?}");
-            assert!(report.hook_owner_observed_live_before_wake, "{report:?}");
-            assert!(!report.wake_message_attempted, "{report:?}");
-            assert!(!report.wake_message_sent, "{report:?}");
-            assert_eq!(report.low_level_hook_was_installed, Some(true));
-            assert_eq!(report.low_level_hook_unregistered, Some(true));
-            assert!(report.kernel_owners_released, "{report:?}");
-            assert!(report.signal_sender_cleared, "{report:?}");
-            assert!(report.install_slot_released, "{report:?}");
+            assert!(report.threads.hook.hook_thread_joined, "{report:?}");
+            assert!(report.threads.worker.worker_thread_joined, "{report:?}");
+            assert!(
+                report.wake_observation.hook_owner_observed_live_before_wake,
+                "{report:?}"
+            );
+            assert!(!report.wake_message.wake_message_attempted, "{report:?}");
+            assert!(!report.wake_message.wake_message_sent, "{report:?}");
+            assert_eq!(report.kernel.low_level_hook_was_installed, Some(true));
+            assert_eq!(report.kernel.low_level_hook_unregistered, Some(true));
+            assert!(report.kernel.kernel_owners_released, "{report:?}");
+            assert!(report.stop.signal_sender_cleared, "{report:?}");
+            assert!(report.stop.install_slot_released, "{report:?}");
             assert!(report.failures.is_empty(), "{report:?}");
 
             let mut replacement = match install_operator_hotkey_with_config(
@@ -2387,8 +2673,8 @@ mod platform {
             };
             {
                 let sender = match hotkey_install_state().lock() {
-                    Ok(state) => state.sender.as_ref().cloned(),
-                    Err(poisoned) => poisoned.into_inner().sender.as_ref().cloned(),
+                    Ok(state) => state.sender.clone(),
+                    Err(poisoned) => poisoned.into_inner().sender.clone(),
                 };
                 let Some(sender) = sender else {
                     panic!("installed real hotkey has no worker sender");
@@ -2406,9 +2692,15 @@ mod platform {
 
             let before_release =
                 guard.shutdown_checked(Duration::ZERO, "live_worker_before_release");
-            assert!(!before_release.worker_thread_terminal, "{before_release:?}");
+            assert!(
+                !before_release.threads.worker.worker_thread_terminal,
+                "{before_release:?}"
+            );
             assert!(!before_release.owners_quiescent(), "{before_release:?}");
-            assert!(!before_release.install_slot_released, "{before_release:?}");
+            assert!(
+                !before_release.stop.install_slot_released,
+                "{before_release:?}"
+            );
             let replacement = install_operator_hotkey_with_config(
                 lifecycle_test_config(b'I'),
                 finish_test_operator_panic_token,
@@ -2432,9 +2724,18 @@ mod platform {
             let after_release =
                 guard.shutdown_checked(Duration::from_secs(10), "live_worker_after_release");
             assert!(after_release.owners_quiescent(), "{after_release:?}");
-            assert!(after_release.worker_thread_joined, "{after_release:?}");
-            assert!(after_release.install_slot_released, "{after_release:?}");
-            assert!(!after_release.wake_message_attempted, "{after_release:?}");
+            assert!(
+                after_release.threads.worker.worker_thread_joined,
+                "{after_release:?}"
+            );
+            assert!(
+                after_release.stop.install_slot_released,
+                "{after_release:?}"
+            );
+            assert!(
+                !after_release.wake_message.wake_message_attempted,
+                "{after_release:?}"
+            );
             assert!(after_release.failures.is_empty(), "{after_release:?}");
         }
     }
@@ -2459,22 +2760,36 @@ mod platform {
                 reason,
                 owner_id: 0,
                 timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
-                stop_requested: true,
-                hook_owner_observed_live_before_wake: false,
-                hook_owner_observed_live_after_wake: false,
-                wake_message_attempted: false,
-                wake_message_sent: false,
-                signal_sender_cleared: true,
-                install_slot_released: true,
-                low_level_hook_was_installed: Some(false),
-                low_level_hook_unregistered: None,
-                register_hotkey_backup_was_registered: Some(false),
-                register_hotkey_backup_unregistered: None,
-                kernel_owners_released: true,
-                hook_thread_terminal: true,
-                hook_thread_joined: true,
-                worker_thread_terminal: true,
-                worker_thread_joined: true,
+                stop: super::OperatorHotkeyStopReport {
+                    stop_requested: true,
+                    signal_sender_cleared: true,
+                    install_slot_released: true,
+                },
+                wake_observation: super::OperatorHotkeyWakeObservationReport {
+                    hook_owner_observed_live_before_wake: false,
+                    hook_owner_observed_live_after_wake: false,
+                },
+                wake_message: super::OperatorHotkeyWakeMessageReport {
+                    wake_message_attempted: false,
+                    wake_message_sent: false,
+                },
+                kernel: super::OperatorHotkeyKernelReport {
+                    low_level_hook_was_installed: Some(false),
+                    low_level_hook_unregistered: None,
+                    register_hotkey_backup_was_registered: Some(false),
+                    register_hotkey_backup_unregistered: None,
+                    kernel_owners_released: true,
+                },
+                threads: super::OperatorHotkeyThreadOwnersReport {
+                    hook: super::OperatorHotkeyHookThreadReport {
+                        hook_thread_terminal: true,
+                        hook_thread_joined: true,
+                    },
+                    worker: super::OperatorHotkeyWorkerThreadReport {
+                        worker_thread_terminal: true,
+                        worker_thread_joined: true,
+                    },
+                },
                 failures: Vec::new(),
             }
         }

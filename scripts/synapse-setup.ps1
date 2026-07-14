@@ -143,6 +143,18 @@ $script:SynapseBindPostExitContinuationRequired = $false
 $script:SynapseBindPostExitContinuationDetail = $null
 $script:SynapsePostExitStartOnly = ($PostExitParentPid -gt 0 -and $PostExitContinuationReason -eq 'dead_owner_bind_after_install')
 $script:SynapseSetupRepairManifestPath = $env:SYNAPSE_SETUP_REPAIR_MANIFEST
+$script:SynapseBundledProfilesManifestFileName = '.synapse-bundled-profiles.manifest.json'
+$script:SynapseBundledProfilesQuarantineDirName = '.synapse-retired-bundled-profiles'
+$script:SynapseBundledProfilesRollbackDirName = '.synapse-profile-reconcile-backups'
+$script:SynapseLegacyRetiredBundledProfiles = @(
+    [pscustomobject]@{
+        relative_path = 'everquest.live.toml'
+        sha256 = 'B921FB8298F5939AD40902360B4E478205827DE5113CD6F2D8ADD1DDA23254BD'
+        retired_by = '95f8e986051468bdd62ed82a6713b1a1167b2d94'
+        issue = '#1544/#1641'
+        reason = 'legacy bundled profile removed before setup had an ownership manifest'
+    }
+)
 function Write-SynapsePostExitManifestState {
     param(
         [Parameter(Mandatory=$true)][string]$State,
@@ -3345,6 +3357,525 @@ function Get-SynapseFileSha256 {
     }
 }
 
+function Get-SynapseFullPathForScopeCheck {
+    param([Parameter(Mandatory=$true)][string]$Path)
+    return [System.IO.Path]::GetFullPath($Path).TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar)
+}
+
+function Assert-SynapseProfileRelativePathSafe {
+    param(
+        [Parameter(Mandatory=$true)][string]$RelativePath,
+        [Parameter(Mandatory=$true)][string]$Context
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RelativePath)) {
+        Die "SYNAPSE_PROFILE_RELATIVE_PATH_EMPTY context=$Context remediation=bundled profile manifests must use non-empty relative paths"
+    }
+    if ($RelativePath -match '^[A-Za-z]:|^\\\\') {
+        Die "SYNAPSE_PROFILE_RELATIVE_PATH_ABSOLUTE context=$Context relative_path=$RelativePath remediation=bundled profile manifests must not contain absolute paths"
+    }
+    $normalized = $RelativePath.Replace('\', '/')
+    foreach ($segment in @($normalized.Split('/'))) {
+        if ([string]::IsNullOrWhiteSpace($segment) -or $segment -eq '.' -or $segment -eq '..') {
+            Die "SYNAPSE_PROFILE_RELATIVE_PATH_UNSAFE context=$Context relative_path=$RelativePath segment=$segment remediation=bundled profile manifests must not contain empty, current-directory, or parent-directory segments"
+        }
+    }
+    return $normalized
+}
+
+function Join-SynapseProfileRelativePath {
+    param(
+        [Parameter(Mandatory=$true)][string]$BaseDir,
+        [Parameter(Mandatory=$true)][string]$RelativePath,
+        [Parameter(Mandatory=$true)][string]$Context
+    )
+
+    $normalized = Assert-SynapseProfileRelativePathSafe -RelativePath $RelativePath -Context $Context
+    $baseFull = Get-SynapseFullPathForScopeCheck -Path $BaseDir
+    $baseWithSep = $baseFull + [System.IO.Path]::DirectorySeparatorChar
+    $nativeRelative = $normalized.Replace('/', [string][System.IO.Path]::DirectorySeparatorChar)
+    $candidate = [System.IO.Path]::GetFullPath((Join-Path $baseFull $nativeRelative))
+    if (-not $candidate.StartsWith($baseWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Die "SYNAPSE_PROFILE_RELATIVE_PATH_SCOPE_ESCAPE context=$Context base=$baseFull relative_path=$RelativePath resolved=$candidate remediation=bundled profile reconciliation refuses paths that escape the profile directory"
+    }
+    return $candidate
+}
+
+function Get-SynapseProfileRelativePath {
+    param(
+        [Parameter(Mandatory=$true)][string]$BaseDir,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$Context
+    )
+
+    $baseFull = Get-SynapseFullPathForScopeCheck -Path $BaseDir
+    $baseWithSep = $baseFull + [System.IO.Path]::DirectorySeparatorChar
+    $full = [System.IO.Path]::GetFullPath($Path)
+    if (-not $full.StartsWith($baseWithSep, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Die "SYNAPSE_PROFILE_PATH_SCOPE_ESCAPE context=$Context base=$baseFull path=$full remediation=bundled profile reconciliation refuses to classify files outside the profile root"
+    }
+    return (Assert-SynapseProfileRelativePathSafe -RelativePath ($full.Substring($baseWithSep.Length).Replace('\', '/')) -Context $Context)
+}
+
+function Test-SynapseSetupProfileMetadataRelativePath {
+    param([Parameter(Mandatory=$true)][string]$RelativePath)
+
+    $normalized = $RelativePath.Replace('\', '/')
+    return (
+        $normalized -ieq $script:SynapseBundledProfilesManifestFileName -or
+        $normalized.StartsWith("$($script:SynapseBundledProfilesQuarantineDirName)/", [System.StringComparison]::OrdinalIgnoreCase) -or
+        $normalized.StartsWith("$($script:SynapseBundledProfilesRollbackDirName)/", [System.StringComparison]::OrdinalIgnoreCase))
+}
+
+function New-SynapseCaseInsensitiveMap {
+    return (New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase))
+}
+
+function Read-SynapseProfileTomlId {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$RelativePath
+    )
+
+    $reader = $null
+    try {
+        $reader = [System.IO.File]::OpenText($Path)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if ($line -match '^\s*#') { continue }
+            if ($line -match '^\s*\[') { break }
+            if ($line -match '^\s*id\s*=\s*"([^"]+)"') {
+                return $Matches[1]
+            }
+        }
+    } catch {
+        Die "SYNAPSE_PROFILE_ID_READ_FAILED path=$Path relative_path=$RelativePath error=$($_.Exception.Message) remediation=verify the bundled profile TOML is readable before setup can deploy it"
+    } finally {
+        if ($null -ne $reader) {
+            $reader.Dispose()
+        }
+    }
+    return ''
+}
+
+function Get-SynapseBundledProfileSourceEntries {
+    param([Parameter(Mandatory=$true)][string]$SourceProfilesDir)
+
+    if (-not (Test-Path -LiteralPath $SourceProfilesDir -PathType Container)) {
+        Die "SYNAPSE_BUNDLED_PROFILES_SOURCE_MISSING path=$SourceProfilesDir remediation=provide the repository bundled profile directory before setup can reconcile installed profiles"
+    }
+
+    $entries = @()
+    foreach ($file in @(Get-ChildItem -LiteralPath $SourceProfilesDir -File -Recurse -ErrorAction Stop)) {
+        $relative = Get-SynapseProfileRelativePath -BaseDir $SourceProfilesDir -Path $file.FullName -Context 'source_bundled_profiles'
+        if (Test-SynapseSetupProfileMetadataRelativePath -RelativePath $relative) { continue }
+        $isTopLevelProfile = ($relative -notmatch '/' -and $relative.EndsWith('.toml', [System.StringComparison]::OrdinalIgnoreCase))
+        $entries += [pscustomobject]@{
+            relative_path = $relative
+            source_path = $file.FullName
+            sha256 = Get-SynapseFileSha256 -Path $file.FullName
+            length = [int64]$file.Length
+            last_write_time_utc = $file.LastWriteTimeUtc.ToString('o')
+            profile_file = [bool]$isTopLevelProfile
+        }
+    }
+
+    $entries = @($entries | Sort-Object relative_path)
+    if ($entries.Count -lt 1) {
+        Die "SYNAPSE_BUNDLED_PROFILES_SOURCE_EMPTY path=$SourceProfilesDir remediation=repository bundled profile source must contain at least one file"
+    }
+
+    $pathMap = New-SynapseCaseInsensitiveMap
+    foreach ($entry in $entries) {
+        if ($pathMap.ContainsKey($entry.relative_path)) {
+            Die "SYNAPSE_BUNDLED_PROFILES_DUPLICATE_RELATIVE_PATH path=$SourceProfilesDir relative_path=$($entry.relative_path) remediation=remove case-colliding bundled profile files before setup can deploy them"
+        }
+        $pathMap[$entry.relative_path] = $entry
+    }
+
+    $profileEntries = @($entries | Where-Object { $_.profile_file })
+    if ($profileEntries.Count -lt 1) {
+        Die "SYNAPSE_BUNDLED_PROFILES_SOURCE_NO_TOML path=$SourceProfilesDir remediation=profile-dependent tools need at least one top-level bundled .toml profile"
+    }
+
+    $ids = @()
+    foreach ($entry in $profileEntries) {
+        $id = Read-SynapseProfileTomlId -Path $entry.source_path -RelativePath $entry.relative_path
+        if ([string]::IsNullOrWhiteSpace($id)) {
+            Die "SYNAPSE_BUNDLED_PROFILE_ID_MISSING path=$($entry.source_path) relative_path=$($entry.relative_path) remediation=bundled profile TOML must declare a top-level id before any table"
+        }
+        $ids += [pscustomobject]@{ id = $id; relative_path = $entry.relative_path }
+    }
+    $duplicateIds = @($ids | Group-Object id | Where-Object { $_.Count -gt 1 })
+    if ($duplicateIds.Count -gt 0) {
+        $detail = (($duplicateIds | ForEach-Object {
+            "$($_.Name):$((@($_.Group | ForEach-Object { $_.relative_path }) -join ','))"
+        }) -join ';')
+        Die "SYNAPSE_BUNDLED_PROFILE_DUPLICATE_ID path=$SourceProfilesDir duplicates=$detail remediation=profile ids must be unique before setup can deploy a coherent bundled set"
+    }
+
+    return $entries
+}
+
+function Read-SynapseBundledProfilesManifest {
+    param([Parameter(Mandatory=$true)][string]$ManifestPath)
+
+    if (-not (Test-Path -LiteralPath $ManifestPath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $manifest = Get-Content -Raw -LiteralPath $ManifestPath | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_INVALID_JSON path=$ManifestPath error=$($_.Exception.Message) remediation=manifest exists but is unreadable; inspect it before setup can safely decide which deployed profiles it owns"
+    }
+
+    if ([int]$manifest.schema_version -ne 1) {
+        Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_UNSUPPORTED path=$ManifestPath schema_version=$($manifest.schema_version) remediation=setup only understands bundled profile manifest schema_version=1"
+    }
+    if ([string]$manifest.owner -ne 'synapse-setup:bundled-profiles') {
+        Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_OWNER_MISMATCH path=$ManifestPath owner=$($manifest.owner) remediation=setup refuses to use a manifest it did not create"
+    }
+
+    $seen = New-SynapseCaseInsensitiveMap
+    foreach ($file in @($manifest.files)) {
+        $relative = Assert-SynapseProfileRelativePathSafe -RelativePath ([string]$file.relative_path) -Context 'previous_bundled_profiles_manifest'
+        if ($seen.ContainsKey($relative)) {
+            Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_DUPLICATE_PATH path=$ManifestPath relative_path=$relative remediation=repair duplicate manifest entries before setup can safely prune retired bundled profiles"
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$file.sha256) -or ([string]$file.sha256) -notmatch '^[0-9A-Fa-f]{64}$') {
+            Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_BAD_HASH path=$ManifestPath relative_path=$relative sha256=$($file.sha256) remediation=manifest file entries must carry valid SHA-256 hashes"
+        }
+        $seen[$relative] = $true
+    }
+
+    return $manifest
+}
+
+function Convert-SynapseEntriesToMap {
+    param([Parameter(Mandatory=$true)]$Entries)
+
+    $map = New-SynapseCaseInsensitiveMap
+    foreach ($entry in @($Entries)) {
+        $relative = Assert-SynapseProfileRelativePathSafe -RelativePath ([string]$entry.relative_path) -Context 'profile_entry_map'
+        $map[$relative] = $entry
+    }
+    return $map
+}
+
+function Copy-SynapseProfileFileWithHashReadback {
+    param(
+        [Parameter(Mandatory=$true)][string]$Source,
+        [Parameter(Mandatory=$true)][string]$Destination,
+        [Parameter(Mandatory=$true)][string]$ExpectedSha256,
+        [Parameter(Mandatory=$true)][string]$Context
+    )
+
+    $parent = Split-Path -Parent $Destination
+    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force
+    $actual = Get-SynapseFileSha256 -Path $Destination
+    if ($actual -ne $ExpectedSha256) {
+        Die "SYNAPSE_PROFILE_COPY_HASH_MISMATCH context=$Context source=$Source destination=$Destination expected_sha256=$ExpectedSha256 actual_sha256=$actual remediation=copied profile bytes changed during copy; setup refuses to install an incoherent bundled profile set"
+    }
+}
+
+function New-SynapseBundledProfilesManifestObject {
+    param(
+        [Parameter(Mandatory=$true)][string]$SourceProfilesDir,
+        [Parameter(Mandatory=$true)][string]$ProfilesDir,
+        [Parameter(Mandatory=$true)]$Entries,
+        [Parameter(Mandatory=$true)]$Quarantined,
+        [Parameter(Mandatory=$true)]$PreservedCustomProfiles,
+        [Parameter(Mandatory=$true)]$PreservedLegacyRetiredHashMismatches
+    )
+
+    $fileRecords = @($Entries | ForEach-Object {
+        [ordered]@{
+            relative_path = [string]$_.relative_path
+            sha256 = [string]$_.sha256
+            length = [int64]$_.length
+            profile_file = [bool]$_.profile_file
+        }
+    })
+    $fingerprintInput = [ordered]@{
+        schema_version = 1
+        files = $fileRecords
+    }
+    $sourceManifestSha256 = Get-SynapseSha256Hex -Text (Get-SynapseCanonicalJson -Value $fingerprintInput)
+
+    return [ordered]@{
+        schema_version = 1
+        owner = 'synapse-setup:bundled-profiles'
+        generated_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        source_profiles_dir = [System.IO.Path]::GetFullPath($SourceProfilesDir)
+        deployed_profiles_dir = [System.IO.Path]::GetFullPath($ProfilesDir)
+        source_manifest_sha256 = $sourceManifestSha256
+        bundled_file_count = $fileRecords.Count
+        bundled_profile_count = @($fileRecords | Where-Object { $_.profile_file }).Count
+        files = $fileRecords
+        quarantined_retired = @($Quarantined)
+        preserved_custom_profiles = @($PreservedCustomProfiles)
+        preserved_legacy_retired_hash_mismatches = @($PreservedLegacyRetiredHashMismatches)
+    }
+}
+
+function Install-SynapseBundledProfiles {
+    param(
+        [Parameter(Mandatory=$true)][string]$SourceProfilesDir,
+        [Parameter(Mandatory=$true)][string]$ProfilesDir,
+        [Parameter(Mandatory=$true)][string]$LogDir
+    )
+
+    New-Item -ItemType Directory -Force -Path $ProfilesDir | Out-Null
+    $manifestPath = Join-Path $ProfilesDir $script:SynapseBundledProfilesManifestFileName
+    $sourceEntries = @(Get-SynapseBundledProfileSourceEntries -SourceProfilesDir $SourceProfilesDir)
+    $sourceMap = Convert-SynapseEntriesToMap -Entries $sourceEntries
+    $previousManifest = Read-SynapseBundledProfilesManifest -ManifestPath $manifestPath
+    $previousMap = New-SynapseCaseInsensitiveMap
+    if ($previousManifest) {
+        $previousMap = Convert-SynapseEntriesToMap -Entries @($previousManifest.files)
+    }
+
+    $stageRoot = New-SynapseSetupRunDirectory -Root $LogDir -Purpose 'profile-stage'
+    foreach ($entry in $sourceEntries) {
+        $stagedPath = Join-SynapseProfileRelativePath -BaseDir $stageRoot -RelativePath $entry.relative_path -Context 'stage_bundled_profiles'
+        Copy-SynapseProfileFileWithHashReadback -Source $entry.source_path -Destination $stagedPath -ExpectedSha256 $entry.sha256 -Context 'stage_bundled_profiles'
+    }
+
+    $retireActions = @()
+    foreach ($previous in @($previousMap.Values)) {
+        $relative = [string]$previous.relative_path
+        if ($sourceMap.ContainsKey($relative)) { continue }
+        $target = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'retire_previous_bundled_profile'
+        if (Test-Path -LiteralPath $target -PathType Leaf) {
+            $retireActions += [pscustomobject]@{
+                relative_path = $relative
+                path = $target
+                prior_sha256 = ([string]$previous.sha256).ToUpperInvariant()
+                reason = 'previous_manifest_absent_from_source'
+                require_hash_match = $false
+            }
+        }
+    }
+
+    foreach ($legacy in @($script:SynapseLegacyRetiredBundledProfiles)) {
+        $relative = Assert-SynapseProfileRelativePathSafe -RelativePath ([string]$legacy.relative_path) -Context 'legacy_retired_bundled_profile'
+        if ($sourceMap.ContainsKey($relative)) { continue }
+        if (@($retireActions | Where-Object { $_.relative_path -ieq $relative }).Count -gt 0) { continue }
+        $target = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'retire_legacy_bundled_profile'
+        if (Test-Path -LiteralPath $target -PathType Leaf) {
+            $retireActions += [pscustomobject]@{
+                relative_path = $relative
+                path = $target
+                prior_sha256 = ([string]$legacy.sha256).ToUpperInvariant()
+                reason = "legacy_retired_seed:$($legacy.issue)"
+                require_hash_match = $true
+            }
+        }
+    }
+
+    $rollbackRoot = $null
+    $quarantineRoot = $null
+    $copiedNew = @()
+    $overwritten = @()
+    $quarantined = @()
+    $preservedLegacyMismatches = @()
+
+    try {
+        foreach ($entry in $sourceEntries) {
+            $relative = [string]$entry.relative_path
+            $stagedPath = Join-SynapseProfileRelativePath -BaseDir $stageRoot -RelativePath $relative -Context 'install_staged_bundled_profile'
+            $targetPath = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'install_bundled_profile'
+            $targetExists = Test-Path -LiteralPath $targetPath -PathType Leaf
+            if ($targetExists) {
+                $targetHash = Get-SynapseFileSha256 -Path $targetPath
+                if ($targetHash -eq $entry.sha256) {
+                    continue
+                }
+                if ([string]::IsNullOrWhiteSpace($rollbackRoot)) {
+                    $rollbackRoot = New-SynapseSetupRunDirectory -Root (Join-Path $ProfilesDir $script:SynapseBundledProfilesRollbackDirName) -Purpose 'profiles-rollback'
+                }
+                $backupPath = Join-SynapseProfileRelativePath -BaseDir $rollbackRoot -RelativePath $relative -Context 'backup_existing_profile'
+                Copy-SynapseProfileFileWithHashReadback -Source $targetPath -Destination $backupPath -ExpectedSha256 $targetHash -Context 'backup_existing_profile'
+                $overwritten += [pscustomobject]@{
+                    relative_path = $relative
+                    target_path = $targetPath
+                    backup_path = $backupPath
+                    original_sha256 = $targetHash
+                }
+            } else {
+                $copiedNew += [pscustomobject]@{
+                    relative_path = $relative
+                    target_path = $targetPath
+                }
+            }
+            Copy-SynapseProfileFileWithHashReadback -Source $stagedPath -Destination $targetPath -ExpectedSha256 $entry.sha256 -Context 'install_bundled_profile'
+        }
+
+        foreach ($action in $retireActions) {
+            if (-not (Test-Path -LiteralPath $action.path -PathType Leaf)) { continue }
+            $currentHash = Get-SynapseFileSha256 -Path $action.path
+            if ($action.require_hash_match -and $currentHash -ne $action.prior_sha256) {
+                $preservedLegacyMismatches += [ordered]@{
+                    relative_path = $action.relative_path
+                    path = $action.path
+                    expected_sha256 = $action.prior_sha256
+                    actual_sha256 = $currentHash
+                    reason = 'legacy_retired_seed_hash_mismatch_preserved_as_custom'
+                }
+                continue
+            }
+
+            if ([string]::IsNullOrWhiteSpace($quarantineRoot)) {
+                $quarantineRoot = New-SynapseSetupRunDirectory -Root (Join-Path $ProfilesDir $script:SynapseBundledProfilesQuarantineDirName) -Purpose 'retired'
+            }
+            $quarantinePath = Join-SynapseProfileRelativePath -BaseDir $quarantineRoot -RelativePath $action.relative_path -Context 'quarantine_retired_bundled_profile'
+            $quarantineParent = Split-Path -Parent $quarantinePath
+            if (-not [string]::IsNullOrWhiteSpace($quarantineParent)) {
+                New-Item -ItemType Directory -Force -Path $quarantineParent | Out-Null
+            }
+            Move-Item -LiteralPath $action.path -Destination $quarantinePath -Force
+            if (Test-Path -LiteralPath $action.path -PathType Leaf) {
+                Die "SYNAPSE_RETIRED_BUNDLED_PROFILE_QUARANTINE_FAILED path=$($action.path) quarantine=$quarantinePath remediation=setup moved a retired bundled profile but it remains active in the watched profile directory"
+            }
+            $quarantineHash = Get-SynapseFileSha256 -Path $quarantinePath
+            if ($quarantineHash -ne $currentHash) {
+                Die "SYNAPSE_RETIRED_BUNDLED_PROFILE_QUARANTINE_HASH_MISMATCH path=$($action.path) quarantine=$quarantinePath expected_sha256=$currentHash actual_sha256=$quarantineHash remediation=quarantined retired bundled profile bytes changed during move"
+            }
+            $quarantineRecord = [ordered]@{
+                relative_path = $action.relative_path
+                original_path = $action.path
+                quarantine_path = $quarantinePath
+                sha256 = $currentHash
+                reason = $action.reason
+            }
+            $quarantined += $quarantineRecord
+        }
+
+        $deployMismatches = @()
+        foreach ($entry in $sourceEntries) {
+            $targetPath = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $entry.relative_path -Context 'verify_installed_bundled_profile'
+            if (-not (Test-Path -LiteralPath $targetPath -PathType Leaf)) {
+                $deployMismatches += "missing:$($entry.relative_path)"
+                continue
+            }
+            $targetHash = Get-SynapseFileSha256 -Path $targetPath
+            if ($targetHash -ne $entry.sha256) {
+                $deployMismatches += "hash_mismatch:$($entry.relative_path):expected=$($entry.sha256):actual=$targetHash"
+            }
+        }
+        if ($deployMismatches.Count -gt 0) {
+            Die "SYNAPSE_BUNDLED_PROFILES_DEPLOY_VERIFY_FAILED mismatches=$($deployMismatches -join ';') remediation=installed bundled profile set does not match the staged source manifest"
+        }
+
+        $staleOwnedStillActive = @()
+        foreach ($previous in @($previousMap.Values)) {
+            $relative = [string]$previous.relative_path
+            if ($sourceMap.ContainsKey($relative)) { continue }
+            $targetPath = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'verify_retired_previous_bundled_profile'
+            if (Test-Path -LiteralPath $targetPath -PathType Leaf) {
+                $staleOwnedStillActive += $relative
+            }
+        }
+        foreach ($legacy in @($script:SynapseLegacyRetiredBundledProfiles)) {
+            $relative = [string]$legacy.relative_path
+            if ($sourceMap.ContainsKey($relative)) { continue }
+            $targetPath = Join-SynapseProfileRelativePath -BaseDir $ProfilesDir -RelativePath $relative -Context 'verify_retired_legacy_bundled_profile'
+            if (Test-Path -LiteralPath $targetPath -PathType Leaf) {
+                $targetHash = Get-SynapseFileSha256 -Path $targetPath
+                if ($targetHash -eq ([string]$legacy.sha256).ToUpperInvariant()) {
+                    $staleOwnedStillActive += $relative
+                }
+            }
+        }
+        if ($staleOwnedStillActive.Count -gt 0) {
+            Die "SYNAPSE_RETIRED_BUNDLED_PROFILES_STILL_ACTIVE profiles=$($staleOwnedStillActive -join ',') remediation=retired setup-owned profile files must be absent from the watched top-level deployed profile directory"
+        }
+
+        $customProfiles = @()
+        foreach ($profile in @(Get-ChildItem -LiteralPath $ProfilesDir -Filter *.toml -File -ErrorAction SilentlyContinue | Sort-Object Name)) {
+            $relative = Get-SynapseProfileRelativePath -BaseDir $ProfilesDir -Path $profile.FullName -Context 'classify_custom_profile'
+            if ($sourceMap.ContainsKey($relative)) { continue }
+            $customProfiles += [ordered]@{
+                relative_path = $relative
+                path = $profile.FullName
+                sha256 = Get-SynapseFileSha256 -Path $profile.FullName
+            }
+        }
+
+        $manifest = New-SynapseBundledProfilesManifestObject `
+            -SourceProfilesDir $SourceProfilesDir `
+            -ProfilesDir $ProfilesDir `
+            -Entries $sourceEntries `
+            -Quarantined $quarantined `
+            -PreservedCustomProfiles $customProfiles `
+            -PreservedLegacyRetiredHashMismatches $preservedLegacyMismatches
+        $manifestTempPath = Join-Path $ProfilesDir (".{0}.{1}.tmp" -f $script:SynapseBundledProfilesManifestFileName, [Guid]::NewGuid().ToString('N'))
+        Write-SynapseUtf8NoBomFile -Path $manifestTempPath -Text (($manifest | ConvertTo-Json -Depth 40) + "`n")
+        Move-Item -LiteralPath $manifestTempPath -Destination $manifestPath -Force
+        $manifestReadback = Read-SynapseBundledProfilesManifest -ManifestPath $manifestPath
+        if ([string]$manifestReadback.source_manifest_sha256 -ne [string]$manifest.source_manifest_sha256) {
+            Die "SYNAPSE_BUNDLED_PROFILES_MANIFEST_READBACK_MISMATCH path=$manifestPath expected_sha256=$($manifest.source_manifest_sha256) actual_sha256=$($manifestReadback.source_manifest_sha256) remediation=setup wrote the bundled profile ownership manifest but read back different content"
+        }
+
+        Info ("Bundled profile reconciliation complete source_files={0} bundled_profiles={1} custom_profiles={2} quarantined_retired={3} legacy_hash_mismatch_preserved={4} manifest={5} source_manifest_sha256={6}" -f `
+            $sourceEntries.Count,
+            @($sourceEntries | Where-Object { $_.profile_file }).Count,
+            $customProfiles.Count,
+            $quarantined.Count,
+            $preservedLegacyMismatches.Count,
+            $manifestPath,
+            $manifest.source_manifest_sha256)
+        return [pscustomobject]@{
+            ManifestPath = $manifestPath
+            SourceManifestSha256 = [string]$manifest.source_manifest_sha256
+            BundledFileCount = $sourceEntries.Count
+            BundledProfileCount = @($sourceEntries | Where-Object { $_.profile_file }).Count
+            CustomProfileCount = $customProfiles.Count
+            QuarantinedRetiredCount = $quarantined.Count
+        }
+    } catch {
+        $originalError = $_.Exception.Message
+        $rollbackErrors = @()
+        foreach ($newFile in @($copiedNew | Sort-Object relative_path -Descending)) {
+            try {
+                if (Test-Path -LiteralPath $newFile.target_path -PathType Leaf) {
+                    Remove-Item -LiteralPath $newFile.target_path -Force
+                }
+            } catch {
+                $rollbackErrors += "remove_new:$($newFile.relative_path):$($_.Exception.Message)"
+            }
+        }
+        foreach ($backup in @($overwritten | Sort-Object relative_path)) {
+            try {
+                Copy-SynapseProfileFileWithHashReadback -Source $backup.backup_path -Destination $backup.target_path -ExpectedSha256 $backup.original_sha256 -Context 'rollback_existing_profile'
+            } catch {
+                $rollbackErrors += "restore_overwritten:$($backup.relative_path):$($_.Exception.Message)"
+            }
+        }
+        foreach ($retired in @($quarantined | Sort-Object relative_path)) {
+            try {
+                if ((Test-Path -LiteralPath $retired.quarantine_path -PathType Leaf) -and -not (Test-Path -LiteralPath $retired.original_path -PathType Leaf)) {
+                    $parent = Split-Path -Parent $retired.original_path
+                    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+                        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+                    }
+                    Move-Item -LiteralPath $retired.quarantine_path -Destination $retired.original_path -Force
+                }
+            } catch {
+                $rollbackErrors += "restore_quarantined:$($retired.relative_path):$($_.Exception.Message)"
+            }
+        }
+        if ($rollbackErrors.Count -gt 0) {
+            Die "SYNAPSE_BUNDLED_PROFILES_RECONCILE_FAILED_ROLLBACK_FAILED original_error=[$originalError] rollback_errors=$($rollbackErrors -join ';') remediation=profile deployment failed and automatic rollback did not fully restore the prior deployed bytes; inspect $ProfilesDir before restarting the daemon"
+        }
+        Die "SYNAPSE_BUNDLED_PROFILES_RECONCILE_FAILED error=[$originalError] rollback=completed remediation=setup restored prior deployed profile bytes; fix the named profile deployment error and rerun setup"
+    }
+}
+
 function New-SynapseSetupRunDirectory {
     param(
         [Parameter(Mandatory=$true)][string]$Root,
@@ -5926,11 +6457,11 @@ if ($script:SynapsePostExitStartOnly) {
 # ---------------------------------------------------------------------------
 Step "Deploying bundled profiles -> $ProfilesDir"
 if ($srcProfiles -and (Test-Path $srcProfiles)) {
-    New-Item -ItemType Directory -Force -Path $ProfilesDir | Out-Null
-    Copy-Item "$srcProfiles\*" $ProfilesDir -Recurse -Force
-    $n = (Get-ChildItem $ProfilesDir -Filter *.toml -File).Count
-    if ($n -lt 1) { Die "SYNAPSE_PROFILES_DEPLOYED_EMPTY path=$ProfilesDir source=$srcProfiles remediation=copied profiles but found 0 .toml files in the deployed profile directory" }
-    Info "Deployed $n profiles."
+    $profileDeploy = Install-SynapseBundledProfiles -SourceProfilesDir $srcProfiles -ProfilesDir $ProfilesDir -LogDir $LogDir
+    if ($profileDeploy.BundledProfileCount -lt 1) {
+        Die "SYNAPSE_PROFILES_DEPLOYED_EMPTY path=$ProfilesDir source=$srcProfiles remediation=reconciled bundled profiles but found 0 top-level .toml files in the setup-owned manifest"
+    }
+    Info "Deployed $($profileDeploy.BundledProfileCount) bundled profiles from manifest $($profileDeploy.ManifestPath)."
 } elseif (-not (Test-Path $ProfilesDir)) {
     Die "SYNAPSE_PROFILES_MISSING source=$srcProfiles deployed=$ProfilesDir remediation=profile-dependent tools need bundled or deployed profiles before daemon start"
 } else { Info "Reusing existing profiles at $ProfilesDir." }

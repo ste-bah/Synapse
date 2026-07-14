@@ -369,23 +369,28 @@ impl SingleInstanceGuard {
             lock_path: lock_path.clone(),
             detail: format!("create db directory: {err}"),
         })?;
-        let file = OpenOptions::new()
+        let file = match OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&lock_path)
-            .map_err(|err| SingleInstanceError::Io {
-                lock_path: lock_path.clone(),
-                detail: format!("open lock file: {err}"),
-            })?;
+        {
+            Ok(file) => file,
+            Err(err) => {
+                return Err(SingleInstanceError::Io {
+                    lock_path,
+                    detail: format!("open lock file: {err}"),
+                });
+            }
+        };
 
         match FileExt::try_lock_exclusive(&file) {
             Ok(()) => {
                 if let Err(error) = write_pid_file(&pid_path, process::id()) {
                     let cleanup = cleanup_failed_pid_write(&file, &lock_path, &pid_path);
                     return Err(SingleInstanceError::Io {
-                        lock_path: lock_path.clone(),
+                        lock_path,
                         detail: format!(
                             "record holder pid at {}: {}; {cleanup}",
                             pid_path.display(),

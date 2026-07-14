@@ -1830,25 +1830,31 @@ pub(super) async fn serve(
     let m3_state_for_recorder = service.m3_state_handle();
     let m2_emitter_owner = take_m2_emitter_owner(&service);
 
-    // Eager storage open: validate RocksDB at startup rather than lazily on the
-    // first reflex tool call, so a lock/schema fault fails fast with a clear
-    // error and the daemon refuses to start half-broken (instead of every tool
-    // call failing later). The handle is cached and reused by the reflex
-    // runtime, so there is no open-then-reopen race.
+    // Eager storage open + maintenance startup: validate RocksDB and retain the
+    // periodic GC/pressure task handles before serving any MCP request, so a
+    // lock/schema/task/probe fault fails fast instead of reporting healthy
+    // storage while retention is inert. The handle is cached and reused by the
+    // reflex runtime, so there is no open-then-reopen race.
     {
-        let open_result = match m3_state_for_recorder.lock() {
-            Ok(mut state) => Some(state.ensure_storage()),
+        let open_or_maintenance_result = match m3_state_for_recorder.lock() {
+            Ok(mut state) => Some(
+                state
+                    .ensure_storage()
+                    .and_then(|_| state.ensure_storage_maintenance_tasks()),
+            ),
             Err(poisoned) => {
                 drop(poisoned);
                 None
             }
         };
-        let Some(open_result) = open_result else {
+        let Some(open_or_maintenance_result) = open_or_maintenance_result else {
             drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "storage_state_lock",
-                    anyhow::anyhow!("m3 service state lock poisoned during startup storage open"),
+                    anyhow::anyhow!(
+                        "m3 service state lock poisoned during startup storage open/maintenance"
+                    ),
                     Vec::new(),
                     None,
                 ),
@@ -1864,7 +1870,7 @@ pub(super) async fn serve(
             )
             .await;
         };
-        if let Err(error) = open_result {
+        if let Err(error) = open_or_maintenance_result {
             let detail = error.to_string();
             if detail.to_lowercase().contains("lock") {
                 tracing::error!(
@@ -1875,16 +1881,16 @@ pub(super) async fn serve(
                 );
             } else {
                 tracing::error!(
-                    code = "STORAGE_OPEN_FAILED",
+                    code = "STORAGE_OPEN_OR_MAINTENANCE_START_FAILED",
                     db_path = %db_path.display(),
                     detail = %detail,
-                    "refusing to start: storage open failed at daemon startup"
+                    "refusing to start: storage open/maintenance startup failed at daemon startup"
                 );
             }
             drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
-                    "storage_open",
+                    "storage_open_or_maintenance_start",
                     anyhow::anyhow!(detail),
                     Vec::new(),
                     None,
@@ -1902,9 +1908,9 @@ pub(super) async fn serve(
             .await;
         }
         tracing::info!(
-            code = "MCP_DAEMON_STORAGE_OPENED",
+            code = "MCP_DAEMON_STORAGE_OPENED_AND_MAINTENANCE_STARTED",
             db_path = %db_path.display(),
-            "daemon storage opened eagerly at startup"
+            "daemon storage opened eagerly and storage maintenance tasks started at startup"
         );
     }
 

@@ -619,7 +619,8 @@ async fn stop_stdio_service_task_after_cancel(
     }
 }
 
-const fn stdio_lifetime_locks_safe_to_close(
+#[derive(Clone, Copy, Debug)]
+struct StdioLifetimeLockReadiness {
     authority_safe_to_unlock: bool,
     server_dispatch_quiescent: bool,
     m2_emitter_safe: bool,
@@ -630,28 +631,25 @@ const fn stdio_lifetime_locks_safe_to_close(
     retained_shutdown_task_owners_quiescent: bool,
     unresolved_shell_child_owners_quiescent: bool,
     activity_recorder_retained_owners_quiescent: bool,
-) -> bool {
-    authority_safe_to_unlock
-        && server_dispatch_quiescent
-        && m2_emitter_safe
-        && win_event_owners_quiescent
-        && hotkey_owners_quiescent
-        && k2_tasks_quiescent
-        && desktop_worker_owners_quiescent
-        && retained_shutdown_task_owners_quiescent
-        && unresolved_shell_child_owners_quiescent
-        && activity_recorder_retained_owners_quiescent
+}
+
+const fn stdio_lifetime_locks_safe_to_close(readiness: StdioLifetimeLockReadiness) -> bool {
+    readiness.authority_safe_to_unlock
+        && readiness.server_dispatch_quiescent
+        && readiness.m2_emitter_safe
+        && readiness.win_event_owners_quiescent
+        && readiness.hotkey_owners_quiescent
+        && readiness.k2_tasks_quiescent
+        && readiness.desktop_worker_owners_quiescent
+        && readiness.retained_shutdown_task_owners_quiescent
+        && readiness.unresolved_shell_child_owners_quiescent
+        && readiness.activity_recorder_retained_owners_quiescent
 }
 
 fn close_stdio_lifetime_locks(
     shell_job_store: crate::single_instance::ShellJobStoreLockGuard,
     single_instance: crate::single_instance::SingleInstanceGuard,
-    authority_safe_to_unlock: bool,
-    server_dispatch_quiescent: bool,
-    m2_emitter_safe: bool,
-    win_event_owners_quiescent: bool,
-    hotkey_owners_quiescent: bool,
-    k2_tasks_quiescent: bool,
+    mut readiness: StdioLifetimeLockReadiness,
     reason: &'static str,
 ) -> anyhow::Result<()> {
     let desktop_worker_owner_report = crate::desktop_worker::desktop_worker_retained_owner_report();
@@ -667,41 +665,35 @@ fn close_stdio_lifetime_locks(
         crate::m3::activity_recorder::retained_owner_readback();
     let activity_recorder_retained_owners_quiescent =
         activity_recorder_retained_owner_readback.safe_to_unlock();
-    if !stdio_lifetime_locks_safe_to_close(
-        authority_safe_to_unlock,
-        server_dispatch_quiescent,
-        m2_emitter_safe,
-        win_event_owners_quiescent,
-        hotkey_owners_quiescent,
-        k2_tasks_quiescent,
-        desktop_worker_owners_quiescent,
-        retained_shutdown_task_owners_quiescent,
-        unresolved_shell_child_owners_quiescent,
-        activity_recorder_retained_owners_quiescent,
-    ) {
+    readiness.desktop_worker_owners_quiescent = desktop_worker_owners_quiescent;
+    readiness.retained_shutdown_task_owners_quiescent = retained_shutdown_task_owners_quiescent;
+    readiness.unresolved_shell_child_owners_quiescent = unresolved_shell_child_owners_quiescent;
+    readiness.activity_recorder_retained_owners_quiescent =
+        activity_recorder_retained_owners_quiescent;
+    if !stdio_lifetime_locks_safe_to_close(readiness) {
         tracing::error!(
             code = "MCP_STDIO_LIFETIME_LOCKS_RETAINED",
             reason,
-            authority_safe_to_unlock,
-            server_dispatch_quiescent,
-            m2_emitter_safe,
-            win_event_owners_quiescent,
-            hotkey_owners_quiescent,
-            k2_tasks_quiescent,
-            desktop_worker_owners_quiescent,
+            authority_safe_to_unlock = readiness.authority_safe_to_unlock,
+            server_dispatch_quiescent = readiness.server_dispatch_quiescent,
+            m2_emitter_safe = readiness.m2_emitter_safe,
+            win_event_owners_quiescent = readiness.win_event_owners_quiescent,
+            hotkey_owners_quiescent = readiness.hotkey_owners_quiescent,
+            k2_tasks_quiescent = readiness.k2_tasks_quiescent,
+            desktop_worker_owners_quiescent = readiness.desktop_worker_owners_quiescent,
             desktop_worker_owner_report = ?desktop_worker_owner_report,
-            retained_shutdown_task_owners_quiescent,
+            retained_shutdown_task_owners_quiescent = readiness.retained_shutdown_task_owners_quiescent,
             retained_shutdown_task_owner_report = ?retained_shutdown_task_owner_report,
-            unresolved_shell_child_owners_quiescent,
+            unresolved_shell_child_owners_quiescent = readiness.unresolved_shell_child_owners_quiescent,
             unresolved_shell_child_owner_report = ?unresolved_shell_child_owner_report,
-            activity_recorder_retained_owners_quiescent,
+            activity_recorder_retained_owners_quiescent = readiness.activity_recorder_retained_owners_quiescent,
             activity_recorder_retained_owner_readback = ?activity_recorder_retained_owner_readback,
             "one or more stdio daemon task owners remained live; retaining both daemon lifetime locks until process teardown"
         );
         use std::io::Write as _;
         if let Err(stderr_error) = writeln!(
             std::io::stderr().lock(),
-            "synapse-mcp fatal shutdown error: reason={reason} authority_safe_to_unlock={authority_safe_to_unlock} server_dispatch_quiescent={server_dispatch_quiescent} m2_emitter_safe={m2_emitter_safe} win_event_owners_quiescent={win_event_owners_quiescent} hotkey_owners_quiescent={hotkey_owners_quiescent} k2_tasks_quiescent={k2_tasks_quiescent} desktop_worker_owners_quiescent={desktop_worker_owners_quiescent} desktop_worker_owner_report={desktop_worker_owner_report:?} retained_shutdown_task_owners_quiescent={retained_shutdown_task_owners_quiescent} retained_shutdown_task_owner_report={retained_shutdown_task_owner_report:?} unresolved_shell_child_owners_quiescent={unresolved_shell_child_owners_quiescent} unresolved_shell_child_owner_report={unresolved_shell_child_owner_report:?} activity_recorder_retained_owners_quiescent={activity_recorder_retained_owners_quiescent} activity_recorder_retained_owner_readback={activity_recorder_retained_owner_readback:?}; daemon lifetime locks retained until process teardown"
+            "synapse-mcp fatal shutdown error: reason={reason} readiness={readiness:?} desktop_worker_owner_report={desktop_worker_owner_report:?} retained_shutdown_task_owner_report={retained_shutdown_task_owner_report:?} unresolved_shell_child_owner_report={unresolved_shell_child_owner_report:?} activity_recorder_retained_owner_readback={activity_recorder_retained_owner_readback:?}; daemon lifetime locks retained until process teardown"
         ) {
             tracing::error!(
                 code = "MCP_STDIO_LIFETIME_LOCK_RETAIN_STDERR_WRITE_FAILED",
@@ -720,7 +712,7 @@ fn close_stdio_lifetime_locks(
         std::mem::forget(shell_job_store);
         std::mem::forget(single_instance);
         anyhow::bail!(
-            "refused to release daemon lifetime locks after {reason}: authority_safe_to_unlock={authority_safe_to_unlock} server_dispatch_quiescent={server_dispatch_quiescent} m2_emitter_safe={m2_emitter_safe} win_event_owners_quiescent={win_event_owners_quiescent} hotkey_owners_quiescent={hotkey_owners_quiescent} k2_tasks_quiescent={k2_tasks_quiescent} desktop_worker_owners_quiescent={desktop_worker_owners_quiescent} desktop_worker_owner_report={desktop_worker_owner_report:?} retained_shutdown_task_owners_quiescent={retained_shutdown_task_owners_quiescent} retained_shutdown_task_owner_report={retained_shutdown_task_owner_report:?} unresolved_shell_child_owners_quiescent={unresolved_shell_child_owners_quiescent} unresolved_shell_child_owner_report={unresolved_shell_child_owner_report:?} activity_recorder_retained_owners_quiescent={activity_recorder_retained_owners_quiescent} activity_recorder_retained_owner_readback={activity_recorder_retained_owner_readback:?}"
+            "refused to release daemon lifetime locks after {reason}: readiness={readiness:?} desktop_worker_owner_report={desktop_worker_owner_report:?} retained_shutdown_task_owner_report={retained_shutdown_task_owner_report:?} unresolved_shell_child_owner_report={unresolved_shell_child_owner_report:?} activity_recorder_retained_owner_readback={activity_recorder_retained_owner_readback:?}"
         );
     }
     crate::single_instance::close_daemon_lifetime_locks(shell_job_store, single_instance)
@@ -1146,6 +1138,39 @@ async fn run_stdio(
         m4_config,
     )
     .context("initialize Synapse service state")?;
+    {
+        let m3_state = service.m3_state_handle();
+        let maintenance_result = match m3_state.lock() {
+            Ok(mut state) => state
+                .ensure_storage_maintenance_tasks()
+                .context("start stdio storage maintenance"),
+            Err(poisoned) => {
+                drop(poisoned);
+                Err(anyhow::anyhow!(
+                    "m3 service state lock poisoned during stdio storage maintenance startup"
+                ))
+            }
+        };
+        if let Err(error) = maintenance_result {
+            tracing::error!(
+                code = "STORAGE_OPEN_OR_MAINTENANCE_START_FAILED",
+                mode = "stdio",
+                db_path = %db_path.display(),
+                detail = %error,
+                "refusing to start: stdio storage open/maintenance startup failed"
+            );
+            daemon_lifecycle::record_startup_exit(
+                "stdio_storage_open_or_maintenance_start_failed",
+                serde_json::json!({
+                    "mode": "stdio",
+                    "db_path": db_path.display().to_string(),
+                    "detail": error.to_string(),
+                }),
+            )
+            .context("record daemon lifecycle stdio storage maintenance startup failure")?;
+            return Err(error);
+        }
+    }
     synapse_action::install_panic_hook();
     let authority_finalizer_service = service.clone();
     let mut m2_emitter_owner = Some(take_m2_emitter_owner(&service));
@@ -1187,12 +1212,18 @@ async fn run_stdio(
             let lifetime_lock_close = close_stdio_lifetime_locks(
                 shell_job_store_lock_guard,
                 single_instance_guard,
-                authority_safe_to_unlock,
-                true,
-                m2_emitter_safe,
-                win_event_owners_quiescent,
-                operator_drain.hotkey_owners_quiescent,
-                operator_drain.k2_tasks_quiescent,
+                StdioLifetimeLockReadiness {
+                    authority_safe_to_unlock,
+                    server_dispatch_quiescent: true,
+                    m2_emitter_safe,
+                    win_event_owners_quiescent,
+                    hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
+                    k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
+                    desktop_worker_owners_quiescent: false,
+                    retained_shutdown_task_owners_quiescent: false,
+                    unresolved_shell_child_owners_quiescent: false,
+                    activity_recorder_retained_owners_quiescent: false,
+                },
                 "stdio operator hotkey install failure",
             );
             return aggregate_stdio_shutdown_results(
@@ -1256,12 +1287,18 @@ async fn run_stdio(
                 let lifetime_lock_close = close_stdio_lifetime_locks(
                     shell_job_store_lock_guard,
                     single_instance_guard,
-                    authority_safe_to_unlock,
-                    true,
-                    m2_emitter_safe,
-                    win_event_owners_quiescent,
-                    operator_drain.hotkey_owners_quiescent,
-                    operator_drain.k2_tasks_quiescent,
+                    StdioLifetimeLockReadiness {
+                        authority_safe_to_unlock,
+                        server_dispatch_quiescent: true,
+                        m2_emitter_safe,
+                        win_event_owners_quiescent,
+                        hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
+                        k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
+                        desktop_worker_owners_quiescent: false,
+                        retained_shutdown_task_owners_quiescent: false,
+                        unresolved_shell_child_owners_quiescent: false,
+                        activity_recorder_retained_owners_quiescent: false,
+                    },
                     "stdio connection closed before init",
                 );
                 aggregate_stdio_shutdown_results(
@@ -1317,12 +1354,18 @@ async fn run_stdio(
                 let lifetime_lock_close = close_stdio_lifetime_locks(
                     shell_job_store_lock_guard,
                     single_instance_guard,
-                    authority_safe_to_unlock,
-                    true,
-                    m2_emitter_safe,
-                    win_event_owners_quiescent,
-                    operator_drain.hotkey_owners_quiescent,
-                    operator_drain.k2_tasks_quiescent,
+                    StdioLifetimeLockReadiness {
+                        authority_safe_to_unlock,
+                        server_dispatch_quiescent: true,
+                        m2_emitter_safe,
+                        win_event_owners_quiescent,
+                        hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
+                        k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
+                        desktop_worker_owners_quiescent: false,
+                        retained_shutdown_task_owners_quiescent: false,
+                        unresolved_shell_child_owners_quiescent: false,
+                        activity_recorder_retained_owners_quiescent: false,
+                    },
                     "stdio startup failure",
                 );
                 return aggregate_stdio_shutdown_results(
@@ -1385,12 +1428,18 @@ async fn run_stdio(
             let lifetime_lock_close = close_stdio_lifetime_locks(
                 shell_job_store_lock_guard,
                 single_instance_guard,
-                authority_safe_to_unlock,
-                true,
-                m2_emitter_safe,
-                win_event_owners_quiescent,
-                operator_drain.hotkey_owners_quiescent,
-                operator_drain.k2_tasks_quiescent,
+                StdioLifetimeLockReadiness {
+                    authority_safe_to_unlock,
+                    server_dispatch_quiescent: true,
+                    m2_emitter_safe,
+                    win_event_owners_quiescent,
+                    hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
+                    k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
+                    desktop_worker_owners_quiescent: false,
+                    retained_shutdown_task_owners_quiescent: false,
+                    unresolved_shell_child_owners_quiescent: false,
+                    activity_recorder_retained_owners_quiescent: false,
+                },
                 "stdio signal before init",
             );
             aggregate_stdio_shutdown_results(
@@ -1464,12 +1513,18 @@ async fn run_stdio(
             let lifetime_lock_close = close_stdio_lifetime_locks(
                 shell_job_store_lock_guard,
                 single_instance_guard,
-                authority_safe_to_unlock,
-                server_dispatch_quiescent,
-                m2_emitter_safe,
-                win_event_owners_quiescent,
-                operator_drain.hotkey_owners_quiescent,
-                operator_drain.k2_tasks_quiescent,
+                StdioLifetimeLockReadiness {
+                    authority_safe_to_unlock,
+                    server_dispatch_quiescent,
+                    m2_emitter_safe,
+                    win_event_owners_quiescent,
+                    hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
+                    k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
+                    desktop_worker_owners_quiescent: false,
+                    retained_shutdown_task_owners_quiescent: false,
+                    unresolved_shell_child_owners_quiescent: false,
+                    activity_recorder_retained_owners_quiescent: false,
+                },
                 "stdio service completion",
             );
             aggregate_stdio_shutdown_results(
@@ -1543,12 +1598,18 @@ async fn run_stdio(
             let lifetime_lock_close = close_stdio_lifetime_locks(
                 shell_job_store_lock_guard,
                 single_instance_guard,
-                authority_safe_to_unlock,
-                server_dispatch_quiescent,
-                m2_emitter_safe,
-                win_event_owners_quiescent,
-                operator_drain.hotkey_owners_quiescent,
-                operator_drain.k2_tasks_quiescent,
+                StdioLifetimeLockReadiness {
+                    authority_safe_to_unlock,
+                    server_dispatch_quiescent,
+                    m2_emitter_safe,
+                    win_event_owners_quiescent,
+                    hotkey_owners_quiescent: operator_drain.hotkey_owners_quiescent,
+                    k2_tasks_quiescent: operator_drain.k2_tasks_quiescent,
+                    desktop_worker_owners_quiescent: false,
+                    retained_shutdown_task_owners_quiescent: false,
+                    unresolved_shell_child_owners_quiescent: false,
+                    activity_recorder_retained_owners_quiescent: false,
+                },
                 "stdio signal after init",
             );
             aggregate_stdio_shutdown_results(
@@ -1699,39 +1760,59 @@ mod stdio_shutdown_tests {
 
     #[test]
     fn stdio_lifetime_unlock_requires_every_owner_set_quiescent() {
-        assert!(stdio_lifetime_locks_safe_to_close(
-            true, true, true, true, true, true, true, true, true, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            false, true, true, true, true, true, true, true, true, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            true, false, true, true, true, true, true, true, true, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            true, true, false, true, true, true, true, true, true, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            true, true, true, false, true, true, true, true, true, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            true, true, true, true, false, true, true, true, true, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            true, true, true, true, true, false, true, true, true, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            true, true, true, true, true, true, false, true, true, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            true, true, true, true, true, true, true, false, true, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            true, true, true, true, true, true, true, true, false, true
-        ));
-        assert!(!stdio_lifetime_locks_safe_to_close(
-            true, true, true, true, true, true, true, true, true, false
-        ));
+        let safe = StdioLifetimeLockReadiness {
+            authority_safe_to_unlock: true,
+            server_dispatch_quiescent: true,
+            m2_emitter_safe: true,
+            win_event_owners_quiescent: true,
+            hotkey_owners_quiescent: true,
+            k2_tasks_quiescent: true,
+            desktop_worker_owners_quiescent: true,
+            retained_shutdown_task_owners_quiescent: true,
+            unresolved_shell_child_owners_quiescent: true,
+            activity_recorder_retained_owners_quiescent: true,
+        };
+        assert!(stdio_lifetime_locks_safe_to_close(safe));
+
+        let mut readiness = safe;
+        readiness.authority_safe_to_unlock = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.server_dispatch_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.m2_emitter_safe = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.win_event_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.hotkey_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.k2_tasks_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.desktop_worker_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.retained_shutdown_task_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.unresolved_shell_child_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
+
+        let mut readiness = safe;
+        readiness.activity_recorder_retained_owners_quiescent = false;
+        assert!(!stdio_lifetime_locks_safe_to_close(readiness));
     }
 
     #[test]

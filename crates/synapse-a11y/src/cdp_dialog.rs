@@ -24,7 +24,7 @@ pub const DEFAULT_DIALOG_BUFFER_CAPACITY: usize = 128;
 pub const MAX_DIALOG_BUFFER_CAPACITY: usize = 1000;
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
-pub(crate) struct CdpDialogDurableDrainReadback {
+pub struct CdpDialogDurableDrainReadback {
     pub found: usize,
     pub listener_tasks_drained: usize,
     pub handler_tasks_drained: usize,
@@ -663,7 +663,7 @@ pub fn dialog_capture_active_count() -> usize {
     dialog_capture_active_count_readback().unwrap_or(usize::MAX)
 }
 
-pub(crate) fn dialog_capture_active_count_readback() -> Result<usize, String> {
+pub fn dialog_capture_active_count_readback() -> Result<usize, String> {
     registry()
         .slots
         .lock()
@@ -676,7 +676,7 @@ pub(crate) fn dialog_capture_active_count_readback() -> Result<usize, String> {
         .map_err(|_| "dialog capture registry lock is poisoned".to_owned())
 }
 
-pub(crate) async fn dialog_capture_disable_and_drain_all() -> CdpDialogDurableDrainReadback {
+pub async fn dialog_capture_disable_and_drain_all() -> CdpDialogDurableDrainReadback {
     let slots = match registry().slots.lock() {
         Ok(mut slots) => std::mem::take(&mut *slots),
         Err(_) => {
