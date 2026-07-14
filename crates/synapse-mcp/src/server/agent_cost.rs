@@ -979,10 +979,9 @@ impl SynapseService {
     /// `agent_cost` rollup with an optional restriction to a fixed set of spawn
     /// ids. When `restrict_spawn_ids` is `Some`, only those spawns' transcript
     /// prefixes are scanned (bounded per spawn) instead of the full
-    /// CF_AGENT_TRANSCRIPTS — the dashboard cost panel uses this with the
-    /// window-active spawn set so it never exhausts the scan budget over the
-    /// entire retained journal (#1328). The public MCP tool passes `None` and
-    /// keeps its fail-closed full-scan contract.
+    /// CF_AGENT_TRANSCRIPTS. Public fleet windows pass `None` and are pruned by
+    /// the timestamp index in the query plan; only explicit all-history scans
+    /// use the full CF path.
     fn agent_cost_impl_scoped(
         &self,
         plan: AgentCostQueryPlan,
